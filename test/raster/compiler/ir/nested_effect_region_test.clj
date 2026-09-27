@@ -113,8 +113,8 @@
                       :effects [{:destination 'out :destination-index 'j
                                  :predicate 1 :value 0.0}]}}
         carried {:loop {:index 'k :lower 0 :extent 2 :locals []
-                        :carry {:parameter 'acc :result 'sum :dtype :double
-                                :init 0.0 :update 'acc}
+                        :carries [{:parameter 'acc :result 'sum :dtype :double
+                                   :init 0.0 :update 'acc}]
                         :effects [{:region {:locals [] :effects [inner]}}]}}]
     (is (dialect/scheduled-effect-carries?
          [{:region {:locals [] :effects [carried]}}]))

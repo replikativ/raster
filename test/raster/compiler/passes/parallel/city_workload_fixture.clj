@@ -6,6 +6,16 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.par :as par]))
 
+(deftm three-carry-effects!
+  [out :- (Array int), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [k 0 a (double k) b (+ a 1.0) c (+ b 1.0)]
+      (when (< k nc)
+        (par/atomic-add! out (* i 3) (int a))
+        (par/atomic-add! out (+ (* i 3) 1) (int b))
+        (par/atomic-add! out (+ (* i 3) 2) (int c))
+        (recur (inc k) b c a)))))
+
 (deftm terminal-moments!
   [weights :- (Array double), sums :- (Array double), squares :- (Array double),
    n :- Long, nc :- Long] :- Void

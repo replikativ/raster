@@ -12,7 +12,7 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
 1. **Control and effects.** Preserve bindings, branch results, ordered effects and loop
    carries through the existing typed regions. Reuse scalar/product Fold and KernelBody
    control instead of adding recognizers with separate semantics. General effect-loop
-   carry tuples, multiple recurrence sites and exits remain open. Accepted kernels must
+   carry tuples are implemented; multiple recurrence sites and exits remain open. Accepted kernels must
    retain all effects; unknown legality produces a source-located decline.
 2. **One complete memory proof.** Follow `memory-planning-campaign.md`: join logical values,
    storage views, initialization, selected replay order, escape/AD retention and completion
@@ -52,11 +52,22 @@ loop, emit through the OpenCL/CUDA/HIP target dialects, and match JVM results on
 OpenCL and Level Zero for zero, one and seven trips. These are correctness checks, not
 performance measurements. Cross-row destination reads retain sequential ordering.
 
-The next effectful carry change must replace the singular carry with one ordered tuple across
-the canonical dialect, lexical scope/rebinding, validation, ownership, JVM projection and
-KernelBody lowering together. `ir/form`'s sequential result binders are part of that contract;
-changing only the source matcher would be incomplete. Pure and effectful tuples should share
-type/SSA mechanisms without conflating their effect sequencing.
+Effect-loop carries now use one ordered `:carries` vector across the canonical dialect, lexical
+scope/rebinding, validation, ownership, JVM projection and KernelBody lowering. Counted
+effect-only source loops accept multiple carried values; the result-valued source recognizer
+still admits a single returned carry. Multiple source exits/recurrence sites remain separate
+coverage work, not permission to reinterpret effectful loops as pure Fold terms.
+
+Source initialization retains a typed sequential local spine at the loop's effect position.
+All recurrence updates see the old tuple after the body effects and yield simultaneously.
+No new KernelBody node or target emitter was introduced. The single-carry spelling and the
+separate zero/one-carry counted-loop recognizers were removed. Scope transforms must reject,
+not truncate and repair, mismatched carry declarations/parameters/initializers.
+
+Validation includes three-carry source/JVM/OpenCL/Level Zero parity, dependent initialization,
+zero trips, cyclic simultaneous updates, second-result capture avoidance, malformed arities,
+the original city kernels and the existing single-carry/CSR/prefill regression cases. Native
+CUDA/HIP execution remains unclaimed; generated sources use their existing compile gates.
 
 The shared lexical scope authority also covers existing result-producing atomics: their
 inputs use the preceding scope and their result binds only subsequent effects. Substitution

@@ -23,11 +23,11 @@
           loop (-> equation dialect/operation-parts :lambda dialect/lambda-parts
                    :body-results first dialect/effect-parts)
           operation (first (lower/lower-typed-effect-map program :ze:0))
-          carry (get-in operation [:scalar-region :effects 0 :loop :carry])
+          carry (get-in operation [:scalar-region :effects 0 :loop :carries 0])
           execute (eval (list 'fn '[x words totals rows seed] (jvm/compile-effect-segmap operation)))
           totals (float-array 2) words (float-array (repeat 16 -77))]
       (is (= :accepted (reason program)))
-      (is (= 'initial (get-in loop [:carry :init])))
+      (is (= 'initial (get-in loop [:carries 0 :init])))
       (is (= 'seed (:init carry)) "capture appears only in initializer but is still substituted")
       (is (= :float (:dtype carry)))
       (is (= 'double (:raster.type/tag (meta (:update carry)))))
@@ -43,14 +43,14 @@
         remapped (dialect/remap-values program {'seed 'starting-value})
         operation (first (lower/lower-typed-effect-map remapped :ze:0))
         [fused stats] (fusion/fusion-fixpoint program)]
-    (is (= 'starting-value (get-in operation [:scalar-region :effects 0 :loop :carry :init])))
+    (is (= 'starting-value (get-in operation [:scalar-region :effects 0 :loop :carries 0 :init])))
     (is (= (dialect/equations program) (dialect/equations fused)))
     (is (zero? (:vertical stats)))
     (is (zero? (:horizontal stats)))
     (is (= :explicit-typed-algorithm (get-in (route/program-envelope program) [:attributes :host-control])))
     (is (some? (-> ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'scalar-region)
                    (first (dialect/equations program)))
-                  :bodies first dialect/effect-parts :carry)))))
+                  :bodies first dialect/effect-parts :carries seq)))))
 
 (defn- host-source [program]
   (:source ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'realize-equation)
@@ -74,7 +74,7 @@
 (deftest production-carry-preserves-generated-fp32-conversion-and-checked-source-arithmetic
   (let [overflow-init (rewrite-loop (fixture/typed-program 0)
                                     (fn [[op attrs extent _ lambda]]
-                                      (list op attrs extent 1.0e100 lambda)))
+                                      (list op attrs extent [1.0e100] lambda)))
         host (eval (list 'fn '[x words totals rows seed] (host-source overflow-init)))
         totals (float-array 1)]
     (host (float-array 16) (float-array 16) totals 1 (float 0.25))
@@ -85,8 +85,8 @@
                    (list op attrs extent init
                          (list lam params
                                (list region locals effects
-                                     (with-meta '(clojure.core/+ 9223372036854775807 1)
-                                                {:raster.type/tag 'long}))))))
+                                     [(with-meta '(clojure.core/+ 9223372036854775807 1)
+                                                 {:raster.type/tag 'long})])))))
         host (eval (list 'fn '[x words totals rows seed] (host-source checked)))
         words (float-array (repeat 16 -77)) totals (float-array [-77])]
     (is (thrown? ArithmeticException (host (float-array (range 16)) words totals 1 (float 0.25))))
@@ -96,16 +96,16 @@
 (deftest canonical-carries-reject-invalid-shapes-scope-and-hidden-writes
   (let [program (fixture/typed-program 1)
         variants
-        [(rewrite-loop program (fn [[op attrs extent init lambda]] (list op (dissoc attrs :carry) extent init lambda)))
-         (rewrite-loop program (fn [[op attrs extent _ lambda]] (list op attrs extent 'sum lambda)))
+        [(rewrite-loop program (fn [[op attrs extent init lambda]] (list op (dissoc attrs :carries) extent init lambda)))
+         (rewrite-loop program (fn [[op attrs extent _ lambda]] (list op attrs extent ['sum] lambda)))
          (rewrite-loop program (fn [[op attrs _ init lambda]] (list op attrs 'acc init lambda)))
          (rewrite-loop program (fn [[op attrs extent init [_ _ region]]]
                                  (list op attrs extent init (list 'lambda '[k wrong] region))))
          (rewrite-loop program (fn [[op attrs extent init [lam params [region locals effects _]]]]
-                                 (list op attrs extent init (list lam params (list region locals effects 'unknown)))))
+                                 (list op attrs extent init (list lam params (list region locals effects ['unknown])))))
          (rewrite-loop program (fn [[op attrs extent init [lam params [region locals effects _]]]]
                                  (list op attrs extent init
-                                       (list lam params (list region locals effects '(aset packed 0 1.0))))))]]
+                                       (list lam params (list region locals effects ['(aset packed 0 1.0)])))))]]
     (doseq [variant variants] (is (not= :accepted (reason variant))))
     (is (= :typed-soac-effect-carry-write (reason (last variants))))))
 
@@ -114,7 +114,7 @@
                  (fixture/typed-program 1)
                  (fn [[op attrs extent init [lam params [region locals effects _]]]]
                    (list op attrs extent init
-                         (list lam params (list region locals effects '(aget packed (+ (* i 8) k)))))))
+                         (list lam params (list region locals effects ['(aget packed (+ (* i 8) k))])))))
         facts (assoc-in (dialect/facts program) [:equations :carry :attributes :result-storage 0 :access] :read-write)
         readable (dialect/make facts (dialect/equations program) [])
         operation (first (lower/lower-typed-effect-map readable :ze:0))]
@@ -167,11 +167,11 @@
                         (fn [[op attrs extent init [lam params [region locals effects _]]]]
                           (list op attrs extent init
                                 (list lam params (list region locals effects
-                                                       (with-meta '(+ acc row-count) {:raster.type/tag 'double}))))))
+                                                       [(with-meta '(+ acc row-count) {:raster.type/tag 'double})])))))
         operation (first (lower/lower-typed-effect-map capture-update :ze:0))
         totals (float-array 2)
         execute (eval (list 'fn '[x words totals rows seed] (jvm/compile-effect-segmap operation)))]
     (is (= :typed-soac-effect-loop (reason reverse-effects)))
-    (is (= '(+ acc rows) (get-in operation [:scalar-region :effects 0 :loop :carry :update])))
+    (is (= '(+ acc rows) (get-in operation [:scalar-region :effects 0 :loop :carries 0 :update])))
     (execute (float-array (range 16)) (float-array 16) totals 2 (float 0.25))
     (is (= [2.25 2.25] (vec totals)))))

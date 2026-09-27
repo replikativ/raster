@@ -8,13 +8,13 @@
   (list 'effect-region
         [(list 'let-value 'local :long 'seed)]
         [(list 'effect 'out :unique 0 true 'local)
-         (list 'effect-loop {:index 'k :lower 0 :carry {:parameter 'acc :result 'sum :dtype :long}}
-               'n 'local
+         (list 'effect-loop {:index 'k :lower 0 :carries [{:parameter 'acc :result 'sum :dtype :long}]}
+               'n ['local]
                (list 'lambda '[k acc]
                      (list 'effect-region
                            [(list 'let-value 'term :long '(aget source k))]
                            [(list 'effect 'out :unique 'k true 'term)]
-                           (with-meta '(+ acc term) {:raster.type/tag 'long}))))
+                           [(with-meta '(+ acc term) {:raster.type/tag 'long})])))
          (list 'effect 'out :unique 1 true 'sum)]))
 
 (deftest scope-authority-models-interleaved-results-as-sequential-bindings
@@ -28,13 +28,29 @@
       (is (contains? (util/free-syms before) 'sum) "result is not in scope before its loop"))))
 
 (deftest malformed-scope-shapes-are-not-destructured-as-binding-regions
-  (doseq [r ['(effect-region 1 2) '(effect-region [17] []) '(effect-loop {} 3 1)]]
+  (doseq [r ['(effect-region 1 2) '(effect-region [17] []) '(effect-loop {} 3 1)
+             '(effect-loop {:index k :lower 0
+                            :carries [{:parameter a :result x :dtype :long}
+                                      {:parameter b :result y :dtype :long}]}
+                           3 [0] (lambda [k a] (effect-region [] [] [a])))
+             '(effect-loop {:index k :lower 0 :carries [{:parameter a :result x :dtype :long}]}
+                           3 [0] (lambda [k wrong] (effect-region [] [] [wrong])))]]
     (is (nil? (form/scope-info r)))))
+
+(deftest rebinding-cannot-repair-a-malformed-tuple-by-truncating-it
+  (let [bad '(effect-loop {:index k :lower 0
+                          :carries [{:parameter a :result x :dtype :long}
+                                    {:parameter b :result y :dtype :long}]}
+                         3 [seed] (lambda [k a] (effect-region [] [] [a])))]
+    (doseq [transformed [(util/alpha-convert bad) (util/subst-syms {'seed 'a} bad)]]
+      (is (= 2 (count (:carries (second transformed)))))
+      (is (= 1 (count (nth transformed 3))))
+      (is (nil? (form/scope-info transformed))))))
 
 (deftest substitution-avoids-capturing-external-values-in-the-continuation
   (let [r (util/subst-syms {'seed 'sum} (region))
         effects (nth r 2)
-        carry (:carry (dialect/effect-parts (second effects)))
+        carry (first (:carries (dialect/effect-parts (second effects))))
         result (:result carry)]
     (is (not= 'sum result))
     (is (= 'sum (nth (first (second r)) 3)))
@@ -48,7 +64,7 @@
         effects (nth r 2)
         loop (dialect/effect-parts (second effects))
         {:keys [locals]} (dialect/lambda-parts (:lambda loop))
-        carry (:carry loop)]
+        carry (first (:carries loop))]
     (is (= (util/free-syms (region)) (util/free-syms r)))
     (is (not= 'k (:index loop)))
     (is (not= 'acc (:parameter carry)))
@@ -102,3 +118,29 @@
     (is (= (meta declaration) (meta (nth actual 6))))
     (is (= (nth atomic 2) (nth actual 2)) "the conflict algebra is not a lexical use")
     (is (not= 'ticket (:result (nth actual 6))))))
+
+(deftest tuple-results-enter-scope-together-after-their-effect
+  (let [base (region)
+        [_ attrs extent [_] [_ parameters [_ locals effects updates]]] (second (nth base 2))
+        loop (list 'effect-loop
+                   (update attrs :carries conj {:parameter 'other :result 'second-result :dtype :long})
+                   extent ['local 'outside]
+                   (list 'lambda (conj parameters 'other)
+                         (list 'effect-region locals effects (conj updates 'other))))
+        r (list 'effect-region (second base)
+                [(first (nth base 2)) loop (last (nth base 2))
+                 (list 'effect 'out :unique 2 true 'second-result)])
+        scope (form/scope-info r)
+        substituted (util/subst-syms {'outside 'second-result} r)
+        renamed (util/alpha-convert r)
+        transformed-loop (second (nth substituted 2))
+        result (get-in (second transformed-loop) [:carries 1 :result])]
+    (is (= ['local nil 'sum 'second-result nil nil] (get-in scope [:scopes 0 :binders])))
+    (is (= r ((:rebuild scope) (:scopes scope) (:outer scope))))
+    (is (= #{'seed 'out 'source 'n 'outside} (util/free-syms r)))
+    (is (= 'second-result (second (nth transformed-loop 3))) "initializer keeps the outer value")
+    (is (not= 'second-result result))
+    (is (= result (last (last (nth substituted 2)))))
+    (is (= #{'seed 'out 'source 'n 'second-result} (util/free-syms substituted)))
+    (is (= (util/free-syms r) (util/free-syms renamed)))
+    (is (= (util/alpha-normalize r) (util/alpha-normalize renamed)))))

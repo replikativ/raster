@@ -53,14 +53,14 @@
                   (mapcat
                    (fn [effect]
                      (let [{:keys [region predicate loop index lower upper-bound extent lambda
-                                   carry destination conflict destination-index]}
+                                   carries destination conflict destination-index]}
                            (soac/effect-parts effect)]
                        (cond
                          ;; Guarded stores are not a complete domain proof.
                          (and region predicate) [nil]
                          region (visit region dimensions locals)
                          loop
-                         (if (and (nil? carry) (= 0 lower) (= :exclusive upper-bound)
+                         (if (and (empty? carries) (= 0 lower) (= :exclusive upper-bound)
                                   (not-any? #{index} (map first dimensions)))
                            (visit (soac/lambda-parts lambda)
                                   (conj dimensions [index (substitute extent)]) locals)
@@ -111,8 +111,8 @@
   (let [{:keys [kind arrays captures lambda]} (soac/operation-parts equation)]
     (if (and (contains? #{'effect-map 'scatter} kind) lambda)
       (let [{:keys [capture-parameters]} (soac/parameter-layout equation)
-            {:keys [locals body-results effect-result]} (soac/lambda-parts lambda)
-            body (concat (map :init locals) body-results (when effect-result [effect-result]))
+            {:keys [locals body-results effect-results]} (soac/lambda-parts lambda)
+            body (concat (map :init locals) body-results effect-results)
             symbols (set (filter symbol? (tree-seq coll? seq body)))]
         (vec (concat arrays
                      (keep (fn [[value parameter]]
@@ -232,13 +232,13 @@
                                        (not-any? (into (set (keys captured))
                                                        (map first dimensions))
                                                  (map :id (:locals region))))
-                              (let [{:keys [region loop index lower extent lambda carry destination
+                              (let [{:keys [region loop index lower extent lambda carries destination
                                             destination-index predicate conflict]}
                                     (soac/effect-parts (first (:body-results region)))]
                                 (cond
                                   region (visit region dimensions)
                                   loop
-                                  (when (and (nil? carry) (= 0 lower)
+                                  (when (and (empty? carries) (= 0 lower)
                                              (not (contains? captured index))
                                              (not-any? #{index} (map first dimensions)))
                                     (when-let [n (bound extent)]

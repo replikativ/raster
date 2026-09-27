@@ -196,19 +196,21 @@
 
 (defn effect-loop-attributes?
   "The binder of a counted store loop inside an effect region: its index symbol and integer-typed
-   lower operand, optionally an inclusive upper-bound mode and a typed carry/result binding.
-   Extent, initializer and update stay scalar operands of the grammar."
+   lower operand, optionally an inclusive upper-bound mode and typed carry/result bindings.
+   Extent, initializers and updates stay scalar operands of the grammar."
   [value]
   (and (map? value)
-       (set/subset? (set (keys value)) #{:index :lower :upper-bound :carry})
+       (set/subset? (set (keys value)) #{:index :lower :upper-bound :carries})
        (contains? value :index)
        (contains? value :lower)
        (contains? #{:exclusive :inclusive} (:upper-bound value :exclusive))
-       (or (not (contains? value :carry))
-           (let [{:keys [parameter result dtype] :as carry} (:carry value)]
-             (and (= #{:parameter :result :dtype} (set (keys carry)))
-                  (symbol? parameter) (symbol? result)
-                  (contains? #{:int :long :float :double} dtype))))
+       (or (not (contains? value :carries))
+           (and (vector? (:carries value))
+                (every? (fn [{:keys [parameter result dtype] :as carry}]
+                          (and (= #{:parameter :result :dtype} (set (keys carry)))
+                               (symbol? parameter) (symbol? result)
+                               (contains? #{:int :long :float :double} dtype)))
+                        (:carries value))))
        (symbol? (:index value))
        (some? (:lower value))))
 
@@ -600,7 +602,7 @@
           (effect ?sym:destination ?ec:conflict
                   ?s:destination-index ?s:predicate ?s:value ?evr)
           (effect-loop ?ela ?s:extent ?el)
-          (effect-loop ?ela ?s:extent ?s:init ?rel))
+          (effect-loop ?ela ?s:extent [(?:+ s)] ?rel))
 
   (Local [d :enforce]
          (let-value ?sym:binding ?dt ?s:init))
@@ -619,7 +621,7 @@
 
   (ResultEffectLambda [rel :enforce]
                       (lambda [(?:* ?sym:parameter)]
-                        (effect-region [(?:* d)] [(?:+ e)] ?s:update)))
+                        (effect-region [(?:* d)] [(?:+ e)] [(?:+ s)])))
 
   (Fold [f :enforce]
         (fold ?fa ?l))
@@ -762,8 +764,8 @@
 (defn effect-parts
   "Project one effect-region item. Store effects yield their destination, conflict contract,
    index, predicate and value; loops yield `:loop true` with `:index`, `:lower`, `:extent` and
-   the `:lambda`. Result-bearing loops additionally expose a typed `:carry` with initializer and
-   update; their parameter vector is [index carry-parameter]. Guarded regions expose their
+   the `:lambda`. Result-bearing loops expose typed `:carries` with initializers and
+   updates; their parameter vector is [index & carry-parameters]. Guarded regions expose their
    predicate beside the lexical region."
   [value]
   (cond
@@ -778,14 +780,20 @@
     (effect-loop-form? value)
     (let [[_ attributes extent] value
           carried? (= 5 (count value))
-          lambda (last value)]
-      (cond-> {:loop true :index (:index attributes) :lower (:lower attributes)
+          lambda (last value)
+          carries (:carries attributes [])
+          inits (if carried? (nth value 3) [])
+          updates (:effect-results (lambda-parts lambda) [])]
+      (when-not (and (vector? inits) (vector? updates)
+                     (= (count carries) (count inits) (count updates))
+                     (= carried? (boolean (seq carries))))
+        (throw (ex-info "effect-loop carries, initializers and updates must align"
+                        {:reason :typed-soac-effect-loop :form value})))
+      {:loop true :index (:index attributes) :lower (:lower attributes)
                :upper-bound (:upper-bound attributes :exclusive)
-               :extent extent :lambda lambda}
-        (or carried? (:carry attributes))
-        (assoc :carry (assoc (:carry attributes)
-                             :init (when carried? (nth value 3))
-                             :update (:effect-result (lambda-parts lambda))))))
+               :extent extent :lambda lambda
+               :carries (mapv (fn [carry init update] (assoc carry :init init :update update))
+                              carries inits updates)})
 
     (effect-form? value)
     (let [[_ destination conflict destination-index predicate written-value result] value]
@@ -821,7 +829,7 @@
   [effects]
   (boolean (some (fn [effect]
                    (when-let [loop (or (:loop effect) (:region effect))]
-                     (or (:carry loop) (scheduled-effect-carries? (:effects loop))))) effects)))
+                     (or (seq (:carries loop)) (scheduled-effect-carries? (:effects loop))))) effects)))
 
 (defn- effect-parts-contain?
   "Search lexical effect scopes without confusing a region with a store leaf."
@@ -843,7 +851,7 @@
            (or (:result effect)
                (:region effect)
                (when-let [loop (:loop effect)]
-                 (or (:carry loop)
+                 (or (seq (:carries loop))
                      (some #(or (:loop %) (:region %)) (:effects loop))
                      (strict-effect-scalar-policy? (:effects loop))))))
          effects)))
@@ -851,7 +859,7 @@
 (declare fail! validate-scalar-fold-scopes!)
 
 (defn validate-scheduled-effect-carries!
-  "Check the lexical contract of optional single-result carries in scheduled effect loops.
+  "Check the lexical contract of ordered carry tuples in scheduled effect loops.
 
    A carry is {:parameter symbol :result symbol :dtype dtype :init scalar :update scalar}.
    Initializers see the enclosing region; updates additionally see the loop index, parameter
@@ -886,29 +894,35 @@
                      (closed! predicate bound :predicate))
                    (walk (:effects region) (locals! (:locals region) bound))
                    bound)
-               (if-let [{:keys [index lower extent locals effects carry]} (:loop effect)]
-                 (if carry
-                   (let [{:keys [parameter result dtype init update]} carry
-                         ids (concat [index parameter result] (map :id locals))]
-                     (when-not (and (= #{:parameter :result :dtype :init :update} (set (keys carry)))
+               (if-let [{:keys [index lower extent locals effects carries] :as loop} (:loop effect)]
+                 (do
+                   (when-not (and (set/subset? (set (keys loop))
+                                               #{:index :lower :extent :upper-bound :locals :effects :carries})
+                                  (or (nil? carries) (vector? carries)))
+                     (fail "effect loops require canonical fields and an ordered carry vector" {:loop loop}))
+                 (if (seq carries)
+                   (let [ids (concat [index] (mapcat (juxt :parameter :result) carries) (map :id locals))]
+                     (when-not (and (vector? carries)
+                                    (every? #(and (= #{:parameter :result :dtype :init :update} (set (keys %)))
+                                                  (contains? #{:int :long :float :double} (:dtype %))) carries)
                                     (every? symbol? ids)
                                     (= (count ids) (count (distinct ids)))
                                     (empty? (set/intersection bound (set ids)))
-                                    (not (contains-loop? effects))
-                                    (contains? #{:int :long :float :double} dtype))
-                       (fail "effect carry requires distinct typed lexical binders" {:carry carry}))
-                     (doseq [[field expression] [[:lower lower] [:extent extent] [:init init]]]
+                                    (not (contains-loop? effects)))
+                       (fail "effect carries require distinct typed lexical binders" {:carries carries}))
+                     (doseq [[field expression] (concat [[:lower lower] [:extent extent]]
+                                                        (map #(vector :init (:init %)) carries))]
                        (closed! expression bound field))
-                     (let [inner (locals! locals (conj bound index parameter))
+                     (let [inner (locals! locals (into (conj bound index) (map :parameter carries)))
                            after-effects (walk effects inner)]
-                       (closed! update after-effects :update))
-                     (conj bound result))
+                       (doseq [carry carries] (closed! (:update carry) after-effects :update)))
+                     (into bound (map :result carries)))
                    ;; Ordinary loops do not export names, including any nested carried result.
                    (do
                      (closed! lower bound :lower)
                      (closed! extent bound :extent)
                      (walk effects (locals! locals (conj bound index)))
-                     bound))
+                     bound)))
                  (do
                    (doseq [field [:destination-index :predicate :value]]
                      (closed! (get effect field) bound field))
@@ -964,19 +978,19 @@
    Locals are returned as maps so compiler passes do not independently parse their S-expression
    spelling. The TypedSOAC form remains the sole serialized representation."
   [lambda]
-  (let [[_ parameters [_ local-forms body-results effect-result :as region]] lambda]
+  (let [[_ parameters [_ local-forms body-results effect-results :as region]] lambda]
     (cond-> {:parameters (vec parameters)
              :locals (mapv (fn [[_ id dtype init]]
                              {:id id :dtype dtype :init init})
                            local-forms)
              :body-results (vec body-results)}
-      (= 4 (count region)) (assoc :effect-result effect-result))))
+      (= 4 (count region)) (assoc :effect-results effect-results))))
 
 (defn scheduled-effect
   "Project a canonical effect into the shared scheduled shape, without source reconstruction.
    This projection does not substitute captures, assign destination dtypes or select a target."
   [effect]
-  (let [{:keys [loop index lower upper-bound extent lambda carry] :as part}
+  (let [{:keys [loop index lower upper-bound extent lambda carries] :as part}
         (effect-parts effect)]
     (cond
       (:region part)
@@ -986,9 +1000,8 @@
       loop
       (let [{:keys [locals body-results]} (lambda-parts lambda)]
         {:loop (cond-> {:index index :lower lower :extent extent :locals locals
-                        :effects (mapv scheduled-effect body-results)}
-                 (= :inclusive upper-bound) (assoc :upper-bound :inclusive)
-                 carry (assoc :carry carry))})
+                        :effects (mapv scheduled-effect body-results) :carries carries}
+                 (= :inclusive upper-bound) (assoc :upper-bound :inclusive))})
       :else part)))
 
 (defn scalar-fold-form?
@@ -1579,33 +1592,33 @@
              (:loop part)
              (let [{loop-parameters :parameters loop-locals :locals :keys [body-results] :as region}
                    (lambda-parts (:lambda part))
-                   carry (:carry part)
-                   expected (cond-> [(:index part)] carry (conj (:parameter carry)))
+                   carries (:carries part)
+                   expected (into [(:index part)] (map :parameter carries))
                    ids (into expected (map :id loop-locals))
                    inner (mapv effect-parts body-results)]
-               (when (and carry
+               (when (and (seq carries)
                           (some (fn [expression]
                                   (or (util/effectful? expression)
                                       (some descriptor/aset-call? (tree-seq coll? seq expression))))
-                                [(:init carry) (:update carry)]))
+                                (mapcat (juxt :init :update) carries)))
                  (fail! :typed-soac-effect-carry-write
                         "carried values cannot hide stores outside the ordered effect spine"
-                        {:equation equation-id :carry carry}))
+                        {:equation equation-id :carries carries}))
                (when-not (and (= expected loop-parameters)
-                              (= (boolean carry) (contains? region :effect-result))
+                              (= (boolean (seq carries)) (contains? region :effect-results))
                               (= (count ids) (count (distinct ids)))
                               (empty? (set/intersection scope (set ids)))
                               (every? some? inner)
                               ;; Ordinary counted loops may contain another ordered effect loop.
                               ;; A carried loop still forbids it until exported nested carry state
                               ;; has an explicit lexical contract.
-                              (or (not carry) (not (effect-parts-contain? :loop inner)))
+                              (or (empty? carries) (not (effect-parts-contain? :loop inner)))
                               (seq inner))
                  (fail! :typed-soac-effect-loop
                         "effect loops require matching typed binders and one closed effect level"
                         {:equation equation-id :loop (:index part) :parameters loop-parameters}))
                (validate-parts inner (into scope ids))
-               (cond-> scope carry (conj (:result carry))))
+               (into scope (map :result carries)))
              :else
              (if-let [result (:result part)]
                (let [result-dtype (:result-dtype part)]

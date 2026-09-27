@@ -31,7 +31,7 @@
 
 (deftest checked-recurrence-fails-after-its-store-not-before
   (let [operation (-> (scheduled-loop 1)
-                      (assoc-in [:scalar-region :effects 0 :loop :carry]
+                      (assoc-in [:scalar-region :effects 0 :loop :carries 0]
                                 {:parameter 'acc :result 'sum :dtype :long
                                  :init Long/MAX_VALUE :update (with-meta '(clojure.core/+ acc 1)
                                                                {:raster.type/tag 'long})})
@@ -48,7 +48,7 @@
 
 (deftest carried-effects-reject-bad-scope-before-target-lowering
   (let [base (scheduled-loop 8)
-        carry-path [:scalar-region :effects 0 :loop :carry]
+        carry-path [:scalar-region :effects 0 :loop :carries 0]
         variants [(assoc-in base (conj carry-path :dtype) :bogus)
                   (assoc-in base (conj carry-path :parameter) 'seed)
                   (assoc-in base (conj carry-path :result) 'k)
@@ -69,8 +69,8 @@
                                   [{:id 'seed :dtype :long :init 3}
                                    {:id 'start :dtype :long :init 1}])
                         (assoc-in [:scalar-region :effects 0 :loop :lower] 'start)
-                        (assoc-in [:scalar-region :effects 0 :loop :carry :parameter] parameter)
-                        (assoc-in [:scalar-region :effects 0 :loop :carry :update] 'k))
+                        (assoc-in [:scalar-region :effects 0 :loop :carries 0 :parameter] parameter)
+                        (assoc-in [:scalar-region :effects 0 :loop :carries 0 :update] 'k))
           execute (eval (list 'fn '[x words totals rows] (jvm/compile-effect-segmap operation)))
           words (float-array (repeat 16 -77)) totals (float-array 2)]
       (execute (float-array (range 16)) words totals 2)
@@ -90,7 +90,7 @@
     (let [expression (with-meta '(clojure.core/+ n 1) {:raster.type/tag 'long})
           operation (-> (scheduled-loop 1)
                         (update-in [:scalar-region :locals] conj {:id 'n :dtype :long :init Long/MAX_VALUE})
-                        (assoc-in [:scalar-region :effects 0 :loop :carry field] expression))
+                        (assoc-in [:scalar-region :effects 0 :loop :carries 0 field] expression))
           execute (eval (list 'fn '[x words totals rows] (jvm/compile-effect-segmap operation)))
           words (float-array [-77]) totals (float-array [-77])]
       (is (thrown? ArithmeticException (execute (float-array [9]) words totals 1)))
@@ -102,7 +102,7 @@
                                      (= :long (get-in % [:result :type]))) all)]
           (is (= 1 (count checked)))
           (is (= :trap (get-in (first checked) [:expression :options :overflow])))))
-      (let [untyped (assoc-in operation [:scalar-region :effects 0 :loop :carry field]
+      (let [untyped (assoc-in operation [:scalar-region :effects 0 :loop :carries 0 field]
                               (with-meta expression nil))]
         (let [all (operations
                    (get-in (artifact untyped :cuda)
@@ -120,7 +120,7 @@
 (deftest carry-conversions-do-not-inherit-device-integer-wrapping
   (let [operation (-> (scheduled-loop 0)
                       (assoc-in [:scalar-region :locals] [{:id 'seed :dtype :long :init 2147483648}])
-                      (assoc-in [:scalar-region :effects 0 :loop :carry :dtype] :int)
+                      (assoc-in [:scalar-region :effects 0 :loop :carries 0 :dtype] :int)
                       (assoc-in [:scalar-region :effects 1 :value] '(float sum)))
         execute (eval (list 'fn '[x words totals rows] (jvm/compile-effect-segmap operation)))]
     (is (thrown? ArithmeticException (execute (float-array 1) (float-array 1) (float-array 1) 1)))
@@ -132,7 +132,7 @@
   (doseq [trips [0 1]]
     (let [operation (-> (scheduled-loop trips)
                         (assoc-in [:scalar-region :locals] [{:id 'seed :dtype :double :init Double/MAX_VALUE}])
-                        (assoc-in [:scalar-region :effects 0 :loop :carry :update] 'seed))
+                        (assoc-in [:scalar-region :effects 0 :loop :carries 0 :update] 'seed))
           execute (eval (list 'fn '[x words totals rows] (jvm/compile-effect-segmap operation)))
           totals (float-array 1)]
       (execute (float-array [9]) (float-array 1) totals 1)
@@ -151,7 +151,7 @@
                       (assoc-in [:scalar-region :effects 0 :loop :locals]
                                 [{:id 'loaded :dtype :float :init 1.0}])
                       (assoc-in [:scalar-region :effects 0 :loop :effects 0 :destination-index] 'i)
-                      (assoc-in [:scalar-region :effects 0 :loop :carry :init] 0.0))
+                      (assoc-in [:scalar-region :effects 0 :loop :carries 0 :init] 0.0))
         execute (eval (list 'fn '[x words totals rows] (jvm/compile-effect-segmap operation)))
         words (float-array 1)
         totals (float-array 1)]
@@ -168,7 +168,7 @@
   (let [base (scheduled-loop 1)
         loop (get-in base [:scalar-region :effects 0])
         second-loop (-> loop
-                        (assoc-in [:loop :carry] {:parameter 'acc2 :result 'sum2 :dtype :float
+                        (assoc-in [:loop :carries 0] {:parameter 'acc2 :result 'sum2 :dtype :float
                                                 :init 'sum :update (with-meta '(+ acc2 loaded)
                                                                      {:raster.type/tag 'double})}))
         operation (assoc-in base [:scalar-region :effects]
