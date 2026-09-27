@@ -167,8 +167,11 @@ through equation-first emission and public replay for a ragged NN contraction. I
 existing cooperative KernelBody (local storage, barriers and per-thread accumulators); no kernel
 source template is added. Admission currently requires fixed positive FP32 shapes, int-sized
 storage capacities and a numerical policy that permits target contraction. The strict policy,
-dynamic shapes and unsupported layouts decline this candidate. Automatic selection is unchanged:
-tests deliberately inject the candidate at the scheduling boundary with a distinct cache request.
+dynamic shapes and unsupported layouts decline this candidate. The public opt-in is
+`:schedule {:typed-contraction {:strategy :register-tiled}}`; the resolved numerical policy must
+permit contraction. Declines are explicit, with no portable fallback. Automatic selection is
+unchanged, and explicit `:portable` selects the same ordered body as `:auto`. All selections use
+the same ScheduledKernelBody certificate and target emitter, without test-only schedule injection.
 Do not advertise optimized equation-first defaults or a speedup from candidate construction alone.
 
 The shared ScheduledKernelBody graph check now requires structural node membership and exact

@@ -176,6 +176,11 @@
                               {"dispatch-a" {:kind :runtime-scalar-ranges}}}})
                            arc-desc))))
   (testing "typed contraction selectors are validated as persistent schedule data"
+    (doseq [strategy [:auto :portable :register-tiled]]
+      (is (= strategy
+             (get-in (sched/compilation-schedule
+                      arc-desc {:schedule {:typed-contraction {:strategy strategy}}})
+                     [:typed-contraction :strategy]))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown typed contraction strategy"
                           (sched/feasible?
                            (sched/resolve (sched/derive-default nil arc-desc)
@@ -187,6 +192,15 @@
                            (sched/resolve (sched/derive-default nil arc-desc)
                                           {:typed-contraction {:measured-selectors :invalid}})
                            arc-desc)))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"require :strategy :auto"
+         (sched/feasible?
+          (sched/resolve
+           (sched/derive-default nil arc-desc)
+           {:typed-contraction
+            {:strategy :register-tiled
+             :measured-selectors {"dispatch-a" {:kind :fixed-selector}}}})
+          arc-desc)))
     (is (true? (sched/feasible?
                 (sched/resolve (sched/derive-default nil arc-desc)
                                {:typed-contraction {:matrix-tiles :finite}})

@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.core.hardware :as compiler-hardware]
             [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
@@ -17,6 +18,8 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -87,38 +90,31 @@
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
 
+(def ^:private register-tiled-schedule
+  {:typed-contraction {:strategy :register-tiled}})
+
+(defn- fixed-contraction-site
+  [target]
+  (let [compilation (equation-first/compile
+                     #'contractions/fixed-matmul {:target target :dtype :float})
+        scheduled (:scheduled compilation)
+        equation (first (filter #(some (fn [operation]
+                                         (= :contraction (:phase operation)))
+                                       (:operations %))
+                                (:equations scheduled)))
+        operation (first (filter #(= :contraction (:phase %)) (:operations equation)))
+        graph (:graph (equation-graph/make-for-equation scheduled equation))
+        node (first (filter #(= operation (:operation %)) (:nodes graph)))
+        facts (:facts (contraction-context/validate! (:algorithm equation) operation))]
+    {:node node :graph graph :facts facts
+     :descriptor (compiler-hardware/descriptor-for target)
+     :options (select-keys (:options compilation) [:array-types :scalar-types])}))
+
 (deftest fixed-register-tile-retains-the-equation-graph-certificate
   (doseq [target [ocl-target cuda-target hip-target]]
-    (let [candidates (atom [])
-          compilation
-          (with-redefs [contraction-schedule/schedule-portable-for-node
-                        (fn [node graph facts descriptor options]
-                          (doseq [[expected candidate-facts candidate-options candidate-descriptor]
-                                  [[:register-tiled-numerical-policy facts
-                                    (assoc options :precision :f32-scalar) descriptor]
-                                   [:register-tiled-static-candidate (assoc-in facts [:free-axes 0 1] 'm)
-                                    (assoc options :precision :mixed-f16-f32) descriptor]
-                                   [:register-tiled-fp32-candidate (assoc facts :dtype :double)
-                                    (assoc options :precision :mixed-f16-f32) descriptor]
-                                   [:register-tiled-static-capacity
-                                    (assoc-in facts [:free-axes 0 1] Integer/MAX_VALUE)
-                                    (assoc options :precision :mixed-f16-f32) descriptor]
-                                   [:target-resources facts
-                                    (assoc options :precision :mixed-f16-f32)
-                                    (assoc-in descriptor [:execution :max-workgroup-size] 1)]]]
-                            (let [decline (contraction-schedule/plan-register-tiled-for-node
-                                           node graph candidate-facts candidate-descriptor candidate-options)]
-                              (is (false? (:ok decline)))
-                              (is (= expected (:reason decline)))))
-                          (let [plan (contraction-schedule/plan-register-tiled-for-node
-                                      node graph facts descriptor
-                                      (assoc options :precision :mixed-f16-f32))]
-                            (swap! candidates conj plan)
-                            (when-not (:ok plan) (throw (ex-info "fixed tile declined" plan)))
-                            (:scheduled plan)))]
-            (equation-first/compile #'contractions/fixed-matmul {:target target :dtype :float}))]
-      (is (= 1 (count @candidates)))
-      (is (every? :ok @candidates))
+    (let [compilation (equation-first/compile
+                       #'contractions/fixed-matmul
+                       {:target target :dtype :float :schedule register-tiled-schedule})]
       (let [identity {:semantic-request-fingerprint "fixed-tile-request"
                       :compiler-build-fingerprint "test-build"
                       :source-dependency-fingerprint "fixed-matmul"
@@ -137,6 +133,89 @@
         (is (= :ordered-k-target-contraction (get-in certificate [:numerics :policy])))
         (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
         (is (= 2 (count (get-in artifact [:launch :workgroup-size]))))))))
+
+(deftest fixed-register-tile-candidate-declines-before-target-emission
+  (let [{:keys [node graph facts descriptor options]} (fixed-contraction-site ocl-target)]
+    (doseq [[expected candidate-facts candidate-options candidate-descriptor]
+            [[:register-tiled-numerical-policy facts
+              (assoc options :precision :f32-scalar) descriptor]
+             [:register-tiled-static-candidate (assoc-in facts [:free-axes 0 1] 'm)
+              (assoc options :precision :mixed-f16-f32) descriptor]
+             [:register-tiled-fp32-candidate (assoc facts :dtype :double)
+              (assoc options :precision :mixed-f16-f32) descriptor]
+             [:register-tiled-static-capacity
+              (assoc-in facts [:free-axes 0 1] Integer/MAX_VALUE)
+              (assoc options :precision :mixed-f16-f32) descriptor]
+             [:target-resources facts
+              (assoc options :precision :mixed-f16-f32)
+              (assoc-in descriptor [:execution :max-workgroup-size] 1)]]]
+      (let [decline (contraction-schedule/plan-register-tiled-for-node
+                     node graph candidate-facts candidate-descriptor candidate-options)]
+        (is (false? (:ok decline)))
+        (is (= expected (:reason decline)))))))
+
+(deftest public-register-tile-request-does-not-weaken-strict-arithmetic
+  (let [error (try
+                (equation-first/compile
+                 #'contractions/fixed-matmul
+                 {:target ocl-target :dtype :float
+                  :schedule {:precision :f32-scalar
+                             :typed-contraction {:strategy :register-tiled}}})
+                nil
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (some? error))
+    (is (= :register-tiled-numerical-policy
+           (get-in (ex-data error) [:schedule-decline :reason])))
+    (is (= :none (:fallback (ex-data error))))))
+
+(deftest public-contraction-selection-preserves-default-and-rejects-dynamic-tiles
+  (let [compile-fixed (fn [strategy]
+                        (equation-first/compile
+                         #'contractions/fixed-matmul
+                         (cond-> {:target ocl-target :dtype :float}
+                           strategy (assoc :schedule {:typed-contraction {:strategy strategy}}))))
+        automatic (compile-fixed nil)
+        portable (compile-fixed :portable)
+        certificates (fn [compilation]
+                       (mapv #(select-keys (get-in % [:provenance :scheduled-operation])
+                                           [:numerics :legality :attributes])
+                             (:kernels compilation)))
+        error (try
+                (equation-first/compile
+                 #'dl-nn/linear-nb
+                 {:target ocl-target :dtype :float :schedule register-tiled-schedule})
+                nil
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= (certificates automatic) (certificates portable)))
+    (is (= :same-typed-ssa-evaluation-order
+           (get-in (first (certificates automatic)) [:numerics :policy])))
+    (is (= :register-tiled-static-candidate
+           (get-in (ex-data error) [:schedule-decline :reason])))
+    (is (= :none (:fallback (ex-data error))))))
+
+(deftest typed-contraction-strategy-participates-in-the-public-template-identity
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [arguments [(float-array 15) (float-array 21)]
+          prepare (fn [strategy]
+                    (compiled/lower
+                     #'contractions/fixed-matmul arguments
+                     (cond-> {:compiler :equation-first :target cuda-target :dtype :float}
+                       strategy
+                       (assoc :schedule {:typed-contraction {:strategy strategy}}))))
+          automatic (prepare nil)
+          portable (prepare :portable)
+          register-tiled (prepare :register-tiled)
+          register-tiled-again (prepare :register-tiled)]
+      (is (= [:auto :portable :register-tiled :register-tiled]
+             (mapv #(get-in % [:schedule :typed-contraction :strategy])
+                   [automatic portable register-tiled register-tiled-again])))
+      (is (= [false false false true]
+             (mapv #(get-in (compiled/preparation-report %) [:template :cache-hit?])
+                   [automatic portable register-tiled register-tiled-again])))
+      (is (= 3 (:entries (compiled/compilation-cache-stats)))))
+    (finally
+      (compiled/clear-compilation-cache!))))
 
 (deftest equation-first-retains-and-validates-the-public-numerical-policy
   (doseq [target [ocl-target cuda-target hip-target]

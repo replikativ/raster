@@ -9,7 +9,6 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
-            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]
@@ -26,19 +25,10 @@
       (let [left (float-array (map #(/ (- % 7) 4.0) (range 15)))
             right (float-array (map #(/ (- % 10) 8.0) (range 21)))
             expected (vec (contractions/fixed-matmul left right))
-            prepared
-            (with-redefs [contraction-schedule/schedule-portable-for-node
-                          (fn [node graph facts descriptor options]
-                            (let [plan (contraction-schedule/plan-register-tiled-for-node
-                                        node graph facts descriptor
-                                        (assoc options :precision :mixed-f16-f32))]
-                              (when-not (:ok plan) (throw (ex-info "fixed tile declined" plan)))
-                              (:scheduled plan)))]
-              (compiled/lower #'contractions/fixed-matmul [left right]
-                              {:compiler :equation-first :target device :dtype :float
-                               ;; This test injects an explicit schedule candidate; its cache
-                               ;; identity must not collide with the ordinary portable request.
-                               ::schedule-candidate :register-tiled}))
+            prepared (compiled/lower
+                      #'contractions/fixed-matmul [left right]
+                      {:compiler :equation-first :target device :dtype :float
+                       :schedule {:typed-contraction {:strategy :register-tiled}}})
             live (compiled/instantiate! prepared)]
         (try
           (is (= [:fixed]

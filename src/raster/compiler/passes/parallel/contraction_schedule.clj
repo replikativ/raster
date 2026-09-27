@@ -597,3 +597,29 @@
         (if (register-tiled/declined? exception)
           {:ok false :reason (:missing-rule (ex-data exception)) :detail (ex-data exception)}
           (throw exception))))))
+
+(defn schedule-for-node
+  "Select a graph-certified body from a resolved public schedule.
+
+   Auto remains ordered portable until measurements justify a different default. An explicit
+   register tile is a legality request: precision, shape or target declines never fall back."
+  [node graph contract-facts descriptor {:keys [schedule] :as options}]
+  (let [strategy (get-in schedule [:typed-contraction :strategy] :auto)]
+    (case strategy
+      (:auto :portable)
+      (schedule-portable-for-node node graph contract-facts descriptor options)
+
+      :register-tiled
+      (let [planned (plan-register-tiled-for-node
+                     node graph contract-facts descriptor
+                     (assoc options :precision (:precision schedule)))]
+        (if (:ok planned)
+          (:scheduled planned)
+          (throw (ex-info "explicit register-tiled contraction schedule is not legal"
+                          {:reason :kernel-graph-contraction-schedule
+                           :operation (get-in node [:operation :id])
+                           :strategy strategy :schedule-decline planned :fallback :none}))))
+
+      (throw (ex-info "unknown typed contraction schedule strategy"
+                      {:reason :kernel-graph-contraction-strategy
+                       :strategy strategy :fallback :none})))))
