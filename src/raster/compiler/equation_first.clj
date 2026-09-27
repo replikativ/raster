@@ -88,9 +88,9 @@
 
    A missing optional descriptor still has a conservative family default: Level Zero is the
    explicit Intel path, while generic OpenCL uses portable subgroup spelling."
-  [target backend]
+  [target backend descriptor]
   (or (try
-        (some-> target hardware/descriptor-for gpu-target/kernel-body-c-dialect)
+        (some-> descriptor gpu-target/kernel-body-c-dialect)
         (catch Throwable _ nil))
       (case (device/device-type target)
         :ze :opencl-intel
@@ -123,12 +123,13 @@
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
-         resolved-schedule (gpu-schedule/compilation-schedule
-                            (hardware/descriptor-for target) options)
+         target-descriptor (hardware/descriptor-for target)
+         resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
          compiler-options (compiler-options f-var target dtype
                                             (-> options
                                                 (dissoc :target :gemm-precision)
-                                                (assoc :schedule resolved-schedule)))
+                                                (assoc :schedule resolved-schedule
+                                                       :target-descriptor target-descriptor)))
          walked (pipeline/get-walked-body f-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
          represented-source (pipeline/run-passes
@@ -148,7 +149,7 @@
                      :dialect (:dialect semantic) :fallback :none}))
          scheduled (structured-route/schedule-program semantic compiler-options)
          backend (device/select-runtime-backend target true nil)
-         target-dialect (target-source-dialect target backend)
+         target-dialect (target-source-dialect target backend target-descriptor)
          emission
          (if target-dialect
            (program-c-family/emit-program

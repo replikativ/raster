@@ -815,10 +815,10 @@
 
    A missing descriptor is an honest abstention: typed fan-out retains its materialization boundary
    rather than making compilation depend on optional probing/catalogue data."
-  [target-device]
+  [target-device target-descriptor]
   (when (device/gpu-target? target-device)
     (try
-      (core-hw/abstract-machine (core-hw/descriptor-for target-device))
+      (core-hw/abstract-machine (or target-descriptor (core-hw/descriptor-for target-device)))
       (catch Throwable _ nil))))
 
 (defn- semantic-program-attempt
@@ -872,7 +872,7 @@
   Returns {:form :stats}."
   [form opts]
   (if (form/binding-form? form)
-    (let [am (abstract-machine-for-target (:target-device opts))
+    (let [am (abstract-machine-for-target (:target-device opts) (:target-descriptor opts))
           semantic (semantic-program-attempt form opts am)]
       (if (:program semantic)
         {:form (:program semantic) :stats (:stats semantic)}
@@ -885,7 +885,7 @@
     ;; Normalize it only HERE, after fixpoint/type analysis, and retain the wrapper only when the
     ;; typed route accepts it. Unsupported forms must reach compatibility lowering unchanged.
     (let [source (top-level-binding-form form)
-          am (abstract-machine-for-target (:target-device opts))
+          am (abstract-machine-for-target (:target-device opts) (:target-descriptor opts))
           semantic (semantic-program-attempt source opts am)]
       (if (:program semantic)
         {:form (:program semantic) :stats (:stats semantic)}
@@ -1224,7 +1224,8 @@
                      (inline/expand-for-backends 3 (:param-env opts))
                      (inline/resolve-generic-deftm-calls (:param-env opts))))
         typed (semantic-program-attempt source opts
-                                        (abstract-machine-for-target target-device))
+                                        (abstract-machine-for-target target-device
+                                                                     (:target-descriptor opts)))
         semantic (or (:program typed) source)
         scheduled (pass-segop-lower semantic
                                     (assoc opts :dtype dtype :target-device target-device))]
