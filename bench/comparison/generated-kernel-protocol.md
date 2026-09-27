@@ -49,6 +49,32 @@ The same laptop session's [RMSNorm and strict-FP32 GEMM ladder](../results/arc-k
 retains validated but nonstationary or transient-contaminated observations. It does not supersede
 the existing CLBlast comparison or establish a cross-workload performance ranking.
 
+### Q4_K projection canary (opt-in)
+
+`raster.perf.q4-comparison/run!` already compares the public generated product-reduction route
+with the serial source schedule, so a second quantized canary is unnecessary. Its deterministic
+Q4_K weights and Q8_K activations use `raster.quant.ggml/vec-dot` as a raw-float-bits oracle.
+It poisons and checks output on every replay, interleaves candidates in rotating order, and
+records resident device-event spans separately from compilation and binding. For example, in a
+test or bench REPL:
+
+```clojure
+(require '[raster.perf.q4-comparison :as q4])
+(q4/run! {:target :ze:0 :shape [1 1024 640]
+          :compiler-revision "git-revision"
+          :environment-tag "machine-driver-label"
+          :rounds 12 :warmup-rounds 4})
+```
+
+The [September 27 Arc diagnostic](../results/q4-public-arc-20260927.edn) passed the bit-exact
+oracle at `[1,256,64]` and `[1,1024,640]`. At the larger shape, both candidates showed a
+simultaneous timing step change after measured round four; the generated and serial medians
+were 37 and 101 µs, respectively, but both series failed stationarity. Their first-use compile
+times were about 64 and 48 seconds, and generated binding took about 17 seconds. These numbers
+identify separate compile/bind and resident-kernel performance questions, not a stable speedup
+or a tuning decision. Repeat from a warm REPL under controlled device load before comparing
+against llama.cpp or promoting a schedule.
+
 ## Baseline selection
 
 ### Strict-FP32 OpenCL SGEMM reference (opt-in)
