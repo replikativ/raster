@@ -76,7 +76,7 @@
    alpha :- Double, dt :- Double, inv-dx2 :- Double, inv-dy2 :- Double] :- (Array double)
   (let [nx (int nx) ny (int ny)]
     (par/map-void! lane (* nx ny)
-      (let [idx (int lane)
+      (let [idx lane
             i (quot idx ny)
             j (rem idx ny)
             im (if (zero? i) (unchecked-subtract-int nx 1) (unchecked-subtract-int i 1))

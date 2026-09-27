@@ -38,10 +38,12 @@ the timed samples. For example, in a `:test` or `:bench` REPL with a real Intel 
 The [first Arc diagnostic](../results/periodic-heat-arc-20260927.edn) caught a scheduling
 cliff: nested source loops launched one work item and took 3.18 ms at `128×128`.
 Expressing independent cells with `par/map-void!` and storing through its original lane
-index lets the compiler prove disjoint outputs; it launches 256 work items per group and
-takes 19.8 µs in the corresponding local run. Both runs matched the independent oracle and
-met the sampler's stationarity heuristic. The `256×256` run retained a slow first sample and
-was nonstationary. These observations validate an important source-to-schedule change, not
+index lets the compiler prove disjoint outputs; it launches 256 work items per group.
+An intermediate kernel measured 19.8 µs with a stationary twelve-sample series, but a
+portable-OpenCL correction removed an unnecessary long-to-int cast afterward. The final source
+measured 15.4 µs median at `128×128`; its series includes outliers and is nonstationary.
+All runs matched the independent oracle. These observations expose an important
+source-to-schedule change, not a stable speedup estimate or
 competitive stencil throughput against an external library or a tuning-cache decision.
 The same laptop session's [RMSNorm and strict-FP32 GEMM ladder](../results/arc-kernel-ladder-20260927.edn)
 retains validated but nonstationary or transient-contaminated observations. It does not supersede
