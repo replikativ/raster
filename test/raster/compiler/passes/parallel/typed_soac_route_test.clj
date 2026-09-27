@@ -28,6 +28,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
             [raster.gpu.program-tuning :as program-tuning]))
@@ -1949,6 +1950,58 @@
                (kernel-graph/boundary-contract
                 (graph-refinement/scheduled-graph refinement)))
             (name variant))))))
+
+(deftest typed-contraction-keeps-accumulator-transform-and-output-storage-types-separate
+  (let [source
+        '(let* [step (raster.par/contract C [[i 64] [j 64]] [[l 64]]
+                                          (raster.numeric/*
+                                           (clojure.core/aget A (+ (* i 64) l))
+                                           (clojure.core/aget B (+ (* l 64) j)))
+                                          :out-dtype :float)]
+               step)
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :half
+                 :array-types {'A :half 'B :half 'C :float}})
+        equation (first (:equations form))
+        algorithm (:algorithm equation)
+        typed-equation (first (dialect/equations algorithm))
+        typed-attributes (:attributes (dialect/operation-parts typed-equation))
+        components (projection/segmented-reduce-contract-components algorithm typed-equation)
+        operation (first (:operations equation))
+        descriptor {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :grf-bytes-per-lane 256 :subgroup-size 16
+                    :max-workgroup-size 1024 :shared-local-memory 131072}
+        dispatch (contract-route/route-typed-contraction-dispatch
+                  algorithm operation :dtype :half :desc descriptor)
+        strategies (set (map kdispatch/alternative-strategy
+                             (:alternatives dispatch)))
+        result-slots (mapv #(first (filter (fn [slot] (= :result (:role slot)))
+                                       (get-in % [:nodes 0 :operation :abi])))
+                           (:alternatives dispatch))]
+    (is (nil? (:typed-soac-declined stats)))
+    (is (= :half (:dtype operation)))
+    (is (= [:half] (:dtypes typed-attributes)))
+    (is (= :float (:result-storage-dtype typed-attributes)))
+    (is (= :float (get-in typed-attributes [:result-transform :result-dtype])))
+    (is (= :half (:dtype components)))
+    (is (= :float (get-in components [:opts :out-dtype])))
+    (is (= #{:dpas :portable-segred} strategies))
+    (is (every? #(= :float (:dtype %)) result-slots))))
+
+(deftest typed-contraction-rejects-output-storage-declaration-mismatch
+  (let [source '(raster.par/contract C [[i 4] [j 4]] [[k 4]]
+                                      (* (clojure.core/aget A (+ (* i 4) k))
+                                         (clojure.core/aget B (+ (* k 4) j)))
+                                      :out-dtype :float)]
+    (try
+      (pipeline/schedule-parallel-form
+       source {:target-device :ocl:0 :dtype :half
+               :array-types {'A :half 'B :half 'C :half}})
+      (is false "the physical output declaration must agree with :out-dtype")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-contraction-output-storage-dtype
+               (:reason (ex-data exception))))))))
 
 (deftest typed-contraction-schedule-families-control-leaf-selection
   (let [source

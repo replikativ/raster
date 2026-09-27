@@ -211,13 +211,20 @@
 
    Source parsing ends here. Typed compiler paths call `from-components` instead, so schedule
    analysis never has to reconstruct or reparse source syntax."
-  [form & {:keys [dtype] :or {dtype :double}}]
+  [form & {:keys [dtype destination-dtype] :or {dtype :double}}]
   (when-not (and (seq? form) (= 'raster.par/contract (first form)))
     (throw (ex-info "contraction-facts: not a par/contract form" {:reason :not-a-contract-form
                                                                   :form form})))
-  (let [[_ out free-axes contract-axes body] form]
+  (let [[_ out free-axes contract-axes body] form
+        opts (form-opts form)]
     (from-components {:out out :free-axes free-axes :contract-axes contract-axes
-                      :body body :opts (form-opts form) :dtype dtype :form form})))
+                      :body body :opts opts
+                      ;; With no explicit result conversion, the declared destination fixes the
+                      ;; scalar reduction dtype. With :out-dtype, it names storage only; `dtype`
+                      ;; remains the numeric source/accumulator policy.
+                      :dtype (or (when-not (contains? opts :out-dtype) destination-dtype)
+                                 dtype)
+                      :form form})))
 
 (defn dependencies
   "Project storage and scalar dependencies from the sole contraction payload.

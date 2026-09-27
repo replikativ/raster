@@ -289,6 +289,10 @@
           (count (:algebra value)))
        (every? keyword? (:dtypes value))
        (every? map? (:algebra value))
+       (or (nil? (:result-storage-dtype value))
+           (let [stored (:result-storage-dtype value)]
+             (and (keyword? stored) (dtype/known? stored)
+                  (= stored (dtype/canon stored)))))
        (or (nil? (:result-transform value))
            (and (= 1 (count (:accumulators value)))
                 (result-transform? (:result-transform value))))))
@@ -2304,13 +2308,16 @@
 
       segmented-reduce
       (let [result-shape (segmented-reduce-result-shape attributes)]
-        (doseq [[id dtype] (map vector results (:dtypes attributes))]
+        (doseq [[id dtype] (map vector results
+                                    (if-let [stored (:result-storage-dtype attributes)]
+                                      [stored]
+                                      (:dtypes attributes)))]
           (let [value (get values id)]
             (when (and value
                        (not (and (= :tensor (:kind value)) (= result-shape (:shape value))
                                  (= dtype (:dtype value)))))
               (fail! :typed-soac-segmented-reduce-result-type
-                     "segmented-reduce results must match the declared segment space and dtype"
+                     "segmented-reduce results must match the declared segment space and storage dtype"
                      {:equation equation-id :id id :value value
                       :segment-axes (:segment-axes attributes) :dtype dtype})))))
 
