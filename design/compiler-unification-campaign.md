@@ -1316,6 +1316,13 @@ The next sequence is workload-driven:
    subcycling/reflux. Existing Dirichlet heat decay tests are not mass conservation, lake-at-rest,
    convergence-rate oracles, or numerical AMR acceptance.
 
+The first numerical evolution oracle now uses an ordinary `deftm` periodic, cell-centred heat
+step with full-domain ratio-two prolongation/restriction. It checks volume-weighted mass,
+resolution convergence against an analytic eigenmode, and continuation from detached fine-field
+bytes against uninterrupted evolution; direct TypedSOAC lowering is checked too. This is a
+whole-domain refinement baseline, not partial-patch AMR, halo execution, a durable manifest,
+subcycling across levels, or reflux. Device parity is tested only when OpenCL is available.
+
 This keeps cloud hardware, native fabrics and object storage out of the development hot loop.
 It does not replace the external training acceptance or measured kernel-comparison work.
 

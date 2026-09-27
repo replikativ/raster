@@ -65,6 +65,33 @@
 ;; 2D Heat Equation
 ;; ================================================================
 
+(deftm periodic-heat-step-2d!
+  "One conservative, explicit cell-centred heat step on a periodic row-major grid.
+
+   `out` and `u` must be distinct arrays of nx*ny cells; nx and ny are at least three.
+   The caller supplies inverse squared spacings and a stable dt. Keeping this as an ordinary
+   numerical program lets the compiler choose a parallel schedule without an AMR-specific
+   kernel opcode. Full-domain refinement can use the same operator at either level."
+  [out :- (Array double), u :- (Array double), nx :- Long, ny :- Long,
+   alpha :- Double, dt :- Double, inv-dx2 :- Double, inv-dy2 :- Double] :- (Array double)
+  (let [nx (int nx) ny (int ny)]
+    (dotimes [i nx]
+      (let [im (if (zero? i) (unchecked-subtract-int nx 1) (unchecked-subtract-int i 1))
+            ip (if (= i (unchecked-subtract-int nx 1)) 0 (unchecked-add-int i 1))]
+        (dotimes [j ny]
+          (let [jm (if (zero? j) (unchecked-subtract-int ny 1) (unchecked-subtract-int j 1))
+                jp (if (= j (unchecked-subtract-int ny 1)) 0 (unchecked-add-int j 1))
+                idx (unchecked-add-int (unchecked-multiply-int i ny) j)
+                center (aget u idx)
+                lap-x (* inv-dx2 (+ (aget u (unchecked-add-int (unchecked-multiply-int im ny) j))
+                                    (* -2.0 center)
+                                    (aget u (unchecked-add-int (unchecked-multiply-int ip ny) j))))
+                lap-y (* inv-dy2 (+ (aget u (unchecked-add-int (unchecked-multiply-int i ny) jm))
+                                    (* -2.0 center)
+                                    (aget u (unchecked-add-int (unchecked-multiply-int i ny) jp))))]
+            (aset out idx (+ center (* alpha dt (+ lap-x lap-y))))))))
+    out))
+
 (deftm heat-rhs-2d!
   "Compute RHS of 2D heat equation: du/dt = alpha * (d^2u/dx^2 + d^2u/dy^2).
   5-point stencil on row-major flat array with Dirichlet boundary conditions."
