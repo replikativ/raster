@@ -5,6 +5,8 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
             [raster.compiler.passes.parallel.indexed-attention-route :as route]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]))
@@ -40,6 +42,26 @@
   ([] (plan :float))
   ([dtype]
    (first (recognize/recognize (chain) :dtype dtype :accumulator-dtype dtype))))
+
+(deftest direct-body-lowering-requires-the-specialized-algebra
+  (let [original (plan)
+        lowerings [#(indexed-body/lower-reference
+                     % {:entities 3 :edges 4 :heads 2 :components 2 :total-dim 5} 16)
+                   #(indexed-body/lower-dynamic-reference % 16)
+                   #(indexed-body/lower-dynamic-score-reuse % 16)]]
+    (is (= original (indexed-body/validate-plan! original)))
+    (doseq [[label changed]
+            [[:weight (assoc-in original [:weight :body] 'score)]
+             [:product (assoc-in original [:score :combine :body]
+                                 '(raster.numeric/+ left right))]
+             [:finalize (assoc-in original [:score :finalize :body] 'dot)]]]
+      (testing (name label)
+        ;; These are valid general plans, but not the algebra these schedules implement.
+        (is (= changed (swr/validate! changed)))
+        (doseq [lower lowerings]
+          (is (= :indexed-segmented-reduction-plan-unsupported
+                 (try (lower changed) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))))
 
 (deftest direct-reference-has-one-ordered-resident-abi-and-no-intermediates
   (let [{:keys [strategy reference? artifact graph schedule declines]}

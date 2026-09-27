@@ -186,10 +186,10 @@ through the existing `:result-storage` contract.
    support alone does **not** close public equation-first coverage.
 3. Certify fixed-reference `ScheduledKernelBody` emission against the source plan and exercise
    public resident execution on OpenCL and Level Zero, including empty/unequal segments.
-   Move the existing indexed leaf's exact algebra/layout admission check from its backend wrapper
-   to the shared schedule lowering before reusing the KernelBody builder. The builder currently
-   relies on that caller check; generic plan validity alone does not prove that its specialized
-   score/weight/normalization implementation preserves every valid plan.
+   The indexed leaf's exact algebra/layout admission check now lives in the shared schedule
+   lowering, used by static reference, dynamic reference, subgroup and backend entry points.
+   Direct-lowering tests reject valid general plans with different score, weight or normalization
+   algebra. Generic plan validity alone cannot authorize a specialized implementation.
 4. Generalize the existing executable slot to graph-or-dispatch. Each alternative must retain
    its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
    common arguments once and allocate only the selected alternative's scratch.
