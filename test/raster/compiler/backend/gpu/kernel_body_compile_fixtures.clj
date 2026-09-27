@@ -44,6 +44,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.ode.multilevel :as multilevel]
+            [raster.ode.pde :as pde]
             [raster.dl.attention :as dl-attention]
             [raster.dl.array-ops :as dl-arrays]
             [raster.dl.loss :as dl-loss]
@@ -567,6 +568,8 @@
                  #'multilevel/prolong-constant-2d! {:target device-id :dtype :double}))
       (:kernels (equation-first/compile
                  #'multilevel/restrict-average-2d! {:target device-id :dtype :double}))
+      (:kernels (equation-first/compile
+                 #'pde/periodic-heat-step-2d! {:target device-id :dtype :double}))
       (:kernels (equation-first/compile
                  #'public-c-family-scan {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
