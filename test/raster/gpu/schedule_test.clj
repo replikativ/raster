@@ -16,6 +16,24 @@
    :machine-lanes 8192 :subgroup-size 16 :grf-bytes-per-lane 256
    :max-workgroup-size 1024})
 
+(deftest compilation-policy-has-one-precedence-and-feasibility-boundary
+  (is (= :mixed-f16-f32 (:precision (sched/compilation-schedule arc-desc {}))))
+  (is (= :f32-scalar
+         (:precision (sched/compilation-schedule arc-desc {:gemm-precision :f32-scalar}))))
+  (is (= :f32-scalar
+         (:precision (sched/compilation-schedule
+                      arc-desc {:gemm-precision :mixed-f16-f32
+                                :schedule {:precision :f32-scalar}}))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown compilation"
+                       (sched/compilation-schedule
+                        arc-desc {:gemm-precision :typo :schedule {:precision :f32-scalar}})))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown compilation"
+                       (sched/compilation-schedule arc-desc {:gemm-precision nil})))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"register budget exceeded"
+                       (sched/compilation-schedule
+                        arc-desc {:schedule {:stage {:space :register
+                                                    :copies {:a 2 :b 2}}}}))))
+
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; Residency axis → locality cost: schedule-cost-ns prices a resident schedule faster
 ;; ════════════════════════════════════════════════════════════════════════════════

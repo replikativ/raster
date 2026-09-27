@@ -22,6 +22,7 @@
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.pipeline :as pipeline]
+            [raster.gpu.schedule :as gpu-schedule]
             [raster.core :as rcore]))
 
 (defrecord EquationFirstCompilation
@@ -122,8 +123,12 @@
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
+         resolved-schedule (gpu-schedule/compilation-schedule
+                            (hardware/descriptor-for target) options)
          compiler-options (compiler-options f-var target dtype
-                                            (dissoc options :target))
+                                            (-> options
+                                                (dissoc :target :gemm-precision)
+                                                (assoc :schedule resolved-schedule)))
          walked (pipeline/get-walked-body f-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
          represented-source (pipeline/run-passes

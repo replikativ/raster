@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -81,6 +82,43 @@
     (raster.par/map! output index n float
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
+
+(deftest equation-first-retains-and-validates-the-public-numerical-policy
+  (doseq [target [ocl-target cuda-target hip-target]
+          [operation arguments] [[#'c-family-elementwise [(float-array [1 2]) 2]]
+                                 [#'dl-nn/linear-nb [(float-array 6) (float-array 6) 2 3 2]]]]
+    (let [options {:target target :dtype :float}
+          via-sugar (equation-first/compile operation
+                                           (assoc options :gemm-precision :f32-scalar))
+          via-schedule (equation-first/compile operation
+                                              (assoc options :schedule {:precision :f32-scalar}))
+          ;; The generated entry name is intentionally fresh, not an arithmetic difference.
+          sources (fn [compilation]
+                    (mapv #(str/replace (:source %) (:kernel-name %) "test_entry")
+                          (:kernels compilation)))
+          buffer-parameters (filter #(contains? #{:input :output :inout} (:kind %))
+                                    (mapcat #(get-in % [:attributes :kernel-body :parameters])
+                                            (:kernels via-sugar)))
+          prepared (compiled/lower operation arguments
+                                   (assoc options :compiler :equation-first
+                                                  :gemm-precision :f32-scalar))]
+      (is (= :f32-scalar (get-in via-sugar [:options :schedule :precision])
+             (get-in via-schedule [:options :schedule :precision])
+             (get-in prepared [:schedule :precision])))
+      (is (not (contains? (:options via-sugar) :gemm-precision)))
+      (is (seq buffer-parameters))
+      (is (every? #(= :float (:dtype %)) buffer-parameters)
+          "strict policy does not introduce narrowed operand storage")
+      (is (= (sources via-sugar) (sources via-schedule))
+          "equivalent policies preserve emitted arithmetic on every source target")
+      (with-redefs [pipeline/get-walked-body
+                    (fn [& _] (throw (ex-info "invalid policy reached semantic compilation" {})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown compilation"
+                             (equation-first/compile #'c-family-elementwise
+                                                     (assoc options :gemm-precision :typo))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stage"
+                             (equation-first/compile #'c-family-elementwise
+                                                     (assoc options :schedule {:stage {:space :typo}}))))))))
 
 (deftm c-family-scan
   "A public certified scan lowered as a three-stage portable KernelGraph."

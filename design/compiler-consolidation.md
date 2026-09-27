@@ -101,9 +101,15 @@ public device input; only `target` is exposed as such. This test does not establ
 with a replacement initial condition.
 
 Do not switch the public default or delete the descriptor orchestration yet. Remaining gates
-include shared schedule/precision resolution (equation-first currently strips the deprecated
-precision option), retained binding-time admission/tuning evidence, and attention dispatch
-with scratch through the same public API. Quantized Q4_K already has a public compiled
+include retained binding-time admission/tuning evidence and attention dispatch with scratch
+through the same public API. Both entry points now share precision-policy validation and the
+pre-emission feasibility gate; equation-first retains the resolved schedule instead of silently
+stripping the deprecated precision option. This is not candidate parity: its portable contraction
+graph still lacks the descriptor route's alternative-selection machinery. A direct probe of
+`resident-structured-reduction-probe` also declines equation-first semantic coverage, while the
+descriptor route accepts it. Keep those gaps explicit rather than equating schedule metadata
+with implemented optimization. Cache canonicalization of equivalent policy spellings and a
+single captured target descriptor remain follow-ups. Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
 The current executed workload matrix and bounded projection diagnostic are recorded in

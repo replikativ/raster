@@ -347,3 +347,15 @@
    `schedule-for` instead.)"
   [steps device-id override policy]
   (schedule-for steps (hw/descriptor-for device-id) override policy))
+
+(defn compilation-schedule
+  "Resolve the public compiler policy against a supplied hardware descriptor.
+
+   Explicit schedule precision overrides deprecated top-level sugar. Invalid sugar still fails
+   even when overridden. Both compiler entry points use this pre-emission feasibility boundary;
+   resolving a policy does not claim that every backend implements its optimized candidates."
+  [descriptor {:keys [schedule gemm-precision] :as options}]
+  (when (and (contains? options :gemm-precision) (not (valid-precisions gemm-precision)))
+    (throw (ex-info "unknown compilation :gemm-precision"
+                    {:gemm-precision gemm-precision :expected valid-precisions})))
+  (schedule-for nil descriptor schedule {:precision (or gemm-precision default-precision)}))
