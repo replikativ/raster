@@ -366,14 +366,14 @@
                                  :equation equation-id :results results
                                  :storage storage :effects effects :dtypes result-dtypes})))
             loop-statement
-            (fn [{:keys [index lower extent locals carries] :as loop} ordered-body]
+            (fn [{:keys [index lower extent locals carries] :as loop} emit-body]
               (if (seq carries)
-                (effect-source/counted-loop generated-cast loop ordered-body)
+                (effect-source/counted-loop generated-cast loop emit-body)
                 ;; Preserve the existing source loop's induction policy when no carry is present.
                 (list 'loop* [index lower]
                       (list 'if (list 'clojure.core/< index extent)
-                            (list 'do (materialize-locals locals ordered-body)
-                                  (list 'recur (list 'clojure.core/inc index)))
+                            (materialize-locals
+                             locals (emit-body (list 'recur (list 'clojure.core/inc index))))
                             nil))))
             statement
             (fn [{:keys [destination conflict destination-index predicate value]}]
@@ -391,8 +391,8 @@
                                         typed-value))]
                       (if (contains? #{true 1} predicate) store (list 'if predicate store))))
             continuation (effect-source/ordered-effects
-                          effects {:emit-store statement :emit-loop loop-statement
-                                   :emit-region materialize-locals})
+                          effects nil {:emit-store statement :emit-loop loop-statement
+                                       :emit-region materialize-locals})
             effect-source
             (with-meta
               (list 'raster.par/map-void! region-index (:extent attributes)

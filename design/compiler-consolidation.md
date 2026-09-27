@@ -77,8 +77,11 @@ Several recurrence sites with carried values remain open. The next extension nee
 result-bearing effect branch, not conditional updates reconstructed after the effects. Each arm
 must yield the same typed tuple after its effects; only fresh merged results escape. KernelBody
 already has multi-result IfRegion/Yield. The missing work is the canonical effect dialect,
-lexical validation/traversals and continuation-aware JVM projection: recurrence must be inside
-the scope of exported branch results. Test old-tuple swaps, branch-local loads used once,
+lexical validation/traversals and source projection. The shared JVM effect builder now accepts
+an explicit continuation and loop-body callback: recurrence stays inside the scope of exported
+effect results. Both host materialization routes use that one contract; a returned atomic value
+feeding the same loop's carry is covered without changing surface syntax or numeric policy.
+Test old-tuple swaps, branch-local loads used once,
 predicate reads changed by stores, and zero trips. Early exits remain a separate contract.
 
 Source initialization retains a typed sequential local spine at the loop's effect position.
