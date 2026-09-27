@@ -4,8 +4,10 @@
             [raster.arrays]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
+            [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
@@ -14,6 +16,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -83,6 +86,57 @@
     (raster.par/map! output index n float
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
+
+(deftest fixed-register-tile-retains-the-equation-graph-certificate
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [candidates (atom [])
+          compilation
+          (with-redefs [contraction-schedule/schedule-portable-for-node
+                        (fn [node graph facts descriptor options]
+                          (doseq [[expected candidate-facts candidate-options candidate-descriptor]
+                                  [[:register-tiled-numerical-policy facts
+                                    (assoc options :precision :f32-scalar) descriptor]
+                                   [:register-tiled-static-candidate (assoc-in facts [:free-axes 0 1] 'm)
+                                    (assoc options :precision :mixed-f16-f32) descriptor]
+                                   [:register-tiled-fp32-candidate (assoc facts :dtype :double)
+                                    (assoc options :precision :mixed-f16-f32) descriptor]
+                                   [:register-tiled-static-capacity
+                                    (assoc-in facts [:free-axes 0 1] Integer/MAX_VALUE)
+                                    (assoc options :precision :mixed-f16-f32) descriptor]
+                                   [:target-resources facts
+                                    (assoc options :precision :mixed-f16-f32)
+                                    (assoc-in descriptor [:execution :max-workgroup-size] 1)]]]
+                            (let [decline (contraction-schedule/plan-register-tiled-for-node
+                                           node graph candidate-facts candidate-descriptor candidate-options)]
+                              (is (false? (:ok decline)))
+                              (is (= expected (:reason decline)))))
+                          (let [plan (contraction-schedule/plan-register-tiled-for-node
+                                      node graph facts descriptor
+                                      (assoc options :precision :mixed-f16-f32))]
+                            (swap! candidates conj plan)
+                            (when-not (:ok plan) (throw (ex-info "fixed tile declined" plan)))
+                            (:scheduled plan)))]
+            (equation-first/compile #'contractions/fixed-matmul {:target target :dtype :float}))]
+      (is (= 1 (count @candidates)))
+      (is (every? :ok @candidates))
+      (let [identity {:semantic-request-fingerprint "fixed-tile-request"
+                      :compiler-build-fingerprint "test-build"
+                      :source-dependency-fingerprint "fixed-matmul"
+                      :target-descriptor-fingerprint (str target)}
+            restored (equation-artifact/open
+                      identity (equation-artifact/decode
+                                (equation-artifact/encode
+                                 (equation-artifact/seal identity compilation))))
+            arguments [(float-array 15) (float-array 21)]]
+        (is (= compilation restored))
+        (is (= (equation-first/lower compilation arguments)
+               (equation-first/lower restored arguments))))
+      (let [artifact (first (:kernels compilation))
+            certificate (get-in artifact [:provenance :scheduled-operation])]
+        (is (= :register-tiled (get-in artifact [:attributes :strategy])))
+        (is (= :ordered-k-target-contraction (get-in certificate [:numerics :policy])))
+        (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+        (is (= 2 (count (get-in artifact [:launch :workgroup-size]))))))))
 
 (deftest equation-first-retains-and-validates-the-public-numerical-policy
   (doseq [target [ocl-target cuda-target hip-target]

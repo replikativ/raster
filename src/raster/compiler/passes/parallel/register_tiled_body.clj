@@ -89,6 +89,28 @@
                                        tile-candidates)
                      :limits limits})))))
 
+(defn int-coordinate-constraints
+  "Return the exact positive-extent limits for this register tile's int coordinates.
+
+   A tail workgroup evaluates masks at every coordinate in its complete tile.  For extent `d` and
+   tile width `t`, its greatest coordinate is `ceil(d/t)*t - 1`, including padded lanes that never
+   load or store.  IndexBinding and the row/column IndexCompute values are int, so this quantity
+   must not exceed INT_MAX.  The resulting maximum logical extent is
+   `floor((INT_MAX+1)/t)*t`.  Keeping this derivation here lets static admission and runtime
+   selection consume the same schedule fact. The K constraint is deliberately conservative when
+   a symbolic K selects a long loop induction variable: row/column coordinates remain int and the
+   existing dispatch capacity policy already imposes the stricter positive-domain limit."
+  [[m n k] {:keys [block-m block-n block-k]}]
+  (let [limit (fn [tile-width]
+                (when-not (pos-int? tile-width)
+                  (throw (ex-info "register-tiled coordinate proof requires positive int tile widths"
+                                  {:reason :raster/bug :tile-width tile-width})))
+                (long (*' (quot (inc (long Integer/MAX_VALUE)) tile-width) tile-width)))]
+    (mapv (fn [axis dimension tile-width]
+            {:axis axis :dimension dimension :tile-width tile-width
+             :maximum-extent (limit tile-width)})
+          [:m :n :k] [m n k] [block-m block-n block-k])))
+
 (defn- additive?
   [combine]
   (contains? '#{+ clojure.core/+ raster.numeric/+} combine))
@@ -170,6 +192,14 @@
             (decline! :symbolic-dims
                       "register-tiled schedule requires positive literal or scalar-bound dimensions"
                       {:free-axes free-axes :contract-axes contract-axes}))
+        coordinate-constraints (int-coordinate-constraints dimensions tile)
+        _ (when-let [failure (some #(when (and (integer? (:dimension %))
+                                                (> (:dimension %) (:maximum-extent %)))
+                                       %)
+                                   coordinate-constraints)]
+            (decline! :padded-coordinate-domain
+                      "register-tiled padded tail coordinates exceed the int index domain"
+                      failure))
         _ (when-not (additive? combine)
             (decline! :non-plus-combine
                       "register-tiled contraction combine must be +"
@@ -449,6 +479,7 @@
        :provenance {:dialect :kernel-body :operation-id operation-id}
        :attributes {:kind :register-tiled-contraction
                     :dims [M N K]
+                    :int-coordinate-constraints coordinate-constraints
                     :axis-symbols [i j k]
                     :bindings (:bindings layout-verdict)
                     :result-transform epilogue}})

@@ -38,6 +38,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.register-tiled-body :as register-tiled-body]
             [raster.compiler.passes.parallel.staged-contraction-schedule :as staged-schedule]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
@@ -1392,11 +1393,26 @@
     selector
     (let [[[_ m] [_ n]] (:free-axes facts)
           [[_ k]] (:contract-axes facts)
-          guards (mapv (fn [dimensions]
-                         {:expression (apply klaunch/product dimensions)
-                          :op :> :value Integer/MAX_VALUE
-                          :strategy :portable-segred})
-                       [[m n] [m k] [k n]])]
+          tiled (some #(when (= :regtiled (:strategy %)) %) candidates)
+          tile (select-keys (get-in tiled [:kernel-body :schedule])
+                            [:block-m :block-n :block-k])
+          coordinate-guards
+          (into []
+                (keep (fn [{:keys [dimension maximum-extent]}]
+                        ;; Existing positive-capacity guards already imply dimension <= INT_MAX.
+                        ;; Only a tile whose padded limit is stricter needs another comparison.
+                        (when (and (symbol? dimension)
+                                   (< maximum-extent Integer/MAX_VALUE))
+                          {:expression dimension :op :> :value maximum-extent
+                           :strategy :portable-segred})))
+                (register-tiled-body/int-coordinate-constraints [m n k] tile))
+          capacity-guards
+          (mapv (fn [dimensions]
+                  {:expression (apply klaunch/product dimensions)
+                   :op :> :value Integer/MAX_VALUE
+                   :strategy :portable-segred})
+                [[m n] [m k] [k n]])
+          guards (into coordinate-guards capacity-guards)]
       (case (:kind selector)
         :fixed-strategy
         {:kind :runtime-expression-cases :cases guards :default (:strategy selector)}
