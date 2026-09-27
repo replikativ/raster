@@ -589,7 +589,7 @@
         template-report (atom nil)
         compilation-options (apply dissoc opts
                                    [:compiler :donate :constants :outputs :taps :roles
-                                    :profile? :on-non-resident :gemm-precision])
+                                    :profile? :on-non-resident])
         compilation-options (assoc compilation-options :target target :dtype dtype)
         template-key
         (fn [revision]
@@ -699,7 +699,8 @@
                     :scalar-params (mapv :symbol (remove #(contains? public-bindings (:symbol %))
                                                         parameters))
                     :steps steps :result-sym nil :equation-first? true}
-        schedule {:compiler :equation-first :stats (:stats compilation)}
+        schedule (assoc (get-in compilation [:options :schedule])
+                        :compiler :equation-first :stats (:stats compilation))
         donated (into {} (map (fn [symbol]
                                 [(keyword (name symbol))
                                  (keyword (str (name symbol) "'"))]))

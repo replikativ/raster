@@ -1876,16 +1876,13 @@
                                          (str (:name (meta f-var))))
                                  f-var)
                      :device device-id})))
-  (when-not (contains? #{:mixed-f16-f32 :f32-scalar} gemm-precision)
-    (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
-                         " (expected :mixed-f16-f32 or :f32-scalar)")
-                    {:gemm-precision gemm-precision})))
   ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
   ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
   ;; FEASIBILITY GATE before any emission — an infeasible schedule (e.g. register double-buffering
   ;; that would spill the GRF file) is a loud compile error, not a measurement-time regression.
-  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/schedule-for-device)
-                           nil device-id schedule {:precision gemm-precision})
+  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/compilation-schedule)
+                           (core-hw/descriptor-for device-id)
+                           {:schedule schedule :gemm-precision gemm-precision})
         gemm-precision (:precision resolved-schedule)
         resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         _ (when (dispatch/host-only? resolved-var)
