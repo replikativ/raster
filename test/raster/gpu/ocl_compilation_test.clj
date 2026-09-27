@@ -11,6 +11,20 @@
 
 (defn- runtime-var [sym] (ns-resolve 'raster.gpu.ocl-runtime sym))
 
+(deftest device-info-distinguishes-driver-from-opencl-version
+  (with-redefs-fn
+    {(runtime-var 'query-device-info-string)
+     (fn [_ ^long parameter] (case parameter 0x102D "driver-A" 0x102F "OpenCL 3.0" "fixture"))
+     (runtime-var 'query-device-info-uint) (fn ^long [_ ^long _] 1)
+     (runtime-var 'query-device-info-ulong) (fn ^long [_ ^long _] 1024)
+     (runtime-var 'query-device-info-size-t) (fn ^long [_ ^long _] 256)
+     (runtime-var 'device-type-keyword) (constantly :gpu)
+     (runtime-var 'device-buffer-offset-alignment) (constantly 64)}
+    (fn []
+      (let [info ((runtime-var 'device-info) MemorySegment/NULL)]
+        (is (= "driver-A" (:driver-version info)))
+        (is (= "OpenCL 3.0" (:version info)))))))
+
 (deftest compiler-options-and-failed-program-ownership
   (with-open [arena (Arena/ofConfined)]
     (let [calls (atom [])

@@ -1,0 +1,37 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-27"
+ :revision "44c8d2fa73e836a7e02b3bab72c8ed3073abe6f0"
+ :device "Intel(R) Arc(TM) Graphics"
+ :driver "26.05.37020.3"
+ :clblast-version [1 7 0]
+ :clblast-revision "87f18d7f0718ea416dfab66c303d11deeff94f3f"
+ :raster-jvm "25.0.3+9-2-25.10.2-Ubuntu"
+ :precision :strict-f32
+ :inputs :deterministic-dyadic-f32
+ :oracle :independent-double-accumulation-cpu
+ :warmups 4 :measured-replays 12
+ :raster-clock :device-event-span
+ :clblast-clock :queue-markers
+ :raster-strategy :regtiled
+ :raster-emission-route :kernel-body
+ :raster-resident-steps 1 :raster-descriptor-scratch-count 0
+ :raster-source-hash "0d88debb6a373e5829f439cf2db641ed70bbdc9b970f663899f7de0953a8e701"
+ :raster-abi-hash "842e62b5f97fd688b95fd1bddb1d36aed3d4d226dd2a6b5cd795c70a42003c13"
+ :notes "Sequential bracketed diagnostics on a shared laptop, not a randomized stationary comparison. Same source and ABI hash for both Raster shapes. All outputs matched the CPU oracle exactly. Raster measured a single kernel, so its kernel total equals its span in every sample. CLBlast uses queue markers and default tuning. Valhalla at the documented path was unavailable; Raster used the existing bounded HotSpot 25 REPL. Do not compare host performance with Valhalla baselines. Compilation/binding/uploads/downloads and validation are outside the device samples. No selector or tuning cache was changed. The square CLBlast bracket moves from 180 to 74 microseconds; this record neither confirms a compiler regression from September 25 nor establishes stable competitiveness."
+ :runs
+ [  {:id :clblast-8-before :shape [8 256 256] :median-ns 151328.5
+   :samples-ns [241510 168333 150416 150468 151041 149948 152708 150886 151615 156615 151042 153229] :max-absolute-error 0.0}
+  {:id :raster-8 :shape [8 256 256] :median-ns 237812
+   :samples-ns [240312 238750 238645 245729 237916 237708 238541 231041 230104 230000 237187 230000] :max-absolute-error 0.0}
+  {:id :clblast-256-before :shape [256 256 256] :median-ns 179557.5
+   :samples-ns [363958 173698 180260 178855 175938 184479 175365 176198 184010 181041 176719 182708] :max-absolute-error 0.0}
+  {:id :raster-256 :shape [256 256 256] :median-ns 242760
+   :samples-ns [307500 270625 269687 270312 243958 217083 217604 240000 241145 241562 267500 236354] :max-absolute-error 0.0}
+  {:id :raster-8-repeat :shape [8 256 256] :median-ns 235155.5
+   :samples-ns [227291 226250 231041 646250 252500 231250 231770 230937 328541 238854 238750 238541] :max-absolute-error 0.0}
+  {:id :clblast-8-after :shape [8 256 256] :median-ns 150833.5
+   :samples-ns [289479 153229 157605 150104 150886 150781 149167 157083 150260 148698 148333 157500] :max-absolute-error 0.0}
+  {:id :clblast-256-after :shape [256 256 256] :median-ns 73775.5
+   :samples-ns [200886 76510 75313 77083 71875 76197 71511 73802 71771 73749 72448 72864] :max-absolute-error 0.0}
+  {:id :raster-256-repeat :shape [256 256 256] :median-ns 270677
+   :samples-ns [488541 457604 276354 270729 270625 270000 270208 270104 270000 269583 286562 300729] :max-absolute-error 0.0}]}

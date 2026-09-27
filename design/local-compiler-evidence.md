@@ -30,6 +30,34 @@ inspectable resident handles, structured-loop replay, or AD tapes.
 
 ## Projection diagnostic, not a promoted baseline
 
+### Strict FP32 countercheck
+
+The [September 27 CLBlast recheck](../bench/results/strict-f32-local-recheck-20260927.edn)
+uses the existing public strict-FP32 GEMM canary, not the mixed-FP16 schedules below.
+All Raster and CLBlast outputs matched the independent CPU oracle exactly. The generated
+register-tiled source and ABI hashes were identical across the two Raster shapes.
+
+| Shape `[M,N,K]` | Raster medians, µs | CLBlast before/after medians, µs |
+| --- | --- | --- |
+| `[8,256,256]` | 238 / 235 | 151 / 151 |
+| `[256,256,256]` | 243 / 271 | 180 / 74 |
+
+These shared-laptop samples do **not** reproduce the favorable September 25 ranking. They also
+do not isolate a compiler regression: the CLBlast square bracket itself changes substantially,
+and timing protocols differ (Raster kernel event span versus CLBlast queue markers). Raster
+has one kernel here, with kernel sum equal to its event span, so inter-kernel launch gaps cannot
+explain this case. Keep strict-FP32 schedule performance open; neither promote a selector nor
+claim general competitiveness from the earlier snapshot. A frozen-revision, source-fingerprinted,
+paired rerun under controlled device load is the next performance gate.
+
+The documented Valhalla installation was unavailable. Device diagnostics used the existing
+bounded HotSpot 25 REPL; host performance is not compared with Valhalla baselines. The check also
+exposed missing OpenCL driver provenance: native discovery now queries `CL_DRIVER_VERSION`, and
+hardware capabilities retain it for the existing calibration signature. Old driver-less identities
+no longer match newly discovered devices; no calibration file is deleted or promoted.
+
+### Mixed-FP16/FP32 projection
+
 The existing `bench/public_linear_schedule_probe.clj` was rerun at `[8,256,256]`, with constant
 weights, mixed FP16 multiplication/FP32 accumulation, three warmups and eight interleaved samples
 per candidate. Both backends passed the exact rounded-input host oracle for all four generated

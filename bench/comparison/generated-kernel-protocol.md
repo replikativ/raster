@@ -84,6 +84,13 @@ under the stated protocol, not that it is a stable winner or the right selector 
 devices, precisions or activation epilogues. A randomized stationary comparison and explicit
 correctness-guarded selection remain necessary before promoting a measured policy.
 
+The [September 27 recheck](../results/strict-f32-local-recheck-20260927.edn) does not reproduce
+that ranking: Raster medians are 235–238 µs at `[8,256,256]` and 243–271 µs at `[256,256,256]`,
+while CLBlast is about 151 µs and its square bracket moves from 180 to 74 µs. All outputs remain
+exact for the dyadic oracle. This leaves performance unresolved, not certified by the older
+favorable samples. The next comparison must freeze revisions and source fingerprints, control
+device load, and alternate runs; no tuning choice was changed from these nonstationary records.
+
 ### Public dynamic GEMM/activation probe
 
 In a test or bench REPL, use the same public functions as the existing production canary:
