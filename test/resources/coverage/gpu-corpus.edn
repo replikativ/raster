@@ -1,10 +1,11 @@
 {:target-device :ocl:0,
  :dtype :float,
  :summary
- {:total 246,
-  :typed-soac 227,
-  :scalar 12,
+ {:total 251,
+  :typed-soac 237,
   :host-only 6,
+  :error 1,
+  :scalar 6,
   :typed-structured-control 1},
  :vars
  [{:var raster.dl.array-ops/argmax-rows!,
@@ -218,19 +219,19 @@
    :route :typed-soac,
    :typed-validated true,
    :declines []}
-  {:var raster.dl.attention/attn-prefill-out!,
-   :route :typed-soac,
-   :typed-validated true,
-   :declines []}
-  {:var raster.dl.attention/attn-prefill-out-strided!,
-   :route :typed-soac,
-   :typed-validated true,
-   :declines []}
   {:var raster.dl.attention/attn-prefill-mask-segmented-head-major!,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/attn-prefill-mask-windowed-head-major!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.attention/attn-prefill-out!,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.attention/attn-prefill-out-strided!,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
@@ -255,11 +256,18 @@
    :typed-validated true,
    :declines [],
    :effect-orders {:independent 1}}
+  {:var raster.dl.attention/attn-prefill-softmax-windowed-head-major!,
+   :route :error,
+   :error :unscheduled-effect-map}
   {:var raster.dl.attention/batched-causal-attn-dsum,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/batched-causal-attn-dw,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.attention/batched-causal-attn-score-jvp,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
@@ -280,6 +288,10 @@
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/batched-causal-sdpa-dv,
+   :route :typed-soac,
+   :typed-validated true,
+   :declines []}
+  {:var raster.dl.attention/batched-causal-sdpa-jvp,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
@@ -326,21 +338,13 @@
    :route :scalar,
    :typed-validated false,
    :declines []}
-  {:var raster.dl.attention/gqa-causal-attention,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
   {:var raster.dl.attention/gqa-causal-mha,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
   {:var raster.dl.attention/gqa-causal-mha-jvp,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
-  {:var raster.dl.attention/gqa-decode-attention,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.attention/gqa-decode-attention-buf!,
    :route :typed-soac,
@@ -352,10 +356,6 @@
    :typed-validated true,
    :declines [],
    :effect-orders {:independent 1}}
-  {:var raster.dl.attention/gqa-decode-attention-heads!,
-   :route :scalar,
-   :typed-validated false,
-   :declines []}
   {:var raster.dl.attention/gqa-decode-attention-weights!,
    :route :scalar,
    :typed-validated false,
@@ -589,16 +589,16 @@
    :declines [],
    :effect-orders {:independent 1, :sequential 1}}
   {:var raster.dl.nn/conv2d-backward-dW-into!,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.nn/conv2d-backward-db-into!,
    :route :typed-soac,
    :typed-validated true,
    :declines []}
   {:var raster.dl.nn/conv2d-backward-dcols-into!,
-   :route :scalar,
-   :typed-validated false,
+   :route :typed-soac,
+   :typed-validated true,
    :declines []}
   {:var raster.dl.nn/conv2d-rearrange-dy!,
    :route :typed-soac,

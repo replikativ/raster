@@ -23,7 +23,11 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
 3. **Pretrained's generated execution paths.** Validate quantized projections, cooperative
    reductions, routed attention and prefill through public compilation and linking. Serving
    policy, page allocation and persistence policy remain in pretrained-rstr. Raster owns
-   reusable numerical, storage and execution contracts.
+   reusable numerical, storage and execution contracts. The corpus now explicitly records
+   `attn-prefill-softmax-windowed-head-major!` as an existing `:unscheduled-effect-map` error:
+   its nested masked folds and effectful row writes still need a verified direct lowering.
+   New corpus compilation errors fail the ratchet instead of being invisible until a baseline
+   refresh.
 4. **Local consolidation gate.** Publish a support/evidence matrix, retire covered duplicate
    paths, and record reproducible correctness, compilation, allocation, transfer and execution
    baselines on both local backends. Retain city irregular kernels, one PDE/stencil and a
