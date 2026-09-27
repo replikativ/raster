@@ -131,8 +131,15 @@
     (is (some? tree))
     (with-bindings {(ns-resolve frontend-ns '*region-local-counter*) (atom 0)
                    (ns-resolve frontend-ns '*region-local-source-symbols*) '#{out i v p k a b}}
-      (is (nil? (project tree 'i [:double :double]))
-          "an unsupported result scope declines instead of lifting the post-store read"))))
+      (let [region (project tree 'i [:double :double])
+            continuation (second (second (:order region)))]
+        (is (empty? (:locals region)) "the read must not be hoisted before the store")
+        (is (= [:store :region] (mapv first (:order region))))
+        (is (= '(clojure.core/aget out i) (get-in continuation [:locals 0 :init])))
+        (is (= [:double :double] (mapv :dtype (:results continuation))))
+        (is (= (:result region) (mapv :result (:results continuation))))
+        (is (= (:yields continuation)
+               (mapv :result (get-in continuation [:order 0 1 :results]))))))))
 
 (deftest counted-store-loops-use-the-existing-effect-dialect
   (let [source '(let* [result (dotimes [i n]
