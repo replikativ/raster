@@ -144,7 +144,8 @@
    (let [instantiation-started (System/nanoTime)
          timings (volatile! {})
          plan (timed-phase! timings :plan-validation #(link-plan/validate! plan))
-         initialization (link-plan/initialization-contract plan)
+         initialization (timed-phase! timings :initialization-contract
+                                       #(link-plan/initialization-contract plan))
          program-instances (filterv link-plan/program-link-instance? (:instances plan))
          _ (when (and (seq program-instances) (not= 1 (count (:instances plan))))
              (throw (ex-info

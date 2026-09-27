@@ -1,0 +1,46 @@
+{:status :diagnostic-not-performance-baseline
+ :date "2026-09-27"
+ :target :ze:0
+ :device "Intel(R) Arc(TM) Graphics"
+ :driver "26.05.37020.3"
+ :shape [1 256 64]
+ :entry raster.quant.ggml-kernels/qdot-q4-K-rows!
+ :compiler :equation-first
+ :heap-limit "4 GiB"
+ :note "The machine had varying background load, so wall times are attribution clues, not regression thresholds. Both iterations in the first experiment used one JVM and identical arguments. The second experiment used a fresh JVM after adding finer phase timers. No kernel replay was timed."
+ :same-jvm-pair
+ [{:iteration 0
+   :preparation-ns 70506830921
+   :template {:cache-hit? false :miss-reason :compulsory
+              :stabilization-attempts 2 :resolution-ns 11172092966
+              :persistent-cache-eligible? false
+              :persistence-blockers #{:resolved-source-dependencies
+                                      :compiler-build-fingerprint}}
+   :link-plan-lowering-ns 40331002785
+   :instantiation-ns 20742104678
+   :instantiation-phases-ns {:plan-validation 8985731673
+                             :binding 3664295769}}
+  {:iteration 1
+   :preparation-ns 39370043797
+   :template {:cache-hit? true :stabilization-attempts 1
+              :resolution-ns 11765}
+   :link-plan-lowering-ns 39367068185
+   :instantiation-ns 22267490595
+   :instantiation-phases-ns {:plan-validation 9213024438
+                             :binding 4414756205}}]
+ :phase-instrumented-cold
+ {:preparation-ns 75529568912
+  :template {:cache-hit? false :miss-reason :compulsory
+             :stabilization-attempts 2 :resolution-ns 8064737430
+             :persistent-cache-eligible? false
+             :persistence-blockers #{:resolved-source-dependencies
+                                     :compiler-build-fingerprint}}
+  :link-plan-lowering-ns 42865497591
+  :lowering-phases-ns {:equation-lower 25981961170
+                       :link-plan-validation 7997555370
+                       :invocation-certification 8879661493}
+  :instantiation-ns 19203307891
+  :instantiation-phases-ns {:plan-validation 7883502870
+                            :initialization-contract 7591939668
+                            :binding 3666484735}}
+ :interpretation "The template process cache works, but LinkPlan lowering and runtime admission remain costly on a hit. Several separately timed validation/effect-analysis boundaries each traverse the same one-instance, nine-node compiled plan. Proof-preserving reuse of certified immutable evidence should be investigated before removing any validation."}
