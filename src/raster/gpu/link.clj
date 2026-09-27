@@ -9,6 +9,7 @@
   (:refer-clojure :exclude [run!])
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.passes.local-storage-reuse :as storage-reuse]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -921,3 +922,56 @@
                          (:phases executable) (:prepared-program executable)
                          (:allocation-keys executable))))
   nil)
+
+(defn- prepare-private-reuse!
+  "Internal proof/rebinding scope. Never expose the returned executable through a public API."
+  [plan]
+  (let [plan (link-plan/validate! plan)]
+    (when-not (and (= 1 (count (:instances plan)))
+                   (link-plan/program-link-instance? (first (:instances plan)))
+                   (every? #(= :owned (get-in % [:view :allocation :ownership]))
+                           (vals (:nodes plan))))
+      (throw (ex-info "private storage reuse requires one owned equation-first program"
+                      {:reason :link-private-reuse-boundary})))
+    (let [{:keys [order before]}
+          (with-open [baseline (instantiate! plan)]
+            {:order (execution-order baseline)
+             :before (instantiation-report baseline)})
+          _ (when (seq (:record-time-prologue order))
+              (throw (ex-info "private storage reuse cannot recycle a record-time prologue"
+                              {:reason :link-private-reuse-prologue})))
+          {:keys [plan bytes-saved allocations-saved]} (storage-reuse/realize-one plan order)
+          executable (instantiate! plan)]
+      (try
+        (when-not (= order (execution-order executable))
+          (throw (ex-info "selected kernel order changed after storage realization"
+                          {:reason :link-private-reuse-order-changed})))
+        (let [after (instantiation-report executable)]
+          (when-not (= allocations-saved (- (:owned-allocations before) (:owned-allocations after)))
+            (throw (ex-info "realized allocations disagree with the private reuse proof"
+                            {:reason :link-private-reuse-allocation-count})))
+          {:executable executable
+           :memory {:bytes-saved bytes-saved :allocations-saved allocations-saved
+                    :owned-allocations-before (:owned-allocations before)
+                    :owned-allocations-after (:owned-allocations after)}})
+        (catch Throwable error
+          (try (close! executable) (catch Throwable _))
+          (throw error))))))
+
+(defn evaluate!
+  "Execute an owned straight-line equation-first LinkPlan and return detached host outputs.
+
+   This opt-in host boundary realizes at most one certified temporary-storage reuse. It binds a
+   baseline to witness selected order, closes it, rewrites/revalidates storage and binds again.
+   No session, resident view, callback, or internal buffer escapes. All device execution and
+   downloads complete before the owned session closes. Public resident `instantiate!` semantics
+   are unchanged. The extra binding is a proof cost, not a latency optimization.
+
+   Returns {:outputs {node-id primitive-array} :memory allocation-delta-report}."
+  [plan]
+  (let [{:keys [executable memory]} (prepare-private-reuse! plan)]
+    (with-open [executable executable]
+      (run! executable)
+      {:outputs (into {} (map (fn [node-id] [node-id (download executable node-id)]))
+                      (get-in executable [:plan :outputs]))
+       :memory memory})))

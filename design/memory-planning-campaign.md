@@ -88,10 +88,10 @@ Only an ABI-certified complete first overwrite of both single-view allocations, 
 per-replay order, discharges the cross-replay initialization obligation. A legacy descriptor's
 write permission alone never does. Completion/escape and physical alias realization remain open.
 
-A four-layer typed dense program now exercises the intersection without injecting write facts:
+A four-layer typed dense program exercises the intersection without injecting write facts:
 the first and third intermediate arrays have certified complete overwrites and disjoint selected
 replay lifetimes. Two numerical replays on OpenCL and Level Zero check that observation changes
-neither buffers nor results. This is still **shadow-only**, not realized memory savings.
+neither buffers nor results on the ordinary resident path.
 
 Before enabling that candidate, establish a nonescape contract: `node-view`, `value-view`, and
 `download` currently expose even internal storage. An internal role alone is not exclusivity.
@@ -99,3 +99,23 @@ Perform any alias rewrite before binding, validate its alias/effect obligations,
 the selected order agrees with the proof. Synchronous completion does not authorize reuse while
 an external view or AD tape can still observe the old contents. Existing JVM/source lifetime
 passes must remain until their successful cases have equivalent coverage.
+
+## First realized reuse: confined host-result execution
+
+`gpu.link/evaluate!` is an opt-in, owned, host-result-only boundary for a straight-line
+equation-first plan. It obtains selected order from a private baseline binding, closes that
+binding, realizes one full-allocation single-view pair with the same complete allocation
+contract (including coherence), and revalidates aliases/effects. A fresh binding must have
+the same selected order and one fewer owned allocation before execution. It then uses the
+existing synchronous runner and downloads only declared outputs; no session, callback or
+resident view escapes. Ordinary `instantiate!` and its inspectable internal views are unchanged.
+
+The tiny four-layer oracle saves one 16-byte allocation on both OpenCL and Level Zero, with
+two optimized replays matching the JVM. This proves a local storage decision, **not** broad
+model savings or a latency improvement. The baseline binding and second binding are deliberate
+proof overhead. No-candidate plans retain distinct storage. Public outputs, host-initialized
+buffers, borrowed storage, incompatible coherence and partial-allocation views are excluded.
+
+A reusable resident facade with explicit private temporaries is the next ownership step; do
+not silently apply this rewrite to an inspectable `LinkedExecutable`. This first GPU-local proof
+does not supersede the JVM/source memory passes, so none is deleted on that claim.

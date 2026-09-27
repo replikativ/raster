@@ -16,7 +16,7 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
    retain all effects; unknown legality produces a source-located decline.
 2. **One complete memory proof.** Follow `memory-planning-campaign.md`: join logical values,
    storage views, initialization, selected replay order, escape/AD retention and completion
-   evidence; enable one justified reuse and remove the analysis it supersedes. Shadow
+   evidence; enable one justified reuse and remove any analysis it actually supersedes. Shadow
    proposals alone do not count as enabled reuse.
 3. **Pretrained's generated execution paths.** Validate quantized projections, cooperative
    reductions, routed attention and prefill through public compilation and linking. Serving
@@ -75,6 +75,13 @@ and alpha normalization preserve declarations and static conflict contracts. Thi
 scope inconsistency before generalizing effect-loop result tuples; it adds no new dialect.
 
 ## Working rhythm
+
+Memory proof progress: straight-line equation-first replay order now joins real typed complete
+writes. An opt-in host-result-only execution scope realizes one full-allocation temporary pair
+and checks the selected order after rebinding. The four-layer OpenCL/Level Zero oracle saves
+one allocation and retains two-replay JVM parity. General resident reuse/escape contracts,
+structured-loop order and AD tape retention remain open. No existing lifetime pass is
+superseded by this narrow GPU proof; keep their distinct JVM/source coverage.
 
 - One bounded JVM/REPL; focused affected tests locally. Full suites run in CI.
 - One reviewer at structural boundaries or before landing a risky change; no permanent agent swarm.
