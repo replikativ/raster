@@ -289,7 +289,7 @@
     (is (= ['renamed] (get-in (dialect/facts (dialect/remap-values scheduled {'output 'renamed}))
                              [:attributes :native-initialization-providers])))
     (is (= :structured-control-native-initialization
-           (try (structured/promote-soac-program (route/program-envelope scheduled) {}) nil
+           (try (structured/promote-program (route/program-envelope scheduled) {}) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest public-initialization-cross-compiles-without-a-device

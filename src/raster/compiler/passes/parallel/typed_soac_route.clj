@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -637,6 +638,194 @@
                          (= (:operands equation) (:inputs (dialect/facts algorithm)))
                          (= (:results equation) (dialect/outputs algorithm))))})))
 
+(defn- equation-references
+  [equation]
+  (vec (distinct
+        (into (dialect/operation-inputs equation)
+              (filter dialect/value-id? (dialect/operation-extents equation))))))
+
+(declare sequential-continuation-decline)
+
+(defn- entry-operands
+  [equations-by-id {:keys [kind equation-id description]}]
+  (case kind
+    :typed-soac (equation-references (get equations-by-id equation-id))
+    :segmented-weighted-reduction
+    (vec (distinct
+          (concat (swr/ordered-input-ids (:plan description))
+                  (filter symbol? (swr/runtime-parameter-values (:plan description))))))))
+
+(defn- component-runs
+  "Partition the one analyzed source spine into maximal ordinary SOAC runs and singleton plans."
+  [entries]
+  (loop [remaining (seq entries) prefix [] components []]
+    (if-not (seq remaining)
+      components
+      (if (= :typed-soac (:kind (first remaining)))
+        (let [[run suffix] (split-with #(= :typed-soac (:kind %)) remaining)]
+          (recur suffix (into prefix run)
+                 (conj components {:kind :typed-soac :entries (vec run)
+                                   :prefix prefix :suffix (vec suffix)})))
+        (recur (next remaining) (conj prefix (first remaining))
+               (conj components {:kind :segmented-weighted-reduction
+                                 :entry (first remaining)
+                                 :prefix prefix
+                                 :suffix (vec (next remaining))}))))))
+
+(defn- entry-storage-values
+  [facts equations-by-id {:keys [kind equation-id description]}]
+  (case kind
+    :typed-soac
+    (let [equation (get equations-by-id equation-id)
+          storage (get-in facts [:equations equation-id :attributes :result-storage])]
+      (into (set (concat (equation-references equation) (nth equation 2)))
+            (keep :destination) storage))
+
+    :segmented-weighted-reduction
+    (set (conj (swr/ordered-input-ids (:plan description))
+               (get-in description [:plan :output :id])))))
+
+(defn- typed-component-program
+  [{:keys [typed-program outputs]} component]
+  (let [source-facts (dialect/facts typed-program)
+        equations-by-id (into {} (map (juxt second identity)) (dialect/equations typed-program))
+        equations (mapv #(get equations-by-id (:equation-id %)) (:entries component))
+        equation-ids (set (map second equations))
+        definitions (set (mapcat #(nth % 2) equations))
+        references (vec (distinct (mapcat equation-references equations)))
+        inputs (vec (remove definitions references))
+        live-after (into (set outputs)
+                         (mapcat #(entry-operands equations-by-id %))
+                         (:suffix component))
+        chunk-outputs (vec (filter live-after (mapcat #(nth % 2) equations)))
+        equation-facts (select-keys (:equations source-facts) equation-ids)
+        effects (reduce set/union #{} (map :effects (vals equation-facts)))
+        current-storage (into #{} (mapcat #(entry-storage-values
+                                           source-facts equations-by-id %))
+                              (:entries component))
+        prior-storage (into #{} (mapcat #(entry-storage-values
+                                         source-facts equations-by-id %))
+                            (:prefix component))
+        first-access-storage (set/difference current-storage prior-storage)
+        allocations (filterv #(contains? first-access-storage (:destination %))
+                             (get-in source-facts [:attributes :allocations]))
+        facts (-> source-facts
+                  (assoc :inputs inputs :equations equation-facts :effects effects)
+                  (assoc-in [:attributes :allocations] allocations))]
+    (dialect/make facts equations chunk-outputs)))
+
+(defn- optimize-typed-component
+  [typed-input {:keys [resident-reductions? resident-initialization?
+                       resident-uniform-input-loads? abstract-machine]}]
+  (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input abstract-machine)
+        [typed-result uniform-stats]
+        (if resident-uniform-input-loads?
+          (resident/inline-uniform-input-loads typed-result)
+          [typed-result {:resident-uniform-input-loads 0}])
+        [typed-result resident-stats]
+        (if resident-reductions?
+          (resident/realize typed-result)
+          [typed-result {:resident-reductions 0 :inlined-scalars 0}])
+        [typed-result initialization-stats]
+        (if resident-initialization?
+          (initialization/materialize typed-result)
+          [typed-result {}])
+        [typed-result ownership-stats] (ownership/prove typed-result)]
+    {:program typed-result
+     :declined (sequential-continuation-decline typed-result)
+     :stats (merge-with (fn [left right]
+                          (if (and (number? left) (number? right)) (+ left right) right))
+                        typed-stats uniform-stats resident-stats initialization-stats
+                        ownership-stats)}))
+
+(defn- realization-program
+  [projection typed-components]
+  (when (seq typed-components)
+    (let [programs (mapv :program typed-components)
+          equations (vec (mapcat dialect/equations programs))
+          equation-facts (apply merge (map #(get-in (dialect/facts %) [:equations]) programs))
+          definitions (set (mapcat #(nth % 2) equations))
+          references (vec (distinct (mapcat equation-references equations)))
+          inputs (vec (remove definitions references))
+          outputs (vec (distinct (mapcat #(nth % 2) equations)))
+          values (apply merge (:values projection) (map #(get-in (dialect/facts %) [:values]) programs))
+          effects (reduce set/union #{} (map :effects (vals equation-facts)))
+          facts (assoc (:facts projection) :values values :inputs inputs
+                       :equations equation-facts :effects effects)]
+      (dialect/make facts equations outputs))))
+
+(defn- swr-equation
+  [{:keys [id sym expr plan result-storage source-prefix? host-binding]}]
+  (let [runtime-values (swr/runtime-parameter-values plan)
+        operands (vec (distinct (concat (swr/ordered-input-ids plan)
+                                        (filter symbol? runtime-values))))]
+    (parallel-program/->ProgramEquation
+     id [:binding sym] expr operands [sym] plan [plan]
+     #{:memory/read :memory/write}
+     {:front-end :analyzed-source :source-binding-id id
+      :pass :segmented-weighted-reduction-protection}
+     {:algorithm-dialect :segmented-weighted-reduction
+      :source-prefix? (boolean source-prefix?)
+      :result-storage result-storage
+      :host-binding host-binding})))
+
+(defn- mixed-envelope
+  [form projection options]
+  (let [components (component-runs (:entries projection))
+        typed-components
+        (into []
+              (comp (filter #(= :typed-soac (:kind %)))
+                    (map #(optimize-typed-component
+                           (typed-component-program projection %) options)))
+              components)]
+    (if-let [decline (some :declined typed-components)]
+      {:declined decline}
+      (let [realization (realization-program projection typed-components)
+            {:keys [source realized]}
+            (if realization (realize-source form realization) {:source form :realized {}})
+            typed-envelopes (mapv #(envelope (:program %) source realized) typed-components)
+            typed-equations (mapv :equations typed-envelopes)
+            equations
+            (:equations
+             (reduce (fn [{:keys [typed-index] :as state} component]
+                       (if (= :typed-soac (:kind component))
+                         (-> state
+                             (update :equations into (nth typed-equations typed-index))
+                             (update :typed-index inc))
+                         (update state :equations conj
+                                 (swr-equation (get-in component [:entry :description])))))
+                     {:equations [] :typed-index 0} components))
+            values (apply merge (:values projection) (map :values typed-envelopes))
+            inputs (parallel-program/infer-inputs equations)
+            effects (reduce set/union #{} (map :effects equations))
+            stats (apply merge-with
+                         (fn [left right]
+                           (if (and (number? left) (number? right)) (+ left right) right))
+                         {} (map :stats typed-components))]
+        {:program
+         ;; The structured-control route owns validation of this existing typed algorithm union.
+         ;; The pipeline validates immediately after this attempt, avoiding a dependency cycle.
+         (parallel-program/make
+          {:dialect :typed-parallel
+           :source source
+           :values values
+           :inputs inputs
+           :equations equations
+           :outputs (:outputs projection)
+           :effects effects
+           :diagnostics (get-in projection [:facts :diagnostics])
+           :provenance {:front-end :analyzed-source
+                        :pass :segmented-weighted-reduction-protection}
+           :attributes (assoc (:attributes (:facts projection))
+                              :host-control :typed-soac-materialization
+                              :mixed-algorithms true)})
+         :stats (merge stats
+                       {:route :typed-parallel
+                        :front-end :analyzed-source
+                        :segmented-weighted-reductions
+                        (count (filter #(= :segmented-weighted-reduction (:kind %))
+                                       components))})}))))
+
 (defn program-envelope
   "Wrap an already constructed TypedSOAC program in the same ParallelProgram boundary used by
    the analyzed-source production route.
@@ -691,47 +880,50 @@
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                  resident-uniform-input-loads?
-                                 scalar-types values abstract-machine]
+                                 scalar-types values abstract-machine segmented-plans?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
                                                  :scalar-types scalar-types})]
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
-                                 :scalar-types scalar-types :values values}
-               typed-input (frontend/form->program form frontend-options)]
-           (if-not typed-input
+                                 :scalar-types scalar-types :values values
+                                 :segmented-plans? segmented-plans?}
+               projection (when segmented-plans?
+                            (frontend/form->program-components form frontend-options))
+               typed-input (or (:typed-program projection)
+                               (when-not projection
+                                 (frontend/form->program form frontend-options)))]
+           (if-not (or typed-input (:segmented-plans? projection))
              (when-let [decline (frontend/coverage-decline form frontend-options)]
                {:declined decline})
-             (let [[typed-result typed-stats]
-                   (fusion/fusion-fixpoint typed-input abstract-machine)
-                   [typed-result uniform-stats]
-                   (if resident-uniform-input-loads?
-                     (resident/inline-uniform-input-loads typed-result)
-                     [typed-result {:resident-uniform-input-loads 0}])
-                   [typed-result resident-stats]
-                   (if resident-reductions?
-                     (resident/realize typed-result)
-                     [typed-result {:resident-reductions 0 :inlined-scalars 0}])
-                   [typed-result initialization-stats]
-                   (if resident-initialization?
-                     (initialization/materialize typed-result)
-                     [typed-result {}])
-                   [typed-result ownership-stats] (ownership/prove typed-result)]
-               (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
-                                           :segmented-reduce :contract :product-reduce
-                                           :segmented-fold-map :scan}
-                                         (:kind (fusion/equation-info %)))
-                             (dialect/equations typed-result))
-                 {:declined {:reason :no-certified-parallel-equation
-                             :stats (merge typed-stats uniform-stats resident-stats ownership-stats)}}
-                 (if-let [decline (sequential-continuation-decline typed-result)]
-                   {:declined decline}
-                   (let [{:keys [source realized]} (realize-source form typed-result)]
-                     {:program (envelope typed-result source realized)
-                      :stats (merge typed-stats uniform-stats resident-stats initialization-stats ownership-stats
-                                    {:route :typed-soac :typed-validated true
-                                     :front-end :analyzed-source})}))))))
+             (if (:segmented-plans? projection)
+               (mixed-envelope form projection
+                               {:resident-reductions? resident-reductions?
+                                :resident-initialization? resident-initialization?
+                                :resident-uniform-input-loads? resident-uniform-input-loads?
+                                :abstract-machine abstract-machine})
+               (let [{typed-result :program typed-stats :stats decline :declined}
+                     (optimize-typed-component
+                      typed-input
+                      {:resident-reductions? resident-reductions?
+                       :resident-initialization? resident-initialization?
+                       :resident-uniform-input-loads? resident-uniform-input-loads?
+                       :abstract-machine abstract-machine})]
+                 (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
+                                             :segmented-reduce :contract :product-reduce
+                                             :segmented-fold-map :scan}
+                                           (:kind (fusion/equation-info %)))
+                               (dialect/equations typed-result))
+                   {:declined {:reason :no-certified-parallel-equation
+                               :stats typed-stats}}
+                   (if decline
+                     {:declined decline}
+                     (let [{:keys [source realized]} (realize-source form typed-result)]
+                       {:program (envelope typed-result source realized)
+                        :stats (merge typed-stats
+                                      {:route :typed-soac :typed-validated true
+                                       :front-end :analyzed-source})})))))))
          (catch clojure.lang.ExceptionInfo exception
            (if (frontend/source-decline? exception)
              {:declined {:reason (:reason (ex-data exception))

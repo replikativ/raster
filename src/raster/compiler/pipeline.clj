@@ -844,9 +844,18 @@
                                               (device/gpu-target? (:target-device opts)))
                     :resident-initialization? (device/gpu-target? (:target-device opts))
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
+                    :segmented-plans? (true? (:segmented-plans? opts))
                     :scalar-types (:scalar-types opts)
                     :values (:values opts)
-                    :abstract-machine abstract-machine})]
+                    :abstract-machine abstract-machine})
+            ;; Mixed source construction shares the ordinary frontend but cannot depend on
+            ;; this route's validator without a namespace cycle. Certify the closed algorithm
+            ;; union here, before exposing it as an accepted semantic program.
+            typed (if (= :typed-parallel (get-in typed [:program :dialect]))
+                    (-> typed
+                        (update :program structured-route/validate-typed-program!)
+                        (assoc-in [:stats :typed-validated] true))
+                    typed)]
         (cond-> (or typed {})
           (:declined structured)
           (assoc :structured-control-declined (:declined structured)))))))
@@ -943,7 +952,7 @@
     ;; must abstain before promotion; the unchanged resident suffix owns the SoA program.
     (when (and (= :typed-soac (:dialect semantic))
                (set/subset? public-parameters representable))
-      (let [typed (structured-route/promote-soac-program semantic opts)
+      (let [typed (structured-route/promote-program semantic opts)
           scheduled (structured-route/schedule-program typed opts)
           plans (parallel-program-c-family/product-consumer-plans scheduled)]
       (when (seq plans)

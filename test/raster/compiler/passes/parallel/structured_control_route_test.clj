@@ -297,6 +297,8 @@
                                                 'x))
              (assoc-in typed [:values 'result]
                        (av/tensor {:dtype :float :shape '[n]}))
+             (assoc-in typed [:values 'result]
+                       (av/tensor {:dtype :float :shape '[width n]}))
              (assoc-in typed [:values 'n]
                        (av/tensor {:dtype :long :shape '[n]}))
              (assoc-in typed [:values 'x]
@@ -319,6 +321,15 @@
                  (assoc :outputs '[out-storage]))]]
       (is (false? (route/valid-typed-program? malformed))))))
 
+(deftest generic-weighted-reduction-admits-exact-flat-source-array-values
+  (let [typed (swr-parallel-program)
+        flat (av/tensor {:dtype :float :shape '[(clojure.core/* n width)]})
+        flattened (-> typed (assoc-in [:values 'x] flat) (assoc-in [:values 'result] flat))]
+    (is (= flattened (route/validate-typed-program! flattened)))
+    (is (= (get-in typed [:equations 0 :algorithm])
+           (get-in flattened [:equations 0 :algorithm]))
+        "mathematical axes remain in the retained plan, not reconstructed from storage")))
+
 (deftest generic-weighted-reduction-declines-before-uncertified-scheduling
   (let [typed (swr-parallel-program)]
     (try
@@ -331,6 +342,23 @@
         (is (= [:binding 4] (:site (ex-data exception))))
         (is (= [:segmented-weighted-reduction :test]
                (:plan-id (ex-data exception))))))))
+
+(deftest generic-weighted-reduction-retains-the-common-invocation-boundary
+  (let [typed (assoc (swr-parallel-program)
+                     :source '(let* [out-storage (clojure.core/float-array
+                                                 (clojure.core/* n width))]
+                                out-storage))
+        promoted (route/promote-program
+                  typed {:dtype :float :public-parameters '[x n width]
+                         :array-types {'x :float}
+                         :scalar-types {'n :long 'width :int}})
+        plan (get-in promoted [:attributes :invocation-plan])]
+    (is (= (:equations typed) (:equations promoted)))
+    (is (= '[x n width] (mapv :symbol (:parameters plan))))
+    (is (= '[x n width] (mapv :program-value (:bindings plan))))
+    (is (= '[result] (:program-outputs plan)))
+    (is (empty? (:steps plan)) "the device-owned output is not allocated in the host prefix")
+    (is (= plan (invocation/validate-against! plan promoted)))))
 
 (deftest loop-output-feeds-an-ordinary-typed-suffix
   (let [initial (av/tensor {:dtype :double :shape ['extent]
@@ -705,7 +733,7 @@
                  :scalar-types {'nrows :long 'width :long 'size :long}}
         parallel (:program (typed-route/attempt source :float {'x :float}
                                                 {:scalar-types (:scalar-types options)}))
-        promoted (route/promote-soac-program parallel options)
+        promoted (route/promote-program parallel options)
         shape-equation (first (:equations promoted))
         prefix-symbols (mapv :symbol (get-in promoted [:attributes :invocation-plan :steps]))]
     (is (= '[size] (:results shape-equation)))
@@ -723,7 +751,7 @@
                  :array-types {'out :double} :scalar-types {'n :long}}
         parallel (:program (typed-route/attempt source :double {'out :double}
                                                 {:scalar-types (:scalar-types options)}))
-        promoted (route/promote-soac-program parallel options)]
+        promoted (route/promote-program parallel options)]
     (is (= '[scalar map]
            (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
                  (:equations promoted))))
@@ -739,7 +767,7 @@
                  :array-types {'out :double} :scalar-types {'n :long}}
         parallel (:program (typed-route/attempt source :double {'out :double}
                                                 {:scalar-types (:scalar-types options)}))
-        promoted (route/promote-soac-program parallel options)
+        promoted (route/promote-program parallel options)
         plan (get-in promoted [:attributes :invocation-plan])
         prefix-steps (:steps plan)
         checked-step (first (filter #(= 'checked (:symbol %)) prefix-steps))]
@@ -779,7 +807,7 @@
           parallel (:program (typed-route/attempt source :double {'out :double}
                                                   {:scalar-types (:scalar-types options)}))]
       (is (= :structured-control-invocation-prefix
-             (reason-of #(route/promote-soac-program parallel options))))))
+             (reason-of #(route/promote-program parallel options))))))
   (testing "an omitted host effect ends the authoritative source prefix"
     (let [source '(let* [host-write (clojure.core/aset scratch 0 2.0)
                          checked (clojure.core/int n)
