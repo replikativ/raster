@@ -63,6 +63,12 @@ accept branch-local recurrence sites when only the induction index advances: bot
 prove the same unit step, and their complete lexical effect regions stay in source order.
 Each stripped arm must contain recognized effects; empty arms still decline rather than
 dropping a potentially observable predicate evaluation.
+Guard presence is structural: an absent predicate is unconditional, while an explicit false
+or nil guard suppresses the region. Projection must not replace this distinction with host
+truthiness. Constant-arm elimination uses the existing closed-core branch selector; dynamic
+predicates remain KernelBody control. Ownership proofs include entry-guard reads in their
+enclosing scope, before branch locals, so cross-row predicates cannot acquire a false
+independence certificate merely from row-local stores.
 Multi-store branch scopes use the existing guarded regions, including entry snapshots when
 their stores can change the predicate. Source/JVM and public OpenCL/Level Zero replay oracles
 cover both arms, zero trips, and a mutable predicate; no new kernel node or emitter is needed.

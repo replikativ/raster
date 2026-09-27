@@ -31,13 +31,23 @@
           read! (ns-resolve runtime 'buffer->array)
           free! (ns-resolve runtime 'free-buffer!)]
       (doseq [[kind trips] (concat (for [kind [:scheduled :typed :nested] trips [0 1 8]] [kind trips])
-                                   [[:typed-index-collision 8]])]
-        (let [operation (case kind
+                                   [[:typed-index-collision 8] [:guarded-false 8]
+                                    [:guarded-nil 8] [:guarded-true 8]])]
+        (let [guarded? (contains? #{:guarded-false :guarded-nil :guarded-true} kind)
+              inactive? (contains? #{:guarded-false :guarded-nil} kind)
+              operation (case kind
                           :scheduled (fixture/scheduled-loop trips)
                           :nested (fixture/scheduled-normalization trips)
                           (first (lower/lower-typed-effect-map
                                   (cond-> (fixture/typed-program trips)
                                     (= kind :typed-index-collision) (dialect/remap-values {'seed 'i})) :ze:0)))
+              operation (if guarded?
+                          (update-in operation [:scalar-region :effects]
+                                     (fn [effects]
+                                       [{:region {:predicate (case kind :guarded-false false
+                                                                      :guarded-nil nil true)
+                                                  :locals [] :effects effects}}]))
+                          operation)
               compiled (fixture/artifact operation :opencl-portable
                                          :scalar-types {'rows :long 'seed :float 'i :float})
               values (vec (range 16))
@@ -56,13 +66,15 @@
                                                  'i {:type :float :value 0.25}}
                                                 (:arguments compiled)))))
             (is (same-values? kind (vec (concat (map-indexed (fn [i v]
-                                              (if (< (mod i 8) trips)
+                                              (if (and (not inactive?) (< (mod i 8) trips))
                                                 (float (if (= :nested kind)
                                                          (* v (nth inverses (quot i 8))) v))
                                                 -77.0)) values)
                                 (repeat 3 -77.0)))
                    (vec (read! words))) "only the selected row elements are written")
-            (is (same-values? kind (vec (concat (if (= :nested kind) inverses sums)
+            (is (same-values? kind (vec (concat (cond inactive? [-77.0 -77.0]
+                                                    (= :nested kind) inverses
+                                                    :else sums)
                                 (repeat 3 -77.0)))
                    (vec (read! totals))) "zero-trip carry and inactive output tail are preserved")
             (finally (free! totals) (free! words) (free! x))))))))

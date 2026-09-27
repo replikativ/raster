@@ -665,7 +665,7 @@
 (defn- order-predicates [order]
   (mapcat (fn [[kind region]]
             (when (= :region kind)
-              (concat (when (:predicate region) [(:predicate region)])
+              (concat (when (contains? region :predicate) [(:predicate region)])
                       (order-predicates (:order region)))))
           order))
 
@@ -680,7 +680,7 @@
                                        (update :locals #(mapv local-fn %))
                                        (update :order #(map-region-order % local-fn expression-fn
                                                                          store-offset loop-offset)))
-                             (:predicate value) (update :predicate expression-fn))
+                             (contains? value :predicate) (update :predicate expression-fn))
                    :store (+ store-offset value)
                    :loop (+ loop-offset value))]) order)))
 
@@ -1833,11 +1833,11 @@
                         (:region effect)
                         (let [region (:region effect)
                               [locals inner-env] (scope-locals (:locals region) environment path)]
-                          {:region (assoc region
-                                          :predicate (some->> (:predicate region)
-                                                              (substitute environment))
-                                          :locals (vec locals)
-                                          :effects (rewrite (:effects region) inner-env path))})
+                          {:region (cond-> (assoc region
+                                                  :locals (vec locals)
+                                                  :effects (rewrite (:effects region) inner-env path))
+                                     (contains? region :predicate)
+                                     (update :predicate (partial substitute environment)))})
 
                         (:loop effect)
                         (let [loop (:loop effect)
@@ -2128,9 +2128,10 @@
               (letfn [(project-order [order]
                         (mapv (fn [[kind value]]
                                 (case kind
-                                  :region {:region {:locals (:locals value)
-                                                    :predicate (:predicate value)
-                                                    :effects (project-order (:order value))}}
+                                  :region {:region (cond-> {:locals (:locals value)
+                                                           :effects (project-order (:order value))}
+                                                    (contains? value :predicate)
+                                                    (assoc :predicate (:predicate value)))}
                                   :store (store-effect (get stores-by-path
                                                             (conj path :store value)))
                                   :loop (project-loop (nth (:loops loop) value)
@@ -2149,9 +2150,10 @@
             ordered-effects ((fn project [order]
                                (mapv (fn [[kind value]]
                                        (case kind
-                                         :region {:region {:locals (:locals value)
-                                                           :predicate (:predicate value)
-                                                           :effects (project (:order value))}}
+                                         :region {:region (cond-> {:locals (:locals value)
+                                                                  :effects (project (:order value))}
+                                                           (contains? value :predicate)
+                                                           (assoc :predicate (:predicate value)))}
                                          :store (store-effect (nth stores value))
                                          :loop (nth loop-effects value))) order)) order)]
         (when (or pointwise? scatter? (and ordered? (every? some? result-dtypes)))
@@ -4402,8 +4404,8 @@
                                                        (transform init) dtype)))
                                (:locals region))
                   effects (mapv effect-form (:effects region))]
-              (if-let [guard (:predicate region)]
-                (dialect/effect-guard-region (transform guard) locals effects)
+              (if (contains? region :predicate)
+                (dialect/effect-guard-region (transform (:predicate region)) locals effects)
                 (dialect/effect-lambda-region locals effects)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower upper-bound extent carries]} (:loop effect)]

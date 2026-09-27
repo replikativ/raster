@@ -890,8 +890,8 @@
              (fn [bound effect]
                (if-let [region (:region effect)]
                  (do
-                   (when-let [predicate (:predicate region)]
-                     (closed! predicate bound :predicate))
+                   (when (contains? region :predicate)
+                     (closed! (:predicate region) bound :predicate))
                    (walk (:effects region) (locals! (:locals region) bound))
                    bound)
                (if-let [{:keys [index lower extent locals effects carries] :as loop} (:loop effect)]
@@ -996,7 +996,7 @@
       (:region part)
       {:region (cond-> {:locals (:locals (:region part))
                         :effects (mapv scheduled-effect (:body-results (:region part)))}
-                 (:predicate part) (assoc :predicate (:predicate part)))}
+                 (contains? part :predicate) (assoc :predicate (:predicate part)))}
       loop
       (let [{:keys [locals body-results]} (lambda-parts lambda)]
         {:loop (cond-> {:index index :lower lower :extent extent :locals locals
