@@ -72,9 +72,11 @@ one step into several kernels, and graph recording may lift cacheable constant t
 one-time prologue. `gpu/graph-execution-order` and `gpu.link/execution-order` report those selected
 record-time and per-replay kernel partitions without exposing backend graph handles. This is a
 necessary correction to source-order liveness, not a completion certificate: event boundaries,
-escape/AD retention, full initialization, and alias realization still gate actual reuse. An
-equation-first prepared program has a separate runner and explicitly declines this report until
-that runner supplies equivalent evidence.
+escape/AD retention, full initialization, and alias realization still gate actual reuse.
+Straight-line equation-first prepared programs now compose the actual bound kernel order with
+their source equation indices through the same linked witness. Host-only equations keep their
+indices but launch no kernels. Structured program loops explicitly decline this flat report;
+preparation order is not a substitute for their repeated execution order.
 
 The shadow planner can consume the linked witness. It declines a proposed reuse when either
 allocation is touched by a one-time prologue (including a mixed prologue/replay semantic step),
@@ -85,3 +87,15 @@ not be recycled for a later temporary in the same replay: it would corrupt the n
 Only an ABI-certified complete first overwrite of both single-view allocations, in the witnessed
 per-replay order, discharges the cross-replay initialization obligation. A legacy descriptor's
 write permission alone never does. Completion/escape and physical alias realization remain open.
+
+A four-layer typed dense program now exercises the intersection without injecting write facts:
+the first and third intermediate arrays have certified complete overwrites and disjoint selected
+replay lifetimes. Two numerical replays on OpenCL and Level Zero check that observation changes
+neither buffers nor results. This is still **shadow-only**, not realized memory savings.
+
+Before enabling that candidate, establish a nonescape contract: `node-view`, `value-view`, and
+`download` currently expose even internal storage. An internal role alone is not exclusivity.
+Perform any alias rewrite before binding, validate its alias/effect obligations, and verify that
+the selected order agrees with the proof. Synchronous completion does not authorize reuse while
+an external view or AD tape can still observe the old contents. Existing JVM/source lifetime
+passes must remain until their successful cases have equivalent coverage.
