@@ -63,7 +63,16 @@
     (is (= :gfx90a (get-in emitted [:attributes :target-facts :required-gfx-arch])))
     (is (= [16 16 16] (mapv :alignment (take 3 (:abi emitted)))))
     (is (= ['a 'b 'c] (mapv :id (take 3 (:parameters body)))))
-    (is (re-find #"rocwmma::mma_sync" (:source emitted)))))
+    (is (re-find #"rocwmma::mma_sync" (:source emitted)))
+    (let [downgraded (-> emitted
+                         (update :abi #(mapv (fn [slot] (dissoc slot :alignment)) %))
+                         (update-in [:attributes :target-facts]
+                                    dissoc :pointer-alignment :required-gfx-arch)
+                         (update-in [:provenance :target-facts]
+                                    dissoc :pointer-alignment :required-gfx-arch))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"requires gfx90a"
+           (scheduled-body/validate-artifact-projection! scheduled downgraded))))))
 
 (deftest pinned-mfma-candidate-compiles-without-amd-hardware
   (if-let [include (System/getenv "RASTER_ROCWMMA_INCLUDE")]
