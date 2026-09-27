@@ -118,6 +118,11 @@
             expected (vec (apply four-layers args))
             linked (lowered target args)]
         (with-open [executable (link/instantiate! linked)]
+          (let [info (link/execution-info executable)]
+            (is (= (count (get-in executable [:prepared-program :binding-order])) (count info)))
+            (is (seq info))
+            (is (every? #(= :fixed (get-in % [:executable :selection])) info))
+            (is (every? #(seq (get-in % [:executable :entry-points])) info)))
           (is (= (selected-order linked) (link/execution-order executable)))
           (assert-candidate linked (link/execution-order executable))
           (dotimes [_ 2]

@@ -112,6 +112,13 @@ with implemented optimization. Cache canonicalization of equivalent policy spell
 single captured target descriptor remain follow-ups. Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
+Equation-first execution reporting now observes actual fixed graph bindings through the public
+compiled API. It shares compact executable descriptions with descriptor admission reports and
+does not infer precision from the requested policy. Loop carry variants are reported once per
+distinct binding, not once per iteration; this report is not replay order, timing, or completion
+evidence. Dynamic alternative admission and tuning still require carrying those alternatives
+through the equation path; an empty admission list with `:selection :fixed` does not prove them.
+
 The current executed workload matrix and bounded projection diagnostic are recorded in
 [local compiler evidence](local-compiler-evidence.md). This separates exact/parity gates from
 nonstationary timing samples and from still-unexecuted native CUDA/HIP claims.

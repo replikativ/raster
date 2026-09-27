@@ -206,6 +206,18 @@
      (let [key (get-in prepared [:plan :step-keys step-index])]
        (graph-order (get (:handles prepared) key))))))
 
+(defn execution-info
+  "Describe each distinct prepared graph binding once, in binding order. Structured-loop carry
+   variants stay bounded; this is neither expanded replay order nor measured execution evidence."
+  [prepared graph-info]
+  (ensure-prepared! prepared :execution-info)
+  (when-not (ifn? graph-info)
+    (throw (ex-info "prepared program execution reporting requires a graph observer"
+                    {:reason :parallel-program-execution-info-observer})))
+  (mapv (fn [key]
+          {:phase key :executable (graph-info (get (:handles prepared) key))})
+        (:binding-order prepared)))
+
 (defn profile-prepared!
   "Replay a prepared program in exact program order through `profile-handle!` and aggregate its
    device-event intervals. Every handle callback must consume/reset one completed profiling replay;

@@ -138,6 +138,12 @@
               temporary (first (vals (get-in @sess [:kernel-graphs :prefix
                                                     :temporary-buffers])))]
           (is (gpu/kernel-graph-handle? handle))
+          (let [info (gpu/kernel-graph-execution-info sess handle)]
+            (is (= :kernel-graph (:kind info)))
+            (is (= :fixed (:selection info)))
+            (is (= [] (:admission info)))
+            (is (= (mapv #(get-in % [:operation :kernel-name]) (:nodes graph))
+                   (:entry-points info))))
           (is (= {'n {:type :int :value 1025}}
                  (get-in @sess [:kernel-graphs :prefix :graph-call :scalar-values]))
               "enclosing shape bookkeeping does not widen the executable scalar ABI")
@@ -157,6 +163,8 @@
               "graph release waits and releases an in-flight submission")
           (is (empty? (:events @sess)))
           (is (empty? (:kernel-graphs @sess)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not bound"
+                               (gpu/kernel-graph-execution-info sess handle)))
           (is (= 1 (count @destroyed-graphs)))
           (is (= 3 (count @destroyed-prepareds)))
           (is (= [temporary] @freed))
@@ -215,6 +223,9 @@
                         session handle :warmup-iterations 1 :budget-ms 1
                         :min-samples 3 :max-samples 3)]
           (is (= [["bound_call_probe" emitted]] @registered))
+          (is (= {:kind :kernel-artifact :strategy nil :precision nil
+                  :entry-points ["bound_call_probe"] :selection :fixed :admission []}
+                 (gpu/kernel-graph-execution-info session handle)))
           (is (identical? output-buffer (get outputs 'out)))
           (is (= 1 @resets) "validation replay resets discarded profiling events")
           (is (= :device-event (:timing-source measured)))
