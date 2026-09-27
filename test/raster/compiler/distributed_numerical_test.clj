@@ -161,14 +161,14 @@
         (testing "structural certification cannot disguise corrupt payload bytes"
           (with-open [channel (FileChannel/open path (into-array OpenOption [StandardOpenOption/WRITE]))]
             (.write channel (ByteBuffer/wrap (byte-array [(byte 127)])) 0))
-          (is (= :checkpoint-digest
+          (is (= :numerical-content-chunk-digest
                  (:reason (ex-data (try
                                      (with-open [unexpected (open-checkpoint-lease path certified)] nil)
                                      (catch clojure.lang.ExceptionInfo error error)))))))
         (testing "a truncated payload fails its extent contract before restoration"
           (with-open [channel (FileChannel/open path (into-array OpenOption [StandardOpenOption/WRITE]))]
             (.truncate channel (dec byte-count)))
-          (is (= :checkpoint-size
+          (is (= :numerical-content-chunk-extent
                  (:reason (ex-data (try
                                      (with-open [unexpected (open-checkpoint-lease path certified)] nil)
                                      (catch clojure.lang.ExceptionInfo error error))))))))

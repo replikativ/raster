@@ -11,7 +11,9 @@
   (:require [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.numerical-state :as numerical-state])
   (:import [java.lang AutoCloseable]
-           [java.lang.foreign MemorySegment]))
+           [java.lang.foreign MemorySegment]
+           [java.security MessageDigest]
+           [java.util HexFormat]))
 
 (defrecord StorageTier [id kind locality durability capabilities attributes])
 (defrecord ContentProviderDescriptor [id tiers capabilities attributes])
@@ -185,6 +187,60 @@
            :numerical-content-lease-closed {:content (:content lease)}))
   (.asSlice ^MemorySegment (:segment lease) (long (:byte-offset lease))
             (long (:byte-length lease))))
+
+(defn content-address-of
+  "Hash immutable stored bytes without materializing the whole segment on the Java heap.
+
+   This is the address of the stored payload, not of its decoded numerical values. A fixed-size
+   staging array also works for mapped chunks larger than ByteBuffer's int-indexed limit."
+  [^MemorySegment segment]
+  (when-not (instance? MemorySegment segment)
+    (fail! "content hashing requires a MemorySegment"
+           :numerical-content-hash-segment {:actual (type segment)}))
+  (let [digest (MessageDigest/getInstance "SHA-256")
+        scratch (byte-array 65536)
+        scratch-segment (MemorySegment/ofArray scratch)
+        total (.byteSize segment)]
+    (loop [offset 0]
+      (when (< offset total)
+        (let [n (int (min (long (alength scratch)) (- total offset)))]
+          (MemorySegment/copy segment offset scratch-segment 0 n)
+          (.update digest scratch 0 n)
+          (recur (+ offset n)))))
+    (numerical-state/content-address :sha-256
+                                     (.formatHex (HexFormat/of) (.digest digest)))))
+
+(defn verify-chunk-lease!
+  "Verify a localized chunk's exact stored extent and SHA-256 before restore or device upload.
+
+   Structural manifest certification alone cannot attest bytes returned by a storage provider.
+   The caller retains ownership of `lease` on success and failure and must close it."
+  [chunk lease]
+  (when-not (numerical-state/state-chunk? chunk)
+    (fail! "chunk verification requires a StateChunk"
+           :numerical-content-chunk-type {:actual (type chunk)}))
+  (numerical-state/chunk chunk)
+  (let [segment (lease-segment lease)
+        expected (:content chunk)]
+    (when-not (= expected (:content lease))
+      (fail! "local lease names a different chunk"
+             :numerical-content-chunk-identity
+             {:chunk (:id chunk) :expected expected :actual (:content lease)}))
+    (when-not (= (:stored-byte-length chunk) (.byteSize ^MemorySegment segment))
+      (fail! "localized chunk extent differs from its manifest"
+             :numerical-content-chunk-extent
+             {:chunk (:id chunk) :expected (:stored-byte-length chunk)
+              :actual (.byteSize ^MemorySegment segment)}))
+    (when-not (= :sha-256 (:algorithm expected))
+      (fail! "chunk content-address algorithm has no runtime verifier"
+             :numerical-content-chunk-algorithm
+             {:chunk (:id chunk) :algorithm (:algorithm expected)}))
+    (let [actual (content-address-of segment)]
+      (when-not (= expected actual)
+        (fail! "localized chunk bytes differ from their content address"
+               :numerical-content-chunk-digest
+               {:chunk (:id chunk) :expected expected :actual actual}))))
+  lease)
 
 (defn provider-descriptor
   [provider]
