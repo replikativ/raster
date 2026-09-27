@@ -219,6 +219,47 @@
     (is (= 3 (count (:cases ordinary)))
         "power-of-two production tiles add no comparisons beyond existing capacity guards")))
 
+(deftest register-tiled-loop-updates-cannot-overflow-at-the-int-boundary
+  (let [kernel-body (:kernel-body
+                     (register-tiled/lower
+                      (contraction-with-dimensions 1 1 Integer/MAX_VALUE)
+                      {:tile register-tiled/default-tile}))
+        source (body-emit/emit-scalar-kernel "register_tile_int_limit" kernel-body)]
+    (is (str/includes?
+         source
+         "for (int rstr_register_k_block = 0; rstr_register_k_block < 2147483647;)"))
+    (is (str/includes?
+         source
+         (str "(uint)(2147483647) - (uint)(rstr_register_k_block)"
+              " <= (uint)(16)"))
+        "the outer K loop breaks before its exiting increment could overflow int")
+    (doseq [staging-index ["rstr_register_a_index" "rstr_register_b_index"]]
+      (is (str/includes?
+           source
+           (str "(uint)(1024) - (uint)(" staging-index ") <= (uint)(256)"))
+          "cooperative staging loops also guard their dynamic starting indices"))
+    (is (str/includes?
+         source
+         (str "for (int rstr_register_k_inner = 0; rstr_register_k_inner < 16;"
+              " rstr_register_k_inner += 1)"))
+        "the finite inner tile loop's exiting increment remains representable")))
+
+(deftest symbolic-long-k-keeps-a-long-guarded-induction-variable
+  (let [kernel-body (:kernel-body
+                     (register-tiled/lower
+                      (contraction-with-dimensions 1 1 'depth)
+                      {:tile register-tiled/default-tile
+                       :scalar-types {'depth :long}}))
+        source (body-emit/emit-scalar-kernel "register_tile_long_k" kernel-body)]
+    (is (str/includes?
+         source
+         "for (long rstr_register_k_block = (long)(0); rstr_register_k_block < depth;)"))
+    (is (str/includes?
+         source
+         (str "(ulong)(depth) - (ulong)(rstr_register_k_block)"
+              " <= (ulong)(16)"))
+        "a long K is not narrowed merely to reuse the conservative dispatch constraint")))
+
 (deftest a-destination-reading-result-transform-stores-through-one-read-write-parameter
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/+ acc (raster.numeric/* beta (clojure.core/aget C (clojure.core/+ (clojure.core/* i 8) j))))

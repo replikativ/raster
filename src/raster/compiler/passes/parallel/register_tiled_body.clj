@@ -97,7 +97,9 @@
    load or store.  IndexBinding and the row/column IndexCompute values are int, so this quantity
    must not exceed INT_MAX.  The resulting maximum logical extent is
    `floor((INT_MAX+1)/t)*t`.  Keeping this derivation here lets static admission and runtime
-   selection consume the same schedule fact."
+   selection consume the same schedule fact. The K constraint is deliberately conservative when
+   a symbolic K selects a long loop induction variable: row/column coordinates remain int and the
+   existing dispatch capacity policy already imposes the stricter positive-domain limit."
   [[m n k] {:keys [block-m block-n block-k]}]
   (let [limit (fn [tile-width]
                 (when-not (pos-int? tile-width)
