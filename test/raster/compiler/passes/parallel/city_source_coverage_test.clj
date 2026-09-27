@@ -87,6 +87,27 @@
                     operation :array-types array-types :scalar-types scalar-types))]
     {:scheduled scheduled :artifact artifact :operation operation}))
 
+(deftest effectful-tuples-initialize-sequentially-and-update-simultaneously
+  (let [{:keys [scheduled artifact operation]}
+        (emitted-body #'city/three-carry-effects! {'out :int} {'n :long 'nc :long})
+        execute (eval (list 'fn '[out n nc] (segop-simd/compile-effect-segmap operation)))
+        body (get-in artifact [:attributes :kernel-body])
+        operations (tree-seq #(and (map? %) (contains? % :operations)) :operations body)
+        loop (first (filter #(seq (:iter-args %)) operations))]
+    (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
+    (is (= 3 (count (:iter-args loop))))
+    (is (= 3 (count (:results loop))))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (= :kernel-body
+             (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :target-dialect target :array-types {'out :int}
+                      :scalar-types {'n :long 'nc :long}) [:attributes :emission-route]))))
+    (doseq [nc [0 1 2 3 7]]
+      (let [expected (int-array 9) actual (int-array 9)]
+        (city/three-carry-effects! expected 3 nc)
+        (execute actual 3 nc)
+        (is (= (vec expected) (vec actual)))))))
+
 (deftest walked-scalar-helpers-and-constants-use-the-shared-typed-route
   (doseq [v [#'city-like-helper-map! #'city-like-constant-map!]]
     (let [{:keys [scheduled artifact]}

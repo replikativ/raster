@@ -17,8 +17,8 @@
                       :locals [{:id 'loaded :dtype :float :init '(aget x (+ (* i 8) k))}]
                       :effects [{:destination 'words :dtype :float :conflict :unique
                                  :destination-index '(+ (* i 8) k) :predicate true :value 'loaded}]
-                      :carry {:parameter 'acc :result 'sum :dtype :float
-                              :init 'seed :update (with-meta '(+ acc loaded) {:raster.type/tag 'double})}}}
+                      :carries [{:parameter 'acc :result 'sum :dtype :float
+                                 :init 'seed :update (with-meta '(+ acc loaded) {:raster.type/tag 'double})}]}}
                {:destination 'totals :dtype :float :conflict :unique
                 :destination-index 'i :predicate true :value 'sum}]}}))
 
@@ -54,13 +54,13 @@
                     (dialect/effect-lambda-form
                      '[source initial row-count packed sums]
                      [(list 'effect-loop {:index 'k :lower 0
-                                          :carry {:parameter 'acc :result 'sum :dtype :float}}
-                            trips 'initial
+                                          :carries [{:parameter 'acc :result 'sum :dtype :float}]}
+                            trips ['initial]
                             (list 'lambda '[k acc]
                                   (list 'effect-region
                                         [(dialect/local-value 'loaded :float '(aget source (+ (* i 8) k)))]
                                         [(list 'effect 'packed :unique '(+ (* i 8) k) true 'loaded)]
-                                        (with-meta '(+ acc loaded) {:raster.type/tag 'double}))))
+                                        [(with-meta '(+ acc loaded) {:raster.type/tag 'double})])))
                       (list 'effect 'sums :unique 'i true 'sum)])))
         equation-facts (assoc (dialect/default-equation-facts)
                               :effects #{:memory/read :memory/write}

@@ -76,7 +76,7 @@
 
 (defn- effect-accesses
   [effect destination-parameters locals loops]
-  (let [{:keys [region loop index lower upper-bound extent lambda carry destination destination-index
+  (let [{:keys [region loop index lower upper-bound extent lambda carries destination destination-index
                 predicate value conflict]}
         (dialect/effect-parts effect)]
     (cond
@@ -85,7 +85,7 @@
       loop
       (let [loop-scope {:index index :extent extent :lower lower
                         :upper-bound upper-bound :kind :effect-loop}
-            prefix (expressions-accesses (cond-> [lower extent] carry (conj (:init carry)))
+            prefix (expressions-accesses (into [lower extent] (map :init carries))
                                          destination-parameters locals loops)
             body (dialect/lambda-parts lambda)
             scoped (local-accesses (:locals body) destination-parameters locals
@@ -95,7 +95,7 @@
                       (mapcat #(effect-accesses % destination-parameters (:locals scoped)
                                                (conj loops loop-scope))
                               (:body-results body))
-                      (when-let [result (:effect-result body)]
+                      (when-let [result (:effect-results body)]
                         (expression-accesses result destination-parameters (:locals scoped)
                                              (conj loops loop-scope))))))
 
@@ -217,8 +217,7 @@
                       [(:accumulator attributes)])
 
                     (dialect/effect-loop-form? form)
-                    (when-let [carry (:carry (dialect/effect-parts form))]
-                      [(:parameter carry) (:result carry)]))))
+                    (mapcat (juxt :parameter :result) (:carries (dialect/effect-parts form))))))
         (filter #(or (dialect/scalar-fold-form? %)
                      (dialect/effect-loop-form? %))
                 (tree-seq coll? seq lambda))))

@@ -88,39 +88,44 @@
     body))
 
 (defn counted-loop
-  "Spell the validated scheduled counted-loop contract, including its optional typed carry.
-   Bounds/initializer are evaluated once. Stores precede recurrence evaluation. A zero-trip loop
-   returns its initializer. Result scope is supplied separately by `ordered-effects`."
-  [generated-cast {:keys [index lower upper-bound extent locals carry]} ordered-body]
-  (let [{:keys [parameter dtype init update]} carry
-        tag (when carry (generated-cast (dtype/scalar-tag-for-dtype dtype)))
-        index-tag (if carry 'clojure.core/long 'clojure.core/int)
+  "Spell the validated scheduled counted-loop contract with simultaneous typed carry updates.
+   Initializers are already outer-scope operands. Stores precede recurrence evaluation, and a
+   zero-trip loop returns the initial tuple. Result scope is supplied by `ordered-effects`."
+  [generated-cast {:keys [index lower upper-bound extent locals carries]} ordered-body]
+  (let [tags (mapv #(generated-cast (dtype/scalar-tag-for-dtype (:dtype %))) carries)
+        index-tag (if (seq carries) 'clojure.core/long 'clojure.core/int)
         limit (gensym "effect_carry_limit__")
-        initial (gensym "effect_carry_init__")
-        next-value (gensym "effect_carry_next__")
+        initials (mapv (fn [_] (gensym "effect_carry_init__")) carries)
+        next-values (mapv (fn [_] (gensym "effect_carry_next__")) carries)
         inclusive? (= :inclusive upper-bound)
-        advance (list (if carry 'clojure.core/unchecked-inc
+        advance (list (if (seq carries) 'clojure.core/unchecked-inc
                           'clojure.core/unchecked-inc-int) index)
-        recur-form (if carry
-                     (list 'let* [next-value (list tag (strip-binder-tags update))]
+        recur-form (if (seq carries)
+                     (list 'let* (vec (mapcat (fn [next tag carry]
+                                               [next (list tag (strip-binder-tags (:update carry)))])
+                                             next-values tags carries))
                            (if inclusive?
                              (list 'if (list 'clojure.core/= index limit)
-                                   next-value (list 'recur advance next-value))
-                             (list 'recur advance next-value)))
+                                   next-values (list* 'recur advance next-values))
+                             (list* 'recur advance next-values)))
                      (if inclusive?
                        (list 'if (list 'clojure.core/= index limit)
                              nil (list 'recur advance))
                        (list 'recur advance)))]
-    (list 'let* (cond-> [limit (list index-tag extent)]
-                  carry (conj initial (list tag (strip-binder-tags init))))
-          (list 'loop* (cond-> [(vary-meta index dissoc :tag) (list index-tag lower)]
-                         carry (conj (vary-meta parameter dissoc :tag) initial))
+    (list 'let* (into [limit (list index-tag extent)]
+                     (mapcat (fn [initial tag carry]
+                               [initial (list tag (strip-binder-tags (:init carry)))])
+                             initials tags carries))
+          (list 'loop* (into [(vary-meta index dissoc :tag) (list index-tag lower)]
+                            (mapcat (fn [carry initial]
+                                      [(vary-meta (:parameter carry) dissoc :tag) initial])
+                                    carries initials))
                 (list 'if (list (if inclusive? 'clojure.core/<= 'clojure.core/<)
                                 index limit)
                       (typed-locals
                        generated-cast locals
                        (list 'do ordered-body recur-form))
-                      parameter)))))
+                      (when (seq carries) (mapv :parameter carries)))))))
 
 (defn ordered-effects
   "Spell scheduled effects as a host continuation. `emit-store` receives a store descriptor;
@@ -138,7 +143,16 @@
                  loop (emit-loop loop (ordered-effects (:effects loop) emitters))
                  :else (emit-store effect))
           continuation (ordered-effects (next effects) emitters)]
-      (if-let [result (or (get-in loop [:carry :result]) (:result effect))]
-        (list 'let* [(vary-meta result dissoc :tag) form] continuation)
-        (list 'do form continuation)))
+      (cond
+        (seq (:carries loop))
+        (let [tuple (gensym "effect_results__")]
+          (list 'let* (into [tuple form]
+                            (mapcat (fn [ordinal {:keys [result dtype]}]
+                                      [(vary-meta result dissoc :tag)
+                                       (list (storage-cast true (dtype/scalar-tag-for-dtype dtype))
+                                             (list 'clojure.core/nth tuple ordinal))])
+                                    (range) (:carries loop))) continuation))
+        (:result effect)
+        (list 'let* [(vary-meta (:result effect) dissoc :tag) form] continuation)
+        :else (list 'do form continuation)))
     nil))

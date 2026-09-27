@@ -5,12 +5,12 @@
 
 (deftest result-binding-encloses-only-the-ordered-continuation
   (let [effects [{:source '(swap! log conj result)}
-                 {:loop {:carry {:result 'result}
+                 {:loop {:carries [{:result 'result :dtype :long}]
                          :effects [{:source '(swap! log conj :inside)}]}}
                  {:source '(swap! log conj result)}]
         form (source/ordered-effects
               effects {:emit-store :source
-                       :emit-loop (fn [_ body] (list 'do body 11))})
+                       :emit-loop (fn [_ body] (list 'do body [11]))})
         execute (eval (list 'fn '[log result] form))
         log (atom [])]
     (is (contains? (util/free-syms form) 'result)

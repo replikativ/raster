@@ -366,8 +366,8 @@
                                  :equation equation-id :results results
                                  :storage storage :effects effects :dtypes result-dtypes})))
             loop-statement
-            (fn [{:keys [index lower extent locals carry] :as loop} ordered-body]
-              (if carry
+            (fn [{:keys [index lower extent locals carries] :as loop} ordered-body]
+              (if (seq carries)
                 (effect-source/counted-loop generated-cast loop ordered-body)
                 ;; Preserve the existing source loop's induction policy when no carry is present.
                 (list 'loop* [index lower]

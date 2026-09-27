@@ -64,6 +64,19 @@
                (set (map :name (filter #(= :no-write-alias (:aliasing %)) (:abi ki))))))
       (finally (gpu/close-session! session)))))
 
+(deftest three-carry-effects-match-jvm-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "three carried values on " device))
+      (doseq [nc [0 1 2 7]]
+        (let [expected (int-array 9)
+              _ (city/three-carry-effects! expected 3 nc)
+              actual (run-device :three-carry-effects #'city/three-carry-effects!
+                                 {:out [:int 9 (int-array 9)]}
+                                 {"n" 3 "nc" nc} 3 [:out] device)]
+          (is (= (vec expected) (:out actual)) (str device " trips=" nc)))))))
+
 (deftest terminal-moments-match-jvm-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]

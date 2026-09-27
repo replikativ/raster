@@ -55,7 +55,7 @@
     (is (= 'effect-map (dialect/operation-kind equation)))
     (is (empty? (:locals parts)))
     (is (= [false true false] (mapv #(boolean (:loop %)) effects)))
-    (is (some? (:carry (second effects))))
+    (is (seq (:carries (second effects))))
     (is (= :independent (-> equation dialect/operation-parts :attributes :iteration-order)))
     (is (nil? (execute (float-array [1 2 3 4 5 6]) packed scales sums 2 3 (float 2.5))))
     (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (vec packed)))

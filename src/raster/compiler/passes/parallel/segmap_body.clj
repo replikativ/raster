@@ -300,8 +300,9 @@
                      (-> loop
                          (update :lower substitute)
                          (update :extent substitute)
-                         (cond-> (:carry loop)
-                           (update :carry #(-> % (update :init substitute) (update :update substitute))))
+                         (update :carries #(mapv (fn [carry]
+                                                  (-> carry (update :init substitute)
+                                                      (update :update substitute))) %))
                          (update :locals (fn [locals] (mapv #(update % :init substitute) locals)))
                          (update :effects (fn [effects]
                                             (mapv #(substitute-effect substitutions %) effects))))))
@@ -337,23 +338,23 @@
                  (:operations inner))
                :masks (:masks inner)})
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                    :keys [lower upper-bound extent carry]} (:loop effect)]
+                    :keys [lower upper-bound extent carries]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
             ;; locals are SSA values scoped to one iteration and its stores keep their own
             ;; per-destination contracts.
-            (let [cast-carry (fn [expression environment]
+            (let [cast-carry (fn [carry expression environment]
                                (let [lowered ((:lower lowerer) expression (:dtype carry) environment)]
                                  ((:cast lowerer) lowered (:dtype carry) expression)))
-                  initial (when carry (cast-carry (:init carry) environment))
+                  initials (mapv #(cast-carry % (:init %) environment) carries)
                   ;; Lexical sibling loops may reuse source binders; KernelBody identities may not.
                   source-index loop-index
-                  loop-index (if carry ((:fresh-binding lowerer) "effect-index") loop-index)
-                  parameter (when carry ((:fresh-binding lowerer) "effect-carry"))
-                  renames (cond-> {} carry (assoc source-index loop-index (:parameter carry) parameter))
+                  loop-index (if (seq carries) ((:fresh-binding lowerer) "effect-index") loop-index)
+                  parameters (mapv (fn [_] ((:fresh-binding lowerer) "effect-carry")) carries)
+                  renames (into {source-index loop-index} (map vector (map :parameter carries) parameters))
                   loop-locals (mapv #(update % :init (partial util/subst-syms renames)) loop-locals)
                   loop-effects (mapv #(substitute-effect renames %) loop-effects)
-                  loop-environment (cond-> (assoc environment loop-index :long)
-                                     carry (assoc parameter (:dtype carry)))
+                  loop-environment (into (assoc environment loop-index :long)
+                                         (map vector parameters (map :dtype carries)))
                   loop-state (lower-locals loop-locals loop-environment)
                   inner (reduce (fn [{:keys [environment operations masks]} effect]
                                   (let [next (lower-effect environment
@@ -363,28 +364,30 @@
                                         (update :masks #(into masks %)))))
                                 {:environment (:environment loop-state)
                                  :operations [] :masks []} loop-effects)
-                  update-value (when carry
-                                 (cast-carry
+                  update-values (mapv (fn [carry]
+                                 (cast-carry carry
                                   (util/subst-syms (:substitutions loop-state)
                                                   (util/subst-syms renames (:update carry)))
-                                  (:environment inner)))
+                                  (:environment inner))) carries)
                   loop-operation (body/->ForLoop
                                   (body/value loop-index :long)
                                   (lower-index lower (set (keys environment)) environment)
                                   (lower-index extent (set (keys environment)) environment)
                                   1
-                                  (if carry [(body/->LoopArg (body/value parameter (:dtype carry))
-                                                            (:result initial))] [])
+                                  (mapv (fn [carry parameter initial]
+                                          (body/->LoopArg (body/value parameter (:dtype carry))
+                                                          (:result initial)))
+                                        carries parameters initials)
                                   (vec (concat (:operations loop-state) (:operations inner)
-                                               (:operations update-value)
-                                               [(body/->Yield (if carry [(:result update-value)] []))]))
-                                  (if carry [(body/value (:result carry) (:dtype carry))] [])
+                                               (mapcat :operations update-values)
+                                               [(body/->Yield (mapv :result update-values))]))
+                                  (mapv #(body/value (:result %) (:dtype %)) carries)
                                   (cond-> {:association :ordered :source-order true}
                                     (= :inclusive upper-bound)
                                     (assoc :upper-bound :inclusive)))]
-              {:operations (conj (vec (:operations initial)) loop-operation)
+              {:operations (conj (vec (mapcat :operations initials)) loop-operation)
                :masks (:masks inner)
-               :environment (cond-> environment carry (assoc (:result carry) (:dtype carry)))})
+               :environment (into environment (map (juxt :result :dtype) carries))})
           (do
           (when-not (contains? output-set destination)
             (decline! :effect-destination

@@ -70,7 +70,7 @@
         carry-parameter
         (some (fn [form]
                 (when (dialect/effect-loop-form? form)
-                  (get-in (dialect/effect-parts form) [:carry :parameter])))
+                  (get-in (dialect/effect-parts form) [:carries 0 :parameter])))
               (tree-seq coll? seq (dialect/equations program)))
         carry-dependent
         (rewrite
@@ -79,7 +79,7 @@
         mismatched-domain
         (rewrite
          #(if (and (dialect/effect-loop-form? %)
-                   (nil? (:carry (dialect/effect-parts %))))
+                   (empty? (:carries (dialect/effect-parts %))))
             (apply list (assoc (vec %) 2 (list 'clojure.core/+ (nth % 2) 1))) %))
         opaque-use
         (rewrite

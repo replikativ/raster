@@ -582,15 +582,15 @@
   "Apply the shared lexical scope engine to a source loop descriptor. A closed-core let scope
    carries the local initializers and operand payloads; no separate carry/local scope walker is
    maintained here. The bound and carry initializer remain outside the body parameter scope."
-  [substitutions {:keys [index locals stores loops order carry] :as loop} & [fresh-index]]
+  [substitutions {:keys [index locals stores loops order carries] :as loop} & [fresh-index]]
   (binding [util/*shadowing-locals*
             (into util/*shadowing-locals* (filter symbol? (vals substitutions)))]
     (let [fields [:index :predicate :value]
-          payload (cond-> (mapv #(mapv % fields) stores) carry (conj (:update carry)))
+          payload (into (mapv #(mapv % fields) stores) (map :update carries))
           body (list 'let* (vec (mapcat (juxt :id :init) locals)) payload)
           scope (util/subst-scoped substitutions
-                                   (cond-> [index] carry (conj (:parameter carry))) [body])
-          [bound-index parameter] (:binders scope)
+                                   (into [index] (map :parameter carries)) [body])
+          [bound-index & parameters] (:binders scope)
           body (if fresh-index
                  (util/subst-syms {bound-index fresh-index} (first (:body scope)))
                  (first (:body scope)))
@@ -600,9 +600,9 @@
           local-renames (into {}
                               (map (fn [local [id _]] [(:id local) id]) locals local-pairs))
           nested-substitutions
-          (cond-> (into substitutions (assoc local-renames index next-index))
-            carry (assoc (:parameter carry) parameter))]
-      (cond-> (assoc loop
+          (into (into substitutions (assoc local-renames index next-index))
+                (map vector (map :parameter carries) parameters))]
+      (assoc loop
                      :index next-index
                      :lower (util/subst-syms substitutions (:lower loop))
                      :extent (util/subst-syms substitutions (:extent loop))
@@ -611,10 +611,12 @@
                      :stores (mapv (fn [store values] (merge store (zipmap fields values)))
                                    stores payload)
                      :loops (mapv #(substitute-loop nested-substitutions %) loops)
-                     :order (when order (substitute-order order nested-substitutions)))
-        carry (assoc :carry (assoc carry :parameter parameter
-                                   :init (util/subst-syms substitutions (:init carry))
-                                   :update (peek payload)))))))
+                     :order (when order (substitute-order order nested-substitutions))
+                     :carries (mapv (fn [carry parameter update]
+                                      (assoc carry :parameter parameter
+                                             :init (util/subst-syms substitutions (:init carry))
+                                             :update update))
+                                    carries parameters (drop (count stores) payload))))))
 
 (defn- substitute-loop [substitutions loop]
   (instantiate-store-loop substitutions loop))
@@ -645,8 +647,10 @@
         ;; those uses free (the Q8_K block sum is one such continuation).
         loop (cond-> (dissoc loop :synthetic-carry-result?)
                (:synthetic-carry-result? loop)
-               (assoc-in [:carry :result]
-                         (symbol (str "rstr_loop_carry_result_" suffix))))]
+               (update :carries #(mapv (fn [ordinal carry]
+                                        (assoc carry :result
+                                               (symbol (str "rstr_loop_carry_result_" suffix "_" ordinal))))
+                                      (range) %)))]
     (update loop :loops
             (fn [children]
               (mapv (fn [ordinal child]
@@ -719,34 +723,21 @@
 (defn- split-trailing-recur
   "Split a counted loop's tail recurrence from its ordered stores. Carried loops require the
    shared exact long induction-step contract, without erasing narrowing conversions."
-  [form index carried?]
+  [form index]
   (let [step? (fn [x]
-                (and (seq? x) (= 'recur (first x)) (= (if carried? 3 2) (count x))
-                     (if carried?
-                       (and (empty? (set/intersection
-                                     (disj (util/free-syms (second x)) index)
-                                     util/*shadowing-locals*))
-                            (patterns/ordered-unit-step? (second x) index))
-                       (let [update (strip-index-cast (second x))]
-                         (or (patterns/ordered-unit-step? update index)
-                             ;; Preserve the historical narrow syntax while all callers migrate
-                             ;; to the shared affine matcher above.
-                             (and (seq? update) (= 2 (count update))
-                                  (contains? '#{inc clojure.core/inc} (first update))
-                                  (= index (strip-index-cast (second update))))
-                             (and (seq? update) (= 3 (count update))
-                                  (contains? '#{+ clojure.core/+} (first update))
-                                  (= index (strip-index-cast (second update)))
-                                  (= 1 (strip-index-cast (nth update 2)))))))))]
+                (and (seq? x) (= 'recur (first x)) (= 3 (count x))
+                     (empty? (set/intersection (disj (util/free-syms (second x)) index)
+                                               util/*shadowing-locals*))
+                     (patterns/ordered-unit-step? (second x) index)))]
     (cond
-      (step? form) {:body '(do) :update (when carried? (nth form 2))}
+      (step? form) {:body '(do) :update (nth form 2)}
       (and (seq? form) (= 'do (first form)) (step? (last form)))
       {:body (list* 'do (butlast (rest form)))
-       :update (when carried? (nth (last form) 2))}
+       :update (nth (last form) 2)}
       ;; The walker may retain a singleton `do` between the counted loop's guard and its
       ;; lexical `let`. It does not change the recurrence's effect order or scope.
       (and (seq? form) (= 'do (first form)) (= 2 (count form)))
-      (split-trailing-recur (second form) index carried?)
+      (split-trailing-recur (second form) index)
       ;; (let* [...] stmt… (recur …)) — the closed-core spelling puts the statements directly
       ;; in the let body; normalize them into one `do` before the recursive recognition.
       (and (seq? form) (symbol? (first form)) (form/let-head? (first form)) (<= 3 (count form)))
@@ -754,7 +745,7 @@
             inner (if (= 1 (count statements))
                     (first statements)
                     (list* 'do statements))]
-        (when-let [split (split-trailing-recur inner index carried?)]
+        (when-let [split (split-trailing-recur inner index)]
           (update split :body #(list head bindings %))))
       :else nil)))
 
@@ -810,7 +801,7 @@
         (when-let [split (split-trailing-recur-many inner index carry-count int-bounded?)]
           (update split :body #(list head bindings %)))))))
 
-(declare store-region pointwise-input? source-effect-destinations)
+(declare store-region pointwise-input? source-effect-destinations retain-free-scalar-reference-types)
 
 (defn- terminal-store-reduction
   "Project a pure counted recurrence before its ordered terminal effect region.
@@ -874,52 +865,35 @@
                    :body (list* 'do body)}
 
                   (and (symbol? head) (form/loop-head? head)
-                       (vector? bindings) (= 2 (count bindings))
-                       (symbol? (first bindings))
-                       (not (util/effectful? (second bindings)))
-                       (= 1 (count body)))
-                  (let [[loop-index lower] bindings
-                        conditional (first body)]
-                    (when (and (seq? conditional)
-                               (contains? '#{if clojure.core/if} (first conditional))
-                               (<= 3 (count conditional) 4)
-                               (nil? (nth conditional 3 nil)))
-                      (let [[_ test then] conditional]
-                        (when (and (seq? test) (= 3 (count test))
-                                   (contains? '#{< <= clojure.core/< clojure.core/<=}
-                                              (first test))
-                                   (= loop-index (strip-index-cast (second test))))
-                          (when-let [split (split-trailing-recur then loop-index false)]
-                            {:index loop-index :lower lower
-                             :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))
-                                            :inclusive :exclusive)
-                             :extent (strip-index-cast (nth test 2))
-                             :body (:body split)})))))
-
-                  (and (symbol? head) (form/loop-head? head)
-                       (vector? bindings) (= 4 (count bindings))
+                       (vector? bindings) (<= 2 (count bindings)) (even? (count bindings))
                        (every? symbol? (take-nth 2 bindings))
                        (not-any? util/effectful? (take-nth 2 (rest bindings)))
                        (= 1 (count body)))
-                  (let [[loop-index lower parameter init] bindings
+                  (let [[loop-index lower] bindings
+                        pairs (vec (partition 2 (drop 2 bindings)))
+                        parameters (mapv first pairs)
+                        dtypes (mapv (fn [[parameter init]] (retained-local-dtype parameter init)) pairs)
                         conditional (first body)]
                     (when (and (seq? conditional)
                                (contains? '#{if clojure.core/if} (first conditional))
                                (<= 3 (count conditional) 4)
                                (nil? (nth conditional 3 nil))
-                               (not= loop-index parameter))
-                      (let [[_ test then] conditional
-                            carry-dtype (retained-local-dtype parameter init)]
+                               (= (inc (count parameters)) (count (set (cons loop-index parameters)))))
+                      (let [[_ test then] conditional]
                         (when (and (seq? test) (= 3 (count test))
                                    (contains? '#{< <= clojure.core/< clojure.core/<=}
                                               (first test))
                                    (= loop-index (strip-index-cast (second test)))
-                                   (contains? #{:int :long :float :double} carry-dtype)
-                                   (not (contains? (util/free-syms (nth test 2)) parameter)))
+                                   (every? #{:int :long :float :double} dtypes)
+                                   (empty? (set/intersection (set parameters) (util/free-syms (nth test 2)))))
                           (when-let [split (split-trailing-recur-many
-                                            then loop-index 1
+                                            then loop-index (count parameters)
                                             (and (contains? '#{< clojure.core/<} (first test))
-                                                 (= :int (retained-local-dtype loop-index lower))
+                                                 (or (= :int (retained-local-dtype loop-index lower))
+                                                     (= :int (some-> lower retained-expression-tag
+                                                                     dtype/dtype-for-scalar-tag))
+                                                     (and (integer? lower)
+                                                          (<= Integer/MIN_VALUE lower Integer/MAX_VALUE)))
                                                  (= :int (some-> (nth test 2)
                                                                  retained-expression-tag
                                                                  dtype/dtype-for-scalar-tag))))]
@@ -927,34 +901,44 @@
                              :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))
                                             :inclusive :exclusive)
                              :extent (strip-index-cast (nth test 2))
-                             :body (:body split)
-                             :carry {:parameter parameter :dtype carry-dtype :init init
-                                     :update (first (:updates split))}}))))))]
+                             :body (:body split) :initial-bindings bindings
+                             :carries (mapv (fn [[parameter init] dtype update]
+                                              {:parameter parameter :dtype dtype :init init :update update})
+                                            pairs dtypes (:updates split))}))))))]
     (when (and counted
                (not= (:index counted) index)
                (not (contains? (util/free-syms (:lower counted)) (:index counted)))
                (not (contains? (util/free-syms (:extent counted)) (:index counted))))
       (when-let [region (store-region (:body counted) index
-                                     (get-in counted [:carry :update]))]
+                                     (when (seq (:carries counted)) (mapv :update (:carries counted))))]
         (when (or (seq (:stores region)) (seq (:loops region)))
           ;; The loop index and the body locals get their own names: a source loop index may
           ;; shadow a captured scalar of the enclosing region, and the region's SSA namespace
           ;; must not confuse the two.
-          (let [loop-index (symbol (str "rstr_loop_index_" (name (:index counted))))
-                parameter (when-let [source (get-in counted [:carry :parameter])]
-                            (symbol (str "rstr_loop_carry_" (name source))))
-                result (when parameter
-                         (fresh-projected-id "rstr_loop_carry_result"
-                                             (util/free-syms form)))
-                renames (into (cond-> {(:index counted) loop-index}
-                                parameter (assoc (get-in counted [:carry :parameter]) parameter))
+          (let [carries (:carries counted)
+                loop-index (symbol (str "rstr_loop_index_" (name (:index counted))))
+                parameters (mapv #(symbol (str "rstr_loop_carry_" (name (:parameter %)))) carries)
+                renames (into (into {(:index counted) loop-index}
+                                    (map vector (map :parameter carries) parameters))
                               (map (fn [{:keys [id]}]
                                      [id (symbol (str "rstr_loop_" (name id)))])
-                                   (:locals region)))]
+                                   (:locals region)))
+                ;; Source loop* initialization is a sequential binding spine. Keep each read
+                ;; and conversion once, before the loop, without putting parameters in scope.
+                initial-state
+                (when (seq carries)
+                  (reduce (fn [{:keys [locals substitutions]} [id init]]
+                            (let [fresh (fresh-region-local-id!)
+                                  dtype (retained-local-dtype id init)]
+                              {:locals (conj locals {:id fresh :dtype dtype
+                                                      :init (util/subst-syms substitutions init)})
+                               :substitutions (assoc substitutions id fresh)}))
+                          {:locals [] :substitutions {}}
+                          (partition 2 (:initial-bindings counted))))]
             {:locals []
              :stores []
              :loops [(cond-> {:index loop-index
-                              :lower (:lower counted)
+                              :lower (get (:substitutions initial-state) (:index counted) (:lower counted))
                               :upper-bound (:upper-bound counted :exclusive)
                               :extent (:extent counted)
                               :locals (mapv (fn [{:keys [id] :as local}]
@@ -964,14 +948,19 @@
                               :stores (mapv #(substitute-store renames %) (:stores region))
                               :loops (mapv #(substitute-loop renames %) (:loops region))
                               :order (substitute-order (region-order region) renames)}
-                       parameter
+                       (seq carries)
                        (assoc :synthetic-carry-result? true
-                              :carry {:parameter parameter :result result
-                                      :dtype (get-in counted [:carry :dtype])
-                                      :init (util/subst-syms renames
-                                                             (get-in counted [:carry :init]))
-                                      :update (util/subst-syms renames (:result region))}))]
-             :order [[:loop 0]]}))))))
+                              :carries (mapv (fn [ordinal carry parameter update]
+                                               (assoc carry :parameter parameter
+                                                      :result (fresh-projected-id
+                                                               (str "rstr_loop_carry_result_" ordinal)
+                                                               (util/free-syms form))
+                                                      :init (get (:substitutions initial-state) (:parameter carry))
+                                                      :update (util/subst-syms renames update)))
+                                             (range) carries parameters (:result region))))]
+             :order (if (seq (:locals initial-state))
+                      [[:region {:locals (:locals initial-state) :order [[:loop 0]]}]]
+                      [[:loop 0]])}))))))
 
 (defn- carried-store-binding
   "Recognize a typed result-valued store loop followed by ordered stores or store loops.
@@ -1013,7 +1002,7 @@
                                             (util/free-syms (nth test 2))))
                    (empty? (set/intersection #{loop-index parameter} (util/free-syms init)))
                    (not (util/effectful? init)))
-          (when-let [{:keys [body update]} (split-trailing-recur then loop-index true)]
+          (when-let [{:keys [body update]} (split-trailing-recur then loop-index)]
             (when-not (util/effectful? update)
               (let [region (store-region body index update)
                     continuation (store-region (list* 'do tail) index)]
@@ -1022,8 +1011,8 @@
                   {:locals [] :stores (:stores continuation)
                    :loops (into [{:index loop-index :lower lower :extent extent
                             :locals (:locals region) :stores (:stores region)
-                            :carry {:parameter parameter :result result :dtype dtype
-                                    :init init :update (:result region)}}]
+                            :carries [{:parameter parameter :result result :dtype dtype
+                                       :init init :update (:result region)}]}]
                                 (:loops continuation))
                    :order (let [order (map-region-order (region-order continuation) identity 0 1)]
                             (into [[:loop 0]]
@@ -1130,12 +1119,17 @@
       (when (and (even? (count bindings))
                  (seq nested-body)
                  (not-any? util/effectful? (take-nth 2 (rest bindings))))
-        (when-let [nested-region (store-region (list* 'do nested-body) index result-expression)]
           (let [pairs (vec (partition 2 bindings))
                 typed (mapv (fn [[binding init]]
                               [binding init (retained-local-dtype binding init)])
                             pairs)]
             (when (every? (comp some? #(nth % 2)) typed)
+              (when-let [nested-region
+                         (store-region
+                          (retain-free-scalar-reference-types
+                           (list* 'do nested-body)
+                           (into {} (map (fn [[id _ dtype]] [id dtype]) typed)))
+                          index result-expression)]
               (let [{:keys [locals substitutions]}
                     (reduce (fn [{:keys [locals substitutions]} [binding init local-dtype]]
                               (let [id (fresh-region-local-id!)]
@@ -1671,8 +1665,7 @@
    uniform array reads become invariant atoms (`destinations` are the region's written arrays)."
   [store index extent locals loops destinations]
   (let [loop (when (:loop store) (nth loops (:loop store)))
-        carry-bindings (set (mapcat #(when-let [carry (:carry %)]
-                                      [(:parameter carry) (:result carry)]) loops))
+        carry-bindings (set (mapcat #(mapcat (juxt :parameter :result) (:carries %)) loops))
         index-expanded (reduce (fn [expression {:keys [id init]}]
                                  (util/subst-syms {id init} expression))
                                (:index store) (reverse (concat locals (:locals loop))))
@@ -1759,13 +1752,13 @@
   [loops]
   (mapcat (fn [loop] (cons loop (loop-tree (:loops loop)))) loops))
 
-(defn- source-loop-expressions [{:keys [lower extent locals order carry loops]}]
+(defn- source-loop-expressions [{:keys [lower extent locals order carries loops]}]
   ;; Ordered regions inside an effect loop may guard a store or bind a scalar search result
   ;; before that store. Both are reads of the enclosing equation even though neither is a
   ;; loop bound or a store leaf. Omitting them loses array/scalar captures and the read effect.
   (concat [lower extent] (map :init locals)
           (map :init (order-locals order)) (order-predicates order)
-          (when carry [(:init carry) (:update carry)])
+          (mapcat (juxt :init :update) carries)
           (mapcat source-loop-expressions loops)))
 
 (defn- loop-store-leaves
@@ -1833,11 +1826,11 @@
                                           :extent (substitute environment (:extent loop))
                                           :locals (vec locals)
                                           :effects (rewrite (:effects loop) inner-env path))
-                                   (:carry loop)
-                                   (update :carry (fn [carry]
-                                                    (-> carry
-                                                        (update :init #(substitute environment %))
-                                                        (update :update #(substitute inner-env %))))))})
+                                   (seq (:carries loop))
+                                   (update :carries #(mapv (fn [carry]
+                                                            (-> carry
+                                                                (update :init (partial substitute environment))
+                                                                (update :update (partial substitute inner-env)))) %)))})
 
                         :else
                         (reduce (fn [store field]
@@ -1911,8 +1904,8 @@
                           (concat (map (fn [loop] [(:index loop) :long]) (loop-tree loops))
                                   (map (juxt :id :dtype) loop-region-locals)))]
     (when (and (or (seq stores) (seq loops))
-               (every? (fn [{:keys [lower extent carry]}]
-                         (or (nil? carry)
+               (every? (fn [{:keys [lower extent carries]}]
+                         (or (empty? carries)
                              (every? (fn [bound]
                                        (let [scalar (strip-index-cast bound)]
                                          (or (integer? scalar)
@@ -2075,8 +2068,7 @@
             loop-expressions (mapcat source-loop-expressions loops)
             scoped-predicates (order-predicates order)
             all-effect-loops (vec (loop-tree loops))
-            carry-bindings (set (mapcat #(when-let [carry (:carry %)]
-                                          [(:parameter carry) (:result carry)])
+            carry-bindings (set (mapcat #(mapcat (juxt :parameter :result) (:carries %))
                                         all-effect-loops))
             effect-result-bindings (set (keep :result all-stores))
             iteration-order (when ordered?
@@ -2128,7 +2120,7 @@
                                 :effects (project-order (region-order loop))}
                          (= :inclusive (:upper-bound loop))
                          (assoc :upper-bound :inclusive)
-                         (:carry loop) (assoc :carry (:carry loop)))}))
+                         (seq (:carries loop)) (assoc :carries (:carries loop)))}))
             loop-effects (mapv (fn [ordinal loop]
                                  (project-loop loop [:loop ordinal]))
                                (range) loops)
@@ -4393,21 +4385,21 @@
                 (dialect/effect-guard-region (transform guard) locals effects)
                 (dialect/effect-lambda-region locals effects)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                    :keys [lower upper-bound extent carry]} (:loop effect)]
+                    :keys [lower upper-bound extent carries]} (:loop effect)]
             (let [local-forms (mapv (fn [{:keys [id dtype init]}]
                                       (dialect/local-value id dtype
                                                            (canonicalize-scalar-folds
                                                             (transform init) dtype)))
                                     loop-locals)
                   body (cond-> (list 'effect-region local-forms (mapv effect-form loop-effects))
-                         carry (concat [(canonicalize-scalar-folds
-                                         (transform (:update carry)) (:dtype carry))]))
+                         (seq carries) (concat [(mapv #(canonicalize-scalar-folds
+                                                        (transform (:update %)) (:dtype %)) carries)]))
                   attributes (cond-> {:index loop-index :lower lower}
                                (= :inclusive upper-bound) (assoc :upper-bound :inclusive)
-                               carry (assoc :carry (select-keys carry [:parameter :result :dtype])))
-                  lambda (list 'lambda (cond-> [loop-index] carry (conj (:parameter carry))) body)]
-              (if carry
-                (list 'effect-loop attributes (transform extent) (transform (:init carry)) lambda)
+                               (seq carries) (assoc :carries (mapv #(select-keys % [:parameter :result :dtype]) carries)))
+                  lambda (list 'lambda (into [loop-index] (map :parameter carries)) body)]
+              (if (seq carries)
+                (list 'effect-loop attributes (transform extent) (mapv #(transform (:init %)) carries) lambda)
                 (list 'effect-loop attributes (transform extent) lambda)))
             (cond-> (list 'effect (get destination-substitutions out)
                           effect-conflict (transform index) (transform predicate)

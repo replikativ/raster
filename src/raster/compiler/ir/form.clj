@@ -194,19 +194,19 @@
   [form & children]
   (with-meta (apply list children) (meta form)))
 
-(defn- effect-result-path
-  "Location of an effect's exported declaration. Its initializer does not bind the result;
-   the enclosing sequential effect region introduces it only for subsequent effects."
+(defn- effect-result-paths
+  "Locations of an effect's exported declarations, introduced only for subsequent effects."
   [effect]
   (when (seq? effect)
     (cond
       (and (= 'effect-loop (first effect))
-           (symbol? (get-in (second effect) [:carry :result])))
-      [1 :carry :result]
+           (vector? (:carries (second effect))))
+      (mapv (fn [ordinal] [1 :carries ordinal :result])
+            (range (count (:carries (second effect)))))
 
       (and (= 'effect (first effect)) (= 7 (count effect))
            (symbol? (:result (nth effect 6))))
-      [6 :result])))
+      [[6 :result]])))
 
 (defn- lambda-strip
   "Split an ftm/fn* arity tail (everything after the param vector) into
@@ -475,29 +475,38 @@
                      (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))) locals))
             (let [result? (= 4 (count form))
               local-count (count locals)
-              result-paths (mapv effect-result-path effects)
-              result-binders (mapv (fn [effect path] (when path (get-in (vec effect) path)))
-                                   effects result-paths)]
+              result-paths (mapv effect-result-paths effects)
+              widths (mapv #(max 1 (count %)) result-paths)
+              offsets (vec (reductions + local-count widths))
+              result-binders (mapcat (fn [effect paths]
+                                      (if (seq paths)
+                                        (map #(get-in (vec effect) %) paths) [nil]))
+                                    effects result-paths)]
             {:sequential? true
              :scopes [{:binders (into (mapv second locals) result-binders)
-                       :inits (into (mapv #(nth % 3) locals) effects)
+                       :inits (into (mapv #(nth % 3) locals)
+                                    (mapcat (fn [effect width]
+                                              (cons effect (repeat (dec width) nil))) effects widths))
                        :body (if result? [result] [])}]
              :outer []
              :rebuild
              (fn [[{:keys [binders inits body]}] _]
                (let [locals' (mapv (fn [local id init] (rl local (first local) id (nth local 2) init))
                                    locals (take local-count binders) (take local-count inits))
-                     effects' (mapv (fn [effect path result]
-                                      (if path
-                                        (apply rl effect (assoc-in (vec effect) path result))
-                                        effect))
-                                    (drop local-count inits) result-paths (drop local-count binders))]
+                     effects' (mapv (fn [offset paths]
+                                      (let [effect (nth inits offset)]
+                                        (apply rl effect
+                                               (reduce (fn [effect [path result]]
+                                                         (assoc-in effect path result))
+                                                       (vec effect)
+                                                       (map vector paths (drop offset binders))))))
+                                    offsets result-paths)]
                  (apply rl form 'effect-region locals' effects' (when result? body))))})))
 
         ;; The result declaration is not an input use. Conflict/dtype fields are static
         ;; contracts, while destination, coordinate, guard and contribution are lexical uses.
         :effect
-        (when (or (= 6 (count form)) (and (= 7 (count form)) (effect-result-path form)))
+        (when (or (= 6 (count form)) (and (= 7 (count form)) (seq (effect-result-paths form))))
           (let [[head destination conflict coordinate predicate value result] form]
             {:sequential? false :scopes []
              :outer [destination coordinate predicate value]
@@ -508,9 +517,15 @@
         :effect-loop
         (let [[_ attributes extent] form
               carried? (= 5 (count form))
-              lambda (last form)]
+              lambda (last form)
+              carries (:carries attributes [])]
           (when (and (contains? #{4 5} (count form)) (map? attributes)
-                     (seq? lambda) (= 'lambda (first lambda)) (vector? (second lambda)))
+                     (seq? lambda) (= 'lambda (first lambda)) (vector? (second lambda))
+                     (vector? carries)
+                     (= (into [(:index attributes)] (map :parameter carries)) (second lambda))
+                     (= carried? (boolean (seq carries)))
+                     (or (not carried?)
+                         (and (vector? (nth form 3)) (= (count carries) (count (nth form 3))))))
             (let [[_ parameters region] lambda]
             {:sequential? false
              :scopes [{:binders parameters :inits [] :body [region]}]
@@ -518,7 +533,10 @@
              :rebuild
              (fn [[{:keys [binders body]}] [lower extent initial]]
                (let [attributes' (cond-> (assoc attributes :index (first binders) :lower lower)
-                                   carried? (assoc-in [:carry :parameter] (second binders)))
+                                   carried? (update :carries
+                                                     #(mapv (fn [carry parameter]
+                                                               (assoc carry :parameter parameter))
+                                                             % (rest binders))))
                      lambda (list 'lambda (vec binders) (first body))]
                  (if carried?
                    (rl form 'effect-loop attributes' extent initial lambda)
