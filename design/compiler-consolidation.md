@@ -7,6 +7,16 @@ Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/H
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.
 
+Verified dense f16 contractions now produce the same scheduled matrix-body vocabulary for
+the exact DPAS, CUDA MMA, and CDNA MFMA instruction shapes. Authoritative device facts must
+agree with the requested instruction and subgroup width. Direct CUDA/HIP schedules require
+static tile-aligned extents and FP32 output because their current fragment emitters cannot
+preserve masked edges or half-result stores. The CI source fixtures for both vendors start
+at verified contraction facts; HIP remains an explicitly source-only, pinned rocWMMA candidate.
+The public flat contraction route still admits only DPAS emission, and the typed program
+route's mixed-precision matrix alternatives are Intel-specific. Those are the next routing
+obligations, not evidence that a public CUDA/HIP GEMM is already available.
+
 ## Completion order
 
 1. **Control and effects.** Preserve bindings, branch results, ordered effects and loop

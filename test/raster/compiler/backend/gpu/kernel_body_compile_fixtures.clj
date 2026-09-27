@@ -6,6 +6,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.cuda-codegen :as cuda-emit]
             [raster.compiler.backend.gpu.matrix-fragment-source :as fragment-emit]
+            [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.backend.gpu.hip-matrix-candidate-test :as hip-matrix-fixture]
             [raster.compiler.backend.gpu.indexed-attention :as indexed-attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
@@ -205,6 +206,27 @@
     (segop-emit/generate-contraction-kernel-body
      (:body planned) :target-dialect dialect
      :kernel-name-prefix "portable_contraction")))
+
+(defn- verified-direct-matrix-body
+  "Cross-vendor source gate starts at the same verified tensor contraction, not a hand-built body."
+  [family]
+  (let [subgroup (if (= family :mma) 32 64)
+        instruction {:family family :m 16 :n 16 :k 16 :subgroup subgroup}
+        form '(raster.par/contract C [[i 64] [j 64]] [[l 64]]
+                                   (raster.numeric/*
+                                    (aget A (+ (* i 64) l))
+                                    (aget B (+ (* l 64) j)))
+                                   :out-dtype :float)
+        proof (contraction-facts/contraction-facts form :dtype :half)
+        planned (contraction-schedule/plan-matrix-body
+                 proof {:backend (if (= family :mma) :cuda :hip)
+                        :matrix instruction}
+                 {:block-m 64 :block-n 64 :block-k 32
+                  :sg-m 32 :sg-n 32 :num-stages 3 :matrix instruction})]
+    (when-not (:ok planned)
+      (throw (ex-info "verified direct matrix fixture did not schedule"
+                      (assoc planned :family family))))
+    (:body planned)))
 
 (defn- outer-product-artifact
   [dialect]
@@ -756,7 +778,11 @@
                (.mkdirs matrix-directory)
                [(write-source! matrix-directory suffix "mfma-uniform-epilogue"
                                (fragment-emit/emit-matrix-kernel
-                                "mfma_uniform_epilogue" (hip-matrix-fixture/candidate-body) :hip))]))
+                                "mfma_uniform_epilogue" (hip-matrix-fixture/candidate-body) :hip))
+                (write-source! matrix-directory suffix "mfma-verified-contract"
+                               (fragment-emit/emit-matrix-kernel
+                                "mfma_verified_contract"
+                                (verified-direct-matrix-body :mfma) :hip))]))
            (when (= :cuda target)
              [(write-source!
                directory suffix "matrix-uniform-epilogue"
@@ -769,7 +795,12 @@
                          :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
                   :epilogue {:acc 'acc
                              :expr '(raster.numeric/max (raster.numeric/* acc alpha) (float 0.0))
-                             :scalars [{:sym 'alpha :dtype :float}]}})))])
+                             :scalars [{:sym 'alpha :dtype :float}]}})))
+              (write-source!
+               directory suffix "mma-verified-contract"
+               (:source (matrix-target/emit-matrix-kernel
+                         "mma_verified_contract"
+                         (verified-direct-matrix-body :mma) :cuda)))])
            (map-indexed
             (fn [index artifact]
               (write-artifact! directory suffix (str "equation-first-" index) artifact))
