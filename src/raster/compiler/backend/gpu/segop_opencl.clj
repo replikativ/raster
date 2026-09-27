@@ -959,7 +959,17 @@
            (let [certificate (scheduled-body/validate-against-node!
                               (get scheduled-bodies (:id node)) node graph)]
              (kernel-body-target/emit-artifact
-              (str "graph_scheduled_" (gensym "")) certificate target-dialect))))]
+              (str "graph_scheduled_" (gensym "")) certificate target-dialect))))
+        strategies (set (map (comp :strategy :attributes)
+                             (vals scheduled-bodies)))
+        strategy (when (and (= 1 (count (:nodes graph))) (= 1 (count strategies)))
+                   (first strategies))
+        existing (get-in emitted [:attributes :strategy])
+        _ (when (and strategy existing (not= strategy existing))
+            (throw (ex-info "certified graph strategy differs from its scheduled body"
+                            {:reason :kernel-graph-certified-strategy
+                             :graph-strategy existing :body-strategy strategy})))
+        emitted (cond-> emitted strategy (assoc-in [:attributes :strategy] strategy))]
     (finalize-emitted-graph
      emitted (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
      scalar-types)))
