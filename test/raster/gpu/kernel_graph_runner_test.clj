@@ -223,6 +223,12 @@
                         session handle :warmup-iterations 1 :budget-ms 1
                         :min-samples 3 :max-samples 3)]
           (is (= [["bound_call_probe" emitted]] @registered))
+          (is (= #{:x :out}
+                 (get-in @session [:kernel-graphs :candidate
+                                   :resident-footprint :buffer-keys])))
+          (is (= #{:x :out}
+                 (set (map :key (vals (get-in @session
+                                              [:kernel-graphs :candidate :resident-views]))))))
           (is (= {:kind :kernel-artifact :strategy nil :precision nil
                   :entry-points ["bound_call_probe"] :selection :fixed :admission []}
                  (gpu/kernel-graph-execution-info session handle)))
