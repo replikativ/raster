@@ -399,8 +399,11 @@
       (is (= "0\n1\n" (with-out-str (is (nil? (eval (:form emitted))))))))))
 
 (deftest declined-raw-effect-scheduling-fails-once-without-source-emission
-  (let [attempts (atom 0)]
-    (with-redefs [segop-lower/schedule-single-program (fn [& _] (swap! attempts inc) {})
+  (let [attempts (atom 0)
+        admission-decline {:reason :sequential-effect-continuation
+                           :message "shared row ownership was not proved"}]
+    (with-redefs [segop-lower/schedule-single-program
+                  (fn [& _] (swap! attempts inc) {:declined admission-decline})
                   par-opencl/generate-par-map-void-kernel
                   (fn [& _] (throw (ex-info "source effect emitter reached" {})))]
       (let [failure
@@ -413,6 +416,7 @@
               (catch clojure.lang.ExceptionInfo error error))]
         (is (= 1 @attempts))
         (is (= :unscheduled-effect-map (:reason (ex-data failure))))
+        (is (= admission-decline (:admission-decline (ex-data failure))))
         (is (= :kernel-body (:target-dialect (ex-data failure))))
         (is (= :none (:fallback (ex-data failure))))))))
 

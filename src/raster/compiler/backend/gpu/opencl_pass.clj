@@ -1029,6 +1029,7 @@
                       {:reason :unscheduled-effect-map
                        :source form
                        :target-dialect :kernel-body
+                       :admission-decline (:declined direct-schedule)
                        :scheduling (:stats direct-schedule)
                        :fallback :none}))
                     (emit-nested-map! form)))))

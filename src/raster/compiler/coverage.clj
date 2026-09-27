@@ -116,7 +116,9 @@
                          :emission-declines (count (get-in report [:emission :declines])))
             (seq orders) (assoc :effect-orders orders)))
         (catch Throwable t
-          (assoc row :route :error :error (error-reason t)))))))
+          (cond-> (assoc row :route :error :error (error-reason t))
+            (:admission-decline (ex-data t))
+            (assoc :admission-decline (:admission-decline (ex-data t)))))))))
 
 (defn corpus-report
   "Route facts for every corpus var, with a summary by route."
