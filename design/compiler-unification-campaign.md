@@ -596,6 +596,11 @@ made uniqueness provable and changed the launch to 256 lanes/workgroup. The loca
 from 3.18 ms to 19.8 µs with exact oracle parity. This is a measured schedule correction, not
 a vendor-library comparison. Raw samples and the nonstationary `256×256` result are retained in
 the generated-kernel comparison protocol.
+The first attempted map stored through a derived `(int lane)` local and still scheduled one
+work item. That is a real proof-coverage gap: a narrowing cast is injective only when its
+runtime domain is proven to fit, so the next general ownership slice should carry an explicit
+range fact through the local and certify the derived address. Do not strip the cast or trust a
+`unique-index` claim without that proof. The current source uses the original lane for the store.
 
 Use the measurements to shortlist legal schedules and validate selective autotuning/cache replay.
 If comparable accelerator hardware is unavailable, complete harnesses and correctness gates but
