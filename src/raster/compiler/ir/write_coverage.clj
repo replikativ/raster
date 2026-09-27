@@ -52,11 +52,12 @@
                                    (map #(update % :init substitute)) (:locals region))]
                   (mapcat
                    (fn [effect]
-                     (let [{:keys [region predicate loop index lower upper-bound extent lambda
+                     (let [{:keys [region branch predicate loop index lower upper-bound extent lambda
                                    carries destination conflict destination-index] :as part}
                            (soac/effect-parts effect)]
                        (cond
                          ;; Guarded stores are not a complete domain proof.
+                         branch [nil]
                          (and region (contains? part :predicate)) [nil]
                          region (visit region dimensions locals)
                          loop
@@ -232,10 +233,11 @@
                                        (not-any? (into (set (keys captured))
                                                        (map first dimensions))
                                                  (map :id (:locals region))))
-                              (let [{:keys [region loop index lower extent lambda carries destination
+                              (let [{:keys [region branch loop index lower extent lambda carries destination
                                             destination-index predicate conflict] :as part}
                                     (soac/effect-parts (first (:body-results region)))]
                                 (cond
+                                  branch nil
                                   (and region (contains? part :predicate)) nil
                                   region (visit region dimensions)
                                   loop

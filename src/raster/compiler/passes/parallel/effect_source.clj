@@ -142,7 +142,23 @@
   [effects continuation {:keys [emit-store emit-loop emit-region] :as emitters}]
   (if-let [effect (first effects)]
     (let [loop (:loop effect)
+          branch (:branch effect)
+          results (or (:results branch) (:carries loop))
           form (cond
+                 branch
+                 (let [emit-arm
+                       (fn [{:keys [locals effects yields]}]
+                         (emit-region
+                          locals
+                          (ordered-effects
+                           effects
+                           (mapv (fn [{:keys [dtype]} value]
+                                   (list (storage-cast true (dtype/scalar-tag-for-dtype dtype))
+                                         (strip-binder-tags value)))
+                                 results yields)
+                           emitters)))]
+                   (list 'if (:predicate branch)
+                         (emit-arm (:then branch)) (emit-arm (:else branch))))
                  (:region effect)
                  (let [{:keys [predicate locals effects]} (:region effect)
                        region (emit-region locals (ordered-effects effects nil emitters))]
@@ -153,14 +169,14 @@
                  :else (emit-store effect))
           continuation (ordered-effects (next effects) continuation emitters)]
       (cond
-        (seq (:carries loop))
+        (seq results)
         (let [tuple (gensym "effect_results__")]
           (list 'let* (into [tuple form]
                             (mapcat (fn [ordinal {:keys [result dtype]}]
                                       [(vary-meta result dissoc :tag)
                                        (list (storage-cast true (dtype/scalar-tag-for-dtype dtype))
                                              (list 'clojure.core/nth tuple ordinal))])
-                                    (range) (:carries loop))) continuation))
+                                    (range) results)) continuation))
         (:result effect)
         (list 'let* [(vary-meta (:result effect) dissoc :tag) form] continuation)
         :else (list 'do form continuation)))

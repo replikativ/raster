@@ -56,6 +56,48 @@
   (:source ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'realize-equation)
             (dialect/validate! program) (first (dialect/equations program)))))
 
+(deftest effect-branch-results-preserve-arm-scope-and-simultaneous-carries
+  (doseq [trips [0 1 2 7]
+          decision [:dynamic true false]
+          physical ['x 'choice 'next-a]]
+    (let [program (cond-> (fixture/typed-branch-program trips)
+                    (not= :dynamic decision)
+                    (->> (walk/postwalk (fn [form]
+                                         (if (and (seq? form) (= 'effect-if (first form)))
+                                           (apply list (assoc (vec form) 2 decision)) form)))))
+          program (dialect/remap-values program {'x physical})
+          operation (first (lower/lower-typed-effect-map program :ze:0))
+          arguments [physical 'words 'totals 'rows 'seed]
+          host (eval (list 'fn arguments (host-source program)))
+          scheduled (eval (list 'fn arguments (jvm/compile-effect-segmap operation)))
+          x (float-array (map inc (range 16)))
+          original (float-array (map #(if (even? %) 1.0 -1.0) (range 16)))
+          expected (aclone original)
+          expected-totals
+          (mapv (fn [row]
+                  (loop [k 0 acc (float 0.25) other (float 1.0)]
+                    (if (< k trips)
+                      (let [position (+ (* row 8) k)
+                            loaded (aget x position)
+                            positive? (if (= :dynamic decision) (pos? (aget expected position)) decision)
+                            choice (float (if positive? (+ acc loaded) (- acc loaded)))]
+                        (aset-float expected position (if positive? (- loaded) loaded))
+                        (recur (inc k) other choice))
+                      acc)))
+                (range 2))]
+      (doseq [execute [host scheduled]]
+        (let [words (aclone original) totals (float-array 2)]
+          (execute x words totals 2 (float 0.25))
+          (is (= (vec expected) (vec words)))
+          (is (= expected-totals (vec totals)))))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body
+               (get-in (emit/generate-scheduled-segmap-kernel
+                        operation :dtype :float :target-dialect target
+                        :array-types {physical :float 'words :float 'totals :float}
+                        :scalar-types {'rows :long 'seed :float})
+                       [:attributes :emission-route])))))))
+
 (defn- atomic-result-carry-program []
   (let [program
         (rewrite-loop

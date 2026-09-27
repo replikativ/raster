@@ -1,7 +1,10 @@
 (ns raster.compiler.ir.result-effect-branch-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
-            [raster.compiler.ir.soac-dialect :as dialect]))
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.backend.gpu.segop-opencl :as emit]
+            [raster.compiler.backend.jvm.segop-simd :as jvm]
+            [raster.compiler.passes.parallel.soac-lower :as lower]))
 
 (def result-specs [{:result 'selected :dtype :float}])
 
@@ -134,7 +137,56 @@
                           {:results [{:result 'x :dtype :half}]}
                           {:results [{:result 'x :dtype :float}
                                      {:result 'x :dtype :float}]}]]
-        (is (false? (dialect/effect-form?
+        (is (not (dialect/effect-form?
                      (list 'effect-if attributes true
                            '(effect-region [] [] [0.0])
                            '(effect-region [] [] [0.0])))))))))
+
+(deftest lexical-result-reuse-lowers-to-unique-target-identities
+  (doseq [kind [:atomic :loop :branch :plain-loop]
+          result-name ['ticket 'selected]]
+    (let [arm (fn [value]
+                (dialect/result-effect-region
+                 []
+                 [(case kind
+                    :atomic (list 'effect 'scratch (dialect/reducing-scatter-conflict '+ :float)
+                                  'i true value {:result result-name :dtype :float})
+                    :loop (list 'effect-loop
+                                {:index 'k :lower 0
+                                 :carries [{:parameter 'acc :result result-name :dtype :float}]}
+                                1 [value]
+                                '(lambda [k acc]
+                                   (effect-region [] [(effect scratch :unique i true acc)] [acc])))
+                    :plain-loop '(effect-loop {:index k :lower 0} 1
+                                   (lambda [k] (effect-region [] [(effect scratch :unique i true 1.0)])))
+                    :branch (dialect/effect-branch
+                             [{:result result-name :dtype :float}] true
+                             (dialect/result-effect-region [] [(list 'effect 'scratch :unique 'i true value)] [value])
+                             (dialect/result-effect-region [] [(list 'effect 'scratch :unique 'i true value)] [value])))]
+                 [(if (= kind :plain-loop) value result-name)]))
+          raw (program (dialect/effect-branch result-specs '(= i 0) (arm 1.0) (arm 2.0)))
+          [eq id outputs [op attrs inputs captures destinations [_ _ region]]]
+          (first (dialect/equations raw))
+          tensor (av/tensor {:dtype :float :shape '[n]})
+          facts (-> (dialect/facts raw)
+                    (update :values assoc 'side tensor 'side-result tensor)
+                    (assoc-in [:equations 'e :aliases 'side-result] 'side)
+                    (update-in [:equations 'e :attributes :result-storage]
+                               conj {:destination 'side :access :read-write :host-return :effect}))
+          typed (dialect/make facts
+                              [(list eq id (conj outputs 'side-result)
+                                     (list op (assoc attrs :dtypes [:float :float]) inputs captures
+                                           (conj destinations 'side)
+                                           (list 'lambda '[dst scratch] region)))] [])
+          operation (first (lower/lower-typed-effect-map typed :ze:0))
+          execute (eval (list 'fn '[out side n] (jvm/compile-effect-segmap operation)))
+          out (float-array [10 20])]
+      (execute out (float-array [10 20]) 2)
+      (is (= (if (= kind :atomic) [10.0 20.0] [1.0 2.0]) (vec out)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body
+               (get-in (emit/generate-scheduled-segmap-kernel
+                        operation :dtype :float :target-dialect target
+                        :array-types {'out :float 'side :float} :scalar-types {'n :long})
+                       [:attributes :emission-route]))
+            (str kind " " result-name " " target))))))

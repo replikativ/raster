@@ -73,16 +73,20 @@ Multi-store branch scopes use the existing guarded regions, including entry snap
 their stores can change the predicate. Source/JVM and public OpenCL/Level Zero replay oracles
 cover both arms, zero trips, and a mutable predicate; no new kernel node or emitter is needed.
 
-Several recurrence sites with carried values remain open. The next extension needs a typed
-result-bearing effect branch, not conditional updates reconstructed after the effects. Each arm
-must yield the same typed tuple after its effects; only fresh merged results escape. KernelBody
-already has multi-result IfRegion/Yield. The missing work is the canonical effect dialect,
-lexical validation/traversals and source projection. The shared JVM effect builder now accepts
+Several source recurrence sites with carried values remain open. The canonical effect dialect
+now has a typed result-bearing branch, rather than conditional updates reconstructed after
+the effects. Each arm yields the same typed tuple after its effects; only fresh merged results
+escape. Lexical rebinding, validation, ownership reads, JVM projection and scheduling consume
+this contract. KernelBody uses its existing multi-result IfRegion/Yield, with no new emitter
+or control node. Branch complete-write proofs conservatively decline; they do not union arm
+writes without a coverage proof. Source recognition is the next extension, not yet enabled.
+The shared JVM effect builder accepts
 an explicit continuation and loop-body callback: recurrence stays inside the scope of exported
 effect results. Both host materialization routes use that one contract; a returned atomic value
 feeding the same loop's carry is covered without changing surface syntax or numeric policy.
-Test old-tuple swaps, branch-local loads used once,
-predicate reads changed by stores, and zero trips. Early exits remain a separate contract.
+Canonical tests cover old-tuple swaps, branch-local loads, name collisions, predicate reads
+changed by stores, zero trips, and actual OpenCL execution. CUDA/HIP source emission is checked;
+native execution is not claimed. Early exits remain a separate contract.
 
 Source initialization retains a typed sequential local spine at the loop's effect position.
 All recurrence updates see the old tuple after the body effects and yield simultaneously.

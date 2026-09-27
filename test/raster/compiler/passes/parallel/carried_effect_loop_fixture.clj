@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.carried-effect-loop-fixture
   "Scheduled and canonical region fixtures; analyzed-source admission is not claimed."
-  (:require [raster.compiler.backend.gpu.segop-opencl :as emit]
+  (:require [clojure.walk :as walk]
+            [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]))
@@ -77,3 +78,38 @@
        :inputs '[x seed rows] :equations {:carry equation-facts}
        :effects #{:memory/read :memory/write}})
      [equation] [])))
+
+(defn typed-branch-program
+  "A source-free carried algorithm: the branch observes memory before writing it and exports
+   two values for a simultaneous carry update. Arm-local names deliberately coincide."
+  [trips]
+  (let [base (typed-program trips)
+        arm (fn [operator stored]
+              (list 'effect-region
+                    [(dialect/local-value 'choice :float
+                                          (with-meta (list operator 'acc 'loaded)
+                                            {:raster.type/tag 'double}))]
+                    [(list 'effect 'packed :unique '(+ (* i 8) k) true stored)]
+                    ['other 'choice]))
+        equations
+        (walk/postwalk
+         (fn [form]
+           (if (dialect/effect-loop-form? form)
+             (let [[head attributes extent initializers [lambda parameters [region locals]]] form]
+               (list head
+                     (update attributes :carries conj {:parameter 'other :result 'other-result :dtype :float})
+                     extent (conj initializers '(float 1.0))
+                     (list lambda (conj parameters 'other)
+                           (list region locals
+                                 [(list 'effect-if
+                                        {:results [{:result 'next-a :dtype :float}
+                                                   {:result 'next-b :dtype :float}]}
+                                        '(> (aget packed (+ (* i 8) k)) 0.0)
+                                        (arm '+ (with-meta '(- loaded) {:raster.type/tag 'float}))
+                                        (arm '- 'loaded))]
+                                 ['next-a 'next-b]))))
+             form))
+         (dialect/equations base))
+        facts (assoc-in (dialect/facts base)
+                        [:equations :carry :attributes :result-storage 0 :access] :read-write)]
+    (dialect/make facts equations [])))
