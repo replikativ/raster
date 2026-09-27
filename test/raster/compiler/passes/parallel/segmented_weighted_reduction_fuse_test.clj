@@ -224,8 +224,48 @@
         scheduled-plan (:algorithm (last (:equations (:scheduled compilation))))]
     (is (swr/plan? semantic-plan))
     (is (= semantic-plan scheduled-plan))
+    (is (= :indexed-segmented-reduction-reference
+           (get-in compilation [:scheduled :equations
+                                (dec (count (get-in compilation [:scheduled :equations])))
+                                :operations 0 :attributes :strategy])))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 1 (count (:kernels compilation))))))
+
+(deftest public-equation-first-selects-only-explicit-subgroup-policy
+  (let [compilation (equation-first/compile
+                     #'resident-structured-reduction-probe
+                     {:target :ze:0 :dtype :float
+                      :schedule {:segmented-weighted-reduction {:strategy :subgroup-score-reuse}}})
+        operation (first (:operations (last (:equations (:emitted compilation)))))
+        index (dec (count (get-in operation [:body :equations])))
+        certificate-path [:body :equations index :operations 0]
+        certificate (get-in operation certificate-path)
+        arguments [(float-array 15) (float-array 15) (float-array 15)
+                   (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
+        identity {:semantic-request-fingerprint "subgroup-public-test"
+                  :compiler-build-fingerprint "test-build"
+                  :source-dependency-fingerprint "test-source"
+                  :target-descriptor-fingerprint "test-target"}
+        restored (equation-artifact/open
+                  identity
+                  (equation-artifact/decode
+                   (equation-artifact/encode (equation-artifact/seal identity compilation))))
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= :reassociated (get-in certificate [:numerics :mode])))
+    (is (= :indexed-segmented-reduction-subgroup-score-reuse
+           (get-in certificate [:attributes :strategy])))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (= 1 (count (:kernels compilation))))
+    (is (seq (emitted-equation/complete-write-domains operation)))
+    (is (= (:outputs (equation-first/lower compilation arguments))
+           (:outputs (equation-first/lower restored arguments))))
+    (doseq [damaged [(update-in operation (conj certificate-path :body :operations) pop)
+                     (assoc-in operation (conj certificate-path :numerics)
+                               {:mode :exact :policy :same-typed-ssa-evaluation-order})]]
+      (is (= :emitted-reduction-subgroup-refinement
+             (reason #(emitted-equation/complete-write-domains damaged)))))
+    (is (= :kernel-precondition-failed
+           (reason #(equation-first/lower compilation (assoc arguments 8 6)))))))
 
 (deftest public-protected-plan-validates-runtime-storage-before-allocation
   (let [compilation (equation-first/compile

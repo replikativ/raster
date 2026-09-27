@@ -204,6 +204,12 @@ through the existing `:result-storage` contract.
    replay matches the independent plan oracle on OpenCL and Level Zero. Arbitrary schedules still
    need their own coverage proof. An entirely empty edge list remains a runtime gap: the local
    OpenCL allocator rejects zero-byte index buffers; empty destination segments are tested.
+   Explicit `:schedule {:segmented-weighted-reduction {:strategy :subgroup-score-reuse}}`
+   now selects the existing generated subgroup leaf on admitted Intel targets. This authorizes
+   its declared Q·K reassociation; edge folds remain ordered. Exact schedule rederivation also
+   proves this leaf's active-component writes plus its disjoint head-zero/tile-zero tail writes.
+   Artifact serialization and public replay retain that proof. `:auto` still chooses reference
+   in the equation-first path; it does not silently promise the compatibility path's dispatch.
 4. Generalize the existing executable slot to graph-or-dispatch. Each alternative must retain
    its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
    common arguments once and allocate only the selected alternative's scratch.

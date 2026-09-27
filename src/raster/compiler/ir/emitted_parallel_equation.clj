@@ -45,12 +45,21 @@
       (let [graph (:graph (equation-graph/make-for-plan-equation body equation))
             certificate (first (:operations equation))
             width (get-in certificate [:body :launch :workgroup-size 0])
-            expected (indexed-body/schedule-reference-for-node
+            subgroup? (= :indexed-segmented-reduction-subgroup-score-reuse
+                         (get-in certificate [:attributes :strategy]))
+            expected ((if subgroup? indexed-body/schedule-score-reuse-for-node
+                                      indexed-body/schedule-reference-for-node)
                       algorithm (first (:nodes graph)) graph
-                      {:subgroup-size width :max-workgroup-size width})]
+                      ;; Reconstruct the leaf, not target discovery: original compilation owns
+                      ;; target admission. Every body, binding, numerical and launch obligation
+                      ;; must still equal the generated candidate below.
+                      (cond-> {:subgroup-size width :max-workgroup-size width}
+                        subgroup? (assoc :device-type :gpu :vendor "Intel"
+                                         :subgroup-sizes #{width})))]
         (when-not (semantic-fingerprint/equivalent? expected certificate)
-          (fail! :emitted-reduction-reference-refinement
-                 "protected reduction requires the exact generated reference schedule" {}))
+          (fail! (if subgroup? :emitted-reduction-subgroup-refinement
+                               :emitted-reduction-reference-refinement)
+                 "protected reduction requires its exact generated schedule" {}))
         (scheduled-body/validate-against-node!
          certificate (first (:nodes graph)) graph)
         graph))
@@ -107,8 +116,10 @@
 
 (defn complete-write-domains
   "Exact output domains proved by schedule rederivation, not ABI write permissions.
-   The reference leaf stores on both active/inactive and valid/invalid shape branches, including
-   empty segments and unused row tails. Other schedules require their own coverage proof."
+   The reference leaf covers the output grid. The subgroup leaf covers each head's components,
+   then its sole head-zero/tile-zero owner writes the remaining row tail with disjoint lane strides.
+   Both write empty destinations and invalid-edge results. Exact rederivation above is required;
+   this is not a general must-write analysis for arbitrary KernelBody or future schedules."
   [emitted]
   (when (swr/plan? (:algorithm emitted))
     (let [{:keys [algorithm]} (validate! emitted)]

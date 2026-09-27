@@ -6,6 +6,7 @@
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-capability :as capability]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as route]
             [raster.compiler.reference.segmented-weighted-reduction :as reference]
             [raster.core :refer [deftm]]
@@ -150,9 +151,13 @@
     (device-probe/opencl-skip! "indexed attention plan oracle" :subgroups)
     (run-case :ocl:0)))
 
-(defn- run-equation-first-case [device-id]
+(defn- run-equation-first-case
+  ([device-id] (run-equation-first-case device-id :reference))
+  ([device-id strategy]
   (let [compilation (equation-first/compile #'resident-indexed-attention-probe
-                                          {:target device-id :dtype :float})
+                                          {:target device-id :dtype :float
+                                           :schedule {:segmented-weighted-reduction
+                                                      {:strategy strategy}}})
         {:keys [plan shape-env buffers]} (test-case)]
     (doseq [edges [4 1]]
       (let [buffers (assoc buffers
@@ -173,7 +178,30 @@
                                     expected actual)))
               (is (= [0.0 0.0 0.0] (mapv actual [4 9 14])))
               (is (= [0.0 0.0 0.0 0.0 0.0] (subvec actual 5 10)))))
-          (finally (link/close! executable)))))))
+          (finally (link/close! executable))))))))
+
+(deftest equation-first-indexed-subgroup-replays-on-level-zero
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "equation-first indexed subgroup")
+    (run-equation-first-case :ze:0 :subgroup-score-reuse)))
+
+(deftest equation-first-indexed-subgroup-replays-on-opencl
+  (if-not @device-probe/opencl-subgroups-available?
+    (device-probe/opencl-skip! "equation-first indexed subgroup" :subgroups)
+    (let [admission (capability/score-reuse (:plan (test-case))
+                                            (hardware/descriptor-for :ocl:0))]
+      (if (= :supported (:status admission))
+        (run-equation-first-case :ocl:0 :subgroup-score-reuse)
+        ;; Subgroup availability alone is not production schedule admission. On a different
+        ;; vendor verify the explicit request declines, rather than claiming local GPU coverage.
+        (is (= (:reason admission)
+               (try
+                 (equation-first/compile
+                  #'resident-indexed-attention-probe
+                  {:target :ocl:0 :dtype :float
+                   :schedule {:segmented-weighted-reduction {:strategy :subgroup-score-reuse}}})
+                 nil
+                 (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception))))))))))
 
 (deftest equation-first-indexed-reference-replays-on-level-zero
   (if-not @gp/gpu-available?
