@@ -181,6 +181,26 @@
           :scalars []
           :nodes [node]})]
     (is (identical? value (scheduled/validate-against-node! value node kernel-graph)))
+    (is (= value (scheduled/validate-against-node!
+                  value (graph/map->ScheduledKernel (into {} node)) kernel-graph))
+        "equal reconstructed nodes remain valid; membership is not object identity")
+    (doseq [storage-path [[:inputs 0 :dtype] [:outputs 0 :dtype]]]
+      (is (= :scheduled-kernel-body-node-storage-dtype
+             (reason-of #(scheduled/validate-against-node!
+                          value node (assoc-in kernel-graph storage-path :double))))
+          "matching effects do not permit silently reinterpreting storage"))
+    (is (= :scheduled-kernel-body-node-storage-dtype
+           (reason-of #(scheduled/validate-against-node!
+                        value node
+                        (assoc kernel-graph :outputs []
+                               :temporaries [(graph/buffer 'output :double 1 :global :temporary)])))))
+    (is (= :scheduled-kernel-body-node-storage-dtype
+           (reason-of #(scheduled/validate-against-node!
+                        value node (assoc-in kernel-graph [:inputs 0 :dtype] :f32))))
+        "physical graph storage uses canonical dtype spelling, as the executable ABI requires")
+    (is (= :scheduled-kernel-body-node-membership
+           (reason-of #(scheduled/validate-against-node!
+                        value (assoc node :id :absent-node) kernel-graph))))
     (testing "source identity and memory effects are independent obligations"
       (is (= :scheduled-kernel-body-source
              (reason-of #(scheduled/validate-against-node!

@@ -232,6 +232,9 @@
         kernel-graph (graph/validate! kernel-graph)
         expected (into {} (map (juxt :buffer :access)) (:uses node))
         actual (into {} (map (juxt :value :access)) (get-in scheduled [:effects :uses]))
+        storage (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                              (:temporaries kernel-graph)))
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
         scalar-arguments (mapv :value (:scalar-bindings scheduled))
         actual-scalars (reduce into #{} (map launch/expression-references scalar-arguments))
@@ -248,6 +251,15 @@
       (fail! :scheduled-kernel-body-node-effects
              "scheduled body pointer effects differ from the graph node uses"
              {:node (:id node) :expected expected :actual actual}))
+    (doseq [[parameter argument] (map vector (get-in scheduled [:body :parameters])
+                                     (:arguments scheduled))
+            :when (not= :scalar (:kind parameter))]
+      (let [buffer (get storage argument)]
+        (when-not (= (:dtype parameter) (:dtype buffer))
+          (fail! :scheduled-kernel-body-node-storage-dtype
+                 "scheduled pointer dtype differs from its graph storage"
+                 {:node (:id node) :parameter (:id parameter) :argument argument
+                  :body-dtype (:dtype parameter) :storage-dtype (:dtype buffer)}))))
     (when-not (= expected-scalars actual-scalars)
       (fail! :scheduled-kernel-body-node-scalars
              "scheduled body scalar dependencies differ from its source operation"
@@ -264,6 +276,10 @@
                  "scheduled scalar binding differs from its GraphScalar dtype"
                  {:node (:id node) :value value :expected dtype
                   :actual (get scalar-types value)}))))
+    (when-not (some #(= node %) (:nodes kernel-graph))
+      (fail! :scheduled-kernel-body-node-membership
+             "scheduled body requires an exact node from its graph"
+             {:node (:id node)}))
     scheduled))
 
 (defn validate-artifact-projection!

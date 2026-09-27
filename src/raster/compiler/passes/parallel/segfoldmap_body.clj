@@ -799,11 +799,6 @@
                              expand-derived)
                         (:shape parameter)))
              graph-elements (some-> buffer :elements extent-expression/canonical)]
-         (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
-           (throw (ex-info "fold-map KernelBody pointer dtype differs from its graph buffer"
-                           {:reason :segfoldmap-storage-dtype :parameter (:id parameter)
-                            :argument argument :parameter-dtype (:dtype parameter)
-                            :graph-dtype (:dtype buffer)})))
          (when-not (and graph-elements
                         (= expected-elements parameter-elements)
                         (or (= expected-elements graph-elements)

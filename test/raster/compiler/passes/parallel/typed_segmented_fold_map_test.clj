@@ -682,7 +682,7 @@
                           forged-attribute-graph)))
           "descriptive graph attributes cannot forge the storage proof"))
     (let [wrong-dtype (make-graph :double elements)]
-      (is (= :segfoldmap-storage-dtype
+      (is (= :scheduled-kernel-body-node-storage-dtype
              (reason-of #(fold-body/validate-against-node!
                           scheduled (first (:nodes wrong-dtype)) wrong-dtype)))))
     (is (= :segfoldmap-schedule-source
