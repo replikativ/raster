@@ -523,17 +523,22 @@
    materializes to `(.invk aset-impl …)`, which a head-only check misses, so an effectful binding
    would be inlined and its effect duplicated or reordered.
 
-   `quote` is opaque: quoted data is not code to be scanned for effects."
+   Binding vectors and evaluated collection literals are traversed too. `quote` is opaque:
+   quoted data is not code to be scanned for effects."
   [expr]
   (boolean
-   (and (seq? expr)
-        (not= 'quote (first expr))
-        (or (void-form? expr)
-            ;; atomic-add! returns a value, but that does not make its read-modify-write pure.
-            (od/atomic-add-op? (od/semantic-op expr))
-            (and (= '.invk (first expr))
-                 (od/aset-op? (:raster.op/original (meta expr))))
-            (some effectful? (rest expr))))))
+   (cond
+     (seq? expr)
+     (and (not= 'quote (first expr))
+          (or (void-form? expr)
+              ;; atomic-add! returns a value, but that does not make its read-modify-write pure.
+              (od/atomic-add-op? (od/semantic-op expr))
+              (and (= '.invk (first expr))
+                   (od/aset-op? (:raster.op/original (meta expr))))
+              (some effectful? (rest expr))))
+
+     (coll? expr) (some effectful? expr)
+     :else false)))
 
 (defn effect-loop-statement?
   "True when a source loop performs effects and has no terminal value.

@@ -87,6 +87,20 @@
                     operation :array-types array-types :scalar-types scalar-types))]
     {:scheduled scheduled :artifact artifact :operation operation}))
 
+(deftest two-exit-search-retains-lazy-lexical-branches
+  (let [{:keys [scheduled artifact operation]}
+        (emitted-body #'city/two-exit-walk!
+                      {'weights :double 'targets :double 'out :int} {'n :long 'nc :long})]
+    (is (= :typed-soac (get-in scheduled [:stats :source-dialect])))
+    (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+    (is (re-find #"while \(1\)" (:source artifact)))
+    (doseq [target [:cuda :hip]]
+      (is (= :kernel-body
+             (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :target-dialect target
+                      :array-types {'weights :double 'targets :double 'out :int}
+                      :scalar-types {'n :long 'nc :long}) [:attributes :emission-route]))))))
+
 (deftest effectful-tuples-initialize-sequentially-and-update-simultaneously
   (let [{:keys [scheduled artifact operation]}
         (emitted-body #'city/three-carry-effects! {'out :int} {'n :long 'nc :long})

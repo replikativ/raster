@@ -12,7 +12,8 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
 1. **Control and effects.** Preserve bindings, branch results, ordered effects and loop
    carries through the existing typed regions. Reuse scalar/product Fold and KernelBody
    control instead of adding recognizers with separate semantics. General effect-loop
-   carry tuples are implemented; multiple recurrence sites and exits remain open. Accepted kernels must
+   carry tuples and pure branch-local exits/recurrences are implemented; effectful multiple
+   recurrence sites remain open. Accepted kernels must
    retain all effects; unknown legality produces a source-located decline.
 2. **One complete memory proof.** Follow `memory-planning-campaign.md`: join logical values,
    storage views, initialization, selected replay order, escape/AD retention and completion
@@ -55,8 +56,10 @@ performance measurements. Cross-row destination reads retain sequential ordering
 Effect-loop carries now use one ordered `:carries` vector across the canonical dialect, lexical
 scope/rebinding, validation, ownership, JVM projection and KernelBody lowering. Counted
 effect-only source loops accept multiple carried values; the result-valued source recognizer
-still admits a single returned carry. Multiple source exits/recurrence sites remain separate
-coverage work, not permission to reinterpret effectful loops as pure Fold terms.
+still admits a single returned carry. Pure search loops now project multiple exits/recurrence
+sites through the existing ordered while-fold. The projection preserves lexical lets and lazy
+branches; it does not reinterpret effectful loops as pure Fold terms. Counted effect loops with
+several recurrence sites remain separate coverage work.
 
 Source initialization retains a typed sequential local spine at the loop's effect position.
 All recurrence updates see the old tuple after the body effects and yield simultaneously.
@@ -68,6 +71,15 @@ Validation includes three-carry source/JVM/OpenCL/Level Zero parity, dependent i
 zero trips, cyclic simultaneous updates, second-result capture avoidance, malformed arities,
 the original city kernels and the existing single-carry/CSR/prefill regression cases. Native
 CUDA/HIP execution remains unclaimed; generated sources use their existing compile gates.
+
+The multi-exit search oracle covers the city candidate walk on OpenCL and Level Zero against
+the JVM, including immediate bound exit. Pure projection tests exercise distinct exit values,
+several recurrence sites and zero-length arrays (untaken reads must not execute). Effects in
+guards, exits, lexical initializers or updates still decline scalar while-fold admission.
+The shared purity predicate now traverses binding vectors and evaluated collection literals;
+quoted data stays opaque. This also prevents beta-reduction from overlooking nested stores or
+value-returning atomics. Subtrees with only exits or only recurrences evaluate their local work
+in that projection, rather than duplicating it just to compute a constant continuation flag.
 
 The shared lexical scope authority also covers existing result-producing atomics: their
 inputs use the preceding scope and their result binds only subsequent effects. Substitution

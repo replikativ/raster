@@ -868,8 +868,58 @@
                  :update-exprs update-exprs
                  :scoped-update-exprs update-exprs}))))))))
 
+(defn- while-decision
+  "Project a pure tail decision tree into continue, simultaneous updates and exit value.
+
+   Exit-only arms have no update projection; recur-only arms have no exit projection. Pruning
+   those arms is safe only because the caller evaluates updates when continuing and the exit
+   after the continue projection returned false. Keep lexical wrappers and lazy conditionals; never
+   speculate a read from an untaken arm. TypedSOAC checks purity before accepting this projection."
+  [expression carries]
+  (let [head (when (seq? expression) (first expression))]
+    (cond
+      (= 'recur head)
+      (when (= (count carries) (count (rest expression)))
+        {:continue true :updates (vec (rest expression)) :recurs? true})
+
+      (and (form/let-head? head) (= 3 (count expression)))
+      (when-let [inner (while-decision (last expression) carries)]
+        (let [wrap #(with-meta (list head (second expression) %) (meta expression))]
+          (cond-> inner
+            ;; A subtree with only one outcome does its work in that outcome's projection.
+            ;; Do not speculate its initializers merely to return a constant continuation flag.
+            (and (:recurs? inner) (contains? inner :exit)) (update :continue wrap)
+            (:recurs? inner) (update :updates #(mapv wrap %))
+            (contains? inner :exit) (update :exit wrap))))
+
+      (and (= 'if head) (= 4 (count expression)))
+      (let [[_ predicate then-expression else-expression] expression
+            then (while-decision then-expression carries)
+            else (while-decision else-expression carries)
+            branch #(with-meta (list 'if predicate %1 %2) (meta expression))]
+        (when (and then else)
+          (cond-> {:continue (cond
+                              (not (or (:recurs? then) (:recurs? else))) false
+                              (not (or (contains? then :exit) (contains? else :exit))) true
+                              :else (branch (:continue then) (:continue else)))
+                   :updates (cond
+                              (not (:recurs? then)) (:updates else)
+                              (not (:recurs? else)) (:updates then)
+                              :else (mapv branch (:updates then) (:updates else)))
+                   :recurs? (or (:recurs? then) (:recurs? else))}
+            (or (contains? then :exit) (contains? else :exit))
+            (assoc :exit (cond
+                           (not (contains? then :exit)) (:exit else)
+                           (not (contains? else :exit)) (:exit then)
+                           :else (branch (:exit then) (:exit else)))))))
+
+      ;; Unknown tail structure containing a recur cannot be treated as an exit. This also
+      ;; conservatively declines nested loop exits until their lexical recurrence is handled.
+      (not-any? #(and (seq? %) (= 'recur (first %))) (tree-seq coll? seq expression))
+      {:continue false :exit expression :recurs? false})))
+
 (defn match-ordered-while-loop
-  "Match a pure data-dependent recurrence whose continuing arm always recurs.
+  "Match a pure data-dependent recurrence with lazy branch-local exits and recurrence sites.
 
    The matcher only exposes source structure. Purity and retained carry types are checked by
    TypedSOAC before a target may schedule it. In particular, mixed recur/side-effect leaves are
@@ -883,27 +933,14 @@
           carry-inits (mapv second pairs)
           body-form (last loop-form)]
       (when (and (seq pairs) (every? symbol? carry-syms)
-                 (= (count carry-syms) (count (set carry-syms)))
-                 (seq? body-form) (= 'if (first body-form)) (= 4 (count body-form)))
-        (let [[_ test then-branch else-branch] body-form
-              then-updates (mapv #(projected-recur-argument
-                                    then-branch % (count pairs)) (range (count pairs)))
-              else-updates (mapv #(projected-recur-argument
-                                    else-branch % (count pairs)) (range (count pairs)))
-              continuing? (cond
-                            (every? some? then-updates) :then
-                            (every? some? else-updates) :else)
-              exit-expr (if (= continuing? :then) else-branch then-branch)]
-          (when (and continuing?
-                     (not-any? #(and (seq? %) (= 'recur (first %)))
-                               (tree-seq coll? seq exit-expr)))
+                 (= (count carry-syms) (count (set carry-syms))))
+        (when-let [decision (while-decision body-form carry-syms)]
+          (when (and (:recurs? decision) (contains? decision :exit))
             {:carry-syms carry-syms
              :carry-inits carry-inits
-             :continue-expr (if (= continuing? :then)
-                              test (list 'if test false true))
-             :exit-expr exit-expr
-             :update-exprs (if (= continuing? :then)
-                             then-updates else-updates)}))))))
+             :continue-expr (:continue decision)
+             :exit-expr (:exit decision)
+             :update-exprs (:updates decision)}))))))
 
 (defn match-binary-reduce-loop
   "Generic matcher for simple binary reduction loops.

@@ -6,6 +6,19 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.par :as par]))
 
+(deftm two-exit-walk!
+  [weights :- (Array double), targets :- (Array double), out :- (Array int),
+   n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (let [selected (loop [q (int 0) acc 0.0]
+                     (if (>= q (int (dec nc)))
+                       q
+                       (let [acc (+ acc (aget weights q))]
+                         (if (< (aget targets i) acc)
+                           q
+                           (recur (int (inc q)) acc)))))]
+      (aset out i (int selected)))))
+
 (deftm three-carry-effects!
   [out :- (Array int), n :- Long, nc :- Long] :- Void
   (par/map-void! i n
