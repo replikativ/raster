@@ -5,6 +5,7 @@
             [raster.compiler.equation-first :as equation]
             [raster.compiler.analysis.physical-liveness :as liveness]
             [raster.compiler.ir.link-plan :as plan]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.passes.local-storage-reuse :as reuse]
             [raster.gpu.core :as gpu]
@@ -65,6 +66,42 @@
         (doseq [{:keys [key node]} (:out-tree prepared)]
           (is (= (get expected key) (vec (get-in result [:outputs node])))
               (str target " " key)))))))
+
+(deftest private-reuse-requires-the-aggregate-semantic-retention-witness
+  (let [original (lowered :ocl:0 (arguments))
+        witness invocation-link/memory-witness
+        bindings (get-in original [:attributes :compiler-buffer-bindings])]
+    (doseq [[linked reason force-unknown?]
+            [[original :unattributed-mutation true]
+             [(update original :attributes dissoc :source)
+              :missing-invocation-retention-certificate false]
+             [(assoc-in original [:attributes :compiler-buffer-bindings] {})
+              :incomplete-compiler-buffer-bindings false]
+             [(assoc-in original [:attributes :compiler-buffer-bindings]
+                        (dissoc bindings (first (keys bindings))))
+              :incomplete-compiler-buffer-bindings false]]]
+      (let [order (selected-order linked)
+            bound (atom [])
+            allocations (count (set (map #(get-in % [:view :allocation :id])
+                                          (vals (:nodes linked)))))]
+        (with-redefs [invocation-link/memory-witness
+                      (fn [certificate]
+                        (if force-unknown?
+                          {:value-versions {:status :unknown
+                                            :unknown [{:reason :unattributed-mutation}]
+                                            ;; A local success must not bypass global doubt.
+                                            :storage {:candidate {:status :witnessed}}}}
+                          (witness certificate)))
+                      reuse/realize-one (fn [& _]
+                                          (throw (ex-info "unproven retention reached reuse" {})))
+                      link/instantiate! (fn [plan] (swap! bound conj plan) ::bound)
+                      link/execution-order (constantly order)
+                      link/instantiation-report (constantly {:owned-allocations allocations})]
+          (let [{:keys [memory]} (#'link/prepare-private-reuse! linked)]
+            (is (= [linked] @bound) "unknown retention still executes the original plan")
+            (is (= [0 0] ((juxt :bytes-saved :allocations-saved) memory)))
+            (is (= :unknown (get-in memory [:retention :status])))
+            (is (= reason (get-in memory [:retention :unknown 0 :reason])))))))))
 
 (deftest typed-program-order-meets-complete-write-evidence
   (let [linked (lowered :ocl:0 (arguments))
@@ -161,6 +198,7 @@
             ;; returns it, and the ordinary resident API still gives distinct temporary storage.
             {:keys [executable memory]} (#'link/prepare-private-reuse! linked)]
         (with-open [executable executable]
+          (is (= {:status :witnessed :unknown []} (:retention memory)))
           (is (= 1 (:allocations-saved memory)))
           (is (= 16 (:bytes-saved memory)))
           (is (= (dec (:owned-allocations-before memory)) (:owned-allocations-after memory)))

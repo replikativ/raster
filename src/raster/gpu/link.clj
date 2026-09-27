@@ -12,6 +12,7 @@
             [raster.compiler.passes.local-storage-reuse :as storage-reuse]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
@@ -933,7 +934,9 @@
 (defn- prepare-private-reuse!
   "Internal proof/binding scope. Never expose the returned executable through a public API."
   [plan]
-  (let [plan (link-plan/validate! plan)]
+  (let [certified (when (= :typed-invocation (get-in plan [:attributes :source]))
+                    (invocation-link/certify plan))
+        plan (if certified (:plan certified) (link-plan/validate! plan))]
     (when-not (and (= 1 (count (:instances plan)))
                    (link-plan/program-link-instance? (first (:instances plan)))
                    (every? #(= :owned (get-in % [:view :allocation :ownership]))
@@ -946,7 +949,18 @@
           _ (when (seq (:record-time-prologue order))
               (throw (ex-info "private storage reuse cannot recycle a record-time prologue"
                               {:reason :link-private-reuse-prologue})))
-          {:keys [plan bytes-saved allocations-saved]} (storage-reuse/realize-one plan order)
+          retention (if certified
+                      (:value-versions
+                       (invocation-link/memory-witness certified))
+                      {:status :unknown
+                       :unknown [{:reason :missing-invocation-retention-certificate}]})
+          ;; Semantic value retention is necessary, not sufficient: realization still checks
+          ;; complete writes, selected replay order and aliases; this scope owns completion and
+          ;; nonescape. Unknown histories execute unchanged, with distinct storage.
+          {:keys [plan bytes-saved allocations-saved]}
+          (if (= :witnessed (:status retention))
+            (storage-reuse/realize-one plan order)
+            {:plan plan :bytes-saved 0 :allocations-saved 0})
           executable (instantiate! plan)]
       (try
         (when-not (= order (execution-order executable))
@@ -958,6 +972,7 @@
                             {:reason :link-private-reuse-allocation-count})))
           {:executable executable
            :memory {:bytes-saved bytes-saved :allocations-saved allocations-saved
+                    :retention (select-keys retention [:status :unknown])
                     :owned-allocations-before before
                     :owned-allocations-after (:owned-allocations after)}})
         (catch Throwable error
