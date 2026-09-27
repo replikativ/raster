@@ -384,6 +384,9 @@ oracle. The compiler fixtures now stage values through both synchronous workgrou
 verified async issue/commit/wait contract; the exact async body is compiled to CUDA sm_80 PTX and
 an RDNA3 HIP code object in hardware-free CI. CUDA/HIP runtime registration, launch and on-device
 numerical coverage remain deliberately separate from source legality.
+The resident CUDA bring-up gates are specified in
+[`cuda-resident-bringup.md`](cuda-resident-bringup.md); compile-only descriptors must not
+be confused with an executable CUDA session.
 
 Paged K/V assignment likewise retains its storage-specific semantic descriptor and unique-slot
 ownership contract, but no longer owns an OpenCL source template. Its one-component-per-work-item
