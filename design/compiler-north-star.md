@@ -1472,7 +1472,9 @@ links declare bandwidth and latency. Concrete `AbstractValue` shapes carry eithe
 or one-axis partitioning; certification proves full coverage, absence of gaps/overlaps, ownership,
 and placement in the mesh. Ordered compute and transfer steps form a fail-loud dependency DAG.
 Its analytic simulator serializes compute per device and transfers per directed link, while allowing
-the two resource classes to overlap, and reports makespan, per-device peak memory, link bytes, and
+the two resource classes to overlap unless a stated transfer capability reserves a route device's
+compute lane. Such reservations must name unique devices on the validated route; arbitrary resource
+names cannot change the simulated schedule. It reports makespan, per-device peak memory, link bytes, and
 total transferred bytes. The re-derived certificate contains those costs and shard/route witnesses.
 This is deliberately a planning model: measured costs may replace analytic durations, and Datahike
 may retain its immutable plan/measurement history, but driver buffers, communicators, and events do
