@@ -112,7 +112,7 @@
    :hip:rdna
    {:type :hip :name "synthetic-rdna"
     :capabilities {:gfx-arch :gfx1100
-                   :wavefront-sizes [32 64]
+                   :wavefront-sizes [32]
                    :wavefront-size 32
                    :max-work-group-size 1024
                    :local-memory-bytes 65536}})
@@ -125,7 +125,7 @@
                    :local-memory-bytes 32768}})
   (let [rdna (hw/descriptor-for :hip:rdna)
         opencl (hw/descriptor-for :ocl:portable)]
-    (is (= #{32 64} (:subgroup-sizes rdna)))
+    (is (= #{32} (:subgroup-sizes rdna)))
     (is (= 32 (:subgroup-size rdna)))
     (is (= 1024 (:max-workgroup-size rdna)))
     (is (= 65536 (get-in rdna [:cache :slm])))
@@ -135,6 +135,20 @@
     (is (= 32768 (get-in opencl [:cache :slm])))
     (is (nil? (hw/shared-memory-bank-model opencl))
         "generic OpenCL does not inherit Intel/NVIDIA/AMD bank topology")))
+
+(deftest hip-rdna-never-admits-an-unsupported-wave64
+  (doseq [[device-id capability]
+          [[:hip:rdna-derived {:gfx-arch :gfx1100}]
+           [:hip:rdna-invalid-set {:gfx-arch :gfx1100 :wavefront-sizes [32 64]}]
+           [:hip:rdna-invalid-preference {:gfx-arch :gfx1100 :wavefront-size 64}]]]
+    (rt/register-target-device!
+     device-id {:type :hip :name (name device-id) :capabilities capability}))
+  (is (= #{32} (:subgroup-sizes (hw/descriptor-for :hip:rdna-derived))))
+  (doseq [device-id [:hip:rdna-invalid-set :hip:rdna-invalid-preference]]
+    (is (= :hardware-rdna-wavefront-unsupported
+           (try (hw/descriptor-for device-id)
+                (catch clojure.lang.ExceptionInfo error
+                  (:reason (ex-data error))))))))
 
 (deftest explicit-bank-topology-overrides-derived-vendor-defaults
   (rt/register-target-device!

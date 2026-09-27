@@ -232,11 +232,20 @@
           :cuda #{32}
           :hip (cond
                  (amd-cdna? caps) #{64}
-                 (amd-rdna? caps) #{32 64}
+                 (amd-rdna? caps) #{32}
                  :else #{})
           #{})
         explicit-widths (supported-widths widths-value)
         explicit-preferred (preferred-width preferred-value)
+        _ (when (and (= :hip target-type)
+                     (amd-rdna? caps)
+                     (or (some #(not= 32 %) explicit-widths)
+                         (and explicit-preferred (not= 32 explicit-preferred))))
+            (throw (ex-info "HIP gfx10+ requires 32-lane wavefronts"
+                            {:reason :hardware-rdna-wavefront-unsupported
+                             :gfx-arch (:gfx-arch caps)
+                             :supported-widths explicit-widths
+                             :preferred-width explicit-preferred})))
         subgroup-sizes (cond-> (if (seq explicit-widths)
                                  explicit-widths
                                  derived-widths)
