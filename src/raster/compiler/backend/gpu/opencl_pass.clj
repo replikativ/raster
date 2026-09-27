@@ -550,7 +550,15 @@
             ;; A compatibility re-entry may need to rebuild structure, but it may never discard
             ;; types already retained by the prior middle-end boundary.
             :scalar-types (merge scalar-types retained-scalar-types)
-            :array-types (merge array-types retained-array-types)})
+            ;; Physical reduction outputs may be rank-zero values in device buffers. They
+            ;; are not source array declarations when re-entering the retained Clojure form.
+            ;; Keep the physical role for emission, but project only tensor-shaped retained
+            ;; values back into the source array environment.
+            :array-types (merge array-types
+                                (into {} (filter (fn [[id _]]
+                                                   (seq (get-in supplied-program0
+                                                                [:values id :shape]))))
+                                      retained-array-types))})
 
           (and (nil? supplied-program) (form/binding-form? form))
           (segop-lower-pass/schedule-source-program
