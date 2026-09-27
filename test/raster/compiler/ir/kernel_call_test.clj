@@ -154,6 +154,33 @@
     (is (= [:resident-x :resident-out] (mapv second (:pointer-pairs plan))))
     (is (= [:float :int] (mapv (comp :type second) (:scalar-pairs plan))))))
 
+(deftest resident-output-capacity-rules-are-shared-before-driver-binding
+  (let [call (kcall/make artifact args)
+        plan (kcall/binding-plan call)
+        capacity (fn [elements]
+                   (fn [value _] (when (= :resident-out value) elements)))
+        reduction (assoc artifact :effects {:kind :scalar-reduction-phase})
+        contraction (-> artifact
+                        (assoc :effects {:kind :tensor-contraction})
+                        (assoc-in [:attributes :out-elems] 4))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"reduction result buffer"
+                          (kcall/validate-resident-output-capacities!
+                           call plan reduction (capacity 2))))
+    (is (= plan (kcall/validate-resident-output-capacities!
+                 call plan reduction (capacity 3))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"contraction output buffer"
+                          (kcall/validate-resident-output-capacities!
+                           call plan contraction (capacity 3))))
+    (is (= plan (kcall/validate-resident-output-capacities!
+                 call plan contraction (capacity 4))))
+    (is (= plan (kcall/validate-resident-output-capacities!
+                 call plan contraction (capacity nil)))
+        "opaque OpenCL handles do not claim a physical allocation capacity")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"output extent must be non-negative"
+                          (kcall/validate-resident-output-capacities!
+                           call plan (assoc-in contraction [:attributes :out-elems] -1)
+                           (capacity 100))))))
+
 (deftest extent-bounds-reject-negative-values-before-launch
   (let [arguments [:resident-x :resident-out
                    {:type :float :value 2.0} {:type :int :value -1}]]

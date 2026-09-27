@@ -346,6 +346,41 @@
      :group-count (:group-count geometry)
      :shared-memory-bytes (:shared-memory-bytes geometry)}))
 
+(defn validate-resident-output-capacities!
+  "Check artifact-declared result extents before a backend contacts its driver.
+
+   `capacity-of` returns the known element capacity of a resident pointer, or nil
+   for an opaque external handle. The backend decides which handles carry trustworthy
+   capacity facts; the artifact/launch rule is shared across backends."
+  [call plan registered capacity-of]
+  (let [{:keys [kernel-name pointer-pairs group-count]} plan
+        results (filterv (fn [[slot _]] (= :result (:role slot))) pointer-pairs)
+        kind (get-in registered [:effects :kind])]
+    (when (contains? #{:pure-reduction :scalar-reduction-phase} kind)
+      (let [required (if (= :scalar-reduction-phase kind)
+                       (long (first group-count)) 1)]
+        (doseq [[slot value] results
+                :let [capacity (capacity-of value slot)]
+                :when (and capacity (< (long capacity) required))]
+          (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
+                          {:kernel-name kernel-name :slot slot
+                           :required-elements required :buffer-elements capacity})))))
+    (when (= :tensor-contraction kind)
+      (let [extent-expr (kart/attribute registered :out-elems)
+            out-elems (long (if (number? extent-expr)
+                              extent-expr
+                              (resolve-value call extent-expr)))]
+        (when (neg? out-elems)
+          (throw (ex-info "resident contraction output extent must be non-negative"
+                          {:kernel-name kernel-name :out-elems out-elems})))
+        (doseq [[slot value] results
+                :let [capacity (capacity-of value slot)]
+                :when (and capacity (< (long capacity) out-elems))]
+          (throw (ex-info "contraction output buffer is smaller than its artifact extent"
+                          {:kernel-name kernel-name :slot slot :out-elems out-elems
+                           :buffer-elements capacity})))))
+    plan))
+
 (defn validate-registered!
   "Prove that a runtime registry entry is the artifact named by this call. Runtime-only cached
    handles may extend the record, so compare compiler-owned fields rather than record equality."
