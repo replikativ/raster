@@ -1,13 +1,62 @@
 (ns raster.compiler.passes.parallel.scheduled-equation-graph-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.dl.nn :as nn]))
+
+(def ^:private indexed-reduction-source
+  '(let* [raw (raster.dl.array-ops/indexed-dot
+               Q K dst src n-nodes n-nodes n-edges dk emb-dim n-heads)
+          weights (raster.dl.array-ops/scale-clamp-exp
+                   raw (raster.numeric// 1.0 (raster.numeric/sqrt dk))
+                   5.0 (clojure.core/* n-edges n-heads))
+          denominator (raster.dl.array-ops/scatter-add
+                       weights dst n-nodes n-edges n-heads)
+          weighted (raster.dl.array-ops/scatter-mul-add
+                    weights V dst src n-nodes n-nodes n-edges dk emb-dim n-heads)
+          normalized (raster.dl.array-ops/segment-div
+                      weighted denominator n-nodes emb-dim n-heads 1.0e-6)]
+     normalized))
+
+(defn- indexed-plan-program
+  []
+  (let [plan (first (indexed-recognize/recognize
+                     indexed-reduction-source :dtype :float :accumulator-dtype :float))
+        runtime-values (vec (distinct (filter symbol? (:runtime-parameters plan))))
+        input-values (into {}
+                           (map (fn [{:keys [id dtype shape]}]
+                                  [id (av/tensor {:dtype dtype :shape shape})]))
+                           (:operands plan))
+        output-description (:output plan)
+        storage-id (:id output-description)
+        result 'semantic-result
+        values (merge input-values
+                      (into {} (map (fn [id] [id (av/tensor {:dtype :long :shape []})]))
+                            runtime-values)
+                      {storage-id (av/tensor {:dtype (:dtype output-description)
+                                              :shape [(:elements output-description)]})
+                       result (av/tensor {:dtype (:dtype output-description)
+                                          :shape (:shape output-description)})})
+        operands (vec (distinct (concat (mapv :id (:operands plan)) runtime-values)))
+        equation (program/->ProgramEquation
+                  :indexed-reduction [:binding 'semantic-result] nil operands [result]
+                  plan [plan] #{:memory/read :memory/write}
+                  {:source :synthetic-indexed-reduction}
+                  {:algorithm-dialect :segmented-weighted-reduction
+                   :result-storage [{:destination storage-id :access :write
+                                     :host-return :buffer}]})]
+    (program/->ParallelProgram
+     :typed-parallel nil values operands [equation] [result]
+     #{:memory/read :memory/write} [] {:source :synthetic-indexed-reduction} {})))
 
 (def ^:private three-map-source
   '(let* [first-effect
@@ -144,3 +193,75 @@
     (is (= :typed-soac (get-in report [:route :source-dialect])))
     (is (= {:kernel-body 4} (get-in report [:emission :routes])))
     (is (empty? (get-in report [:route :declines])))))
+
+(deftest segmented-plan-forms-one-exact-schedule-neutral-source-graph
+  (let [parallel-program (indexed-plan-program)
+        equation (first (:equations parallel-program))
+        plan (:algorithm equation)
+        {:keys [body graph]} (equation-graph/make-for-plan-equation
+                              parallel-program equation)
+        node (first (:nodes graph))]
+    (is (= [equation] (:equations body)))
+    (is (= (:dialect parallel-program) (:dialect body)))
+    (is (= plan (:operation node)))
+    (is (= (mapv :id (:operands plan)) (mapv :id (:inputs graph))))
+    (is (= [(get-in plan [:output :id])] (mapv :id (:outputs graph))))
+    (is (= (mapv :elements (:operands plan)) (mapv :elements (:inputs graph))))
+    (is (= (get-in plan [:output :elements]) (get-in graph [:outputs 0 :elements])))
+    (is (= (set (map :id (:scalars graph))) (:scalar-uses node)))
+    (is (every? #(= :long (:dtype %)) (:scalars graph)))
+    (is (nil? (:abi graph)))
+    (is (nil? (:arguments graph)))))
+
+(deftest segmented-plan-graph-reconstructs-from-its-exact-scheduled-body
+  (let [parallel-program (indexed-plan-program)
+        equation (first (:equations parallel-program))
+        plan (:algorithm equation)
+        semantic (equation-graph/make-for-plan-equation parallel-program equation)
+        source-graph (:graph semantic)
+        scheduled-operation
+        (indexed-body/schedule-reference-for-node
+         plan (first (:nodes source-graph)) source-graph {:subgroup-size 16})
+        scheduled-equation (assoc equation :operations [scheduled-operation])
+        scheduled-program (assoc parallel-program :dialect :scheduled-parallel
+                                  :equations [scheduled-equation])
+        reconstructed (equation-graph/make-for-plan-equation
+                       scheduled-program scheduled-equation)]
+    (is (= [scheduled-operation]
+           (get-in reconstructed [:body :equations 0 :operations])))
+    (is (= source-graph (:graph reconstructed)))
+    (is (= :segmented-weighted-reduction
+           (get-in reconstructed [:graph :provenance :source-dialect])))))
+
+(deftest segmented-plan-graph-preserves-public-scalar-width
+  (let [parallel-program (indexed-plan-program)
+        runtime-id (first (filter symbol?
+                                  (get-in parallel-program
+                                          [:equations 0 :algorithm :runtime-parameters])))
+        parallel-program (assoc-in parallel-program [:values runtime-id :dtype] :int)
+        {:keys [graph]} (equation-graph/make-for-plan-equation
+                         parallel-program (first (:equations parallel-program)))]
+    (is (= :int (:dtype (first (filter #(= runtime-id (:id %)) (:scalars graph))))))))
+
+(deftest segmented-plan-graph-retains-only-an-exact-output-allocation-contract
+  (let [parallel-program (indexed-plan-program)
+        equation (first (:equations parallel-program))
+        descriptor (get-in equation [:algorithm :output])
+        allocation {:destination (:id descriptor) :source-binding-id 4
+                    :extent (:elements descriptor) :initialization :zero
+                    :dtype (:dtype descriptor)}
+        initialized (assoc-in parallel-program [:attributes :allocations] [allocation])
+        {:keys [body graph]} (equation-graph/make-for-plan-equation initialized equation)]
+    (is (= [allocation] (get-in body [:attributes :allocations])))
+    (is (= allocation (get-in graph [:attributes :output-allocation])))
+    (is (= :segmented-plan-output-allocation
+           (reason-of #(equation-graph/make-for-plan-equation
+                        (assoc-in initialized [:attributes :allocations 0 :extent] 1)
+                        equation))))
+    (is (= :segmented-plan-output-allocation
+           (reason-of #(equation-graph/make-for-plan-equation
+                        (update-in initialized [:attributes :allocations] conj allocation)
+                        equation))))
+    (is (= :segmented-plan-equation-boundary
+           (reason-of #(equation-graph/make-for-plan-equation
+                        parallel-program (assoc equation :operations [:not-the-plan])))))))
