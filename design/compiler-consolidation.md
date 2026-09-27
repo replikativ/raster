@@ -91,6 +91,21 @@ scope inconsistency before generalizing effect-loop result tuples; it adds no ne
 
 ## Working rhythm
 
+Public boundary consolidation is still in progress. The city three-carry effect oracle and
+the complete linear/MSE/AD/SGD oracle now replay through `gpu.compiled/lower` with the
+equation-first compiler on both local backends. Explicit effect outputs retain state across
+replays; donated weights consume the previous value handle, while constant training inputs
+are not reuploaded. Closing the executable invalidates its result handles. The RK4 scalar
+loss also crosses this public boundary. Its `u0` clone is currently staged, not a bindable
+public device input; only `target` is exposed as such. This test does not establish replay
+with a replacement initial condition.
+
+Do not switch the public default or delete the descriptor orchestration yet. Remaining gates
+include shared schedule/precision resolution (equation-first currently strips the deprecated
+precision option), retained binding-time admission/tuning evidence, and attention dispatch
+with scratch through the same public API. Quantized Q4_K already has a public compiled
+artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
+
 The current executed workload matrix and bounded projection diagnostic are recorded in
 [local compiler evidence](local-compiler-evidence.md). This separates exact/parity gates from
 nonstationary timing samples and from still-unexecuted native CUDA/HIP claims.

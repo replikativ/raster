@@ -16,7 +16,6 @@
    residency is not a claim that an XMX candidate was selected. Skips visibly without a GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
-            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.dl.array-ops :as ops]
             [raster.dl.attention :as attn]
@@ -24,6 +23,8 @@
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.value :as value]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.descriptor-fixture :as fixture]))
@@ -409,15 +410,16 @@
           (is (seq (:steps p)) "resident descriptor carries kernel steps"))))
     (doseq [[device available? skip!] [[:ze:0 gp/gpu-available? gp/gpu-skip!]
                                       [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
-     (let [compilation (equation-first/compile train {:target device :dtype :float})
-          batch 2 in-f 3 out-f 2 lr 0.01
+     (let [batch 2 in-f 3 out-f 2 lr 0.01
           weights (rnd (* in-f out-f) 31)
           initial-weights (vec weights)
           input (rnd (* batch in-f) 32)
           target (rnd (* batch out-f) 33)
-          plan (equation-first/lower compilation
-                                     [weights input target batch in-f out-f lr])]
-      (is (= :none (get-in compilation [:stats :fallback])))
+          prepared (compiled/lower train [weights input target batch in-f out-f lr]
+                                   {:compiler :equation-first :target device :dtype :float
+                                    :constants '[x tgt] :donate '[W]})
+          plan (get-in prepared [:lowering :plan])]
+      (is (= :none (get-in prepared [:schedule :stats :fallback])))
       (is (= 0 (get-in plan [:attributes :driver-allocations])))
       (let [{:keys [compiler-buffer-bindings compiler-values semantic-outputs memory
                     value-versions]}
@@ -439,12 +441,22 @@
           (skip! (str "gpu-ad-full-train-step-execution on " device))
           (let [expected (aclone weights)
                 previous (volatile! initial-weights)
-                live (gpu-link/instantiate! plan)]
+                prior (volatile! nil)
+                live (compiled/instantiate! prepared)]
             (try
               (dotimes [_ 2]
                 (@train expected input target batch in-f out-f lr)
-                (gpu-link/run! live)
-                (let [out (gpu-link/download live (first (:outputs plan)))]
+                (let [old @prior
+                      result (with-redefs [gpu-link/write!
+                                           (fn [& _]
+                                             (throw (ex-info "resident replay uploaded an input" {})))]
+                               (live (if old {:W old} {})))
+                      next-weights (:W' result)
+                      out (value/->host next-weights)]
+                  (when old
+                    (is (not (value/live? old)) "donation consumes the previous value handle"))
+                  (is (value/live? next-weights))
+                  (vreset! prior next-weights)
                   (is (= (* in-f out-f) (count out) (count expected)))
                   (is (< (rel-err out expected) 1e-3)
                       "each resident replay matches the complete CPU AD and SGD composition")
@@ -455,4 +467,5 @@
                   (vreset! previous (vec out))))
               (is (= initial-weights (vec weights))
                   "the host initialization array is not the evolving resident state")
-              (finally (gpu-link/close! live))))))))))
+              (finally (compiled/close! live)))
+            (is (not (value/live? @prior)) "closing the owner invalidates its result"))))))))
