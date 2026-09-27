@@ -813,7 +813,8 @@
   {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2 :byte 1 :int8 1})
 
 (defn make-buffer
-  "Allocate a persistent shared-memory GPU buffer.
+  "Allocate a persistent shared-memory GPU buffer. Zero-length logical buffers receive one
+  physical byte for a bindable pointer while retaining zero visible capacity.
   Returns a DeviceBuffer that survives across kernel launches.
 
   n: number of elements
@@ -822,8 +823,11 @@
   ([n dtype]
    (let [n (long n)
          elem-size (long (get dtype-byte-sizes dtype 4))
-         byte-size (* n elem-size)
-         seg (alloc-shared byte-size)]
+         _ (when (neg? n)
+             (throw (ex-info "GPU buffer element count must be non-negative"
+                             {:reason :gpu-buffer-negative-elements :elements n})))
+         byte-size (Math/multiplyExact n elem-size)
+         seg (alloc-shared (max 1 byte-size))]
      (->DeviceBuffer seg n byte-size dtype))))
 
 (defn make-buffer-like

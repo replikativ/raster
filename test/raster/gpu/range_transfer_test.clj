@@ -18,6 +18,38 @@
             [raster.gpu.device-probe :as device-probe])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
 
+(defn- check-empty-resident-buffer!
+  [device-id]
+  (g/with-gpu-session [session device-id]
+    (g/alloc! session {:left [:long 0 (long-array 0)]
+                       :right [:long 0 nil]})
+    (is (= 0 (:n-elements (g/buffer session :left))))
+    (is (= 0 (:byte-size (g/buffer session :left))))
+    (is (= [] (vec (g/download session :left))))
+    (is (= 0 (get-in (g/buffer-view session :left) [:view :byte-length])))
+    (g/upload! session :left (long-array 0))
+    (g/upload-range! session :left (long-array 0) {:elements 0})
+    (g/download-range! session :left (long-array 0) {:elements 0})
+    (g/copy-range! session :left :right {:elements 0})
+    (is (= [] (vec (g/download session :right))))
+    (let [event (g/submit-upload-ranges! session [[:left (long-array 0) {:elements 0}]])]
+      (try
+        (is (g/gpu-event? event))
+        (is (true? (g/event-complete? session event)))
+        (g/await-event! session event)
+        (is (= {:bytes 0 :commands 0 :asynchronous? false}
+               (select-keys (g/event-measurement session event)
+                            [:bytes :commands :asynchronous?])))
+        (finally (g/release-event! session event))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (g/upload-range! session :left (long-array 1) {:elements 1})))))
+
+(deftest empty-resident-buffer-on-local-backends
+  (when @gp/gpu-available?
+    (check-empty-resident-buffer! :ze:0))
+  (when @device-probe/opencl-available?
+    (check-empty-resident-buffer! :ocl:0)))
+
 (deftest asynchronous-transfer-batches-use-the-common-event-contract
   (let [buffer {:dtype :float :n-elements 8 :byte-size 32}
         allocation (bview/allocation

@@ -119,9 +119,12 @@ binding, before session setup. Exact reference schedule rederivation proves comp
 writes; changing its stores or enclosing allocation contract is rejected. Shape multiplication
 uses the same checked integer algebra in graph construction and invocation realization.
 
-An attempted zero-membership device case exposed a separate runtime limitation: OpenCL rejects
-the zero-byte index buffer allocation. It is not included as a passing execution case. Supporting
-zero-sized physical allocations without changing logical array extents remains follow-up work.
+The zero-membership case now executes through public compilation and linking on both local
+backends, for both the reference and explicit subgroup schedule. Empty logical index buffers have
+zero visible length and retain one native byte only to provide a bindable pointer. Empty uploads,
+downloads, fills and resident copies enqueue no device transfer. Zero-length asynchronous range
+batches complete immediately under the existing event contract. The independent numerical oracle
+and device replays cover this case; they do not imply that a kernel may read a zero-length buffer.
 
 The existing subgroup score-reuse body now has an independent semantic-graph certificate as
 well. Reference and subgroup candidates share graph/storage validation, shape leaves and ordered
@@ -137,4 +140,4 @@ equation-first path now also admits explicit subgroup selection, with exact opti
 rederivation before granting complete-write initialization. Public compile/lower/LinkPlan execution
 passed both replays of both edge counts on OpenCL and Level Zero (36 assertions), and serialized
 artifact roundtrips preserve the selected schedule. `:auto` still selects reference; automatic
-dispatch/tuning, paged-storage equation coverage and zero-byte physical storage remain open.
+dispatch/tuning and paged-storage equation coverage remain open.

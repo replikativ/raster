@@ -202,8 +202,8 @@ through the existing `:result-storage` contract.
    proved by rederiving the exact generated schedule (including empty-segment and row-tail stores),
    not from an ABI write flag; the emitted artifact must project that same certificate. Public
    replay matches the independent plan oracle on OpenCL and Level Zero. Arbitrary schedules still
-   need their own coverage proof. An entirely empty edge list remains a runtime gap: the local
-   OpenCL allocator rejects zero-byte index buffers; empty destination segments are tested.
+   need their own coverage proof. Entirely empty edge lists now execute on both local backends:
+   zero-length logical index buffers receive a bindable native pointer without a visible element.
    Explicit `:schedule {:segmented-weighted-reduction {:strategy :subgroup-score-reuse}}`
    now selects the existing generated subgroup leaf on admitted Intel targets. This authorizes
    its declared Q·K reassociation; edge folds remain ordered. Exact schedule rederivation also
