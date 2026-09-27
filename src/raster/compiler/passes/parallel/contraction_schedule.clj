@@ -388,8 +388,10 @@
    (when-not (facts/facts? contract-facts)
      (throw (ex-info "contraction scheduling requires verified contraction facts"
                      {:reason :raster/bug :facts contract-facts})))
-   (let [{:keys [dtype free-axes contract-axes operands epilogue]}
+   (let [{:keys [dtype out-dtype free-axes contract-axes operands epilogue]}
          contract-facts
+         result-dtype (when (dtype/known? (or out-dtype dtype))
+                        (dtype/canon (or out-dtype dtype)))
          {:keys [element combine neutral]} (facts/scalar-reduction-view contract-facts)
          authoritative-desc? (and desc (or (:backend desc) (:execution desc)))
          matrix-capability-unavailable? (and authoritative-desc? (nil? (:matrix desc)))
@@ -416,6 +418,9 @@
 
        (or (not (dtype/known? dtype)) (not= :half (dtype/canon dtype)))
        (decline :dtype-not-dpas {:dtype dtype})
+
+       (not (contains? #{:half :float} result-dtype))
+       (decline :matrix-result-dtype-not-lowered {:result-dtype result-dtype})
 
        (not= [2 1] [(count free-axes) (count contract-axes)])
        (decline :not-2-free)
@@ -479,6 +484,7 @@
                                            (map first contract-axes)))
                 :tile tile
                 :bindings bindings
+                :result-dtype result-dtype
                 :epilogue epilogue
                 :provenance {:dialect :segcontract :operation-id operation-id}})}))))
 

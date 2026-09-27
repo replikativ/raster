@@ -89,6 +89,32 @@
       (is (body/kernel-body? (:body planned)))
       (is (= init (:neutral (facts/scalar-reduction-view proof)))))))
 
+(deftest declared-matrix-output-dtype-reaches-the-body-abi-and-source
+  (let [form (concat (matrix-form 128 128 128) [:out-dtype :float])
+        proof (facts/contraction-facts form :dtype :half)
+        planned (schedule/plan-matrix-body proof nil nil)
+        routed (route/route-contraction form :dtype :half)
+        result-type (fn [parameters]
+                      (:dtype (first (filter #(= :result (:role %)) parameters))))]
+    (is (:ok planned))
+    (is (= :float (result-type (get-in planned [:body :parameters]))))
+    (is (= :dpas (:strategy routed)))
+    (is (= :float (:out-dtype routed)))
+    (is (= :float (result-type (:abi routed))))
+    (is (re-find #"__global float\* restrict C" (:source routed)))
+    (is (= :float (result-type (get-in routed [:artifact :abi])))))
+  (testing "unsupported leaves decline instead of quietly writing half output"
+    (doseq [[form options]
+            [[(concat (matrix-form 128 128 24) [:out-dtype :float]) []]
+             [(concat (matrix-form 128 128 128) [:out-dtype :float])
+              [:candidate-families [:register-tiled]]]
+             [(concat (matrix-form 128 128 128) [:out-dtype :double]) []]]]
+      (try
+        (apply route/route-contraction form :dtype :half options)
+        (is false "an unsupported output conversion must not select a half-typed fallback")
+        (catch clojure.lang.ExceptionInfo error
+          (is (= :contraction-output-dtype-not-lowered (:reason (ex-data error)))))))))
+
 (deftest matrix-fragment-boundaries-are-a-legality-policy
   (testing "K=24 meets the old 16-byte pitch test but cannot form a final K16 instruction"
     (let [planned (schedule/plan-matrix-body
