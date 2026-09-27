@@ -118,25 +118,30 @@
 (deftest compiled-wrapper-does-not-invalidate-a-leased-output-before-declining
   (let [executable (executable)
         releases (atom 0)
+        donations (atom 0)
         closes (atom 0)
         replays (atom 0)
         compiled (compiled/map->Compiled
-                  {:executable executable :in-tree [] :out-tree [] :donated {}
+                  {:executable executable
+                   :in-tree [{:key :state :role :state :node :state}]
+                   :out-tree [] :donated {:state :out}
                    :target :ocl:0 :live-outputs (atom [:old-output])})]
     (with-redefs [gpu/replay! (fn [& _] (swap! replays inc))
                   gpu/close-session! (fn [& _] (swap! closes inc))
                   value/free! (fn [_] (swap! releases inc))
+                  value/consume! (fn [_] (swap! donations inc))
                   link/outputs (fn [_] {:out :resident-view})
                   link/output-values (fn [_] {:semantic-out :resident-view})]
       (link/run! executable)
       (with-open [lease (link/output-lease! executable)]
         (is (= :link-output-lease-active
-               (reason #(compiled/invoke-compiled compiled {}))))
+               (reason #(compiled/invoke-compiled compiled {:state :donated-value}))))
         (is (= :link-output-lease-active
                (reason #(compiled/close! compiled))))
         (is (= 1 (:replay @lease)))
         (is (= [:old-output] @(:live-outputs compiled)))
         (is (zero? @releases))
+        (is (zero? @donations))
         (is (zero? @closes))
         (is (= 1 @replays)))
       (compiled/close! compiled)
