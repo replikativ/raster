@@ -189,17 +189,21 @@
      ;; root (for example a changed closed-over helper or dispatch table).
      :root-identity (System/identityHashCode @resolved)}))
 
-(defn- target-specialization-identity [target]
-  (try
-    {:semantic {:target target
-                :descriptor-fingerprint
-                (semantic-fingerprint/fingerprint (hardware/descriptor-for target))}
-     :persistent-cache-eligible? true
-     :persistence-blockers #{}}
-    (catch Exception _
-      {:semantic {:target target :descriptor-fingerprint nil}
-       :persistent-cache-eligible? false
-       :persistence-blockers #{:target-descriptor}})))
+(defn- target-specialization-identity
+  ([target]
+   (try
+     (target-specialization-identity target (hardware/descriptor-for target))
+     (catch Exception _
+       {:semantic {:target target :descriptor-fingerprint nil}
+        :persistent-cache-eligible? false
+        :persistence-blockers #{:target-descriptor}})))
+  ([target descriptor]
+   ;; Captured target facts must be immutable fingerprintable compiler data. Collapsing an
+   ;; unsupported snapshot to a nil fingerprint would alias different targets in process memory.
+   {:semantic {:target target
+               :descriptor-fingerprint (semantic-fingerprint/fingerprint descriptor)}
+    :persistent-cache-eligible? true
+    :persistence-blockers #{}}))
 
 (defn- fingerprint-or-nil [value]
   (try (semantic-fingerprint/fingerprint value)
@@ -587,6 +591,9 @@
                 :as opts}]
   (let [preparation-started (System/nanoTime)
         template-report (atom nil)
+        target-descriptor (equation-first/validate-target-description!
+                           target (hardware/descriptor-for target))
+        target-identity (target-specialization-identity target target-descriptor)
         compilation-options (apply dissoc opts
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident])
@@ -597,13 +604,13 @@
            ::equation-first-template
            (source-specialization-identity fn-var dtype)
            revision
-           (target-specialization-identity target)
+           target-identity
            compilation-options
            (System/identityHashCode @#'equation-first/compile)))
         compilation (binding [*compilation-template-observer* #(reset! template-report %)]
                       (stable-compilation-template
                        template-key :equation-first
-                       #(equation-first/compile fn-var compilation-options)))
+                       #(equation-first/compile fn-var compilation-options target-descriptor)))
         lowering-started (System/nanoTime)
         raw-plan (equation-first/lower compilation args)
         attributes (:attributes raw-plan)

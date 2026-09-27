@@ -102,15 +102,28 @@
           :hip :hip
           nil))))
 
+(defn ^:no-doc validate-target-description!
+  "Check the identity of a captured compilation target before cache lookup or scheduling."
+  [target descriptor]
+  (when-not (= target (:device-id descriptor))
+    (fail! :equation-first-target-description
+           "captured target description does not match the compilation target"
+           {:target target :descriptor-target (:device-id descriptor)}))
+  descriptor)
+
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
 
    `:target` may select Level Zero/OpenCL, CUDA, or HIP. CUDA/HIP compilation is hardware-free:
    it produces verified target source artifacts but does not require an installed runtime or a
    physical device. Unsupported target families and uncovered KernelBody graph families fail
-   rather than borrowing the compatibility backend. `:dtype` defaults from retained deftm tags."
+   rather than borrowing the compatibility backend. `:dtype` defaults from retained deftm tags.
+
+   The three-argument form consumes an already captured target descriptor, allowing cache identity
+   and compilation to share one immutable snapshot. Its device identity must match `:target`."
   ([f-var] (compile f-var {}))
-  ([f-var {:keys [target dtype] :or {target :ze:0} :as options}]
+  ([f-var options] (compile f-var options nil))
+  ([f-var {:keys [target dtype] :or {target :ze:0} :as options} captured-target]
    (when-not (var? f-var)
      (fail! :equation-first-function "equation-first compilation requires a deftm Var"
             {:function f-var :actual (type f-var)}))
@@ -123,7 +136,8 @@
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
-         target-descriptor (hardware/descriptor-for target)
+         target-descriptor (validate-target-description!
+                            target (or captured-target (hardware/descriptor-for target)))
          resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
          compiler-options (compiler-options f-var target dtype
                                             (-> options
