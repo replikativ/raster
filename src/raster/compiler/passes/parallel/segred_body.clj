@@ -886,11 +886,6 @@
                               (= :result (:role parameter)) output-elements
                               (contains? resident-scalar-captures (:id parameter)) 1
                               :else (:bound (segop/seg-space-reduced-dim (:space source))))]
-        (when-not (= (dtype/canon (:dtype parameter)) (some-> buffer :dtype dtype/canon))
-          (decline! :storage-dtype
-                    "scalar SegRed pointer dtype differs from its KernelGraph buffer"
-                    {:node (:id node) :parameter (:id parameter) :argument argument
-                     :parameter-dtype (:dtype parameter) :buffer buffer}))
         (when-not (and buffer
                        (= source-elements realized-elements (:elements buffer)))
           (decline! :storage-extent

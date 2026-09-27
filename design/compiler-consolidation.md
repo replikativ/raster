@@ -137,6 +137,13 @@ dynamic shapes and unsupported layouts decline this candidate. Automatic selecti
 tests deliberately inject the candidate at the scheduling boundary with a distinct cache request.
 Do not advertise optimized equation-first defaults or a speedup from candidate construction alone.
 
+The shared ScheduledKernelBody graph check now requires structural node membership and exact
+canonical pointer-storage dtypes. Previously the executable boundary caught a dtype mismatch
+after emission; the earlier refinement certificate now rejects it too. The scalar-reduction and
+fold-map-specific copies of this dtype check are removed, while their distinct extent and source
+equivalence checks remain. Explicit matrix/packed-storage conversions still use separate typed
+buffers or value conversions; pointer reinterpretation is not an implicit exception to this rule.
+
 Equation-first execution reporting now observes actual fixed graph bindings through the public
 compiled API. It shares compact executable descriptions with descriptor admission reports and
 does not infer precision from the requested policy. Loop carry variants are reported once per
