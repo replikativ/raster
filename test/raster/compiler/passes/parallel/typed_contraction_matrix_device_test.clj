@@ -11,6 +11,7 @@
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gpu-probe]
+            [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.device-probe :as opencl]
@@ -59,6 +60,28 @@
             (dotimes [_ 2]
               (is (= expected (vec (value/->host (:result (live {})))))
                   (str device " " [batch in-f out-f])))
+            (finally (compiled/close! live))))))))
+
+(deftest shared-transposed-weights-use-the-generated-register-schedule
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "equation-first generated linear-nb on " device))
+      (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]]
+        (let [x (float-array (map #(/ (- (mod % 17) 8) 4.0) (range (* batch in-f))))
+              w (float-array (map #(/ (- (mod % 13) 6) 8.0) (range (* out-f in-f))))
+              arguments [x w batch in-f out-f]
+              expected (vec (apply nn/linear-nb arguments))
+              prepared (compiled/lower
+                        #'nn/linear-nb arguments
+                        {:compiler :equation-first :target device :dtype :float
+                         :constants '[W]
+                         :schedule {:typed-contraction {:strategy :register-tiled}}})
+              live (compiled/instantiate! prepared)]
+          (try
+            (dotimes [_ 2]
+              (is (= expected (vec (value/->host (:result (live {})))))
+                  (str device " shared NT " [batch in-f out-f])))
             (finally (compiled/close! live))))))))
 
 (def ^:private source

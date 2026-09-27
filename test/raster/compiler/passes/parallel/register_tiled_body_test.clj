@@ -64,6 +64,29 @@
       (is (some? error) "a matrix schedule must not silently drop scalar work")
       (is (= :body-has-unmodeled-terms (:missing-rule (ex-data error)))))))
 
+(deftest transposed-rhs-stages-in-physical-order-into-the-canonical-tile
+  (let [proof (facts/from-components
+               {:out 'C :free-axes [['i 3] ['j 7]] :contract-axes [['k 5]]
+                :body '(* (aget A (+ (* i 5) k)) (aget B (+ (* j 5) k)))
+                :opts {:init (float 0.0)} :dtype :float})
+        kernel (:kernel-body (register-tiled/lower proof {:tile small-tile}))
+        outer (first (:operations kernel))
+        staging (second (:operations outer))
+        [load store] (:operations staging)
+        flat 'register-b-index
+        k (body/expression :mod flat 2)
+        n (body/expression :floor-div flat 2)]
+    (is (= :nt (get-in kernel [:schedule :variant])))
+    (is (= [7 5] (:shape (second (:parameters kernel)))))
+    (is (= 'B (:buffer load)))
+    (is (= [(body/expression :add 'register-block-col n)
+            (body/expression :add 'register-k-block k)] (:coordinates load)))
+    (is (= [k n] (:coordinates store)))
+    (is (= [2 4] (:shape (second (:allocations kernel)))))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (string? (body-emit/emit-scalar-kernel
+                    "nt_register_tile" kernel {:target-dialect target}))))))
+
 (deftest checked-zero-identities-reach-the-register-tiled-body
   (doseq [init '[0.0 (float 0.0) (double (float 0))]]
     (let [proof (contraction nil init)

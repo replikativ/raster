@@ -590,10 +590,12 @@
                                           (:dims lowered) (:tile lowered))
                           :effects {:kind :pure-contraction
                                     :uses (scheduled-body/derive-uses kernel-body arguments)}
-                          :legality {:kind :register-tiled-contraction :tile (:tile lowered)}
+                          :legality {:kind :register-tiled-contraction
+                                     :tile (:tile lowered) :variant (:variant lowered)}
                           :numerics {:mode :reassociated :policy :ordered-k-target-contraction
                                      :accumulator-dtype :float :rounding :implementation-defined}
                           :attributes {:strategy :register-tiled :precision :f32
+                                       :variant (:variant lowered)
                                        :out-elems (:output-count lowered)}})]
           {:ok true :scheduled (scheduled-body/validate-against-node! scheduled node graph)})
         (catch clojure.lang.ExceptionInfo exception

@@ -185,14 +185,19 @@ of bitwise equality between target compilers. The older descriptor body's source
 direct low-level artifact tests still exist; removing those requires migrating their callers.
 
 The register-tiled schedule has an explicit graph-certified candidate constructor, exercised
-through equation-first emission and public replay for a ragged NN contraction. It reuses the
+through equation-first emission and public replay for ragged NN and shared-weight NT contractions.
+The existing dense matrix view proves the orientation; NT stages physical `[N,K]` storage through
+contiguous K loads into the same canonical shared `[K,N]` tile. The source does not need a
+materialized transpose or a special projection kernel. The certified variant records this choice.
+It reuses the
 existing cooperative KernelBody (local storage, barriers and per-thread accumulators); no kernel
 source template is added. Admission requires positive FP32 shapes, int-sized storage capacities
 and a numerical policy that permits target contraction. Literal and scalar-bound extents share
 the same body; runtime positivity, capacity and padded-coordinate obligations are retained in its
 certificate and checked before allocation or launch. Mixed static/dynamic shapes still reject
-oversized static products at compile time. Strict arithmetic and unsupported layouts (including
-the transposed weights of `linear-nb`) decline this candidate. The public opt-in is
+oversized static products at compile time. Strict arithmetic, TN/TT orientations and leading
+batched matrix slabs still decline this candidate. `linear-nb` now uses NT directly, including
+batch-one and ragged batches with shared weights. The public opt-in is
 `:schedule {:typed-contraction {:strategy :register-tiled}}`; the resolved numerical policy must
 permit contraction. Declines are explicit, with no portable fallback. Automatic selection is
 unchanged, and explicit `:portable` selects the same ordered body as `:auto`. All selections use

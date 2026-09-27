@@ -229,6 +229,19 @@
         (is (thrown? clojure.lang.ExceptionInfo
                      (graph-call/preflight! graph (apply scalars shape))))))))
 
+(deftest public-transposed-projection-retains-generated-schedule-certificate
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'dl-nn/linear-nb
+                       {:target target :dtype :float :schedule register-tiled-schedule})
+          artifact (first (:kernels compilation))
+          certificate (get-in artifact [:provenance :scheduled-operation])]
+      (is (= :register-tiled (get-in artifact [:attributes :strategy])))
+      (is (= :nt (get-in certificate [:legality :variant])))
+      (is (= :nt (get-in certificate [:attributes :variant])))
+      (is (= (:preconditions certificate) (:preconditions artifact)))
+      (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact))))))
+
 (deftest typed-contraction-strategy-participates-in-the-public-template-identity
   (compiled/clear-compilation-cache!)
   (try
