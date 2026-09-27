@@ -5,10 +5,80 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]))
 
+(defn validate-plan!
+  "Check the exact algebra and storage implemented by indexed reference/subgroup schedules.
+   General plan validity alone does not authorize these specialized lowerings."
+  [plan]
+  (let [{:keys [segment-axes membership storage score weight value numerator denominator
+                normalization operands output accumulator-dtype provenance]
+         :as plan} (swr/validate! plan)
+        [destination-axis head-axis] segment-axes
+        [q k v destination-indices source-indices] operands
+        score-arguments (:arguments score)
+        [scale lower upper] score-arguments
+        bound (:value upper)]
+    (when-not
+     (and (= [:destination :head] (mapv :name segment-axes))
+          (= :edge-list-by-destination (:kind membership))
+          (= :multiset (:duplicate-policy membership))
+          (= [(:id destination-indices) (:id source-indices)] (:buffers membership))
+          (= (:id destination-indices) (:destination-indices membership))
+          (= (:id source-indices) (:source-indices membership))
+          (= :indexed-dense-values (:kind storage))
+          (= [(:id q) (:id k) (:id v)] (:buffers storage))
+          (= (:extent destination-axis) (:entity-count storage))
+          (= :dot (:kind score))
+          (= {:name :head-component :extent (:components value)} (:axis score))
+          (= {:kind :identity :heads (:extent head-axis)} (:head-map score))
+          (= {:kind :indexed-query :buffer (:id q)
+              :indices (:id destination-indices) :dtype (:dtype q)
+              :total-dim (:total-dim storage)}
+             (:left score))
+          (= {:kind :indexed-key :buffer (:id k)
+              :indices (:id source-indices) :dtype (:dtype k)
+              :total-dim (:total-dim storage)}
+             (:right score))
+          (= '(raster.numeric/* left right) (get-in score [:combine :body]))
+          (= ['left 'right] (get-in score [:combine :parameters]))
+          (= [:inverse-sqrt :literal :literal] (mapv :kind score-arguments))
+          (= ['scale 'lower 'upper] (mapv :parameter score-arguments))
+          (= (:components value) (:extent scale))
+          (number? bound) (pos? (double bound))
+          (= (- (double bound)) (double (:value lower)))
+          (= '(raster.numeric/min
+               upper
+               (raster.numeric/max lower (raster.numeric/* dot scale)))
+             (get-in score [:finalize :body]))
+          (= ['dot 'scale 'lower 'upper] (get-in score [:finalize :parameters]))
+          (= '(raster.math/exp score) (:body weight))
+          (= ['score] (:parameters weight))
+          (= :indexed-value (:kind value))
+          (= (:id v) (:buffer value))
+          (= (:id source-indices) (:indices value))
+          (= (:dtype v) (:dtype value))
+          (= (:extent destination-axis) (:entity-count value))
+          (= (:total-dim storage) (:total-dim value))
+          (= :sum (:operator numerator))
+          (zero? (double (:identity numerator)))
+          (= '(raster.numeric/* weight value) (get-in numerator [:map-region :body]))
+          (= :sum (:operator denominator))
+          (zero? (double (:identity denominator)))
+          (= 'weight (get-in denominator [:map-region :body]))
+          (= :divide (:kind normalization))
+          (pos? (double (:epsilon normalization)))
+          (= 0.0 (double (:empty-result normalization)))
+          (= 5 (count operands))
+          (= [:long :long] (mapv :dtype [destination-indices source-indices]))
+          (= [(:extent destination-axis) (:total-dim storage)] (:shape q))
+          (= (:shape q) (:shape k) (:shape v) (:shape output))
+          (= (:dtype q) (:dtype k) (:dtype v) (:dtype output) accumulator-dtype))
+      (throw (ex-info "indexed edge-list leaf cannot preserve this reduction plan exactly"
+                      {:reason :indexed-segmented-reduction-plan-unsupported
+                       :plan-id (:id plan) :provenance provenance})))
+    plan))
+
 (defn- lit [value type] (body/literal value type))
 (defn- expr [op type & arguments] (body/scalar-expression op type arguments))
-(defn- bounded-expr [op type & arguments]
-  (body/scalar-expression op type arguments {:overflow :no-overflow}))
 (defn- compute [id type expression]
   (body/->ScalarCompute (body/value id type) expression))
 (defn- select [condition if-true if-false type]
@@ -25,7 +95,7 @@
   NaN result for every active head component when any edge index is malformed. Unused row
   tails remain zero; malformed shapes produce NaN for every launched output."
   [plan {:keys [entities edges heads components total-dim] :as shape} workgroup-x dynamic?]
-  (let [plan (swr/validate! plan)
+  (let [plan (validate-plan! plan)
         [q k v destination-indices source-indices] (:operands plan)
         output (:output plan)
         dtype (:accumulator-dtype plan)
@@ -264,7 +334,7 @@
   lane accumulates a strided dot fragment, then the subgroup shares one score. No collective
   occurs inside the lane-varying dot loop or the guarded value update."
   [plan width]
-  (let [plan (swr/validate! plan)
+  (let [plan (validate-plan! plan)
         [q k v dst src] (mapv :id (:operands plan))
         out (get-in plan [:output :id])
         dtype (:accumulator-dtype plan)

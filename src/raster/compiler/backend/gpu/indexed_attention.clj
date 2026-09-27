@@ -18,75 +18,6 @@
   [message reason data]
   (throw (ex-info message (assoc data :reason reason))))
 
-(defn- indexed-attention-plan!
-  [plan]
-  (let [{:keys [segment-axes membership storage score weight value numerator denominator
-                normalization operands output accumulator-dtype provenance]
-         :as plan} (swr/validate! plan)
-        [destination-axis head-axis] segment-axes
-        [q k v destination-indices source-indices] operands
-        score-arguments (:arguments score)
-        [scale lower upper] score-arguments
-        bound (:value upper)]
-    (when-not
-     (and (= [:destination :head] (mapv :name segment-axes))
-          (= :edge-list-by-destination (:kind membership))
-          (= :multiset (:duplicate-policy membership))
-          (= [(:id destination-indices) (:id source-indices)] (:buffers membership))
-          (= (:id destination-indices) (:destination-indices membership))
-          (= (:id source-indices) (:source-indices membership))
-          (= :indexed-dense-values (:kind storage))
-          (= [(:id q) (:id k) (:id v)] (:buffers storage))
-          (= (:extent destination-axis) (:entity-count storage))
-          (= :dot (:kind score))
-          (= {:name :head-component :extent (:components value)} (:axis score))
-          (= {:kind :identity :heads (:extent head-axis)} (:head-map score))
-          (= {:kind :indexed-query :buffer (:id q)
-              :indices (:id destination-indices) :dtype (:dtype q)
-              :total-dim (:total-dim storage)}
-             (:left score))
-          (= {:kind :indexed-key :buffer (:id k)
-              :indices (:id source-indices) :dtype (:dtype k)
-              :total-dim (:total-dim storage)}
-             (:right score))
-          (= '(raster.numeric/* left right) (get-in score [:combine :body]))
-          (= ['left 'right] (get-in score [:combine :parameters]))
-          (= [:inverse-sqrt :literal :literal] (mapv :kind score-arguments))
-          (= ['scale 'lower 'upper] (mapv :parameter score-arguments))
-          (= (:components value) (:extent scale))
-          (number? bound) (pos? (double bound))
-          (= (- (double bound)) (double (:value lower)))
-          (= '(raster.numeric/min
-               upper
-               (raster.numeric/max lower (raster.numeric/* dot scale)))
-             (get-in score [:finalize :body]))
-          (= ['dot 'scale 'lower 'upper] (get-in score [:finalize :parameters]))
-          (= '(raster.math/exp score) (:body weight))
-          (= ['score] (:parameters weight))
-          (= :indexed-value (:kind value))
-          (= (:id v) (:buffer value))
-          (= (:id source-indices) (:indices value))
-          (= (:dtype v) (:dtype value))
-          (= (:extent destination-axis) (:entity-count value))
-          (= (:total-dim storage) (:total-dim value))
-          (= :sum (:operator numerator))
-          (zero? (double (:identity numerator)))
-          (= '(raster.numeric/* weight value) (get-in numerator [:map-region :body]))
-          (= :sum (:operator denominator))
-          (zero? (double (:identity denominator)))
-          (= 'weight (get-in denominator [:map-region :body]))
-          (= :divide (:kind normalization))
-          (pos? (double (:epsilon normalization)))
-          (= 0.0 (double (:empty-result normalization)))
-          (= 5 (count operands))
-          (= [:long :long] (mapv :dtype [destination-indices source-indices]))
-          (= [(:extent destination-axis) (:total-dim storage)] (:shape q))
-          (= (:shape q) (:shape k) (:shape v) (:shape output))
-          (= (:dtype q) (:dtype k) (:dtype v) (:dtype output) accumulator-dtype))
-      (fail "indexed edge-list leaf cannot preserve this reduction plan exactly"
-            :indexed-segmented-reduction-plan-unsupported
-            {:plan-id (:id plan) :provenance provenance}))
-    plan))
 
 (defn- resolve-extent
   [shape-env owner value]
@@ -120,7 +51,7 @@
 
 (defn reference-workgroup-x
   [plan shape-env desc]
-  (let [{:keys [total-dim]} (checked-shape! (indexed-attention-plan! plan) shape-env)
+  (let [{:keys [total-dim]} (checked-shape! (indexed-body/validate-plan! plan) shape-env)
         subgroup (long (or (:subgroup-size desc) 16))
         maximum (long (or (:max-workgroup-size desc) 256))]
     (long (max 1 (min total-dim subgroup maximum)))))
@@ -199,7 +130,7 @@
    are proven model semantics and stay embedded constants. `:out-elems` names an explicit scalar
    argument so the staging path can allocate/read back without interpreting product forms."
   [plan desc]
-  (let [plan (indexed-attention-plan! plan)
+  (let [plan (indexed-body/validate-plan! plan)
         fields (dynamic-fields plan)
         values (mapv :value fields)
         [entities _ total-dim _ _ output-elements] values
@@ -258,7 +189,7 @@
    reduces each edge score and broadcasts its weight across component lanes. This retains the
    edge-list ABI while removing the reference leaf's per-output score recomputation."
   [plan desc]
-  (let [plan (indexed-attention-plan! plan)
+  (let [plan (indexed-body/validate-plan! plan)
         fields (dynamic-fields plan)
         values (mapv :value fields)
         [entities _ _ heads components output-elements] values
@@ -312,7 +243,7 @@
 (defn emit-reference
   "Emit the direct indexed-attention correctness schedule for a resolved shape environment."
   [plan shape-env desc]
-  (let [plan (indexed-attention-plan! plan)
+  (let [plan (indexed-body/validate-plan! plan)
         shape (checked-shape! plan shape-env)
         {:keys [entities total-dim]} shape
         workgroup-x (reference-workgroup-x plan shape-env desc)
@@ -360,7 +291,7 @@
 (defn kernel-graph
   "Wrap the direct leaf in a one-node graph with resolved external buffer extents."
   [plan shape-env artifact]
-  (let [plan (indexed-attention-plan! plan)
+  (let [plan (indexed-body/validate-plan! plan)
         {:keys [entities edges total-dim]} (checked-shape! plan shape-env)
         artifact (kart/validate! artifact)
         inputs (swr/ordered-input-ids plan)
@@ -394,7 +325,7 @@
 (defn dynamic-kernel-graph
   "Wrap a dynamic artifact while retaining runtime-resolvable external buffer ranges."
   [plan artifact]
-  (let [plan (indexed-attention-plan! plan)
+  (let [plan (indexed-body/validate-plan! plan)
         artifact (kart/validate! artifact)
         {public-abi :abi public-arguments :arguments}
         (kgraph/public-interface (:abi artifact) (:arguments artifact))
