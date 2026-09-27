@@ -3024,13 +3024,12 @@
     (and (seq? expression) (= 'raster.par/contract (first expression)))
     (let [facts (contraction-facts/contraction-facts
                  expression
-                 ;; A contraction's element dtype is the declared dtype of the array it writes.
-                 ;; The form's elem-type stamp is the compile's dtype policy, which a hard-typed
-                 ;; double kernel compiled under a float policy does not follow; the program-wide
-                 ;; dtype is only the last resort when nothing declares it.
-                 :dtype (or (some-> (get array-types (second expression)) dtype/canon)
-                            (:raster.type/elem-type (meta expression))
-                            default-dtype :double))
+                 ;; Explicit :out-dtype separates destination storage from the numeric
+                 ;; contraction dtype. Otherwise the destination's declared dtype retains the
+                 ;; existing homogeneous contraction policy.
+                 :dtype (or (:raster.type/elem-type (meta expression))
+                            default-dtype :double)
+                 :destination-dtype (some-> (get array-types (second expression)) dtype/canon))
           ;; Select this schedule for explicit precision or mixed storage, without diverting
           ;; homogeneous matrix contractions from their existing optimized schedule families.
           mixed-storage? (some (fn [{:keys [sym]}]
@@ -3042,20 +3041,35 @@
                   facts)
           {:keys [free-axes contract-axes out opts]} facts
           contraction-dtype (dtype/canon (:dtype facts))
-          ;; A result transform that reads the destination reads the storage the contraction
-          ;; writes: that operand and the transform result have the contraction's dtype (a
-          ;; double-spelled GEMM compiled under the float policy accumulates into a float
-          ;; buffer), whatever tag the source call carried.
+          output-dtype (dtype/canon (or (:out-dtype facts) contraction-dtype))
+          _ (when-let [declared (some-> (get array-types out) dtype/canon)]
+              (when-not (= declared output-dtype)
+                (throw (ex-info "contraction result storage disagrees with its declared output dtype"
+                                {:reason :typed-contraction-output-storage-dtype
+                                 :output out :declared declared :out-dtype output-dtype}))))
+          ;; A result transform that reads the destination must use its physical storage dtype,
+          ;; which may differ from the reduction accumulator dtype.
           epilogue (let [epilogue (:epilogue facts)]
                      (if (some #(= out (:sym %)) (:operands epilogue))
                        (-> epilogue
-                           (assoc :dtype contraction-dtype)
+                           (assoc :dtype output-dtype)
                            (update :operands
                                    (fn [operands]
                                      (mapv #(cond-> % (= out (:sym %))
-                                              (assoc :dtype contraction-dtype))
+                                              (assoc :dtype output-dtype))
                                            operands))))
                        epilogue))
+          epilogue (or epilogue
+                       (when-not (= output-dtype contraction-dtype)
+                         (when-not (contains? #{:float :double} output-dtype)
+                           (throw (ex-info "typed contraction has no scalar spelling for this output conversion"
+                                           {:reason :typed-contraction-output-conversion
+                                            :accumulator-dtype contraction-dtype
+                                            :out-dtype output-dtype})))
+                         (let [acc '%result]
+                           {:acc acc
+                            :expr (list (clojure.core/symbol (name output-dtype)) acc)
+                            :operands [] :scalars [] :dtype output-dtype})))
           result-transform (typed-result-transform epilogue)
           epilogue-arrays (set (map :value (:operands result-transform)))
           epilogue-scalar-ids (set (map :value (:scalars result-transform)))]
@@ -3096,7 +3110,7 @@
                  ;; Decode lambdas, declared physical maps, staged accumulators and output
                  ;; conversions are not scalar fold syntax. Keep them on the certified
                  ;; contraction route until TypedSOAC represents those facts explicitly.
-                 (empty? (apply dissoc opts [:init :combine :algebra :epilogue]))
+                 (empty? (apply dissoc opts [:init :combine :algebra :epilogue :out-dtype]))
                  ;; The contraction's element dtype is the dtype of its operands. A double
                  ;; product over arrays declared float (a hard-typed double function compiled
                  ;; under a float policy) has no single typed kernel; it stays a host call.
@@ -3126,6 +3140,7 @@
            :product product :inputs arrays :outputs #{out}
            :scalars (set/union scalars epilogue-scalar-ids)
            :result-transform result-transform
+           :output-dtype output-dtype
            :effect-only? true :host-binding symbol
            ;; Contract is effectful at the source spelling because it writes `out`, but its
            ;; TypedSOAC equation denotes the mathematical output tensor. A terminal reference to
@@ -4891,7 +4906,7 @@
 
 (defn- segmented-reduce-equation
   [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
-           result-transform]}]
+           result-transform output-dtype]}]
   (let [component (first (:components product))
         expressions (:results (reduction/fold-region product))
         arrays (if (empty? segment-axes)
@@ -4918,6 +4933,7 @@
                  :accumulators [(:accumulator component)]
                  :identities [(:neutral component)]
                  :dtypes [(:dtype component)]
+                 :result-storage-dtype output-dtype
                  :algebra [algebra]
                  :result-transform result-transform}
                 arrays captures
@@ -5295,7 +5311,8 @@
                         scalar (:dtypes attributes)
                         stencil (:dtypes attributes)
                         reduce (:dtypes attributes)
-                        segmented-reduce (:dtypes attributes)
+                        segmented-reduce [(or (:result-storage-dtype attributes)
+                                              (first (:dtypes attributes)))]
                         product-reduce (mapv #((:dtypes attributes) %)
                                              (:result-components attributes))
                         segmented-fold-map (:dtypes attributes)

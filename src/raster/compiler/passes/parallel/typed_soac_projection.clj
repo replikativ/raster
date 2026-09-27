@@ -260,7 +260,10 @@
      :opts (cond-> (array-map :init (first (:identities attributes))
                               :combine combine
                               :algebra (first (:algebra attributes)))
-             result-transform (assoc :epilogue result-transform))
+             result-transform (assoc :epilogue result-transform)
+             (and (:result-storage-dtype attributes)
+                  (not= (:result-storage-dtype attributes) contraction-dtype))
+             (assoc :out-dtype (:result-storage-dtype attributes)))
      :dtype contraction-dtype
      :metadata {:raster.type/elem-type contraction-dtype}}))
 
