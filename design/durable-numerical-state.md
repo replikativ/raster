@@ -56,6 +56,15 @@ S3 has no transaction spanning many objects. Immutable chunks followed by one ma
 readers an atomic semantic publication point. An S3 ETag is not a content identity, particularly
 for multipart objects; Raster must retain its own digest.
 
+Manifest certification checks geometry and declared addresses, not bytes returned by a provider.
+`raster.runtime.numerical-content/verify-chunk-lease!` checks the exact stored extent and SHA-256
+over a scoped local lease before restore or upload. It hashes in bounded blocks rather than turning
+a large mapped chunk into an int-indexed `ByteBuffer` or heap array. The caller still owns the lease
+and must retain it through any asynchronous transfer. Provider adapters and publication paths must
+call this verifier (or supply a separately certified equivalent); merely opening a lease is not a
+digest check. The mapped PDE restart oracle now uses this shared boundary and injects corruption
+and truncation faults.
+
 ## Konserve, mmap, LMDB and S3
 
 The practical first composition is a Konserve tiered store with a local file frontend and an

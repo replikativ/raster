@@ -5,7 +5,9 @@
             [raster.gpu.core :as gpu]
             [raster.runtime.numerical-content :as content])
   (:import [java.lang AutoCloseable]
-           [java.lang.foreign MemorySegment ValueLayout]))
+           [java.lang.foreign MemorySegment ValueLayout]
+           [java.security MessageDigest]
+           [java.util HexFormat]))
 
 (defn- address
   [n]
@@ -140,6 +142,63 @@
               nil
               (catch clojure.lang.ExceptionInfo error
                 (ex-data error))))))))
+
+(defn- raw-chunk [address bytes]
+  (numerical-state/chunk
+   {:id :sample :offsets [0] :shape [bytes]
+    :logical-byte-length bytes :stored-byte-length bytes
+    :content address :storage {:format :raw-array :byte-order :little-endian}}))
+
+(defn- chunk-lease [bytes address release-count]
+  (content/local-content-lease
+   {:content address
+    :placement (content/content-placement
+                {:provider-id :local-test :tier-id :file :content address})
+    :segment (MemorySegment/ofArray bytes) :byte-offset 4 :byte-length 8
+    :release-fn #(swap! release-count inc)}))
+
+(deftest content-address-streams-across-staging-blocks
+  (let [bytes (byte-array (map unchecked-byte (range 131073)))
+        expected (.formatHex (HexFormat/of)
+                             (.digest (MessageDigest/getInstance "SHA-256") bytes))]
+    (is (= (numerical-state/content-address :sha-256 expected)
+           (content/content-address-of (MemorySegment/ofArray bytes))))))
+
+(deftest localized-chunks-are-verified-over-the-leased-byte-range
+  (let [bytes (byte-array (map byte (range 16)))
+        expected-address (content/content-address-of
+                          (.asSlice (MemorySegment/ofArray bytes) 4 8))
+        chunk (raw-chunk expected-address 8)
+        releases (atom 0)]
+    (with-open [lease (chunk-lease bytes expected-address releases)]
+      (is (identical? lease (content/verify-chunk-lease! chunk lease)))
+      (is (= 0 @releases) "verification does not consume the provider lease")
+      (aset-byte bytes 7 (byte 99))
+      (is (= :numerical-content-chunk-digest
+             (:reason (try (content/verify-chunk-lease! chunk lease) nil
+                           (catch clojure.lang.ExceptionInfo error (ex-data error))))))
+      (is (false? (content/lease-closed? lease))))
+    (is (= 1 @releases))
+    (with-open [lease (chunk-lease bytes expected-address releases)]
+      (is (= :numerical-content-chunk-extent
+             (:reason (try (content/verify-chunk-lease! (assoc chunk :stored-byte-length 7)
+                                                           lease)
+                           nil
+                           (catch clojure.lang.ExceptionInfo error (ex-data error))))))
+      (is (= :numerical-content-chunk-identity
+             (:reason (try (content/verify-chunk-lease!
+                            (assoc chunk :content (address 1)) lease)
+                           nil
+                           (catch clojure.lang.ExceptionInfo error (ex-data error))))))
+      (is (false? (content/lease-closed? lease))))
+    (let [unsupported (numerical-state/content-address :unsupported "digest")]
+      (with-open [lease (chunk-lease bytes unsupported releases)]
+        (is (= :numerical-content-chunk-algorithm
+               (:reason (try (content/verify-chunk-lease!
+                              (assoc chunk :content unsupported) lease)
+                             nil
+                             (catch clojure.lang.ExceptionInfo error (ex-data error))))))))
+    (is (= 3 @releases))))
 
 (defn- fake-transfer-session
   []
