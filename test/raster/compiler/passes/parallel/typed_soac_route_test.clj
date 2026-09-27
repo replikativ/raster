@@ -1978,7 +1978,10 @@
                              (:alternatives dispatch)))
         result-slots (mapv #(first (filter (fn [slot] (= :result (:role slot)))
                                        (get-in % [:nodes 0 :operation :abi])))
-                           (:alternatives dispatch))]
+                           (:alternatives dispatch))
+        emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
+                  (opencl-pass/opencl-pass form :device-id :ocl:0
+                                           :dtype :half :min-elements 0))]
     (is (nil? (:typed-soac-declined stats)))
     (is (= :half (:dtype operation)))
     (is (= [:half] (:dtypes typed-attributes)))
@@ -1987,7 +1990,10 @@
     (is (= :half (:dtype components)))
     (is (= :float (get-in components [:opts :out-dtype])))
     (is (= #{:dpas :portable-segred} strategies))
-    (is (every? #(= :float (:dtype %)) result-slots))))
+    (is (every? #(= :float (:dtype %)) result-slots))
+    (is (= #{:dpas :portable-segred}
+           (set (map kdispatch/alternative-strategy
+                     (-> emitted :dispatches first :alternatives)))))))
 
 (deftest typed-contraction-rejects-output-storage-declaration-mismatch
   (let [source '(raster.par/contract C [[i 4] [j 4]] [[k 4]]
