@@ -122,3 +122,16 @@ uses the same checked integer algebra in graph construction and invocation reali
 An attempted zero-membership device case exposed a separate runtime limitation: OpenCL rejects
 the zero-byte index buffer allocation. It is not included as a passing execution case. Supporting
 zero-sized physical allocations without changing logical array extents remains follow-up work.
+
+The existing subgroup score-reuse body now has an independent semantic-graph certificate as
+well. Reference and subgroup candidates share graph/storage validation, shape leaves and ordered
+scalar bindings; target admission is shared with compatibility routing. The subgroup certificate
+declares floating-point dot reassociation, ordered membership folds, three-dimensional coordinate
+bounds and no scratch. Unit checks project that certificate through OpenCL/CUDA/HIP emitters;
+this is source-generation evidence, not NVIDIA/AMD execution or production admission.
+
+A focused warm-REPL check replaced only the existing device test's compatibility graph provider
+with the common emitter's certified subgroup graph. The same independent plan oracle passed on
+local OpenCL and Level Zero (8 assertions), including empty destinations and row tails. The
+production equation-first path still selects reference: explicit optimized selection and exact
+optimized complete-write rederivation are the next slice, before automatic dispatch/tuning.
