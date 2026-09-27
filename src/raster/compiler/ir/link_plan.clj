@@ -1155,10 +1155,15 @@
 
    The facts must have been remapped from immediately verified component evidence. This is the
    composition operation for effect evidence: all cross-component initialization, output and alias
-   obligations are rechecked against the newly composed nodes, while executable ABIs are not
-   reparsed. Arbitrary plans must use `validate!`."
+   obligations and the current logical-value/binder-role contracts are rechecked against the
+   newly composed nodes. Program executable ABI access facts are not rederived; legacy descriptor
+   bindings still undergo their full contract check. Arbitrary plans must use `validate!`."
   [plan step-facts]
   (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
+        _ (doseq [instance (:instances plan)]
+            (if (program-link-instance? instance)
+              (validate-program-buffer-contracts! (:nodes plan) (:values plan) instance)
+              (validate-instance-bindings! (:nodes plan) (:values plan) instance)))
         step-facts (vec step-facts)
         initialization (analyze-effects! plan step-facts)]
     {:plan plan

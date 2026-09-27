@@ -634,14 +634,13 @@
                                         (when-let [role (get token-roles token)]
                                           [compiler-value role])))
                              compiler-bindings)
-        validation-started (System/nanoTime)
+        role-projection-started (System/nanoTime)
         plan (-> (reduce-kv (fn [plan token role]
                               (assoc-in plan [:nodes token :role] role))
                             raw-plan token-roles)
                  (assoc-in [:instances 0 :roles] compiler-roles)
-                 (assoc-in [:attributes :public-buffer-roles] effective-roles)
-                 link-plan/validate!)
-        link-plan-validation-ns (- (System/nanoTime) validation-started)
+                 (assoc-in [:attributes :public-buffer-roles] effective-roles))
+        role-projection-ns (- (System/nanoTime) role-projection-started)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         argument-map (zipmap (map :symbol parameters) args)
         donate-set (set donate)
@@ -697,6 +696,9 @@
                             {:reason :compiled-equation-first-output-keys
                              :keys duplicate-keys})))
         certification-started (System/nanoTime)
+        ;; certify revalidates the projected roles and escaped output boundary together. A
+        ;; separate validate! here repeated the same executable/effect derivation before the
+        ;; final output vector was known, without establishing an additional fact.
         lowering (invocation-link/certify plan (mapv :node out-tree))
         invocation-certification-ns (- (System/nanoTime) certification-started)
         lowering-ns (- (System/nanoTime) lowering-started)
@@ -723,7 +725,7 @@
                 :template @template-report
                 :link-plan-lowering-ns lowering-ns
                 :phases-ns {:equation-lower equation-lower-ns
-                            :link-plan-validation link-plan-validation-ns
+                            :role-projection role-projection-ns
                             :invocation-certification invocation-certification-ns}
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]

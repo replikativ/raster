@@ -35,7 +35,9 @@
         session (atom {:device-id :ze:0})]
     ;; Only backend operations are stubbed: real validation, instantiation, upload and run gates
     ;; remain active. This is a hardware-free contract test, not numerical kernel validation.
-    (with-redefs [gpu/alloc! (fn [& _])
+    (with-redefs [link/initialization-contract
+                  (fn [& _] (throw (AssertionError. "runtime rederived initialization")))
+                  gpu/alloc! (fn [& _])
                   gpu/buffer-view (fn [_ key opts] (assoc opts :buffer-key key))
                   gpu/bind-step! (fn [& _])
                   gpu/record-graph! (fn [& _])
