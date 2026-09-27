@@ -143,7 +143,8 @@
   (if-let [effect (first effects)]
     (let [loop (:loop effect)
           branch (:branch effect)
-          results (or (:results branch) (:carries loop))
+          result-region (:region effect)
+          results (or (:results branch) (:carries loop) (:results result-region))
           form (cond
                  branch
                  (let [emit-arm
@@ -160,8 +161,14 @@
                    (list 'if (:predicate branch)
                          (emit-arm (:then branch)) (emit-arm (:else branch))))
                  (:region effect)
-                 (let [{:keys [predicate locals effects]} (:region effect)
-                       region (emit-region locals (ordered-effects effects nil emitters))]
+                 (let [{:keys [predicate locals effects yields results]} (:region effect)
+                       continuation
+                       (when (seq results)
+                         (mapv (fn [{:keys [dtype]} value]
+                                 (list (storage-cast true (dtype/scalar-tag-for-dtype dtype))
+                                       (strip-binder-tags value)))
+                               results yields))
+                       region (emit-region locals (ordered-effects effects continuation emitters))]
                    (if (contains? (:region effect) :predicate)
                      (list 'if predicate region)
                      region))

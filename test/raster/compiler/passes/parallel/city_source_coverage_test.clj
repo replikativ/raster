@@ -146,6 +146,29 @@
             (is (= (vec expected-state) (vec state)))
             (is (= (vec expected-out) (vec out)))))))))
 
+(deftest carried-locals-read-after-prefix-effects
+  (let [{:keys [operation]}
+        (emitted-body #'city/carried-steps-with-post-store-local!
+                      {'state :double 'out :double} {'n :long 'nc :long})]
+    (is (some? operation) "post-store locals must retain their evaluation position")
+    (when operation
+      (let [execute (eval (list 'fn '[state out n nc]
+                                (segop-simd/compile-effect-segmap operation)))]
+        (doseq [target [:opencl-portable :cuda :hip]]
+          (is (= :kernel-body
+                 (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                          operation :target-dialect target
+                          :array-types {'state :double 'out :double}
+                          :scalar-types {'n :long 'nc :long}) [:attributes :emission-route]))))
+        (doseq [nc [0 1 2 7]]
+          (let [state (double-array [-10 -1 1]) out (double-array [-77 -77 -77])
+                expected-state (aclone state) expected-out (aclone out)]
+            (dotimes [_ 2]
+              (city/carried-steps-with-post-store-local! expected-state expected-out 3 nc)
+              (execute state out 3 nc)
+              (is (= (vec expected-state) (vec state)))
+              (is (= (vec expected-out) (vec out))))))))))
+
 (deftest effectful-tuples-initialize-sequentially-and-update-simultaneously
   (let [{:keys [scheduled artifact operation]}
         (emitted-body #'city/three-carry-effects! {'out :int} {'n :long 'nc :long})
