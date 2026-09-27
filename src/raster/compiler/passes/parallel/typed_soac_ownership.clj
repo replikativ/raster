@@ -80,7 +80,10 @@
                 predicate value conflict]}
         (dialect/effect-parts effect)]
     (cond
-      region (region-accesses region destination-parameters locals loops)
+      ;; A guarded region evaluates its decision in the enclosing scope, before arm locals.
+      ;; Omitting these reads can falsely certify dst[0] -> dst[i] as item-owned.
+      region (into (expression-accesses predicate destination-parameters locals loops)
+                   (region-accesses region destination-parameters locals loops))
 
       loop
       (let [loop-scope {:index index :extent extent :lower lower
