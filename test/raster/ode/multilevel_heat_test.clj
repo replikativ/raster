@@ -97,6 +97,10 @@
                              [output input nx ny 0.2 0.001 (double (* nx nx)) (double (* ny ny))])]
     (is (pos? (count (get-in plan [:instances 0 :call :steps]))))
     (is (= :none (get-in compiled [:stats :fallback])))
+    (is (> (first (get-in compiled [:kernels 0 :launch :workgroup-size])) 1)
+        "independent cells must not collapse to one serial work item")
+    (is (not= [1] (get-in compiled [:kernels 0 :launch :group-count]))
+        "the generated cell map must cover multiple workgroups")
     (when @device-probe/opencl-available?
       (testing "generated OpenCL execution agrees with the JVM numerical operator"
         (let [expected (double-array (* nx ny))

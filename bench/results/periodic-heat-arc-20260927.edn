@@ -1,0 +1,59 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-27"
+ :base-revision "9970500ddc367a12739dc12c72b33bbc27cf75f5"
+ :device "Intel(R) Arc(TM) Graphics"
+ :driver "26.05.37020.3"
+ :backend :ze:0
+ :java-version "25.0.1+8-LTS-jvmci-b01"
+ :dtype :double
+ :clock :device-event-span
+ :warmups 4
+ :measured-replays 12
+ :oracle :independent-primitive-array-five-point-periodic-heat
+ :notes "Resident inputs/output; compile, lower, bind, uploads, downloads and oracle evaluation are outside the device-event samples. The laptop had other active JVMs. No external stencil baseline or tuning-cache promotion. The pre-change source used nested dotimes and compiled to one work item with two serial loops. A direct map initially also compiled serially when the store index was a derived int; storing to the original map lane made output uniqueness provable. The first parallel measurements used an intermediate source with a long-to-int cast for input indexing, which portable OpenCL rejected. The final portable source removes that cast. Source hashes cover the whole pde.clj file. Final runs retain outliers and are nonstationary."
+ :runs
+ [{:id :serial-128
+   :shape [128 128]
+   :source-sha256 "3f878467420aa4107b135e940ab2e529716a8c37a99a6359899792009194a93f"
+   :launch {:workgroup-size [1] :group-count [1]}
+   :kernel-count 1 :fallback :none :max-absolute-error 0.0
+   :compile-ns 1118433439 :lower-ns 1731455906 :bind-ns 1307497011
+   :samples-ns [3215833 3175208 3157604 3114687 3154895 3167500
+                3469791 3674270 3192708 3180312 3184583 3184166]
+   :median-ns 3180312 :cv 0.048250675037828046 :stationary? true}
+  {:id :parallel-intermediate-128
+   :shape [128 128]
+   :source-sha256 "84c2712fbdf623496ba82fbe39d95637bf8b2fe65d437176d0871806cea82f5d"
+   :launch {:workgroup-size [256] :group-count :ceil-div-cell-count-by-256}
+   :kernel-count 1 :fallback :none :max-absolute-error 0.0
+   :compile-ns 629533050 :lower-ns 1411341479 :bind-ns 1365534357
+   :samples-ns [19583 19895 19791 19791 19687 19375
+                19583 20000 20312 20000 19583 19895]
+   :median-ns 19791 :cv 0.012151968271363847 :stationary? true}
+  {:id :parallel-intermediate-256
+   :shape [256 256]
+   :source-sha256 "84c2712fbdf623496ba82fbe39d95637bf8b2fe65d437176d0871806cea82f5d"
+   :launch {:workgroup-size [256] :group-count :ceil-div-cell-count-by-256}
+   :kernel-count 1 :fallback :none :max-absolute-error 0.0
+   :compile-ns 634440270 :lower-ns 1208532181 :bind-ns 1041219156
+   :samples-ns [183125 76354 68437 65937 65104 65312
+                65208 65208 65000 65312 64895 65104]
+   :median-ns 65208 :cv 0.4245765968210482 :stationary? false}
+  {:id :parallel-portable-128
+   :shape [128 128]
+   :source-sha256 "22fa0eb11533913bcef8df0f7059ebc7a31e148d49326dfab3109346db5ba67d"
+   :launch {:workgroup-size [256] :group-count :ceil-div-cell-count-by-256}
+   :kernel-count 1 :fallback :none :max-absolute-error 0.0
+   :compile-ns 3934805164 :lower-ns 2703476382 :bind-ns 2217099503
+   :samples-ns [86145 15937 15312 15416 15208 15520
+                15416 15104 15104 23229 15729 15416]
+   :median-ns 15416 :cv 0.8866747253815719 :stationary? false}
+  {:id :parallel-portable-256
+   :shape [256 256]
+   :source-sha256 "22fa0eb11533913bcef8df0f7059ebc7a31e148d49326dfab3109346db5ba67d"
+   :launch {:workgroup-size [256] :group-count :ceil-div-cell-count-by-256}
+   :kernel-count 1 :fallback :none :max-absolute-error 0.0
+   :compile-ns 795362316 :lower-ns 1594027322 :bind-ns 1223153187
+   :samples-ns [65104 65520 65104 65208 65104 65833
+                65104 65104 65312 65104 70104 235312]
+   :median-ns 65104 :cv 0.5875308766975076 :stationary? false}]}

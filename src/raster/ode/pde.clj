@@ -75,21 +75,22 @@
   [out :- (Array double), u :- (Array double), nx :- Long, ny :- Long,
    alpha :- Double, dt :- Double, inv-dx2 :- Double, inv-dy2 :- Double] :- (Array double)
   (let [nx (int nx) ny (int ny)]
-    (dotimes [i nx]
-      (let [im (if (zero? i) (unchecked-subtract-int nx 1) (unchecked-subtract-int i 1))
-            ip (if (= i (unchecked-subtract-int nx 1)) 0 (unchecked-add-int i 1))]
-        (dotimes [j ny]
-          (let [jm (if (zero? j) (unchecked-subtract-int ny 1) (unchecked-subtract-int j 1))
-                jp (if (= j (unchecked-subtract-int ny 1)) 0 (unchecked-add-int j 1))
-                idx (unchecked-add-int (unchecked-multiply-int i ny) j)
-                center (aget u idx)
-                lap-x (* inv-dx2 (+ (aget u (unchecked-add-int (unchecked-multiply-int im ny) j))
-                                    (* -2.0 center)
-                                    (aget u (unchecked-add-int (unchecked-multiply-int ip ny) j))))
-                lap-y (* inv-dy2 (+ (aget u (unchecked-add-int (unchecked-multiply-int i ny) jm))
-                                    (* -2.0 center)
-                                    (aget u (unchecked-add-int (unchecked-multiply-int i ny) jp))))]
-            (aset out idx (+ center (* alpha dt (+ lap-x lap-y))))))))
+    (par/map-void! lane (* nx ny)
+      (let [idx lane
+            i (quot idx ny)
+            j (rem idx ny)
+            im (if (zero? i) (unchecked-subtract-int nx 1) (unchecked-subtract-int i 1))
+            ip (if (= i (unchecked-subtract-int nx 1)) 0 (unchecked-add-int i 1))
+            jm (if (zero? j) (unchecked-subtract-int ny 1) (unchecked-subtract-int j 1))
+            jp (if (= j (unchecked-subtract-int ny 1)) 0 (unchecked-add-int j 1))
+            center (aget u idx)
+            lap-x (* inv-dx2 (+ (aget u (unchecked-add-int (unchecked-multiply-int im ny) j))
+                                (* -2.0 center)
+                                (aget u (unchecked-add-int (unchecked-multiply-int ip ny) j))))
+            lap-y (* inv-dy2 (+ (aget u (unchecked-add-int (unchecked-multiply-int i ny) jm))
+                                (* -2.0 center)
+                                (aget u (unchecked-add-int (unchecked-multiply-int i ny) jp))))]
+        (aset out lane (+ center (* alpha dt (+ lap-x lap-y))))))
     out))
 
 (deftm heat-rhs-2d!

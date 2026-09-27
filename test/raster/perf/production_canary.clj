@@ -5,6 +5,7 @@
             [clojure.java.io :as io]
             [raster.arrays :as arrays]
             [raster.compiler.core.hardware :as compiler-hardware]
+            [raster.compiler.equation-first :as equation]
             [raster.core :refer [deftm]]
             [raster.dl.nn :as dl-nn]
             [raster.compiler.pipeline :as pipeline]
@@ -13,6 +14,8 @@
             [raster.gpu.compiled :as compiled]
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.link :as link]
+            [raster.gpu.measurement :as measurement]
+            [raster.ode.pde :as pde]
             [raster.runtime.hardware :as hardware]
             [raster.runtime.microbench :as microbench]))
 
@@ -200,6 +203,106 @@
              (range features))))
     (range rows))))
 
+(defn- checked-heat-shape [shape]
+  (when-not (and (vector? shape) (= 2 (count shape))
+                 (every? #(and (integer? %) (<= 3 % 4096)) shape)
+                 (<= (apply *' shape) 1048576))
+    (throw (ex-info "heat canary requires [nx ny], each >=3, with at most 1M cells"
+                    {:shape shape})))
+  shape)
+
+(defn heat-arguments
+  "Deterministic periodic input and stable explicit-step parameters for a resident stencil."
+  [shape]
+  (let [[nx ny] (checked-heat-shape shape)
+        alpha 0.2
+        inv-dx2 (double (* nx nx))
+        inv-dy2 (double (* ny ny))
+        dt (/ 0.1 (* alpha (+ inv-dx2 inv-dy2)))]
+    [(double-array (* nx ny))
+     (double-array
+      (for [i (range nx) j (range ny)]
+        (+ 2.0 (* 0.4 (Math/sin (* 2.0 Math/PI (/ (+ i 0.5) nx))))
+           (* 0.2 (Math/cos (* 2.0 Math/PI (/ (+ j 0.5) ny)))))))
+     (long nx) (long ny) alpha dt inv-dx2 inv-dy2]))
+
+(defn heat-reference
+  "Independent primitive-array five-point reference; avoids benchmark-time deftm JVM dispatch."
+  [[_ ^doubles input nx ny alpha dt inv-dx2 inv-dy2]]
+  (let [out (double-array (* nx ny))]
+    (dotimes [i nx]
+      (let [im (if (zero? i) (dec nx) (dec i))
+            ip (if (= i (dec nx)) 0 (inc i))]
+        (dotimes [j ny]
+          (let [jm (if (zero? j) (dec ny) (dec j))
+                jp (if (= j (dec ny)) 0 (inc j))
+                idx (+ (* i ny) j)
+                center (aget input idx)
+                lap-x (* inv-dx2 (+ (aget input (+ (* im ny) j))
+                                    (* -2.0 center)
+                                    (aget input (+ (* ip ny) j))))
+                lap-y (* inv-dy2 (+ (aget input (+ (* i ny) jm))
+                                    (* -2.0 center)
+                                    (aget input (+ (* i ny) jp))))]
+            (aset-double out idx (+ center (* alpha dt (+ lap-x lap-y))))))))
+    out))
+
+(defn- heat-max-error [^doubles expected actual]
+  (when-not (= (alength expected) (alength ^doubles actual))
+    (throw (ex-info "heat canary output length differs from reference" {})))
+  (reduce max 0.0
+          (map (fn [want got] (Math/abs (- (double want) (double got))))
+               expected actual)))
+
+(defn heat!
+  "Opt-in public TypedSOAC periodic-heat canary, with resident device-event timing.
+
+   Compile, lower, bind, transfers and independent validation are outside the event samples.
+   Returns raw chronological samples; nonstationary results must not promote a schedule."
+  [{:keys [environment-tag target compiler-revision shape]
+    :or {target :ze:0 shape [128 128]}}]
+  (let [shape (checked-heat-shape shape)
+        identity (identity-for :periodic-heat-step-resident target :double shape
+                               :device-event environment-tag)
+        args (heat-arguments shape)
+        expected (heat-reference args)
+        started (System/nanoTime)
+        compiled (equation/compile #'pde/periodic-heat-step-2d!
+                                   {:target target :dtype :double})
+        compile-ns (- (System/nanoTime) started)
+        started (System/nanoTime)
+        plan (equation/lower compiled args)
+        lower-ns (- (System/nanoTime) started)
+        started (System/nanoTime)
+        resident (link/instantiate! plan {:profile? true})
+        bind-ns (- (System/nanoTime) started)]
+    (try
+      (let [output (first (:outputs plan))
+            _ (when-not output
+                (throw (ex-info "heat canary has no output" {})))
+            _ (dotimes [_ 4] (link/profile! resident))
+            pre-error (heat-max-error expected (link/download resident output))
+            profiles (vec (repeatedly 12 #(link/profile! resident)))
+            post-error (heat-max-error expected (link/download resident output))
+            error (max pre-error post-error)
+            _ (when (> error 1.0e-10)
+                (throw (ex-info "generated heat step differs from independent reference"
+                                {:shape shape :max-absolute-error error})))
+            samples (mapv #(long (* 1.0e6 (:device-wall-ms %))) profiles)
+            _ (when-not (every? pos? samples)
+                (throw (ex-info "heat canary lacks positive device-event spans"
+                                {:samples-ns samples})))
+            measured (measurement/summarize samples :timing-source :device-event
+                                           :warmup-iterations 4)]
+        {:identity identity :compiler-revision compiler-revision :validated? true
+         :compile-ns compile-ns :lower-ns lower-ns :bind-ns bind-ns
+         :compiled-fallback (get-in compiled [:stats :fallback])
+         :kernel-count (count (:profile (first profiles)))
+         :kernel-names (mapv :kernel-name (:profile (first profiles)))
+         :kernel-total-ns (mapv #(long (* 1.0e6 (:kernel-total-ms %))) profiles)
+         :max-absolute-error error :measurement measured})
+      (finally (link/close! resident)))))
+
 (defn rmsnorm!
   "Validate and device-event measure the public equation-first cooperative RMSNorm path.
 
@@ -343,8 +446,8 @@
     (when (and baseline output
                (= (.getCanonicalPath (io/file baseline)) (.getCanonicalPath (io/file output))))
       (throw (ex-info "canary output must not overwrite its baseline" {})))
-    (let [result ((clojure.core/case case :cpu cpu! :gemm gemm! :rmsnorm rmsnorm!
-                       (throw (ex-info "canary :case must be :cpu, :gemm or :rmsnorm" {}))) opts)
+    (let [result ((clojure.core/case case :cpu cpu! :gemm gemm! :rmsnorm rmsnorm! :heat heat!
+                       (throw (ex-info "canary :case must be :cpu, :gemm, :rmsnorm or :heat" {}))) opts)
           baseline (when (and baseline (.exists (io/file baseline)))
                      (edn/read-string (slurp baseline)))
           result (assoc result :verdict (verdict baseline result))]
