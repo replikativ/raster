@@ -840,8 +840,6 @@
                               :target :opencl-c :node id :operation operation})))))]
     (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
 
-(declare generate-contraction-kernel-artifact)
-
 (defn- generate-reduction-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts
                  scheduled-equation-algorithm scheduled-equation-body]
@@ -870,20 +868,11 @@
                                        {:reason :kernel-graph-segmented-reduction-facts
                                         :operation (:id operation) :fallback :none})))
                      descriptor (hw/descriptor-for target-device)
-                     planned (contraction-schedule/plan-portable-body
-                              facts operation descriptor
-                              {:array-types array-types :scalar-types scalar-types})]
-                 (when-not (:ok planned)
-                   (throw (ex-info
-                           "segmented reduction has no portable KernelBody schedule"
-                           {:reason :kernel-graph-segmented-reduction-body
-                            :operation (:id operation) :schedule-decline planned
-                            :fallback :none})))
-                 (kart/certify-scheduled-operation
-                  (generate-contraction-kernel-artifact
-                   (:body planned) :target-dialect target-dialect
-                   :kernel-name-prefix "graph_contraction")
-                  operation))
+                     scheduled (contraction-schedule/schedule-portable-for-node
+                                node graph facts descriptor
+                                {:array-types array-types :scalar-types scalar-types})]
+                 (kernel-body-target/emit-artifact
+                  (str "graph_contraction_" (gensym "")) scheduled target-dialect))
                ;; Scalar reductions are certified against their complete graph context before
                ;; projection. Do not add the older artifact-only operation wrapper outside it.
                (generate-segred-kernel
