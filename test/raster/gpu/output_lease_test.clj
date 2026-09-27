@@ -1,8 +1,10 @@
 (ns raster.gpu.output-lease-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.link-plan :as plan]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
-            [raster.gpu.link :as link]))
+            [raster.gpu.link :as link]
+            [raster.gpu.value :as value]))
 
 (defn- executable
   ([] (executable :owned true))
@@ -112,3 +114,31 @@
               (is (= 1 (:replay @lease)))
               (.close ^java.io.Closeable lease)))
           (finally (deliver release true)))))))
+
+(deftest compiled-wrapper-does-not-invalidate-a-leased-output-before-declining
+  (let [executable (executable)
+        releases (atom 0)
+        closes (atom 0)
+        replays (atom 0)
+        compiled (compiled/map->Compiled
+                  {:executable executable :in-tree [] :out-tree [] :donated {}
+                   :target :ocl:0 :live-outputs (atom [:old-output])})]
+    (with-redefs [gpu/replay! (fn [& _] (swap! replays inc))
+                  gpu/close-session! (fn [& _] (swap! closes inc))
+                  value/free! (fn [_] (swap! releases inc))
+                  link/outputs (fn [_] {:out :resident-view})
+                  link/output-values (fn [_] {:semantic-out :resident-view})]
+      (link/run! executable)
+      (with-open [lease (link/output-lease! executable)]
+        (is (= :link-output-lease-active
+               (reason #(compiled/invoke-compiled compiled {}))))
+        (is (= :link-output-lease-active
+               (reason #(compiled/close! compiled))))
+        (is (= 1 (:replay @lease)))
+        (is (= [:old-output] @(:live-outputs compiled)))
+        (is (zero? @releases))
+        (is (zero? @closes))
+        (is (= 1 @replays)))
+      (compiled/close! compiled)
+      (is (= 1 @releases))
+      (is (= 1 @closes)))))

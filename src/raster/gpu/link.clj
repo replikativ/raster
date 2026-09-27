@@ -334,6 +334,18 @@
                      :leases @(:output-leases executable)
                      :plan (get-in executable [:plan :id])}))))
 
+(defn with-unleased-execution!
+  "Run a composite Link/Compiled mutation under the same lifetime guard as replay and leases.
+   Check before invoking `f`, so input donation or output-wrapper invalidation cannot occur when
+   a lease would reject the eventual replay. `f` must finish synchronously and may call Link
+   operations reentrantly. This is an execution boundary, not permission for private reuse."
+  [executable operation f]
+  (let [executable (ensure-live! executable operation)]
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable operation)
+      (ensure-no-output-leases! executable operation)
+      (f))))
+
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
   [executable node-id]
