@@ -11,7 +11,8 @@
    compilation and, through the direct equation-first LinkPlan, repeated numerical agreement
    with CPU updates over resident mutable weights.
 
-   Device checks use Level Zero. Schedule selection retains precision and index-width legality;
+   Device checks use Level Zero; the full training-step oracle also runs on OpenCL.
+   Schedule selection retains precision and index-width legality;
    residency is not a claim that an XMX candidate was selected. Skips visibly without a GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
@@ -23,6 +24,7 @@
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as opencl]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.descriptor-fixture :as fixture]))
 
@@ -405,7 +407,9 @@
             "mse∘linear train step must extract fully resident (matmuls + fused loss + SGD)")
         (when p
           (is (seq (:steps p)) "resident descriptor carries kernel steps"))))
-    (let [compilation (equation-first/compile train {:target :ze:0 :dtype :float})
+    (doseq [[device available? skip!] [[:ze:0 gp/gpu-available? gp/gpu-skip!]
+                                      [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+     (let [compilation (equation-first/compile train {:target device :dtype :float})
           batch 2 in-f 3 out-f 2 lr 0.01
           weights (rnd (* in-f out-f) 31)
           initial-weights (vec weights)
@@ -431,8 +435,8 @@
         (is (= :unproven (:reuse memory))
             "resident AD compilation is not proof that its tape storage can be reused"))
       (testing "direct AD/SGD updates replay over resident weights without host reupload"
-        (if-not @gp/gpu-available?
-          (gp/gpu-skip! "gpu-ad-full-train-step-execution")
+        (if-not @available?
+          (skip! (str "gpu-ad-full-train-step-execution on " device))
           (let [expected (aclone weights)
                 previous (volatile! initial-weights)
                 live (gpu-link/instantiate! plan)]
@@ -451,4 +455,4 @@
                   (vreset! previous (vec out))))
               (is (= initial-weights (vec weights))
                   "the host initialization array is not the evolving resident state")
-              (finally (gpu-link/close! live)))))))))
+              (finally (gpu-link/close! live))))))))))

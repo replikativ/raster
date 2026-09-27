@@ -12,7 +12,7 @@ if command -v clinfo >/dev/null 2>&1; then
   clinfo -l
 fi
 
-mapfile -t files < <(grep -rl 'opencl-available?' test --include='*_test.clj' | sort)
+mapfile -t files < <(grep -Elr 'opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?' test --include='*_test.clj' | sort)
 if (( ${#files[@]} == 0 )); then
   echo "no OpenCL-gated test namespaces found" >&2
   exit 2
