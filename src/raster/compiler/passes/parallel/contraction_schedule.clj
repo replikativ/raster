@@ -53,10 +53,15 @@
         (recur (next remaining) (conj used fresh) (conj result fresh)))
       result)))
 
-(defn- lowered-dpas-instruction?
-  [{:keys [family m n k subgroup]}]
-  (and (= :dpas family) (= 8 m) (= 16 k)
-       (= 16 subgroup) (= n subgroup)))
+(def ^:private lowered-matrix-instructions
+  #{{:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+    {:family :mma :m 16 :n 16 :k 16 :subgroup 32}
+    {:family :mfma :m 16 :n 16 :k 16 :subgroup 64}})
+
+(defn- lowered-matrix-instruction?
+  [matrix]
+  (contains? lowered-matrix-instructions
+             (select-keys matrix [:family :m :n :k :subgroup])))
 
 (defn- tile-valid?
   [{:keys [block-m block-n block-k sg-m sg-n matrix num-stages]}]
@@ -380,8 +385,8 @@
   "Apply `tile` to verified contraction facts.
 
   Returns `{:ok true :body KernelBody :bindings …}` or a structured decline.  The initial family
-  is Intel DPAS f16×f16→f32.  Other families become additional target-lowering rows over this same
-  body vocabulary; they are not new contraction IRs."
+  admits the direct f16×f16→f32 DPAS, MMA and MFMA instruction shapes. Target emission remains a
+  separate qualified boundary; admission here never implies runtime support."
   ([contract-facts desc tile]
    (plan-matrix-body contract-facts desc tile {}))
   ([contract-facts desc tile {:keys [operation-id]}]
@@ -395,6 +400,8 @@
          {:keys [element combine neutral]} (facts/scalar-reduction-view contract-facts)
          authoritative-desc? (and desc (or (:backend desc) (:execution desc)))
          matrix-capability-unavailable? (and authoritative-desc? (nil? (:matrix desc)))
+         supported-widths (when authoritative-desc?
+                            (hardware/supported-subgroup-sizes desc))
          raw-tile (when-not matrix-capability-unavailable?
                     (or tile (hardware/derive-gemm-tile (or desc {}))))
          matrix (when raw-tile
@@ -413,14 +420,26 @@
        matrix-capability-unavailable?
        (decline :matrix-capability-unavailable
                 {:backend (:backend desc)
-                 :supported-subgroup-sizes
-                 (hardware/supported-subgroup-sizes desc)})
+                 :supported-subgroup-sizes supported-widths})
+
+       (and authoritative-desc?
+            (or (not= (select-keys (:matrix desc) [:family :m :n :k :subgroup])
+                      (select-keys matrix [:family :m :n :k :subgroup]))
+                (and (seq supported-widths)
+                     (not (contains? (set supported-widths) (:subgroup matrix))))))
+       (decline :matrix-capability-mismatch
+                {:requested matrix :available (:matrix desc)
+                 :supported-subgroup-sizes supported-widths})
 
        (or (not (dtype/known? dtype)) (not= :half (dtype/canon dtype)))
        (decline :dtype-not-dpas {:dtype dtype})
 
        (not (contains? #{:half :float} result-dtype))
        (decline :matrix-result-dtype-not-lowered {:result-dtype result-dtype})
+
+       (and (not= :dpas (:family matrix)) (not= :float result-dtype))
+       (decline :matrix-result-dtype-not-lowered
+                {:family (:family matrix) :result-dtype result-dtype})
 
        (not= [2 1] [(count free-axes) (count contract-axes)])
        (decline :not-2-free)
@@ -440,10 +459,7 @@
        (not (every? number? [M N K]))
        (decline :symbolic-dims)
 
-       (not= :dpas (:family matrix))
-       (decline :matrix-family-not-lowered {:family (:family matrix)})
-
-       (not (lowered-dpas-instruction? matrix))
+       (not (lowered-matrix-instruction? matrix))
        (decline :matrix-instruction-not-lowered {:matrix matrix})
 
        (not (tile-valid? tile))
@@ -462,8 +478,17 @@
        (not (zero? (mod (long K) (long matrix-k))))
        (decline :partial-matrix-k-fragment {:K K :matrix-k matrix-k})
 
-       (block-io/static-failure M N K)
+       (and (= :dpas (:family matrix)) (block-io/static-failure M N K))
        (decline :matrix-surface-contract {:condition (block-io/static-failure M N K)})
+
+       (and (not= :dpas (:family matrix))
+            (not (every? zero?
+                         [(mod M (:block-m tile))
+                          (mod N (:block-n tile))
+                          (mod K (:block-k tile))])))
+       (decline :matrix-direct-tile-unaligned
+                {:dimensions [M N K]
+                 :block (mapv tile [:block-m :block-n :block-k])})
 
       ;; Helper strings are target source pasted above a kernel and have no KernelBody meaning.
       ;; Refuse them so callers express the computation in the typed scalar expression instead.

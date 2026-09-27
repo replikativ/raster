@@ -1627,8 +1627,13 @@
                    {:tensorized false :reason :epilogue-reads-destination
                     :family :matrix :destination out-sym}
 
-                   (:ok scheduled)
+                   (and (:ok scheduled)
+                        (= :dpas (get-in scheduled [:tile :matrix :family])))
                    (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
+
+                   (:ok scheduled)
+                   {:tensorized false :reason :matrix-target-not-routed
+                    :family (get-in scheduled [:tile :matrix :family])}
 
                    :else
                    {:tensorized false :reason (:reason scheduled) :detail scheduled})]

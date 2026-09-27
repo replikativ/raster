@@ -7,6 +7,8 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.backend.gpu.matrix-target :as matrix-target]
+            [raster.compiler.backend.gpu.matrix-fragment-source :as matrix-fragment]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
@@ -79,6 +81,44 @@
         "pipeline depth reaches the explicit prefetch op")
     (is (= :dot-operand (get-in kernel [:fragments 8 :layout :kind])))
     (is (= :mma-frag (get-in kernel [:fragments 0 :layout :kind])))))
+
+(deftest verified-contractions-admit-target-qualified-direct-matrix-bodies
+  (let [form (concat (matrix-form 64 64 64) [:out-dtype :float])
+        proof (facts/contraction-facts form :dtype :half)
+        tile (fn [instruction]
+               {:block-m 64 :block-n 64 :block-k 32
+                :sg-m 32 :sg-n 32 :num-stages 3 :matrix instruction})]
+    (doseq [[family subgroup] [[:mma 32] [:mfma 64]]]
+      (let [instruction {:family family :m 16 :n 16 :k 16 :subgroup subgroup}
+            planned (schedule/plan-matrix-body proof nil (tile instruction))
+            kernel (:body planned)]
+        (is (:ok planned) (str family " should retain the verified contraction"))
+        (is (= family (get-in kernel [:attributes :instruction-family])))
+        (is (= :float (:dtype (first (filter #(= :result (:role %))
+                                             (:parameters kernel))))))
+        (is (body/kernel-body? kernel))
+        (is (re-find (if (= family :mma) #"wmma::mma_sync" #"rocwmma::mma_sync")
+                     (if (= family :mma)
+                       (:source (matrix-target/emit-matrix-kernel
+                                 "verified_mma" kernel :cuda))
+                       (matrix-fragment/emit-matrix-kernel
+                        "verified_mfma" kernel :hip))))))
+    (let [mma {:family :mma :m 16 :n 16 :k 16 :subgroup 32}
+          unaligned (schedule/plan-matrix-body
+                     (facts/contraction-facts
+                      (concat (matrix-form 80 64 64) [:out-dtype :float]) :dtype :half)
+                     nil (tile mma))
+          narrow-result (schedule/plan-matrix-body
+                         (facts/contraction-facts (matrix-form 64 64 64) :dtype :half)
+                         nil (tile mma))
+          mismatched-target (schedule/plan-matrix-body
+                             proof
+                             {:backend :cuda :matrix {:family :dpas :m 8 :n 16
+                                                     :k 16 :subgroup 16}}
+                             (tile mma))]
+      (is (= :matrix-direct-tile-unaligned (:reason unaligned)))
+      (is (= :matrix-result-dtype-not-lowered (:reason narrow-result)))
+      (is (= :matrix-capability-mismatch (:reason mismatched-target))))))
 
 (deftest checked-zero-identities-reach-the-matrix-schedule
   (doseq [init '[(float 0.0) (double (float 0))]]
