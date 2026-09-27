@@ -4080,7 +4080,9 @@
     (first (descriptor/call-args expression))))
 
 (defn- source-descriptions
-  [pairs default-dtype array-types scalar-types]
+  ([pairs default-dtype array-types scalar-types]
+   (source-descriptions pairs default-dtype array-types scalar-types false))
+  ([pairs default-dtype array-types scalar-types segmented-plans?]
   ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
   ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
@@ -4091,9 +4093,10 @@
          [id [symbol expression]]]
       (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
             description
-            (or (binding [*scalar-definitions* scalar-definitions]
-                  (operation-description id symbol expression default-dtype array-types
-                                         local-scalar-types))
+            (or (when (or segmented-plans? (not (swr-fuse/marker? expression)))
+                  (binding [*scalar-definitions* scalar-definitions]
+                    (operation-description id symbol expression default-dtype array-types
+                                           local-scalar-types)))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
@@ -4180,7 +4183,7 @@
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
     {:descriptions [] :array-types array-types :scalar-definitions {}
      :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true}
-    (map-indexed vector pairs))))
+    (map-indexed vector pairs)))))
 
 (defn- canonical-extent
   [equalities values extent]
@@ -5521,7 +5524,8 @@
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
           descriptions (preserve-map-storage-inputs
-                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
+                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types
+                                                                 segmented-plans?)
                                             shape-equalities values)
                          values)]
       (when (and (even? (count bindings))

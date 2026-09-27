@@ -160,12 +160,18 @@
                            source :float array-types
                            {:scalar-types scalar-types :values values
                             :segmented-plans? true}))
+        descriptor-attempt (typed-route/attempt
+                            source :float array-types
+                            {:scalar-types scalar-types :values values})
         algorithms (filterv
                     #(or (swr/plan? %)
                          (some (fn [equation] (not= 'scalar (soac/operation-kind equation)))
                                (soac/equations %)))
                     (map :algorithm (:equations program)))]
     (is (= 3 (count algorithms)))
+    (is (= :typed-soac (get-in descriptor-attempt [:stats :route])))
+    (is (some fuse/marker? (tree-seq coll? seq (get-in descriptor-attempt [:program :source])))
+        "descriptor compilation keeps the protected binding between its typed SOAC islands")
     (is (soac/program-form? (first algorithms)))
     (is (= plan (second algorithms)))
     (is (soac/program-form? (last algorithms)))
