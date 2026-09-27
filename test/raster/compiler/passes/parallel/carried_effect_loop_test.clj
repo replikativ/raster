@@ -23,7 +23,10 @@
               loop (first (filter #(seq (:iter-args %)) all))
               inner (:operations loop)]
           (is (= :kernel-body (get-in compiled [:attributes :emission-route])))
-          (is (= ['sum] (mapv :id (:results loop))))
+          (is (= [:float] (mapv :type (:results loop))))
+          (is (= (get-in loop [:results 0 :id])
+                 (:value (first (filter #(= 'totals (:buffer %)) all))))
+              "the fresh loop result feeds the continuation store")
           (is (= [:float] (mapv #(get-in % [:binding :type]) (:iter-args loop))))
           (is (< (first (keep-indexed #(when (= 'words (:buffer %2)) %1) inner))
                  (first (keep-indexed #(when (= :+ (get-in %2 [:expression :op])) %1) inner)))
