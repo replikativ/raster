@@ -19,12 +19,13 @@
         "the same derived digit in the address still requires a separate proof")))
 
 (deftest windowed-prefill-softmax-has-a-certified-parallel-row-kernel
-  (let [compiled (pipeline/show-pipeline
-                  #'attention/attn-prefill-softmax-windowed-head-major!
-                  :target-device :ocl:0 :dtype :float)]
-    (is (= :typed-soac (get-in compiled [:soac-fused-stats :route])))
-    (is (= [:kernel-body]
-           (mapv #(get-in % [:attributes :emission-route]) (:kernels compiled))))))
+  (doseq [target [:ocl:0 :ze:0]]
+    (let [compiled (pipeline/show-pipeline
+                    #'attention/attn-prefill-softmax-windowed-head-major!
+                    :target-device target :dtype :float)]
+      (is (= :typed-soac (get-in compiled [:soac-fused-stats :route])))
+      (is (= [:kernel-body]
+             (mapv #(get-in % [:attributes :emission-route]) (:kernels compiled)))))))
 
 (defn- guarded-source [read-index]
   (list 'let*
