@@ -203,7 +203,7 @@
                   [{:strategy :regtiled :kernel-body {:schedule register-tiled/default-tile}}
                    {:strategy :portable-segred}]
                   (contraction-with-dimensions 'm 'n 'k))
-        coordinate-cases (take 3 (:cases guarded))]
+        coordinate-cases (take-last 3 (:cases guarded))]
     (is (= :runtime-expression-cases (:kind guarded)))
     (is (= :regtiled (:default guarded)))
     (is (= [{:expression 'm :op :> :value 2147483646
@@ -214,10 +214,14 @@
              :strategy :portable-segred}]
            coordinate-cases)
         "dynamic admission projects the exact constraints used by static lowering")
-    (is (= 6 (count (:cases guarded)))
-        "coordinate guards precede the three existing logical-capacity guards")
-    (is (= 3 (count (:cases ordinary)))
-        "power-of-two production tiles add no comparisons beyond existing capacity guards")))
+    (is (= 9 (count (:cases guarded)))
+        "positive dimensions, dense products and padded coordinates are guarded")
+    (is (= 6 (count (:cases ordinary)))
+        "power-of-two tiles need only positivity and capacity guards")
+    (is (= (mapv (fn [dimension]
+                   {:expression dimension :op :<= :value 0 :strategy :portable-segred})
+                 '[m n k])
+           (vec (take 3 (:cases ordinary)))))))
 
 (deftest register-tiled-loop-updates-cannot-overflow-at-the-int-boundary
   (let [kernel-body (:kernel-body
@@ -281,3 +285,15 @@
     (is (re-find #"\? out\[" (:source emitted))
         "the destination element is loaded under the same store mask")
     (is (str/includes? (:source emitted) "(beta * "))))
+
+(deftest mixed-static-shapes-retain-impossible-capacity-obligations
+  (let [dimensions [65536 65536 'depth]
+        conditions (register-tiled/admission-preconditions
+                    dimensions register-tiled/default-tile)
+        static-product (launch/product 65536 65536)]
+    (is (register-tiled/static-capacity-overflow? dimensions)
+        "a static pair cannot hide behind an unrelated symbolic dimension")
+    (is (some #(= {:expression static-product :op :<= :value Integer/MAX_VALUE} %)
+              conditions)
+        "legacy guarded dispatch must retain the impossible condition and fall back")
+    (is (not (register-tiled/static-capacity-overflow? [65535 32768 'depth])))))

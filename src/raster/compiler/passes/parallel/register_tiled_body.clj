@@ -111,6 +111,63 @@
              :maximum-extent (limit tile-width)})
           [:m :n :k] [m n k] [block-m block-n block-k])))
 
+(defn static-capacity-overflow?
+  "Whether any fully static dense operand/result pair exceeds the int-addressable contract.
+
+   Mixed shapes are checked pair by pair: a static M*N overflow is already fatal even when K is a
+   runtime scalar. Products containing a symbol remain call-time obligations."
+  [[m n k :as dimensions]]
+  (when-not (= 3 (count dimensions))
+    (throw (ex-info "register-tiled capacity proof requires exactly three dimensions"
+                    {:reason :raster/bug :dimensions dimensions})))
+  (boolean
+   (some (fn [factors]
+           (and (every? integer? factors)
+                (> (apply *' factors) Integer/MAX_VALUE)))
+         [[m n] [m k] [k n]])))
+
+(defn admission-preconditions
+  "Return the checked runtime obligations for one register-tiled shape and selected tile.
+
+   Positive static dimensions and fully static capacities that fit are compile-time admission facts
+   and do not become redundant call conditions. Every symbolic dimension remains positive; every
+   product involving one is bounded by the current int-addressable dense-buffer contract. An
+   already-overflowing static pair remains as an impossible condition so guarded legacy dispatch
+   selects its portable alternative. A padded coordinate condition is retained only when the
+   selected tile imposes a stricter limit than that positive/product proof. The same ordered facts
+   drive explicit schedule admission and legacy guarded fallback selection."
+  [[m n k :as dimensions] tile]
+  (when-not (and (= 3 (count dimensions))
+                 (every? #(or (symbol? %) (and (integer? %) (pos? %))) dimensions))
+    (throw (ex-info "register-tiled admission requires three positive literal or scalar dimensions"
+                    {:reason :raster/bug :dimensions dimensions :tile tile})))
+  (let [symbolic? symbol?
+        positive
+        (into []
+              (keep (fn [dimension]
+                      (when (symbolic? dimension)
+                        {:expression dimension :op :> :value 0})))
+              dimensions)
+        capacities
+        (into []
+              (keep (fn [factors]
+                      (when (or (some symbolic? factors)
+                                (and (every? integer? factors)
+                                     (> (apply *' factors) Integer/MAX_VALUE)))
+                        {:expression (apply launch/product factors)
+                         :op :<= :value Integer/MAX_VALUE})))
+              [[m n] [m k] [k n]])
+        coordinates
+        (into []
+              (keep (fn [{:keys [dimension maximum-extent]}]
+                      ;; Positive dimensions plus the three dense products already imply an
+                      ;; INT_MAX bound. Keep only stricter padded-tail limits.
+                      (when (and (symbolic? dimension)
+                                 (< maximum-extent Integer/MAX_VALUE))
+                        {:expression dimension :op :<= :value maximum-extent})))
+              (int-coordinate-constraints dimensions tile))]
+    (into (into positive capacities) coordinates)))
+
 (defn- additive?
   [combine]
   (contains? '#{+ clojure.core/+ raster.numeric/+} combine))

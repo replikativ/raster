@@ -176,9 +176,12 @@ direct low-level artifact tests still exist; removing those requires migrating t
 The register-tiled schedule has an explicit graph-certified candidate constructor, exercised
 through equation-first emission and public replay for a ragged NN contraction. It reuses the
 existing cooperative KernelBody (local storage, barriers and per-thread accumulators); no kernel
-source template is added. Admission currently requires fixed positive FP32 shapes, int-sized
-storage capacities and a numerical policy that permits target contraction. The strict policy,
-dynamic shapes and unsupported layouts decline this candidate. The public opt-in is
+source template is added. Admission requires positive FP32 shapes, int-sized storage capacities
+and a numerical policy that permits target contraction. Literal and scalar-bound extents share
+the same body; runtime positivity, capacity and padded-coordinate obligations are retained in its
+certificate and checked before allocation or launch. Mixed static/dynamic shapes still reject
+oversized static products at compile time. Strict arithmetic and unsupported layouts (including
+the transposed weights of `linear-nb`) decline this candidate. The public opt-in is
 `:schedule {:typed-contraction {:strategy :register-tiled}}`; the resolved numerical policy must
 permit contraction. Declines are explicit, with no portable fallback. Automatic selection is
 unchanged, and explicit `:portable` selects the same ordered body as `:auto`. All selections use
@@ -197,7 +200,9 @@ launch/storage expression algebra. They refer to physical integral scalar parame
 derived bindings, and precede target-specific requirements in the emitted artifact. The projection
 certificate rejects dropped or changed conditions. Existing graph/call preflight checks them
 before allocation or launch; no second guard interpreter is introduced. This supplies the missing
-admission boundary for a later explicitly requested dynamic tile, not automatic tile selection.
+admission boundary for explicitly requested dynamic tiles, not automatic tile selection. The
+legacy descriptor selector derives inverse fallback guards from the same condition builder;
+buffer capacity validation remains separate from these bounded-index proofs.
 
 Equation-first execution reporting now observes actual fixed graph bindings through the public
 compiled API. It shares compact executable descriptions with descriptor admission reports and

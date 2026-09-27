@@ -37,6 +37,30 @@
             (is (= expected (vec (value/->host (:result (live {}))))) (str device)))
           (finally (compiled/close! live)))))))
 
+(deftest dynamic-register-tiles-replay-with-tail-shapes-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "equation-first dynamic register tile on " device))
+      (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]]
+        (let [left (float-array (map #(/ (- (mod % 17) 8) 4.0)
+                                     (range (* batch in-f))))
+              right (float-array (map #(/ (- (mod % 13) 6) 8.0)
+                                      (range (* out-f in-f))))
+              arguments [left right batch out-f in-f]
+              expected (vec (apply contractions/dynamic-matmul arguments))
+              prepared (compiled/lower
+                        #'contractions/dynamic-matmul arguments
+                        {:compiler :equation-first :target device :dtype :float
+                         :schedule {:typed-contraction {:strategy :register-tiled}}})
+              live (compiled/instantiate! prepared)]
+          (try
+            ;; Dyadic values keep these sums exact in FP32, even with target FMA.
+            (dotimes [_ 2]
+              (is (= expected (vec (value/->host (:result (live {})))))
+                  (str device " " [batch in-f out-f])))
+            (finally (compiled/close! live))))))))
+
 (def ^:private source
   '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
                                       (* (clojure.core/aget A (+ (* i k) l))

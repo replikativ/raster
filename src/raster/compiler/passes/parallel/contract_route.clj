@@ -1396,23 +1396,16 @@
           tiled (some #(when (= :regtiled (:strategy %)) %) candidates)
           tile (select-keys (get-in tiled [:kernel-body :schedule])
                             [:block-m :block-n :block-k])
-          coordinate-guards
-          (into []
-                (keep (fn [{:keys [dimension maximum-extent]}]
-                        ;; Existing positive-capacity guards already imply dimension <= INT_MAX.
-                        ;; Only a tile whose padded limit is stricter needs another comparison.
-                        (when (and (symbol? dimension)
-                                   (< maximum-extent Integer/MAX_VALUE))
-                          {:expression dimension :op :> :value maximum-extent
-                           :strategy :portable-segred})))
-                (register-tiled-body/int-coordinate-constraints [m n k] tile))
-          capacity-guards
-          (mapv (fn [dimensions]
-                  {:expression (apply klaunch/product dimensions)
-                   :op :> :value Integer/MAX_VALUE
-                   :strategy :portable-segred})
-                [[m n] [m k] [k n]])
-          guards (into coordinate-guards capacity-guards)]
+          inverse-op {:> :<= :<= :>}
+          guards
+          (mapv (fn [{:keys [op] :as condition}]
+                  (assoc condition :op (or (get inverse-op op)
+                                           (throw (ex-info
+                                                   "register-tiled condition has no fallback inverse"
+                                                   {:reason :raster/bug
+                                                    :condition condition})))
+                                   :strategy :portable-segred))
+                (register-tiled-body/admission-preconditions [m n k] tile))]
       (case (:kind selector)
         :fixed-strategy
         {:kind :runtime-expression-cases :cases guards :default (:strategy selector)}

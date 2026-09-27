@@ -14,6 +14,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -147,12 +148,18 @@
     (doseq [[expected candidate-facts candidate-options candidate-descriptor]
             [[:register-tiled-numerical-policy facts
               (assoc options :precision :f32-scalar) descriptor]
-             [:register-tiled-static-candidate (assoc-in facts [:free-axes 0 1] 'm)
+             [:symbolic-dims (assoc-in facts [:free-axes 0 1] '(+ m 1))
               (assoc options :precision :mixed-f16-f32) descriptor]
              [:register-tiled-fp32-candidate (assoc facts :dtype :double)
               (assoc options :precision :mixed-f16-f32) descriptor]
              [:register-tiled-static-capacity
               (assoc-in facts [:free-axes 0 1] Integer/MAX_VALUE)
+              (assoc options :precision :mixed-f16-f32) descriptor]
+             [:register-tiled-static-capacity
+              (-> facts
+                  (assoc-in [:free-axes 0 1] 65536)
+                  (assoc-in [:free-axes 1 1] 65536)
+                  (assoc-in [:contract-axes 0 1] 'depth))
               (assoc options :precision :mixed-f16-f32) descriptor]
              [:target-resources facts
               (assoc options :precision :mixed-f16-f32)
@@ -176,7 +183,7 @@
            (get-in (ex-data error) [:schedule-decline :reason])))
     (is (= :none (:fallback (ex-data error))))))
 
-(deftest public-contraction-selection-preserves-default-and-rejects-dynamic-tiles
+(deftest public-contraction-selection-preserves-default
   (let [compile-fixed (fn [strategy]
                         (equation-first/compile
                          #'contractions/fixed-matmul
@@ -187,19 +194,40 @@
         certificates (fn [compilation]
                        (mapv #(select-keys (get-in % [:provenance :scheduled-operation])
                                            [:numerics :legality :attributes])
-                             (:kernels compilation)))
-        error (try
-                (equation-first/compile
-                 #'dl-nn/linear-nb
-                 {:target ocl-target :dtype :float :schedule register-tiled-schedule})
-                nil
-                (catch clojure.lang.ExceptionInfo exception exception))]
+                             (:kernels compilation)))]
     (is (= (certificates automatic) (certificates portable)))
     (is (= :same-typed-ssa-evaluation-order
-           (get-in (first (certificates automatic)) [:numerics :policy])))
-    (is (= :register-tiled-static-candidate
-           (get-in (ex-data error) [:schedule-decline :reason])))
-    (is (= :none (:fallback (ex-data error))))))
+           (get-in (first (certificates automatic)) [:numerics :policy])))))
+
+(deftest dynamic-register-tiles-preserve-preallocation-shape-obligations
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'contractions/dynamic-matmul
+                       {:target target :dtype :float :schedule register-tiled-schedule})
+          artifact (first (:kernels compilation))
+          certificate (get-in artifact [:provenance :scheduled-operation])
+          graph (some (fn [equation]
+                        (some (fn [operation]
+                                (when (some #(= artifact (:operation %))
+                                            (get-in operation [:graph :nodes]))
+                                  (:graph operation)))
+                              (:operations equation)))
+                      (get-in compilation [:emitted :equations]))
+          scalars (fn [m n k]
+                    (into {} (map (fn [[id value]] [id {:type :long :value value}]))
+                          {'m m 'n n 'k k}))]
+      (is (= :register-tiled (get-in artifact [:attributes :strategy])))
+      (is (seq (:preconditions certificate)))
+      (is (= (:preconditions certificate) (:preconditions artifact)))
+      (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+      (doseq [shape [[1 3 2] [3 5 7] [65 17 67]]]
+        (is (= graph (graph-call/preflight! graph (apply scalars shape)))))
+      ;; No huge buffer allocations: rejected entirely by scalar preflight.
+      (doseq [shape [[0 3 2] [1 -1 2] [1 3 0]
+                     [65536 1 65536] [65536 65536 1] [1 65536 65536]
+                     [Long/MAX_VALUE 1 1]]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (graph-call/preflight! graph (apply scalars shape))))))))
 
 (deftest typed-contraction-strategy-participates-in-the-public-template-identity
   (compiled/clear-compilation-cache!)
