@@ -1,6 +1,7 @@
 (ns raster.gpu.cuda-nvrtc
   "Hardware-free CUDA C++ to PTX compilation through NVRTC. This is a transport
    for generated KernelArtifact source, not a resident CUDA session or a second emitter."
+  (:require [raster.compiler.ir.kernel-artifact :as artifact])
   (:import [java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout]
            [java.lang.invoke MethodHandle]
@@ -174,3 +175,17 @@
              :nvrtc-version (version)}))
         (finally
           (check! :destroy (invoke (:destroy @handles) program-pointer)))))))
+
+(defn compile-artifact-ptx
+  "Compile a verified CUDA KernelArtifact through the NVRTC transport."
+  [kernel-artifact virtual-architecture & {:keys [include-paths] :or {include-paths []}}]
+  (let [kernel-artifact (artifact/validate! kernel-artifact)]
+    (when-not (= :cuda-c (:target kernel-artifact))
+      (throw (ex-info "NVRTC requires a CUDA C++ KernelArtifact"
+                      {:reason :nvrtc-artifact-target
+                       :kernel-name (:kernel-name kernel-artifact)
+                       :target (:target kernel-artifact)})))
+    (assoc (compile-ptx (:source kernel-artifact) (:kernel-name kernel-artifact)
+                        virtual-architecture :include-paths include-paths)
+           :kernel-name (:kernel-name kernel-artifact)
+           :target (:target kernel-artifact))))
