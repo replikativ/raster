@@ -6,10 +6,12 @@
    result contracts. The resulting call owns no driver handles and never reads retained source."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -97,6 +99,19 @@
 
 (declare validate-result-views!)
 
+(defn- preflight-violations
+  [graph scalar-values]
+  (try
+    (graph-call/preflight! graph scalar-values)
+    []
+    (catch clojure.lang.ExceptionInfo exception
+      (let [reason (:reason (ex-data exception))]
+        ;; Only a failed, data-dependent precondition is an inapplicable schedule. Malformed
+        ;; certificates, scalar bindings and internal errors must propagate, not trigger fallback.
+        (if (= :kernel-precondition-failed reason)
+          [{:reason reason}]
+          (throw exception))))))
+
 (defn validate-equation-call!
   [call]
   (when-not (emitted-equation-call? call)
@@ -104,8 +119,11 @@
   (let [{equation :equation call-graph :graph buffers :buffers
          scalar-values :scalar-values outputs :outputs} call
         operation (first (:operations equation))
-        emitted (emitted-equation/validate! operation)
-        graph (:graph emitted)
+        emitted (equation-dispatch/boundary-equation operation)
+        expected-graphs (if (equation-dispatch/emitted-equation-dispatch? operation)
+                          (mapv :graph (equation-dispatch/candidates operation))
+                          [(:graph emitted)])
+        graph call-graph
         runtime-arguments
         (mapv (fn [slot argument]
                 (if (= :scalar (:kind slot))
@@ -129,9 +147,9 @@
              "emitted equation outputs differ from its logical results"
              {:equation (:id equation) :expected (:results equation)
               :actual (keys outputs)}))
-    (when-not (= graph call-graph)
+    (when-not (some #(= % call-graph) expected-graphs)
       (fail! :emitted-program-equation-graph
-             "emitted equation call graph differs from its certified operation"
+             "emitted equation call graph is not a certified alternative"
              {:equation (:id equation)}))
     (validate-result-views! equation (or (:result-views call) {}))
     call))
@@ -141,8 +159,9 @@
   (when-not (map? result-views)
     (fail! :emitted-program-result-views "result views must be a map" {:result-views result-views}))
   (let [emitted (first (:operations equation))
-        algorithm (:algorithm emitted)
-        physical (emitted-equation/physical-results emitted)]
+        boundary (equation-dispatch/boundary-equation emitted)
+        algorithm (:algorithm boundary)
+        physical (emitted-equation/physical-results boundary)]
     (doseq [[result destination] result-views]
       (let [producer (when (soac/program-form? algorithm)
                        (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm)))]
@@ -157,8 +176,9 @@
 
 (defn- prepare-equation-call
   [equation values buffers scalars result-views]
-  (let [emitted (emitted-equation/validate! (first (:operations equation)))
-        graph (:graph emitted)
+  (let [operation (first (:operations equation))
+        emitted (equation-dispatch/boundary-equation operation)
+        common-graph (:graph emitted)
         result-storage (emitted-equation/physical-results emitted)
         result-views (validate-result-views! equation (select-keys result-views (:results equation)))
         buffers
@@ -198,9 +218,15 @@
                               :expected (:dtype slot) :actual (:type value)}))
                     value)
                   (require-buffer buffers argument :equation-interface)))
-              (:abi graph) (:arguments graph))
-        runtime-arguments (executable/typed-runtime-arguments graph runtime-arguments)
-        bindings (executable/graph-bindings graph runtime-arguments)
+              (:abi common-graph) (:arguments common-graph))
+        runtime-arguments (executable/typed-runtime-arguments common-graph runtime-arguments)
+        bindings (executable/graph-bindings common-graph runtime-arguments)
+        graph (if (equation-dispatch/emitted-equation-dispatch? operation)
+                (:executable
+                 (dispatch/admit-alternative
+                  (:dispatch operation) runtime-arguments
+                  #(preflight-violations % (:scalar-values bindings))))
+                common-graph)
         outputs (select-keys buffers (:results equation))]
     {:call (validate-equation-call!
             (assoc (->EmittedEquationCall equation graph (:buffers bindings)
