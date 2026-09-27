@@ -28,7 +28,8 @@
 
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
-            instantiation-report pending-inputs profile? closed?]
+            instantiation-report pending-inputs profile? closed? lifetime-lock completed-replays
+            output-leases output-ready?]
   java.io.Closeable
   (close [this] (close! this))
   clojure.lang.IFn
@@ -303,6 +304,10 @@
                                                      node-id)))
                                            (:nodes plan)))
                                (boolean profile?)
+                               (atom false)
+                               (Object.)
+                               (atom 0)
+                               (atom 0)
                                (atom false))))
        (catch Throwable error
          (if owns-session?
@@ -320,6 +325,14 @@
     (throw (ex-info "linked executable is closed"
                     {:operation operation :plan (get-in executable [:plan :id])})))
   executable)
+
+(defn- ensure-no-output-leases! [executable operation]
+  (when (pos? @(:output-leases executable))
+    (throw (ex-info "linked output lease prevents mutation or release"
+                    {:reason :link-output-lease-active
+                     :operation operation
+                     :leases @(:output-leases executable)
+                     :plan (get-in executable [:plan :id])}))))
 
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
@@ -647,32 +660,101 @@
           (map (fn [value-id] [value-id (value-view executable value-id)]))
           value-ids)))
 
+(defn- require-owned-output-boundary! [executable]
+  (when-not (and (:owns-session? executable)
+                 (seq (get-in executable [:plan :outputs]))
+                 (every? #(= :owned (get-in executable [:plan :nodes % :view
+                                                         :allocation :ownership]))
+                         (get-in executable [:plan :outputs])))
+    (throw (ex-info "output leases require owned resident outputs in an owned session"
+                    {:reason :link-output-lease-ownership
+                     :plan (get-in executable [:plan :id])}))))
+
+(defn output-lease!
+  "Pin one completed replay's owned resident outputs until the returned Closeable is released.
+
+   Deref returns {:outputs node-views :values logical-values :replay n}. LinkPlan replay,
+   uploads, writes and executable close fail while any output lease is live. This covers the
+   synchronous LinkedExecutable API only: a caller must not mutate the owned session directly
+   or continue using a view after releasing the lease. It does not authorize private temporary
+   reuse or turn an attached/borrowed allocation into an owned value."
+  [executable]
+  (let [executable (ensure-live! executable :output-lease!)]
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :output-lease!)
+      (require-owned-output-boundary! executable)
+      (when-not @(:output-ready? executable)
+        (throw (ex-info "output lease requires a completed replay"
+                        {:reason :link-output-lease-before-replay
+                         :plan (get-in executable [:plan :id])})))
+      (let [result {:outputs (outputs executable)
+                    :values (output-values executable)
+                    :replay @(:completed-replays executable)}
+            released? (atom false)]
+        (swap! (:output-leases executable) inc)
+        (reify
+          java.io.Closeable
+          (close [_]
+            (locking (:lifetime-lock executable)
+              (when (compare-and-set! released? false true)
+                (swap! (:output-leases executable) dec))))
+          clojure.lang.IDeref
+          (deref [_]
+            (locking (:lifetime-lock executable)
+              (when @released?
+                (throw (ex-info "output lease has been released"
+                                {:reason :link-output-lease-released})))
+              result)))))))
+
 (defn run!
-  "Replay the linked graph synchronously and return its resident output views. No host copies."
+  "Replay synchronously and return resident output views. No host copies. Live output leases
+   prevent replay until released."
   [executable]
   (let [executable (ensure-live! executable :run!)]
-    (when (seq @(:pending-inputs executable))
-      (throw (ex-info "linked executable has owned inputs or state that have not been initialized"
-                      {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
-                       :nodes @(:pending-inputs executable)})))
-    (if-let [prepared (:prepared-program executable)]
-      (parallel-program/run-prepared! prepared)
-      (gpu/replay! (:session executable) (:graph-key executable)))
-    (outputs executable)))
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :run!)
+      (ensure-no-output-leases! executable :run!)
+      (when (seq @(:pending-inputs executable))
+        (throw (ex-info "linked executable has owned inputs or state that have not been initialized"
+                        {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
+                         :nodes @(:pending-inputs executable)})))
+      (reset! (:output-ready? executable) false)
+      (if-let [prepared (:prepared-program executable)]
+        (parallel-program/run-prepared! prepared)
+        (gpu/replay! (:session executable) (:graph-key executable)))
+      (swap! (:completed-replays executable) inc)
+      (reset! (:output-ready? executable) true)
+      (outputs executable))))
+
+(defn run-and-lease!
+  "Replay and acquire an owned output lease as one serialized operation. Unlike separate run!
+   and output-lease! calls, another thread cannot replay between completion and lease acquisition.
+   Ownership is checked before starting any device work."
+  [executable]
+  (let [executable (ensure-live! executable :run-and-lease!)]
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :run-and-lease!)
+      (require-owned-output-boundary! executable)
+      (run! executable)
+      (output-lease! executable))))
 
 (defn upload!
   "Upload an exact contiguous host value into one live LinkNode view. Returns the executable."
   [executable node-id source]
   (let [executable (ensure-live! executable :upload!)
         node (get-in executable [:plan :nodes node-id])]
-    (when-not node
-      (node-view executable node-id))
-    ;; Reject dtype/length mistakes before the backend copy sees them.
-    (link-plan/validate-node-source! node source)
-    (gpu/upload-range! (:session executable) (node-view executable node-id) source
-                       {:elements (reduce * 1 (get-in node [:view :shape]))})
-    (swap! (:pending-inputs executable) disj node-id)
-    executable))
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :upload!)
+      (ensure-no-output-leases! executable :upload!)
+      (when-not node
+        (node-view executable node-id))
+      ;; Reject dtype/length mistakes before the backend copy sees them.
+      (link-plan/validate-node-source! node source)
+      (reset! (:output-ready? executable) false)
+      (gpu/upload-range! (:session executable) (node-view executable node-id) source
+                         {:elements (reduce * 1 (get-in node [:view :shape]))})
+      (swap! (:pending-inputs executable) disj node-id)
+      executable)))
 
 (defn- same-buffer-range?
   [left-buffer left-view right-buffer right-view]
@@ -686,18 +768,9 @@
        (< (:byte-offset left-view) (bview/byte-end right-view))
        (< (:byte-offset right-view) (bview/byte-end left-view))))
 
-(defn write!
-  "Initialize or replace one complete contiguous LinkNode from a host value or DeviceArray.
-
-   Host values use upload!. A compatible DeviceArray already naming the exact destination range
-   is accepted without a copy; every other compatible resident value uses a backend device copy,
-   never device→host→device. Partially overlapping ranges fail explicitly because backend
-   overlap semantics are not a portable memory contract. Returns the executable."
+(defn- write-device-array!
   [executable node-id source]
-  (if-not (value/device-array? source)
-    (upload! executable node-id source)
-    (let [executable (ensure-live! executable :write!)
-          node (get-in executable [:plan :nodes node-id])
+  (let [node (get-in executable [:plan :nodes node-id])
           _ (when-not node (node-view executable node-id))
           _ (when-not (value/live? source)
               (throw (ex-info "cannot write from a consumed or freed DeviceArray"
@@ -725,6 +798,7 @@
           destination-buffer (gpu/buffer session (:key destination))
           source-buffer (:buffer source)
           elements (reduce * 1 (:shape destination-view))]
+      (reset! (:output-ready? executable) false)
       (cond
         (same-buffer-range? source-buffer source-view destination-buffer destination-view)
         nil
@@ -765,7 +839,23 @@
               ;; Borrowed registrations are detached, never freed.
               (gpu/free-buffer! session temporary-key)))))
       (swap! (:pending-inputs executable) disj node-id)
-      executable)))
+      executable))
+
+(defn write!
+  "Initialize or replace one complete contiguous LinkNode from a host value or DeviceArray.
+
+   Host values use upload!. A compatible DeviceArray already naming the exact destination range
+   is accepted without a copy; every other compatible resident value uses a backend device copy,
+   never device→host→device. Partially overlapping ranges fail explicitly because backend
+   overlap semantics are not a portable memory contract. Returns the executable."
+  [executable node-id source]
+  (let [executable (ensure-live! executable :write!)]
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :write!)
+      (ensure-no-output-leases! executable :write!)
+      (if (value/device-array? source)
+        (write-device-array! executable node-id source)
+        (upload! executable node-id source)))))
 
 (defn execution-info
   "Return resident phase admission reports without executing the linked program.
@@ -919,16 +1009,19 @@
 
 (defn close!
   "Release a LinkedExecutable. Idempotent. An owned session is closed wholesale; an attached
-   executable releases only its recording, phases, and allocation registrations."
+   executable releases only its recording, phases, and allocation registrations. A live output
+   lease prevents close; release all leases first."
   [executable]
   (when-not (linked-executable? executable)
     (throw (ex-info "close! requires a LinkedExecutable" {:actual (type executable)})))
-  (when (compare-and-set! (:closed? executable) false true)
-    (if (:owns-session? executable)
-      (gpu/close-session! (:session executable))
-      (cleanup-attached! (:session executable) (:graph-key executable)
-                         (:phases executable) (:prepared-program executable)
-                         (:allocation-keys executable))))
+  (locking (:lifetime-lock executable)
+    (ensure-no-output-leases! executable :close!)
+    (when (compare-and-set! (:closed? executable) false true)
+      (if (:owns-session? executable)
+        (gpu/close-session! (:session executable))
+        (cleanup-attached! (:session executable) (:graph-key executable)
+                           (:phases executable) (:prepared-program executable)
+                           (:allocation-keys executable)))))
   nil)
 
 (defn- prepare-private-reuse!

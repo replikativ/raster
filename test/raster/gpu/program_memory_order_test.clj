@@ -184,7 +184,12 @@
           (assert-candidate linked (link/execution-order executable))
           (dotimes [_ 2]
             (link/run! executable)
-            (is (= expected (vec (link/download executable (first (:outputs linked))))))))))))
+            (with-open [lease (link/output-lease! executable)]
+              (is (= #{(first (:outputs linked))} (set (keys (:outputs @lease)))))
+              (is (= expected (vec (link/download executable (first (:outputs linked))))))
+              (is (= :link-output-lease-active
+                     (try (link/run! executable)
+                          (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))))))
 
 (deftest private-storage-realization-preserves-two-device-replays
   (doseq [[target available? skip!] [[:ocl:0 opencl/opencl-available? opencl/opencl-skip!]
