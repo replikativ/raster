@@ -24,6 +24,12 @@ cache reports, executable signatures and raw event samples remain in the result.
 Resources close on completion or failure. The precision policy permits target
 contraction, but both storage and accumulation remain FP32: this is not FP16 GEMM.
 
+The probe caps CPU oracle work at 64 Mi multiply-accumulate iterations and logical
+array payload at 4 Mi elements, before allocation. It is not a large-model benchmark.
+Preparation/binding times depend on candidate order and cache state; they are diagnostic
+metadata, not a controlled comparison of compilation speed. Cleanup attempts every owned
+candidate even if one close fails, preserving the primary exception.
+
 Check `:stationary?`, raw samples and driver provenance before drawing conclusions.
 A long-lived REPL may retain an old hardware registry; source reload alone does not
 refresh detected descriptors. Start a fresh REPL for a published baseline if its

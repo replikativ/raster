@@ -16,9 +16,16 @@
   (when-not (and (string? revision) (seq revision)
                  (string? environment) (seq environment))
     (throw (ex-info "benchmark requires revision and environment provenance" {})))
+  (when-not (and (vector? shape) (= 3 (count shape))
+                 (every? #(and (integer? %) (pos? %)) shape)
+                 (<= (reduce *' shape) (* 64 1024 1024))
+                 (let [[m n k] shape]
+                   (<= (+' (*' m k) (*' k n) (*' 3 m n)) (* 4 1024 1024))))
+    (throw (ex-info "probe exceeds bounded shape/work budget" {:shape shape})))
   (let [[a b _ :as arrays] (canary/gemm-arguments shape)
         expected (vec (canary/gemm-reference a b shape))
-        bound (atom [])]
+        bound (atom [])
+        failure (volatile! nil)]
     (try
       (doseq [strategy [:portable :register-tiled]]
         (let [args (into (assoc arrays 2 (float-array (count expected))) (map long shape))
@@ -33,7 +40,7 @@
               started (System/nanoTime)
               live (compiled/instantiate! prepared {:profile? true})
               bind-ns (- (System/nanoTime) started)]
-          ;; Register ownership immediately, including failure during validation/metadata capture.
+          ;; After instantiate! returns, own cleanup even if validation/metadata capture fails.
           (swap! bound conj {:id strategy :live live})
           (let [profile (compiled/profile live)
                 actual (vec (get-in profile [:result :C]))]
@@ -68,6 +75,16 @@
                                                 (link/profile! (:executable live))))))})
               @bound)
         :rounds rounds :warmup-rounds warmup-rounds)}
+      (catch Throwable error
+        (vreset! failure error)
+        (throw error))
       (finally
-        (doseq [{:keys [live]} (reverse @bound)]
-          (compiled/close! live))))))
+        (let [cleanup-errors
+              (reduce (fn [errors {:keys [live]}]
+                        (try (compiled/close! live) errors
+                             (catch Throwable error (conj errors error))))
+                      [] (reverse @bound))]
+          (when-let [primary (or @failure (first cleanup-errors))]
+            (doseq [error (if @failure cleanup-errors (rest cleanup-errors))]
+              (when-not (identical? primary error) (.addSuppressed ^Throwable primary error)))
+            (when-not @failure (throw primary))))))))
