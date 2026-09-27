@@ -41,6 +41,11 @@ resident handles or promise versioned AD tape snapshots.
 
 ## Current control/effect slice
 
+Register-tiled contraction replacement now requires the existing dense matrix view's exact
+two-operand product proof, not just matching operand indices. Additional factors or additive
+terms in the reduction body decline this schedule instead of being dropped. A separate retained
+epilogue remains supported. This legality check precedes extending physical operand orientations.
+
 Pure counted loops with terminal effects use the existing scalar or product Fold followed by
 an ordered exit region. This replaces the single-carry/single-terminal-store restriction.
 All carry projections precede the exit; terminal reads and writes retain their source order.

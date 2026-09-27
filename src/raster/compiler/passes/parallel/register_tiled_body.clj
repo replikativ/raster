@@ -265,12 +265,20 @@
             (decline! :non-zero-matrix-init
                       "register-tiled contraction requires a zero reduction identity"
                       {:neutral neutral}))
-        layout-verdict (facts/check-layout contract-facts (:dpas facts/leaf-layouts))
-        _ (when-not (:ok layout-verdict)
+        matrix-view (facts/dense-matrix-view contract-facts)
+        _ (when-not (:ok matrix-view)
+            (if (= :body-has-unmodeled-terms (:reason matrix-view))
+              (decline! :body-has-unmodeled-terms
+                        "register-tiled schedule cannot replace unmodeled contraction terms"
+                        matrix-view)
+              (decline! :dense-row-major-operands
+                        "register-tiled schedule requires a verified dense matrix product"
+                        matrix-view)))
+        _ (when-not (= :nn (:variant matrix-view))
             (decline! :dense-row-major-operands
-                      "register-tiled schedule requires dense A(i,k) and B(k,j) operands"
-                      layout-verdict))
-        {:keys [row col]} (:bindings layout-verdict)
+                      "register-tiled schedule currently requires dense A(i,k) and B(k,j) operands"
+                      matrix-view))
+        {:keys [row col]} (:bindings matrix-view)
         [[i M] [j N]] free-axes
         [[k K]] contract-axes
         symbolic-dimensions (vec (filter symbol? [M N K]))
@@ -538,9 +546,9 @@
                     :dims [M N K]
                     :int-coordinate-constraints coordinate-constraints
                     :axis-symbols [i j k]
-                    :bindings (:bindings layout-verdict)
+                    :bindings (:bindings matrix-view)
                     :result-transform epilogue}})
-     :bindings (:bindings layout-verdict)
+     :bindings (:bindings matrix-view)
      :dims [M N K]
      :runtime-scalar-values runtime-scalar-values
      :output-count (or output-count (* M N))
