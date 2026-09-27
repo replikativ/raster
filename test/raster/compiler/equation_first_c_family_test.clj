@@ -59,7 +59,7 @@
       :name "Synthetic AMD equation-first source target"
       :capabilities {:gfx-arch :gfx1100
                      :warp-size 32
-                     :subgroup-sizes [32 64]
+                     :subgroup-sizes [32]
                      :max-workgroup-size 1024
                      :shared-local-memory 65536
                      :total-eus 60}})
