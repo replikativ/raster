@@ -1893,6 +1893,12 @@
   (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/compilation-schedule)
                            (core-hw/descriptor-for device-id)
                            {:schedule schedule :gemm-precision gemm-precision})
+        _ (when (= :dispatch-reassociated
+                   (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
+            (throw (ex-info
+                    "reassociated equation dispatch requires the equation-first compiler"
+                    {:reason :reassociated-equation-dispatch-requires-equation-first
+                     :device device-id})))
         gemm-precision (:precision resolved-schedule)
         resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         _ (when (dispatch/host-only? resolved-var)

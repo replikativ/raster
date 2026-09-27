@@ -230,9 +230,14 @@ through the existing `:result-storage` contract.
    call now selects and preflights a certified graph from concrete ABI scalars before LinkPlan
    instantiation, and the LinkPlan binds only that selected graph's private storage. An explicit
    numerical policy is still required. The local OpenCL device replay covers both nonempty and
-   empty indexed edge lists. The public compiler still emits one fixed schedule per invocation;
-   producing both candidates from one scheduled program and exposing a numerical-policy-aware
-   auto mode are the next integration steps.
+   empty indexed edge lists. The public compiler now offers the explicit
+   `:schedule {:segmented-weighted-reduction {:strategy :dispatch-reassociated}}` mode. It
+   retains one semantic TypedSOAC program, schedules/emits exact and subgroup alternatives
+   independently, and joins only matching reduction equations. Existing `:auto` stays exact.
+   This first mode prefers the admitted subgroup candidate with exact fallback; measured
+   selection and emission from one multi-schedule program remain subsequent optimizations.
+   Unsupported targets decline explicitly. The older resident-descriptor compiler entry also
+   declines this equation-only policy rather than silently interpreting it as a pinned schedule.
 
 Invocation shape realization now reuses the graph's checked dimension-to-launch projection.
 The shared index algebra lives under compiler IR (the former pass namespace is removed), so

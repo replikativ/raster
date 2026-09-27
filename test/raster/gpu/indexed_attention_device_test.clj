@@ -2,7 +2,6 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.equation-first :as equation-first]
-            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
@@ -218,30 +217,11 @@
 
 (defn- run-equation-first-dispatch-case
   [device-id]
-  (let [compile-strategy
-        (fn [strategy]
-          (equation-first/compile
-           #'resident-indexed-attention-probe
-           {:target device-id :dtype :float
-            :schedule {:segmented-weighted-reduction {:strategy strategy}}}))
-        reference (compile-strategy :reference)
-        subgroup (compile-strategy :subgroup-score-reuse)
-        candidates (mapv #(-> % :emitted :equations last :operations first)
-                         [reference subgroup])
-        selection (kdispatch/make
-                   {:id "indexed-equation-device-dispatch"
-                    :alternatives (mapv :graph candidates)
-                    :default-strategy :indexed-segmented-reduction-reference
-                    :selector {:kind :fixed-strategy
-                               :strategy :indexed-segmented-reduction-subgroup-score-reuse
-                               :fallback :none}})
-        operation (equation-dispatch/make
-                   candidates selection {:permitted-modes #{:exact :reassociated}})
-        program (update (:emitted reference) :equations
-                        (fn [equations]
-                          (update equations (dec (count equations)) assoc
-                                  :operations [operation])))
-        compilation (assoc reference :emitted program)
+  (let [compilation
+        (equation-first/compile
+         #'resident-indexed-attention-probe
+         {:target device-id :dtype :float
+          :schedule {:segmented-weighted-reduction {:strategy :dispatch-reassociated}}})
         {:keys [plan shape-env buffers]} (test-case)]
     (doseq [edges [4 0]]
       (let [buffers (assoc buffers
