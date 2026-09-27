@@ -234,7 +234,7 @@
             selected (-> linked :instances first :call :steps last :graph)
             executable (link/instantiate! linked)]
         (try
-          (is (= :indexed-segmented-reduction-subgroup-score-reuse
+          (is (= :indexed-segmented-reduction-reference
                  (get-in selected [:attributes :strategy])))
           (link/run! executable)
           (let [actual (vec (link/download executable (first (:outputs linked))))]

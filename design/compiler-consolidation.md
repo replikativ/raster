@@ -234,8 +234,12 @@ through the existing `:result-storage` contract.
    `:schedule {:segmented-weighted-reduction {:strategy :dispatch-reassociated}}` mode. It
    retains one semantic TypedSOAC program, schedules/emits exact and subgroup alternatives
    independently, and joins only matching reduction equations. Existing `:auto` stays exact.
-   This first mode prefers the admitted subgroup candidate with exact fallback; measured
-   selection and emission from one multi-schedule program remain subsequent optimizations.
+   Its analytic selector chooses the exact reference below the descriptor-derived component-width
+   crossover and the admitted subgroup candidate above it. A selector measured elsewhere can
+   override that choice under the stable dispatch ID; its tuning contract retains the allowed
+   numerical modes and physical layout. This is selection machinery, not measured performance
+   evidence. A public equation-first tuning manifest/benchmark path and emission from one
+   multi-schedule program remain subsequent optimizations.
    Unsupported targets decline explicitly. The older resident-descriptor compiler entry also
    declines this equation-only policy rather than silently interpreting it as a pinned schedule.
 

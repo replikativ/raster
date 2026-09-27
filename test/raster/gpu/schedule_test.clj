@@ -166,7 +166,7 @@
                             (sched/derive-default nil arc-desc)
                             {:segmented-weighted-reduction {:measured-selectors :invalid}})
                            arc-desc)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :strategy :auto"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require an emitting dispatch strategy"
                           (sched/feasible?
                            (sched/resolve
                             (sched/derive-default nil arc-desc)
@@ -174,7 +174,16 @@
                              {:strategy :reference
                               :measured-selectors
                               {"dispatch-a" {:kind :runtime-scalar-ranges}}}})
-                           arc-desc))))
+                           arc-desc)))
+    (is (= :dispatch-reassociated
+           (get-in (sched/compilation-schedule
+                    arc-desc
+                    {:schedule {:segmented-weighted-reduction
+                                {:strategy :dispatch-reassociated
+                                 :measured-selectors
+                                 {"dispatch-a" {:kind :fixed-strategy
+                                                :strategy :indexed-segmented-reduction-reference}}}}})
+                   [:segmented-weighted-reduction :strategy]))))
   (testing "typed contraction selectors are validated as persistent schedule data"
     (doseq [strategy [:auto :portable :register-tiled]]
       (is (= strategy
