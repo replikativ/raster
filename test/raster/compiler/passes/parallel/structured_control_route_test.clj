@@ -16,6 +16,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
@@ -208,6 +209,128 @@
     nil
     (catch clojure.lang.ExceptionInfo exception
       (:reason (ex-data exception)))))
+
+(defn- test-swr-region
+  [parameters body]
+  (swr/region {:parameters parameters :body body :result-dtype :float}))
+
+(defn- generic-swr-plan
+  []
+  (swr/make
+   {:id [:segmented-weighted-reduction :test]
+    :segment-axes [{:name :row :extent 'n}]
+    :membership {:kind :dense-membership}
+    :storage {:kind :dense-values}
+    :score {:kind :dot
+            :axis {:name :component :extent 'width}
+            :left {:kind :dense-left :buffer 'x :dtype :float}
+            :right {:kind :dense-right :buffer 'x :dtype :float}
+            :combine (test-swr-region '[left right] '(raster.numeric/* left right))
+            :arguments []
+            :finalize (test-swr-region '[dot] 'dot)}
+    :weight (test-swr-region '[score] '(raster.math/exp score))
+    :value {:kind :dense-value :buffer 'x :dtype :float :components 'width}
+    :numerator (swr/reduction
+                {:operator :sum :identity 0.0
+                 :map-region (test-swr-region '[weight value]
+                                               '(raster.numeric/* weight value))})
+    :denominator (swr/reduction
+                  {:operator :sum :identity 0.0
+                   :map-region (test-swr-region '[weight] 'weight)})
+    :normalization {:kind :divide :epsilon 0.0 :empty-result 0.0}
+    :operands [{:id 'x :dtype :float :shape '[n width]
+                :elements '(clojure.core/* n width)}]
+    :output {:id 'out-storage :dtype :float :shape '[n width]
+             :elements '(clojure.core/* n width)}
+    :accumulator-dtype :float
+    :source-operation {:kind :generic-weighted-reduction}
+    :provenance {:semantic-op :generic-weighted-reduction :operation-id :test}
+    :runtime-parameters '[n width]}))
+
+(defn- swr-parallel-program
+  []
+  (let [plan (generic-swr-plan)
+        values {'x (av/tensor {:dtype :float :shape '[n width]})
+                'n (av/tensor {:dtype :long :shape []})
+                'width (av/tensor {:dtype :int :shape []})
+                ;; The plan's result is logically N-D while its generated backing allocation is
+                ;; represented by its exact flattened element count.
+                'out-storage (av/tensor {:dtype :float
+                                         :shape '[(clojure.core/* n width)]})
+                'result (av/tensor {:dtype :float :shape '[n width]})}
+        equation
+        (program/->ProgramEquation
+         :weighted-reduction [:binding 4] nil '[x n width] '[result]
+         plan [plan] #{:memory/read :memory/write}
+         {:source :synthetic}
+         {:algorithm-dialect :segmented-weighted-reduction
+          :result-storage [{:destination 'out-storage :access :write
+                            :host-return :buffer}]})]
+    (program/->ParallelProgram
+     :typed-parallel nil values '[x n width] [equation] '[result]
+     #{:memory/read :memory/write} [] {:source :synthetic} {})))
+
+(deftest generic-weighted-reduction-uses-the-shared-typed-program-boundary
+  (let [typed (swr-parallel-program)
+        equation (first (:equations typed))]
+    (is (= typed (route/validate-typed-program! typed)))
+    (is (swr/plan? (:algorithm equation)))
+    (is (= '[x n width] (:operands equation)))
+    (is (= '[result] (:results equation)))
+    (is (= 'out-storage
+           (get-in equation [:attributes :result-storage 0 :destination])))))
+
+(deftest generic-weighted-reduction-boundary-rejects-contract-drift
+  (let [typed (swr-parallel-program)
+        change-equation (fn [program f]
+                          (update program :equations
+                                  #(assoc % 0 (f (first %)))))
+        change-plan (fn [program f]
+                      (change-equation
+                       program
+                       (fn [equation]
+                         (let [plan (f (:algorithm equation))]
+                           (assoc equation :algorithm plan :operations [plan])))))]
+    (doseq [malformed
+            [(change-equation typed #(assoc % :operands '[n x width]))
+             (change-equation typed #(assoc-in % [:attributes :result-storage 0 :destination]
+                                                'x))
+             (assoc-in typed [:values 'result]
+                       (av/tensor {:dtype :float :shape '[n]}))
+             (assoc-in typed [:values 'n]
+                       (av/tensor {:dtype :long :shape '[n]}))
+             (assoc-in typed [:values 'x]
+                       (av/tensor {:dtype :float :shape '[n width]
+                                   :representation {:kind :quantized :scheme :q4-k}}))
+             (assoc-in typed [:values 'out-storage]
+                       (av/tensor {:dtype :float :shape []}))
+             (assoc-in typed [:values 'width]
+                       (av/tensor {:dtype :float :shape []}))
+             (change-equation typed #(assoc % :effects #{:memory/write}))
+             (change-equation typed #(assoc % :operations []))
+             (change-plan typed #(assoc % :runtime-parameters '[(unknown-runtime n) width]))
+             (change-plan typed #(assoc % :runtime-parameters '[0.5 width]))
+             (-> (change-plan typed #(assoc % :runtime-parameters '[n]))
+                 (change-equation #(assoc % :operands '[x n])))
+             (change-plan typed #(assoc-in % [:output :elements] 'n))
+             (change-plan typed #(assoc-in % [:score :axis :extent] 'undeclared-width))
+             (-> typed
+                 (change-equation #(assoc % :results '[out-storage]))
+                 (assoc :outputs '[out-storage]))]]
+      (is (false? (route/valid-typed-program? malformed))))))
+
+(deftest generic-weighted-reduction-declines-before-uncertified-scheduling
+  (let [typed (swr-parallel-program)]
+    (try
+      (route/schedule-program typed {:target-device :ocl:0 :dtype :float})
+      (is false "the unscheduled semantic plan must not reach target lowering")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :segmented-weighted-reduction-unscheduled
+               (:reason (ex-data exception))))
+        (is (= :weighted-reduction (:equation (ex-data exception))))
+        (is (= [:binding 4] (:site (ex-data exception))))
+        (is (= [:segmented-weighted-reduction :test]
+               (:plan-id (ex-data exception))))))))
 
 (deftest loop-output-feeds-an-ordinary-typed-suffix
   (let [initial (av/tensor {:dtype :double :shape ['extent]

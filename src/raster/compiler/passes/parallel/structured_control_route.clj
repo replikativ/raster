@@ -1,10 +1,10 @@
 (ns raster.compiler.passes.parallel.structured-control-route
   "Place a typed sequential fixpoint in Raster's common ParallelProgram envelope.
 
-   TypedSOAC and TypedStructuredControl are two algorithm variants, not two program containers.
-   This route gives structured control the same ordered equation/value spine used by loop-free
-   algorithms. Scheduling replaces the equation's typed control operation with one checked
-   ScheduledStructuredLoop; it does not reconstruct or recognize a source-shaped compound loop."
+   TypedSOAC, TypedStructuredControl, and the existing generic segmented weighted-reduction plan
+   are algorithm variants, not separate program containers. This route gives them the same ordered
+   equation/value spine used by loop-free algorithms. Scheduling replaces a typed operation with a
+   checked schedule; it does not reconstruct or recognize source-shaped compound operations."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -12,6 +12,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -43,8 +44,103 @@
        (= (:operands equation) (:inputs (soac/facts algorithm)))
        (= (:results equation) (soac/outputs algorithm))))
 
+(defn- shape-elements
+  [shape]
+  (let [dimensions (vec (remove #(= 1 %) shape))]
+    (cond
+      (empty? dimensions) 1
+      (= 1 (count dimensions)) (first dimensions)
+      (every? integer? dimensions) (reduce *' dimensions)
+      :else (apply list 'clojure.core/* dimensions))))
+
+(defn- descriptor-shape-contract?
+  [{:keys [shape elements]}]
+  (= elements (shape-elements shape)))
+
+(defn- tensor-contract?
+  [value {:keys [dtype shape] :as descriptor}]
+  (and (descriptor-shape-contract? descriptor)
+       value
+       (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape shape}))
+       (= shape (:shape value))))
+
+(defn- storage-contract?
+  [value {:keys [dtype elements] :as descriptor}]
+  (and (descriptor-shape-contract? descriptor)
+       value
+       (seq (:shape value))
+       (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape [elements]}))
+       (= elements (shape-elements (:shape value)))))
+
+(defn- runtime-value-ids
+  "The current protected marker transports only normalized shape scalars or integer literals.
+
+   Reject general expressions here: the plan carries no result dtype/effect certificate for them,
+   and admitting a call would recreate source inference inside the algorithm boundary."
+  [runtime-parameters]
+  (when (every? #(or (symbol? %) (integer? %)) runtime-parameters)
+    (ordered-distinct (filter symbol? runtime-parameters))))
+
+(defn- plan-scalar-references
+  "Scalar values used by the plan's shape/storage descriptors, excluding declared buffers and
+   scalar-region-local parameter names. Source/provenance are evidence, not executable dimensions."
+  [plan]
+  (let [buffer-ids (set (conj (swr/ordered-input-ids plan) (get-in plan [:output :id])))
+        score (-> (:score plan)
+                  (dissoc :combine :finalize)
+                  (update :arguments
+                          #(mapv (fn [argument] (dissoc argument :parameter)) %)))
+        descriptors {:segment-axes (:segment-axes plan)
+                     :membership (:membership plan)
+                     :storage (:storage plan)
+                     :score score
+                     :value (:value plan)
+                     :operands (mapv #(select-keys % [:shape :elements]) (:operands plan))
+                     :output (select-keys (:output plan) [:shape :elements])}]
+    (set/difference (util/free-syms descriptors) buffer-ids)))
+
+(defn- swr-boundary?
+  "Check the logical equation boundary around one already-validated generic SWR plan.
+
+   The plan names physical output storage. ProgramEquation names the fresh logical result, and its
+   ordinary result-storage attribute is the sole relation between those identities."
+  [values equation algorithm]
+  (when (swr/plan? algorithm)
+    (let [plan (swr/validate! algorithm)
+          input-descriptors (:operands plan)
+          output-descriptor (:output plan)
+          runtime-values (runtime-value-ids (swr/runtime-parameter-values plan))
+          runtime-value-set (set runtime-values)
+          expected-operands (ordered-distinct
+                             (concat (swr/ordered-input-ids plan) runtime-values))
+          results (:results equation)
+          storage [{:destination (:id output-descriptor)
+                    :access :write
+                    :host-return :buffer}]]
+      (and (some? runtime-values)
+           (set/subset? (plan-scalar-references plan) runtime-value-set)
+           (= expected-operands (:operands equation))
+           (= 1 (count results))
+           (not= (first results) (:id output-descriptor))
+           (= [algorithm] (:operations equation))
+           (= #{:memory/read :memory/write} (:effects equation))
+           (= storage (get-in equation [:attributes :result-storage]))
+           (every? (fn [{:keys [id] :as descriptor}]
+                     (tensor-contract? (get values id) descriptor))
+                   input-descriptors)
+           (storage-contract? (get values (:id output-descriptor)) output-descriptor)
+           (tensor-contract? (get values (first results)) output-descriptor)
+           (every? (fn [id]
+                     (let [value (get values id)]
+                       (and value (empty? (:shape value))
+                            (contains? #{:int :long}
+                                       (some-> (:dtype value) dtype/canon))
+                            (av/storage-contract-compatible?
+                             value (av/tensor {:dtype (:dtype value) :shape []})))))
+                   runtime-values)))))
+
 (defn- typed-algorithm-boundary?
-  [equation algorithm]
+  [values equation algorithm]
   (cond
     (control/loop-program? algorithm)
     (and (loop-boundary? equation algorithm)
@@ -55,6 +151,9 @@
          (or (and (true? (get-in equation [:attributes :host-only]))
                   (empty? (:operations equation)))
              (= (soac/equations algorithm) (:operations equation))))
+
+    (swr/plan? algorithm)
+    (boolean (swr-boundary? values equation algorithm))
 
     :else false))
 
@@ -79,7 +178,9 @@
 
 (defn- typed-operation?
   [operation]
-  (or (control/loop-program? operation) (boolean (fusion/equation-info operation))))
+  (or (control/loop-program? operation)
+      (swr/plan? operation)
+      (boolean (fusion/equation-info operation))))
 
 (defn- scheduled-operation?
   [operation]
@@ -94,7 +195,8 @@
     (fail! :structured-control-program-dialect
            "typed structured-control routing requires :typed-parallel"
            {:dialect (:dialect parallel-program)}))
-  (program/validate! parallel-program typed-operation? typed-algorithm-boundary?))
+  (program/validate! parallel-program typed-operation?
+                     (partial typed-algorithm-boundary? (:values parallel-program))))
 
 (defn valid-typed-program?
   [parallel-program]
@@ -658,7 +760,7 @@
            :attributes {:host-control :typed-structured-control
                         :mixed-algorithms (boolean suffix)}
            :operation? typed-operation?
-           :algorithm? typed-algorithm-boundary?})
+           :algorithm? (partial typed-algorithm-boundary? values)})
          public-parameters (or (:public-parameters options) (:active-params options))]
      (if (seq public-parameters)
        (let [plan (invocation/from-prefix
@@ -726,6 +828,13 @@
                                     :schedule-dialect :segop
                                     :graph-dialect :kernel-graph)))
                   :values values})
+
+               (swr/plan? algorithm)
+               (fail! :segmented-weighted-reduction-unscheduled
+                      "segmented weighted-reduction has no equation-first schedule yet"
+                      {:equation (:id equation)
+                       :site (:site equation)
+                       :plan-id (:id algorithm)})
 
                :else
                (let [algorithm-values (:values (soac/facts algorithm))
