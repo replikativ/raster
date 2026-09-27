@@ -1389,34 +1389,9 @@
                               {:kernel-name kernel-name :slot slot :value-type (type value)}))))
         _ (kabi/validate-physical-pointer-dtypes!
            abi (physical-pointer-dtypes pointer-values))
-        reduction-kind (get-in registered [:effects :kind])
-        _ (when (contains? #{:pure-reduction :scalar-reduction-phase} reduction-kind)
-            (let [required (if (= :scalar-reduction-phase reduction-kind)
-                             (long (first group-count)) 1)]
-              (doseq [[slot value] pointer-pairs
-                      :when (= :result (:role slot))]
-                ;; A raw MemorySegment here is an opaque cl_mem handle, not the allocation it
-                ;; names. Its byteSize is the handle representation size and says nothing about
-                ;; device capacity. Only OclBuffer carries a checked element count.
-                (let [capacity (known-buffer-capacity value)]
-                  (when (and capacity (< (long capacity) required))
-                    (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
-                                    {:kernel-name kernel-name :slot slot
-                                     :required-elements required :buffer-elements capacity})))))))
-        _ (when (= :tensor-contraction (get-in registered [:effects :kind]))
-            (let [extent-expr (kart/attribute registered :out-elems)
-                  out-elems (long (if (number? extent-expr)
-                                    extent-expr
-                                    (kcall/resolve-value call extent-expr)))]
-              (when (neg? out-elems)
-                (throw (ex-info "resident contraction output extent must be non-negative"
-                                {:kernel-name kernel-name :out-elems out-elems})))
-              (doseq [[slot value] pointer-pairs :when (= :result (:role slot))]
-                (let [capacity (known-buffer-capacity value)]
-                  (when (and capacity (< (long capacity) out-elems))
-                    (throw (ex-info "contraction output buffer is smaller than its artifact extent"
-                                    {:kernel-name kernel-name :slot slot :out-elems out-elems
-                                     :buffer-elements capacity})))))))
+        ;; cl_mem MemorySegments are opaque handles, not allocation byte ranges.
+        _ (kcall/validate-resident-output-capacities!
+           call plan registered (fn [value _] (known-buffer-capacity value)))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
         {:keys [program]} (ensure-kernel-loaded! kernel-name)
         kh (create-kernel-fresh program kernel-name)]
