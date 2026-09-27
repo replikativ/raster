@@ -128,6 +128,15 @@ The numerical witness preserves the existing typed SSA evaluation schedule; it i
 of bitwise equality between target compilers. The older descriptor body's source/ABI adapter and
 direct low-level artifact tests still exist; removing those requires migrating their callers.
 
+The register-tiled schedule has an explicit graph-certified candidate constructor, exercised
+through equation-first emission and public replay for a ragged NN contraction. It reuses the
+existing cooperative KernelBody (local storage, barriers and per-thread accumulators); no kernel
+source template is added. Admission currently requires fixed positive FP32 shapes, int-sized
+storage capacities and a numerical policy that permits target contraction. The strict policy,
+dynamic shapes and unsupported layouts decline this candidate. Automatic selection is unchanged:
+tests deliberately inject the candidate at the scheduling boundary with a distinct cache request.
+Do not advertise optimized equation-first defaults or a speedup from candidate construction alone.
+
 Equation-first execution reporting now observes actual fixed graph bindings through the public
 compiled API. It shares compact executable descriptions with descriptor admission reports and
 does not infer precision from the requested policy. Loop carry variants are reported once per

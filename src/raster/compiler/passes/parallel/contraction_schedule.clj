@@ -17,6 +17,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.contraction-body :as contraction-body]
+            [raster.compiler.passes.parallel.register-tiled-body :as register-tiled]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
 (defn- decline [reason & [data]]
@@ -546,3 +547,53 @@
                       :attributes {:strategy (get-in kernel-body [:schedule :strategy])
                                    :out-elems (get-in kernel-body [:attributes :launch-segment-count])}})]
       (scheduled-body/validate-against-node! scheduled node graph))))
+
+(defn plan-register-tiled-for-node
+  "Admit a fixed FP32 register tile through the common graph/body certificate.
+
+   This is an explicit candidate constructor, not an automatic selector. The initial candidate
+   requires static extents and the permissive scheduling policy, which permits target multiply/add
+   contraction. It never narrows storage to FP16. Strict arithmetic and dynamic shapes retain
+   the portable candidate until their separate numerical/index-domain obligations are met."
+  [node graph contract-facts descriptor {:keys [precision] :as options}]
+  (cond
+    (not= :mixed-f16-f32 precision)
+    {:ok false :reason :register-tiled-numerical-policy}
+
+    (not= :float (:dtype contract-facts))
+    {:ok false :reason :register-tiled-fp32-candidate}
+
+    (not-every? #(and (integer? %) (pos? %))
+                (map second (concat (:free-axes contract-facts) (:contract-axes contract-facts))))
+    {:ok false :reason :register-tiled-static-candidate}
+
+    (and (= [2 1] [(count (:free-axes contract-facts)) (count (:contract-axes contract-facts))])
+         (let [[m n] (map second (:free-axes contract-facts))
+               k (second (first (:contract-axes contract-facts)))]
+           (some #(> % Integer/MAX_VALUE) [(*' m n) (*' m k) (*' k n)])))
+    {:ok false :reason :register-tiled-static-capacity}
+
+    :else
+    (try
+      (let [operation (:operation node)
+            lowered (register-tiled/lower
+                     contract-facts (assoc options :descriptor descriptor :operation-id (:id operation)))
+            kernel-body (:kernel-body lowered)
+            arguments (mapv :id (:parameters kernel-body))
+            scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
+            scheduled (scheduled-body/make
+                       {:source operation :body kernel-body :arguments arguments
+                        :scalar-bindings (scheduled-body/derive-scalar-bindings
+                                          kernel-body arguments scalar-types)
+                        :effects {:kind :pure-contraction
+                                  :uses (scheduled-body/derive-uses kernel-body arguments)}
+                        :legality {:kind :register-tiled-contraction :tile (:tile lowered)}
+                        :numerics {:mode :reassociated :policy :ordered-k-target-contraction
+                                   :accumulator-dtype :float :rounding :implementation-defined}
+                        :attributes {:strategy :register-tiled :precision :f32
+                                     :out-elems (:output-count lowered)}})]
+        {:ok true :scheduled (scheduled-body/validate-against-node! scheduled node graph)})
+      (catch clojure.lang.ExceptionInfo exception
+        (if (register-tiled/declined? exception)
+          {:ok false :reason (:missing-rule (ex-data exception)) :detail (ex-data exception)}
+          (throw exception))))))

@@ -253,10 +253,10 @@
         source (body-emit/emit-scalar-kernel "register_tile_long_k" kernel-body)]
     (is (str/includes?
          source
-         "for (long rstr_register_k_block = (long)(0); rstr_register_k_block < depth;)"))
+         "for (long rstr_register_k_block = (long)(0); rstr_register_k_block < rstr_depth;)"))
     (is (str/includes?
          source
-         (str "(ulong)(depth) - (ulong)(rstr_register_k_block)"
+         (str "(ulong)(rstr_depth) - (ulong)(rstr_register_k_block)"
               " <= (ulong)(16)"))
         "a long K is not narrowed merely to reuse the conservative dispatch constraint")))
 
