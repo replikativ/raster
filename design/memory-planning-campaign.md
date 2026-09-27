@@ -145,6 +145,9 @@ and consumed by generated backward equations; no separate AD tape-name registry 
 This report is not a selected execution-order or completion certificate. Persistent public
 storage remains excluded from reuse, and unresolved mutations, partial writes, overlapping
 versions/views and structured control must remain explicit unknowns. Physical escape still does
-not identify which earlier mutable value a caller intended to retain. The allocator does not
-consume this observation yet; resident leases, escaped pullbacks and version-preserving copies
-remain separate obligations.
+not identify which earlier mutable value a caller intended to retain. The confined host-result
+executor now requires the aggregate witness before attempting its one-pair reuse. Unknown
+retention (or a plan lacking the invocation certificate) preserves distinct storage and reports
+the reason; it does not reject otherwise valid execution. Selected order, complete initialization,
+alias validation, nonescape and synchronous completion remain independent gates. Resident
+leases, escaped pullbacks and version-preserving copies remain separate obligations.
