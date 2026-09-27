@@ -66,6 +66,27 @@
                (set (map :name (filter #(= :no-write-alias (:aliasing %)) (:abi ki))))))
       (finally (gpu/close-session! session)))))
 
+(deftest branched-effect-steps-match-jvm-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "branch-local effect recurrences on " device))
+      (doseq [nc [0 1 2 7]]
+        (let [expected (int-array 3)
+              expected-state (int-array 3)
+              prepared (compiled/lower #'city/branch-local-store-steps! [(int-array 3) (int-array 3) 3 nc]
+                                       {:compiler :equation-first :target device :dtype :double
+                                        :outputs '[state out]})
+              live (compiled/instantiate! prepared)]
+          (try
+            (dotimes [_ 2]
+              (city/branch-local-store-steps! expected-state expected 3 nc)
+              (let [result (live {})]
+                (is (= (vec expected) (vec (value/->host (:out result))))
+                    (str device " trips=" nc))
+                (is (= (vec expected-state) (vec (value/->host (:state result)))))))
+            (finally (compiled/close! live))))))))
+
 (deftest two-exit-search-matches-jvm-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-fp64-available? opencl/opencl-skip!]]]

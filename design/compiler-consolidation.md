@@ -58,8 +58,22 @@ scope/rebinding, validation, ownership, JVM projection and KernelBody lowering. 
 effect-only source loops accept multiple carried values; the result-valued source recognizer
 still admits a single returned carry. Pure search loops now project multiple exits/recurrence
 sites through the existing ordered while-fold. The projection preserves lexical lets and lazy
-branches; it does not reinterpret effectful loops as pure Fold terms. Counted effect loops with
-several recurrence sites remain separate coverage work.
+branches; it does not reinterpret effectful loops as pure Fold terms. Counted effect loops now
+accept branch-local recurrence sites when only the induction index advances: both arms must
+prove the same unit step, and their complete lexical effect regions stay in source order.
+Each stripped arm must contain recognized effects; empty arms still decline rather than
+dropping a potentially observable predicate evaluation.
+Multi-store branch scopes use the existing guarded regions, including entry snapshots when
+their stores can change the predicate. Source/JVM and public OpenCL/Level Zero replay oracles
+cover both arms, zero trips, and a mutable predicate; no new kernel node or emitter is needed.
+
+Several recurrence sites with carried values remain open. The next extension needs a typed
+result-bearing effect branch, not conditional updates reconstructed after the effects. Each arm
+must yield the same typed tuple after its effects; only fresh merged results escape. KernelBody
+already has multi-result IfRegion/Yield. The missing work is the canonical effect dialect,
+lexical validation/traversals and continuation-aware JVM projection: recurrence must be inside
+the scope of exported branch results. Test old-tuple swaps, branch-local loads used once,
+predicate reads changed by stores, and zero trips. Early exits remain a separate contract.
 
 Source initialization retains a typed sequential local spine at the loop's effect position.
 All recurrence updates see the old tuple after the body effects and yield simultaneously.

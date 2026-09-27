@@ -101,6 +101,25 @@
                       :array-types {'weights :double 'targets :double 'out :int}
                       :scalar-types {'n :long 'nc :long}) [:attributes :emission-route]))))))
 
+(deftest induction-only-branches-preserve-effects-and-lexical-locals
+  (let [{:keys [operation]}
+        (emitted-body #'city/branch-local-store-steps!
+                      {'state :int 'out :int} {'n :long 'nc :long})
+        execute (eval (list 'fn '[state out n nc] (segop-simd/compile-effect-segmap operation)))]
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (= :kernel-body
+             (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :target-dialect target :array-types {'state :int 'out :int}
+                      :scalar-types {'n :long 'nc :long}) [:attributes :emission-route]))))
+    (doseq [nc [0 1 2 7]]
+      (let [state (int-array 3) out (int-array 3)
+            expected-state (int-array 3) expected-out (int-array 3)]
+        (dotimes [_ 2]
+          (city/branch-local-store-steps! expected-state expected-out 3 nc)
+          (execute state out 3 nc)
+          (is (= (vec expected-state) (vec state)))
+          (is (= (vec expected-out) (vec out))))))))
+
 (deftest effectful-tuples-initialize-sequentially-and-update-simultaneously
   (let [{:keys [scheduled artifact operation]}
         (emitted-body #'city/three-carry-effects! {'out :int} {'n :long 'nc :long})

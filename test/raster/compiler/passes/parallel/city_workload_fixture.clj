@@ -6,6 +6,22 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.par :as par]))
 
+(deftm branch-local-store-steps!
+  [state :- (Array int), out :- (Array int), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [k 0]
+      (when (< k nc)
+        (aset state i (unchecked-int (inc (aget state i))))
+        (if (== (aget state i) (int 1))
+          (let [v (unchecked-int (unchecked-add k 3))]
+            (aset state i (unchecked-int (inc (aget state i))))
+            (aset out i (unchecked-int (+ (aget out i) v)))
+            (recur (inc k)))
+          (let [v (unchecked-int (unchecked-add k 7))]
+            (aset state i (unchecked-int (dec (aget state i))))
+            (aset out i (unchecked-int (+ (aget out i) v)))
+            (recur (inc k))))))))
+
 (deftm two-exit-walk!
   [weights :- (Array double), targets :- (Array double), out :- (Array int),
    n :- Long, nc :- Long] :- Void
