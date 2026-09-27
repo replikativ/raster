@@ -65,7 +65,7 @@
    NB success/failure is carried in an explicit `{:ok …}`/`{:err …}` rather than a truthy value: a
    SOAC node is a RECORD, and records satisfy `map?` and are always truthy, so a compact
    `or`/`if-let` version silently misread every successful lowering as a decline marker."
-  [sym form device-id dtype array-types scalar-types]
+  [sym form device-id target-descriptor dtype array-types scalar-types]
   (when (seq? form)
     (let [par? (par/par-form? form)
           decline (fn [stage e] (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
@@ -103,7 +103,8 @@
                             :scalar-types scalar-types}))
               segops (attempt #(if algorithm
                                  (soac-lower/lower-typed-reduce
-                                  algorithm (or device-id :cpu:0) :dtype (or dtype :double))
+                                  algorithm (or device-id :cpu:0) :dtype (or dtype :double)
+                                  :target-descriptor target-descriptor)
                                  (soac-lower/lower-soac legacy-node (or device-id :cpu:0)
                                                         :dtype (or dtype :double))))]
           (cond
@@ -348,6 +349,7 @@
 
    Options from pipeline opts:
      :target-device — device for launch param computation
+     :target-descriptor — optional frozen descriptor for that compilation
      :dtype — element type (:double or :float)"
   [form opts]
   (if (and (program/parallel-program? form) (= :typed-soac (:dialect form)))
@@ -356,6 +358,7 @@
     ;; the lowerings must read it as a scalar operand, never as the core function.
     (binding [util/*shadowing-locals* (set (keys (:values form)))]
     (let [device-id (or (:target-device opts) :cpu:0)
+          target-descriptor (:target-descriptor opts)
           dtype (or (:dtype opts) :double)
           ;; The TypedSOAC program remains purely functional, while `:result-storage` gives every
           ;; equation result its physical identity. Scheduling later equations must consume that
@@ -373,28 +376,37 @@
                               contract {:operations (soac-lower/lower-typed-contract
                                                       scheduling-algorithm device-id)}
                               map {:operations (soac-lower/lower-typed-map
-                                                scheduling-algorithm device-id :dtype dtype)}
+                                                scheduling-algorithm device-id :dtype dtype
+                                                :target-descriptor target-descriptor)}
                               scatter {:operations (soac-lower/lower-typed-scatter
-                                                    scheduling-algorithm device-id :dtype dtype)}
+                                                    scheduling-algorithm device-id :dtype dtype
+                                                    :target-descriptor target-descriptor)}
                               effect-map
                               {:operations (soac-lower/lower-typed-effect-map
-                                            scheduling-algorithm device-id :dtype dtype)}
+                                            scheduling-algorithm device-id :dtype dtype
+                                            :target-descriptor target-descriptor)}
                               stencil {:operations (soac-lower/lower-typed-stencil
-                                                    scheduling-algorithm device-id :dtype dtype)}
+                                                    scheduling-algorithm device-id :dtype dtype
+                                                    :target-descriptor target-descriptor)}
                               reduce {:operations (soac-lower/lower-typed-reduce
-                                                   scheduling-algorithm device-id :dtype dtype)}
+                                                   scheduling-algorithm device-id :dtype dtype
+                                                   :target-descriptor target-descriptor)}
                               segmented-reduce
                               {:operations (soac-lower/lower-typed-segmented-reduce
-                                            scheduling-algorithm device-id :dtype dtype)}
+                                            scheduling-algorithm device-id :dtype dtype
+                                            :target-descriptor target-descriptor)}
                               product-reduce
                               {:operations (soac-lower/lower-typed-product-reduce
-                                            scheduling-algorithm device-id :dtype dtype)}
+                                            scheduling-algorithm device-id :dtype dtype
+                                            :target-descriptor target-descriptor)}
                               segmented-fold-map
                               {:operations (soac-lower/lower-typed-segmented-fold-map
-                                            scheduling-algorithm device-id :dtype dtype)}
+                                            scheduling-algorithm device-id :dtype dtype
+                                            :target-descriptor target-descriptor)}
                               scan (soac-lower/lower-typed-scan
                                     scheduling-algorithm device-id :dtype dtype
-                                    :array-types (:array-types opts)))
+                                    :array-types (:array-types opts)
+                                    :target-descriptor target-descriptor))
                     operations (:operations lowered)
                     scheduled-equation
                     (-> equation
@@ -480,6 +492,7 @@
       (let [[let-sym bindings-vec & body-exprs] form
             pairs (partition 2 bindings-vec)
             device-id (:target-device opts)
+            target-descriptor (:target-descriptor opts)
             dtype (:dtype opts)
             array-types (:array-types opts)
             scalar-types (:scalar-types opts)
@@ -490,7 +503,8 @@
           ;; anyone diagnosing why a kernel took the legacy path.
             declined (atom [])
             attempt (fn [sym init]
-                      (let [r (lower-attempt sym init device-id dtype array-types scalar-types)]
+                      (let [r (lower-attempt sym init device-id target-descriptor dtype
+                                             array-types scalar-types)]
                         (when-let [d (:declined r)] (swap! declined conj d))
                         (when (:segops r) r)))
             binding-equations

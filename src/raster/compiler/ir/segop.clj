@@ -234,11 +234,14 @@
     - Warp size for block size rounding
     - Shared memory limits
 
+  A supplied :target-descriptor is the already-frozen compilation target and avoids runtime
+  hardware initialization or catalogue lookup. Standalone callers may omit it.
+
   Returns a KernelGrid. For reduction/scan, shared-mem is
   block-size * element-size bytes."
-  [segop-type device-id n-expr & {:keys [dtype] :or {dtype :double}}]
-  (hw/init!)
-  (let [desc (chw/descriptor-for device-id)
+  [segop-type device-id n-expr & {:keys [dtype target-descriptor] :or {dtype :double}}]
+  (when-not target-descriptor (hw/init!))
+  (let [desc (or target-descriptor (chw/descriptor-for device-id))
         config (chw/launch-config desc 65536 :reduction? (not= segop-type :map))
         block-size (or (:block-size config) 256)
         elem-size (case dtype :double 8 :float 4 :long 8 :int 4 8)

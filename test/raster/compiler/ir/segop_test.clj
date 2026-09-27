@@ -3,6 +3,8 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.core.hardware :as hardware]
+            [raster.runtime.hardware :as runtime-hardware]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
 
 ;; ================================================================
@@ -77,6 +79,15 @@
   (testing "Launch params for reduce include shared memory"
     (let [grid (segop/compute-launch-params :reduce nil 'n)]
       (is (pos? (:shared-mem-bytes grid))))))
+
+(deftest frozen-launch-description-never-initializes-or-probes-hardware
+  (with-redefs [runtime-hardware/init! (fn [] (throw (ex-info "unexpected initialization" {})))
+                hardware/descriptor-for (fn [_] (throw (ex-info "unexpected target reread" {})))]
+    (let [descriptor {:subgroup-size 32 :max-workgroup-size 32 :machine-lanes 512}
+          grid (segop/compute-launch-params :reduce :synthetic:0 'n
+                                            :dtype :float :target-descriptor descriptor)]
+      (is (= 32 (:block-size grid)))
+      (is (= 128 (:shared-mem-bytes grid))))))
 
 ;; ================================================================
 ;; Map lowering

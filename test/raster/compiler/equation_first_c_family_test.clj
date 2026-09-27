@@ -367,6 +367,36 @@
                      sum))]
        (raster.arrays/aset output row total)))))
 
+(deftest equation-first-captures-one-target-description-for-all-stages
+  (doseq [target [ocl-target cuda-target hip-target]
+          [operation options]
+          [[#'contractions/fixed-matmul {:dtype :float :schedule register-tiled-schedule}]
+           [#'c-family-elementwise {:dtype :float}]
+           [#'c-family-effect-map! {:dtype :float}]
+           [#'c-family-dot {:dtype :double}]
+           [#'c-family-stencil {:dtype :float}]
+           [#'c-family-segment-sum! {:dtype :float}]
+           [#'c-family-scan {:dtype :float}]
+           [#'c-family-broadcast-product-map!
+            {:dtype :int
+             :values {'input (av/tensor {:dtype :int :shape [64]})
+                      'weights (av/tensor {:dtype :int :shape [64]})
+                      'output (av/tensor {:dtype :int :shape [1]})}}]]]
+    (let [descriptor (compiler-hardware/descriptor-for target)
+          calls (atom [])
+          compilation
+          (with-redefs [compiler-hardware/descriptor-for
+                        (fn [requested]
+                          (swap! calls conj requested)
+                          (when (< 1 (count @calls))
+                            (throw (ex-info "compilation reread mutable target facts"
+                                            {:target requested})))
+                          descriptor)]
+            (equation-first/compile operation (assoc options :target target)))]
+      (is (= [target] @calls) (str operation " " target))
+      (is (identical? descriptor (get-in compilation [:options :target-descriptor])))
+      (is (seq (:kernels compilation))))))
+
 (defn- reason-of
   [thunk]
   (try

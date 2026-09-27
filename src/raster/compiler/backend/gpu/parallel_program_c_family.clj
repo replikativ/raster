@@ -49,6 +49,7 @@
      :array-types (:array-types opts)
      :target-dialect (get opts :target-dialect :opencl-intel)
      :target-device (:target-device opts)
+     :target-descriptor (:target-descriptor opts)
      :schedule (:schedule opts)
      :contraction-facts (:contraction-facts opts)
      :scheduled-equation-algorithm (:scheduled-equation-algorithm opts)
@@ -161,10 +162,11 @@
   (let [target-dialect (get opts :target-dialect :opencl-intel)
         target-module (c-dialect/target (c-dialect/resolve! target-dialect))
         target-device (:target-device opts)
-        target-description (cond
-                             (map? target-device) target-device
-                             target-device (hardware/descriptor-for target-device)
-                             :else nil)
+        target-description (or (:target-descriptor opts)
+                               (cond
+                                 (map? target-device) target-device
+                                 target-device (hardware/descriptor-for target-device)
+                                 :else nil))
         routed (product-consumer-route/schedule plan target-description)
         kernel-name (str "rstr_product_consumer_" (:region-ordinal plan))
         {:keys [emitted refinement]} (product-consumer-route/emit

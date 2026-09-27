@@ -841,7 +841,8 @@
     (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
 
 (defn- generate-reduction-kernel-graph
-  [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts schedule
+  [graph {:keys [scalar-types array-types target-dialect target-device target-descriptor
+                 contraction-facts schedule
                  scheduled-equation-algorithm scheduled-equation-body]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel
                contraction-facts {}}}]
@@ -867,7 +868,7 @@
                                        "segmented reduction lacks verified contraction facts"
                                        {:reason :kernel-graph-segmented-reduction-facts
                                         :operation (:id operation) :fallback :none})))
-                     descriptor (hw/descriptor-for target-device)
+                     descriptor (or target-descriptor (hw/descriptor-for target-device))
                      scheduled (contraction-schedule/schedule-for-node
                                 node graph facts descriptor
                                 {:array-types array-types :scalar-types scalar-types

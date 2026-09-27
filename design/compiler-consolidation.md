@@ -147,8 +147,11 @@ stripping the deprecated precision option. This is not candidate parity: its por
 graph still lacks the descriptor route's alternative-selection machinery. A direct probe of
 `resident-structured-reduction-probe` also declines equation-first semantic coverage, while the
 descriptor route accepts it. Keep those gaps explicit rather than equating schedule metadata
-with implemented optimization. Cache canonicalization of equivalent policy spellings and a
-single captured target descriptor remain follow-ups. Quantized Q4_K already has a public compiled
+with implemented optimization. Equation-first compilation captures its target description once
+for fusion costs, schedule admission, launch planning and C-family projection; direct low-level
+callers may still resolve a descriptor when none is supplied. This snapshot is not an admission
+lease against later runtime device changes. Cache canonicalization of equivalent policy spellings
+remains a follow-up. Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
 Both orchestration paths now use one typed contraction boundary validator before emission.

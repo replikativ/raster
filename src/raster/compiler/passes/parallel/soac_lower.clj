@@ -77,7 +77,7 @@
    structural output slot and spells the remaining stores explicitly in the scalar region; all
    results remain declared outputs, so the ABI and memory contracts do not infer writes from the
    generated expression."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-map-program? program)
       (throw (ex-info "typed SegMap lowering requires one map equation"
@@ -138,11 +138,12 @@
                        :cast-fn nil}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
-            (lower-map-description description device-id :dtype result-dtype)))))
+            (lower-map-description description device-id :dtype result-dtype
+                                   :target-descriptor target-descriptor)))))
 
 (defn lower-typed-stencil
   "Lower one validated boundary-aware TypedSOAC stencil to a scheduled SegStencil."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))
         [_ equation-id results] equation
@@ -168,7 +169,7 @@
     (let [bound (:extent attributes)
           space (segop/make-seg-space (:index attributes) bound)
           level (segop/->SegLevel :thread :virtual)
-          grid (phase-grid :map device-id bound result-dtype)]
+          grid (phase-grid :map device-id bound result-dtype target-descriptor)]
       [(assoc (segop/->SegStencil
                equation-id space level body stable #{(first physical-results)}
                (set/difference (set captures) stable) grid result-dtype
@@ -184,7 +185,7 @@
    order or a checked reassociation certificate, and the final map covers the complete per-segment
    extent. A later schedule makes loop/control structure and launch geometry concrete in
    KernelBody."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))
         [_ equation-id results] equation
@@ -224,7 +225,7 @@
           space (segop/make-seg-space-nd dims)
           segment-count (segop/seg-space-num-segments-expr space)
           result-dtype (or (first result-dtypes) dtype)
-          grid (phase-grid :map device-id segment-count result-dtype)]
+          grid (phase-grid :map device-id segment-count result-dtype target-descriptor)]
       [(assoc (segop/->SegFoldMap
                equation-id space (:index attributes) (:extent attributes)
                lowered-folds map-results stable (vec physical-results)
@@ -241,7 +242,7 @@
    destinations retain their logical preservation contract in TypedSOAC, while the scheduled
    kernel ABI lists them as inputs only when the scalar region actually reads them (or the
    scatter is an atomic reduction)."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))]
     (when-not (and (= 1 (count (soac-dialect/equations program)))
@@ -314,7 +315,8 @@
                     :algorithm-equation equation-id
                     :write-conflict (if reducing? :reduce :unique)
                     :conflict-contract conflict)
-            (lower-map-description description device-id :dtype result-dtype)))))
+            (lower-map-description description device-id :dtype result-dtype
+                                   :target-descriptor target-descriptor)))))
 
 (defn lower-typed-effect-map
   "Lower one validated ordered effect-map to the common portable SegMap schedule boundary.
@@ -322,7 +324,7 @@
    Effects remain structured data in `:scalar-region`; no source `map-void!` form is rebuilt.
    Physical destinations come from the checked result-storage contract and every destination keeps
    its unique/reduction conflict proof for KernelBody lowering."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)
         equation (first (soac-dialect/equations program))]
     (when-not (and (= 1 (count (soac-dialect/equations program)))
@@ -403,7 +405,8 @@
                     :write-conflict :ordered-effects
                     :effect-iteration-order iteration-order
                     :write-conflicts write-conflicts)
-            (lower-map-description description device-id :dtype result-dtype)))))
+            (lower-map-description description device-id :dtype result-dtype
+                                   :target-descriptor target-descriptor)))))
 
 (defn typed-reduce-program?
   "Whether a validated one-equation TypedSOAC program is the scalar reduction vertical currently
@@ -419,7 +422,7 @@
    TypedSOAC keeps element values and captures as lexical lambda parameters. SegRed's temporary
    scalar-region adapter still spells element reads as `aget`; this conversion is a mechanical
    projection from the validated parameter layout, not a second analysis of the host form."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-reduce-program? program)
       (throw (ex-info "typed SegRed lowering requires one reduce equation"
@@ -487,7 +490,8 @@
                        :elem-type accumulator-dtype}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
-            (lower-reduce-description description device-id :dtype accumulator-dtype)))))
+            (lower-reduce-description description device-id :dtype accumulator-dtype
+                                      :target-descriptor target-descriptor)))))
 
 (defn typed-segmented-reduce-program?
   "Whether a validated one-equation TypedSOAC program is a general segmented reduction."
@@ -511,7 +515,7 @@
    innermost reduced dimension. Stable tensor captures retain arbitrary index expressions, which
    is the general representation used by contractions; ordinary element operands denote dense
    row-major storage over the complete segment-plus-reduction space."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-segmented-reduce-program? program)
       (throw (ex-info "typed segmented reduction lowering requires one segmented-reduce equation"
@@ -591,7 +595,8 @@
           contraction? (= :raster.par/contract
                           (get-in attributes [:attributes :source-operation]))
           planned-grid (when contraction?
-                         (phase-grid :reduce device-id reduced-extent output-dtype))
+                         (phase-grid :reduce device-id reduced-extent output-dtype
+                                     target-descriptor))
           contraction-schedule
           (when contraction?
             (let [workgroup-size (:block-size planned-grid)
@@ -619,7 +624,7 @@
           :reduction operator :segment-axes [] :bound reduced-extent :idx reduced-index
           :inputs inputs :outputs (set physical-results) :scalars scalars
           :elem-type output-dtype}
-         device-id :dtype output-dtype)
+         device-id :dtype output-dtype :target-descriptor target-descriptor)
         [(segop/->SegRed equation-id space
                        (segop/->SegLevel :thread :virtual)
                        operator nil inputs (set physical-results) scalars planned-grid
@@ -636,7 +641,7 @@
 
 (defn lower-typed-product-reduce
   "Mechanically project a typed two-region product reduction into the existing SegRed schedule."
-  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-product-reduce-program? program)
       (throw (ex-info "typed product reduction lowering requires one product-reduce equation"
@@ -704,7 +709,8 @@
                        :elem-type output-dtype}]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
-            (lower-reduce-description description device-id :dtype output-dtype)))))
+            (lower-reduce-description description device-id :dtype output-dtype
+                                      :target-descriptor target-descriptor)))))
 
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."
@@ -790,7 +796,7 @@
 
    Returns both ordered SegOps and their KernelGraph because temporary storage and dependencies are
    properties of the selected schedule, not of the functional scan equation."
-  [program device-id & {:keys [dtype array-types]
+  [program device-id & {:keys [dtype array-types target-descriptor]
                         :or {dtype :double array-types {}}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-scan-program? program)
@@ -800,7 +806,8 @@
           operations (mapv #(assoc % :algorithm-dialect :typed-soac
                                    :algorithm-equation (:id description))
                            (lower-scan-description description device-id
-                                                   :dtype (:elem-type description)))]
+                                                   :dtype (:elem-type description)
+                                                   :target-descriptor target-descriptor))]
       {:operations operations
        :kernel-graph (scan-kernel-graph-description description operations
                                                     {:array-types array-types})})))
@@ -814,14 +821,15 @@
   (or (soac/soac-outputs soac) (:outputs soac)))
 
 (defn- phase-grid
-  [segop-type device-id bound-expr dtype]
-  (segop/compute-launch-params segop-type device-id bound-expr :dtype dtype))
+  [segop-type device-id bound-expr dtype & [target-descriptor]]
+  (segop/compute-launch-params segop-type device-id bound-expr :dtype dtype
+                               :target-descriptor target-descriptor))
 
 (defn- scan-grid
   "A scan needs one workgroup per contiguous block. Unlike map/reduce it cannot cap the grid and
    recover coverage with a grid-stride loop because block prefixes are ordered dataflow."
-  [device-id bound-expr dtype]
-  (let [planned (phase-grid :scan device-id bound-expr dtype)
+  [device-id bound-expr dtype & [target-descriptor]]
+  (let [planned (phase-grid :scan device-id bound-expr dtype target-descriptor)
         block-size (:block-size planned)]
     (segop/->KernelGrid
      (kernel-launch/ceil-div bound-expr block-size)
@@ -852,8 +860,8 @@
    power of two: idle lanes above that size cannot contribute to the tree. Each component has an
    independent local array, so charging only the primary dtype would make mixed products legal
    on paper while overcommitting local memory at emission."
-  [device-id planned reduction bound]
-  (let [descriptor (hardware/descriptor-for device-id)
+  [device-id planned reduction bound & [target-descriptor]]
+  (let [descriptor (or target-descriptor (hardware/descriptor-for device-id))
         bytes-per-lane (reduce + (map (comp dtype/bytes-of :dtype) (:components reduction)))
         slm-budget (long (or (get-in descriptor [:cache :slm])
                              (:shared-memory-per-block descriptor)
@@ -940,13 +948,13 @@
   (lower-map-description (legacy-map-description soac) device-id :dtype dtype))
 
 (defn- lower-map-description
-  [description device-id & {:keys [dtype] :or {dtype :double}}]
+  [description device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [dtype (or (:elem-type description) dtype)
         bound (:bound description)
         idx (:idx description)
         space (segop/make-seg-space idx bound)
         level (segop/->SegLevel :thread :virtual)
-        grid (phase-grid :map device-id bound dtype)
+        grid (phase-grid :map device-id bound dtype target-descriptor)
         out-sym (:out-sym description)
         cast-fn (:cast-fn description)]
     [(segop/->SegMap (:id description) space level
@@ -976,7 +984,7 @@
   (lower-reduce-description (legacy-reduce-description soac) device-id :dtype dtype))
 
 (defn- lower-reduce-description
-  [description device-id & {:keys [dtype] :or {dtype :double}}]
+  [description device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [reduction (:reduction description)
         product? (some? (:combine reduction))
         dtype (or (first (map :dtype (:components reduction))) (:elem-type description) dtype)
@@ -987,8 +995,10 @@
                (conj (mapv (fn [[name axis-bound]] {:name name :bound axis-bound})
                            (:segment-axes description))
                      {:name idx :bound bound}))
-        planned-grid (phase-grid :reduce device-id bound dtype)
-        product-grid-info (when product? (product-grid device-id planned-grid reduction bound))
+        planned-grid (phase-grid :reduce device-id bound dtype target-descriptor)
+        product-grid-info (when product?
+                            (product-grid device-id planned-grid reduction bound
+                                          target-descriptor))
         grid-1 (cond-> (or (:grid product-grid-info) planned-grid)
                  ;; Product schedules own one workgroup per segment, or one uniformly guarded
                  ;; group for an empty domain. The scalar grid only seeds workgroup sizing.
@@ -1116,7 +1126,7 @@
   (lower-scan-description (legacy-scan-description soac) device-id :dtype dtype))
 
 (defn- lower-scan-description
-  [description device-id & {:keys [dtype] :or {dtype :double}}]
+  [description device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
   (let [dtype (or (:elem-type description) dtype)
         bound (:bound description)
         idx (:idx description)
@@ -1131,7 +1141,7 @@
         scan-op (assoc raw-scan-op :algebra scan-facts
                        :element (or (:element raw-scan-op) (:element scan-facts)))
         space (segop/make-seg-space idx bound)
-        grid-1 (scan-grid device-id bound dtype)
+        grid-1 (scan-grid device-id bound dtype target-descriptor)
         execution (execution-plan/scan-execution bound grid-1)]
     (case (:strategy execution)
       :single
@@ -1169,7 +1179,7 @@
                                      dtype)
             carry-idx (gensym "ci_")
             carry-space (segop/make-seg-space carry-idx bound)
-            grid-3 (phase-grid :map device-id bound dtype)
+            grid-3 (phase-grid :map device-id bound dtype target-descriptor)
             level-3 (segop/->SegLevel :thread :virtual)
             out-sym (or (:out scan-op) (first (:outputs description)))
             block-idx-expr (list 'clojure.core/quot carry-idx (:block-size grid-1))
