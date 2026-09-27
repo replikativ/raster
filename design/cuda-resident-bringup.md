@@ -13,6 +13,9 @@ The path must be `deftm → typed SOAC → schedule → KernelBody → CUDA sour
 
 1. Probe the installed CUDA driver and enumerate a real device, recording device name,
    compute capability, driver version, toolkit/compiler version, and available memory.
+   `raster.gpu.cuda-driver-probe/probe` now performs the read-only driver/name/capability
+   part and reports `:no-device` on this laptop; it does not create a session or promise
+   executable CUDA support. Memory and full capability facts remain for the resident adapter.
 2. Create a resident session; allocate input/output buffers; upload the input through the
    existing typed buffer contract. Compile the generated source, load its module, bind its
    **ordered KernelABI**, and launch its **KernelLaunch** 1–3D geometry. No fixture-specific
