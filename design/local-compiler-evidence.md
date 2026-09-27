@@ -133,5 +133,8 @@ this is source-generation evidence, not NVIDIA/AMD execution or production admis
 A focused warm-REPL check replaced only the existing device test's compatibility graph provider
 with the common emitter's certified subgroup graph. The same independent plan oracle passed on
 local OpenCL and Level Zero (8 assertions), including empty destinations and row tails. The
-production equation-first path still selects reference: explicit optimized selection and exact
-optimized complete-write rederivation are the next slice, before automatic dispatch/tuning.
+equation-first path now also admits explicit subgroup selection, with exact optimized schedule
+rederivation before granting complete-write initialization. Public compile/lower/LinkPlan execution
+passed both replays of both edge counts on OpenCL and Level Zero (36 assertions), and serialized
+artifact roundtrips preserve the selected schedule. `:auto` still selects reference; automatic
+dispatch/tuning, paged-storage equation coverage and zero-byte physical storage remain open.
