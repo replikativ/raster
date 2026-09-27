@@ -39,6 +39,7 @@
      :device (:device allocation)
      :memory-space (:memory-space allocation)
      :alignment (:alignment allocation)
+     :coherence (:coherence allocation)
      :dtype (when (= 1 (count node-facts)) (:dtype (first node-facts)))
      :first-order first-order :last-order last-order
      :first-complete-write? (boolean (and (= :write (:access (first events)))
@@ -46,8 +47,8 @@
      :reason reason}))
 
 (defn- compatible? [left right]
-  (= (select-keys left [:byte-size :device :memory-space :alignment :dtype])
-     (select-keys right [:byte-size :device :memory-space :alignment :dtype])))
+  (= (select-keys left [:byte-size :device :memory-space :alignment :coherence :dtype])
+     (select-keys right [:byte-size :device :memory-space :alignment :coherence :dtype])))
 
 (defn- source-step [access]
   {:instance (:instance access) :step (:step access)})
