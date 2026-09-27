@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.runtime.hardware :as hw]
             [raster.hardware-fixture :as hardware-fixture]
+            [raster.gpu.ocl-runtime :as ocl]
             [raster.compiler.core.hardware :as chw]
             [raster.runtime.hardware-catalogue :as catalogue]))
 
@@ -11,6 +12,23 @@
 ;; ================================================================
 ;; CPU detection
 ;; ================================================================
+
+(deftest opencl-driver-version-participates-in-calibration-identity
+  (let [detected (fn [driver]
+                   (with-redefs [ocl/query-devices
+                                 (constantly [{:name "fixture GPU" :vendor "fixture"
+                                               :version "OpenCL 3.0" :driver-version driver}])]
+                     (first (#'hw/detect-opencl-devices))))
+        first-device (detected "driver-A")
+        next-device (detected "driver-B")
+        signature (fn [device]
+                    (with-redefs [hw/device (constantly device)]
+                      (hw/device-signature :ocl:0)))]
+    (is (= "driver-A" (:driver-version first-device)))
+    (is (= "driver-A" (get-in first-device [:capabilities :driver-version])))
+    (is (= :detected (get-in first-device [:source :driver-version])))
+    (is (not= (signature first-device) (signature next-device)))
+    (is (= (signature first-device) (signature (detected "driver-A"))))))
 
 (deftest cpu-detection-test
   (testing "CPU auto-detected on init"

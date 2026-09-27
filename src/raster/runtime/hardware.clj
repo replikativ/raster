@@ -302,7 +302,7 @@
                                                    :max-workgroup-size :subgroup-sizes :simd-width
                                                    :global-mem-bytes :global-memory-bytes
                                                    :shared-local-memory :local-memory-bytes
-                                                   :max-clock-mhz :extensions :vendor :version
+                                                   :max-clock-mhz :extensions :vendor :version :driver-version
                                                    :integrated?]))
                         caps (merge (when catalogue-spec catalogue-spec) probed)
                         source (merge
@@ -314,6 +314,7 @@
                      :type :ocl
                      :index idx
                      :name dev-name
+                     :driver-version (:driver-version dev-info)
                      :capabilities caps
                      :source source}))
                 (range) (take 1 devices)))))

@@ -124,6 +124,7 @@
 (def ^:private CL_DEVICE_MEM_BASE_ADDR_ALIGN 0x1019)
 (def ^:private CL_DEVICE_NAME 0x102B)
 (def ^:private CL_DEVICE_VENDOR 0x102C)
+(def ^:private CL_DRIVER_VERSION 0x102D)
 (def ^:private CL_DEVICE_EXTENSIONS 0x1030)
 (def ^:private CL_DEVICE_VERSION 0x102F)
 
@@ -356,6 +357,7 @@
   {:name (query-device-info-string device CL_DEVICE_NAME)
    :type (device-type-keyword device)
    :vendor (query-device-info-string device CL_DEVICE_VENDOR)
+   :driver-version (query-device-info-string device CL_DRIVER_VERSION)
    :version (query-device-info-string device CL_DEVICE_VERSION)
    :max-compute-units (query-device-info-uint device CL_DEVICE_MAX_COMPUTE_UNITS)
    :max-work-group-size (query-device-info-size-t device CL_DEVICE_MAX_WORK_GROUP_SIZE)
