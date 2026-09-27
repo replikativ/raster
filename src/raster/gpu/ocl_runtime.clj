@@ -598,22 +598,27 @@
 (declare buffer-offset-alignment)
 
 (defn make-buffer
-  "Allocate a persistent GPU buffer via clCreateBuffer."
+  "Allocate a persistent GPU buffer via clCreateBuffer. A zero-length logical buffer owns one
+   native byte so it can still be bound as a pointer; its visible capacity remains zero."
   ([n] (make-buffer n :float))
   ([n dtype]
    (ensure-init!)
    (let [{:keys [context arena]} @state
+         n (long n)
          elem-size (long (get dtype-byte-sizes dtype 4))
-         byte-size (long (* n elem-size))
+         _ (when (neg? n)
+             (throw (ex-info "GPU buffer element count must be non-negative"
+                             {:reason :gpu-buffer-negative-elements :elements n})))
+         byte-size (Math/multiplyExact n elem-size)
          err-seg (.allocate ^Arena arena I32)
          cl-mem (.invokeWithArguments ^MethodHandle @h-clCreateBuffer
                                       (into-array Object [context (long CL_MEM_READ_WRITE)
-                                                          (long byte-size) MemorySegment/NULL err-seg]))
+                                                          (long (max 1 byte-size)) MemorySegment/NULL err-seg]))
          _ (when (not= CL_SUCCESS (read-int err-seg))
              (throw (ex-info "clCreateBuffer failed" {:error (read-int err-seg) :size byte-size})))
          ;; Host staging buffer for data transfer
          host-seg (.allocate ^Arena arena byte-size)]
-     (->OclBuffer host-seg cl-mem (long n) byte-size dtype
+     (->OclBuffer host-seg cl-mem n byte-size dtype
                   (long (buffer-offset-alignment))))))
 
 (defn buffer-offset-alignment
@@ -697,11 +702,12 @@
         src-seg (MemorySegment/ofArray arr)
         byte-size (:byte-size buf)]
     ;; Copy to host staging
-    (MemorySegment/copy src-seg 0 (:segment buf) 0 byte-size)
-    ;; Upload to device
-    (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
-              [queue (:cl-mem buf) (int CL_TRUE) (long 0) (long byte-size)
-               (:segment buf) (int 0) MemorySegment/NULL MemorySegment/NULL])
+    (when (pos? byte-size)
+      (MemorySegment/copy src-seg 0 (:segment buf) 0 byte-size)
+      ;; OpenCL does not require zero-byte enqueue support.
+      (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
+                [queue (:cl-mem buf) (int CL_TRUE) (long 0) (long byte-size)
+                 (:segment buf) (int 0) MemorySegment/NULL MemorySegment/NULL]))
     buf))
 
 (defn- as-segment
@@ -744,7 +750,8 @@
   (ensure-init!)
   (let [{:keys [queue]} @state
         staging (.asSlice ^MemorySegment (:segment buf) (long buf-off))]
-    (case direction
+    (when (pos? (long n-bytes))
+      (case direction
       :upload
       (do (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
           (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
@@ -754,7 +761,7 @@
       (do (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
                     [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
                      staging (int 0) MemorySegment/NULL MemorySegment/NULL])
-          (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes))))))
+          (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes)))))))
 
 (defn upload-range!
   "Ranged host → device copy; returns the buffer."
@@ -779,11 +786,12 @@
         dst-byte (* (long dst-element) element-bytes)
         byte-count (* (long elements) element-bytes)
         queue (:queue @state)]
-    (cl-call! "clEnqueueCopyBuffer" @h-clEnqueueCopyBuffer
-              [queue (:cl-mem src) (:cl-mem dst)
-               src-byte dst-byte byte-count
-               (int 0) MemorySegment/NULL MemorySegment/NULL])
-    (cl-call! "clFinish" @h-clFinish [queue])
+    (when (pos? byte-count)
+      (cl-call! "clEnqueueCopyBuffer" @h-clEnqueueCopyBuffer
+                [queue (:cl-mem src) (:cl-mem dst)
+                 src-byte dst-byte byte-count
+                 (int 0) MemorySegment/NULL MemorySegment/NULL])
+      (cl-call! "clFinish" @h-clFinish [queue]))
     dst))
 
 (defn buffer->array
@@ -794,9 +802,10 @@
         byte-size (:byte-size buf)
         n (:n-elements buf)]
     ;; Download from device
-    (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
-              [queue (:cl-mem buf) (int CL_TRUE) (long 0) (long byte-size)
-               (:segment buf) (int 0) MemorySegment/NULL MemorySegment/NULL])
+    (when (pos? byte-size)
+      (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
+                [queue (:cl-mem buf) (int CL_TRUE) (long 0) (long byte-size)
+                 (:segment buf) (int 0) MemorySegment/NULL MemorySegment/NULL]))
     ;; Copy to JVM array
     (case (:dtype buf)
       :float (let [arr (float-array n)]
@@ -846,10 +855,11 @@
   (let [{:keys [queue arena]} @state
         zero-pattern (.allocate ^Arena arena 4)]
     (.set zero-pattern I32 0 (int 0))
-    (cl-call! "clEnqueueFillBuffer" @h-clEnqueueFillBuffer
-              [queue (:cl-mem buf) zero-pattern (long 4) (long 0) (long (:byte-size buf))
-               (int 0) MemorySegment/NULL MemorySegment/NULL])
-    (cl-call! "clFinish" @h-clFinish [queue])
+    (when (pos? (:byte-size buf))
+      (cl-call! "clEnqueueFillBuffer" @h-clEnqueueFillBuffer
+                [queue (:cl-mem buf) zero-pattern (long 4) (long 0) (long (:byte-size buf))
+                 (int 0) MemorySegment/NULL MemorySegment/NULL])
+      (cl-call! "clFinish" @h-clFinish [queue]))
     buf))
 
 ;; ================================================================

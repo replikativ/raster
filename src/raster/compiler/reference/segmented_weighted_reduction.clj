@@ -12,16 +12,17 @@
   (throw (ex-info message (assoc data :reason reason))))
 
 (defn- extent
-  [value scalars]
+  ([value scalars] (extent value scalars false))
+  ([value scalars allow-zero?]
   (let [resolved (if (symbol? value) (get scalars value ::missing) value)]
     (when (= ::missing resolved)
       (fail "segmented reduction is missing a scalar extent"
             :segmented-reduction-missing-scalar {:extent value}))
-    (when-not (and (integer? resolved) (pos? resolved))
-      (fail "segmented reduction extent must resolve to a positive integer"
+    (when-not (and (integer? resolved) (if allow-zero? (not (neg? resolved)) (pos? resolved)))
+      (fail "segmented reduction extent has an invalid runtime value"
             :segmented-reduction-invalid-runtime-extent
             {:extent value :resolved resolved}))
-    (long resolved)))
+    (long resolved))))
 
 (defn- scalar-call
   [operator arguments]
@@ -146,7 +147,7 @@
         axis-extents (into {} (map (juxt :name #(extent (:extent %) scalars))) segment-axes)
         n-destinations (get axis-extents :destination)
         n-heads (get axis-extents :head)
-        n-edges (extent (:edges membership) scalars)
+        n-edges (extent (:edges membership) scalars true)
         components (extent (:components value) scalars)
         total-dim (extent (:total-dim value) scalars)
         destination-id (:destination-indices membership)

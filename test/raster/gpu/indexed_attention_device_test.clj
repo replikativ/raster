@@ -159,7 +159,7 @@
                                            :schedule {:segmented-weighted-reduction
                                                       {:strategy strategy}}})
         {:keys [plan shape-env buffers]} (test-case)]
-    (doseq [edges [4 1]]
+    (doseq [edges [4 1 0]]
       (let [buffers (assoc buffers
                            'dst (long-array (take edges (get buffers 'dst)))
                            'src (long-array (take edges (get buffers 'src))))
