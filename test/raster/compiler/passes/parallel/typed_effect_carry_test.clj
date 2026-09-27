@@ -56,6 +56,23 @@
   (:source ((ns-resolve 'raster.compiler.passes.parallel.typed-soac-route 'realize-equation)
             (dialect/validate! program) (first (dialect/equations program)))))
 
+(defn- atomic-result-carry-program []
+  (let [program
+        (rewrite-loop
+         (fixture/typed-program 1)
+         (fn [[op attributes extent initializers [lambda parameters [region locals effects _]]]]
+           (let [[effect destination _ index predicate value] (first effects)
+                 atomic (list effect destination (dialect/reducing-scatter-conflict '+ :float)
+                              index predicate value {:result 'previous :dtype :float})]
+             (list op attributes extent initializers
+                   (list lambda parameters
+                         (list region locals [atomic]
+                               [(with-meta 'previous {:raster.type/tag 'float})]))))))
+        facts (assoc-in (dialect/facts program)
+                        [:equations :carry :attributes :result-storage 0 :access]
+                        :read-write)]
+    (dialect/make facts (dialect/equations program) (dialect/outputs program))))
+
 (deftest production-carries-share-scheduled-execution-and-hygiene
   (doseq [trips [0 1 8] physical ['seed 'i 'acc 'sum 'loaded 'float]]
     (let [program (dialect/remap-values (fixture/typed-program trips) {'seed physical})
@@ -70,6 +87,25 @@
       (is (nil? (host x host-words host-totals 2 (float 0.25))))
       (is (= (vec words) (vec host-words)))
       (is (= (vec totals) (vec host-totals))))))
+
+(deftest exported-atomic-result-drives-the-same-loop-recurrence
+  (let [program (atomic-result-carry-program)
+        operation (first (lower/lower-typed-effect-map program :ze:0))
+        arguments '[x words totals rows seed]
+        host (eval (list 'fn arguments (host-source program)))
+        scheduled (eval (list 'fn arguments (jvm/compile-effect-segmap operation)))
+        x (float-array (cons 2.0 (repeat 15 0.0)))
+        host-words (float-array (cons 10.0 (repeat 15 0.0)))
+        words (aclone host-words)
+        host-totals (float-array 1)
+        totals (float-array 1)]
+    (is (= :accepted (reason program)))
+    (is (nil? (host x host-words host-totals 1 (float 0.25))))
+    (scheduled x words totals 1 (float 0.25))
+    (is (= [12.0] (subvec (vec words) 0 1)))
+    (is (= [10.0] (vec totals)) "the carry consumes atomic-add!'s old value")
+    (is (= (vec words) (vec host-words)))
+    (is (= (vec totals) (vec host-totals)))))
 
 (deftest production-carry-preserves-generated-fp32-conversion-and-checked-source-arithmetic
   (let [overflow-init (rewrite-loop (fixture/typed-program 0)

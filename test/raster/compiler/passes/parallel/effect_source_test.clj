@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.effect-source-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.effect-source :as source]))
 
 (deftest result-binding-encloses-only-the-ordered-continuation
@@ -9,8 +10,9 @@
                          :effects [{:source '(swap! log conj :inside)}]}}
                  {:source '(swap! log conj result)}]
         form (source/ordered-effects
-              effects {:emit-store :source
-                       :emit-loop (fn [_ body] (list 'do body [11]))})
+              effects nil
+              {:emit-store :source
+               :emit-loop (fn [_ emit-body] (list 'do (emit-body nil) [11]))})
         execute (eval (list 'fn '[log result] form))
         log (atom [])]
     (is (contains? (util/free-syms form) 'result)
@@ -23,10 +25,10 @@
               [{:source '(swap! log conj :before)}
                {:loop {:effects [{:source '(swap! log conj :inside)}]}}
                {:source '(swap! log conj :after)}]
-              {:emit-store :source :emit-loop (fn [_ body] body)})
+              nil {:emit-store :source :emit-loop (fn [_ emit-body] (emit-body nil))})
         execute (eval (list 'fn '[log] form))
         log (atom [])]
-    (is (nil? (source/ordered-effects [] {})))
+    (is (= :tail (source/ordered-effects [] :tail {})))
     (is (nil? (execute log)))
     (is (= [:before :inside :after] @log))))
 
@@ -36,7 +38,7 @@
                          :locals [{:id 'checked :dtype :long :init '(inc n)}]
                          :effects [{:source '(swap! log conj checked)}]}}
                {:source '(swap! log conj :after)}]
-              {:emit-store :source
+              nil {:emit-store :source
                :emit-region (fn [locals body]
                               (list 'let* (vec (mapcat (juxt :id :init) locals)) body))})
         execute (eval (list 'fn '[log active? n] form))]
@@ -46,6 +48,24 @@
     (let [log (atom [])]
       (is (nil? (execute log true 4)))
       (is (= [5 :after] @log)))))
+
+(deftest counted-recurrence-is-inside-an-exported-effect-result
+  (let [loop {:index 'k :lower 0 :extent 2 :locals []
+              :effects [{:destination 'counter
+                         :conflict (dialect/reducing-scatter-conflict '+ :int)
+                         :destination-index 0 :predicate true :value '(inc acc)
+                         :result 'previous :result-dtype :int}]
+              :carries [{:parameter 'acc :result 'sum :dtype :int
+                         :init 0 :update 'previous}]}
+        form (source/ordered-effects
+              [{:loop loop}] 'sum
+              {:emit-store :value
+               :emit-loop (partial source/counted-loop
+                                   (partial source/storage-cast true))})
+        execute (eval (list 'fn [] form))]
+    (is (not (contains? (util/free-syms form) 'previous))
+        "the recurrence consumes the atomic result inside its binding")
+    (is (= 2 (execute)))))
 
 (deftest product-fold-tuple-is-bound-once-after-its-captures
   (let [product

@@ -1068,8 +1068,9 @@
           (when (seq effects)
             (materialize-locals locals
                                 (effect-source/ordered-effects
-                                 effects {:emit-store effect-statement :emit-loop loop-statement
-                                          :emit-region materialize-locals})))
+                                 effects nil
+                                 {:emit-store effect-statement :emit-loop loop-statement
+                                  :emit-region materialize-locals})))
           body (clojure.walk/postwalk
                 (fn [form] (if (= form index) j-sym form))
                 (bc/desugar-invk (or typed-region-body (:lambda segmap))))]

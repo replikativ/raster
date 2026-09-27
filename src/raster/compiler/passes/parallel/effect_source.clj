@@ -90,8 +90,9 @@
 (defn counted-loop
   "Spell the validated scheduled counted-loop contract with simultaneous typed carry updates.
    Initializers are already outer-scope operands. Stores precede recurrence evaluation, and a
-   zero-trip loop returns the initial tuple. Result scope is supplied by `ordered-effects`."
-  [generated-cast {:keys [index lower upper-bound extent locals carries]} ordered-body]
+   zero-trip loop returns the initial tuple. `emit-body` receives the recurrence as its lexical
+   tail, so an ordered effect result may be consumed by a carry update without escaping scope."
+  [generated-cast {:keys [index lower upper-bound extent locals carries]} emit-body]
   (let [tags (mapv #(generated-cast (dtype/scalar-tag-for-dtype (:dtype %))) carries)
         index-tag (if (seq carries) 'clojure.core/long 'clojure.core/int)
         limit (gensym "effect_carry_limit__")
@@ -124,26 +125,33 @@
                                 index limit)
                       (typed-locals
                        generated-cast locals
-                       (list 'do ordered-body recur-form))
+                       (emit-body recur-form))
                       (when (seq carries) (mapv :parameter carries)))))))
 
 (defn ordered-effects
-  "Spell scheduled effects as a host continuation. `emit-store` receives a store descriptor;
-   `emit-loop` receives a loop descriptor and its already-spelled ordered body. `emit-region`
-   receives retained locals and their ordered body. All callbacks return forms.
-   A carried result encloses only subsequent effects, never its initializer or preceding stores."
-  [effects {:keys [emit-store emit-loop emit-region] :as emitters}]
+  "Spell scheduled effects around an explicit host `continuation`.
+
+   `emit-store` receives a store descriptor. `emit-loop` receives a loop descriptor and an
+   `emit-body` callback; invoking that callback with the loop's recurrence spells the ordered body
+   with that recurrence in the lexical scope of every exported body result. `emit-region` receives
+   retained locals and its already-spelled effect-only body. All callbacks return forms.
+
+   An exported result encloses only the subsequent continuation, never its initializer or a
+   preceding effect. Ordinary region locals remain lexical and do not enclose the outer
+   continuation."
+  [effects continuation {:keys [emit-store emit-loop emit-region] :as emitters}]
   (if-let [effect (first effects)]
     (let [loop (:loop effect)
           form (cond
                  (:region effect)
                  (let [{:keys [predicate locals effects]} (:region effect)
-                       region (emit-region locals (ordered-effects effects emitters))]
+                       region (emit-region locals (ordered-effects effects nil emitters))]
                    (if (contains? (:region effect) :predicate)
-                     (list 'if predicate region) region))
-                 loop (emit-loop loop (ordered-effects (:effects loop) emitters))
+                     (list 'if predicate region)
+                     region))
+                 loop (emit-loop loop #(ordered-effects (:effects loop) % emitters))
                  :else (emit-store effect))
-          continuation (ordered-effects (next effects) emitters)]
+          continuation (ordered-effects (next effects) continuation emitters)]
       (cond
         (seq (:carries loop))
         (let [tuple (gensym "effect_results__")]
@@ -156,4 +164,4 @@
         (:result effect)
         (list 'let* [(vary-meta (:result effect) dissoc :tag) form] continuation)
         :else (list 'do form continuation)))
-    nil))
+    continuation))
