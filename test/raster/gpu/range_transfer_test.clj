@@ -149,6 +149,65 @@
           (is (= [idle-buffer buffer] @freed))
           (g/release-event! session event))))))
 
+(deftest transfers-and-kernel-graphs-require-an-explicit-cross-queue-boundary
+  (let [buffer {:dtype :float :n-elements 8 :byte-size 32}
+        independent-buffer (assoc buffer :test-id :independent)
+        allocation (bview/allocation
+                    {:id :shared-allocation :byte-size 32 :memory-space :device
+                     :device :ze:0 :coherence :host-coherent :ownership :owned})
+        footprint {:buffer-keys #{:shared}
+                   :allocation-ids #{:shared-allocation}
+                   :resident-buffers [buffer]}
+        session (atom {:device-id :ze:0 :session-id :cross-queue
+                       :buffers {:shared buffer :independent independent-buffer}
+                       :allocations {:shared allocation
+                                     :independent (assoc allocation :id :independent-allocation)}
+                       :kernel-graphs {:graph {:runtime-graph :bound
+                                               :outputs {}
+                                               :execution-plan {:queues [{:class :compute}]}
+                                               :resident-footprint footprint}}
+                       :events {} :closed? false})
+        handle (g/->KernelGraphHandle :graph)
+        source (float-array 8)
+        resolver (fn [_ name]
+                   (case name
+                     "plan-range" (fn [_ _ _ _] {:n-bytes 32})
+                     "submit-range-batch!" (fn [_ _] :transfer-token)
+                     "submit-graph!" (fn [_] :graph-token)
+                     "await-event!" (constantly {:bytes 32 :commands 1})
+                     "release-event!" (constantly nil)
+                     (throw (ex-info "unexpected mocked runtime function" {:name name}))))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
+      (fn []
+        (let [transfer (g/submit-upload-ranges!
+                        session [[:shared source {:elements 8}]])]
+          (is (= :graph-pending-transfer
+                 (try (g/submit-kernel-graph! session handle)
+                      (catch clojure.lang.ExceptionInfo error
+                        (:reason (ex-data error))))))
+          (g/await-event! session transfer)
+          (let [graph (g/submit-kernel-graph! session handle)]
+            (is (= :graph (get-in @session [:events (:id graph) :kind])))
+            (is (= :transfer-pending-graph
+                   (try (g/submit-upload-ranges!
+                         session [[:shared source {:elements 8}]])
+                        (catch clojure.lang.ExceptionInfo error
+                          (:reason (ex-data error))))))
+            (g/await-event! session graph)
+            (g/release-event! session graph))
+          (g/release-event! session transfer)
+          (let [next-transfer (g/submit-upload-ranges!
+                               session [[:shared source {:elements 8}]])]
+            (g/release-event! session next-transfer))
+          (let [independent-transfer (g/submit-upload-ranges!
+                                      session [[:independent source {:elements 8}]])
+                graph (g/submit-kernel-graph! session handle)]
+            (is (= :pending (get-in @session [:events (:id independent-transfer) :status])))
+            (is (= :pending (get-in @session [:events (:id graph) :status])))
+            (g/release-event! session graph)
+            (g/release-event! session independent-transfer)))))))
+
 (deftest transfer-capabilities-preserve-backend-and-device-identity
   (let [session (atom {:device-id :ocl:3})]
     (with-redefs-fn

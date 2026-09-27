@@ -171,6 +171,14 @@ release certificate. Session close continues to drain outstanding events. This c
 use-after-free path, but it does not yet provide a general read/write dependency scheduler for
 other operations submitted against the same ranges while a transfer is pending.
 
+The session event boundary now also rejects a bound `KernelGraph` submission against a pending
+range transfer that names the same resident allocation, and rejects the reverse submission order.
+The binding carries physical allocation and buffer identities, including the single-kernel-call
+path; disjoint buffers may still use independent queues. This is a conservative whole-allocation
+hazard check, not range-aware dependency scheduling or automatic wait insertion. Direct legacy
+session `replay!` and synchronous transfer calls remain outside this event-order contract; their
+eventual retirement or unification must be explicit before claiming general cross-queue safety.
+
 `Compiled/invoke-leased` now projects its ordinary external `DeviceArray` results and acquires
 the Link output lease in one locked invocation. Only declared LinkPlan outputs may be projected;
 ownership is rejected before input writes or donation, and exactly one completed replay is

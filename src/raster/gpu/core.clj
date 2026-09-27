@@ -574,6 +574,25 @@
                            (assoc-in [:allocations key] allocation))))
          buffer)))))
 
+(defn- resident-footprints-overlap?
+  [left right]
+  (or (some #(contains? (:buffer-keys right) %) (:buffer-keys left))
+      (some #(contains? (:allocation-ids right) %)
+            (remove nil? (:allocation-ids left)))
+      (some (fn [buffer]
+              (some #(identical? buffer %) (:resident-buffers right)))
+            (:resident-buffers left))))
+
+(defn- pending-resident-events
+  [events kind footprint]
+  (->> events
+       (keep (fn [[event-id entry]]
+               (when (and (= kind (:kind entry))
+                          (= :pending (:status entry))
+                          (resident-footprints-overlap? footprint entry))
+                 event-id)))
+       vec))
+
 (defn free-buffer!
   "Release a specific buffer registration. Raster frees it only when the allocation is owned.
    An unawaited transfer retains its resident buffers even when a nonblocking status query says
@@ -587,19 +606,10 @@
                                                 (vals (:resident-views entry)))
                                       graph-key)))
                             vec)
-          allocation-id (get-in allocations [key :id])
-          pending-transfers (->> events
-                                 (keep (fn [[event-id entry]]
-                                         (when (and (= :transfer (:kind entry))
-                                                    (not= :complete (:status entry))
-                                                    (or (contains? (:buffer-keys entry) key)
-                                                        (and allocation-id
-                                                             (contains? (:allocation-ids entry)
-                                                                        allocation-id))
-                                                        (some #(identical? (get buffers key) %)
-                                                              (:resident-buffers entry))))
-                                           event-id)))
-                                 vec)]
+          footprint {:buffer-keys #{key}
+                     :allocation-ids #{(get-in allocations [key :id])}
+                     :resident-buffers [(get buffers key)]}
+          pending-transfers (pending-resident-events events :transfer footprint)]
       (when-let [buf (get buffers key)]
         (when (seq bound-graphs)
           (throw (ex-info "cannot release a buffer while a kernel graph holds one of its views"
@@ -1021,6 +1031,13 @@
      :resident resident
      :view (:view resident)}))
 
+(defn- binding-footprint
+  [sess bindings]
+  (let [buffer-keys (set (map (comp :key :resident) (vals bindings)))]
+    {:buffer-keys buffer-keys
+     :allocation-ids (set (map #(get-in @sess [:allocations % :id]) buffer-keys))
+     :resident-buffers (mapv :buffer (vals bindings))}))
+
 (defn- checked-view-range-spec
   [buffer view spec direction]
   (let [view (bview/validate-view! view)
@@ -1182,6 +1199,25 @@
        (let [plans (plan-transfer-ranges sess entries direction)
              buffer-keys (set (map #(nth % 3) plans))
              allocation-ids (set (map #(get-in @sess [:allocations % :id]) buffer-keys))
+             footprint {:buffer-keys buffer-keys
+                        :allocation-ids allocation-ids
+                        :resident-buffers (mapv first plans)}
+             unwitnessed-graphs (->> (:events @sess)
+                                    (keep (fn [[event-id entry]]
+                                            (when (and (= :graph (:kind entry))
+                                                       (= :pending (:status entry))
+                                                       (nil? (:buffer-keys entry)))
+                                              event-id)))
+                                    vec)
+             _ (when (seq unwitnessed-graphs)
+                 (throw (ex-info "in-flight kernel graph has no resident footprint"
+                                 {:reason :transfer-graph-footprint-missing
+                                  :events unwitnessed-graphs})))
+             conflicting-graphs (pending-resident-events (:events @sess) :graph footprint)
+             _ (when (seq conflicting-graphs)
+                 (throw (ex-info "transfer overlaps an in-flight kernel graph"
+                                 {:reason :transfer-pending-graph
+                                  :events conflicting-graphs})))
              values (mapv (fn [[buffer _ host]]
                             (if (= :upload direction) buffer host))
                           plans)
@@ -1203,7 +1239,7 @@
                  :retained-resources retained-resources
                  :buffer-keys buffer-keys
                  :allocation-ids allocation-ids
-                 :resident-buffers (mapv first plans)
+                 :resident-buffers (:resident-buffers footprint)
                  :value values})
          event)))))
 
@@ -1536,6 +1572,7 @@
                         :owned-view-buffers @owned-view-buffers
                         :temporary-buffers temporary-buffers
                         :buffer-keys buffer-keys
+                        :resident-footprint (binding-footprint sess external-bindings)
                         :resident-views (into {} (map (fn [[id binding]]
                                                         [id (:resident binding)]))
                                               external-bindings)
@@ -1621,6 +1658,10 @@
                       :prepareds @prepareds
                       :owned-view-buffers @owned-view-buffers
                       :temporary-buffers {}
+                      :resident-footprint (binding-footprint sess pointer-bindings)
+                      :resident-views (into {} (map (fn [[index binding]]
+                                                     [index (:resident binding)]))
+                                            pointer-bindings)
                       :outputs outputs
                       :profile? (boolean profile?)}
                old (get-in @sess [:kernel-graphs call-key])]
@@ -1864,7 +1905,7 @@
     (let [{:keys [device-id session-id closed? events]} @sess]
       (when closed?
         (throw (ex-info "cannot submit a kernel graph in a closed GPU session" {:handle handle})))
-      (let [{:keys [runtime-graph outputs execution-plan]}
+      (let [{:keys [runtime-graph outputs execution-plan resident-footprint]}
             (resolve-kernel-graph-entry sess handle)
             pending (some (fn [[_ entry]]
                             (when (and (= (:key handle) (:graph-key entry))
@@ -1874,16 +1915,28 @@
         (when pending
           (throw (ex-info "kernel graph already has an in-flight submission"
                           {:handle handle :event pending})))
+        (when (and (nil? resident-footprint)
+                   (some #(and (= :transfer (:kind %)) (= :pending (:status %)))
+                         (vals events)))
+          (throw (ex-info "kernel graph has no resident footprint for transfer ordering"
+                          {:reason :graph-resident-footprint-missing :handle handle})))
+        (let [transfers (pending-resident-events events :transfer resident-footprint)]
+          (when (seq transfers)
+            (throw (ex-info "kernel graph overlaps an in-flight transfer"
+                            {:reason :graph-pending-transfer :handle handle
+                             :events transfers}))))
         (let [backend-event ((rt-resolve device-id "submit-graph!") runtime-graph)
               event-id (random-uuid)
               queue (first (:queues execution-plan))
               event (->GPUEvent session-id event-id queue)]
           (swap! sess assoc-in [:events event-id]
-                 {:event event
-                  :graph-key (:key handle)
-                  :status :pending
-                  :backend-event backend-event
-                  :value outputs})
+                 (merge {:event event
+                         :kind :graph
+                         :graph-key (:key handle)
+                         :status :pending
+                         :backend-event backend-event
+                         :value outputs}
+                        resident-footprint))
           event)))))
 
 (defn run-kernel-graph!
