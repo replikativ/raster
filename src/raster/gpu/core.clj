@@ -575,20 +575,39 @@
          buffer)))))
 
 (defn free-buffer!
-  "Release a specific buffer registration. Raster frees it only when the allocation is owned."
+  "Release a specific buffer registration. Raster frees it only when the allocation is owned.
+   An unawaited transfer retains its resident buffers even when a nonblocking status query says
+   the device completed: awaiting establishes visibility and releases backend staging first."
   [sess key]
   (locking sess
-    (let [{:keys [device-id buffers allocations kernel-graphs]} @sess
+    (let [{:keys [device-id buffers allocations kernel-graphs events]} @sess
           bound-graphs (->> kernel-graphs
                             (keep (fn [[graph-key entry]]
                                     (when (some #(= key (:key %))
                                                 (vals (:resident-views entry)))
                                       graph-key)))
-                            vec)]
+                            vec)
+          allocation-id (get-in allocations [key :id])
+          pending-transfers (->> events
+                                 (keep (fn [[event-id entry]]
+                                         (when (and (= :transfer (:kind entry))
+                                                    (not= :complete (:status entry))
+                                                    (or (contains? (:buffer-keys entry) key)
+                                                        (and allocation-id
+                                                             (contains? (:allocation-ids entry)
+                                                                        allocation-id))
+                                                        (some #(identical? (get buffers key) %)
+                                                              (:resident-buffers entry))))
+                                           event-id)))
+                                 vec)]
       (when-let [buf (get buffers key)]
         (when (seq bound-graphs)
           (throw (ex-info "cannot release a buffer while a kernel graph holds one of its views"
                           {:key key :kernel-graphs bound-graphs})))
+        (when (seq pending-transfers)
+          (throw (ex-info "cannot release a buffer while an asynchronous transfer uses it"
+                          {:reason :buffer-pending-transfer :key key
+                           :events pending-transfers})))
         (when (= :owned (:ownership (get allocations key)))
           ((rt-resolve device-id "free-buffer!") buf))
         (swap! sess (fn [state]
@@ -1085,9 +1104,9 @@
   (let [device-id (:device-id @sess)
         plan (rt-resolve device-id "plan-range")]
     (mapv (fn [[key-or-view host spec]]
-            (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+            (let [{:keys [buffer view resident]} (resolve-resident-binding sess key-or-view)
                   spec (checked-view-range-spec buffer view spec direction)]
-              [buffer (plan buffer host spec direction) host]))
+              [buffer (plan buffer host spec direction) host (:key resident)]))
           entries)))
 
 (defn- transfer-ranges!
@@ -1161,6 +1180,8 @@
        ;; source/destination directly: successful submission transfers their close responsibility
        ;; to this event, and completion releases them exactly once.
        (let [plans (plan-transfer-ranges sess entries direction)
+             buffer-keys (set (map #(nth % 3) plans))
+             allocation-ids (set (map #(get-in @sess [:allocations % :id]) buffer-keys))
              values (mapv (fn [[buffer _ host]]
                             (if (= :upload direction) buffer host))
                           plans)
@@ -1180,6 +1201,9 @@
                  :submitted-ns submitted-ns
                  :submit-return-ns submit-return-ns
                  :retained-resources retained-resources
+                 :buffer-keys buffer-keys
+                 :allocation-ids allocation-ids
+                 :resident-buffers (mapv first plans)
                  :value values})
          event)))))
 
