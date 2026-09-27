@@ -681,20 +681,20 @@
 (defn- order-yields [order]
   (mapcat (fn [[kind value]]
             (case kind
-              :region (order-yields (:order value))
+              :region (concat (:yields value) (order-yields (:order value)))
               :branch (concat (:yields (:then value)) (:yields (:else value))
                               (order-yields (:order (:then value)))
                               (order-yields (:order (:else value))))
               nil))
           order))
 
-(defn- order-branch-results [order]
+(defn- order-results [order]
   (mapcat (fn [[kind value]]
             (case kind
-              :region (order-branch-results (:order value))
+              :region (concat (:results value) (order-results (:order value)))
               :branch (concat (:results value)
-                              (order-branch-results (:order (:then value)))
-                              (order-branch-results (:order (:else value))))
+                              (order-results (:order (:then value)))
+                              (order-results (:order (:else value))))
               nil))
           order))
 
@@ -709,7 +709,9 @@
                                        (update :locals #(mapv local-fn %))
                                        (update :order #(map-region-order % local-fn expression-fn
                                                                          store-offset loop-offset)))
-                             (contains? value :predicate) (update :predicate expression-fn))
+                             (contains? value :predicate) (update :predicate expression-fn)
+                             (contains? value :yields)
+                             (update :yields #(mapv expression-fn %)))
                    :branch (-> value
                                (update :predicate expression-fn)
                                (update :then
@@ -1502,22 +1504,26 @@
             (if (and (empty? (:locals left)) (empty? (:stores left))
                      (empty? (:loops left)) (empty? (region-order left)))
               right
-              ;; An ordinary nested region cannot export a carried result. Moving its locals
-              ;; before earlier effects would change checked/exceptional evaluation, so typed GPU
-              ;; admission deliberately declines that source shape for now.
-              (when-not (and (seq (:locals right)) (contains? right :result))
-                (let [store-offset (count (:stores left))
-                      loop-offset (count (:loops left))
-                      right-order (map-region-order (region-order right) identity
-                                                    store-offset loop-offset)
-                      continuation (if (seq (:locals right))
-                                     [[:region {:locals (:locals right) :order right-order}]]
-                                     right-order)]
-                  (cond-> {:locals (:locals left)
-                           :stores (into (:stores left) (:stores right))
-                           :loops (into (:loops left) (:loops right))
-                           :order (into (region-order left) continuation)}
-                    (contains? right :result) (assoc :result (:result right)))))))
+              (let [store-offset (count (:stores left))
+                    loop-offset (count (:loops left))
+                    right-order (map-region-order (region-order right) identity
+                                                  store-offset loop-offset)
+                    result-region? (and (seq (:locals right)) (contains? right :result))
+                    results (when result-region?
+                              (mapv (fn [result-dtype]
+                                      {:result (fresh-region-local-id!) :dtype result-dtype})
+                                    result-dtypes))
+                    continuation (if (seq (:locals right))
+                                   [[:region (cond-> {:locals (:locals right) :order right-order}
+                                               result-region?
+                                               (assoc :results results :yields (:result right)))]]
+                                   right-order)]
+                (cond-> {:locals (:locals left)
+                         :stores (into (:stores left) (:stores right))
+                         :loops (into (:loops left) (:loops right))
+                         :order (into (region-order left) continuation)}
+                  (contains? right :result)
+                  (assoc :result (if result-region? (mapv :result results) (:result right)))))))
           (retain-tree-types [tree reference-types]
             (let [retain #(retain-free-scalar-reference-types % reference-types)]
               (case (:kind tree)
@@ -2082,7 +2088,9 @@
                                                   :locals (vec locals)
                                                   :effects (rewrite (:effects region) inner-env path))
                                      (contains? region :predicate)
-                                     (update :predicate (partial substitute environment)))})
+                                     (update :predicate (partial substitute environment))
+                                     (contains? region :yields)
+                                     (update :yields #(mapv (partial substitute inner-env) %)))})
 
                         (:branch effect)
                         (let [branch (:branch effect)
@@ -2209,16 +2217,16 @@
         order (region-order region)
         analysis-locals (vec (concat locals (order-locals order)))
         loop-region-locals (vec (mapcat #(order-locals (:order %)) (loop-tree loops)))
-        branch-results (vec (concat (order-branch-results order)
-                                    (mapcat #(order-branch-results (:order %))
-                                            (loop-tree loops))))
+        ordered-results (vec (concat (order-results order)
+                                     (mapcat #(order-results (:order %))
+                                             (loop-tree loops))))
         local-types (into (into (into (assoc scalar-types index :long)
                                      (map (juxt :id :dtype)) analysis-locals)
                                 (keep (fn [{:keys [result result-dtype]}]
                                         (when result [result result-dtype]))) stores)
                           (concat (map (fn [loop] [(:index loop) :long]) (loop-tree loops))
                                   (map (juxt :id :dtype) loop-region-locals)
-                                  (map (juxt :result :dtype) branch-results)))]
+                                  (map (juxt :result :dtype) ordered-results)))]
     (when (and (or (seq stores) (seq loops))
                (every? (fn [{:keys [lower extent carries]}]
                          (or (empty? carries)
@@ -2387,7 +2395,7 @@
             carry-bindings (set (mapcat #(mapcat (juxt :parameter :result) (:carries %))
                                         all-effect-loops))
             effect-result-bindings (set (keep :result all-stores))
-            branch-result-bindings (set (map :result branch-results))
+            ordered-result-bindings (set (map :result ordered-results))
             iteration-order (when ordered?
                               (if (or (some #(= :ordered (:effect-conflict %)) all-stores)
                                       (not (ordered-effects-safe?
@@ -2408,7 +2416,7 @@
             io (update (extract-io (list* 'do analysis-values) index destinations)
                        :scalars set/difference (set (map :id all-locals))
                        (set (map :index all-effect-loops)) carry-bindings
-                       effect-result-bindings branch-result-bindings)
+                       effect-result-bindings ordered-result-bindings)
             results (if (= :buffer host-return)
                       [symbol]
                       (mapv #(effect-result-id id %) (range (count destinations))))
@@ -2431,15 +2439,20 @@
                 :else {:locals (get-in value [:else :locals])
                        :effects (project-order (get-in value [:else :order]))
                        :yields (get-in value [:else :yields])}}})
+            project-region
+            (fn [value project-order]
+              {:region (cond-> {:locals (:locals value)
+                                :effects (project-order (:order value))}
+                         (contains? value :predicate)
+                         (assoc :predicate (:predicate value))
+                         (seq (:results value))
+                         (assoc :results (:results value) :yields (:yields value)))})
             project-loop
             (fn project-loop [loop path]
               (letfn [(project-order [order]
                         (mapv (fn [[kind value]]
                                 (case kind
-                                  :region {:region (cond-> {:locals (:locals value)
-                                                           :effects (project-order (:order value))}
-                                                    (contains? value :predicate)
-                                                    (assoc :predicate (:predicate value)))}
+                                  :region (project-region value project-order)
                                   :branch (project-branch value project-order)
                                   :store (store-effect (get stores-by-path
                                                             (conj path :store value)))
@@ -2459,10 +2472,7 @@
             ordered-effects ((fn project [order]
                                (mapv (fn [[kind value]]
                                        (case kind
-                                         :region {:region (cond-> {:locals (:locals value)
-                                                                  :effects (project (:order value))}
-                                                           (contains? value :predicate)
-                                                           (assoc :predicate (:predicate value)))}
+                                         :region (project-region value project)
                                          :branch (project-branch value project)
                                          :store (store-effect (nth stores value))
                                          :loop (nth loop-effects value))) order)) order)]
@@ -4722,15 +4732,21 @@
                                      (arm-form (:then branch))
                                      (arm-form (:else branch))))
           (if-let [region (:region effect)]
-            (let [locals (mapv (fn [{:keys [id dtype init]}]
-                                 (dialect/local-value id dtype
-                                                      (canonicalize-scalar-folds
-                                                       (transform init) dtype)))
-                               (:locals region))
+            (let [locals (mapv typed-local (:locals region))
                   effects (mapv effect-form (:effects region))]
-              (if (contains? region :predicate)
+              (cond
+                (seq (:results region))
+                (dialect/effect-result-region
+                 (:results region) locals effects
+                 (mapv (fn [result-spec expression]
+                         (canonicalize-scalar-folds
+                          (transform expression) (:dtype result-spec)))
+                       (:results region) (:yields region)))
+
+                (contains? region :predicate)
                 (dialect/effect-guard-region (transform (:predicate region)) locals effects)
-                (dialect/effect-lambda-region locals effects)))
+
+                :else (dialect/effect-lambda-region locals effects)))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower upper-bound extent carries]} (:loop effect)]
             (let [local-forms (mapv (fn [{:keys [id dtype init]}]

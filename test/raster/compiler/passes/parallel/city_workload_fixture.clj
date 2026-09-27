@@ -55,6 +55,19 @@
             (aset out i (+ a b))
             (recur (inc k) (+ a 2.0) b)))))))
 
+(deftm carried-steps-with-post-store-local!
+  [state :- (Array double), out :- (Array double), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [k 0 a 1.0 b 2.0]
+      (when (< k nc)
+        (aset state i (+ (aget state i) a))
+        (let [after (aget state i)]
+          (if (> after 0.0)
+            (do (aset out i (+ after b))
+                (recur (inc k) b after))
+            (do (aset out i (- after b))
+                (recur (inc k) after a))))))))
+
 (deftm two-exit-walk!
   [weights :- (Array double), targets :- (Array double), out :- (Array int),
    n :- Long, nc :- Long] :- Void
@@ -132,8 +145,8 @@
             (recur (int (inc e))))))
       (aset diary i (int -1)))))
 
-;; Literals are written out inside the kernels: a var reference, even a
-;; ^:const one, reaches the C emitter as a bare symbol (`earth_m`).
+;; Retain the original city's literal constants so this fixture stays comparable to its
+;; numerical anchor. Constant-var lowering has separate source-coverage tests.
 (deftm haversine-m
   "Great-circle metres between two lon/lat points in degrees; the atan2 form,
    which every backend has, equal to `world/haversine-m`'s asin form."

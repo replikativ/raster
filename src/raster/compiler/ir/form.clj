@@ -210,6 +210,11 @@
       (mapv (fn [ordinal] [1 :results ordinal :result])
             (range (count (:results (second effect)))))
 
+      (and (= 'effect-region (first effect)) (= 5 (count effect))
+           (vector? (:results (second effect))))
+      (mapv (fn [ordinal] [1 :results ordinal :result])
+            (range (count (:results (second effect)))))
+
       (and (= 'effect-loop (first effect))
            (vector? (:carries (second effect))))
       (mapv (fn [ordinal] [1 :carries ordinal :result])
@@ -481,10 +486,15 @@
         ;; An effect-region's result binders enter scope only after their effect initializer.
         ;; Nil binder slots retain intervening stores in the same sequential spine.
         :effect-region
-        (let [[_ locals effects result] form]
-          (when (and (contains? #{3 4} (count form)) (vector? locals) (vector? effects)
+        (let [result-scope? (= 5 (count form))
+              [_ attributes locals effects result]
+              (if result-scope? form (into [(first form) nil] (rest form)))]
+          (when (and (contains? #{3 4 5} (count form))
+                     (or (not result-scope?)
+                         (and (map? attributes) (vector? (:results attributes))))
+                     (vector? locals) (vector? effects)
                      (every? #(and (seq? %) (= 4 (count %)) (= 'let-value (first %))) locals))
-            (let [result? (= 4 (count form))
+            (let [result? (contains? #{4 5} (count form))
               local-count (count locals)
               result-paths (mapv effect-result-paths effects)
               widths (mapv #(max 1 (count %)) result-paths)
@@ -512,7 +522,9 @@
                                                        (vec effect)
                                                        (map vector paths (drop offset binders))))))
                                     offsets result-paths)]
-                 (apply rl form 'effect-region locals' effects' (when result? body))))})))
+                 (if result-scope?
+                   (apply rl form 'effect-region attributes locals' effects' (when result? body))
+                   (apply rl form 'effect-region locals' effects' (when result? body)))))})))
 
         :effect-when
         (let [[_ predicate locals effects] form]

@@ -92,7 +92,8 @@
                                     [:ocl:0 opencl/opencl-fp64-available? opencl/opencl-skip!]]]
     (if-not @available?
       (skip! (str "carried effect branches on " device))
-      (doseq [kernel [#'city/branch-local-carried-steps! #'city/carried-steps-with-empty-arm!]
+      (doseq [kernel [#'city/branch-local-carried-steps! #'city/carried-steps-with-empty-arm!
+                     #'city/carried-steps-with-post-store-local!]
               nc [0 1 2 7]]
         (let [expected-state (double-array [-1 1 -1])
               expected (double-array [-77 -77 -77])

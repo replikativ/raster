@@ -88,9 +88,15 @@ or control node. Branch complete-write proofs conservatively decline; they do no
 writes without a coverage proof. Source recognition retains lexical `let`, sequential prefixes
 and binary branches until arm effects and the full recurrence tuple can be projected together.
 Every terminal recurrence proves the same unit step and arity. An arm may yield values without
-writing; the loop as a whole still requires recognized effects. A prefix effect followed by
-result-bearing locals that would escape an ordinary region currently declines, rather than
-hoisting those locals across effects. Early exit/recurrence mixtures also decline.
+writing; the loop as a whole still requires recognized effects. Lexical
+regions now have explicit typed results, so a prefix effect followed by local reads can yield the carry
+tuple without hoisting those reads across effects. This is an unguarded region with fresh exported
+binders, not an implicit escape of ordinary region locals or a synthetic always-true branch.
+Its host continuation and target SSA projections must preserve the same evaluation order.
+Early exit/recurrence mixtures remain a separate obligation.
+Canonical scope/validation and source tests pass (31 tests, 298 assertions); carried-branch
+replay, including the post-store local case, passes on OpenCL and Level Zero (96 assertions).
+The two duplicate source-order region projectors now share one field-preserving projector.
 The shared JVM effect builder accepts
 an explicit continuation and loop-body callback: recurrence stays inside the scope of exported
 effect results. Both host materialization routes use that one contract; a returned atomic value

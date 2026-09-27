@@ -71,8 +71,11 @@
   [region destination-parameters inherited-locals loops]
   (let [scoped (local-accesses (:locals region) destination-parameters inherited-locals loops)]
     (into (:accesses scoped)
-          (mapcat #(effect-accesses % destination-parameters (:locals scoped) loops)
-                  (:body-results region)))))
+          (concat
+           (mapcat #(effect-accesses % destination-parameters (:locals scoped) loops)
+                   (:body-results region))
+           (expressions-accesses (:effect-results region)
+                                 destination-parameters (:locals scoped) loops)))))
 
 (defn- effect-accesses
   [effect destination-parameters locals loops]

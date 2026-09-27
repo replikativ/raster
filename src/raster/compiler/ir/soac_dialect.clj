@@ -618,6 +618,7 @@
 
   (Effect [e :enforce]
           (effect-region [(?:* d)] [(?:+ e)])
+          (effect-region ?eba [(?:* d)] [(?:* e)] [(?:+ s)])
           (effect-when ?s:predicate [(?:* d)] [(?:+ e)])
           (effect ?sym:destination ?ec:conflict
                   ?s:destination-index ?s:predicate ?s:value)
@@ -782,6 +783,11 @@
       (effect-loop-form? value)
       (and (seq? value) (= 'effect-region (first value)) (= 3 (count value))
            (vector? (second value)) (vector? (nth value 2)))
+      (and (seq? value) (= 'effect-region (first value)) (= 5 (count value))
+           (effect-branch-attributes? (second value))
+           (vector? (nth value 2)) (vector? (nth value 3))
+           (vector? (nth value 4)) (seq (nth value 4))
+           (= (count (:results (second value))) (count (nth value 4))))
       (and (seq? value) (= 'effect-when (first value)) (= 4 (count value))
            (vector? (nth value 2)) (vector? (nth value 3)))
       (and (seq? value) (= 'effect-if (first value)) (= 5 (count value))
@@ -803,7 +809,12 @@
   [value]
   (cond
     (and (effect-form? value) (= 'effect-region (first value)))
-    {:region (lambda-parts (list 'lambda [] value))}
+    (if (= 5 (count value))
+      (let [[_ {:keys [results]} locals effects yields] value]
+        {:region (assoc (lambda-parts
+                         (list 'lambda [] (list 'effect-region locals effects yields)))
+                        :results results)})
+      {:region (lambda-parts (list 'lambda [] value))})
 
     (and (effect-form? value) (= 'effect-when (first value)))
     (let [[_ predicate locals effects] value]
@@ -881,7 +892,7 @@
                          (scheduled-effect-carries? (:effects (:then branch)))
                          (scheduled-effect-carries? (:effects (:else branch))))
                      (when-let [loop (or (:loop effect) (:region effect))]
-                       (or (seq (:carries loop))
+                       (or (seq (:carries loop)) (seq (:results loop))
                            (scheduled-effect-carries? (:effects loop)))))) effects)))
 
 (defn- effect-parts-contain?
@@ -977,6 +988,8 @@
                       (cond
                         (:branch effect)
                         (into types (map (juxt :result :dtype) (get-in effect [:branch :results])))
+                        (seq (get-in effect [:region :results]))
+                        (into types (map (juxt :result :dtype) (get-in effect [:region :results])))
                         (seq (get-in effect [:loop :carries]))
                         (into types (map (juxt :result :dtype) (get-in effect [:loop :carries])))
                         (:result effect) (assoc types (:result effect) (:result-dtype effect))
@@ -988,56 +1001,74 @@
                   (get-in (scalar-convert-parts expression) [:attributes :target-dtype]))
                 (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
                         dtype/dtype-for-scalar-tag)))
+          (result-names! [results bound owner]
+            (let [result-names (mapv :result results)
+                  result-dtypes (mapv :dtype results)]
+              (when-not (and (vector? results) (seq results)
+                             (every? #(= #{:result :dtype} (set (keys %))) results)
+                             (every? symbol? result-names)
+                             (= (count result-names) (count (distinct result-names)))
+                             (every? #{:int :long :float :double} result-dtypes)
+                             (empty? (set/intersection bound (set result-names))))
+                (fail "effect results require fresh typed scalar binders"
+                      {:owner owner :results results :scope bound}))
+              result-names))
+          (yield-scope! [locals effects yields results bound label]
+            (when-not (and (vector? locals) (vector? effects) (vector? yields)
+                           (= (count results) (count yields)))
+              (fail "effect result region must yield its declared result arity"
+                    {:region label :results results :yields yields}))
+            (let [after-effects (walk effects (locals! locals bound))
+                  known-types (into (into {} (map (juxt :id :dtype) locals))
+                                    (exported-result-dtypes effects))]
+              (doseq [[ordinal result expression] (map vector (range) results yields)]
+                (pure-closed! expression after-effects [:yield label ordinal])
+                (when-let [actual (known-expression-dtype expression known-types)]
+                  (when-not (= (:dtype result) actual)
+                    (fail "effect yield dtype disagrees with its result"
+                          {:region label :ordinal ordinal :result result
+                           :yield expression :actual-dtype actual}))))
+              after-effects))
           (walk [effects bound]
             (reduce
              (fn [bound effect]
                (if-let [branch (:branch effect)]
                  (let [{:keys [predicate results then else] :as branch} branch
-                       result-names (mapv :result results)
-                       result-dtypes (mapv :dtype results)
+                       result-names (result-names! results bound :branch)
                        arm-scope
                        (fn [arm label]
                          (when-not (= #{:locals :effects :yields} (set (keys arm)))
                            (fail "effect branch arms require canonical lexical fields"
                                  {:arm label :branch branch :fields (set (keys arm))}))
-                         (let [{:keys [locals effects yields]} arm]
-                           (when-not (and (vector? locals) (vector? effects) (vector? yields)
-                                          (= (count results) (count yields)))
-                             (fail "effect branch arms must yield the declared result arity"
-                                   {:arm label :results results :yields yields}))
-                           (let [after-effects (walk effects (locals! locals bound))
-                                 known-types (into (into {} (map (juxt :id :dtype) locals))
-                                                   (exported-result-dtypes effects))]
-                             (doseq [[ordinal result expression]
-                                     (map vector (range) results yields)]
-                               (pure-closed! expression after-effects
-                                             [:yield label ordinal])
-                               (when-let [actual (known-expression-dtype expression known-types)]
-                                 (when-not (= (:dtype result) actual)
-                                   (fail "effect branch yield dtype disagrees with its result"
-                                         {:arm label :ordinal ordinal :result result
-                                          :yield expression :actual-dtype actual}))))
-                             after-effects)))]
+                         (yield-scope! (:locals arm) (:effects arm) (:yields arm)
+                                       results bound label))]
                    (when-not (and (= #{:branch} (set (keys effect)))
                                   (= #{:predicate :results :then :else} (set (keys branch)))
-                                  (vector? results) (seq results)
-                                  (every? #(= #{:result :dtype} (set (keys %))) results)
-                                  (every? symbol? result-names)
-                                  (= (count result-names) (count (distinct result-names)))
-                                  (every? #{:int :long :float :double} result-dtypes)
-                                  (empty? (set/intersection bound (set result-names))))
+                                  (vector? results) (seq results))
                      (fail "effect branch results require fresh typed scalar binders"
                            {:branch branch :scope bound}))
                    (pure-closed! predicate bound :predicate)
                    (arm-scope then :then)
                    (arm-scope else :else)
                    (into bound result-names))
-               (if-let [region (:region effect)]
-                 (do
-                   (when (contains? region :predicate)
-                     (closed! (:predicate region) bound :predicate))
-                   (walk (:effects region) (locals! (:locals region) bound))
-                   bound)
+               (if-let [{:keys [locals effects results yields] :as region} (:region effect)]
+                 (if (seq results)
+                   (let [result-names (result-names! results bound :region)]
+                     (when-not (and (= #{:locals :effects :results :yields} (set (keys region)))
+                                    (vector? locals) (vector? effects) (vector? results)
+                                    (vector? yields) (= (count results) (count yields)))
+                       (fail "effect result region requires fresh typed results and aligned yields"
+                             {:region region :scope bound}))
+                     (yield-scope! locals effects yields results bound :region)
+                     (into bound result-names))
+                   (do
+                     (when-not (or (= #{:locals :effects} (set (keys region)))
+                                   (= #{:predicate :locals :effects} (set (keys region))))
+                       (fail "ordinary effect region has noncanonical fields" {:region region}))
+                     (when (contains? region :predicate)
+                       (closed! (:predicate region) bound :predicate))
+                     (walk effects (locals! locals bound))
+                     bound))
                (if-let [{:keys [index lower extent locals effects carries] :as loop} (:loop effect)]
                  (do
                    (when-not (and (set/subset? (set (keys loop))
@@ -1107,6 +1138,12 @@
   [locals effects yields]
   (list 'effect-region (vec locals) (vec effects) (vec yields)))
 
+(defn effect-result-region
+  "Construct an unguarded lexical ordered-effect region whose typed yield tuple is exported to
+   subsequent effects. The result declarations remain outside the region's local scope."
+  [results locals effects yields]
+  (list 'effect-region {:results (vec results)} (vec locals) (vec effects) (vec yields)))
+
 (defn effect-branch
   "Construct a canonical typed binary ordered-effect branch with phi-like scalar results."
   [results predicate then-arm else-arm]
@@ -1153,9 +1190,12 @@
                 :then (update (:then part) :effects #(mapv scheduled-effect %))
                 :else (update (:else part) :effects #(mapv scheduled-effect %))}}
       (:region part)
-      {:region (cond-> {:locals (:locals (:region part))
-                        :effects (mapv scheduled-effect (:body-results (:region part)))}
-                 (contains? part :predicate) (assoc :predicate (:predicate part)))}
+      (let [region (:region part)]
+        {:region (cond-> {:locals (:locals region)
+                          :effects (mapv scheduled-effect (:body-results region))}
+                   (contains? part :predicate) (assoc :predicate (:predicate part))
+                   (seq (:results region))
+                   (assoc :results (:results region) :yields (:effect-results region)))})
       loop
       (let [{:keys [locals body-results]} (lambda-parts lambda)]
         {:loop (cond-> {:index index :lower lower :extent extent :locals locals
@@ -1751,10 +1791,10 @@
                                            (into scope (map :id (:locals arm)))))
                          (into scope result-names))
                        (:region part)
-                       (let [{:keys [locals body-results]} (:region part)]
+                       (let [{:keys [locals body-results results]} (:region part)]
                          (validate-parts (mapv effect-parts body-results)
                                          (into scope (map :id locals)))
-                         scope)
+                         (into scope (map :result results)))
                        (:loop part)
                        (let [{loop-parameters :parameters loop-locals :locals
                               :keys [body-results] :as region}

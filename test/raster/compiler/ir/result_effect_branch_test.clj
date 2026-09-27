@@ -143,7 +143,7 @@
                            '(effect-region [] [] [0.0])))))))))
 
 (deftest lexical-result-reuse-lowers-to-unique-target-identities
-  (doseq [kind [:atomic :loop :branch :plain-loop]
+  (doseq [kind [:atomic :loop :branch :plain-loop :region]
           result-name ['ticket 'selected]]
     (let [arm (fn [value]
                 (dialect/result-effect-region
@@ -159,6 +159,10 @@
                                    (effect-region [] [(effect scratch :unique i true acc)] [acc])))
                     :plain-loop '(effect-loop {:index k :lower 0} 1
                                    (lambda [k] (effect-region [] [(effect scratch :unique i true 1.0)])))
+                    :region (dialect/effect-result-region
+                             [{:result result-name :dtype :float}]
+                             [(dialect/local-value 'value :float value)]
+                             [(list 'effect 'scratch :unique 'i true 'value)] ['value])
                     :branch (dialect/effect-branch
                              [{:result result-name :dtype :float}] true
                              (dialect/result-effect-region [] [(list 'effect 'scratch :unique 'i true value)] [value])
