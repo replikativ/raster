@@ -36,6 +36,15 @@ The backend entry must declare its memory space, coherence, slice ownership, tra
 capabilities, event behavior and physical-queue facts. Unsupported graph or async operations
 should fail explicitly; they must not silently become synchronous or fall back to OpenCL.
 
+`raster.gpu.core` currently resolves many historical runtime functions, including
+`invoke-registered-map-void-kernel` and `bind-registered-map-void-kernel`. These are **not**
+requirements for a new CUDA backend. The first gate uses the modern `KernelArtifact`,
+`KernelCall` and ordered ABI path: arena creation/close, resident buffer allocation/free,
+transfer, artifact registration, call binding, launch/completion and download. Add graph
+record/replay and asynchronous range batches at the subsequent gate. Where the public
+session layer still calls a legacy operation, report an unsupported-route diagnostic
+with its operation and backend; do not implement a second CUDA source compiler to satisfy it.
+
 ## Subsequent gates
 
 1. Ordered multi-kernel `KernelGraph` recording/replay with stable resident bindings,
