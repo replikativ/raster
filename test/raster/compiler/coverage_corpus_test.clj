@@ -130,6 +130,15 @@
            (:violation (first (coverage/ratchet-violations
                                {:vars [typed-row]} {:vars [host-row]})))))))
 
+(deftest new-compilation-errors-are-not-invisible-to-the-ratchet
+  (let [baseline {:vars [{:var 'existing :route :typed-soac :typed-validated true}]}
+        report {:vars [{:var 'existing :route :typed-soac :typed-validated true}
+                       {:var 'new-working :route :typed-soac :typed-validated true}
+                       {:var 'new-broken :route :error :error :unscheduled-effect-map}]}]
+    (is (= [{:var 'new-broken :violation :new-compilation-error
+             :error :unscheduled-effect-map :declines nil}]
+           (coverage/ratchet-violations baseline report)))))
+
 (deftest emitted-artifact-summary-does-not-change-the-portable-ratchet
   (let [rows [{:var 'a :dtype :float :route :typed-soac :typed-validated true :declines []
                :emission-declines 0 :emission {:routes {:kernel-body 2} :declines []}}

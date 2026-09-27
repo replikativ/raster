@@ -144,27 +144,32 @@
   "Ways in which `report` regressed against `baseline`.
 
    A var may not move to a worse route (typed → compatibility → scalar → error) and a validated
-   typed program may not lose its validation. New and removed vars are not violations, so the
-   corpus can grow and shrink without editing the baseline."
+   typed program may not lose its validation. New vars are admitted without a baseline edit
+   unless they fail compilation; removed vars do not violate the ratchet."
   [baseline report]
   (let [before (into {} (map (juxt :var identity)) (:vars baseline))]
     (vec
      (for [row (:vars report)
            :let [old (get before (:var row))]
-           :when old
+           :when (or old (= :error (:route row)))
            violation (cond-> []
-                       (> (get route-rank (:route row) 3) (get route-rank (:route old) 3))
+                       (and (nil? old) (= :error (:route row)))
+                       (conj {:var (:var row) :violation :new-compilation-error
+                              :error (:error row) :declines (:declines row)})
+
+                       (and old (> (get route-rank (:route row) 3)
+                                   (get route-rank (:route old) 3)))
                        (conj {:var (:var row) :violation :route-downgraded
                               :before (:route old) :after (:route row)
                               :declines (:declines row) :error (:error row)})
 
-                       (and (:typed-validated old) (not (:typed-validated row)))
+                       (and old (:typed-validated old) (not (:typed-validated row)))
                        (conj {:var (:var row) :violation :lost-typed-validation
                               :route (:route row)})
 
                        ;; an effect map that iterated independently may not start serializing
                        ;; or disappear from the typed program
-                       (and (:effect-orders old)
+                       (and old (:effect-orders old)
                             (or (> (get-in row [:effect-orders :sequential] 0)
                                    (get-in old [:effect-orders :sequential] 0))
                                 (< (get-in row [:effect-orders :independent] 0)
