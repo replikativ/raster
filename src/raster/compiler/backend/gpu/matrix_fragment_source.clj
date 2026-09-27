@@ -169,8 +169,8 @@
 
 (defn emit-matrix-kernel
   "Emit the direct fragment subset for a verified body.
-   HIP is a source-only candidate requiring the separately pinned rocWMMA compile environment;
-   it is not admitted by matrix-target or advertised as a runtime-supported artifact."
+   HIP requires the separately pinned rocWMMA compile environment and a gfx90a code target.
+   Matrix-target may package this source in a verified artifact; Raster still has no HIP runtime."
   [kernel-name kernel-body target]
   (let [dialect (fragment-dialect! target)
         plan (matrix-plan/analyze kernel-body)

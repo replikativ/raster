@@ -634,6 +634,50 @@
             {:ok false :reason (:missing-rule (ex-data exception)) :detail (ex-data exception)}
             (throw exception)))))))
 
+(defn plan-matrix-for-node
+  "Admit an explicitly requested matrix instruction through the graph/body certificate.
+
+   The target descriptor chooses the instruction and tile; the typed contraction fixes the
+   arithmetic, storage and output. A decline is an error for this explicit schedule, never a
+   silent portable fallback."
+  [node graph contract-facts descriptor {:keys [precision matrix-tiles]}]
+  (if (not= :mixed-f16-f32 precision)
+    {:ok false :reason :matrix-numerical-policy}
+    (let [tiles (if (vector? matrix-tiles)
+                  matrix-tiles
+                  (hardware/gemm-tile-candidates descriptor))
+          attempts (mapv #(plan-matrix-body contract-facts descriptor %
+                                            {:operation-id (get-in node [:operation :id])})
+                         tiles)
+          planned (or (first (filter :ok attempts))
+                      {:ok false :reason :no-legal-matrix-tile
+                       :declines (mapv #(select-keys % [:reason :detail :matrix :tile])
+                                       attempts)})]
+      (if-not (:ok planned)
+        planned
+        (let [kernel-body (:body planned)
+              dimensions (get-in kernel-body [:attributes :dimension-values])
+              arguments (mapv (fn [{:keys [id role]}]
+                                (if (= :dimension role) (get dimensions id) id))
+                              (:parameters kernel-body))
+              scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
+              scheduled (scheduled-body/make
+                         {:source (:operation node) :body kernel-body :arguments arguments
+                          :scalar-bindings (scheduled-body/derive-scalar-bindings
+                                            kernel-body arguments scalar-types)
+                          :effects {:kind :pure-contraction
+                                    :uses (scheduled-body/derive-uses kernel-body arguments)}
+                          :legality {:kind :matrix-instruction-tiling
+                                     :tile (:tile planned)
+                                     :instruction (get-in planned [:tile :matrix])}
+                          :numerics {:mode :reassociated :policy :tiled-contraction
+                                     :rounding :nearest-even :accumulator-dtype :float}
+                          :attributes {:strategy :matrix
+                                       :out-elems (apply * (map second
+                                                              (:free-axes contract-facts)))}})]
+          {:ok true :scheduled (scheduled-body/validate-against-node!
+                                scheduled node graph)})))))
+
 (defn schedule-for-node
   "Select a graph-certified body from a resolved public schedule.
 
@@ -652,6 +696,18 @@
         (if (:ok planned)
           (:scheduled planned)
           (throw (ex-info "explicit register-tiled contraction schedule is not legal"
+                          {:reason :kernel-graph-contraction-schedule
+                           :operation (get-in node [:operation :id])
+                           :strategy strategy :schedule-decline planned :fallback :none}))))
+
+      :matrix
+      (let [planned (plan-matrix-for-node
+                     node graph contract-facts descriptor
+                     {:precision (:precision schedule)
+                      :matrix-tiles (get-in schedule [:typed-contraction :matrix-tiles])})]
+        (if (:ok planned)
+          (:scheduled planned)
+          (throw (ex-info "explicit matrix contraction schedule is not legal"
                           {:reason :kernel-graph-contraction-schedule
                            :operation (get-in node [:operation :id])
                            :strategy strategy :schedule-decline planned :fallback :none}))))

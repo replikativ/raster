@@ -6,6 +6,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.cuda-codegen :as cuda-emit]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.hip-matrix-candidate-test :as hip-matrix-fixture]
             [raster.compiler.backend.gpu.indexed-attention :as indexed-attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
@@ -40,6 +41,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.ode.multilevel :as multilevel]
             [raster.dl.attention :as dl-attention]
@@ -256,6 +258,38 @@
                     :numerics {:mode :reassociated :policy :tiled-contraction
                                :rounding :nearest-even :accumulator-dtype :float}})]
     (body-target/emit-artifact kernel-name scheduled dialect)))
+
+(defn- typed-equation-matrix-artifact
+  "CI compiles the C-family source emitted from a scheduled TypedSOAC equation, not merely a
+   separately constructed matrix body. The synthetic target carries no runtime dependency."
+  [target]
+  (let [hip? (= :hip target)
+        subgroup (if hip? 64 32)
+        dialect (if hip? :hip :cuda)
+        descriptor {:device-type :gpu :backend target
+                    :matrix {:family (if hip? :mfma :mma)
+                             :m 16 :n 16 :k 16 :subgroup subgroup}
+                    :subgroup-size subgroup :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :shared-local-memory 65536}
+        target-device (keyword (str (name target) ":typed-matrix-compile-gate"))
+        source '(let* [step (raster.par/contract C [[i 128] [j 128]] [[k 64]]
+                                                 (raster.numeric/*
+                                                  (clojure.core/aget A (+ (* i 64) k))
+                                                  (clojure.core/aget B (+ (* k 128) j)))
+                                                 :out-dtype :float)]
+                      step)
+        array-types {'A :half 'B :half 'C :float}
+        scheduled (:form (pipeline/schedule-parallel-form
+                          source {:target-device target-device
+                                  :target-descriptor descriptor
+                                  :dtype :half :array-types array-types}))
+        emitted (program-c-family/emit-program
+                 (assoc scheduled :dialect :scheduled-parallel)
+                 {:target-device target-device :target-descriptor descriptor
+                  :target-dialect dialect :array-types array-types
+                  :schedule {:precision :mixed-f16-f32
+                             :typed-contraction {:strategy :matrix}}})]
+    (first (:kernels emitted))))
 
 (defn- outer-product-artifact
   [dialect]
@@ -814,9 +848,13 @@
                 (write-source! matrix-directory suffix "mfma-verified-contract"
                                (:source (verified-matrix-artifact
                                          "mfma_verified_contract"
-                                         (verified-direct-matrix-body :mfma) :hip)))]))
+                                         (verified-direct-matrix-body :mfma) :hip)))
+                (write-artifact! matrix-directory suffix "typed-equation-mfma"
+                                 (typed-equation-matrix-artifact :hip))]))
            (when (= :cuda target)
-             [(write-source!
+             [(write-artifact! directory suffix "typed-equation-mma"
+                               (typed-equation-matrix-artifact :cuda))
+              (write-source!
                directory suffix "matrix-uniform-epilogue"
                (cuda-emit/emit-matrix-kernel
                 "matrix_uniform_epilogue"

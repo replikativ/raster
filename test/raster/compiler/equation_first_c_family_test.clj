@@ -4,6 +4,7 @@
             [raster.arrays]
             [raster.compiler.compatibility-ledger-test :as ledger]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.core.hardware :as compiler-hardware]
             [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.pipeline :as pipeline]
@@ -38,6 +39,7 @@
 
 (def ^:private cuda-target :cuda:equation-first-source-test)
 (def ^:private hip-target :hip:equation-first-source-test)
+(def ^:private hip-matrix-target :hip:equation-first-matrix-test)
 (def ^:private ocl-target :ocl:equation-first-source-test)
 
 (use-fixtures
@@ -63,6 +65,16 @@
                      :max-workgroup-size 1024
                      :shared-local-memory 65536
                      :total-eus 60}})
+    (hardware/register-target-device!
+     hip-matrix-target
+     {:type :hip
+      :name "Synthetic gfx90a equation-first matrix target"
+      :capabilities {:gfx-arch :gfx90a
+                     :wavefront-size 64
+                     :subgroup-sizes [64]
+                     :max-workgroup-size 1024
+                     :shared-local-memory 65536
+                     :total-eus 110}})
     (hardware/register-target-device!
      ocl-target
      {:type :ocl
@@ -101,6 +113,56 @@
 
 (def ^:private register-tiled-schedule
   {:typed-contraction {:strategy :register-tiled}})
+
+(deftest explicit-matrix-schedule-emits-typed-equations-on-vendor-targets
+  (let [source
+        '(let* [step (raster.par/contract C [[i 128] [j 128]] [[k 64]]
+                                          (raster.numeric/*
+                                           (clojure.core/aget A (+ (* i 64) k))
+                                           (clojure.core/aget B (+ (* k 128) j)))
+                                          :out-dtype :float)]
+               step)
+        schedule {:precision :mixed-f16-f32
+                  :typed-contraction {:strategy :matrix}}
+        array-types {'A :half 'B :half 'C :float}]
+    (doseq [[target dialect instruction]
+            [[cuda-target :cuda "wmma::mma_sync"]
+             [hip-matrix-target :hip "rocwmma::mma_sync"]]]
+      (let [descriptor (compiler-hardware/descriptor-for target)
+            {:keys [form stats]}
+            (pipeline/schedule-parallel-form
+             source {:target-device target :target-descriptor descriptor
+                     :dtype :half :array-types array-types})
+            emitted (program-c-family/emit-program
+                     (assoc form :dialect :scheduled-parallel)
+                     {:target-device target :target-descriptor descriptor
+                      :target-dialect dialect :array-types array-types
+                      :schedule schedule})
+            artifact (first (:kernels emitted))
+            certificate (get-in artifact [:provenance :scheduled-operation])]
+        (is (= :typed-soac (:source-dialect stats)))
+        (is (= :matrix (get-in artifact [:attributes :strategy])))
+        (is (str/includes? (:source artifact) instruction))
+        (is (= artifact (scheduled-body/validate-artifact-projection!
+                         certificate artifact)))))
+    (let [descriptor (compiler-hardware/descriptor-for hip-target)
+          {:keys [form]} (pipeline/schedule-parallel-form
+                          source {:target-device hip-target :target-descriptor descriptor
+                                  :dtype :half :array-types array-types})]
+      (doseq [[policy expected]
+              [[:mixed-f16-f32 :no-legal-matrix-tile]
+               [:f32-scalar :matrix-numerical-policy]]]
+        (try
+          (program-c-family/emit-program
+           (assoc form :dialect :scheduled-parallel)
+           {:target-device hip-target :target-descriptor descriptor
+            :target-dialect :hip :array-types array-types
+            :schedule {:precision policy :typed-contraction {:strategy :matrix}}})
+          (is false "an ineligible explicit matrix schedule must fail before target emission")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :kernel-graph-contraction-schedule (:reason (ex-data exception))))
+            (is (= expected (get-in (ex-data exception) [:schedule-decline :reason])))
+            (is (= :none (:fallback (ex-data exception))))))))))
 
 (defn- fixed-contraction-site
   [target]

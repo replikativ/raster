@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Compile a Raster-generated candidate, not a prewritten rocWMMA GEMM. No GPU is required.
+# Compile Raster-generated verified MFMA artifacts, including the TypedSOAC equation route.
 set -euo pipefail
 
 if (( $# )); then
   sources=("$@")
 else
   sources=(gpu-compile-gates/hip-matrix/mfma-uniform-epilogue.hip
-           gpu-compile-gates/hip-matrix/mfma-verified-contract.hip)
+           gpu-compile-gates/hip-matrix/mfma-verified-contract.hip
+           gpu-compile-gates/hip-matrix/typed-equation-mfma.hip)
 fi
 for source_file in "${sources[@]}"; do
   test -s "$source_file"
