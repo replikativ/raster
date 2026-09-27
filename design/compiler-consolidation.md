@@ -192,6 +192,13 @@ fold-map-specific copies of this dtype check are removed, while their distinct e
 equivalence checks remain. Explicit matrix/packed-storage conversions still use separate typed
 buffers or value conversions; pointer reinterpretation is not an implicit exception to this rule.
 
+ScheduledKernelBody also retains ordered scalar preconditions in the existing checked
+launch/storage expression algebra. They refer to physical integral scalar parameters, including
+derived bindings, and precede target-specific requirements in the emitted artifact. The projection
+certificate rejects dropped or changed conditions. Existing graph/call preflight checks them
+before allocation or launch; no second guard interpreter is introduced. This supplies the missing
+admission boundary for a later explicitly requested dynamic tile, not automatic tile selection.
+
 Equation-first execution reporting now observes actual fixed graph bindings through the public
 compiled API. It shares compact executable descriptions with descriptor admission reports and
 does not infer precision from the requested policy. Loop carry variants are reported once per

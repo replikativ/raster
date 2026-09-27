@@ -1,8 +1,10 @@
 (ns raster.compiler.equation-artifact-test
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [boring.core :as boring]
+            [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
             [raster.runtime.hardware :as hardware])
@@ -67,6 +69,26 @@
            (equation-first/lower restored arguments)))
     (is (= (:payload-fingerprint envelope)
            (:payload-fingerprint (artifact/decode transport))))))
+
+(deftest scheduled-preconditions-round-trip-through-the-compiler-record-codec
+  (let [original (get-in @compilation [:kernels 0 :provenance :scheduled-operation])
+        parameter (first (filter #(and (= :scalar (:kind %))
+                                       (contains? #{:int :long} (:dtype %)))
+                                 (get-in original [:body :parameters])))
+        condition {:expression (:id parameter) :op :> :value 0}
+        conditioned (scheduled-body/validate!
+                     (assoc original :preconditions [condition]))
+        options {:profile :archival
+                 :registry (var-get #'artifact/compiler-record-registry)
+                 :on-unknown-record :error}
+        restored (#'artifact/restore-sequences
+                  (boring/decode
+                   (boring/encode (#'artifact/prepare-sequences conditioned) options)
+                   options))]
+    (is (some? parameter) "the fixture must retain its integral launch bound")
+    (is (= conditioned restored))
+    (is (= [condition] (:preconditions restored)))
+    (is (= restored (scheduled-body/validate! restored)))))
 
 (deftest envelope-authentication-fails-before-record-reconstruction
   (let [envelope (artifact/seal identity @compilation)]

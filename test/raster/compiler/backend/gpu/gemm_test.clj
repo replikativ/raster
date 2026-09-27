@@ -4,6 +4,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.intel-block-io :as block-io]
@@ -211,6 +212,28 @@
                                   (str/replace "int pk =" "long pk =")
                                   (str/replace "C[row*N+col]" "C[(long)row*(long)N+(long)col]")))
         "direct lowering preserves the oracle except for widened K and output arithmetic")))
+
+(deftest scheduled-matrix-preconditions-precede-target-requirements
+  (let [graph (dispatch/alternative (emitted :nn) :xmx-direct)
+        original (matrix-contract graph)
+        scheduled (artifact/attribute original :scheduled-kernel-body)
+        schedule-condition {:expression :k :op :>= :value 32}
+        conditioned (scheduled-body/validate!
+                     (assoc scheduled :preconditions [schedule-condition]))
+        emitted (kernel-body-target/emit-artifact
+                 "scheduled_matrix_preconditions" conditioned :opencl-intel)
+        target-conditions (:preconditions original)
+        expected (into [schedule-condition] target-conditions)]
+    (is (seq target-conditions)
+        "the fixture must exercise composition with Intel matrix requirements")
+    (is (= expected (:preconditions emitted)))
+    (is (= emitted
+           (scheduled-body/validate-artifact-projection! conditioned emitted)))
+    (doseq [changed [(assoc emitted :preconditions target-conditions)
+                     (assoc-in emitted [:preconditions 0 :value] 16)]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"target artifact differs from its embedded scheduled-body certificate"
+           (scheduled-body/validate-artifact-projection! conditioned changed))))))
 
 (deftest production-xmx-epilogue-is-part-of-the-certified-stage
   (let [tile (hardware/derive-gemm-tile {})
