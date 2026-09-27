@@ -718,6 +718,26 @@
                                 {:reason :link-output-lease-released})))
               result)))))))
 
+(defn execute-and-lease!
+  "Run one synchronous higher-level invocation and lease its resulting owned output boundary.
+
+   Checks ownership and existing leases before `invoke!` can write inputs or consume donations.
+   The callback must complete exactly one Link replay; the same lifetime lock covers invocation,
+   output projection, and lease acquisition. Returns {:result callback-result :lease Closeable}.
+   This does not expose or enable private temporary-storage reuse."
+  [executable operation invoke!]
+  (with-unleased-execution!
+   executable operation
+   (fn []
+     (require-owned-output-boundary! executable)
+     (let [before @(:completed-replays executable)
+           result (invoke!)]
+       (when-not (= (inc before) @(:completed-replays executable))
+         (throw (ex-info "leased invocation must complete exactly one linked replay"
+                         {:reason :link-leased-invocation-replay-count
+                          :before before :after @(:completed-replays executable)})))
+       {:result result :lease (output-lease! executable)}))))
+
 (defn run!
   "Replay synchronously and return resident output views. No host copies. Live output leases
    prevent replay until released."

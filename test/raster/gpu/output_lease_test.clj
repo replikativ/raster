@@ -147,3 +147,83 @@
       (compiled/close! compiled)
       (is (= 1 @releases))
       (is (= 1 @closes)))))
+
+(deftest compiled-invoke-lease-pins-device-values-and-preflights-ownership
+  (let [executable (executable)
+        compiled (compiled/map->Compiled
+                  {:executable executable :in-tree []
+                   :out-tree [{:key :out :node :out}] :donated {}
+                   :target :ocl:0 :live-outputs (atom nil)})
+        replays (atom 0)
+        frees (atom 0)]
+    (with-redefs-fn
+      {#'gpu/replay! (fn [& _] (swap! replays inc))
+       #'link/outputs (fn [_] {:out :resident-view})
+       #'link/output-values (fn [_] {:out :resident-view})
+       #'value/free! (fn [_] (swap! frees inc))
+       #'compiled/project-node (fn [& _] :device-result)}
+      (fn []
+        (with-open [lease (compiled/invoke-leased compiled {})]
+          (is (= {:out :device-result} @lease))
+          (is (= 1 @replays))
+          (is (= :link-output-lease-active
+                 (reason #(compiled/invoke-compiled compiled {}))))
+          (is (zero? @frees)))
+        (is (= 1 @frees) "closing the compiled lease invalidates its external wrapper")
+        (is (= :compiled-output-lease-released
+               (let [lease (compiled/invoke-leased compiled {})]
+                 (.close ^java.io.Closeable lease)
+                 (reason #(deref lease)))))
+        (is (= 2 @replays)))))
+  (let [executable (executable :borrowed true)
+        compiled (compiled/map->Compiled
+                  {:executable executable :in-tree []
+                   :out-tree [{:key :out :node :out}] :donated {}
+                   :live-outputs (atom nil)})
+        calls (atom 0)]
+    (with-redefs [gpu/replay! (fn [& _] (swap! calls inc))]
+      (is (= :link-output-lease-ownership
+             (reason #(compiled/invoke-leased compiled {}))))
+      (is (zero? @calls))))
+  (let [executable (executable)
+        compiled (compiled/map->Compiled
+                  {:executable executable :in-tree []
+                   :out-tree [{:key :leak :node :internal}] :donated {}
+                   :live-outputs (atom nil)})
+        calls (atom 0)]
+    (with-redefs [gpu/replay! (fn [& _] (swap! calls inc))]
+      (is (= :compiled-output-lease-boundary
+             (reason #(compiled/invoke-leased compiled {}))))
+      (is (zero? @calls)))))
+
+(deftest compiled-projection-and-lease-acquisition-are-atomic-against-replay
+  (let [executable (executable)
+        compiled (compiled/map->Compiled
+                  {:executable executable :in-tree []
+                   :out-tree [{:key :out :node :out}] :donated {}
+                   :target :ocl:0 :live-outputs (atom nil)})
+        entered (promise)
+        release (promise)]
+    (with-redefs-fn
+      {#'gpu/replay! (fn [& _] nil)
+       #'link/outputs (fn [_] {:out :resident-view})
+       #'link/output-values (fn [_] {:out :resident-view})
+       #'value/free! (fn [_] nil)
+       #'compiled/project-node (fn [& _] (deliver entered true) @release :device-result)}
+      (fn []
+        (let [invocation (future (compiled/invoke-leased compiled {}))]
+          (try
+            (is (= true (deref entered 5000 ::timeout)))
+            (let [racing (future (reason #(link/run! executable)))]
+              (is (= ::timeout (deref racing 100 ::timeout)))
+              (deliver release true)
+              (with-open [lease (deref invocation 5000 ::timeout)]
+                (is (= {:out :device-result} @lease))
+                (is (= :link-output-lease-active (deref racing 5000 ::timeout)))))
+            (finally (deliver release true))))))))
+
+(deftest leased-execution-requires-exactly-one-replay
+  (let [executable (executable)]
+    (is (= :link-leased-invocation-replay-count
+           (reason #(link/execute-and-lease! executable :test (fn [] :no-replay)))))
+    (is (zero? @(:output-leases executable)))))

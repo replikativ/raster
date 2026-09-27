@@ -161,5 +161,12 @@ through the Link API; `Compiled` guards its input donation and output-wrapper in
 the same lease lock before replay or close. It does **not** authorize private temporary reuse:
 callers can still inspect internal views and the session, and direct session mutation lies outside
 this lease. An opaque composition capability plus asynchronous event/AD-tape retention is required
-before a private
-resident-result executor can safely realize reuse while outputs escape.
+before a private resident-result executor can safely realize reuse while outputs escape.
+
+`Compiled/invoke-leased` now projects its ordinary external `DeviceArray` results and acquires
+the Link output lease in one locked invocation. Only declared LinkPlan outputs may be projected;
+ownership is rejected before input writes or donation, and exactly one completed replay is
+required. Closing the lease invalidates the returned wrappers, not the session-owned buffers. A
+real equation-first effect map on CPU OpenCL checks
+the value before release, rejects an intervening replay/close, and runs again after release.
+This still leaves the existing `Compiled` wrapper inspectable and makes no alias-reuse claim.
