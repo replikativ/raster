@@ -790,8 +790,25 @@
       {:body (list* 'do (butlast (rest form)))
        :updates (vec (drop 2 (last form)))}
 
-      (and (seq? form) (= 'do (first form)) (= 2 (count form)))
-      (split-trailing-recur-many (second form) index carry-count int-bounded?)
+      (and (seq? form) (= 'do (first form)) (<= 2 (count form))
+           (or (zero? carry-count) (= 2 (count form))))
+      (when-let [split (split-trailing-recur-many (last form) index carry-count int-bounded?)]
+        (update split :body #(with-meta (list* 'do (concat (butlast (rest form)) [%]))
+                              (meta form))))
+
+      ;; No value escapes either branch: removing their identical induction-only tails
+      ;; leaves exactly the existing ordered effect conditional. Carried branches need
+      ;; a value-yielding effect region; rebuilding their updates after the effects could
+      ;; re-read a changed predicate or evaluate a branch-local expression twice.
+      (and (zero? carry-count) (seq? form)
+           (contains? '#{if clojure.core/if} (first form)) (= 4 (count form)))
+      (let [[head predicate then else] form
+            then-split (split-trailing-recur-many then index carry-count int-bounded?)
+            else-split (split-trailing-recur-many else index carry-count int-bounded?)]
+        (when (and then-split else-split)
+          {:body (with-meta (list head predicate (:body then-split) (:body else-split))
+                   (meta form))
+           :updates []}))
 
       (and (seq? form) (form/let-head? (first form))
            (vector? (second form)) (<= 3 (count form)))
@@ -1223,11 +1240,15 @@
                                {:tag value-tag :raster.type/tag value-tag})
                              expression)))]
       (cond
-        ;; A branch may contain an ordered loop as well as direct stores. Flattening only its
-        ;; stores silently discards the loop (and every effect in it). Keep each branch's full
-        ;; source-order region under its guard, rebasing the inventory ordinals independently.
+        ;; Preserve complete branch regions for loops and multi-store lexical scopes. Only
+        ;; the single aligned store case below can project scoped locals into a value-if.
+        ;; Flattening inventories would discard loops or hoist branch-local computations.
         (and then-region else-region
-             (or (seq (:loops then-region)) (seq (:loops else-region))))
+             (or (seq (:loops then-region)) (seq (:loops else-region))
+                 (and (or (seq (:locals then-region)) (seq (:locals else-region)))
+                      (not (and aligned?
+                                (= 1 (count (:stores then-region))
+                                   (count (:stores else-region))))))))
         (let [then-stores (vec (:stores then-region))
               then-loops (vec (:loops then-region))
               else-stores (vec (:stores else-region))

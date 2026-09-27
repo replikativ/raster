@@ -76,6 +76,27 @@
                 '(let* [^floats p x] p)]]
     (is (nil? (#'frontend/typed-map-region body)))))
 
+(deftest induction-only-effect-branches-preserve-their-source-region
+  (let [split (ns-resolve 'raster.compiler.passes.parallel.typed-soac-frontend
+                          'split-trailing-recur-many)
+        source '(do (aset out i 1)
+                    (if (aget flags i)
+                      (let* [v 3] (aset out i v) (recur (inc k)))
+                      (do (aset out i 7) (recur (+ k 1)))))
+        result (split source 'k 0 false)]
+    (is (= [] (:updates result)))
+    (is (= '(do (aset out i 1)
+                (if (aget flags i)
+                  (let* [v 3] (do (aset out i v)))
+                  (do (aset out i 7))))
+           (:body result)))
+    (doseq [unsupported ['(if p (recur (inc k)) nil)
+                         '(if p (recur (inc k)) (recur (+ k 2)))
+                         '(if p (recur (inc k)) (recur (inc k) extra))]]
+      (is (nil? (split unsupported 'k 0 false))))
+    (is (nil? (split '(if p (recur (inc k) a) (recur (inc k) b)) 'k 1 false))
+        "carried branch results require a value-yielding effect region, not re-evaluation")))
+
 (deftest counted-store-loops-use-the-existing-effect-dialect
   (let [source '(let* [result (dotimes [i n]
                                (aset out i 1.0)
