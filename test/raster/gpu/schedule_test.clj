@@ -185,7 +185,7 @@
                                                 :strategy :indexed-segmented-reduction-reference}}}}})
                    [:segmented-weighted-reduction :strategy]))))
   (testing "typed contraction selectors are validated as persistent schedule data"
-    (doseq [strategy [:auto :portable :register-tiled]]
+    (doseq [strategy [:auto :portable :register-tiled :matrix]]
       (is (= strategy
              (get-in (sched/compilation-schedule
                       arc-desc {:schedule {:typed-contraction {:strategy strategy}}})
@@ -193,7 +193,7 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown typed contraction strategy"
                           (sched/feasible?
                            (sched/resolve (sched/derive-default nil arc-desc)
-                                          {:typed-contraction {:strategy :matrix}})
+                                          {:typed-contraction {:strategy :unknown}})
                            arc-desc)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"measured typed contraction selectors must map dispatch IDs"
