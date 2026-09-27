@@ -27,7 +27,7 @@
       (println "  [coverage] full report:" report-path)
       (doseq [row (coverage/residual-rows report)]
         (println "  [coverage] residual:"
-                 (pr-str (select-keys row [:var :route :error :declines]))))
+                 (pr-str (select-keys row [:var :route :error :admission-decline :declines]))))
       (testing "every var that took the typed route still does, and no var started failing"
         (is (empty? violations)
             (with-out-str
@@ -96,6 +96,23 @@
                              (pipeline/compile-gpu-program
                               #'pde/solve-fixed-step :ze:debug :dtype :double)
                              (catch clojure.lang.ExceptionInfo error error)))))))
+
+(deftest corpus-error-retains-the-specific-typed-admission-decline
+  (let [decline {:reason :sequential-effect-continuation
+                 :equation 1
+                 :message "row ownership was not proved"}]
+    (with-redefs [pipeline/show-pipeline
+                  (fn [& _]
+                    (throw (ex-info "effect map has no schedule"
+                                    {:reason :unscheduled-effect-map
+                                     :admission-decline decline})))]
+      (is (= {:route :error
+              :error :unscheduled-effect-map
+              :admission-decline decline}
+             (select-keys
+              (coverage/report-var #'attention/attn-prefill-softmax-windowed-head-major!
+                                   {:target-device :ocl:0 :dtype :float})
+              [:route :error :admission-decline]))))))
 
 (deftest unique-scatter-retains-independent-effect-ratchet-evidence
   (let [algorithm (list 'soac-program {}
