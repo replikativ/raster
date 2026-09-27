@@ -274,9 +274,10 @@
               (decline! :dense-row-major-operands
                         "register-tiled schedule requires a verified dense matrix product"
                         matrix-view)))
-        _ (when-not (= :nn (:variant matrix-view))
+        variant (:variant matrix-view)
+        _ (when-not (contains? #{:nn :nt} variant)
             (decline! :dense-row-major-operands
-                      "register-tiled schedule currently requires dense A(i,k) and B(k,j) operands"
+                      "register-tiled schedule currently requires dense A(i,k) with B(k,j) or B(j,k) operands"
                       matrix-view))
         {:keys [row col]} (:bindings matrix-view)
         [[i M] [j N]] free-axes
@@ -309,7 +310,7 @@
         runtime-scalars symbolic-dimensions
         runtime-scalar-values symbolic-dimensions
         row-shape [M K]
-        col-shape [K N]
+        col-shape (case variant :nn [K N] :nt [N K])
         out-shape [M N]
         row-layout (layout/row-major row-shape dtype)
         col-layout (layout/row-major col-shape dtype)
@@ -367,8 +368,15 @@
         col-stage-index 'register-b-index
         row-stage-row #(div % block-k)
         row-stage-col #(modulo % block-k)
-        col-stage-row #(div % block-n)
-        col-stage-col #(modulo % block-n)
+        ;; Traverse the physical RHS tile in its contiguous dimension, then transpose only the
+        ;; workgroup store for NT. The shared tile therefore remains canonical [K,N], so the
+        ;; multiply loop and its register microtile are independent of external storage layout.
+        col-stage-k (case variant
+                      :nn #(div % block-n)
+                      :nt #(modulo % block-k))
+        col-stage-n (case variant
+                      :nn #(modulo % block-n)
+                      :nt #(div % block-k))
         k-block 'register-k-block
         k-coordinate (fn [offset]
                        (add k-block (if (= :long k-index-dtype)
@@ -385,8 +393,8 @@
              (body/predicate :lt (k-coordinate (row-stage-col row-stage-index)) K)])
            (body/->Mask
             col-valid-mask
-            [(body/predicate :lt (k-coordinate (col-stage-row col-stage-index)) K)
-             (body/predicate :lt (add block-col (col-stage-col col-stage-index)) N)])]
+            [(body/predicate :lt (k-coordinate (col-stage-k col-stage-index)) K)
+             (body/predicate :lt (add block-col (col-stage-n col-stage-index)) N)])]
           (for [mm (range thread-m) nn (range thread-n)]
             (body/->Mask
              (keyword (str "register-store-" mm "-" nn))
@@ -464,11 +472,16 @@
          {:id "register-b" :buffer col :allocation col-allocation :dtype dtype
           :elements (* block-k block-n) :thread-id thread-id
           :workgroup-width workgroup-width
-          :row-coordinate col-stage-row :col-coordinate col-stage-col
+          :row-coordinate col-stage-k :col-coordinate col-stage-n
           :source-coordinates
           (fn [index]
-            [(k-coordinate (col-stage-row index))
-             (add block-col (col-stage-col index))])
+            (let [k-offset (col-stage-k index)
+                  n-offset (col-stage-n index)
+                  k-position (k-coordinate k-offset)
+                  n-position (add block-col n-offset)]
+              (case variant
+                :nn [k-position n-position]
+                :nt [n-position k-position])))
           :valid-mask col-valid-mask})
         outer-loop
         (body/->ForLoop
@@ -535,20 +548,23 @@
        :indices indices
        :masks masks
        :operations (into [outer-loop] stores)
-       :schedule (assoc tile :strategy :register-tiled)
+       :schedule (assoc tile :strategy :register-tiled :variant variant)
        :launch (launch/spec
                 {:workgroup-size [workgroup-by-col workgroup-by-row]
                  :group-count [(launch/ceil-div N block-n)
                                (launch/ceil-div M block-m)]
                  :shared-memory-bytes (:bytes memory-plan)})
-       :provenance {:dialect :kernel-body :operation-id operation-id}
+       :provenance {:dialect :kernel-body :operation-id operation-id
+                    :matrix-variant variant}
        :attributes {:kind :register-tiled-contraction
+                    :variant variant
                     :dims [M N K]
                     :int-coordinate-constraints coordinate-constraints
                     :axis-symbols [i j k]
                     :bindings (:bindings matrix-view)
                     :result-transform epilogue}})
      :bindings (:bindings matrix-view)
+     :variant variant
      :dims [M N K]
      :runtime-scalar-values runtime-scalar-values
      :output-count (or output-count (* M N))
