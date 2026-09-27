@@ -6,9 +6,10 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
-            [raster.compiler.ir.segmented-weighted-reduction :as swr]))
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-capability :as capability]))
 
-(declare lower-dynamic-reference)
+(declare lower-dynamic-reference lower-dynamic-score-reuse)
 
 (defn validate-plan!
   "Check the exact algebra and storage implemented by indexed reference/subgroup schedules.
@@ -118,14 +119,9 @@
     ;; Preserve that reference fallback while never emitting a zero-sized workgroup.
     (long (max 1 (min subgroup maximum)))))
 
-(defn- dynamic-reference-preconditions
-  [plan workgroup-x]
+(defn- dynamic-shape-preconditions
+  [plan]
   [{:expression 'n_entities :op :> :value 0}
-   ;; IndexBinding is int on every C-family target. Casts to long happen after group/lane
-   ;; arithmetic, so even masked tail coordinates must fit the original int domain.
-   {:expression 'n_entities :op :<= :value (inc (long Integer/MAX_VALUE))}
-   {:expression (launch/align-up 'total_dim workgroup-x)
-    :op :<= :value (inc (long Integer/MAX_VALUE))}
    {:expression 'n_edges :op :>= :value 0}
    {:expression 'total_dim :op :> :value 0}
    {:expression 'n_heads :op :> :value 0}
@@ -140,6 +136,18 @@
    {:expression 'output_elements :op :<=
     :value (quot Long/MAX_VALUE (dtype/bytes-of (:accumulator-dtype plan)))}
    {:expression 'n_edges :op :<= :value (quot Long/MAX_VALUE (dtype/bytes-of :long))}])
+
+(defn- dynamic-reference-preconditions
+  [plan workgroup-x]
+  (let [[positive-entities & remaining] (dynamic-shape-preconditions plan)]
+    ;; Retain the existing reference certificate ordering, including in serialized artifacts.
+    (into [positive-entities
+           ;; IndexBinding is int on every C-family target. Casts to long happen after group/lane
+           ;; arithmetic, so even masked tail coordinates must fit the original int domain.
+           {:expression 'n_entities :op :<= :value (inc (long Integer/MAX_VALUE))}
+           {:expression (launch/align-up 'total_dim workgroup-x)
+            :op :<= :value (inc (long Integer/MAX_VALUE))}]
+          remaining)))
 
 (defn- validate-plan-storage-against-graph!
   [plan kernel-graph]
@@ -162,13 +170,8 @@
                            :actual actual})))))
     kernel-graph))
 
-(defn schedule-reference-for-node
-  "Bind the portable indexed reference body to one exact SWR semantic graph node.
-
-   This constructs no graph and emits no target source. The caller owns the semantic graph; this
-   function proves the selected KernelBody's source identity, storage effects/dtypes, scalar
-   closure, launch obligations and evaluation policy against that independently built graph."
-  [plan node kernel-graph descriptor]
+(defn- schedule-context
+  [plan kernel-graph]
   (let [plan (validate-plan! plan)
         kernel-graph (->> kernel-graph graph/validate!
                           (validate-plan-storage-against-graph! plan))
@@ -188,14 +191,26 @@
       (throw (ex-info "indexed reference requires int64 public shape scalars"
                       {:reason :indexed-reference-public-scalar-dtype
                        :required :long :actual non-long-leaves})))
-    (let [workgroup-x (dynamic-reference-workgroup-x descriptor)
-          kernel-body (lower-dynamic-reference plan workgroup-x)
-          physical-values (mapv (fn [{:keys [value]}]
+    (let [physical-values (mapv (fn [{:keys [value]}]
                                   (if (= :int (launch/typed-expression-dtype value scalar-types))
                                     (body/index-cast value :long :exact)
                                     value)) fields)
           arguments (into (conj (swr/ordered-input-ids plan) (get-in plan [:output :id]))
-                          physical-values)
+                          physical-values)]
+      {:plan plan :graph kernel-graph :scalar-types scalar-types
+       :arguments arguments :physical-values physical-values})))
+
+(defn schedule-reference-for-node
+  "Bind the portable indexed reference body to one exact SWR semantic graph node.
+
+   This constructs no graph and emits no target source. The caller owns the semantic graph; this
+   function proves the selected KernelBody's source identity, storage effects/dtypes, scalar
+   closure, launch obligations and evaluation policy against that independently built graph."
+  [plan node kernel-graph descriptor]
+  (let [{:keys [plan graph scalar-types arguments physical-values]}
+        (schedule-context plan kernel-graph)
+        workgroup-x (dynamic-reference-workgroup-x descriptor)
+        kernel-body (lower-dynamic-reference plan workgroup-x)
           scheduled
           (scheduled-body/make
            {:source plan
@@ -220,7 +235,59 @@
                          :optimization-tier :reference
                          :out-elems (nth physical-values 5)
                          :dynamic-shape? true}})]
-      (scheduled-body/validate-against-node! scheduled node kernel-graph))))
+    (scheduled-body/validate-against-node! scheduled node graph)))
+
+(defn schedule-score-reuse-for-node
+  "Certify the existing subgroup body against an independently built semantic graph.
+
+   This constructs a target-admitted candidate, not a numerical-policy selection: the caller must
+   authorize reassociation before choosing it. No source recognition, graph construction, target
+   emission or default-route change occurs here."
+  [plan node kernel-graph descriptor]
+  (let [{:keys [status width reason data]} (capability/score-reuse plan descriptor)
+        _ (when-not (= :supported status)
+            (throw (ex-info "indexed subgroup schedule is not supported by this target"
+                            (assoc data :reason reason))))
+        _ (when (> width Integer/MAX_VALUE)
+            (throw (ex-info "indexed subgroup width exceeds the lane coordinate domain"
+                            {:reason :indexed-subgroup-width :width width})))
+        {:keys [plan graph scalar-types arguments physical-values]}
+        (schedule-context plan kernel-graph)
+        kernel-body (lower-dynamic-score-reuse plan width)
+        scheduled
+        (scheduled-body/make
+         {:source plan :body kernel-body :arguments arguments
+          :scalar-bindings (scheduled-body/derive-scalar-bindings
+                            kernel-body arguments scalar-types)
+          :preconditions
+          (into (dynamic-shape-preconditions plan)
+                ;; Each group index is int, but component and address arithmetic starts after
+                ;; widening to long. Bound the three group coordinates, not the padded feature.
+                [{:expression 'n_entities :op :<= :value (inc (long Integer/MAX_VALUE))}
+                 {:expression 'n_heads :op :<= :value (inc (long Integer/MAX_VALUE))}
+                 {:expression (launch/ceil-div 'n_components width)
+                  :op :<= :value (inc (long Integer/MAX_VALUE))}
+                 ;; The inactive lanes still form feature/tail-start in signed int64 arithmetic.
+                 {:expression 'total_dim :op :<= :value (- Long/MAX_VALUE (dec width))}])
+          :effects {:kind :segmented-weighted-reduction-subgroup
+                    :uses (scheduled-body/derive-uses kernel-body arguments)}
+          :legality {:kind :indexed-edge-list-subgroup-score-reuse
+                     :plan-id (:id plan) :algebra-key (swr/algebra-key plan)
+                     :membership :edge-list-by-destination :duplicate-policy :multiset
+                     :required-subgroup-size width}
+          :numerics {:mode :reassociated
+                     :policy :subgroup-dot-ordered-edge-accumulation
+                     :accumulator-dtype (:accumulator-dtype plan)
+                     :rounding :implementation-defined}
+          :provenance {:dialect :kernel-body
+                       :source-dialect :segmented-weighted-reduction
+                       :algebra-plan-id (:id plan)
+                       :lowering :indexed-score-reuse-kernel-body}
+          :attributes {:strategy :indexed-segmented-reduction-subgroup-score-reuse
+                       :optimization-tier :subgroup
+                       :out-elems (nth physical-values 5)
+                       :dynamic-shape? true}})]
+    (scheduled-body/validate-against-node! scheduled node graph)))
 
 (defn- lit [value type] (body/literal value type))
 (defn- expr [op type & arguments] (body/scalar-expression op type arguments))

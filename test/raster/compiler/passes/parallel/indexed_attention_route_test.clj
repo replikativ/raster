@@ -207,6 +207,17 @@
       (is (= [:reduce :broadcast]
              (mapv :kind (filter #(= "Collective" (some-> % class .getSimpleName)) operations)))))))
 
+(deftest score-reuse-emission-uses-the-admitted-normalized-width
+  (let [{:keys [artifact schedule]}
+        (route/route-dynamic-score-reuse
+         (plan) {:device-type :gpu
+                 :vendor "Intel"
+                 :execution {:preferred-subgroup-size 32
+                             :subgroup-sizes #{32}
+                             :max-workgroup-size 256}})]
+    (is (= [32 1 1] (:workgroup-size schedule)))
+    (is (str/includes? (:source artifact) "intel_reqd_sub_group_size(32)"))))
+
 (deftest score-reuse-decline-falls-through-to-reference
   (let [{:keys [leaf strategy]}
         (swr-route/route-dynamic!

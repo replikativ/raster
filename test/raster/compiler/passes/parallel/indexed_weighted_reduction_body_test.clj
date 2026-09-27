@@ -60,6 +60,78 @@
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
 
+(defn- subgroup-descriptor [width]
+  {:device-type :gpu :vendor "Intel" :subgroup-size width
+   :subgroup-sizes #{width} :max-workgroup-size 256})
+
+(deftest subgroup-certificate-shares-reference-storage-and-scalar-interface
+  (let [plan (plan)
+        source (source-graph plan)
+        node (first (:nodes source))
+        reference (indexed-body/schedule-reference-for-node plan node source {})
+        scheduled (indexed-body/schedule-score-reuse-for-node plan node source (subgroup-descriptor 16))]
+    (is (= (:arguments reference) (:arguments scheduled)))
+    (is (= (:scalar-bindings reference) (:scalar-bindings scheduled)))
+    (is (= (get-in reference [:effects :uses]) (get-in scheduled [:effects :uses])))
+    (is (= :reassociated (get-in scheduled [:numerics :mode])))
+    (is (= :subgroup-dot-ordered-edge-accumulation (get-in scheduled [:numerics :policy])))
+    (is (= :ordered-edge-list (get-in scheduled [:body :schedule :membership-traversal])))
+    (is (= 16 (get-in scheduled [:legality :required-subgroup-size])))
+    (is (= [16 1 1] (get-in (scheduled-body/realized-launch scheduled) [:workgroup-size])))
+    (is (= [(launch/ceil-div 'dk 16) (launch/runtime-value 'n-heads)
+            (launch/runtime-value 'n-nodes)]
+           (get-in (scheduled-body/realized-launch scheduled) [:group-count])))
+    (doseq [[dialect width] [[:opencl-intel 16] [:cuda 32] [:hip 64]]]
+      (let [scheduled (indexed-body/schedule-score-reuse-for-node
+                       plan node source (subgroup-descriptor width))
+            emitted (target/emit-artifact "indexed_subgroup" scheduled dialect)]
+        (is (= :reassociated (get-in emitted [:attributes :numerics :mode])))
+        (is (empty? (:temporaries emitted)))
+        (is (= emitted (scheduled-body/validate-artifact-projection! scheduled emitted)))))))
+
+(deftest subgroup-certificate-bounds-all-three-group-coordinates
+  (let [plan (plan)
+        source (source-graph plan)
+        scheduled (indexed-body/schedule-score-reuse-for-node
+                   plan (first (:nodes source)) source (subgroup-descriptor 16))
+        values {'n_entities 3 'n_edges 4 'total_dim 5 'n_heads 2
+                'n_components 2 'output_elements 15}
+        check #(precondition/check! (:preconditions scheduled) %)]
+    (is (true? (check values)))
+    (doseq [changed [{'n_entities 2147483649 'output_elements 10737418245}
+                     {'n_entities 1 'n_heads 2147483649 'n_components 1
+                      'total_dim 2147483649 'output_elements 2147483649}
+                     {'n_entities 1 'n_heads 1 'n_components 34359738369
+                      'total_dim 34359738369 'output_elements 34359738369}
+                     {'n_edges -1} {'output_elements 14}]]
+      (is (= :kernel-precondition-failed (reason #(check (merge values changed))))))
+    (is (true? (check {'n_entities 1 'n_edges 0 'n_heads 1 'n_components 34359738368
+                      'total_dim 34359738368 'output_elements 34359738368}))
+        "the final legal group coordinate is INT_MAX; component arithmetic is int64")
+    (is (thrown? ArithmeticException
+                 (check (assoc values 'n_heads Long/MAX_VALUE))))))
+
+(deftest subgroup-certificate-rejects-unproved-targets-and-interfaces
+  (let [plan (plan)
+        source (source-graph plan)
+        node (first (:nodes source))
+        descriptor (subgroup-descriptor 16)
+        schedule #(indexed-body/schedule-score-reuse-for-node plan node source %)]
+    (doseq [[changed expected]
+            [[{:vendor "NVIDIA"} :score-reuse-requires-intel-subgroup-dialect]
+             [{:device-type :cpu} :score-reuse-requires-gpu]
+             [{:subgroup-sizes #{8}} :score-reuse-subgroup-width-unsupported]
+             [{:max-workgroup-size 8} :score-reuse-invalid-subgroup-geometry]]]
+      (is (= expected (reason #(schedule (merge descriptor changed))))))
+    (let [source (source-graph plan :int)]
+      (is (= :indexed-reference-public-scalar-dtype
+             (reason #(indexed-body/schedule-score-reuse-for-node
+                       plan (first (:nodes source)) source descriptor)))))
+    (let [source (assoc-in source [:inputs 0 :elements] 1)]
+      (is (= :indexed-reference-graph-storage
+             (reason #(indexed-body/schedule-score-reuse-for-node
+                       plan (first (:nodes source)) source descriptor)))))))
+
 (deftest reference-schedule-certifies-an-independent-semantic-graph
   (let [plan (plan)
         source (source-graph plan)
