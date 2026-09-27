@@ -138,12 +138,12 @@
    `:include-paths` are explicit CUDA toolkit header directories, not inferred from a
    device descriptor; they participate in the caller's compilation cache key."
   [source kernel-name virtual-architecture & {:keys [include-paths] :or {include-paths []}}]
-  (when-not (and (string? source) (not (empty? source))
-                 (string? kernel-name) (not (empty? kernel-name))
+  (when-not (and (string? source) (seq source)
+                 (string? kernel-name) (seq kernel-name)
                  (string? virtual-architecture)
                  (re-matches #"compute_[0-9]+" virtual-architecture)
                  (vector? include-paths)
-                 (every? #(and (string? %) (not (empty? %))) include-paths))
+                 (every? #(and (string? %) (seq %)) include-paths))
     (throw (ex-info "invalid NVRTC compilation request"
                     {:kernel-name kernel-name :virtual-architecture virtual-architecture})))
   (with-open [arena (Arena/ofConfined)]
@@ -158,21 +158,21 @@
       (check! :create (invoke (:create @handles) program-pointer src name
                               (int (count c-headers)) header-pointer header-name-pointer))
       (try
-        (let [program (.get program-pointer ValueLayout/ADDRESS 0)]
-          (let [result (invoke (:compile @handles) program (int (count options)) option-pointer)
-                log (log-string arena program)]
-            (when-not (zero? (int result))
-              (throw (ex-info "NVRTC compilation failed"
-                              {:reason :nvrtc-compilation :kernel-name kernel-name
-                               :virtual-architecture virtual-architecture
-                               :error-code (int result) :log log})))
-            {:ptx (bytes-from-program arena program (:ptx-size @handles)
-                                      (:ptx @handles) :ptx)
-             :log log
-             :virtual-architecture virtual-architecture
-             :include-paths include-paths
-             :virtual-header-version virtual-header-version
-             :nvrtc-version (version)}))
+        (let [program (.get program-pointer ValueLayout/ADDRESS 0)
+              result (invoke (:compile @handles) program (int (count options)) option-pointer)
+              log (log-string arena program)]
+          (when-not (zero? (int result))
+            (throw (ex-info "NVRTC compilation failed"
+                            {:reason :nvrtc-compilation :kernel-name kernel-name
+                             :virtual-architecture virtual-architecture
+                             :error-code (int result) :log log})))
+          {:ptx (bytes-from-program arena program (:ptx-size @handles)
+                                    (:ptx @handles) :ptx)
+           :log log
+           :virtual-architecture virtual-architecture
+           :include-paths include-paths
+           :virtual-header-version virtual-header-version
+           :nvrtc-version (version)})
         (finally
           (check! :destroy (invoke (:destroy @handles) program-pointer)))))))
 
