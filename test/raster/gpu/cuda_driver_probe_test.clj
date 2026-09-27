@@ -8,6 +8,8 @@
 
 (deftest native-probe-classifies-physical-device-state
   (let [{:keys [status devices init-code driver-api-version]} (driver/probe)]
+    (when (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
+      (is (= :ready status) "a CUDA device is required for this test run"))
     (is (vector? devices))
     (case status
       :unavailable (is (empty? devices))
