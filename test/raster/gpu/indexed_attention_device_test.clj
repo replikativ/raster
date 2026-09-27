@@ -181,7 +181,9 @@
     (run-equation-first-case :ze:0)))
 
 (deftest equation-first-indexed-reference-replays-on-opencl
-  (if-not @device-probe/opencl-gpu-available?
+  ;; The reference body needs neither GPU-only features nor subgroup collectives. Exercise
+  ;; the same public path on the CPU OpenCL CI lane instead of incorrectly skipping it.
+  (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "equation-first indexed reference")
     (run-equation-first-case :ocl:0)))
 

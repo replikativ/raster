@@ -532,9 +532,9 @@
         calls (atom [])
         emit-graph segop-opencl/generate-kernel-graph]
     (with-redefs [segop-opencl/generate-kernel-graph
-                  (fn [graph & arguments]
-                    (swap! calls conj (apply hash-map arguments))
-                    (apply emit-graph graph arguments))]
+                  (fn [graph & {:as options}]
+                    (swap! calls conj options)
+                    (emit-graph graph options))]
       (program-opencl/emit-program scheduled options))
     (let [iteration-call
           (some #(when (= (:body scheduled-loop) (:scheduled-equation-body %)) %) @calls)]

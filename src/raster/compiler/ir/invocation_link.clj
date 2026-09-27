@@ -177,7 +177,10 @@
                                       (catch clojure.lang.ExceptionInfo error
                                         (if (contains? #{:invocation-link-shape-scalar
                                                          :invocation-link-shape-extent
-                                                         :invocation-link-shape-expression}
+                                                         :invocation-link-shape-expression
+                                                         :unbound-index-symbol
+                                                         :index-expression
+                                                         :launch-index-expression}
                                                        (:reason (ex-data error)))
                                           nil
                                           (throw error)))))
