@@ -1178,6 +1178,21 @@ Do not restore the old binder or use the tiny Raster block as evidence those ext
 The pretrained-rstr checkout inspected alongside it was `3b13ad42e7bf4c98e348cb779c28096848931ba0`;
 no sibling source or dependency was changed by this audit.
 
+2026-09-27 external-source probe, with both sibling checkouts left untouched: the locally cached
+pretrained-rstr `origin/main` at `7553e2c9365548ce7593dc87d353198a0cfe475f` was archived into
+temporary storage and loaded with Raster main `002abbf902f2ca8acce5bd3560e77aff3d884a51`
+as its local dependency. The real descriptor generator's Gemma-3-270m-shaped B=2 layer
+(`640×2048`, `:map-void`) compiled for `:ocl:0` to 29 resident `:map-void` stages and zero
+compiler allocations, without weights or device allocation. This verifies source acceptance for
+that exact external snapshot and the **descriptor** route only; it is not direct equation-first
+lowering, numerical replay, or performance evidence. The active pretrained working branch instead
+references `gqa-decode-attention-heads!`, presently found only in the dirty Raster root checkout,
+so testing that pair against released Raster main fails at namespace load before compilation.
+Separately, loading active `finetune.head-gpu` against this Raster main fails at
+`finetune/head_gpu.clj:308` because it still refers to removed `gpu/bind-program!`. Next external
+acceptance must migrate that adapter to public compiled artifacts/LinkPlans, then run its
+real-weight forward/VJP/update gates; do not revive the retired binder to make the import pass.
+
 The existing small `mse ∘ linear-nb` AD/SGD acceptance now executes through the direct equation-first
 compile/lower/LinkPlan boundary. Its legacy descriptor compilation assertion remains a compatibility
 check, but numerical validation uses two resident updates with CPU parity, per-replay state progress,
