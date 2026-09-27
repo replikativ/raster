@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.indexed-weighted-reduction-body
   "Target-neutral reference and subgroup schedules for indexed dense weighted reductions."
-  (:require [raster.compiler.core.layout :as layout]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -75,6 +76,8 @@
           (= [:long :long] (mapv :dtype [destination-indices source-indices]))
           (= [(:extent destination-axis) (:total-dim storage)] (:shape q))
           (= (:shape q) (:shape k) (:shape v) (:shape output))
+          (= [(:edges membership)] (:shape destination-indices) (:shape source-indices))
+          (every? swr/descriptor-shape-contract? (conj operands output))
           (= (:dtype q) (:dtype k) (:dtype v) (:dtype output) accumulator-dtype))
       (throw (ex-info "indexed edge-list leaf cannot preserve this reduction plan exactly"
                       {:reason :indexed-segmented-reduction-plan-unsupported
@@ -116,8 +119,13 @@
     (long (max 1 (min subgroup maximum)))))
 
 (defn- dynamic-reference-preconditions
-  []
+  [plan workgroup-x]
   [{:expression 'n_entities :op :> :value 0}
+   ;; IndexBinding is int on every C-family target. Casts to long happen after group/lane
+   ;; arithmetic, so even masked tail coordinates must fit the original int domain.
+   {:expression 'n_entities :op :<= :value (inc (long Integer/MAX_VALUE))}
+   {:expression (launch/align-up 'total_dim workgroup-x)
+    :op :<= :value (inc (long Integer/MAX_VALUE))}
    {:expression 'n_edges :op :>= :value 0}
    {:expression 'total_dim :op :> :value 0}
    {:expression 'n_heads :op :> :value 0}
@@ -128,7 +136,10 @@
     :op :<= :value 'total_dim}
    {:expression (launch/product 'n_entities 'total_dim)
     :op := :value 'output_elements}
-   {:expression 'output_elements :op :> :value 0}])
+   {:expression 'output_elements :op :> :value 0}
+   {:expression 'output_elements :op :<=
+    :value (quot Long/MAX_VALUE (dtype/bytes-of (:accumulator-dtype plan)))}
+   {:expression 'n_edges :op :<= :value (quot Long/MAX_VALUE (dtype/bytes-of :long))}])
 
 (defn- validate-plan-storage-against-graph!
   [plan kernel-graph]
@@ -161,8 +172,8 @@
         kernel-graph (->> kernel-graph graph/validate!
                           (validate-plan-storage-against-graph! plan))
         fields (dynamic-fields plan)
-        public-leaves (reduce into #{}
-                              (map (comp launch/expression-references :value)) fields)
+        public-leaves (into #{}
+                            (mapcat (comp launch/expression-references :value)) fields)
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
         non-long-leaves (into {}
                               (keep (fn [id]
@@ -178,8 +189,12 @@
                        :required :long :actual non-long-leaves})))
     (let [workgroup-x (dynamic-reference-workgroup-x descriptor)
           kernel-body (lower-dynamic-reference plan workgroup-x)
+          physical-values (mapv (fn [{:keys [value]}]
+                                  (if (= :int (launch/typed-expression-dtype value scalar-types))
+                                    (body/index-cast value :long :exact)
+                                    value)) fields)
           arguments (into (conj (swr/ordered-input-ids plan) (get-in plan [:output :id]))
-                          (map :value fields))
+                          physical-values)
           scheduled
           (scheduled-body/make
            {:source plan
@@ -187,7 +202,7 @@
             :arguments arguments
             :scalar-bindings (scheduled-body/derive-scalar-bindings
                               kernel-body arguments scalar-types)
-            :preconditions (dynamic-reference-preconditions)
+            :preconditions (dynamic-reference-preconditions plan workgroup-x)
             :effects {:kind :segmented-weighted-reduction-reference
                       :uses (scheduled-body/derive-uses kernel-body arguments)}
             :legality {:kind :indexed-edge-list-reference
@@ -202,7 +217,7 @@
                          :lowering :indexed-reference-kernel-body}
             :attributes {:strategy :indexed-segmented-reduction-reference
                          :optimization-tier :reference
-                         :out-elems (get-in fields [5 :value])
+                         :out-elems (nth physical-values 5)
                          :dynamic-shape? true}})]
       (scheduled-body/validate-against-node! scheduled node kernel-graph))))
 

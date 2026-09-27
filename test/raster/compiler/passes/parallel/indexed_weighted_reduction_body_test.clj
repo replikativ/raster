@@ -1,5 +1,7 @@
 (ns raster.compiler.passes.parallel.indexed-weighted-reduction-body-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
+            [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
@@ -77,7 +79,7 @@
     (is (= [(launch/ceil-div (launch/runtime-value 'emb-dim) 16)
             (launch/runtime-value 'n-nodes)]
            (get-in (scheduled-body/realized-launch scheduled) [:group-count])))
-    (is (= 8 (count (:preconditions scheduled))))
+    (is (= 12 (count (:preconditions scheduled))))
     (is (true? (precondition/check!
                 (:preconditions scheduled)
                 {'n_entities 3, 'n_edges 4, 'total_dim 5, 'n_heads 2,
@@ -90,8 +92,55 @@
     (is (thrown? ArithmeticException
                  (precondition/check!
                   (:preconditions scheduled)
-                  {'n_entities Long/MAX_VALUE, 'n_edges 4, 'total_dim 2, 'n_heads 1,
-                   'n_components 1, 'output_elements Long/MAX_VALUE})))))
+                  {'n_entities 3, 'n_edges 4, 'total_dim 5, 'n_heads Long/MAX_VALUE,
+                   'n_components 2, 'output_elements 15})))))
+
+(deftest reference-launch-bounds-cover-masked-tail-coordinates
+  (let [plan (plan)
+        source (source-graph plan)
+        scheduled (indexed-body/schedule-reference-for-node
+                   plan (first (:nodes source)) source {:subgroup-size 3})
+        values {'n_entities 1 'n_edges 0 'n_heads 1 'n_components 1}
+        check #(precondition/check! (:preconditions scheduled)
+                                    (assoc values 'total_dim % 'output_elements %))]
+    (is (true? (check 2147483646)))
+    (is (= :kernel-precondition-failed (reason #(check Integer/MAX_VALUE)))
+        "the logical bound fits int, but its padded group would evaluate INT_MAX+1")
+    (is (= :kernel-precondition-failed
+           (reason #(precondition/check!
+                     (:preconditions scheduled)
+                     (assoc values 'n_entities 2147483649
+                            'total_dim 1 'output_elements 2147483649)))))))
+
+(deftest static-dimensions-use-explicit-private-int64-bindings
+  (let [source-form (walk/postwalk-replace
+                     {'n-nodes 3 'n-edges 4 'dk 2 'emb-dim 5 'n-heads 2} (chain))
+        plan (first (recognize/recognize source-form :dtype :float :accumulator-dtype :float))
+        source (source-graph plan)
+        scheduled (indexed-body/schedule-reference-for-node
+                   plan (first (:nodes source)) source {})]
+    (is (empty? (:scalars source)))
+    (is (= [3 4 5 2 2 15]
+           (mapv #(launch/resolve-expression (constantly nil) %)
+                 (drop 6 (:arguments scheduled)))))
+    (is (every? #(= :long (:dtype %)) (:scalar-bindings scheduled)))
+    (is (some? (target/emit-artifact "static_indexed_reference" scheduled :opencl-portable)))))
+
+(deftest reference-certificate-survives-common-target-emission
+  (let [plan (plan)
+        source (source-graph plan)
+        scheduled (indexed-body/schedule-reference-for-node
+                   plan (first (:nodes source)) source {})]
+    (doseq [[dialect module] [[:opencl-portable :opencl-c] [:cuda :cuda-c] [:hip :hip-cpp]]]
+      (let [artifact (target/emit-artifact "indexed_reference" scheduled dialect)]
+        (is (= module (:target artifact)))
+        (is (= scheduled (get-in artifact [:provenance :scheduled-operation])))
+        (is (= (:arguments scheduled) (:arguments artifact)))
+        (is (= (:preconditions scheduled) (:preconditions artifact)))
+        (is (= artifact (scheduled-body/validate-artifact-projection! scheduled artifact)))
+        (is (= :scheduled-kernel-body-artifact-projection
+               (reason #(scheduled-body/validate-artifact-projection!
+                         scheduled (assoc-in artifact [:arguments 0] 'different-input)))))))))
 
 (deftest reference-schedule-rejects-unproved-representations-and-graph-drift
   (let [plan (plan)

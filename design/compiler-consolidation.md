@@ -190,6 +190,14 @@ through the existing `:result-storage` contract.
    lowering, used by static reference, dynamic reference, subgroup and backend entry points.
    Direct-lowering tests reject valid general plans with different score, weight or normalization
    algebra. Generic plan validity alone cannot authorize a specialized implementation.
+   The reference schedule now constructs a `ScheduledKernelBody` against an independently
+   supplied exact-plan graph: ordered pointer/scalar bindings, descriptor footprints, effects,
+   int-coordinate limits (including masked tails), checked shape products and byte capacities.
+   Literal dimensions are explicitly widened; public int32 shape leaves still decline rather
+   than acquiring an implicit conversion. The semantic equation/value validator is shared by
+   compilation stages, and C-family emission reads the verified graph scalar interface instead
+   of reconstructing it from operation families. This prerequisite is not yet public execution:
+   semantic graph construction, initialization coverage and equation-envelope integration remain.
 4. Generalize the existing executable slot to graph-or-dispatch. Each alternative must retain
    its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
    common arguments once and allocate only the selected alternative's scratch.

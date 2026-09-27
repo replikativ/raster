@@ -311,7 +311,8 @@
       (every? integer? dimensions) (reduce *' dimensions)
       :else (apply list 'clojure.core/* dimensions))))
 
-(defn- descriptor-shape-contract?
+(defn descriptor-shape-contract?
+  "Check that a buffer descriptor's declared element footprint matches its logical axes."
   [{:keys [shape elements]}]
   (= elements (shape-elements shape)))
 
