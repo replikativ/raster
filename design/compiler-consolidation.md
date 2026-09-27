@@ -222,6 +222,13 @@ through the existing `:result-storage` contract.
    boundary, select and preflight one before allocation, and keep the numerical policy in tuning
    identity. A graph strategy label by itself does not authorize a numerical substitution.
 
+   The reduction-specific `EmittedEquationDispatch` now groups independently validated emitted
+   equations behind one `KernelDispatch`. It requires the same semantic plan, physical result
+   mapping and complete-write proof for every candidate, an exact default, and an explicit set
+   of permitted numerical modes. This is a compiler IR contract, not yet a public equation call:
+   the enclosing program must still validate every candidate's host-scalar prefix, and runtime
+   binding must select and preflight a candidate before allocating its private storage.
+
 Invocation shape realization now reuses the graph's checked dimension-to-launch projection.
 The shared index algebra lives under compiler IR (the former pass namespace is removed), so
 materialization and linking do not interpret arbitrary source or guess types. Shape products are
