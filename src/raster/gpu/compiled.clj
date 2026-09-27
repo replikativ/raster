@@ -929,7 +929,7 @@
     (reset! live-outputs nil))
   c)
 
-(defn invoke-compiled
+(defn- invoke-compiled-unleased
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
      1. write each dynamic input (host upload, exact-view no-op, or device-to-device copy);
      2. consume exact resident donated values (donation-invalidation, §1.3);
@@ -992,6 +992,14 @@
       (when-let [live-outputs (:live-outputs c)]
         (reset! live-outputs (vec (vals out))))
       out)))
+
+(defn invoke-compiled
+  "Invoke a resident artifact under its linked lifetime guard. A live output lease rejects the
+   entire input/donation/replay/output-invalidation sequence before any of those effects run."
+  [^Compiled c inputs]
+  (gpu-link/with-unleased-execution!
+   (:executable c) :invoke-compiled
+   #(invoke-compiled-unleased c inputs)))
 
 ;; ================================================================
 ;; Inspection (§2.1) + lifecycle
@@ -1082,6 +1090,12 @@
    any still-live projected output values FIRST, so a `->host` on a value returned before close!
    fails loud (use-after-free) instead of copying from a zeMemFree'd segment (SIGSEGV/garbage)."
   [^Compiled c]
-  (invalidate-live-outputs! c)
-  (gpu-link/close! (:executable c))
+  (let [executable (:executable c)]
+    (locking (:lifetime-lock executable)
+      (if @(:closed? executable)
+        (invalidate-live-outputs! c)
+        (gpu-link/with-unleased-execution!
+         executable :compiled-close!
+         #(do (invalidate-live-outputs! c)
+              (gpu-link/close! executable))))))
   nil)

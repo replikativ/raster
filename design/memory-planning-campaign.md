@@ -151,3 +151,15 @@ retention (or a plan lacking the invocation certificate) preserves distinct stor
 the reason; it does not reject otherwise valid execution. Selected order, complete initialization,
 alias validation, nonescape and synchronous completion remain independent gates. Resident
 leases, escaped pullbacks and version-preserving copies remain separate obligations.
+
+The ordinary, inspectable `LinkedExecutable` now has an explicit synchronous output lease. A
+successful replay makes its owned outputs leaseable; replay, upload, write and close are serialized
+against live leases, and a failed replay or subsequent mutation invalidates the completed-result
+claim. Attached sessions and borrowed/external outputs decline. Releasing the lease permits the
+next replay; it is not a copy or an earlier-version snapshot. This protects output views used
+through the Link API; `Compiled` guards its input donation and output-wrapper invalidation under
+the same lease lock before replay or close. It does **not** authorize private temporary reuse:
+callers can still inspect internal views and the session, and direct session mutation lies outside
+this lease. An opaque composition capability plus asynchronous event/AD-tape retention is required
+before a private
+resident-result executor can safely realize reuse while outputs escape.

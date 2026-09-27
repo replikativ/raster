@@ -192,7 +192,8 @@
                      :graph-key :graph
                      :phases [:phase-0 :phase-1]
                      :allocation-keys [:allocation-0 :allocation-1]
-                     :closed? (atom false)})]
+                     :closed? (atom false)
+                     :lifetime-lock (Object.) :output-leases (atom 0)})]
     (with-redefs [gpu/release-recorded-graph!
                   (fn [_ graph]
                     (swap! calls conj [:graph graph])
@@ -228,7 +229,9 @@
                      :session ::session
                      :node-views {:destination resident}
                      :pending-inputs (atom #{:destination})
-                     :closed? (atom false)})
+                     :closed? (atom false)
+                     :lifetime-lock (Object.) :output-leases (atom 0)
+                     :output-ready? (atom false)})
         device-array (fn [buffer view]
                        (value/map->DeviceArray
                         {:buffer buffer :device :ze:0 :dtype :float :shape [4] :view view
