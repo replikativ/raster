@@ -87,6 +87,28 @@
                 (is (= (vec expected-state) (vec (value/->host (:state result)))))))
             (finally (compiled/close! live))))))))
 
+(deftest carried-branches-match-jvm-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-fp64-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "carried effect branches on " device))
+      (doseq [kernel [#'city/branch-local-carried-steps! #'city/carried-steps-with-empty-arm!]
+              nc [0 1 2 7]]
+        (let [expected-state (double-array [-1 1 -1])
+              expected (double-array [-77 -77 -77])
+              prepared (compiled/lower kernel [(aclone expected-state) (aclone expected) 3 nc]
+                                       {:compiler :equation-first :target device :dtype :double
+                                        :outputs '[state out]})
+              live (compiled/instantiate! prepared)]
+          (try
+            (dotimes [_ 2]
+              (kernel expected-state expected 3 nc)
+              (let [result (live {})]
+                (is (= (vec expected) (vec (value/->host (:out result))))
+                    (str kernel " " device " trips=" nc))
+                (is (= (vec expected-state) (vec (value/->host (:state result)))))))
+            (finally (compiled/close! live))))))))
+
 (deftest two-exit-search-matches-jvm-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-fp64-available? opencl/opencl-skip!]]]

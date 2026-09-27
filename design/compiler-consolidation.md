@@ -12,8 +12,9 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
 1. **Control and effects.** Preserve bindings, branch results, ordered effects and loop
    carries through the existing typed regions. Reuse scalar/product Fold and KernelBody
    control instead of adding recognizers with separate semantics. General effect-loop
-   carry tuples and pure branch-local exits/recurrences are implemented; effectful multiple
-   recurrence sites remain open. Accepted kernels must
+   carry tuples and pure branch-local exits/recurrences are implemented. Counted effect loops
+   admit multiple recurrence sites when every arm yields the full carry tuple and advances
+   the same verified unit step; early exits in effectful loops remain open. Accepted kernels must
    retain all effects; unknown legality produces a source-located decline.
 2. **One complete memory proof.** Follow `memory-planning-campaign.md`: join logical values,
    storage views, initialization, selected replay order, escape/AD retention and completion
@@ -73,20 +74,26 @@ Multi-store branch scopes use the existing guarded regions, including entry snap
 their stores can change the predicate. Source/JVM and public OpenCL/Level Zero replay oracles
 cover both arms, zero trips, and a mutable predicate; no new kernel node or emitter is needed.
 
-Several source recurrence sites with carried values remain open. The canonical effect dialect
-now has a typed result-bearing branch, rather than conditional updates reconstructed after
+Several source recurrence sites with carried values now use the canonical effect dialect's
+typed result-bearing branch, rather than conditional updates reconstructed after
 the effects. Each arm yields the same typed tuple after its effects; only fresh merged results
 escape. Lexical rebinding, validation, ownership reads, JVM projection and scheduling consume
 this contract. KernelBody uses its existing multi-result IfRegion/Yield, with no new emitter
 or control node. Branch complete-write proofs conservatively decline; they do not union arm
-writes without a coverage proof. Source recognition is the next extension, not yet enabled.
+writes without a coverage proof. Source recognition retains lexical `let`, sequential prefixes
+and binary branches until arm effects and the full recurrence tuple can be projected together.
+Every terminal recurrence proves the same unit step and arity. An arm may yield values without
+writing; the loop as a whole still requires recognized effects. A prefix effect followed by
+result-bearing locals that would escape an ordinary region currently declines, rather than
+hoisting those locals across effects. Early exit/recurrence mixtures also decline.
 The shared JVM effect builder accepts
 an explicit continuation and loop-body callback: recurrence stays inside the scope of exported
 effect results. Both host materialization routes use that one contract; a returned atomic value
 feeding the same loop's carry is covered without changing surface syntax or numeric policy.
 Canonical tests cover old-tuple swaps, branch-local loads, name collisions, predicate reads
 changed by stores, zero trips, and actual OpenCL execution. CUDA/HIP source emission is checked;
-native execution is not claimed. Early exits remain a separate contract.
+native execution is not claimed. Source/JVM and public OpenCL/Level Zero replay compare
+branch-local carried updates, a mutable predicate, an effect-empty arm, and zero trips.
 
 Source initialization retains a typed sequential local spine at the loop's effect position.
 All recurrence updates see the old tuple after the body effects and yield simultaneously.
