@@ -83,6 +83,7 @@
                       "portable contraction body requires at least one free axis"
                       {:segred-id (:id segred)}))
         dtype (dtype/canon (:dtype segred))
+        output-dtype (dtype/canon (or (:out-dtype contract-facts) dtype))
         ;; The product and accumulator of an integer contraction need an algebraic overflow
         ;; contract, not merely address-range facts.  No portable contract has been introduced
         ;; yet, so decline instead of assigning an arbitrary target integer behavior.
@@ -91,7 +92,13 @@
                       "portable integer contraction requires explicit product and accumulation overflow contracts"
                       {:dtype dtype :segred-id (:id segred)}))
         result-transform (:epilogue contract-facts)
-        result-region (scalar-region-lower/make-region result-transform)
+        ;; A declared result representation is independent of the reduction accumulator.
+        ;; Even without a user epilogue, close an identity region so the conversion is an
+        ;; explicit typed ScalarCompute rather than an implicit target-language store cast.
+        result-region (or (scalar-region-lower/make-region result-transform)
+                          (when-not (= output-dtype dtype)
+                            (body/->ScalarRegion ['segment-accumulator]
+                                                 'segment-accumulator [] output-dtype)))
         transform-operands (vec (:operands result-transform))
         transform-scalars (vec (:scalars result-transform))
         core-operand-ids (set (map :sym (:operands contract-facts)))
@@ -253,9 +260,9 @@
                         array :input storage-dtype [extent] :global
                         (layout/row-major [extent] storage-dtype) :operand)))
                    arrays)
-              [(body/->KernelParameter output (if destination-read? :inout :output) dtype
+              [(body/->KernelParameter output (if destination-read? :inout :output) output-dtype
                                        [segment-count] :global
-                                       (layout/row-major [segment-count] dtype) :result)]
+                                       (layout/row-major [segment-count] output-dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
               transform-operand-parameters
@@ -269,7 +276,7 @@
              result-region
              {:accumulator reduction-result
               :accumulator-dtype dtype
-              :store-dtype dtype
+              :store-dtype output-dtype
               :parameters parameter-map
               :coordinate-lower epilogue-coordinate-lower
               :predicate active-mask}))
@@ -330,7 +337,8 @@
                       :reduced-bound reduced-bound
                       :axis-symbols (cond-> (mapv :name segment-dims)
                                       reduced-index (conj reduced-index))
-                      :result-transform result-transform}})
+                      :result-transform result-transform
+                      :output-dtype output-dtype}})
        :arrays arrays
        :scalars scalars
        :output output

@@ -616,7 +616,11 @@
               :epilogue-scalars epilogue-scalars
               :fused-epilogue (boolean epilogue)
               :kernel-body (:body portable)
-              :dtype dtype :out-dtype dtype
+              :dtype dtype
+              :out-dtype (or (some (fn [slot]
+                                     (when (= :result (:role slot)) (:dtype slot)))
+                                   abi)
+                             dtype)
          ;; Values follow the emitter's scalar order; widths come only from its typed ABI.
               :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
               :out-elems nseg :dims [nseg]
@@ -1660,7 +1664,10 @@
              :scalar-args (descriptor-scalar-arguments (:abi dpas) (:dims dpas))
              :dims (:dims dpas)})
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel when enabled
-          (if register-tiled?
+          (if (and register-tiled?
+                   (or (nil? (:out-dtype contract-facts))
+                       (= (dtype/canon (:out-dtype contract-facts))
+                          (dtype/canon dtype))))
             (let [rt (sco/generate-register-tiled-kernel-body
                       contract-facts out-sym :operation-id operation-id :descriptor desc
                       :scalar-types scalar-types)
@@ -1685,8 +1692,12 @@
                              (:abi rt) (:runtime-scalar-values rt))
                :dims (:dims rt)})
             (do
-              (note! (decline :regtiled :schedule-family-disabled nil
-                              {:family :register-tiled}))
+              (note! (if register-tiled?
+                       (decline :regtiled :declared-output-dtype-not-lowered nil
+                                {:input-dtype dtype
+                                 :out-dtype (:out-dtype contract-facts)})
+                       (decline :regtiled :schedule-family-disabled nil
+                                {:family :register-tiled})))
               {::declines @acc}))))
       (catch clojure.lang.ExceptionInfo e
      ;; whichever tensorize leaf threw, record WHY and let the caller fall through. `decline-of`
