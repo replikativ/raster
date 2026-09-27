@@ -80,24 +80,9 @@
                  :c-name "source_indices" :role :source-indices)
       (kabi/slot (:id output) :output fp :c-name "output" :role :result)])))
 
-(defn- dynamic-fields
-  [plan]
-  (let [[destination-axis head-axis] (:segment-axes plan)
-        membership (:membership plan)
-        storage (:storage plan)
-        value (:value plan)
-        output-elements (klaunch/product (:extent destination-axis) (:total-dim storage))]
-    [{:name 'n_entities :c-name "n_entities" :value (:extent destination-axis)}
-     {:name 'n_edges :c-name "n_edges" :value (:edges membership)}
-     {:name 'total_dim :c-name "total_dim" :value (:total-dim storage)}
-     {:name 'n_heads :c-name "n_heads" :value (:extent head-axis)}
-     {:name 'n_components :c-name "n_components" :value (:components value)}
-     {:name 'output_elements :c-name "output_elements" :value output-elements}]))
-
 (defn- dynamic-workgroup-x
   [desc]
-  (long (max 1 (min (long (or (:subgroup-size desc) 16))
-                    (long (or (:max-workgroup-size desc) 256))))))
+  (indexed-body/dynamic-reference-workgroup-x desc))
 
 (defn- dynamic-abi
   [plan fields]
@@ -131,7 +116,7 @@
    argument so the staging path can allocate/read back without interpreting product forms."
   [plan desc]
   (let [plan (indexed-body/validate-plan! plan)
-        fields (dynamic-fields plan)
+        fields (indexed-body/dynamic-fields plan)
         values (mapv :value fields)
         [entities _ total-dim _ _ output-elements] values
         workgroup-x (dynamic-workgroup-x desc)
@@ -190,7 +175,7 @@
    edge-list ABI while removing the reference leaf's per-output score recomputation."
   [plan desc]
   (let [plan (indexed-body/validate-plan! plan)
-        fields (dynamic-fields plan)
+        fields (indexed-body/dynamic-fields plan)
         values (mapv :value fields)
         [entities _ _ heads components output-elements] values
         subgroup-size (score-reuse-subgroup-size desc)

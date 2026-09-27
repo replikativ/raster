@@ -11,7 +11,8 @@
   (:require [clojure.set :as set]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.core.util :as util]))
+            [raster.compiler.core.util :as util]
+            [raster.compiler.ir.abstract-value :as av]))
 
 (defrecord ScalarRegion [parameters body result-dtype])
 (defrecord Reduction [operator identity map-region])
@@ -300,6 +301,103 @@
 (defn ordered-input-ids
   [plan]
   (mapv :id (:operands (validate! plan))))
+
+(defn- shape-elements
+  [shape]
+  (let [dimensions (vec (remove #(= 1 %) shape))]
+    (cond
+      (empty? dimensions) 1
+      (= 1 (count dimensions)) (first dimensions)
+      (every? integer? dimensions) (reduce *' dimensions)
+      :else (apply list 'clojure.core/* dimensions))))
+
+(defn descriptor-shape-contract?
+  "Check that a buffer descriptor's declared element footprint matches its logical axes."
+  [{:keys [shape elements]}]
+  (= elements (shape-elements shape)))
+
+(defn- storage-contract?
+  [value {:keys [dtype elements] :as descriptor}]
+  (and (descriptor-shape-contract? descriptor)
+       value
+       (seq (:shape value))
+       (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape [elements]}))
+       (= elements (shape-elements (:shape value)))))
+
+(defn- plan-value-contract?
+  "Source arrays are flat contiguous values; the plan retains its mathematical axes. Accept that
+   exact flattening as well as the plan's own logical shape, not an arbitrary reshaped tensor."
+  [value {:keys [shape elements] :as descriptor}]
+  (and (or (= shape (:shape value)) (= [elements] (:shape value)))
+       (storage-contract? value descriptor)))
+
+(defn- runtime-value-ids
+  "The current protected marker transports only normalized shape scalars or integer literals.
+
+   Reject general expressions here: the plan carries no result dtype/effect certificate for them,
+   and admitting a call would recreate source inference inside the algorithm boundary."
+  [runtime-parameters]
+  (when (every? #(or (symbol? %) (integer? %)) runtime-parameters)
+    (vec (distinct (filter symbol? runtime-parameters)))))
+
+(defn- plan-scalar-references
+  "Scalar values used by the plan's shape/storage descriptors, excluding declared buffers and
+   scalar-region-local parameter names. Source/provenance are evidence, not executable dimensions."
+  [plan]
+  (let [buffer-ids (set (conj (ordered-input-ids plan) (get-in plan [:output :id])))
+        score (-> (:score plan)
+                  (dissoc :combine :finalize)
+                  (update :arguments
+                          #(mapv (fn [argument] (dissoc argument :parameter)) %)))
+        descriptors {:segment-axes (:segment-axes plan)
+                     :membership (:membership plan)
+                     :storage (:storage plan)
+                     :score score
+                     :value (:value plan)
+                     :operands (mapv #(select-keys % [:shape :elements]) (:operands plan))
+                     :output (select-keys (:output plan) [:shape :elements])}]
+    (set/difference (util/free-syms descriptors) buffer-ids)))
+
+(defn equation-boundary?
+  "Check the logical equation boundary around one already-validated generic SWR plan.
+
+   The plan names physical output storage. ProgramEquation names the fresh logical result, and its
+   ordinary result-storage attribute is the sole relation between those identities. This checks
+   semantic dataflow, not the equation's operation sequence: each compilation stage must separately
+   validate its typed, scheduled or emitted representation against the retained algorithm."
+  [values equation algorithm]
+  (when (plan? algorithm)
+    (let [plan (validate! algorithm)
+          input-descriptors (:operands plan)
+          output-descriptor (:output plan)
+          runtime-values (runtime-value-ids (:runtime-parameters plan))
+          runtime-value-set (set runtime-values)
+          expected-operands (vec (distinct
+                                 (concat (ordered-input-ids plan) runtime-values)))
+          results (:results equation)
+          storage [{:destination (:id output-descriptor)
+                    :access :write
+                    :host-return :buffer}]]
+      (and (some? runtime-values)
+           (set/subset? (plan-scalar-references plan) runtime-value-set)
+           (= expected-operands (:operands equation))
+           (= 1 (count results))
+           (not= (first results) (:id output-descriptor))
+           (= #{:memory/read :memory/write} (:effects equation))
+           (= storage (get-in equation [:attributes :result-storage]))
+           (every? (fn [{:keys [id] :as descriptor}]
+                     (plan-value-contract? (get values id) descriptor))
+                   input-descriptors)
+           (storage-contract? (get values (:id output-descriptor)) output-descriptor)
+           (plan-value-contract? (get values (first results)) output-descriptor)
+           (every? (fn [id]
+                     (let [value (get values id)]
+                       (and value (empty? (:shape value))
+                            (contains? #{:int :long}
+                                       (some-> (:dtype value) dtype/canon))
+                            (av/storage-contract-compatible?
+                             value (av/tensor {:dtype (:dtype value) :shape []})))))
+                   runtime-values)))))
 
 (defn runtime-parameter-values
   "Ordered dynamic scalar values transported by a protected reduction marker. These are semantic

@@ -14,7 +14,6 @@
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
-            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
@@ -28,21 +27,12 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :parallel-program-c-family))))
 
-(defn- scalar-types
-  [values operations]
-  (into {}
-        (map (fn [id]
-               (let [value (get values id)]
-                 (when-not value
-                   (fail! :c-family-parallel-scalar-value
-                          "scheduled scalar lacks an AbstractValue"
-                          {:value id}))
-                 [id (:dtype value)])))
-        (distinct (mapcat segop/operation-scalars operations))))
-
 (defn- emit-graph
-  [scheduled-graph values operations opts]
-  (let [types (scalar-types values operations)]
+  [scheduled-graph opts]
+  ;; Graph construction already projects and checks the logical scalar interface. Do not
+  ;; reconstruct a second interface by inspecting operation families at the target boundary.
+  (let [scheduled-graph (graph/validate! scheduled-graph)
+        types (into {} (map (juxt :id :dtype)) (:scalars scheduled-graph))]
     (segop-emission/generate-kernel-graph
      scheduled-graph
      :scalar-types (merge (:scalar-types opts) types)
@@ -96,9 +86,8 @@
       (control/loop-program? algorithm)
       (let [scheduled (schedule/validate! (first (:operations equation)))
             body (:body scheduled)
-            operations (vec (mapcat :operations (:equations body)))
             emitted (emit-graph
-                     (:graph scheduled) (:values body) operations
+                     (:graph scheduled)
                      (assoc opts
                             :scheduled-equation-algorithm
                             (control/body (:algorithm scheduled))
@@ -118,7 +107,7 @@
             ;; dataflow remains generic, but those schedule facts must survive to target lowering.
             operations (:operations equation)
             contraction-facts (contraction-facts-by-operation algorithm operations)
-            emitted (emit-graph graph (:values body) operations
+            emitted (emit-graph graph
                                 (cond-> (assoc opts
                                                :scheduled-equation-algorithm algorithm
                                                :scheduled-equation-body body)

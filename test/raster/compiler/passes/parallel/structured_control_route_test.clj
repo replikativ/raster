@@ -274,6 +274,13 @@
   (let [typed (swr-parallel-program)
         equation (first (:equations typed))]
     (is (= typed (route/validate-typed-program! typed)))
+    (is (swr/equation-boundary? (:values typed) (assoc equation :operations [])
+                              (:algorithm equation))
+        "the shared semantic boundary is independent of scheduled/emitted representation")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (route/validate-typed-program!
+                  (assoc-in typed [:equations 0 :operations] [])))
+        "typed admission must still require the exact typed operation")
     (is (swr/plan? (:algorithm equation)))
     (is (= '[x n width] (:operands equation)))
     (is (= '[result] (:results equation)))
