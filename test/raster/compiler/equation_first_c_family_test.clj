@@ -512,7 +512,14 @@
     (is (every? (fn [{:keys [storage public-output?]}]
                   (= (contains? (set escaped) storage) public-output?))
                 (vals (:compiler-values witness)))
-        "compiler value bindings agree with physical storage escape")))
+        "compiler value bindings agree with physical storage escape")
+    (is (every? #(true? (get-in % [:retention :physical-storage-escaped?]))
+                (filter #(and (:public-output? %)
+                              (not= :storage-only (get-in % [:definition :kind])))
+                        (vals (:compiler-values witness))))
+        "physical output retention does not pretend to identify an earlier logical version")
+    (is (every? #(contains? (:boundary-reasons %) :physical-output)
+                (keep (get-in witness [:value-versions :storage]) escaped)))))
 
 (deftest equation-first-rejects-explicit-host-orchestration-before-lowering
   (is (= :equation-first-host-only
@@ -608,7 +615,15 @@
     (is (invocation-link/certificate? (compiled/certificate functional)))
     (let [{:keys [compiler-buffer-bindings compiler-values memory value-versions]}
           (invocation-link/memory-witness (:lowering functional))]
-      (is (= :unproven value-versions))
+      (is (= :semantic-equation-read-before-write (:ordering value-versions)))
+      (is (= :unproven (:completion value-versions)))
+      (is (= :witnessed (:status value-versions)))
+      (is (every? #(not= :storage-only
+                         (get-in compiler-values [% :definition :kind]))
+                  (mapcat :versions (vals (:storage value-versions)))))
+      (is (every? #(map? (:retention %))
+                  (filter #(not= :storage-only (get-in % [:definition :kind]))
+                          (vals compiler-values))))
       (is (= (set (keys compiler-buffer-bindings)) (set (keys compiler-values))))
       (is (every? #(contains? (:values memory) %)
                   (vals compiler-buffer-bindings)))
@@ -667,6 +682,21 @@
              (:reason (reason-of #(invocation-link/certify
                                    plan (conj (:outputs plan) ::unknown-output)))))
           "an escaped identity must name storage in the validated plan"))))
+
+(deftest retention-requires-complete-call-binding-coverage
+  (let [prepared (compiled/lower #'c-family-elementwise [(float-array 8) 8]
+                                 {:compiler :equation-first :target cuda-target :dtype :float})
+        original (compiled/plan prepared)
+        bindings (get-in original [:attributes :compiler-buffer-bindings])]
+    (is (seq bindings))
+    (doseq [incomplete [{} (dissoc bindings (first (keys bindings)))]]
+      (let [changed (assoc-in original [:attributes :compiler-buffer-bindings] incomplete)
+            report (invocation-link/memory-witness (invocation-link/certify changed))]
+        (is (= :typed-invocation (get-in changed [:attributes :source])))
+        (is (= :unknown (get-in report [:value-versions :status])))
+        (is (some #(and (= :incomplete-compiler-buffer-bindings (:reason %))
+                        (seq (:missing %)))
+                  (get-in report [:value-versions :unknown])))))))
 
 (deftest trusted-equation-first-construction-derives-its-link-witness-once
   (compiled/clear-compilation-cache!)

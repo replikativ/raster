@@ -9,6 +9,17 @@
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
 
+(deftest physical-access-join-is-a-permission-union
+  (let [permissions {nil #{} :read #{:read} :write #{:write}
+                     :read-write #{:read :write}}
+        accesses (keys permissions)]
+    (doseq [a accesses b accesses]
+      (is (= (into (permissions a) (permissions b))
+             (permissions (kabi/merge-access a b)))))
+    (doseq [a accesses b accesses c accesses]
+      (is (= (kabi/merge-access a (kabi/merge-access b c))
+             (kabi/merge-access (kabi/merge-access a b) c))))))
+
 (def map-abi
   [(kabi/slot 'x :input :float :role :operand)
    (kabi/slot 'out :output :float :role :result)

@@ -10,6 +10,16 @@
 
 (def ^:private kinds #{:input :output :inout :scalar})
 
+(defn merge-access
+  "Join validated physical access permissions; nil means no access.
+   Read joined with write is read-write, never evidence of initialization or a full overwrite."
+  [left right]
+  (cond
+    (nil? left) right
+    (nil? right) left
+    (= left right) left
+    :else :read-write))
+
 (defn slot
   "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, :binding, :field, and
   :aliasing, and :alignment.

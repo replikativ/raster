@@ -133,3 +133,18 @@ sharing one storage identity still need a separate value-version/tape proof. In 
 the existing `Compiled` wrapper exposes its executable and cannot silently opt into private
 reuse. Resident leases, structured replay and AD tape lifetime integration remain open. This
 GPU-local proof does not supersede the JVM/source memory passes, so none is deleted on that claim.
+
+## Semantic value retention
+
+The invocation memory witness follows each semantic buffer definition through later equation
+uses. It distinguishes an equation's read phase from its result-write phase, retains observable
+storage through the call boundary, and excludes storage-only destination names from the set of
+semantic versions. The same ordinary use information covers values produced in a forward pass
+and consumed by generated backward equations; no separate AD tape-name registry is needed.
+
+This report is not a selected execution-order or completion certificate. Persistent public
+storage remains excluded from reuse, and unresolved mutations, partial writes, overlapping
+versions/views and structured control must remain explicit unknowns. Physical escape still does
+not identify which earlier mutable value a caller intended to retain. The allocator does not
+consume this observation yet; resident leases, escaped pullbacks and version-preserving copies
+remain separate obligations.
