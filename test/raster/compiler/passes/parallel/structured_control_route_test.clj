@@ -835,6 +835,9 @@
           :run! #(swap! events conj [:run %])
           :release! #(swap! events conj [:release %])})]
     (is (program-runtime/prepared-parallel-program? prepared))
+    (is (= :parallel-program-structured-execution-order
+           (reason-of #(program-runtime/execution-order
+                        prepared (fn [_] (throw (AssertionError. "must decline before visiting")))))))
     (program-runtime/run-prepared! prepared)
     (program-runtime/run-prepared! prepared)
     (is (= 4 (count (filter #(= :bind (first %)) @events))))

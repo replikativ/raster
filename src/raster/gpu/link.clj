@@ -780,15 +780,21 @@
           (:phases executable))))
 
 (defn execution-order
-  "Report the selected record-time prologue and per-replay kernel order of a linked descriptor.
+  "Report selected record-time prologue and per-replay kernel order of a linked executable.
    A source-order memory report alone cannot justify storage reuse when constant transforms are
    hoisted. This report does not attest completion, escape safety, or alias realization."
   [executable]
   (let [executable (ensure-live! executable :execution-order)]
-    (when (:prepared-program executable)
-      (throw (ex-info "equation-first execution-order reporting is not yet available"
-                      {:reason :link-program-execution-order-unsupported})))
-    (let [phases (:phases executable)
+    (if-let [prepared (:prepared-program executable)]
+      (let [plan (:plan executable)
+            instance-id (:id (first (:instances plan)))
+            annotate #(mapv (fn [entry] (assoc-in entry [:source :instance] instance-id)) %)]
+        (-> (parallel-program/execution-order
+             prepared #(gpu/kernel-graph-execution-order (:session executable) %))
+            (assoc :plan (:id plan) :target (:target plan))
+            (update :record-time-prologue annotate)
+            (update :per-replay annotate)))
+      (let [phases (:phases executable)
           sources (vec (for [instance (:instances (:plan executable))
                              [step-index _] (map-indexed vector
                                                          (get-in instance [:descriptor :steps]))]
@@ -808,7 +814,7 @@
             (assoc :plan (:id (:plan executable))
                    :target (:target (:plan executable)))
             (update :record-time-prologue #(mapv annotate %))
-            (update :per-replay #(mapv annotate %)))))))
+            (update :per-replay #(mapv annotate %))))))))
 
 (defn profile!
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready.

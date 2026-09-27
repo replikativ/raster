@@ -1803,6 +1803,19 @@
   [sess handle]
   (:execution-plan (resolve-kernel-graph-entry sess handle)))
 
+(defn kernel-graph-execution-order
+  "Report the actual serial recording of a bound emitted graph. Unlike descriptor recording,
+   this path records every prepared kernel for replay; it does not hoist constant transforms.
+   Selection/order is evidence only, not completion or permission to reuse exposed buffers."
+  [sess handle]
+  (when (:closed? @sess)
+    (throw (ex-info "cannot inspect a closed GPU session"
+                    {:reason :gpu-execution-order-closed})))
+  (let [entry (resolve-kernel-graph-entry sess handle)]
+    {:record-time-prologue []
+     :per-replay (mapv (fn [prepared] {:kernel-phase (:phase prepared)}) (:prepareds entry))
+     :completion :unproven}))
+
 (defn submit-kernel-graph!
   "Submit a bound graph without waiting and return a session-owned GPUEvent.
 

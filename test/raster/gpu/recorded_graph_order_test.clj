@@ -3,6 +3,19 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]))
 
+(deftest emitted-graph-order-reads-the-bound-recording
+  (let [handle (gpu/->KernelGraphHandle :emitted)
+        sess (atom {:closed? false :kernel-graphs
+                    {:emitted {:prepareds [{:phase :producer} {:phase :consumer}]}}})]
+    (is (= {:record-time-prologue []
+            :per-replay [{:kernel-phase :producer} {:kernel-phase :consumer}]
+            :completion :unproven}
+           (gpu/kernel-graph-execution-order sess handle)))
+    (swap! sess assoc :closed? true)
+    (is (= :gpu-execution-order-closed
+           (try (gpu/kernel-graph-execution-order sess handle)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest graph-order-separates-record-time-prologue-from-replay
   (let [calls (atom [])
         sess (atom {:device-id :ocl:0 :prepared
