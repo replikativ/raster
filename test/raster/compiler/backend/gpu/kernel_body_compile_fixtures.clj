@@ -207,6 +207,23 @@
      (:body planned) :target-dialect dialect
      :kernel-name-prefix "portable_contraction")))
 
+(defn- widened-contraction-artifact
+  "Compile the declared result representation, independent of the FP32 accumulator dtype."
+  [dialect]
+  (let [form '(raster.par/contract y [[i 4]] [[l 8]]
+                                   (raster.numeric/*
+                                    (aget A (+ (* i 8) l)) (aget x l))
+                                   :out-dtype :double)
+        verified (contraction-facts/contraction-facts form :dtype :float)
+        segred (contract-lower/contract-form->segred
+                form :dtype :float :facts verified)
+        planned (contraction-schedule/plan-portable-body verified segred nil)]
+    (when-not (:ok planned)
+      (throw (ex-info "widened portable contraction fixture did not schedule" planned)))
+    (segop-emit/generate-contraction-kernel-body
+     (:body planned) :target-dialect dialect
+     :kernel-name-prefix "widened_contraction")))
+
 (defn- verified-direct-matrix-body
   "Cross-vendor source gate starts at the same verified tensor contraction, not a hand-built body."
   [family]
@@ -614,6 +631,8 @@
                             (reduction-artifact dialect))
            (write-artifact! directory suffix "portable-contraction"
                             (contraction-artifact dialect descriptor))
+           (write-artifact! directory suffix "widened-contraction-result"
+                            (widened-contraction-artifact dialect))
            (write-artifact! directory suffix "outer-product"
                             (outer-product-artifact dialect))
            (write-artifact! directory suffix "map-independent-capacities"

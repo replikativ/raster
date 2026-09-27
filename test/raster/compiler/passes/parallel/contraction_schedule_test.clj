@@ -143,17 +143,31 @@
     (is (= :float (result-type (:abi routed))))
     (is (re-find #"__global float\* restrict C" (:source routed)))
     (is (= :float (result-type (get-in routed [:artifact :abi])))))
-  (testing "unsupported leaves decline instead of quietly writing half output"
-    (doseq [[form options]
-            [[(concat (matrix-form 128 128 24) [:out-dtype :float]) []]
-             [(concat (matrix-form 128 128 128) [:out-dtype :float])
-              [:candidate-families [:register-tiled]]]
-             [(concat (matrix-form 128 128 128) [:out-dtype :double]) []]]]
-      (try
-        (apply route/route-contraction form :dtype :half options)
-        (is false "an unsupported output conversion must not select a half-typed fallback")
-        (catch clojure.lang.ExceptionInfo error
-          (is (= :contraction-output-dtype-not-lowered (:reason (ex-data error)))))))))
+  (testing "portable fallback converts the declared result after the scalar reduction"
+    (doseq [[form expected]
+            [[(concat (matrix-form 128 128 24) [:out-dtype :float]) :float]
+             [(concat (matrix-form 128 128 128) [:out-dtype :double]) :double]]]
+      (let [routed (route/route-contraction form :dtype :half)
+            kernel (:kernel-body routed)]
+        (is (= :portable-segred (:strategy routed)))
+        (is (= expected (:out-dtype routed)))
+        (is (= expected (:dtype (first (filter #(= :result (:role %))
+                                               (:abi routed))))))
+        (is (= expected (:dtype (first (filter #(= :result (:role %))
+                                               (:parameters kernel))))))
+        (is (some #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                       (= :cast (get-in % [:expression :op]))
+                       (= expected (get-in % [:expression :result-type])))
+                  (:operations kernel)))
+        (is (= :kernel-body (artifact/emission-route (:artifact routed)))))))
+  (testing "a register-only schedule does not fabricate a result conversion"
+    (try
+      (route/route-contraction
+       (concat (matrix-form 128 128 128) [:out-dtype :float])
+       :dtype :half :candidate-families [:register-tiled])
+      (is false "a register-only route cannot lower the declared output conversion")
+      (catch clojure.lang.ExceptionInfo error
+        (is (= :no-legal-contraction-family (:reason (ex-data error))))))))
 
 (deftest matrix-fragment-boundaries-are-a-legality-policy
   (testing "K=24 meets the old 16-byte pitch test but cannot form a final K16 instruction"

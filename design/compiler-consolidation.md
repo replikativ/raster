@@ -16,6 +16,11 @@ at verified contraction facts; HIP remains an explicitly source-only, pinned roc
 The public flat contraction route still admits only DPAS emission, and the typed program
 route's mixed-precision matrix alternatives are Intel-specific. Those are the next routing
 obligations, not evidence that a public CUDA/HIP GEMM is already available.
+The portable scalar contraction now separates its reduction dtype from a declared result
+storage dtype. A typed post-reduction cast supplies the fallback ABI for widened results;
+the register-tiled leaf declines this case until it can preserve the same contract. This is
+needed before vendor matrix alternatives can join one semantic dispatch rather than each
+inventing an incompatible result buffer.
 
 ## Completion order
 
