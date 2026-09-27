@@ -1,14 +1,32 @@
 (ns raster.compiler.ir.emitted-equation-dispatch-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.gpu.indexed-attention-device-test :as indexed-fixture]
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
+
+(def ^:private artifact-identity
+  {:semantic-request-fingerprint "equation-dispatch-request"
+   :compiler-build-fingerprint "equation-dispatch-build"
+   :source-dependency-fingerprint "equation-dispatch-source"
+   :target-descriptor-fingerprint "equation-dispatch-target"})
+
+(defn- register-target!
+  []
+  (hardware/register-target-device!
+   target
+   {:type :ocl :name "Synthetic Intel certified equation dispatch"
+    :vendor "Intel"
+    :capabilities {:warp-size 16 :subgroup-sizes [16]
+                   :max-workgroup-size 256 :shared-local-memory 65536 :total-eus 32}}))
 
 (defn- compilation
   [strategy]
@@ -25,12 +43,7 @@
 
 (deftest independently-certified-equations-require-numerical-permission
   ;; Source generation is hardware-free; no driver or runtime session is opened.
-  (hardware/register-target-device!
-   target
-   {:type :ocl :name "Synthetic Intel certified equation dispatch"
-    :vendor "Intel"
-    :capabilities {:warp-size 16 :subgroup-sizes [16]
-                   :max-workgroup-size 256 :shared-local-memory 65536 :total-eus 32}})
+  (register-target!)
   (let [reference-compilation (compilation :reference)
         subgroup-compilation (compilation :subgroup-score-reuse)
         reference-program (:emitted reference-compilation)
@@ -85,3 +98,64 @@
                                                  [:graph :nodes 0 :operation :provenance
                                                   :scheduled-operation :numerics :mode]
                                                  :exact)])))))))
+
+(deftest public-compilation-retains-numerical-dispatch-policy
+  (register-target!)
+  (let [auto (compilation :auto)
+        dispatched (compilation :dispatch-reassociated)
+        operation (-> dispatched :emitted :equations last :operations first)
+        arguments [(float-array 15) (float-array 15) (float-array 15)
+                   (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
+        linked (equation-first/lower dispatched arguments)]
+    (is (not (equation-dispatch/emitted-equation-dispatch?
+              (-> auto :emitted :equations last :operations first)))
+        "existing :auto retains exact fixed-reference numerics")
+    (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (is (= :dispatch-reassociated
+           (get-in dispatched [:options :schedule :segmented-weighted-reduction :strategy])))
+    (is (= 2 (count (:kernels dispatched))))
+    (is (= :indexed-segmented-reduction-subgroup-score-reuse
+           (executable/strategy (-> linked :instances first :call :steps last :graph))))))
+
+(deftest certified-dispatch-survives-persistent-artifact-round-trip
+  (register-target!)
+  (let [original (compilation :dispatch-reassociated)
+        restored (artifact/open artifact-identity
+                                (artifact/decode
+                                 (artifact/encode
+                                  (artifact/seal artifact-identity original))))
+        arguments [(float-array 15) (float-array 15) (float-array 15)
+                   (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]]
+    (is (semantic-fingerprint/equivalent? original restored))
+    (is (equation-dispatch/emitted-equation-dispatch?
+         (-> restored :emitted :equations last :operations first)))
+    (is (= (executable/strategy
+            (-> (equation-first/lower original arguments)
+                :instances first :call :steps last :graph))
+           (executable/strategy
+            (-> (equation-first/lower restored arguments)
+                :instances first :call :steps last :graph))))))
+
+(deftest reassociated-dispatch-declines-an-unproved-target
+  (let [target-id :ocl:unproved-equation-dispatch-test]
+    (hardware/register-target-device!
+     target-id
+     {:type :ocl :name "Synthetic NVIDIA portable equation target"
+      :vendor "NVIDIA"
+      :capabilities {:warp-size 32 :subgroup-sizes [32]
+                     :max-workgroup-size 256 :shared-local-memory 65536 :total-eus 32}})
+    (is (= :score-reuse-requires-intel-subgroup-dialect
+           (reason #(equation-first/compile
+                     #'indexed-fixture/resident-indexed-attention-probe
+                     {:target target-id :dtype :float
+                      :schedule {:segmented-weighted-reduction
+                                 {:strategy :dispatch-reassociated}}}))))))
+
+(deftest legacy-resident-entry-declines-equation-only-dispatch-mode
+  (register-target!)
+  (is (= :reassociated-equation-dispatch-requires-equation-first
+         (reason #(pipeline/compile-gpu-program
+                   #'indexed-fixture/resident-indexed-attention-probe target
+                   :dtype :float :on-non-resident :nil
+                   :schedule {:segmented-weighted-reduction
+                              {:strategy :dispatch-reassociated}})))))

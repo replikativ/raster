@@ -14,6 +14,7 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
@@ -148,7 +149,7 @@
              "emitted equation outputs differ from its logical results"
              {:equation (:id equation) :expected (:results equation)
               :actual (keys outputs)}))
-    (when-not (some #(= % call-graph) expected-graphs)
+    (when-not (some #(semantic-fingerprint/equivalent? % call-graph) expected-graphs)
       (fail! :emitted-program-equation-graph
              "emitted equation call graph is not a certified alternative"
              {:equation (:id equation)}))

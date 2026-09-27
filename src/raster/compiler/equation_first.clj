@@ -16,9 +16,13 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.pipeline :as pipeline]
@@ -112,6 +116,62 @@
            {:target target :descriptor-target (:device-id descriptor)}))
   descriptor)
 
+(defn- dispatch-reduction-emissions
+  "Join two independently emitted schedules over one retained semantic equation spine.
+
+   This runs after TypedSOAC construction: it neither repeats source analysis nor recognizes
+   a model operation from target code. Non-reduction equations must be identical."
+  [function-id reference subgroup]
+  (let [reference-program (emitted-program/validate! (:program reference))
+        subgroup-program (emitted-program/validate! (:program subgroup))
+        ref-equations (:equations reference-program)
+        subgroup-equations (:equations subgroup-program)]
+    (when-not (and (= (dissoc reference-program :equations)
+                      (dissoc subgroup-program :equations))
+                   (= (count ref-equations) (count subgroup-equations)))
+      (fail! :equation-dispatch-program-spine
+             "reduction alternatives changed the surrounding emitted program" {}))
+    (let [equations
+          (mapv
+           (fn [reference-equation subgroup-equation]
+             (if (swr/plan? (:algorithm reference-equation))
+               (let [_ (when-not (= (dissoc reference-equation :operations)
+                                    (dissoc subgroup-equation :operations))
+                         (fail! :equation-dispatch-equation-spine
+                                "reduction alternatives changed their semantic equation" {}))
+                     candidates (mapv (comp first :operations)
+                                      [reference-equation subgroup-equation])
+                     selection (kernel-dispatch/make
+                                {:id (str function-id "/reduction-" (:id reference-equation))
+                                 :alternatives (mapv :graph candidates)
+                                 :default-strategy :indexed-segmented-reduction-reference
+                                 :selector {:kind :fixed-strategy
+                                            :strategy :indexed-segmented-reduction-subgroup-score-reuse}})
+                     operation (equation-dispatch/make
+                                candidates selection
+                                {:permitted-modes #{:exact :reassociated}})]
+                 (assoc reference-equation :operations [operation]))
+               (do
+                 (when-not (= reference-equation subgroup-equation)
+                   (fail! :equation-dispatch-other-equation
+                          "reduction scheduling changed an unrelated emitted equation"
+                          {:equation (:id reference-equation)}))
+                 reference-equation)))
+           ref-equations subgroup-equations)
+          dispatch-count (count (filter (comp equation-dispatch/emitted-equation-dispatch?
+                                              first :operations)
+                                        equations))
+          _ (when (zero? dispatch-count)
+              (fail! :equation-dispatch-no-reduction
+                     "reassociated reduction dispatch requires a segmented reduction" {}))
+          program (emitted-program/validate!
+                   (assoc reference-program :equations equations))]
+      {:program program
+       :kernels (vec (distinct (concat (:kernels reference) (:kernels subgroup))))
+       :stats (assoc (:stats reference)
+                     :reduction-dispatches dispatch-count
+                     :alternative-emission (:stats subgroup))})))
+
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
 
@@ -140,10 +200,17 @@
          target-descriptor (validate-target-description!
                             target (or captured-target (hardware/descriptor-for target)))
          resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
+         dispatch-reassociated?
+         (= :dispatch-reassociated
+            (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
+         reference-schedule
+         (if dispatch-reassociated?
+           (assoc-in resolved-schedule [:segmented-weighted-reduction :strategy] :reference)
+           resolved-schedule)
          compiler-options (compiler-options f-var target dtype
                                             (-> options
                                                 (dissoc :target :gemm-precision)
-                                                (assoc :schedule resolved-schedule
+                                                (assoc :schedule reference-schedule
                                                        :target-descriptor target-descriptor)))
          walked (pipeline/get-walked-body f-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
@@ -168,13 +235,27 @@
          scheduled (structured-route/schedule-program semantic compiler-options)
          backend (device/select-runtime-backend target true nil)
          target-dialect (target-source-dialect target backend target-descriptor)
-         emission
+         reference-emission
          (if target-dialect
            (program-c-family/emit-program
             scheduled (assoc compiler-options :target-dialect target-dialect))
            (fail! :equation-first-target-emitter
                   "equation-first scheduled program has no public source emitter for this target"
                   {:target target :backend backend :fallback :none}))
+         emission
+         (if dispatch-reassociated?
+           (let [subgroup-options
+                 (assoc-in compiler-options
+                           [:schedule :segmented-weighted-reduction :strategy]
+                           :subgroup-score-reuse)
+                 subgroup-scheduled (structured-route/schedule-program
+                                     semantic subgroup-options)
+                 subgroup-emission (program-c-family/emit-program
+                                    subgroup-scheduled
+                                    (assoc subgroup-options :target-dialect target-dialect))]
+             (dispatch-reduction-emissions
+              (function-symbol f-var) reference-emission subgroup-emission))
+           reference-emission)
          invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
          _ (when-not invocation-plan
              (fail! :equation-first-invocation
@@ -185,6 +266,7 @@
      (->EquationFirstCompilation
       id (function-symbol f-var) target (:dtype compiler-options) source-ns-symbol
       (-> compiler-options
+          (assoc :schedule resolved-schedule)
           (assoc :source-ns source-ns-symbol)
           (dissoc :values))
       semantic scheduled (:program emission) (:kernels emission)
