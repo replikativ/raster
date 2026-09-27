@@ -424,7 +424,17 @@
       (let [{:keys [compiler-buffer-bindings compiler-values semantic-outputs memory
                     value-versions]}
             (invocation-link/memory-witness (invocation-link/certify plan))]
-        (is (= :unproven value-versions))
+        (is (= :semantic-equation-read-before-write (:ordering value-versions)))
+        (is (= :unproven (:completion value-versions)))
+        (is (seq (:storage value-versions)))
+        (is (some (fn [{:keys [retention definition public-output?]}]
+                    (and (= :equation (:kind definition))
+                         (not public-output?)
+                         (some #(> (:equation-index %)
+                                   (get-in retention [:definition-position :equation-index]))
+                               (:use-positions retention))))
+                  (vals compiler-values))
+            "internal forward/gradient values stay live through later AD equations")
         (is (seq compiler-buffer-bindings))
         (is (= (set (keys compiler-buffer-bindings)) (set (keys compiler-values))))
         (is (some #(= :equation (get-in % [:definition :kind]))

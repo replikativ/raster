@@ -403,13 +403,6 @@
                          {:reason :link-allocation-fields :symbol sym :fields fields}))))
      leaves)))
 
-(defn- merge-access [left right]
-  (if (= left right) left
-      (if (or (= :read-write left) (= :read-write right)
-              (and left right))
-        :read-write
-        (or left right))))
-
 (defn- step-selection-override [step schedule]
   (if-let [{:keys [path mapping default]} (:strategy-selection step)]
     (get mapping (get-in schedule path) default)
@@ -1059,7 +1052,7 @@
                                 (get-in view [:allocation :id])))))))]
     (doseq [{:keys [instance step phase facts produced-views partial-writes complete-writes]} step-facts]
       (let [by-node (reduce (fn [m {:keys [node access]}]
-                              (update m node merge-access access)) {} facts)]
+                              (update m node kabi/merge-access access)) {} facts)]
         (doseq [[node-id access] by-node
                 :let [role (get-in nodes [node-id :role])]]
           (when (contains? #{:read :read-write} access)
@@ -1185,7 +1178,7 @@
                                       (map (fn [leaf] [(:node leaf) id]) (:leaves value)))
                                     (:values plan)))]
     (reduce (fn [accesses {:keys [node access]}]
-              (update accesses (get node-values node) merge-access access))
+              (update accesses (get node-values node) kabi/merge-access access))
             {} (mapcat :facts (instance-access-facts plan)))))
 
 (defn memory-report

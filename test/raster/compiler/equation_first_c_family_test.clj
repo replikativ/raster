@@ -512,7 +512,14 @@
     (is (every? (fn [{:keys [storage public-output?]}]
                   (= (contains? (set escaped) storage) public-output?))
                 (vals (:compiler-values witness)))
-        "compiler value bindings agree with physical storage escape")))
+        "compiler value bindings agree with physical storage escape")
+    (is (every? #(true? (get-in % [:retention :physical-storage-escaped?]))
+                (filter #(and (:public-output? %)
+                              (not= :storage-only (get-in % [:definition :kind])))
+                        (vals (:compiler-values witness))))
+        "physical output retention does not pretend to identify an earlier logical version")
+    (is (every? #(contains? (:boundary-reasons %) :physical-output)
+                (keep (get-in witness [:value-versions :storage]) escaped)))))
 
 (deftest equation-first-rejects-explicit-host-orchestration-before-lowering
   (is (= :equation-first-host-only
@@ -608,7 +615,15 @@
     (is (invocation-link/certificate? (compiled/certificate functional)))
     (let [{:keys [compiler-buffer-bindings compiler-values memory value-versions]}
           (invocation-link/memory-witness (:lowering functional))]
-      (is (= :unproven value-versions))
+      (is (= :semantic-equation-read-before-write (:ordering value-versions)))
+      (is (= :unproven (:completion value-versions)))
+      (is (= :witnessed (:status value-versions)))
+      (is (every? #(not= :storage-only
+                         (get-in compiler-values [% :definition :kind]))
+                  (mapcat :versions (vals (:storage value-versions)))))
+      (is (every? #(map? (:retention %))
+                  (filter #(not= :storage-only (get-in % [:definition :kind]))
+                          (vals compiler-values))))
       (is (= (set (keys compiler-buffer-bindings)) (set (keys compiler-values))))
       (is (every? #(contains? (:values memory) %)
                   (vals compiler-buffer-bindings)))

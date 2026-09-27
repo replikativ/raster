@@ -28,14 +28,6 @@
                     {:reason :program-stage-descriptor :descriptor descriptor})))
   descriptor)
 
-(defn- merge-access
-  [left right]
-  (cond
-    (nil? left) right
-    (nil? right) left
-    (= left right) left
-    :else :read-write))
-
 (defn- reads?
   [access]
   (contains? #{:read :read-write} access))
@@ -71,13 +63,13 @@
                         {:reason :program-stage-symbols :phase (:phase step)
                          :symbols symbols})))
       (reduce (fn [accesses [symbol {:keys [binding slots]}]]
-                (let [access (reduce merge-access nil
+                (let [access (reduce kabi/merge-access nil
                                      (map kabi/slot-access slots))]
                   (when-not access
                     (throw (ex-info "program stage ABI pointer has no readable or writable effect"
                                     {:reason :program-stage-access :phase (:phase step)
                                      :symbol symbol :binding binding})))
-                  (update accesses symbol merge-access access)))
+                  (update accesses symbol kabi/merge-access access)))
               {}
               (map vector symbols slot-groups))))
 

@@ -14,6 +14,7 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.write-coverage :as coverage]
@@ -503,12 +504,227 @@
              {:expected expected :actual (:certificate lowering)}))
     lowering))
 
+(defn- retention-position
+  [equation-index equation phase]
+  {:equation-index equation-index :equation equation :phase phase})
+
+(defn- position-key
+  [position]
+  (cond
+    (= :entry position) [Long/MIN_VALUE 0]
+    (= :escape position) [Long/MAX_VALUE 0]
+    :else [(:equation-index position) (case (:phase position) :read 0 :write 1)]))
+
+(defn- later-position?
+  [left right]
+  (pos? (compare (position-key left) (position-key right))))
+
+(defn- before-position?
+  [left right]
+  (neg? (compare (position-key left) (position-key right))))
+
+(defn- value-retention-witness
+  "Derive semantic value intervals over one verified invocation's physical storage.
+
+   This is deliberately not a liveness or completion certificate.  It records equation-order
+   read-before-write positions and rejects storage histories that cannot be justified from the
+   existing complete-write effect evidence. Individual storage entries remain diagnostic when the
+   aggregate status is unknown; any future safety decision must require the aggregate status."
+  [plan certificate report emitted bindings definitions uses]
+  (let [equations (:equations emitted)
+        equation-index (into {} (map-indexed (fn [index equation] [(:id equation) index])) equations)
+        inputs (set (:inputs emitted))
+        semantic-outputs (set (:outputs emitted))
+        output-nodes (set (:outputs plan))
+        step-facts (get-in certificate [:effect-evidence :step-facts])
+        storage-order (vec (distinct (vals bindings)))
+        storage-nodes (fn [storage]
+                        (mapv :node (get-in report [:values storage :leaves])))
+        node-storage (into {} (map (fn [[node facts]] [node (:value facts)])) (:nodes report))
+        allocation-nodes (reduce-kv (fn [groups node {:keys [allocation]}]
+                                      (update groups allocation (fnil conj []) node))
+                                    {} (:nodes report))
+        semantic-values
+        (into {}
+              (keep (fn [[compiler-value storage]]
+                      (let [definition (or (get definitions compiler-value)
+                                           (when (contains? inputs compiler-value)
+                                             {:kind :program-input}))]
+                        (when definition
+                          (let [definition-position
+                                (if (= :program-input (:kind definition))
+                                  :entry
+                                  (retention-position (get equation-index (:id definition))
+                                                      (:id definition) :write))
+                                use-positions
+                                (mapv (fn [equation]
+                                        (retention-position (get equation-index equation)
+                                                            equation :read))
+                                      (get uses compiler-value []))
+                                logical-last-use (reduce (fn [latest position]
+                                                           (if (later-position? position latest)
+                                                             position latest))
+                                                         definition-position use-positions)
+                                semantic-output? (contains? semantic-outputs compiler-value)]
+                            [compiler-value
+                             {:storage storage
+                              :definition-position definition-position
+                              :use-positions use-positions
+                              :logical-last-use logical-last-use
+                              :semantic-output? semantic-output?
+                              :retained-through (if semantic-output? :escape logical-last-use)
+                              :physical-storage-escaped?
+                              (boolean (some output-nodes (storage-nodes storage)))}])))))
+              bindings)
+        versions-by-storage
+        (reduce-kv (fn [groups compiler-value {:keys [storage]}]
+                     (update groups storage (fnil conj []) compiler-value))
+                   {} semantic-values)
+        definition-storage-by-step
+        (reduce-kv (fn [by-step _ {:keys [storage definition-position]}]
+                     (if (map? definition-position)
+                       (update by-step (:equation-index definition-position)
+                               (fnil conj #{}) storage)
+                       by-step))
+                   {} semantic-values)
+        write-events
+        (reduce
+         (fn [events {:keys [step phase facts complete-writes]}]
+           (if-not (integer? step)
+             events
+             (let [by-node
+                   (reduce (fn [nodes {:keys [node access symbol]}]
+                             (-> nodes
+                                 (update-in [node :access] kabi/merge-access access)
+                                 (update-in [node :symbols] (fnil conj []) symbol)))
+                           {} facts)]
+               (reduce-kv
+                (fn [events node {:keys [access symbols]}]
+                  (if (contains? #{:write :read-write} access)
+                    (update events (get node-storage node) (fnil conj [])
+                            {:equation-index step :equation phase :node node :symbols symbols
+                             :access access
+                             :complete-write? (boolean (and complete-writes
+                                                            (contains? complete-writes node)))})
+                    events))
+                events by-node))))
+         {} step-facts)
+        global-unknown
+        (cond-> []
+          (not= 1 (count (:instances plan)))
+          (conj {:reason :multiple-program-instances :count (count (:instances plan))})
+
+          (some emitted-loop/emitted-loop? (mapcat :operations equations))
+          (conj {:reason :structured-replay}))
+        storage-report
+        (into {}
+              (map
+               (fn [storage]
+                 (let [nodes (storage-nodes storage)
+                       node-facts (mapv #(get-in report [:nodes %]) nodes)
+                       versions (->> (get versions-by-storage storage [])
+                                     (sort-by #(position-key
+                                                (get-in semantic-values [% :definition-position])))
+                                     vec)
+                       events (get write-events storage [])
+                       boundary-reasons
+                       (cond-> #{}
+                         (some #(contains? #{:input :constant :state :output} (:role %)) node-facts)
+                         (conj :persistent-role)
+                         (some :host-initializer? node-facts) (conj :host-initialized)
+                         (some output-nodes nodes) (conj :physical-output))
+                       reasons
+                       (cond-> []
+                         (not= 1 (count nodes))
+                         (conj {:reason :multi-leaf-value :nodes nodes})
+
+                         (some #(> (count (get allocation-nodes (:allocation %))) 1) node-facts)
+                         (conj {:reason :multi-view-allocation :nodes nodes})
+
+                         (some #(not (:complete-write? %)) events)
+                         (conj {:reason :partial-write
+                                :events (filterv #(not (:complete-write? %)) events)})
+
+                         (some #(= :read-write (:access %)) events)
+                         (conj {:reason :read-write-mutation
+                                :events (filterv #(= :read-write (:access %)) events)})
+
+                         (some (fn [{:keys [equation-index]}]
+                                 (not (contains? (get definition-storage-by-step equation-index #{})
+                                                 storage)))
+                               events)
+                         (conj {:reason :unattributed-mutation
+                                :events (filterv
+                                         (fn [{:keys [equation-index]}]
+                                           (not (contains?
+                                                 (get definition-storage-by-step equation-index #{})
+                                                 storage)))
+                                         events)}))
+                       reasons
+                       (reduce
+                        (fn [reasons compiler-value]
+                          (let [definition-position
+                                (get-in semantic-values [compiler-value :definition-position])]
+                            (if (and (map? definition-position)
+                                     (not-any? #(and (= (:equation-index definition-position)
+                                                        (:equation-index %))
+                                                     (:complete-write? %))
+                                               events))
+                              (conj reasons {:reason :definition-without-complete-write
+                                             :value compiler-value
+                                             :position definition-position})
+                              reasons)))
+                        reasons versions)
+                       reasons
+                       (reduce
+                        (fn [reasons [prior next]]
+                          (let [prior-retention
+                                (if (get-in semantic-values [prior :semantic-output?])
+                                  :escape
+                                  (get-in semantic-values [prior :logical-last-use]))
+                                next-definition
+                                (get-in semantic-values [next :definition-position])]
+                            (if-not (before-position? prior-retention next-definition)
+                              (conj reasons {:reason (if (= :escape prior-retention)
+                                                       :escaped-old-version
+                                                       :overlapping-value-versions)
+                                             :prior prior :next next
+                                             :prior-retained-through prior-retention
+                                             :next-definition next-definition})
+                              reasons)))
+                        reasons (partition 2 1 versions))
+                       reasons
+                       (if (and (some output-nodes nodes) (< 1 (count versions))
+                                (not-any? #(get-in semantic-values [% :semantic-output?]) versions))
+                         (conj reasons {:reason :ambiguous-physical-escape :versions versions})
+                         reasons)
+                       status (cond (seq reasons) :unknown
+                                    (seq boundary-reasons) :persistent-boundary
+                                    :else :witnessed)]
+                   [storage (cond-> {:status status :versions versions :nodes nodes}
+                              (seq boundary-reasons) (assoc :boundary-reasons boundary-reasons)
+                              (seq reasons) (assoc :unknown reasons))])))
+              storage-order)
+        unknown (into global-unknown
+                      (mapcat (fn [[storage {:keys [unknown]}]]
+                                (map #(assoc % :storage storage) unknown)))
+                      storage-report)]
+    {:status (if (seq unknown) :unknown :witnessed)
+     :ordering :semantic-equation-read-before-write
+     :completion :unproven
+     :values semantic-values
+     :storage storage-report
+     :unknown (vec unknown)}))
+
 (defn memory-witness
   "Join a verified typed invocation's compiler storage identities to its LinkPlan memory facts.
 
    Compiler values may share a storage identity; physical destination names with no semantic
-   SSA definition are marked :storage-only. These are bindings rather than proofs of independent
-   value versions. The returned report makes no release/reuse/completion decision."
+   SSA definition are marked :storage-only and are not treated as versions. Straight-line semantic
+   retention is derived in equation read-before-write order and checked against complete-write
+   effect evidence. Unsupported storage histories remain explicit unknowns. A future safety
+   consumer must require the aggregate :value-versions status, not cherry-pick a storage entry.
+   The returned report makes no selected-order, release, reuse, or completion decision."
   [lowering]
   (let [{:keys [plan certificate]} (verify! lowering)
         report (link/memory-report plan)
@@ -526,7 +742,8 @@
                      {} (:equations emitted))
         inputs (set (:inputs emitted))
         semantic-outputs (set (:outputs emitted))
-        escaped-storage (set (:outputs plan))]
+        version-witness (value-retention-witness plan certificate report emitted bindings
+                                                 definitions uses)]
     (doseq [[compiler-value storage-id] bindings]
       (when-not (contains? (:values report) storage-id)
         (fail! :invocation-memory-binding
@@ -552,12 +769,15 @@
                                     {:kind :storage-only})
                     :uses (get uses compiler-value [])
                     :semantic-output? (contains? semantic-outputs compiler-value)
-                    :public-output? (contains? escaped-storage storage-id)}]))
+                    :public-output? (contains? (get-in version-witness
+                                                       [:storage storage-id :boundary-reasons] #{})
+                                               :physical-output)
+                    :retention (get-in version-witness [:values compiler-value])}]))
            bindings)
      :public-buffer-bindings (:public-buffer-bindings certificate)
      :semantic-outputs (:semantic-outputs certificate)
      :memory report
-     :value-versions :unproven}))
+     :value-versions (dissoc version-witness :values)}))
 
 (defn certify
   "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness.
