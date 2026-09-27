@@ -9,6 +9,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.index-expression :as index-expression]
@@ -921,6 +922,7 @@
 
 (defn- program-complete-writes [nodes values instance step call-scalars]
   (let [operation (first (get-in step [:equation :operations]))
+        operation (equation-dispatch/boundary-equation operation)
         algorithm (:algorithm operation)
         scalars (merge (program-extent-values nodes values instance (:buffers step))
                        call-scalars (:scalar-values step))
@@ -963,6 +965,7 @@
           (program-call/emitted-equation-call? step)
           (let [complete (program-complete-writes nodes values id step (:scalar-values call))
                 operation (first (get-in step [:equation :operations]))
+                operation (equation-dispatch/boundary-equation operation)
                 algorithm (:algorithm operation)
                 equation (when (soac/program-form? algorithm)
                            (first (soac/equations algorithm)))

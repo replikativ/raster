@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
@@ -214,6 +215,61 @@
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "equation-first indexed reference")
     (run-equation-first-case :ocl:0)))
+
+(defn- run-equation-first-dispatch-case
+  [device-id]
+  (let [compile-strategy
+        (fn [strategy]
+          (equation-first/compile
+           #'resident-indexed-attention-probe
+           {:target device-id :dtype :float
+            :schedule {:segmented-weighted-reduction {:strategy strategy}}}))
+        reference (compile-strategy :reference)
+        subgroup (compile-strategy :subgroup-score-reuse)
+        candidates (mapv #(-> % :emitted :equations last :operations first)
+                         [reference subgroup])
+        selection (kdispatch/make
+                   {:id "indexed-equation-device-dispatch"
+                    :alternatives (mapv :graph candidates)
+                    :default-strategy :indexed-segmented-reduction-reference
+                    :selector {:kind :fixed-strategy
+                               :strategy :indexed-segmented-reduction-subgroup-score-reuse
+                               :fallback :none}})
+        operation (equation-dispatch/make
+                   candidates selection {:permitted-modes #{:exact :reassociated}})
+        program (update (:emitted reference) :equations
+                        (fn [equations]
+                          (update equations (dec (count equations)) assoc
+                                  :operations [operation])))
+        compilation (assoc reference :emitted program)
+        {:keys [plan shape-env buffers]} (test-case)]
+    (doseq [edges [4 0]]
+      (let [buffers (assoc buffers
+                           'dst (long-array (take edges (get buffers 'dst)))
+                           'src (long-array (take edges (get buffers 'src))))
+            expected (reference/evaluate
+                      plan {:buffers buffers :scalars (assoc shape-env 'n-edges edges)})
+            arguments (into (mapv buffers '[Q K V dst src]) [3 edges 5 2])
+            linked (equation-first/lower compilation arguments)
+            selected (-> linked :instances first :call :steps last :graph)
+            executable (link/instantiate! linked)]
+        (try
+          (is (= :indexed-segmented-reduction-subgroup-score-reuse
+                 (get-in selected [:attributes :strategy])))
+          (link/run! executable)
+          (let [actual (vec (link/download executable (first (:outputs linked))))]
+            (is (every? true?
+                        (map #(< (Math/abs (- (double %1) (double %2))) 2.0e-5)
+                             expected actual))))
+          (finally (link/close! executable)))))))
+
+(deftest equation-first-certified-dispatch-replays-on-opencl
+  (if-not @device-probe/opencl-subgroups-available?
+    (device-probe/opencl-skip! "equation-first certified dispatch" :subgroups)
+    (if (= :supported (:status (capability/score-reuse (:plan (test-case))
+                                                        (hardware/descriptor-for :ocl:0))))
+      (run-equation-first-dispatch-case :ocl:0)
+      (device-probe/opencl-skip! "equation-first certified dispatch" :intel-subgroups))))
 
 (defn- production-case
   [descriptor total-dim]

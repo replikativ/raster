@@ -9,6 +9,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -191,10 +192,11 @@
 
 (defn- complete-write?
   [operation id capacity scalars buffers storage]
-  (when (emitted-equation/emitted-equation? operation)
-    (or (when-let [extent (get (emitted-equation/complete-write-domains operation) id)]
-          (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
-        (soac-complete-write? operation id capacity scalars buffers storage))))
+  (let [equation (equation-dispatch/boundary-equation operation)]
+    (when (emitted-equation/emitted-equation? equation)
+      (or (when-let [extent (get (emitted-equation/complete-write-domains equation) id)]
+            (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
+          (soac-complete-write? equation id capacity scalars buffers storage)))))
 
 (defn- write-before-read-inputs
   [parallel-program materialized scalars]
@@ -206,7 +208,9 @@
                 (let [[access operation]
                       (some (fn [equation]
                               (when-let [operation (first (:operations equation))]
-                                (when-let [access (graph-buffer-access (:graph operation) id)]
+                                (when-let [access (graph-buffer-access
+                                                   (equation-dispatch/boundary-graph operation)
+                                                   id)]
                                   [access operation])))
                             (:equations parallel-program))]
                   (when (and (= :write access)
@@ -229,7 +233,7 @@
         (into #{}
               (mapcat (fn [equation]
                         (when-let [operation (first (:operations equation))]
-                          (let [kernel-graph (:graph operation)]
+                          (let [kernel-graph (equation-dispatch/boundary-graph operation)]
                             (concat (map :id (:inputs kernel-graph))
                                     (map :id (:outputs kernel-graph)))))))
               (:equations parallel-program))
@@ -330,7 +334,8 @@
     (lower-loop-storage state invocation-id equation scalars)
 
     :else
-    (let [emitted (emitted-equation/validate! (first (:operations equation)))
+    (let [emitted (emitted-equation/validate!
+                   (equation-dispatch/boundary-equation (first (:operations equation))))
           physical (emitted-equation/physical-results emitted)]
       (reduce
        (fn [state result]
@@ -417,7 +422,9 @@
                  (some (fn [equation]
                          (when-let [operation (first (:operations equation))]
                            (contains? #{:write :read-write}
-                                      (graph-buffer-access (:graph operation) compiler-value))))
+                                      (graph-buffer-access
+                                       (equation-dispatch/boundary-graph operation)
+                                                           compiler-value))))
                        (:equations parallel-program))))
               (keys (:buffers call)))
         written-tokens

@@ -4,6 +4,7 @@
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.gpu.indexed-attention-device-test :as indexed-fixture]
             [raster.runtime.hardware :as hardware]))
 
@@ -30,8 +31,10 @@
     :vendor "Intel"
     :capabilities {:warp-size 16 :subgroup-sizes [16]
                    :max-workgroup-size 256 :shared-local-memory 65536 :total-eus 32}})
-  (let [reference-program (:emitted (compilation :reference))
-        subgroup-program (:emitted (compilation :subgroup-score-reuse))
+  (let [reference-compilation (compilation :reference)
+        subgroup-compilation (compilation :subgroup-score-reuse)
+        reference-program (:emitted reference-compilation)
+        subgroup-program (:emitted subgroup-compilation)
         reference (-> reference-program :equations last :operations first)
         subgroup (-> subgroup-program :equations last :operations first)
         alternatives [reference subgroup]
@@ -50,6 +53,13 @@
                                   :operations [certified])))]
     (is (equation-dispatch/emitted-equation-dispatch? certified))
     (is (= program (emitted-program/validate! program)))
+    (let [arguments [(float-array 15) (float-array 15) (float-array 15)
+                     (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
+          linked (equation-first/lower (assoc reference-compilation :emitted program)
+                                      arguments)
+          selected (-> linked :instances first :call :steps last :graph)]
+      (is (= :indexed-segmented-reduction-subgroup-score-reuse
+             (executable/strategy selected))))
     (is (= [:exact :reassociated]
            (mapv #(get-in (last (get-in % [:body :equations]))
                           [:operations 0 :numerics :mode]) alternatives)))
