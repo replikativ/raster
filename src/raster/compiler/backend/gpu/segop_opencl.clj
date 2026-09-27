@@ -941,6 +941,29 @@
                              (kernel-body-c-dialect/resolve! target-dialect))
                             scalar-types)))
 
+(defn- generate-certified-body-graph
+  "Project already scheduled bodies without recognizing their operation families again."
+  [graph {:keys [scheduled-bodies scalar-types target-dialect]
+          :or {scalar-types {} target-dialect :opencl-intel}}]
+  (when-not (and (seq (:nodes graph))
+                 (map? scheduled-bodies)
+                 (= (set (map :id (:nodes graph))) (set (keys scheduled-bodies))))
+    (throw (ex-info "scheduled body certificates must cover exactly the semantic graph nodes"
+                    {:reason :kernel-graph-scheduled-body-coverage
+                     :nodes (mapv :id (:nodes graph))
+                     :certificates (when (map? scheduled-bodies) (vec (keys scheduled-bodies)))})))
+  (let [emitted
+        (kgraph/map-operations
+         graph
+         (fn [node]
+           (let [certificate (scheduled-body/validate-against-node!
+                              (get scheduled-bodies (:id node)) node graph)]
+             (kernel-body-target/emit-artifact
+              (str "graph_scheduled_" (gensym "")) certificate target-dialect))))]
+    (finalize-emitted-graph
+     emitted (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
+     scalar-types)))
+
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
 
@@ -953,6 +976,9 @@
         opencl? (kernel-body-c-dialect/opencl?
                  (kernel-body-c-dialect/resolve! target-dialect))]
     (cond
+      (contains? opts :scheduled-bodies)
+      (generate-certified-body-graph graph opts)
+
       (and (seq (:nodes graph))
            (every? #(segop/seg-contract? (:operation %))
                    (:nodes graph)))

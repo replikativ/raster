@@ -11,7 +11,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.ir.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
 (defn- ordered-axis-selections

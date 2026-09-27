@@ -9,8 +9,11 @@
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.compiler.ir.structured-control :as control]))
+            [raster.compiler.ir.structured-control :as control]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (def ^:private dialect-targets
   {:opencl-parallel :opencl-c
@@ -56,6 +59,15 @@
                          (= (:operands equation) expected-operands)
                          (= (:results equation) (soac/outputs algorithm))))))))
 
+    (swr/plan? algorithm)
+    (and (= 1 (count (:operations equation)))
+         (let [operation (first (:operations equation))]
+           (and (emitted-equation/emitted-equation? operation)
+                (let [emitted (emitted-equation/validate! operation)]
+                  (and (= algorithm (:algorithm emitted))
+                       (swr/equation-boundary? (get-in emitted [:body :values])
+                                               equation algorithm))))))
+
     :else false))
 
 (defn- scheduled-equation-view
@@ -92,6 +104,20 @@
                             (scheduled-equation-view (first numerical-body)))))
                   expected-inputs (program/infer-inputs body-equations)
                   expected-effects (reduce set/union #{} (map :effects body-equations))]
+              (when (swr/plan? (:algorithm equation))
+                (let [source-equation (assoc equation :operations
+                                             (:operations (first numerical-body)))
+                      source-program (update parallel-program :equations
+                                             #(mapv (fn [entry]
+                                                      (if (= (:id entry) (:id equation))
+                                                        source-equation entry)) %))
+                      expected-body (:body (equation-graph/make-for-plan-equation
+                                            (assoc source-program :dialect (:dialect body))
+                                            source-equation))]
+                  (when-not (semantic-fingerprint/equivalent? expected-body body)
+                    (throw (ex-info "emitted reduction changed its enclosing value or allocation contract"
+                                    {:reason :emitted-reduction-outer-slice
+                                     :equation (:id equation)})))))
               (when-not (and (= host-prefix actual-prefix)
                              exact-source?
                              (= expected-inputs (:inputs body))

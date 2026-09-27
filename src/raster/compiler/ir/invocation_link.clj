@@ -14,7 +14,9 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.invocation-materialization :as materialization]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.write-coverage :as coverage]
@@ -43,7 +45,9 @@
 (defn- scalar-number
   [scalars value-id storage-id]
   (let [scalar (get scalars value-id)]
-    (when-not (and (typed-scalar? scalar) (integer? (:value scalar)))
+    (when-not (and (typed-scalar? scalar)
+                   (contains? #{:int :long} (:type scalar))
+                   (integer? (:value scalar)))
       (fail! :invocation-link-shape-scalar
              "program storage shape requires an integral typed scalar"
              {:storage-value storage-id :shape-value value-id
@@ -83,6 +87,11 @@
                         "program extent projection names unavailable resident storage"
                         {:dimension dimension :buffers (set (keys buffers))}))
                (first (:shape source)))
+             (seq? dimension)
+             (launch/resolve-expression
+              #(scalar-number scalars % id)
+              (index-expression/project-dimension
+               dimension #(get-in scalars [% :type]) fail!))
              :else
              (fail! :invocation-link-shape-expression
                     "program storage shape is not a canonical integer/value/extent expression"
@@ -93,14 +102,6 @@
                 {:dimension dimension :resolved resolved}))
        resolved))
    (:shape abstract)))
-
-(defn- physical-output-map
-  [algorithm]
-  (let [facts (soac/facts algorithm)]
-    (into {}
-          (mapcat (fn [equation]
-                    (map vector (nth equation 2) (soac/physical-results facts equation))))
-          (soac/equations algorithm))))
 
 (defn- storage-id
   [invocation-id kind compiler-value]
@@ -145,9 +146,12 @@
       (contains? roles :output) :write
       :else nil)))
 
-(defn- complete-write?
+(defn- soac-complete-write?
   [operation id capacity scalars buffers storage]
-  (when (emitted-equation/emitted-equation? operation)
+  (when (and (emitted-equation/emitted-equation? operation)
+             ;; New algorithm variants preserve constructor initialization until their own
+             ;; complete-write coverage proof is admitted here. A :write use alone is not proof.
+             (soac/program-form? (:algorithm operation)))
     (let [algorithm (:algorithm operation)
           facts (soac/facts algorithm)
           equations (soac/equations algorithm)
@@ -173,7 +177,10 @@
                                       (catch clojure.lang.ExceptionInfo error
                                         (if (contains? #{:invocation-link-shape-scalar
                                                          :invocation-link-shape-extent
-                                                         :invocation-link-shape-expression}
+                                                         :invocation-link-shape-expression
+                                                         :unbound-index-symbol
+                                                         :index-expression
+                                                         :launch-index-expression}
                                                        (:reason (ex-data error)))
                                           nil
                                           (throw error)))))
@@ -181,6 +188,13 @@
                       (map vector (nth equation 2) (soac/physical-results facts equation)
                            (soac/result-storage facts (second equation)))))
               equations)))))
+
+(defn- complete-write?
+  [operation id capacity scalars buffers storage]
+  (when (emitted-equation/emitted-equation? operation)
+    (or (when-let [extent (get (emitted-equation/complete-write-domains operation) id)]
+          (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
+        (soac-complete-write? operation id capacity scalars buffers storage))))
 
 (defn- write-before-read-inputs
   [parallel-program materialized scalars]
@@ -279,7 +293,7 @@
   [state invocation-id equation scalars]
   (let [emitted (emitted-loop/validate! (first (:operations equation)))
         algorithm (-> emitted :schedule :algorithm)
-        body-storage (physical-output-map (control/body algorithm))]
+        body-storage (soac/physical-result-map (control/body algorithm))]
     (reduce
      (fn [state {:keys [initial parameter result output]}]
        (let [initial-token (get-in state [:buffers initial])
@@ -317,7 +331,7 @@
 
     :else
     (let [emitted (emitted-equation/validate! (first (:operations equation)))
-          physical (physical-output-map (:algorithm emitted))]
+          physical (emitted-equation/physical-results emitted)]
       (reduce
        (fn [state result]
          (let [physical-id (get physical result)
@@ -328,9 +342,10 @@
                  shape (concrete-shape result logical scalars (:buffers state) (:storage state))
                  backing (get-in state [:storage token])
                  prefix? (< (reduce *' 1 shape) (reduce *' 1 (:shape backing)))
-                 producer (some #(when (some #{result} (nth % 2)) %)
-                                (soac/equations (:algorithm emitted)))]
-             (if (and prefix? (contains? '#{contract map} (soac/operation-kind producer)))
+                 producer (when (soac/program-form? (:algorithm emitted))
+                            (some #(when (some #{result} (nth % 2)) %)
+                                  (soac/equations (:algorithm emitted))))]
+             (if (and prefix? producer (contains? '#{contract map} (soac/operation-kind producer)))
                (let [view-token (storage-id invocation-id :result-view result)]
                  (-> state
                      (add-storage view-token result logical shape nil :unspecified)

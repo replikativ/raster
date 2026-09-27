@@ -7,7 +7,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.ir.index-expression :as index]
             [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.segred-body :as segred]
             [raster.compiler.passes.parallel.scalar-region-lower :as result-region]

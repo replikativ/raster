@@ -10,6 +10,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
@@ -69,14 +70,6 @@
              {:value id :role role}))
     value))
 
-(defn- physical-results
-  [algorithm]
-  (let [facts (soac/facts algorithm)]
-    (into {}
-          (mapcat (fn [equation]
-                    (map vector (nth equation 2) (soac/physical-results facts equation))))
-          (soac/equations algorithm))))
-
 (defn- validate-host-step!
   [values step]
   (when-not (evaluated-host-equation? step)
@@ -128,6 +121,9 @@
         (fail! :emitted-program-equation-bindings
                "emitted equation call bindings differ from its ordered ABI"
                {:equation (:id equation)})))
+    ;; Shape/representation obligations are decidable from bound scalars, before any caller
+    ;; opens a session or allocates result storage. Runtime binding repeats this check.
+    (graph-call/preflight! graph scalar-values)
     (when-not (= (set (:results equation)) (set (keys outputs)))
       (fail! :emitted-program-equation-outputs
              "emitted equation outputs differ from its logical results"
@@ -144,12 +140,15 @@
   [equation result-views]
   (when-not (map? result-views)
     (fail! :emitted-program-result-views "result views must be a map" {:result-views result-views}))
-  (let [algorithm (:algorithm (first (:operations equation)))
-        physical (physical-results algorithm)]
+  (let [emitted (first (:operations equation))
+        algorithm (:algorithm emitted)
+        physical (emitted-equation/physical-results emitted)]
     (doseq [[result destination] result-views]
-      (let [producer (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm))]
+      (let [producer (when (soac/program-form? algorithm)
+                       (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm)))]
         (when-not (and (some #{result} (:results equation))
                        (= destination (get physical result))
+                       producer
                        (contains? '#{contract map} (soac/operation-kind producer)))
           (fail! :emitted-program-result-view
                  "result view must retain a prefix-producing physical storage relation"
@@ -160,7 +159,7 @@
   [equation values buffers scalars result-views]
   (let [emitted (emitted-equation/validate! (first (:operations equation)))
         graph (:graph emitted)
-        result-storage (physical-results (:algorithm emitted))
+        result-storage (emitted-equation/physical-results emitted)
         result-views (validate-result-views! equation (select-keys result-views (:results equation)))
         buffers
         (reduce

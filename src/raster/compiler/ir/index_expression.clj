@@ -1,10 +1,11 @@
-(ns raster.compiler.passes.parallel.index-expression
+(ns raster.compiler.ir.index-expression
   "Lower already-verified integer index expressions to target-neutral KernelBody arithmetic.
 
   Schedules provide their own decline function so this small shared vocabulary does not decide
   whether a missing rule is a map, reduction, scan, or contraction coverage failure."
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.kernel-launch :as launch]))
@@ -325,3 +326,28 @@
     (decline! :launch-index-expression
               "kernel index value cannot be projected into launch IR"
               {:expression expression :type (type expression)})))
+
+(defn project-dimension
+  "Project one retained AbstractValue dimension into checked KernelLaunch algebra.
+
+   `scalar-dtype` returns the retained dtype for a stable scalar leaf. `(value id)` unwraps a
+   compound compiler identity, while `(extent buffer)` and `unknown-dimension` remain opaque for
+   their existing graph-capacity handling. Compound source spelling is mathematical dimension
+   algebra here, not host scalar evaluation; only declared integral leaves enter its scope."
+  [dimension scalar-dtype decline!]
+  (cond
+    (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
+    (second dimension)
+
+    (and (seq? dimension)
+         (contains? '#{extent unknown-dimension} (first dimension)))
+    dimension
+
+    (seq? dimension)
+    (let [scope (into #{}
+                      (filter #(contains? #{:int :long}
+                                          (some-> (scalar-dtype %) dtype/canon)))
+                      (util/free-syms dimension))]
+      (to-launch-expression (lower dimension scope decline!) decline!))
+
+    :else dimension))

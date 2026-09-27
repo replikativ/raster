@@ -14,6 +14,7 @@
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
@@ -35,15 +36,11 @@
         types (into {} (map (juxt :id :dtype)) (:scalars scheduled-graph))]
     (segop-emission/generate-kernel-graph
      scheduled-graph
-     :scalar-types (merge (:scalar-types opts) types)
-     :array-types (:array-types opts)
-     :target-dialect (get opts :target-dialect :opencl-intel)
-     :target-device (:target-device opts)
-     :target-descriptor (:target-descriptor opts)
-     :schedule (:schedule opts)
-     :contraction-facts (:contraction-facts opts)
-     :scheduled-equation-algorithm (:scheduled-equation-algorithm opts)
-     :scheduled-equation-body (:scheduled-equation-body opts))))
+     (assoc (select-keys opts [:array-types :target-device :target-descriptor :schedule
+                              :contraction-facts :scheduled-equation-algorithm
+                              :scheduled-equation-body :scheduled-bodies])
+            :scalar-types (merge (:scalar-types opts) types)
+            :target-dialect (get opts :target-dialect :opencl-intel)))))
 
 (defn- contraction-facts-by-operation
   "Project typed contraction facts once at the algorithm/schedule boundary.
@@ -113,6 +110,15 @@
                                                :scheduled-equation-body body)
                                   (seq contraction-facts)
                                   (assoc :contraction-facts contraction-facts)))]
+        (assoc equation :operations
+               [(emitted-equation/make algorithm body emitted {:provenance provenance})]))
+
+      (swr/plan? algorithm)
+      (let [{:keys [body graph]} (equation-graph/make-for-plan-equation
+                                  parallel-program equation)
+            node (first (:nodes graph))
+            certificate (first (:operations equation))
+            emitted (emit-graph graph (assoc opts :scheduled-bodies {(:id node) certificate}))]
         (assoc equation :operations
                [(emitted-equation/make algorithm body emitted {:provenance provenance})]))
 

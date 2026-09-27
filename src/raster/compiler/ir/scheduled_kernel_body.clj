@@ -14,6 +14,7 @@
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.numerical-contract :as numerics]))
 
 (defrecord ScheduledKernelBody
@@ -337,7 +338,10 @@
              [:preconditions (into (:preconditions scheduled) (:preconditions intel-requirements))
               (:preconditions emitted)]
              [:abi expected-abi actual-abi]]]
-      (when-not (= expected actual)
+      (when-not (if (contains? #{:certificate :body} field)
+                  (or (identical? expected actual)
+                      (semantic-fingerprint/equivalent? expected actual))
+                  (= expected actual))
         (fail! :scheduled-kernel-body-artifact-projection
                "target artifact differs from its embedded scheduled-body certificate"
                {:field field :expected expected :actual actual})))

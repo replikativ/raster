@@ -39,6 +39,33 @@
           * (* (:value (get operands (nth expression 2))) (double (second expression))))]
     {:type (get-in step [:value :dtype]) :value value}))
 
+(deftest checked-dimension-algebra-shares-graph-extent-semantics
+  (let [make-plan
+        (fn [dimension scalar-type]
+          (invocation/from-prefix
+           {:id :checked-dimension
+            :parameters '[x n m]
+            :parameter-values {'x (array-value :float '(extent x))
+                               'n (scalar scalar-type) 'm (scalar :long)}
+            :bindings [] :binding-values {}
+            :program-values {'x (array-value :float dimension)
+                             'n (scalar scalar-type) 'm (scalar :long)}
+            :program-inputs '[x n m] :program-outputs '[x]}))
+        plan (make-plan '(clojure.core/* n m) :long)]
+    (is (= [6] (get-in (materialization/materialize plan [(float-array 6) 2 3] nil)
+                       [:program-buffers 'x :shape])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"producer shape differs"
+                          (materialization/materialize plan [(float-array 5) 2 3] nil)))
+    (is (thrown? ArithmeticException
+                 (materialization/materialize plan [(float-array 1) Long/MAX_VALUE 2] nil)))
+    (doseq [[dimension scalar-type arguments]
+            [['(clojure.core/* n m) :float [(float-array 6) 2.0 3]]
+             ['(clojure.core/* missing m) :long [(float-array 6) 2 3]]
+             ['(do n m) :long [(float-array 6) 2 3]]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (materialization/materialize (make-plan dimension scalar-type)
+                                                arguments nil))))))
+
 (deftest ordered-public-values-materialize-the-exact-program-boundary
   (let [source (double-array [1.0 2.0 3.0])
         result (materialization/materialize (fixture-plan) [source 0.25 7] evaluate-scalar)

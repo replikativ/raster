@@ -12,7 +12,8 @@
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.abstract-value :as av]))
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (defrecord ScalarRegion [parameters body result-dtype])
 (defrecord Reduction [operator identity map-region])
@@ -315,6 +316,19 @@
   "Check that a buffer descriptor's declared element footprint matches its logical axes."
   [{:keys [shape elements]}]
   (= elements (shape-elements shape)))
+
+(defn descriptor-launch-elements
+  "Project validated dimension algebra into checked graph storage arithmetic, not source code."
+  [descriptor]
+  (when-not (descriptor-shape-contract? descriptor)
+    (throw (ex-info "reduction buffer footprint differs from its logical dimensions"
+                    {:reason :segmented-reduction-descriptor-footprint :descriptor descriptor})))
+  (let [dimensions (vec (remove #(= 1 %) (:shape descriptor)))]
+    (cond
+      (empty? dimensions) 1
+      (= 1 (count dimensions)) (first dimensions)
+      (every? integer? dimensions) (:elements descriptor)
+      :else (apply launch/product dimensions))))
 
 (defn- storage-contract?
   [value {:keys [dtype elements] :as descriptor}]

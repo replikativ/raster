@@ -11,9 +11,11 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
 
@@ -21,29 +23,12 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :scheduled-equation-graph))))
 
-(declare integral-scalar-value?)
-
 (defn- value-elements
   [values derived-scalars value]
   (let [dimension-value (fn [dimension]
-                          ;; AbstractValue uses `(value id)` to distinguish a compound stable
-                          ;; value ID from shape syntax. KernelGraph owns explicit integer
-                          ;; expressions, so remove only that marker at this physical boundary.
-                          (if (and (seq? dimension)
-                                   (= 'value (first dimension))
-                                   (= 2 (count dimension)))
-                            (second dimension)
-                            (if (and (seq? dimension)
-                                     (not (contains? '#{extent unknown-dimension} (first dimension))))
-                              (let [decline! (fn [rule message data] (fail! rule message data))
-                                    scope (set (filter #(integral-scalar-value? (get values %))
-                                                       (util/free-syms dimension)))
-                                    ;; This is AbstractValue dimension algebra, not a host
-                                    ;; scalar expression. Its operations are mathematical extents
-                                    ;; (scan's n+1), so no source arithmetic dtype is inferred.
-                                    index (index-expression/lower dimension scope decline!)]
-                                (index-expression/to-launch-expression index decline!))
-                              dimension)))
+                          (index-expression/project-dimension
+                           dimension #(get-in values [% :dtype])
+                           (fn [rule message data] (fail! rule message data))))
         shape (mapv dimension-value (:shape value))
         elements (cond
                    (empty? shape) 1
@@ -239,14 +224,9 @@
                           value)))
      {} values)))
 
-(defn body-for-equations
-  "Return the dependency-closed scheduled program slice for a numerical equation region.
-
-   The equations must be an exact contiguous slice. Earlier host-scalar definitions are retained
-   as proof terms, while only terminal or escaping numerical results remain on the region boundary.
-   This is the graph-level seam used by schedules that refine several semantic equations into one
-   kernel; it does not itself authorize fusion or change their operations."
-  [parallel-program equations]
+(defn- dependency-closed-body
+  [parallel-program equations
+   {:keys [dialect source-dialect operation? algorithm? body-attributes]}]
   (let [parallel-program (program/validate! parallel-program)
         equations (vec equations)
         {:keys [indices host-gap]} (contiguous-equation-region! parallel-program equations)
@@ -257,7 +237,7 @@
         body-equations (vec (concat scalar-prefix host-gap equations))
         values (slice-value-contracts (:values parallel-program) body-equations)]
     (program/make
-     {:dialect :segop
+     {:dialect dialect
       :source nil
       :values values
       :inputs (program/infer-inputs body-equations)
@@ -265,15 +245,31 @@
       :outputs outputs
       :effects (reduce set/union #{} (map :effects body-equations))
       :diagnostics []
-      :provenance {:source-dialect :typed-soac
+      :provenance {:source-dialect source-dialect
                    :pass :scheduled-equation-graph}
-      :attributes {:host-control :explicit-typed-algorithm
-                   :equation-region (mapv :id equations)}
-      :operation? segop/segop-node?
-      :algorithm? (fn [candidate algorithm]
-                    (and (= algorithm (soac/validate! algorithm))
-                         (= (:operands candidate) (:inputs (soac/facts algorithm)))
-                         (= (:results candidate) (soac/outputs algorithm))))})))
+      :attributes (merge {:host-control :explicit-typed-algorithm
+                          :equation-region (mapv :id equations)}
+                         body-attributes)
+      :operation? operation?
+      :algorithm? algorithm?})))
+
+(defn body-for-equations
+  "Return the dependency-closed scheduled program slice for a numerical equation region.
+
+   The equations must be an exact contiguous slice. Earlier host-scalar definitions are retained
+   as proof terms, while only terminal or escaping numerical results remain on the region boundary.
+   This is the graph-level seam used by schedules that refine several semantic equations into one
+   kernel; it does not itself authorize fusion or change their operations."
+  [parallel-program equations]
+  (dependency-closed-body
+   parallel-program equations
+   {:dialect :segop
+    :source-dialect :typed-soac
+    :operation? segop/segop-node?
+    :algorithm? (fn [candidate algorithm]
+                  (and (= algorithm (soac/validate! algorithm))
+                       (= (:operands candidate) (:inputs (soac/facts algorithm)))
+                       (= (:results candidate) (soac/outputs algorithm))))}))
 
 (defn body-for-equation
   "Return the dependency-closed scheduled program slice for one numerical equation.
@@ -645,3 +641,136 @@
                     graph-contract
                     (assoc :provenance (:provenance graph-contract)
                            :attributes (:attributes graph-contract))))}))
+
+(defn- validated-scheduled-plan-operation?
+  [plan operation]
+  (cond
+    (= plan operation) true
+    (scheduled-body/scheduled-kernel-body? operation)
+    (try
+      (= plan (:source (scheduled-body/validate! operation)))
+      (catch clojure.lang.ExceptionInfo _ false))
+    :else false))
+
+(defn- plan-equation-boundary?
+  [values equation algorithm]
+  (cond
+    (swr/plan? algorithm)
+    (and (swr/equation-boundary? values equation algorithm)
+         (= 1 (count (:operations equation)))
+         (validated-scheduled-plan-operation? algorithm (first (:operations equation))))
+
+    (soac/program-form? algorithm)
+    (algorithm-boundary? equation algorithm)
+
+    :else false))
+
+(defn- plan-output-allocations!
+  [parallel-program plan]
+  (let [{:keys [id dtype elements]} (:output plan)
+        allocations (filterv #(= id (:destination %))
+                             (get-in parallel-program [:attributes :allocations] []))
+        fields #{:destination :source-binding-id :extent :initialization :dtype}
+        valid? (fn [allocation]
+                 (and (= fields (set (keys allocation)))
+                      (integer? (:source-binding-id allocation))
+                      (not (neg? (:source-binding-id allocation)))
+                      (or (= elements (:extent allocation))
+                          (and (symbol? (:extent allocation))
+                               (integral-scalar-value?
+                                (get-in parallel-program [:values (:extent allocation)]))))
+                      (= dtype (:dtype allocation))
+                      (contains? #{:zero :copy :unspecified}
+                                 (:initialization allocation))))]
+    (when-not (and (<= (count allocations) 1) (every? valid? allocations))
+      (fail! :segmented-plan-output-allocation
+             "segmented plan output has a malformed or conflicting allocation contract"
+             {:output id :descriptor (:output plan) :allocations allocations}))
+    ;; Keep the exact contract. In particular, :zero may not be discarded merely because the
+    ;; semantic graph has a :write use; only a later body-specific complete-write witness can
+    ;; authorize that optimization. Unrelated allocations remain owned by their equations.
+    allocations))
+
+(defn- descriptor-buffer
+  [values descriptor role]
+  (let [id (:id descriptor)
+        value (get values id)]
+    (graph/buffer id (:dtype descriptor) (swr/descriptor-launch-elements descriptor)
+                  (or (:memory-space value) :device) role)))
+
+(defn- plan-public-scalars
+  [values plan]
+  (mapv (fn [id]
+          ;; equation-boundary? already proves scalar shape, integral dtype and plain storage.
+          ;; Preserve that retained width: int-valued leaves remain int and may be declined by a
+          ;; schedule whose private body only supports long.
+          (graph/scalar id (get-in values [id :dtype])))
+        (ordered-distinct (filter symbol? (swr/runtime-parameter-values plan)))))
+
+(defn make-for-plan-equation
+  "Derive the schedule-neutral semantic graph for one exact segmented-reduction equation.
+
+   The returned body retains the equation's preceding host-scalar proof terms and either its typed
+   plan operation or an exact ScheduledKernelBody refinement. The graph deliberately stores the
+   original plan as its sole operation; target scheduling and emission are later phases. An exact
+   output-allocation contract is retained, never elided from a mere graph write permission."
+  [parallel-program equation]
+  (let [parallel-program (program/validate! parallel-program)
+        plan (:algorithm equation)
+        _ (when-not (and (swr/plan? plan)
+                         (plan-equation-boundary? (:values parallel-program) equation plan))
+            (fail! :segmented-plan-equation-boundary
+                   "segmented graph construction requires one exact validated plan equation"
+                   {:equation (:id equation) :algorithm plan}))
+        output-allocations (plan-output-allocations! parallel-program plan)
+        body (dependency-closed-body
+              parallel-program [equation]
+              {:dialect (:dialect parallel-program)
+               :source-dialect (:dialect parallel-program)
+               :operation? #(or (swr/plan? %)
+                                (scheduled-body/scheduled-kernel-body? %))
+               :algorithm? #(plan-equation-boundary? (:values parallel-program) %1 %2)
+               :body-attributes (when (seq output-allocations)
+                                  {:allocations output-allocations})})
+        input-buffers (mapv #(descriptor-buffer (:values body) % :input) (:operands plan))
+        output-buffer (descriptor-buffer (:values body) (:output plan) :output)
+        plan-scalars (plan-public-scalars (:values body) plan)
+        scalar-ids (set (map :id plan-scalars))
+        allocation-extent (:extent (first output-allocations))
+        allocation-check? (and allocation-extent
+                               (not= allocation-extent (get-in plan [:output :elements])))
+        available (set (concat (:inputs body)
+                               (mapcat :results (filter #(get-in % [:attributes :host-only])
+                                                        (:equations body)))))
+        _ (when (and allocation-check? (not (contains? available allocation-extent)))
+            (fail! :segmented-plan-allocation-scope
+                   "output allocation guard requires an earlier typed host scalar"
+                   {:extent allocation-extent :available available}))
+        scalars (cond-> plan-scalars
+                  (and allocation-check? (not (contains? scalar-ids allocation-extent)))
+                  (conj (graph/scalar allocation-extent
+                                      (get-in body [:values allocation-extent :dtype]))))
+        uses (into (mapv #(graph/->ValueUse (:id %) :read) input-buffers)
+                   [(graph/->ValueUse (:id output-buffer) :write)])
+        node (graph/->ScheduledKernel
+              [:segmented-weighted-reduction (:id plan)] plan uses scalar-ids [])
+        kernel-graph
+        (graph/make
+         {:inputs input-buffers
+          :outputs [output-buffer]
+          :scalars scalars
+          :preconditions (if allocation-check?
+                           [{:expression allocation-extent :op :=
+                             :value (swr/descriptor-launch-elements (:output plan))}]
+                           [])
+          :nodes [node]
+          :effects {:semantic (:effects equation)}
+          :provenance {:source-dialect :segmented-weighted-reduction
+                       :algorithm-dialect :segmented-weighted-reduction
+                       :schedule-dialect :semantic-plan
+                       :pass :scheduled-equation-graph}
+          :attributes {:equation (:id equation)
+                       :plan-id (:id plan)
+                       :full-result-descriptor (:output plan)
+                       :output-allocation (first output-allocations)}})]
+    {:body body :graph kernel-graph}))

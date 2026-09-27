@@ -9,6 +9,8 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.index-expression :as index-expression]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.invocation-plan :as invocation]))
 
 (defrecord MaterializedBuffer [id value shape source initialization])
@@ -64,6 +66,12 @@
 
 (declare scalar-number)
 
+(defn- resolve-dimension [dimension lexical values]
+  (launch/resolve-expression
+   #(scalar-number values (get lexical %))
+   (index-expression/project-dimension
+    dimension #(get-in values [(get lexical %) :type]) fail!)))
+
 (defn- runtime-buffer-shape [parameter abstract source lexical values]
   (let [id (:id parameter)
         symbol (:symbol parameter)
@@ -92,6 +100,7 @@
             (and (seq? dimension) (= 'extent (first dimension))
                  (= 2 (count dimension)) (= symbol (second dimension)))
             elements
+            (seq? dimension) (resolve-dimension dimension lexical values)
             :else
             (fail! :invocation-materialization-buffer-shape
                    "public buffer shape must resolve from a static extent, scalar, or self extent"
@@ -110,7 +119,8 @@
              "symbolic buffer shape requires an earlier typed scalar"
              {:value-id id :actual value}))
     (let [number (:value value)]
-      (when-not (integer? number)
+      (when-not (and (contains? #{:int :long} (dtype/canon (:type value)))
+                     (integer? number))
         (fail! :invocation-materialization-shape-value
                "buffer dimensions require integral scalar values"
                {:value-id id :actual value}))
@@ -138,6 +148,7 @@
                         "extent projection requires an earlier materialized buffer"
                         {:value-id id :dimension dimension :source source-symbol
                          :actual source})))
+             (seq? dimension) (resolve-dimension dimension lexical values)
              :else
              (fail! :invocation-materialization-shape-expression
                     "buffer shape must be canonicalized to integer or scalar SSA dimensions"

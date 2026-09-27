@@ -4,6 +4,15 @@
 
 (defrecord Example [a b])
 
+(deftest semantic-equality-preserves-floating-bits
+  (is (fingerprint/equivalent? {:x Double/NaN} {:x Double/NaN}))
+  (is (not (fingerprint/equivalent? 0.0 -0.0)))
+  (is (not (fingerprint/equivalent? (int 1) (long 1))))
+  (is (fingerprint/equivalent? (with-meta 'x {:tag 'long :line 1})
+                              (with-meta 'x {:tag 'long :line 2})))
+  (is (not (fingerprint/equivalent? (with-meta 'x {:tag 'long})
+                                   (with-meta 'x {:tag 'int})))))
+
 (defn- reason-of [thunk]
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))

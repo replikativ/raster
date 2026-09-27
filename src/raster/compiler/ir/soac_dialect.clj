@@ -1514,6 +1514,15 @@
       (mapv :destination storage)
       results)))
 
+(defn physical-result-map
+  "Project every logical result in a SOAC program to its certified physical storage identity."
+  [program]
+  (let [facts (facts program)]
+    (into {}
+          (mapcat (fn [equation]
+                    (map vector (nth equation 2) (physical-results facts equation))))
+          (equations program))))
+
 (defn parameter-layout
   "Split a SOAC lambda's ordered parameters into semantic roles."
   [equation]

@@ -148,8 +148,9 @@
                               (:temporaries kernel-graph)))
         expected (concat (map #(assoc % :graph-role :input) (:operands plan))
                          [(assoc (:output plan) :graph-role :output)])]
-    (doseq [{:keys [id dtype elements graph-role]} expected]
-      (let [actual (get storage id)]
+    (doseq [{:keys [id dtype graph-role] :as descriptor} expected]
+      (let [actual (get storage id)
+            elements (swr/descriptor-launch-elements descriptor)]
         (when-not (and actual
                        (= dtype (:dtype actual))
                        (= elements (:elements actual))

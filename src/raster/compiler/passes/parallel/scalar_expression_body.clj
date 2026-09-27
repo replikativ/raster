@@ -15,7 +15,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
 (defn- contains-indexed-load?

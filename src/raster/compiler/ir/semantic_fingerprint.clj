@@ -170,6 +170,12 @@
       (encode-value! out value))
     (.toByteArray buffer)))
 
+(defn equivalent?
+  "Exact canonical semantic equality, including floating-point bits and type metadata.
+   Unlike Clojure numeric equality, identical NaN payloads compare equal and signed zeros differ."
+  [left right]
+  (java.util.Arrays/equals ^bytes (canonical-bytes left) ^bytes (canonical-bytes right)))
+
 (defn fingerprint
   "Return a schema-qualified SHA-256 fingerprint of a supported pure compiler value."
   [value]
