@@ -51,6 +51,19 @@
                (operation-kinds (:operations operation)))))
    operations))
 
+(deftest register-tile-does-not-discard-unmodeled-product-terms
+  (doseq [expression ['(* 2.0 (* (aget A (+ (* i 5) k)) (aget B (+ (* k 2) j))))
+                      '(+ 1.0 (* (aget A (+ (* i 5) k)) (aget B (+ (* k 2) j))))]]
+    (let [proof (facts/from-components
+                 {:out 'C :free-axes [['i 3] ['j 2]] :contract-axes [['k 5]]
+                  :body expression :opts {:init (float 0.0)} :dtype :float})
+          error (try (register-tiled/lower proof {:tile small-tile}) nil
+                     (catch clojure.lang.ExceptionInfo error error))]
+      (is (facts/facts? proof))
+      (is (= :body-has-unmodeled-terms (:reason (facts/dense-matrix-view proof))))
+      (is (some? error) "a matrix schedule must not silently drop scalar work")
+      (is (= :body-has-unmodeled-terms (:missing-rule (ex-data error)))))))
+
 (deftest checked-zero-identities-reach-the-register-tiled-body
   (doseq [init '[0.0 (float 0.0) (double (float 0))]]
     (let [proof (contraction nil init)
