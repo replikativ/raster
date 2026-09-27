@@ -227,6 +227,14 @@
         (is (not (covers? guarded)) "a guarded store does not prove complete initialization")
         (is (nil? (coverage/symbolic-complete-write-shape guarded equation result))
             "symbolic coverage must retain guards too, including explicit false/nil")))
+    (let [branched (change-store
+                    #(soac/effect-branch
+                      [{:result 'coverage-choice :dtype :double}] true
+                      (soac/result-effect-region [] [%] [0.0])
+                      (soac/result-effect-region [] [%] [0.0])))
+          equation (first (soac/equations branched))]
+      (is (not (covers? branched)) "branch coverage needs its own proof, not a union of writes")
+      (is (nil? (coverage/symbolic-complete-write-shape branched equation result))))
     (is (not (coverage/rectangular-effect-covers?
                algorithm result 60 (assoc scalars destination-parameter {:type :long :value 1}))))
     (is (not (coverage/rectangular-effect-covers? algorithm result 61 scalars)))

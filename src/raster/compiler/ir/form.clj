@@ -136,6 +136,12 @@
         (= 'effect-region head)
         {:kind :effect-region :introduces-scope? true :liftable? false :head head}
 
+        (= 'effect-when head)
+        {:kind :effect-when :introduces-scope? true :liftable? false :head head}
+
+        (= 'effect-if head)
+        {:kind :effect-if :introduces-scope? true :liftable? false :head head}
+
         (= 'effect-loop head)
         {:kind :effect-loop :introduces-scope? true :liftable? false :head head}
 
@@ -199,6 +205,11 @@
   [effect]
   (when (seq? effect)
     (cond
+      (and (= 'effect-if (first effect))
+           (vector? (:results (second effect))))
+      (mapv (fn [ordinal] [1 :results ordinal :result])
+            (range (count (:results (second effect)))))
+
       (and (= 'effect-loop (first effect))
            (vector? (:carries (second effect))))
       (mapv (fn [ordinal] [1 :carries ordinal :result])
@@ -503,6 +514,25 @@
                                     offsets result-paths)]
                  (apply rl form 'effect-region locals' effects' (when result? body))))})))
 
+        :effect-when
+        (let [[_ predicate locals effects] form]
+          (when (and (= 4 (count form)) (vector? locals) (vector? effects))
+            {:sequential? false :scopes []
+             :outer [predicate (list 'effect-region locals effects)]
+             :rebuild (fn [_ [predicate [_ locals effects]]]
+                        (rl form 'effect-when predicate locals effects))}))
+
+        ;; Each arm owns a separate lexical region. Result declarations enter scope only
+        ;; through the surrounding effect spine, never in the predicate or either arm.
+        :effect-if
+        (let [[_ attributes predicate then-region else-region] form]
+          (when (and (= 5 (count form)) (map? attributes)
+                     (vector? (:results attributes)))
+            {:sequential? false :scopes []
+             :outer [predicate then-region else-region]
+             :rebuild (fn [_ [predicate then-region else-region]]
+                        (rl form 'effect-if attributes predicate then-region else-region))}))
+
         ;; The result declaration is not an input use. Conflict/dtype fields are static
         ;; contracts, while destination, coordinate, guard and contribution are lexical uses.
         :effect
@@ -645,7 +675,7 @@
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]
   (contains? #{:scope :lambda :par :fold :product-fold :while-fold
-               :effect-region :effect-loop}
+               :effect-region :effect-loop :effect-when :effect-if}
              (:kind (form-info form))))
 
 (defn call-form?

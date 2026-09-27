@@ -76,10 +76,21 @@
 
 (defn- effect-accesses
   [effect destination-parameters locals loops]
-  (let [{:keys [region loop index lower upper-bound extent lambda carries destination destination-index
+  (let [{:keys [region branch then else loop index lower upper-bound extent lambda carries destination destination-index
                 predicate value conflict]}
         (dialect/effect-parts effect)]
     (cond
+      branch
+      (into (expression-accesses predicate destination-parameters locals loops)
+            (mapcat (fn [arm]
+                      (let [scoped (local-accesses (:locals arm) destination-parameters locals loops)]
+                        (concat (:accesses scoped)
+                                (mapcat #(effect-accesses % destination-parameters (:locals scoped) loops)
+                                        (:effects arm))
+                                (expressions-accesses (:yields arm)
+                                                     destination-parameters (:locals scoped) loops))))
+                    [then else]))
+
       ;; A guarded region evaluates its decision in the enclosing scope, before arm locals.
       ;; Omitting these reads can falsely certify dst[0] -> dst[i] as item-owned.
       region (into (expression-accesses predicate destination-parameters locals loops)
@@ -220,9 +231,13 @@
                       [(:accumulator attributes)])
 
                     (dialect/effect-loop-form? form)
-                    (mapcat (juxt :parameter :result) (:carries (dialect/effect-parts form))))))
+                    (mapcat (juxt :parameter :result) (:carries (dialect/effect-parts form)))
+
+                    (and (seq? form) (= 'effect-if (first form)))
+                    (map :result (:results (dialect/effect-parts form))))))
         (filter #(or (dialect/scalar-fold-form? %)
-                     (dialect/effect-loop-form? %))
+                     (dialect/effect-loop-form? %)
+                     (and (seq? %) (= 'effect-if (first %))))
                 (tree-seq coll? seq lambda))))
 
 (defn- equation-ownership

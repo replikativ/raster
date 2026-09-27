@@ -36,6 +36,16 @@
                   (effect-when predicate
                     [(let-value branch-local :dtype init-expr) ...]
                     [(effect destination-parameter conflict destination-index true value) ...])
+                  (effect-if {:results [{:result branch-result :dtype} ...]}
+                    predicate
+                    (effect-region [(let-value then-local :dtype init-expr) ...]
+                                   [(effect destination-parameter conflict
+                                            destination-index true value) ...]
+                                   [then-yield ...])
+                    (effect-region [(let-value else-local :dtype init-expr) ...]
+                                   [(effect destination-parameter conflict
+                                            destination-index true value) ...]
+                                   [else-yield ...]))
                   ...]))))
         (= equation-id [result ...]
            (reduce {:index i :extent n
@@ -231,6 +241,17 @@
        (= #{:result :dtype} (set (keys value)))
        (symbol? (:result value))
        (contains? #{:int :long :float :double} (:dtype value))))
+
+(defn effect-branch-attributes?
+  "Canonical typed result tuple exported by one binary ordered-effect branch."
+  [value]
+  (let [results (:results value)]
+    (and (map? value)
+         (= #{:results} (set (keys value)))
+         (vector? results)
+         (seq results)
+         (every? effect-value-result? results)
+         (= (count results) (count (distinct (map :result results)))))))
 
 (defn stencil-attributes?
   "Attributes for a boundary-aware neighborhood map.
@@ -565,6 +586,7 @@
              [ema effect-map-attributes?]
              [ec effect-conflict?]
              [evr effect-value-result?]
+             [eba effect-branch-attributes?]
              [ela effect-loop-attributes?]
              [sta stencil-attributes?]
              [ra reduce-attributes?]
@@ -601,6 +623,7 @@
                   ?s:destination-index ?s:predicate ?s:value)
           (effect ?sym:destination ?ec:conflict
                   ?s:destination-index ?s:predicate ?s:value ?evr)
+          (effect-if ?eba ?s:predicate ?rer:then ?rer:else)
           (effect-loop ?ela ?s:extent ?el)
           (effect-loop ?ela ?s:extent [(?:+ s)] ?rel))
 
@@ -612,6 +635,9 @@
 
   (EffectRegion [er :enforce]
                 (effect-region [(?:* d)] [(?:+ e)]))
+
+  (ResultEffectRegion [rer :enforce]
+                      (effect-region [(?:* d)] [(?:* e)] [(?:+ s)]))
 
   (Lambda [l :enforce]
           (lambda [(?:* ?sym:parameter)] ?r))
@@ -750,14 +776,20 @@
 
 (defn effect-form?
   "Whether a typed ordered-effect item has canonical syntax: a store, counted loop, lexical
-   region, or guarded lexical region."
+   region, guarded lexical region, or result-bearing binary branch."
   [value]
   (or (and (seq? value) (= 'effect (first value)) (contains? #{6 7} (count value)))
       (effect-loop-form? value)
       (and (seq? value) (= 'effect-region (first value)) (= 3 (count value))
            (vector? (second value)) (vector? (nth value 2)))
       (and (seq? value) (= 'effect-when (first value)) (= 4 (count value))
-           (vector? (nth value 2)) (vector? (nth value 3)))))
+           (vector? (nth value 2)) (vector? (nth value 3)))
+      (and (seq? value) (= 'effect-if (first value)) (= 5 (count value))
+           (effect-branch-attributes? (second value))
+           (every? #(and (seq? %) (= 'effect-region (first %)) (= 4 (count %))
+                         (vector? (second %)) (vector? (nth % 2)) (vector? (nth % 3))
+                         (seq (nth % 3)))
+                   (drop 3 value)))))
 
 (declare lambda-parts)
 
@@ -766,7 +798,8 @@
    index, predicate and value; loops yield `:loop true` with `:index`, `:lower`, `:extent` and
    the `:lambda`. Result-bearing loops expose typed `:carries` with initializers and
    updates; their parameter vector is [index & carry-parameters]. Guarded regions expose their
-   predicate beside the lexical region."
+   predicate beside the lexical region. Result-bearing branches expose their declared merge tuple
+   and two lexical arms with independent locals, effects and yields."
   [value]
   (cond
     (and (effect-form? value) (= 'effect-region (first value)))
@@ -776,6 +809,15 @@
     (let [[_ predicate locals effects] value]
       {:predicate predicate
        :region (lambda-parts (list 'lambda [] (list 'effect-region locals effects)))})
+
+    (and (effect-form? value) (= 'effect-if (first value)))
+    (let [[_ {:keys [results]} predicate then-region else-region] value
+          arm-parts (fn [region]
+                      (let [{:keys [locals body-results effect-results]}
+                            (lambda-parts (list 'lambda [] region))]
+                        {:locals locals :effects body-results :yields effect-results}))]
+      {:branch true :predicate predicate :results results
+       :then (arm-parts then-region) :else (arm-parts else-region)})
 
     (effect-loop-form? value)
     (let [[_ attributes extent] value
@@ -802,10 +844,13 @@
         result (assoc :result (:result result) :result-dtype (:dtype result))))))
 
 (defn effect-part-leaves
-  "The store effects of projected effect parts, descending into store loops."
+  "The store effects of projected effect parts, descending into loops, regions and branches."
   [parts]
   (vec (mapcat (fn [part]
                  (cond
+                   (:branch part)
+                   (mapcat #(effect-part-leaves (map effect-parts %))
+                           [(:effects (:then part)) (:effects (:else part))])
                    (:region part)
                    (effect-part-leaves (map effect-parts (:body-results (:region part))))
                    (:loop part)
@@ -816,20 +861,28 @@
 
 (defn effect-leaves
   "The store effects of lowered effect maps (`{:loop {:effects […]}}` entries), descending into
-   store loops."
+   structured effect scopes."
   [effects]
   (vec (mapcat (fn [effect]
-                 (if-let [scope (or (:loop effect) (:region effect))]
-                   (effect-leaves (:effects scope))
-                   [effect]))
+                 (if-let [branch (:branch effect)]
+                   (mapcat effect-leaves [(:effects (:then branch))
+                                          (:effects (:else branch))])
+                   (if-let [scope (or (:loop effect) (:region effect))]
+                     (effect-leaves (:effects scope))
+                     [effect])))
                effects)))
 
 (defn scheduled-effect-carries?
-  "Whether scheduled effects contain a result-carrying loop, including nested effect scopes."
+  "Whether scheduled effects contain result-carrying control, including nested effect scopes."
   [effects]
   (boolean (some (fn [effect]
-                   (when-let [loop (or (:loop effect) (:region effect))]
-                     (or (seq (:carries loop)) (scheduled-effect-carries? (:effects loop))))) effects)))
+                   (if-let [branch (:branch effect)]
+                     (or (seq (:results branch))
+                         (scheduled-effect-carries? (:effects (:then branch)))
+                         (scheduled-effect-carries? (:effects (:else branch))))
+                     (when-let [loop (or (:loop effect) (:region effect))]
+                       (or (seq (:carries loop))
+                           (scheduled-effect-carries? (:effects loop)))))) effects)))
 
 (defn- effect-parts-contain?
   "Search lexical effect scopes without confusing a region with a store leaf."
@@ -837,18 +890,24 @@
   (boolean
    (some (fn [part]
            (or (predicate part)
+               (when (:branch part)
+                 (or (effect-parts-contain? predicate
+                                            (map effect-parts (:effects (:then part))))
+                     (effect-parts-contain? predicate
+                                            (map effect-parts (:effects (:else part))))))
                (when-let [region (or (:region part)
                                      (when (:loop part) (lambda-parts (:lambda part))))]
                  (effect-parts-contain? predicate (map effect-parts (:body-results region))))))
          parts)))
 
 (defn strict-effect-scalar-policy?
-  "Carried values and nested lexical scopes require retained arithmetic types and explicit
+  "Carried/merged values and nested lexical scopes require retained arithmetic types and explicit
    storage conversion. Legacy flat, uncarried effects keep their existing policy."
   [effects]
   (boolean
    (some (fn [effect]
            (or (:result effect)
+               (:branch effect)
                (:region effect)
                (when-let [loop (:loop effect)]
                  (or (seq (:carries loop))
@@ -856,38 +915,123 @@
                      (strict-effect-scalar-policy? (:effects loop))))))
          effects)))
 
-(declare fail! validate-scalar-fold-scopes!)
+(declare fail! validate-scalar-fold-scopes! scalar-convert-form? scalar-convert-parts)
 
 (defn validate-scheduled-effect-carries!
-  "Check the lexical contract of ordered carry tuples in scheduled effect loops.
+  "Check lexical contracts of ordered carry tuples and result-bearing branches.
 
    A carry is {:parameter symbol :result symbol :dtype dtype :init scalar :update scalar}.
    Initializers see the enclosing region; updates additionally see the loop index, parameter
-   and ordered loop locals. Only the result escapes, and only to subsequent effects. This is
-   shared by JVM and KernelBody lowering; it does not admit new source/dialect forms."
+   and ordered loop locals. A branch predicate sees only its entry scope; each arm sees its own
+   locals and ordered effect results, and its pure yield tuple defines the declared merged results.
+   Only declared loop or branch results escape, and only to subsequent effects. This is shared by
+   JVM and KernelBody lowering; it does not admit new source forms."
   [effects scope]
   (letfn [(fail [message data]
             (throw (ex-info message (assoc data :reason :scheduled-effect-carry))))
           (closed! [expression bound field]
             (validate-scalar-fold-scopes! expression bound :scheduled-effect)
             (when-let [unbound (seq (util/free-syms expression bound))]
-              (fail "effect carry expression is outside its lexical scope"
+              (fail "ordered effect expression is outside its lexical scope"
                     {:field field :unbound (set unbound) :expression expression})))
+          (canonical-effect-term? [expression]
+            (boolean
+             (letfn [(walk [form]
+                       (cond
+                         (and (seq? form) (= 'quote (first form))) false
+                         (seq? form)
+                         (or (contains? #{'effect 'effect-loop 'effect-region 'effect-when
+                                          'effect-if 'write}
+                                        (first form))
+                             (some walk (rest form)))
+                         (coll? form) (some walk form)
+                         :else false))]
+               (walk expression))))
+          (pure-closed! [expression bound field]
+            (closed! expression bound field)
+            (when (or (util/effectful? expression)
+                      (some descriptor/aset-call? (tree-seq coll? seq expression))
+                      (canonical-effect-term? expression))
+              (fail "effect branch predicates and yields must be pure scalar expressions"
+                    {:field field :expression expression})))
           (locals! [locals bound]
             (reduce (fn [scope {:keys [id dtype init] :as local}]
                       (when-not (and (symbol? id) (not (contains? scope id))
                                      (dtype/known? dtype) (= dtype (dtype/canon dtype))
                                      (:scalar-tag (dtype/info dtype))
                                      (not (util/effectful? init))
-                                     (not-any? descriptor/aset-call? (tree-seq coll? seq init)))
+                                     (not-any? descriptor/aset-call? (tree-seq coll? seq init))
+                                     (not (canonical-effect-term? init)))
                         (fail "effect locals require fresh typed pure scalar bindings" {:local local}))
                       (closed! init scope :local)
                       (conj scope id)) bound locals))
           (contains-loop? [effects]
-            (some #(or (:loop %) (when (:region %) (contains-loop? (get-in % [:region :effects])))) effects))
+            (some #(or (:loop %)
+                       (when (:region %) (contains-loop? (get-in % [:region :effects])))
+                       (when-let [branch (:branch %)]
+                         (or (contains-loop? (get-in branch [:then :effects]))
+                             (contains-loop? (get-in branch [:else :effects])))))
+                  effects))
+          (exported-result-dtypes [effects]
+            (reduce (fn [types effect]
+                      (cond
+                        (:branch effect)
+                        (into types (map (juxt :result :dtype) (get-in effect [:branch :results])))
+                        (seq (get-in effect [:loop :carries]))
+                        (into types (map (juxt :result :dtype) (get-in effect [:loop :carries])))
+                        (:result effect) (assoc types (:result effect) (:result-dtype effect))
+                        :else types))
+                    {} effects))
+          (known-expression-dtype [expression known-types]
+            (or (when (symbol? expression) (get known-types expression))
+                (when (scalar-convert-form? expression)
+                  (get-in (scalar-convert-parts expression) [:attributes :target-dtype]))
+                (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                        dtype/dtype-for-scalar-tag)))
           (walk [effects bound]
             (reduce
              (fn [bound effect]
+               (if-let [branch (:branch effect)]
+                 (let [{:keys [predicate results then else] :as branch} branch
+                       result-names (mapv :result results)
+                       result-dtypes (mapv :dtype results)
+                       arm-scope
+                       (fn [arm label]
+                         (when-not (= #{:locals :effects :yields} (set (keys arm)))
+                           (fail "effect branch arms require canonical lexical fields"
+                                 {:arm label :branch branch :fields (set (keys arm))}))
+                         (let [{:keys [locals effects yields]} arm]
+                           (when-not (and (vector? locals) (vector? effects) (vector? yields)
+                                          (= (count results) (count yields)))
+                             (fail "effect branch arms must yield the declared result arity"
+                                   {:arm label :results results :yields yields}))
+                           (let [after-effects (walk effects (locals! locals bound))
+                                 known-types (into (into {} (map (juxt :id :dtype) locals))
+                                                   (exported-result-dtypes effects))]
+                             (doseq [[ordinal result expression]
+                                     (map vector (range) results yields)]
+                               (pure-closed! expression after-effects
+                                             [:yield label ordinal])
+                               (when-let [actual (known-expression-dtype expression known-types)]
+                                 (when-not (= (:dtype result) actual)
+                                   (fail "effect branch yield dtype disagrees with its result"
+                                         {:arm label :ordinal ordinal :result result
+                                          :yield expression :actual-dtype actual}))))
+                             after-effects)))]
+                   (when-not (and (= #{:branch} (set (keys effect)))
+                                  (= #{:predicate :results :then :else} (set (keys branch)))
+                                  (vector? results) (seq results)
+                                  (every? #(= #{:result :dtype} (set (keys %))) results)
+                                  (every? symbol? result-names)
+                                  (= (count result-names) (count (distinct result-names)))
+                                  (every? #{:int :long :float :double} result-dtypes)
+                                  (empty? (set/intersection bound (set result-names))))
+                     (fail "effect branch results require fresh typed scalar binders"
+                           {:branch branch :scope bound}))
+                   (pure-closed! predicate bound :predicate)
+                   (arm-scope then :then)
+                   (arm-scope else :else)
+                   (into bound result-names))
                (if-let [region (:region effect)]
                  (do
                    (when (contains? region :predicate)
@@ -933,7 +1077,7 @@
                          (fail "atomic effect result requires a fresh typed scalar binder"
                                {:result result :dtype result-dtype}))
                        (conj bound result))
-                     bound)))))
+                     bound))))))
              bound effects))]
     (walk effects (set scope))
     effects))
@@ -957,6 +1101,16 @@
   "Construct a lexical ordered-effect region evaluated only when `predicate` is true."
   [predicate locals effects]
   (list 'effect-when predicate (vec locals) (vec effects)))
+
+(defn result-effect-region
+  "Construct one lexical result-bearing branch arm. Effects may be empty; yields may not."
+  [locals effects yields]
+  (list 'effect-region (vec locals) (vec effects) (vec yields)))
+
+(defn effect-branch
+  "Construct a canonical typed binary ordered-effect branch with phi-like scalar results."
+  [results predicate then-arm else-arm]
+  (list 'effect-if {:results (vec results)} predicate then-arm else-arm))
 
 (defn effect-lambda-form
   "Construct a canonical TypedSOAC ordered-effect lambda."
@@ -993,6 +1147,11 @@
   (let [{:keys [loop index lower upper-bound extent lambda carries] :as part}
         (effect-parts effect)]
     (cond
+      (:branch part)
+      {:branch {:predicate (:predicate part)
+                :results (:results part)
+                :then (update (:then part) :effects #(mapv scheduled-effect %))
+                :else (update (:else part) :effects #(mapv scheduled-effect %))}}
       (:region part)
       {:region (cond-> {:locals (:locals (:region part))
                         :effects (mapv scheduled-effect (:body-results (:region part)))}
@@ -1583,53 +1742,66 @@
             region-bound (into (set parameters) (cons (:index attributes) (map :id locals)))]
         (letfn [(validate-parts [parts scope]
                   (reduce
-         (fn [scope part]
-           (cond
-             (:region part)
-             (let [{:keys [locals body-results]} (:region part)]
-               (validate-parts (mapv effect-parts body-results) (into scope (map :id locals)))
-               scope)
-             (:loop part)
-             (let [{loop-parameters :parameters loop-locals :locals :keys [body-results] :as region}
-                   (lambda-parts (:lambda part))
-                   carries (:carries part)
-                   expected (into [(:index part)] (map :parameter carries))
-                   ids (into expected (map :id loop-locals))
-                   inner (mapv effect-parts body-results)]
-               (when (and (seq carries)
-                          (some (fn [expression]
-                                  (or (util/effectful? expression)
-                                      (some descriptor/aset-call? (tree-seq coll? seq expression))))
-                                (mapcat (juxt :init :update) carries)))
-                 (fail! :typed-soac-effect-carry-write
-                        "carried values cannot hide stores outside the ordered effect spine"
-                        {:equation equation-id :carries carries}))
-               (when-not (and (= expected loop-parameters)
-                              (= (boolean (seq carries)) (contains? region :effect-results))
-                              (= (count ids) (count (distinct ids)))
-                              (empty? (set/intersection scope (set ids)))
-                              (every? some? inner)
-                              ;; Ordinary counted loops may contain another ordered effect loop.
-                              ;; A carried loop still forbids it until exported nested carry state
-                              ;; has an explicit lexical contract.
-                              (or (empty? carries) (not (effect-parts-contain? :loop inner)))
-                              (seq inner))
-                 (fail! :typed-soac-effect-loop
-                        "effect loops require matching typed binders and one closed effect level"
-                        {:equation equation-id :loop (:index part) :parameters loop-parameters}))
-               (validate-parts inner (into scope ids))
-               (into scope (map :result carries)))
-             :else
-             (if-let [result (:result part)]
-               (let [result-dtype (:result-dtype part)]
-                 (when-not (and (symbol? result) (not (contains? scope result))
-                                (contains? #{:int :long :float :double} result-dtype))
-                   (fail! :typed-soac-effect-result
-                          "atomic effect result requires a fresh typed scalar binder"
-                          {:equation equation-id :result result :dtype result-dtype}))
-                 (conj scope result))
-               scope)))
-         scope parts))]
+                   (fn [scope part]
+                     (cond
+                       (:branch part)
+                       (let [result-names (mapv :result (:results part))]
+                         (doseq [arm [(:then part) (:else part)]]
+                           (validate-parts (mapv effect-parts (:effects arm))
+                                           (into scope (map :id (:locals arm)))))
+                         (into scope result-names))
+                       (:region part)
+                       (let [{:keys [locals body-results]} (:region part)]
+                         (validate-parts (mapv effect-parts body-results)
+                                         (into scope (map :id locals)))
+                         scope)
+                       (:loop part)
+                       (let [{loop-parameters :parameters loop-locals :locals
+                              :keys [body-results] :as region}
+                             (lambda-parts (:lambda part))
+                             carries (:carries part)
+                             expected (into [(:index part)] (map :parameter carries))
+                             ids (into expected (map :id loop-locals))
+                             inner (mapv effect-parts body-results)]
+                         (when (and (seq carries)
+                                    (some (fn [expression]
+                                            (or (util/effectful? expression)
+                                                (some descriptor/aset-call?
+                                                      (tree-seq coll? seq expression))))
+                                          (mapcat (juxt :init :update) carries)))
+                           (fail! :typed-soac-effect-carry-write
+                                  "carried values cannot hide stores outside the ordered effect spine"
+                                  {:equation equation-id :carries carries}))
+                         (when-not (and (= expected loop-parameters)
+                                        (= (boolean (seq carries))
+                                           (contains? region :effect-results))
+                                        (= (count ids) (count (distinct ids)))
+                                        (empty? (set/intersection scope (set ids)))
+                                        (every? some? inner)
+                                        ;; Ordinary counted loops may contain another ordered
+                                        ;; effect loop. A carried loop still forbids it until
+                                        ;; exported nested carry state has an explicit contract.
+                                        (or (empty? carries)
+                                            (not (effect-parts-contain? :loop inner)))
+                                        (seq inner))
+                           (fail! :typed-soac-effect-loop
+                                  "effect loops require matching typed binders and one closed effect level"
+                                  {:equation equation-id :loop (:index part)
+                                   :parameters loop-parameters}))
+                         (validate-parts inner (into scope ids))
+                         (into scope (map :result carries)))
+                       :else
+                       (if-let [result (:result part)]
+                         (let [result-dtype (:result-dtype part)]
+                           (when-not (and (symbol? result) (not (contains? scope result))
+                                          (contains? #{:int :long :float :double} result-dtype))
+                             (fail! :typed-soac-effect-result
+                                    "atomic effect result requires a fresh typed scalar binder"
+                                    {:equation equation-id :result result
+                                     :dtype result-dtype}))
+                           (conj scope result))
+                         scope)))
+                   scope parts))]
           (validate-parts effects region-bound))
         (try
           (validate-scheduled-effect-carries! (mapv scheduled-effect body-results) region-bound)
@@ -2168,7 +2340,7 @@
         (when (= 'effect-map kind)
           (let [lambda (:lambda (operation-parts equation))
                 parts (mapv effect-parts (:body-results (lambda-parts lambda)))]
-            (when (or (effect-parts-contain? :region parts)
+            (when (or (effect-parts-contain? #(or (:region %) (:branch %)) parts)
                       (scheduled-effect-carries?
                        (mapv scheduled-effect (:body-results (lambda-parts lambda)))))
               (let [destination-parameters (:destination-parameters (parameter-layout equation))

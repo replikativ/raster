@@ -8,6 +8,30 @@
 ;; free-syms: scoped free variable collection
 ;; ================================================================
 
+(deftest result-effect-branches-bind-only-their-continuation
+  (let [source '(effect-region []
+                 [(effect out :unique 0 true joined)
+                  (effect-if {:results [{:result joined :dtype :float}]} decision
+                    (effect-region [(let-value choice :float seed)] [] [choice])
+                    (effect-region [(let-value choice :float seed)] [] [choice]))
+                  (effect out :unique 1 true joined)])
+        replaced (util/subst-syms {'seed 'joined} source)
+        branch (nth (nth replaced 2) 1)
+        result (get-in (vec branch) [1 :results 0 :result])]
+    (is (= '#{out joined decision seed} (util/free-syms source)))
+    (is (= '#{out joined decision} (util/free-syms replaced)))
+    (is (not= 'joined result) "the exported result cannot capture the substituted arm input")
+    (is (= 'joined (last (first (nth replaced 2)))) "the earlier use remains external")
+    (is (= result (last (last (nth replaced 2)))) "only the continuation sees the result")))
+
+(deftest guarded-effect-locals-have-lexical-scope
+  (let [source '(effect-when decision [(let-value choice :float seed)]
+                 [(effect out :unique 0 true choice)])
+        replaced (util/subst-syms {'seed 'choice} source)]
+    (is (= '#{decision seed out} (util/free-syms source)))
+    (is (= '#{decision choice out} (util/free-syms replaced)))
+    (is (not= 'choice (second (first (nth replaced 2)))))))
+
 (deftest free-syms-simple-test
   (testing "bare symbols"
     (is (= #{'x} (util/free-syms 'x)))

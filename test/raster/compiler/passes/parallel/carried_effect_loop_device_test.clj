@@ -78,3 +78,44 @@
                                 (repeat 3 -77.0)))
                    (vec (read! totals))) "zero-trip carry and inactive output tail are preserved")
             (finally (free! totals) (free! words) (free! x))))))))
+
+(deftest result-effect-branches-execute-on-opencl
+  (if-not @probe/opencl-available?
+    (probe/opencl-skip! "result-bearing effect branches")
+    (let [runtime (find-ns 'raster.gpu.ocl-runtime)
+          register! (ns-resolve runtime 'register-kernel!)
+          buffer-of-array (ns-resolve runtime 'buffer-of-array)
+          bind-call (ns-resolve runtime 'bind-kernel-call)
+          launch! (ns-resolve runtime 'launch-registered-bound!)
+          read! (ns-resolve runtime 'buffer->array)
+          free! (ns-resolve runtime 'free-buffer!)]
+      (doseq [trips [0 1 2 7]]
+        (let [operation (first (lower/lower-typed-effect-map
+                                (fixture/typed-branch-program trips) :ze:0))
+              compiled (fixture/artifact operation :opencl-portable
+                                         :scalar-types {'rows :long 'seed :float})
+              values (float-array (map inc (range 16)))
+              expected (float-array (concat (map #(if (even? %) 1.0 -1.0) (range 16)) [-77 -77]))
+              sums (mapv (fn [row]
+                           (loop [k 0 acc (float 0.25) other (float 1)]
+                             (if (< k trips)
+                               (let [position (+ (* row 8) k)
+                                     loaded (aget values position)
+                                     positive? (pos? (aget expected position))
+                                     choice (float (if positive? (+ acc loaded) (- acc loaded)))]
+                                 (aset-float expected position (if positive? (- loaded) loaded))
+                                 (recur (inc k) other choice))
+                               acc))) (range 2))
+              x (buffer-of-array values :float)
+              words (buffer-of-array (float-array (concat (map #(if (even? %) 1.0 -1.0) (range 16)) [-77 -77])) :float)
+              totals (buffer-of-array (float-array [-77 -77 -77]) :float)]
+          (try
+            (register! (:kernel-name compiled) compiled)
+            (launch! (bind-call (call/make compiled
+                                          (mapv {'x x 'words words 'totals totals
+                                                 'rows {:type :long :value 2}
+                                                 'seed {:type :float :value 0.25}}
+                                                (:arguments compiled)))))
+            (is (= (vec expected) (vec (read! words))) "the entry predicate chooses exactly one mutating arm")
+            (is (= (conj sums -77.0) (vec (read! totals))) "branch results feed simultaneous loop carries")
+            (finally (free! totals) (free! words) (free! x))))))))

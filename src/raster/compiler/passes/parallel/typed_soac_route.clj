@@ -667,8 +667,8 @@
   [program]
   (letfn [(nested-region? [effects]
             (some (fn [effect]
-                    (let [{:keys [region loop lambda]} (dialect/effect-parts effect)]
-                      (or region
+                    (let [{:keys [region branch loop lambda]} (dialect/effect-parts effect)]
+                      (or region branch
                           (and loop (nested-region?
                                      (:body-results (dialect/lambda-parts lambda)))))))
                   effects))]

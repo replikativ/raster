@@ -288,6 +288,17 @@
         (fn substitute-effect [substitutions effect]
           (let [substitute #(util/subst-syms substitutions %)]
             (cond
+              (:branch effect)
+              (update effect :branch
+                      (fn [branch]
+                        (reduce (fn [branch arm]
+                                  (update branch arm
+                                          (fn [region]
+                                            (-> region
+                                                (update :locals #(mapv (fn [local] (update local :init substitute)) %))
+                                                (update :effects #(mapv (partial substitute-effect substitutions) %))
+                                                (update :yields #(mapv substitute %))))))
+                                (update branch :predicate substitute) [:then :else])))
               (:region effect)
               (update effect :region
                       (fn [region]
@@ -309,161 +320,246 @@
                                             (mapv #(substitute-effect substitutions %) effects))))))
               :else (reduce (fn [effect field] (update effect field substitute))
                       effect [:destination :destination-index :predicate :value]))))
-        lower-effect
-        (fn lower-effect
-          [environment {:keys [destination conflict destination-index predicate value
-                               result result-dtype] :as effect}]
-          (if-let [{:keys [predicate locals effects] :as region} (:region effect)]
-            (let [guarded? (contains? region :predicate)
-                  selected (when guarded? (form/constant-if-branch predicate))]
-              (if (= :else selected)
-                {:environment environment :operations [] :masks []}
-                (let [dynamic-guard? (and guarded? (nil? selected))
-                  lowered-predicate (when dynamic-guard?
-                                      ((:lower lowerer) predicate :predicate environment))
-                  state (lower-locals locals environment)
-                  inner (reduce (fn [{:keys [environment operations masks]} effect]
-                                  (let [next (lower-effect
-                                              environment
-                                              (substitute-effect (:substitutions state) effect))]
-                                    (-> next
-                                        (update :operations #(into operations %))
-                                        (update :masks #(into masks %)))))
-                                {:environment (:environment state)
-                                 :operations (:operations state) :masks []}
-                                effects)]
-              ;; Nested locals/results remain lexical. A guard dominates their evaluation, so a
-              ;; checked conversion in the region is never speculated into an inactive lane.
-              {:environment environment
-               :operations
-               (if dynamic-guard?
-                 (vec (concat (:operations lowered-predicate)
-                              [(body/->IfRegion (:result lowered-predicate)
-                                                (conj (vec (:operations inner)) (body/->Yield []))
-                                                [(body/->Yield [])] [])]))
-                 (:operations inner))
-               :masks (:masks inner)})))
-          (if-let [{loop-index :index loop-locals :locals loop-effects :effects
-                    :keys [lower upper-bound extent carries]} (:loop effect)]
-            ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its
-            ;; locals are SSA values scoped to one iteration and its stores keep their own
-            ;; per-destination contracts.
-            (let [cast-carry (fn [carry expression environment]
-                               (let [lowered ((:lower lowerer) expression (:dtype carry) environment)]
-                                 ((:cast lowerer) lowered (:dtype carry) expression)))
-                  initials (mapv #(cast-carry % (:init %) environment) carries)
-                  ;; Lexical sibling loops may reuse source binders; KernelBody identities may not.
-                  source-index loop-index
-                  loop-index (if (seq carries) ((:fresh-binding lowerer) "effect-index") loop-index)
-                  parameters (mapv (fn [_] ((:fresh-binding lowerer) "effect-carry")) carries)
-                  renames (into {source-index loop-index} (map vector (map :parameter carries) parameters))
-                  loop-locals (mapv #(update % :init (partial util/subst-syms renames)) loop-locals)
-                  loop-effects (mapv #(substitute-effect renames %) loop-effects)
-                  loop-environment (into (assoc environment loop-index :long)
-                                         (map vector parameters (map :dtype carries)))
-                  loop-state (lower-locals loop-locals loop-environment)
-                  inner (reduce (fn [{:keys [environment operations masks]} effect]
-                                  (let [next (lower-effect environment
-                                                           (substitute-effect (:substitutions loop-state) effect))]
-                                    (-> next
-                                        (update :operations #(into operations %))
-                                        (update :masks #(into masks %)))))
-                                {:environment (:environment loop-state)
-                                 :operations [] :masks []} loop-effects)
-                  update-values (mapv (fn [carry]
-                                 (cast-carry carry
-                                  (util/subst-syms (:substitutions loop-state)
-                                                  (util/subst-syms renames (:update carry)))
-                                  (:environment inner))) carries)
-                  loop-operation (body/->ForLoop
-                                  (body/value loop-index :long)
-                                  (lower-index lower (set (keys environment)) environment)
-                                  (lower-index extent (set (keys environment)) environment)
-                                  1
-                                  (mapv (fn [carry parameter initial]
-                                          (body/->LoopArg (body/value parameter (:dtype carry))
-                                                          (:result initial)))
-                                        carries parameters initials)
-                                  (vec (concat (:operations loop-state) (:operations inner)
-                                               (mapcat :operations update-values)
-                                               [(body/->Yield (mapv :result update-values))]))
-                                  (mapv #(body/value (:result %) (:dtype %)) carries)
-                                  (cond-> {:association :ordered :source-order true}
-                                    (= :inclusive upper-bound)
-                                    (assoc :upper-bound :inclusive)))]
-              {:operations (conj (vec (mapcat :operations initials)) loop-operation)
-               :masks (:masks inner)
-               :environment (into environment (map (juxt :result :dtype) carries))})
-          (do
-          (when-not (contains? output-set destination)
-            (decline! :effect-destination
-                      "ordered effect targets an undeclared result"
-                      {:operation (:id segmap) :effect effect}))
-          (let [coordinate-value (when (or (contains-indexed-load? destination-index)
+        lower-effects
+        (fn lower-effects [effects environment substitutions]
+          (reduce
+           (fn [{:keys [environment operations masks substitutions]} source-effect]
+             (let [effect (substitute-effect substitutions source-effect)
+                   {:keys [destination conflict destination-index predicate value
+                           result result-dtype]} effect
+                   lowered
+                   (if-let [{:keys [predicate results then else]} (:branch effect)]
+                     (let [lower-arm
+                           (fn [{:keys [locals effects yields]}]
+                             (let [local-state (lower-locals locals environment)
+                                   inner (lower-effects effects (:environment local-state)
+                                                        (:substitutions local-state))
+                                   values
+                                   (mapv (fn [{:keys [dtype]} expression]
+                                           (let [expression
+                                                 (util/subst-syms (:substitutions inner) expression)
+                                                 value ((:lower lowerer) expression dtype
+                                                        (:environment inner))]
+                                             ((:cast lowerer) value dtype expression)))
+                                         results yields)]
+                               {:operations (vec (concat (:operations local-state)
+                                                        (:operations inner)
+                                                        (mapcat :operations values)))
+                                :values (mapv :result values) :masks (:masks inner)}))
+                           selected (form/constant-if-branch predicate)
+                           target-results (mapv (fn [_]
+                                                  ((:fresh-binding lowerer) "effect-branch-result"))
+                                                results)
+                           declarations (mapv (fn [target {:keys [dtype]}]
+                                                (body/value target dtype))
+                                              target-results results)
+                           result-substitutions (zipmap (map :result results) target-results)
+                           emitted
+                           (if selected
+                             (let [arm (lower-arm (if (= :then selected) then else))]
+                               {:operations
+                                (into (:operations arm)
+                                      (map (fn [declaration value]
+                                             (body/->ScalarCompute
+                                              declaration
+                                              (body/cast-expression
+                                               value (:type declaration) :exact :exact)))
+                                           declarations (:values arm)))
+                                :masks (:masks arm)})
+                             (let [condition ((:lower lowerer) predicate :predicate environment)
+                                   then (lower-arm then)
+                                   else (lower-arm else)]
+                               {:operations
+                                (conj (vec (:operations condition))
+                                      (body/->IfRegion
+                                       (:result condition)
+                                       (conj (:operations then) (body/->Yield (:values then)))
+                                       (conj (:operations else) (body/->Yield (:values else)))
+                                       declarations))
+                                :masks (into (:masks then) (:masks else))}))]
+                       (assoc emitted
+                              :environment
+                              (into environment (map vector target-results (map :dtype results)))
+                              :substitutions (into substitutions result-substitutions)))
+                     (if-let [{:keys [predicate locals effects] :as region} (:region effect)]
+                       (let [guarded? (contains? region :predicate)
+                             selected (when guarded? (form/constant-if-branch predicate))]
+                         (if (= :else selected)
+                           {:environment environment :operations [] :masks []
+                            :substitutions substitutions}
+                           (let [dynamic-guard? (and guarded? (nil? selected))
+                                 lowered-predicate
+                                 (when dynamic-guard?
+                                   ((:lower lowerer) predicate :predicate environment))
+                                 local-state (lower-locals locals environment)
+                                 inner (lower-effects effects (:environment local-state)
+                                                      (:substitutions local-state))
+                                 inner-operations (vec (concat (:operations local-state)
+                                                               (:operations inner)))]
+                             ;; Region results remain lexical. A guard dominates their evaluation,
+                             ;; so checked conversions are never speculated into an inactive lane.
+                             {:environment environment
+                              :operations
+                              (if dynamic-guard?
+                                (vec (concat (:operations lowered-predicate)
+                                             [(body/->IfRegion
+                                               (:result lowered-predicate)
+                                               (conj inner-operations (body/->Yield []))
+                                               [(body/->Yield [])] [])]))
+                                inner-operations)
+                              :masks (:masks inner)
+                              :substitutions substitutions})))
+                       (if-let [{loop-index :index loop-locals :locals loop-effects :effects
+                                 :keys [lower upper-bound extent carries]} (:loop effect)]
+                         ;; A counted store loop lowers to ordered target SSA. Source binders may be
+                         ;; reused in sibling scopes, so every target parameter/result is fresh.
+                         (let [cast-carry
+                               (fn [carry expression environment]
+                                 (let [lowered ((:lower lowerer) expression (:dtype carry)
+                                                environment)]
+                                   ((:cast lowerer) lowered (:dtype carry) expression)))
+                               initials (mapv #(cast-carry % (:init %) environment) carries)
+                               source-index loop-index
+                               loop-index ((:fresh-binding lowerer) "effect-index")
+                               parameters (mapv (fn [_]
+                                                  ((:fresh-binding lowerer) "effect-carry"))
+                                                carries)
+                               target-results (mapv (fn [_]
+                                                      ((:fresh-binding lowerer)
+                                                       "effect-loop-result"))
+                                                    carries)
+                               result-substitutions
+                               (zipmap (map :result carries) target-results)
+                               renames (into {source-index loop-index}
+                                             (map vector (map :parameter carries) parameters))
+                               loop-locals
+                               (mapv #(update % :init (partial util/subst-syms renames))
+                                     loop-locals)
+                               loop-effects (mapv #(substitute-effect renames %) loop-effects)
+                               loop-environment
+                               (into (assoc environment loop-index :long)
+                                     (map vector parameters (map :dtype carries)))
+                               loop-state (lower-locals loop-locals loop-environment)
+                               inner (lower-effects loop-effects (:environment loop-state)
+                                                    (:substitutions loop-state))
+                               update-values
+                               (mapv (fn [carry]
+                                       (let [expression
+                                             (->> (:update carry)
+                                                  (util/subst-syms renames)
+                                                  (util/subst-syms (:substitutions inner)))]
+                                         (cast-carry carry expression (:environment inner))))
+                                     carries)
+                               loop-operation
+                               (body/->ForLoop
+                                (body/value loop-index :long)
+                                (lower-index lower (set (keys environment)) environment)
+                                (lower-index extent (set (keys environment)) environment)
+                                1
+                                (mapv (fn [carry parameter initial]
+                                        (body/->LoopArg (body/value parameter (:dtype carry))
+                                                        (:result initial)))
+                                      carries parameters initials)
+                                (vec (concat (:operations loop-state) (:operations inner)
+                                             (mapcat :operations update-values)
+                                             [(body/->Yield (mapv :result update-values))]))
+                                (mapv (fn [target carry]
+                                        (body/value target (:dtype carry)))
+                                      target-results carries)
+                                (cond-> {:association :ordered :source-order true}
+                                  (= :inclusive upper-bound)
+                                  (assoc :upper-bound :inclusive)))]
+                           {:operations (conj (vec (mapcat :operations initials)) loop-operation)
+                            :masks (:masks inner)
+                            :environment
+                            (into environment (map vector target-results (map :dtype carries)))
+                            :substitutions (into substitutions result-substitutions)})
+                         (do
+                           (when-not (contains? output-set destination)
+                             (decline! :effect-destination
+                                       "ordered effect targets an undeclared result"
+                                       {:operation (:id segmap) :effect effect}))
+                           (let [coordinate-value
+                                 (when (or (contains-indexed-load? destination-index)
                                            (index-expression/requires-scalar-evaluation?
                                             destination-index))
                                    ((:lower lowerer) destination-index :long environment))
-                coordinate-expression (if coordinate-value
-                                        (:result coordinate-value)
-                                        (lower-index destination-index
-                                                     (set (keys environment)) environment))
-                lowered-value ((:lower lowerer) value (get array-types destination) environment)
-                operator (when (= :reduce (:kind conflict))
-                           (intrinsics/canonical (:operator conflict)))
-                _ (when (and (= :reduce (:kind conflict)) (nil? operator))
-                    (decline! :effect-reduction-operator
-                              "ordered reduction effect has no canonical scalar operator"
-                              {:operation (:id segmap) :effect effect}))
-                _ (when (and result (not= :reduce (:kind conflict)))
-                    (decline! :effect-atomic-result
-                              "a value-returning atomic effect requires a reduction"
-                              {:operation (:id segmap) :effect effect}))
-                lowered-predicate (when (and result
-                                             (not (contains? #{true 1} predicate)))
-                                    ((:lower lowerer) predicate :predicate environment))
-                guarded-atomic-result (when lowered-predicate
-                                        ((:fresh-binding lowerer) "atomic-old"))
-                store (if (= :reduce (:kind conflict))
-                        (cond-> (body/->AtomicRMW destination [coordinate-expression]
-                                                  (:result lowered-value) operator
-                                                  (when-not lowered-predicate :map-active))
-                          result (assoc :result
-                                        (body/value (or guarded-atomic-result result)
+                                 coordinate-expression
+                                 (if coordinate-value
+                                   (:result coordinate-value)
+                                   (lower-index destination-index
+                                                (set (keys environment)) environment))
+                                 lowered-value
+                                 ((:lower lowerer) value (get array-types destination) environment)
+                                 operator (when (= :reduce (:kind conflict))
+                                            (intrinsics/canonical (:operator conflict)))
+                                 _ (when (and (= :reduce (:kind conflict)) (nil? operator))
+                                     (decline! :effect-reduction-operator
+                                               "ordered reduction effect has no canonical scalar operator"
+                                               {:operation (:id segmap) :effect effect}))
+                                 _ (when (and result (not= :reduce (:kind conflict)))
+                                     (decline! :effect-atomic-result
+                                               "a value-returning atomic effect requires a reduction"
+                                               {:operation (:id segmap) :effect effect}))
+                                 lowered-predicate
+                                 (when (and result (not (contains? #{true 1} predicate)))
+                                   ((:lower lowerer) predicate :predicate environment))
+                                 target-result (when result
+                                                 ((:fresh-binding lowerer)
+                                                  "effect-atomic-result"))
+                                 guarded-atomic-result
+                                 (when lowered-predicate
+                                   ((:fresh-binding lowerer) "effect-atomic-old"))
+                                 store
+                                 (if (= :reduce (:kind conflict))
+                                   (cond-> (body/->AtomicRMW
+                                            destination [coordinate-expression]
+                                            (:result lowered-value) operator
+                                            (when-not lowered-predicate :map-active))
+                                     result (assoc :result
+                                                   (body/value
+                                                    (or guarded-atomic-result target-result)
                                                     result-dtype)))
-                        (body/->ScalarStore destination [coordinate-expression]
-                                            (:result lowered-value) :map-active))
-                atomic-operations (vec (concat (:operations coordinate-value)
-                                               (:operations lowered-value) [store]))
-                effect-operations
-                (if lowered-predicate
-                  (vec (concat
-                        (:operations lowered-predicate)
-                        [(body/->IfRegion
-                          (:result lowered-predicate)
-                          (conj atomic-operations
-                                (body/->Yield [guarded-atomic-result]))
-                          [(body/->Yield [(body/literal 0 result-dtype)])]
-                          [(body/value result result-dtype)])]))
-                  atomic-operations)
-                operations
-                (if (or result (contains? #{true 1} predicate))
-                  effect-operations
-                  (let [lowered-predicate ((:lower lowerer) predicate :predicate environment)]
-                    (vec (concat (:operations lowered-predicate)
-                                 [(body/->IfRegion (:result lowered-predicate)
-                                                   (conj effect-operations (body/->Yield []))
-                                                   [(body/->Yield [])] [])]))))]
-            {:operations operations
-             :masks []
-             :environment (cond-> environment result (assoc result result-dtype))})))))
-        effect-state
-        (reduce (fn [{:keys [environment operations masks]} effect]
-                   (let [next (lower-effect environment
-                                            (substitute-effect (:substitutions local-state) effect))]
-                     (-> next
-                         (update :operations #(into operations %))
-                         (update :masks #(into masks %)))))
-                 {:environment environment :operations [] :masks []} effects)
+                                   (body/->ScalarStore destination [coordinate-expression]
+                                                       (:result lowered-value) :map-active))
+                                 atomic-operations
+                                 (vec (concat (:operations coordinate-value)
+                                              (:operations lowered-value) [store]))
+                                 effect-operations
+                                 (if lowered-predicate
+                                   (vec (concat
+                                         (:operations lowered-predicate)
+                                         [(body/->IfRegion
+                                           (:result lowered-predicate)
+                                           (conj atomic-operations
+                                                 (body/->Yield [guarded-atomic-result]))
+                                           [(body/->Yield [(body/literal 0 result-dtype)])]
+                                           [(body/value target-result result-dtype)])]))
+                                   atomic-operations)
+                                 operations
+                                 (if (or result (contains? #{true 1} predicate))
+                                   effect-operations
+                                   (let [lowered-predicate
+                                         ((:lower lowerer) predicate :predicate environment)]
+                                     (vec (concat
+                                           (:operations lowered-predicate)
+                                           [(body/->IfRegion
+                                             (:result lowered-predicate)
+                                             (conj effect-operations (body/->Yield []))
+                                             [(body/->Yield [])] [])]))))]
+                             {:operations operations
+                              :masks []
+                              :environment (cond-> environment
+                                             result (assoc target-result result-dtype))
+                              :substitutions (cond-> substitutions
+                                               result (assoc result target-result))})))))]
+               (-> lowered
+                   (update :operations #(into operations %))
+                   (update :masks #(into masks %)))))
+           {:environment environment :operations [] :masks []
+            :substitutions substitutions}
+           effects))
+        effect-state (lower-effects effects environment (:substitutions local-state))
         effect-operations (:operations effect-state)
         primary-lowered (when primary-output
                           ((:lower lowerer) primary-form
