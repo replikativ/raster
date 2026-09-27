@@ -6,6 +6,9 @@
 (deftest resident-backend-facts-are-shared
   (is (= :ze (gpu/backend-type :ze:0)))
   (is (= :ocl (gpu/backend-type :ocl:0)))
+  (is (= :ze (gpu/backend-type :ze-contracts))
+      "synthetic compiler target IDs retain the established prefix behavior")
+  (is (= :ocl (gpu/backend-type :ocl-equation-first-source-test)))
   (is (= {:namespace 'raster.gpu.ze-runtime
           :memory-space :shared
           :coherence :host-coherent
@@ -26,6 +29,6 @@
         (is (some? error))
         (is (= device-id (:device-id (ex-data error))))
         (is (true? (:compile-only? (ex-data error)))))))
-  (doseq [device-id [:ze-bogus :ocl-bogus nil]]
+  (doseq [device-id [:unknown:0 nil]]
     (is (thrown? clojure.lang.ExceptionInfo
                  (backend/backend-type device-id)))))

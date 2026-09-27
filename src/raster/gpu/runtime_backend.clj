@@ -18,8 +18,8 @@
   [device-id]
   (let [s (when (keyword? device-id) (name device-id))
         backend (cond
-                  (and s (str/starts-with? s "ze:")) :ze
-                  (and s (str/starts-with? s "ocl:")) :ocl)]
+                  (and s (str/starts-with? s "ze")) :ze
+                  (and s (str/starts-with? s "ocl")) :ocl)]
     (if (and backend (contains? resident-backends backend))
       backend
       (throw (ex-info "No resident GPU runtime for device; use :ze:N or :ocl:N"
