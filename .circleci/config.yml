@@ -57,6 +57,11 @@ jobs:
           root: ~/
           paths:
             - repo
+            # The cache key is immutable. A setup job can repair an old incomplete cache locally
+            # but cannot overwrite it; pass the completed dependency tree to this workflow's
+            # parallel test and compiler jobs instead of making each shard refetch Maven artifacts.
+            - .m2
+            - .gitlibs
 
   build:
     executor: clojure-java24
@@ -79,10 +84,6 @@ jobs:
       - attach_workspace:
           at: ~/
       - install-clojure
-      - restore_cache:
-          keys:
-            - v2-dependencies-{{ checksum "deps.edn" }}
-            - v2-dependencies-
       - run:
           name: Install OpenBLAS + clang
           command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev clang
@@ -158,10 +159,6 @@ jobs:
       - attach_workspace:
           at: ~/
       - install-clojure
-      - restore_cache:
-          keys:
-            - v2-dependencies-{{ checksum "deps.edn" }}
-            - v2-dependencies-
       - run:
           name: Install OpenBLAS, clang and a CPU OpenCL runtime
           command: |
