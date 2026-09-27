@@ -1,0 +1,56 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-27"
+ :compiler-revision "a615cf94"
+ :target :ze:0
+ :device "Intel(R) Arc(TM) Graphics"
+ :driver "26.05.37020.3"
+ :java-version "25.0.1+8-LTS-jvmci-b01"
+ :environment-tag "local-arc-diagnostic-20260927"
+ :heap-limit "4 GiB"
+ :workload :public-q4-k-schedule-comparison
+ :dtype :float
+ :weight-format :q4_K
+ :activation-format :q8_K
+ :clock :device-event-span
+ :scope {:cache-state :warm-resident
+         :transfers-included? false
+         :validation-included? false
+         :promotion? false}
+ :oracle {:source :raster.quant.ggml/vec-dot
+          :comparison :raw-float-bits
+          :every-replay? true
+          :passed? true}
+ :notes "Two candidates were interleaved in rotating round-robin order. Both showed a simultaneous step change after round 4, so neither distribution is stationary and neither result should update runtime policy. Compile and bind times include first-use work and are not an isolated compiler-cache benchmark. The machine had other active processes and swap in use."
+ :runs
+ [{:shape [1 256 64]
+   :rounds 4 :warmup-rounds 2
+   :generated-product {:compiler :equation-first
+                       :samples-ns [46250.0 19270.833333333336
+                                    18854.166666666668 18333.333333333336]
+                       :median-ns 18854.166666666668 :cv 0.46276369032214726
+                       :stationary? false}
+   :serial-source {:compiler :resident-descriptor
+                   :samples-ns [112187.5 79479.16666666667
+                                78333.33333333334 78645.83333333334]
+                   :median-ns 78645.83333333334 :cv 0.16584005457518475
+                   :stationary? false}}
+  {:shape [1 1024 640]
+   :rounds 12 :warmup-rounds 4
+   :generated-product {:compiler :equation-first
+                       :compile-ns 63751144528 :bind-ns 17382668301
+                       :resident-step-count 1
+                       :samples-ns [104375.0 99375.0 98958.33333333334
+                                    95625.0 100208.33333333334 36770.833333333336
+                                    36770.833333333336 37187.5 37083.333333333336
+                                    36562.5 36562.5 36562.5]
+                       :median-ns 37083.333333333336 :cv 0.4932211953324085
+                       :stationary? false}
+   :serial-source {:compiler :resident-descriptor
+                   :compile-ns 48140937647 :bind-ns 40628914
+                   :resident-step-count 1
+                   :samples-ns [290416.6666666667 287812.5 288750.0
+                                288333.3333333334 246979.1666666667 100520.83333333334
+                                100625.0 100416.66666666667 100104.16666666667
+                                100312.5 101041.66666666667 100312.5]
+                   :median-ns 100625.0 :cv 0.5094349076265706
+                   :stationary? false}}]}

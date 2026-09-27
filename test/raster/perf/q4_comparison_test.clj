@@ -18,6 +18,8 @@
                   (fn [_ {:keys [id compiler]} _]
                     (swap! events conj [:compile id compiler])
                     {:id id :compiler compiler :descriptor {:steps [{:convention :fixture}]}})
+                  compiled/preparation-report
+                  (fn [prepared] {:kind :fixture :candidate (:id prepared)})
                   compiled/instantiate!
                   (fn [prepared opts]
                     (swap! events conj [:bind (:id prepared) opts])
@@ -25,6 +27,8 @@
                       (throw (ex-info "injected bind failure" {})))
                     {:id (:id prepared) :executable (:id prepared)
                      :out-tree [{:sym 'y :node :y}]})
+                  compiled/instantiation-report
+                  (fn [instance] {:kind :fixture :candidate (:id instance)})
                   compiled/profile
                   (fn [instance]
                     (swap! events conj [:profile (:id instance)])
@@ -46,6 +50,10 @@
       (let [result (comparison/run! options)]
         (is (= [:generated-product :serial-source] (mapv :id (:candidates result))))
         (is (= [:equation-first :resident-descriptor] (mapv :compiler (:candidates result))))
+        (is (= [:generated-product :serial-source]
+               (mapv #(get-in % [:preparation-report :candidate]) (:candidates result))))
+        (is (= [:generated-product :serial-source]
+               (mapv #(get-in % [:instantiation-report :candidate]) (:candidates result))))
         (is (= 10 (count (filter #(= :profile (first %)) @events))))
         (is (= 10 (count (filter #(= :poison (first %)) @events))))
         (is (every? #(every? Float/isNaN %) (vals @buffers)))
