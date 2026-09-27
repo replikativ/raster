@@ -7,7 +7,9 @@
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.compiled :as compiled]
-            [raster.gpu.link :as gpu-link]))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
+            [raster.gpu.parallel-program :as parallel-program]))
 
 (defn component [_x _w _n])
 
@@ -21,9 +23,23 @@
     (is (= :compiled-execution-info-unbound
            (try (compiled/execution-info (compiled/map->Prepared {}))
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (is (= :link-program-execution-info-unsupported
-           (try (gpu-link/execution-info (assoc live :prepared-program :equation-first))
-                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (let [prepared (parallel-program/map->PreparedParallelProgram
+                    {:binding-order [:fixed-phase]
+                     :handles {:fixed-phase :bound-handle}
+                     :closed? (atom false)})
+          fixed-info (assoc info :selection :fixed :admission [])
+          artifact (assoc compiled :executable (assoc live :prepared-program prepared))]
+      (with-redefs [gpu/kernel-graph-execution-info
+                    (fn [actual-session handle]
+                      (is (identical? session actual-session))
+                      (is (= :bound-handle handle))
+                      fixed-info)]
+        (is (= [{:phase :fixed-phase :executable fixed-info}]
+               (compiled/execution-info artifact))))
+      (reset! (:closed? prepared) true)
+      (is (= :parallel-program-closed
+             (try (compiled/execution-info artifact)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
     (reset! (:closed? live) true)
     (is (thrown? clojure.lang.ExceptionInfo (compiled/execution-info compiled)))))
 
