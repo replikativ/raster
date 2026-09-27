@@ -116,10 +116,14 @@
         (let [started (System/nanoTime)
               prepared (prepare-candidate target candidate arguments)
               compile-ns (- (System/nanoTime) started)
+              preparation-report (compiled/preparation-report prepared)
               started (System/nanoTime)
-              instance (compiled/instantiate! prepared {:profile? true})]
+              instance (compiled/instantiate! prepared {:profile? true})
+              instantiation-report (compiled/instantiation-report instance)]
           (swap! live conj {:id id :compiler compiler :prepared prepared :instance instance
-                           :compile-ns compile-ns :bind-ns (- (System/nanoTime) started)})))
+                           :compile-ns compile-ns :bind-ns (- (System/nanoTime) started)
+                           :preparation-report preparation-report
+                           :instantiation-report instantiation-report})))
       (let [samplers
             (mapv (fn [{:keys [id instance]}]
                     (let [resident (:executable instance)
@@ -160,8 +164,11 @@
                  :validation-included? false :promotion? false}
          :replay-profiles @profiles
          :candidates
-         (mapv (fn [{:keys [id compiler prepared instance compile-ns bind-ns]}]
+         (mapv (fn [{:keys [id compiler prepared instance compile-ns bind-ns
+                           preparation-report instantiation-report]}]
                  {:id id :compiler compiler :compile-ns compile-ns :bind-ns bind-ns
+                  :preparation-report preparation-report
+                  :instantiation-report instantiation-report
                   :execution (compiled/ir instance)
                   :resident-step-count (count (get-in prepared [:descriptor :steps]))})
                @live)

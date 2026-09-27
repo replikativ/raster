@@ -73,7 +73,10 @@ were 37 and 101 µs, respectively, but both series failed stationarity. Their fi
 times were about 64 and 48 seconds, and generated binding took about 17 seconds. These numbers
 identify separate compile/bind and resident-kernel performance questions, not a stable speedup
 or a tuning decision. Repeat from a warm REPL under controlled device load before comparing
-against llama.cpp or promoting a schedule.
+against llama.cpp or promoting a schedule. Future runs also retain the compiler's preparation
+report and the linked executable's instantiation-phase report beside the coarse elapsed times,
+so a long first invocation can be attributed to template compilation, plan lowering, allocation,
+or backend binding rather than being mistaken for device execution.
 
 ## Baseline selection
 
