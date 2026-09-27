@@ -139,7 +139,8 @@
                  (:region effect)
                  (let [{:keys [predicate locals effects]} (:region effect)
                        region (emit-region locals (ordered-effects effects emitters))]
-                   (if predicate (list 'if predicate region) region))
+                   (if (contains? (:region effect) :predicate)
+                     (list 'if predicate region) region))
                  loop (emit-loop loop (ordered-effects (:effects loop) emitters))
                  :else (emit-store effect))
           continuation (ordered-effects (next effects) emitters)]

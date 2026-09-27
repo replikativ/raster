@@ -11,6 +11,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -293,7 +294,7 @@
                         (cond-> (-> region
                             (update :locals #(mapv (fn [local] (update local :init substitute)) %))
                             (update :effects #(mapv (partial substitute-effect substitutions) %)))
-                          (:predicate region) (update :predicate substitute))))
+                          (contains? region :predicate) (update :predicate substitute))))
               (:loop effect)
               (let [loop (:loop effect)]
               (assoc effect :loop
@@ -312,8 +313,13 @@
         (fn lower-effect
           [environment {:keys [destination conflict destination-index predicate value
                                result result-dtype] :as effect}]
-          (if-let [{:keys [predicate locals effects]} (:region effect)]
-            (let [lowered-predicate (when predicate
+          (if-let [{:keys [predicate locals effects] :as region} (:region effect)]
+            (let [guarded? (contains? region :predicate)
+                  selected (when guarded? (form/constant-if-branch predicate))]
+              (if (= :else selected)
+                {:environment environment :operations [] :masks []}
+                (let [dynamic-guard? (and guarded? (nil? selected))
+                  lowered-predicate (when dynamic-guard?
                                       ((:lower lowerer) predicate :predicate environment))
                   state (lower-locals locals environment)
                   inner (reduce (fn [{:keys [environment operations masks]} effect]
@@ -330,13 +336,13 @@
               ;; checked conversion in the region is never speculated into an inactive lane.
               {:environment environment
                :operations
-               (if predicate
+               (if dynamic-guard?
                  (vec (concat (:operations lowered-predicate)
                               [(body/->IfRegion (:result lowered-predicate)
                                                 (conj (vec (:operations inner)) (body/->Yield []))
                                                 [(body/->Yield [])] [])]))
                  (:operations inner))
-               :masks (:masks inner)})
+               :masks (:masks inner)})))
           (if-let [{loop-index :index loop-locals :locals loop-effects :effects
                     :keys [lower upper-bound extent carries]} (:loop effect)]
             ;; A counted store loop lowers to an ordered ForLoop nested in the work item: its

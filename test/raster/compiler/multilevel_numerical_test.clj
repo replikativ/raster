@@ -221,6 +221,12 @@
         covers? #(boolean (coverage/rectangular-effect-covers? % result 60 scalars))
         change-store (fn [f] (walk/postwalk (fn [x] (if (and (seq? x) (= 'effect (first x))) (f x) x)) algorithm))]
     (is (covers? algorithm))
+    (doseq [predicate [false nil true '(clojure.core/> 1 0)]]
+      (let [guarded (change-store #(list 'effect-when predicate [] [%]))
+            equation (first (soac/equations guarded))]
+        (is (not (covers? guarded)) "a guarded store does not prove complete initialization")
+        (is (nil? (coverage/symbolic-complete-write-shape guarded equation result))
+            "symbolic coverage must retain guards too, including explicit false/nil")))
     (is (not (coverage/rectangular-effect-covers?
                algorithm result 60 (assoc scalars destination-parameter {:type :long :value 1}))))
     (is (not (coverage/rectangular-effect-covers? algorithm result 61 scalars)))

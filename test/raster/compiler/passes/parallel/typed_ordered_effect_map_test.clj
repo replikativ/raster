@@ -4,6 +4,7 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -19,6 +20,38 @@
 (def ^:private extent (av/tensor {:dtype :long :shape []}))
 (def ^:private vector-value (av/tensor {:dtype :float :shape '[n]}))
 (def ^:private scalar-slot (av/tensor {:dtype :float :shape '[1]}))
+
+(deftest literal-false-region-guard-is-not-an-absent-guard
+  (doseq [predicate [false nil true]]
+    (let [source (list 'let*
+                       ['effect (list 'raster.par/map-void! 'i 'n
+                                      (list 'if predicate
+                                            '(dotimes [k 1]
+                                               (clojure.core/aset out i (float 3)))))]
+                       'effect)
+          program (frontend/form->program source
+                                         {:dtype :float :array-types {'out :float}
+                                          :scalar-types {'n :long}})
+          effect (-> program dialect/equations first dialect/operation-parts
+                     :lambda dialect/lambda-parts :body-results first)
+          scheduled (dialect/scheduled-effect effect)
+          operation (first (soac-lower/lower-typed-effect-map program :ze:0 :dtype :float))
+          host (eval (list 'fn '[out n] (segop-simd/compile-effect-segmap operation)))
+          out (float-array [9 9 9])]
+      (is (= 'effect-when (first effect)))
+      (is (contains? (:region scheduled) :predicate))
+      (is (= predicate (get-in scheduled [:region :predicate])))
+      (host out 3)
+      (is (= (if predicate [3.0 3.0 3.0] [9.0 9.0 9.0]) (vec out)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (let [artifact (segop-opencl/generate-scheduled-segmap-kernel
+                        operation :dtype :float :target-dialect target
+                        :array-types {'out :float} :scalar-types {'n :long})]
+          (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+          (is (= (boolean predicate)
+                 (boolean (some #(instance? raster.compiler.ir.kernel_body.ScalarStore %)
+                                (tree-seq coll? seq (get-in artifact [:attributes :kernel-body])))))
+              "constant-false arms emit no stores; constant-true arms keep their stores"))))))
 
 (defn- effect-program
   []
