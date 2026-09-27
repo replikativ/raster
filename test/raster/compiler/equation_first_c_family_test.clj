@@ -13,6 +13,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -111,6 +112,19 @@
           "strict policy does not introduce narrowed operand storage")
       (is (= (sources via-sugar) (sources via-schedule))
           "equivalent policies preserve emitted arithmetic on every source target")
+      (when (= operation #'dl-nn/linear-nb)
+        (let [contractions (filter #(= :contraction
+                                       (get-in % [:provenance :scheduled-operation :source :phase]))
+                                   (:kernels via-sugar))]
+          (is (seq contractions) "the contraction uses the common scheduled-body certificate")
+          (doseq [artifact contractions
+                  :let [certificate (get-in artifact [:provenance :scheduled-operation])]]
+            (is (scheduled-body/scheduled-kernel-body? certificate))
+            (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+            (is (= :same-typed-ssa-evaluation-order (get-in certificate [:numerics :policy])))
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (scheduled-body/validate-artifact-projection!
+                          certificate (assoc artifact :arguments (vec (reverse (:arguments artifact))))))))))
       (with-redefs [pipeline/get-walked-body
                     (fn [& _] (throw (ex-info "invalid policy reached semantic compilation" {})))]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown compilation"

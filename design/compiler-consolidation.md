@@ -120,6 +120,14 @@ ScheduledKernelBody and equation/graph certificates remain necessary for optimiz
 The next optimized equation-first slice must preserve those certificates and explicit numerical
 policy rather than copying the descriptor route or silently enabling FP16/FMA changes.
 
+Equation-first portable contractions now bind their existing ordered KernelBody to the exact
+graph node as a ScheduledKernelBody and use the common target emitter. The graph path no longer
+builds a separate portable artifact and then attaches only its source operation. Ordered arguments,
+derived scalar conversions, memory uses and realized launch are checked before target projection.
+The numerical witness preserves the existing typed SSA evaluation schedule; it is not a promise
+of bitwise equality between target compilers. The older descriptor body's source/ABI adapter and
+direct low-level artifact tests still exist; removing those requires migrating their callers.
+
 Equation-first execution reporting now observes actual fixed graph bindings through the public
 compiled API. It shares compact executable descriptions with descriptor admission reports and
 does not infer precision from the requested policy. Loop carry variants are reported once per

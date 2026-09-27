@@ -15,6 +15,7 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.contraction-body :as contraction-body]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
@@ -514,3 +515,34 @@
           :reason (:missing-rule (ex-data exception))
           :detail (ex-data exception)}
          (throw exception))))))
+
+(defn schedule-portable-for-node
+  "Bind the existing ordered portable body to its exact graph node before target projection.
+
+   Facts must come from the typed contraction boundary. This adds ABI/effect/launch validation,
+   not a new arithmetic schedule or a cross-target bitwise floating-point guarantee."
+  [node graph contract-facts descriptor options]
+  (let [operation (:operation node)
+        planned (plan-portable-body contract-facts operation descriptor options)]
+    (when-not (:ok planned)
+      (throw (ex-info "segmented reduction has no portable KernelBody schedule"
+                      {:reason :kernel-graph-segmented-reduction-body
+                       :operation (:id operation) :schedule-decline planned :fallback :none})))
+    (let [kernel-body (:body planned)
+          arguments (mapv (fn [{:keys [id]}]
+                            (if (= '_nseg id)
+                              (get-in kernel-body [:attributes :launch-segment-count])
+                              id))
+                          (:parameters kernel-body))
+          scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
+          scheduled (scheduled-body/make
+                     {:source operation :body kernel-body :arguments arguments
+                      :scalar-bindings (scheduled-body/derive-scalar-bindings
+                                        kernel-body arguments scalar-types)
+                      :effects {:kind :pure-contraction
+                                :uses (scheduled-body/derive-uses kernel-body arguments)}
+                      :legality {:kind :ordered-portable-contraction}
+                      :numerics {:mode :exact :policy :same-typed-ssa-evaluation-order}
+                      :attributes {:strategy (get-in kernel-body [:schedule :strategy])
+                                   :out-elems (get-in kernel-body [:attributes :launch-segment-count])}})]
+      (scheduled-body/validate-against-node! scheduled node graph))))
