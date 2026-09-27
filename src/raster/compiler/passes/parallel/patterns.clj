@@ -705,29 +705,7 @@
 
     :else nil))
 
-(defn- projected-recur-argument
-  "Project one carry's next value through a pure branchy recurrence region.
-
-   This is the scalar SSA phi construction for source loops: every control-flow leaf must recur
-   with the same arity, while lexical lets and conditionals are retained around the selected
-   argument. Effects and arbitrary statement sequences deliberately remain outside this subset."
-  [form ordinal arity]
-  (cond
-    (and (seq? form) (= 'recur (first form)) (= arity (count (rest form))))
-    (nth (vec (rest form)) ordinal)
-
-    (and (form/binding-form? form) (= 1 (count (drop 2 form))))
-    (when-let [projected (projected-recur-argument (last form) ordinal arity)]
-      (with-meta (list (first form) (second form) projected) (meta form)))
-
-    (and (seq? form) (contains? '#{if clojure.core/if} (first form)) (= 4 (count form)))
-    (let [[head predicate then-expression else-expression] form
-          then-value (projected-recur-argument then-expression ordinal arity)
-          else-value (projected-recur-argument else-expression ordinal arity)]
-      (when (and then-value else-value)
-        (with-meta (list head predicate then-value else-value) (meta form))))
-
-    :else nil))
+(declare tail-decision)
 
 (defn- match-reduce-loop*
   "Generic matcher for reduction loops.
@@ -848,10 +826,13 @@
                                      (ordered-unit-step? (nth (vec (rest %)) index-slot)
                                                          index-sym))
                                all-recurs))
-                  update-exprs (mapv #(projected-recur-argument
-                                        then-branch % (count pairs)) carry-slots)]
+                  decision (tail-decision then-branch ids)
+                  update-exprs (when (and (:recurs? decision)
+                                          (not (contains? decision :exit)))
+                                 (mapv #(nth (:updates decision) %) carry-slots))]
               (when (and (not (contains-sym? else-branch index-sym))
                          recurrence-edges-valid?
+                         (some? update-exprs)
                          (every? some? update-exprs))
                 {:index-sym index-sym
                  :index-init index-init
@@ -868,7 +849,7 @@
                  :update-exprs update-exprs
                  :scoped-update-exprs update-exprs}))))))))
 
-(defn- while-decision
+(defn- tail-decision
   "Project a pure tail decision tree into continue, simultaneous updates and exit value.
 
    Exit-only arms have no update projection; recur-only arms have no exit projection. Pruning
@@ -883,7 +864,7 @@
         {:continue true :updates (vec (rest expression)) :recurs? true})
 
       (and (form/let-head? head) (= 3 (count expression)))
-      (when-let [inner (while-decision (last expression) carries)]
+      (when-let [inner (tail-decision (last expression) carries)]
         (let [wrap #(with-meta (list head (second expression) %) (meta expression))]
           (cond-> inner
             ;; A subtree with only one outcome does its work in that outcome's projection.
@@ -892,10 +873,10 @@
             (:recurs? inner) (update :updates #(mapv wrap %))
             (contains? inner :exit) (update :exit wrap))))
 
-      (and (= 'if head) (= 4 (count expression)))
+      (and (contains? '#{if clojure.core/if} head) (= 4 (count expression)))
       (let [[_ predicate then-expression else-expression] expression
-            then (while-decision then-expression carries)
-            else (while-decision else-expression carries)
+            then (tail-decision then-expression carries)
+            else (tail-decision else-expression carries)
             branch #(with-meta (list 'if predicate %1 %2) (meta expression))]
         (when (and then else)
           (cond-> {:continue (cond
@@ -934,7 +915,7 @@
           body-form (last loop-form)]
       (when (and (seq pairs) (every? symbol? carry-syms)
                  (= (count carry-syms) (count (set carry-syms))))
-        (when-let [decision (while-decision body-form carry-syms)]
+        (when-let [decision (tail-decision body-form carry-syms)]
           (when (and (:recurs? decision) (contains? decision :exit))
             {:carry-syms carry-syms
              :carry-inits carry-inits

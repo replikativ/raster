@@ -80,6 +80,9 @@ The shared purity predicate now traverses binding vectors and evaluated collecti
 quoted data stays opaque. This also prevents beta-reduction from overlooking nested stores or
 value-returning atomics. Subtrees with only exits or only recurrences evaluate their local work
 in that projection, rather than duplicating it just to compute a constant continuation flag.
+Counted product loops and data-dependent while loops share this tail-decision projection.
+The old per-carry recursive projector is removed; counted-loop admission still separately proves
+unit induction steps and rejects early exits, rather than borrowing the while-loop legality rule.
 
 The shared lexical scope authority also covers existing result-producing atomics: their
 inputs use the preceding scope and their result binds only subsequent effects. Substitution

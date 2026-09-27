@@ -354,7 +354,7 @@
                                         (form/let-head? (first then-branch)))
                                then-branch)
           locals (if local-bindings (typed-region-locals local-bindings) [])
-          ;; projected-recur-argument retains the lexical wrapper independently for every carry.
+          ;; The shared tail projection retains the lexical wrapper for every carry.
           ;; The product lambda owns that common prefix once; leave only each projected body here.
           update-exprs
           (if local-bindings
