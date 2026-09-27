@@ -125,8 +125,11 @@ leave it unchanged. The callable is not an inspectable `LinkedExecutable`. Each 
 a detached host snapshot, valid after later invocations or close. `evaluate!` delegates to this
 scope rather than maintaining a second lifecycle implementation.
 
-This is not yet a zero-copy resident-output facade. AD residuals must be declared plan outputs
-before reuse analysis; runtime taps are not a substitute for that escape evidence. In particular,
+This is not yet a zero-copy resident-output facade. The equation-first `Compiled` boundary now
+certifies all exposed result, explicit-output, donation and tap nodes as plan outputs before
+initialization and escape analysis. Certification cannot drop the original semantic outputs.
+This is physical-storage retention, not a snapshot of an earlier SSA version: two compiler names
+sharing one storage identity still need a separate value-version/tape proof. In particular,
 the existing `Compiled` wrapper exposes its executable and cannot silently opt into private
 reuse. Resident leases, structured replay and AD tape lifetime integration remain open. This
 GPU-local proof does not supersede the JVM/source memory passes, so none is deleted on that claim.

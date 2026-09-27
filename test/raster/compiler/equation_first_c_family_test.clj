@@ -90,6 +90,14 @@
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
 
+(deftm c-family-four-layers
+  "A multi-stage contraction fixture whose named middle value is a distinct resident tap."
+  [w :- (Array double) b :- (Array double) x :- (Array double)] :- (Array double)
+  (let [a (nn/dense w x b)
+        middle (nn/dense w a b)
+        c (nn/dense w middle b)]
+    (nn/dense w c b)))
+
 (def ^:private register-tiled-schedule
   {:typed-contraction {:strategy :register-tiled}})
 
@@ -367,6 +375,26 @@
     (catch clojure.lang.ExceptionInfo exception
       (ex-data exception))))
 
+(defn- assert-certified-output-boundary
+  [prepared]
+  (let [escaped (mapv :node (:out-tree prepared))
+        plan (compiled/plan prepared)
+        certificate (compiled/certificate prepared)
+        witness (invocation-link/memory-witness (:lowering prepared))
+        memory (:memory witness)]
+    (is (= escaped (:outputs plan))
+        "every escaped DeviceArray is part of the validated LinkPlan boundary")
+    (is (= escaped (:outputs certificate))
+        "the certificate records the same ordered physical boundary")
+    (is (= (set escaped) (:outputs (link-plan/initialization-contract plan)))
+        "effect validation covers every retained output")
+    (is (every? #(true? (get-in memory [:nodes % :output?])) escaped)
+        "liveness sees the same physical escape boundary")
+    (is (every? (fn [{:keys [storage public-output?]}]
+                  (= (contains? (set escaped) storage) public-output?))
+                (vals (:compiler-values witness)))
+        "compiler value bindings agree with physical storage escape")))
+
 (deftest equation-first-rejects-explicit-host-orchestration-before-lowering
   (is (= :equation-first-host-only
          (:reason (reason-of #(equation-first/compile
@@ -486,6 +514,40 @@
     (is (every? #(zero? (get-in (compiled/certificate %)
                                 [:driver-allocations]))
                 [functional effect state]))))
+
+(deftest compiled-equation-first-certifies-every-escaped-output
+  (let [input (float-array 8)
+        explicit (compiled/lower #'c-family-effect-map!
+                                 [input (float-array 8) (long-array 8) 8]
+                                 {:compiler :equation-first
+                                  :target cuda-target :dtype :float
+                                  :outputs '[left right]})
+        donated (compiled/lower #'c-family-lane-owned-inout! [(float-array 8) 8]
+                                {:compiler :equation-first
+                                 :target cuda-target :dtype :float
+                                 :donate '[output]})
+        tapped (compiled/lower #'c-family-four-layers
+                               [(double-array [1.0 0.25 -0.5 1.0])
+                                (double-array [0.25 -0.125])
+                                (double-array [1.0 -2.0])]
+                               {:compiler :equation-first
+                                :target cuda-target :dtype :double
+                                :taps '[middle]})]
+    (is (= [:output :output] (mapv :from (:out-tree explicit))))
+    (is (= [:donated] (mapv :from (:out-tree donated))))
+    (is (= [:result :tap] (mapv :from (:out-tree tapped))))
+    (is (= 2 (count (distinct (map :node (:out-tree tapped)))))
+        "the retained middle contraction is not the final semantic result")
+    (doseq [prepared [explicit donated tapped]]
+      (assert-certified-output-boundary prepared))
+    (let [plan (compiled/plan tapped)]
+      (is (= :invocation-link-output-boundary
+             (:reason (reason-of #(invocation-link/certify plan (pop (:outputs plan))))))
+          "recertification cannot silently drop an already retained output")
+      (is (= :link-outputs
+             (:reason (reason-of #(invocation-link/certify
+                                   plan (conj (:outputs plan) ::unknown-output)))))
+          "an escaped identity must name storage in the validated plan"))))
 
 (deftest trusted-equation-first-construction-derives-its-link-witness-once
   (compiled/clear-compilation-cache!)
