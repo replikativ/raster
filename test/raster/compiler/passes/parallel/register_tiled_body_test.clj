@@ -28,6 +28,20 @@
                   (some? init) (assoc :init init))
     :dtype :float}))
 
+(defn- contraction-with-dimensions
+  [m n k]
+  (facts/from-components
+   {:out 'C
+    :free-axes [['i m] ['j n]]
+    :contract-axes [['p k]]
+    :body (list 'raster.numeric/*
+                (list 'clojure.core/aget 'A
+                      (list 'clojure.core/+ (list 'clojure.core/* 'i k) 'p))
+                (list 'clojure.core/aget 'B
+                      (list 'clojure.core/+ (list 'clojure.core/* 'p n) 'j)))
+    :opts {:init (float 0.0)}
+    :dtype :float}))
+
 (defn- operation-kinds
   [operations]
   (mapcat
@@ -150,6 +164,60 @@
         (contraction)
         {:descriptor {:execution {:max-workgroup-size 8}
                       :shared-local-memory 128}}))))
+
+(deftest padded-tail-coordinates-stay-in-the-int-domain
+  (let [tile {:block-m 3 :block-n 5 :block-k 7 :thread-m 1 :thread-n 1}
+        limits (register-tiled/int-coordinate-constraints [1 1 1] tile)
+        m-limit (:maximum-extent (first limits))]
+    (is (= 2147483646 m-limit)
+        "the exact limit accounts for the last padded coordinate, not only the logical extent")
+    (is (body/kernel-body?
+         (:kernel-body
+          (register-tiled/lower (contraction-with-dimensions m-limit 1 1) {:tile tile}))))
+    (try
+      (register-tiled/lower (contraction-with-dimensions (inc m-limit) 1 1) {:tile tile})
+      (is false "an overflowing padded coordinate must decline before KernelBody emission")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :register-tiled-kernel-body-declined (:reason (ex-data exception))))
+        (is (= :padded-coordinate-domain (:missing-rule (ex-data exception))))
+        (is (= {:axis :m :dimension (inc m-limit) :tile-width 3
+                :maximum-extent m-limit}
+               (select-keys (ex-data exception)
+                            [:axis :dimension :tile-width :maximum-extent])))))
+    (is (= (inc (long Integer/MAX_VALUE))
+           (:maximum-extent
+            (first (register-tiled/int-coordinate-constraints
+                    [Integer/MAX_VALUE 1 1]
+                    {:block-m 64 :block-n 64 :block-k 16}))))
+        "ordinary power-of-two tiles retain the complete positive int extent domain")))
+
+(deftest dynamic-dispatch-uses-the-same-padded-coordinate-limits
+  (let [tile {:block-m 3 :block-n 5 :block-k 7 :thread-m 1 :thread-n 1}
+        guarded (#'route/guard-register-tiled-selector
+                 {:kind :fixed-strategy :strategy :regtiled}
+                 [{:strategy :regtiled :kernel-body {:schedule tile}}
+                  {:strategy :portable-segred}]
+                 (contraction-with-dimensions 'm 'n 'k))
+        ordinary (#'route/guard-register-tiled-selector
+                  {:kind :fixed-strategy :strategy :regtiled}
+                  [{:strategy :regtiled :kernel-body {:schedule register-tiled/default-tile}}
+                   {:strategy :portable-segred}]
+                  (contraction-with-dimensions 'm 'n 'k))
+        coordinate-cases (take 3 (:cases guarded))]
+    (is (= :runtime-expression-cases (:kind guarded)))
+    (is (= :regtiled (:default guarded)))
+    (is (= [{:expression 'm :op :> :value 2147483646
+             :strategy :portable-segred}
+            {:expression 'n :op :> :value 2147483645
+             :strategy :portable-segred}
+            {:expression 'k :op :> :value 2147483646
+             :strategy :portable-segred}]
+           coordinate-cases)
+        "dynamic admission projects the exact constraints used by static lowering")
+    (is (= 6 (count (:cases guarded)))
+        "coordinate guards precede the three existing logical-capacity guards")
+    (is (= 3 (count (:cases ordinary)))
+        "power-of-two production tiles add no comparisons beyond existing capacity guards")))
 
 (deftest a-destination-reading-result-transform-stores-through-one-read-write-parameter
   (let [epilogue {:acc 'acc
