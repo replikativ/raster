@@ -22,10 +22,11 @@
 
 (deftest installed-nvrtc-compiles-cuda-preamble-without-a-device
   (if (nvrtc/available?)
-    (let [{:keys [ptx nvrtc-version target]} (nvrtc/compile-artifact-ptx
-                                             smoke-artifact "compute_80")]
+    (let [{:keys [ptx nvrtc-version target virtual-header-version]}
+          (nvrtc/compile-artifact-ptx smoke-artifact "compute_80")]
       (is (pos? (alength ptx)))
       (is (= :cuda-c target))
+      (is (= nvrtc/virtual-header-version virtual-header-version))
       (is (= (nvrtc/version) nvrtc-version))
       (is (re-find #"nvrtc_probe" (String. ^bytes ptx java.nio.charset.StandardCharsets/UTF_8)))
       (let [error (try (nvrtc/compile-ptx "not valid CUDA C++" "bad_probe" "compute_80")
