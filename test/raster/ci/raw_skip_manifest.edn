@@ -56,6 +56,9 @@
   {:count 1 :class :toolchain :reason "Optional C compiler execution gate"}
   "test/raster/gpu/byte_transpose_test.clj"
   {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/gpu/cuda_nvrtc_test.clj"
+  {:count 1 :class :optional-library
+   :reason "NVRTC is optional on generic CI; RASTER_REQUIRE_NVRTC=1 makes this a required native gate"}
   "test/raster/gpu/device_probe.clj"
   {:count 3 :class :shared-gate :reason "Canonical honest OpenCL skip reporting"}
   "test/raster/gpu/soa_test.clj"
