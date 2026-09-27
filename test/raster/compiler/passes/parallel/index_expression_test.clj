@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]))
+            [raster.compiler.ir.index-expression :as index-expression]))
 
 (defn- fail!
   [reason message data]

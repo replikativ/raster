@@ -4,6 +4,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
@@ -206,8 +207,10 @@
     (is (= plan (:operation node)))
     (is (= (mapv :id (:operands plan)) (mapv :id (:inputs graph))))
     (is (= [(get-in plan [:output :id])] (mapv :id (:outputs graph))))
-    (is (= (mapv :elements (:operands plan)) (mapv :elements (:inputs graph))))
-    (is (= (get-in plan [:output :elements]) (get-in graph [:outputs 0 :elements])))
+    (is (= (mapv swr/descriptor-launch-elements (:operands plan))
+           (mapv :elements (:inputs graph))))
+    (is (= (swr/descriptor-launch-elements (:output plan))
+           (get-in graph [:outputs 0 :elements])))
     (is (= (set (map :id (:scalars graph))) (:scalar-uses node)))
     (is (every? #(= :long (:dtype %)) (:scalars graph)))
     (is (nil? (:abi graph)))

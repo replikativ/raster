@@ -2,7 +2,10 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.walk :as walk]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -131,12 +134,7 @@
            (:operands plan-equation)))
     (is (= '[normalized] (:results plan-equation)))
     (is (identical? program (structured-route/validate-typed-program! program)))
-    (is (= :segmented-weighted-reduction-unscheduled
-           (try
-             (structured-route/schedule-program program {})
-             nil
-             (catch clojure.lang.ExceptionInfo exception
-               (:reason (ex-data exception))))))))
+    (is (= [plan] (:operations plan-equation)))))
 
 (deftest protected-plan-preserves-ordinary-equations-on-both-sides
   (let [{:keys [form]} (fuse/fuse (chain) :float)
@@ -219,15 +217,53 @@
     (is (= '[post] (:outputs program)))
     (is (identical? program (structured-route/validate-typed-program! program)))))
 
-(deftest public-equation-first-reaches-the-named-unscheduled-boundary
-  (let [failure (try
-                  (equation-first/compile
-                   #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
-                  nil
-                  (catch clojure.lang.ExceptionInfo exception (ex-data exception)))]
-    (is (= :segmented-weighted-reduction-unscheduled (:reason failure)))
-    (is (= [:binding 'normalized] (:site failure)))
-    (is (= :segmented-weighted-reduction (first (:plan-id failure))))))
+(deftest public-equation-first-emits-the-protected-plan
+  (let [compilation (equation-first/compile
+                     #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
+        semantic-plan (:algorithm (last (:equations (:semantic compilation))))
+        scheduled-plan (:algorithm (last (:equations (:scheduled compilation))))]
+    (is (swr/plan? semantic-plan))
+    (is (= semantic-plan scheduled-plan))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (= 1 (count (:kernels compilation))))))
+
+(deftest public-protected-plan-validates-runtime-storage-before-allocation
+  (let [compilation (equation-first/compile
+                     #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
+        arguments [(float-array 15) (float-array 15) (float-array 15)
+                   (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
+        linked (equation-first/lower compilation arguments)
+        identity {:semantic-request-fingerprint "segmented-public-test"
+                  :compiler-build-fingerprint "test-build"
+                  :source-dependency-fingerprint "test-source"
+                  :target-descriptor-fingerprint "test-target"}
+        restored (equation-artifact/open
+                  identity
+                  (equation-artifact/decode
+                   (equation-artifact/encode (equation-artifact/seal identity compilation))))]
+    (is (= 0 (get-in linked [:attributes :driver-allocations])))
+    (is (= 1 (count (:outputs linked))))
+    (is (= (:outputs linked) (:outputs (equation-first/lower restored arguments))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (equation-first/lower compilation (assoc arguments 2 (float-array 14)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (equation-first/lower compilation (assoc arguments 8 6))))))
+
+(deftest protected-plan-complete-write-proof-is-bound-to-the-exact-schedule
+  (let [compilation (equation-first/compile
+                     #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
+        emitted (:emitted compilation)
+        operation (first (:operations (last (:equations emitted))))
+        numerical-index (dec (count (get-in operation [:body :equations])))
+        damaged (update-in operation [:body :equations numerical-index :operations 0
+                                      :body :operations] pop)
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (seq (emitted-equation/complete-write-domains operation)))
+    (is (= :emitted-reduction-reference-refinement
+           (reason #(emitted-equation/complete-write-domains damaged))))
+    (is (= :emitted-reduction-outer-slice
+           (reason #(emitted-program/validate!
+                     (assoc-in emitted [:attributes :allocations 0 :initialization] :unspecified)))))))
 
 (deftest mixed-components-initialize-shared-scratch-only-once
   (let [{:keys [form]} (fuse/fuse (chain) :float)

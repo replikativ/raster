@@ -16,7 +16,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-consumer-region :as region]
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))

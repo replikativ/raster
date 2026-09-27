@@ -18,7 +18,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
 (defn- decline!

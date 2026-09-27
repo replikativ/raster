@@ -6,8 +6,11 @@
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (defrecord EmittedParallelEquation [algorithm body refinement graph provenance attributes])
@@ -28,6 +31,33 @@
        (= (:operands equation) (:inputs (soac/facts algorithm)))
        (= (:results equation) (soac/outputs algorithm))))
 
+(defn- expected-graph
+  [algorithm body]
+  (if (swr/plan? algorithm)
+    (let [numerical (filterv #(not (true? (get-in % [:attributes :host-only])))
+                             (:equations body))
+          equation (first numerical)]
+      (when-not (and (= 1 (count numerical)) (= algorithm (:algorithm equation))
+                     (= 1 (count (:operations equation)))
+                     (scheduled-body/scheduled-kernel-body? (first (:operations equation))))
+        (fail! :emitted-parallel-equation-algorithm
+               "emitted reduction body requires its exact single scheduled semantic equation" {}))
+      (let [graph (:graph (equation-graph/make-for-plan-equation body equation))
+            certificate (first (:operations equation))
+            width (get-in certificate [:body :launch :workgroup-size 0])
+            expected (indexed-body/schedule-reference-for-node
+                      algorithm (first (:nodes graph)) graph
+                      {:subgroup-size width :max-workgroup-size width})]
+        (when-not (semantic-fingerprint/equivalent? expected certificate)
+          (fail! :emitted-reduction-reference-refinement
+                 "protected reduction requires the exact generated reference schedule" {}))
+        (scheduled-body/validate-against-node!
+         certificate (first (:nodes graph)) graph)
+        graph))
+    (let [algorithm (soac/validate! algorithm)
+          body (program/validate! body segop/segop-node? algorithm-boundary?)]
+      (equation-graph/make algorithm body))))
+
 (defn validate!
   [emitted-equation]
   (when-not (emitted-equation? emitted-equation)
@@ -35,9 +65,7 @@
            "expected an EmittedParallelEquation"
            {:actual (type emitted-equation)}))
   (let [{:keys [algorithm body refinement graph provenance attributes]} emitted-equation
-        algorithm (soac/validate! algorithm)
-        body (program/validate! body segop/segop-node? algorithm-boundary?)
-        expected (equation-graph/make algorithm body)
+        expected (expected-graph algorithm body)
         refinement (when refinement (refinement/validate-against! refinement expected))
         scheduled (if refinement (refinement/scheduled-graph refinement) expected)
         emitted (-> graph graph/validate! executable/validate!)]
@@ -57,6 +85,12 @@
                                (if (scheduled-body/scheduled-kernel-body? certificate)
                                  (do (scheduled-body/validate-against-node!
                                       certificate scheduled-node scheduled)
+                                     (when (and (swr/plan? algorithm)
+                                                (not (semantic-fingerprint/equivalent?
+                                                      certificate
+                                                      (first (:operations (last (:equations body)))))))
+                                       (fail! :emitted-reduction-artifact-refinement
+                                              "emitted reduction artifact changed its exact schedule" {}))
                                      (scheduled-body/validate-artifact-projection!
                                       certificate (:operation emitted-node))
                                      true)
@@ -70,6 +104,26 @@
                "emitted equation descriptions must be maps"
                {:field field :value value})))
     emitted-equation))
+
+(defn complete-write-domains
+  "Exact output domains proved by schedule rederivation, not ABI write permissions.
+   The reference leaf stores on both active/inactive and valid/invalid shape branches, including
+   empty segments and unused row tails. Other schedules require their own coverage proof."
+  [emitted]
+  (when (swr/plan? (:algorithm emitted))
+    (let [{:keys [algorithm]} (validate! emitted)]
+      {(get-in algorithm [:output :id])
+       (swr/descriptor-launch-elements (:output algorithm))})))
+
+(defn physical-results
+  "Project logical results to physical storage from the retained, validated semantic equation."
+  [emitted]
+  (let [{:keys [algorithm body]} (validate! emitted)]
+    (if (swr/plan? algorithm)
+      (let [equation (last (:equations body))]
+        (zipmap (:results equation)
+                (map :destination (get-in equation [:attributes :result-storage]))))
+      (soac/physical-result-map algorithm))))
 
 (defn make
   ([algorithm body emitted]

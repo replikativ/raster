@@ -103,3 +103,22 @@ graphs on both local backends, and transfer/event ownership.
 Next: repeat the existing matched strict-FP32 CLBlast protocol
 and the external pretrained fixtures under controlled load. Do not compare these mixed-precision
 samples to strict-FP32 BLAS, or infer end-to-end Laya latency from this small projection.
+
+## Equation-first indexed reduction reference
+
+The existing `indexed_attention_device_test` now also exercises the public equation-first
+compile/lower/LinkPlan path on local Arc OpenCL and Level Zero. The independent plan interpreter
+is the oracle for three destinations, width five, two heads and either four or one membership
+entries. Both backends passed two replays of both cases (36 assertions): repeated memberships,
+unequal/empty destination segments and unused row tails retain their expected values. This is
+fixed-reference correctness, not optimized attention performance or cross-vendor execution.
+
+Compilation retains the generic segmented weighted-reduction plan and emits a generated
+KernelBody through the common target emitter. Scalar shape preconditions fail during pure
+binding, before session setup. Exact reference schedule rederivation proves complete output
+writes; changing its stores or enclosing allocation contract is rejected. Shape multiplication
+uses the same checked integer algebra in graph construction and invocation realization.
+
+An attempted zero-membership device case exposed a separate runtime limitation: OpenCL rejects
+the zero-byte index buffer allocation. It is not included as a passing execution case. Supporting
+zero-sized physical allocations without changing logical array extents remains follow-up work.

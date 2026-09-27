@@ -15,7 +15,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-reduction-regions :as regions]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 

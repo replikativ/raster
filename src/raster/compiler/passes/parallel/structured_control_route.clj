@@ -12,12 +12,15 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
@@ -65,7 +68,7 @@
     :else false))
 
 (defn- scheduled-algorithm-boundary?
-  [equation algorithm]
+  [parallel-program equation algorithm]
   (cond
     (control/loop-program? algorithm)
     (and (loop-boundary? equation algorithm)
@@ -81,6 +84,16 @@
              (and (seq (:operations equation))
                   (every? segop/segop-node? (:operations equation)))))
 
+    (swr/plan? algorithm)
+    (and (swr/equation-boundary? (:values parallel-program) equation algorithm)
+         (= 1 (count (:operations equation)))
+         (let [certificate (first (:operations equation))]
+           (and (scheduled-body/scheduled-kernel-body? certificate)
+                (let [graph (:graph (equation-graph/make-for-plan-equation
+                                     parallel-program equation))]
+                  (boolean (scheduled-body/validate-against-node!
+                            certificate (first (:nodes graph)) graph))))))
+
     :else false))
 
 (defn- typed-operation?
@@ -91,7 +104,8 @@
 
 (defn- scheduled-operation?
   [operation]
-  (or (schedule/scheduled-loop? operation) (segop/segop-node? operation)))
+  (or (schedule/scheduled-loop? operation) (segop/segop-node? operation)
+      (scheduled-body/scheduled-kernel-body? operation)))
 
 (declare fail!)
 
@@ -118,7 +132,8 @@
     (fail! :structured-control-program-dialect
            "scheduled structured-control routing requires :scheduled-parallel"
            {:dialect (:dialect parallel-program)}))
-  (program/validate! parallel-program scheduled-operation? scheduled-algorithm-boundary?))
+  (program/validate! parallel-program scheduled-operation?
+                     (partial scheduled-algorithm-boundary? parallel-program)))
 
 (defn valid-scheduled-program?
   [parallel-program]
@@ -739,11 +754,25 @@
                   :values values})
 
                (swr/plan? algorithm)
-               (fail! :segmented-weighted-reduction-unscheduled
-                      "segmented weighted-reduction has no equation-first schedule yet"
-                      {:equation (:id equation)
-                       :site (:site equation)
-                       :plan-id (:id algorithm)})
+               (let [graph (:graph (equation-graph/make-for-plan-equation
+                                    parallel-program equation))
+                     descriptor (or (:target-descriptor opts)
+                                    (when (map? (:target-device opts)) (:target-device opts))
+                                    {})
+                     certificate
+                     (try
+                       (indexed-body/schedule-reference-for-node
+                        algorithm (first (:nodes graph)) graph descriptor)
+                       (catch clojure.lang.ExceptionInfo exception
+                         (if (= :indexed-segmented-reduction-plan-unsupported
+                                (:reason (ex-data exception)))
+                           (fail! :segmented-weighted-reduction-unscheduled
+                                  "segmented weighted-reduction has no verified equation-first schedule"
+                                  {:equation (:id equation) :site (:site equation)
+                                   :plan-id (:id algorithm) :decline (ex-data exception)})
+                           (throw exception))))]
+                 {:equations (conj equations (assoc equation :operations [certificate]))
+                  :values values})
 
                :else
                (let [algorithm-values (:values (soac/facts algorithm))
@@ -784,5 +813,4 @@
        :provenance (assoc (:provenance parallel-program)
                           :target-dialect :scheduled-parallel)
        :attributes (:attributes parallel-program)
-       :operation? scheduled-operation?
-       :algorithm? scheduled-algorithm-boundary?}))))
+       :operation? scheduled-operation?}))))

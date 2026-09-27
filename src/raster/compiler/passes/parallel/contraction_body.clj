@@ -14,7 +14,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]))
 

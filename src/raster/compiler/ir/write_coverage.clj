@@ -5,7 +5,7 @@
             [raster.compiler.ir.index-algebra :as algebra]
             [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]))
+            [raster.compiler.ir.index-expression :as index-expression]))
 
 (defn dense-result-covers?
   "Whether a validated dense functional result covers exactly capacity elements.

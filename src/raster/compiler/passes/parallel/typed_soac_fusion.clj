@@ -15,7 +15,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.fusion-placement :as placement]
             [raster.compiler.passes.scalar.effects :as effects]))
 

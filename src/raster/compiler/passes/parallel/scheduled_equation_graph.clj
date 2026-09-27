@@ -15,7 +15,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
-            [raster.compiler.passes.parallel.index-expression :as index-expression]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
 
@@ -23,29 +23,12 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :scheduled-equation-graph))))
 
-(declare integral-scalar-value?)
-
 (defn- value-elements
   [values derived-scalars value]
   (let [dimension-value (fn [dimension]
-                          ;; AbstractValue uses `(value id)` to distinguish a compound stable
-                          ;; value ID from shape syntax. KernelGraph owns explicit integer
-                          ;; expressions, so remove only that marker at this physical boundary.
-                          (if (and (seq? dimension)
-                                   (= 'value (first dimension))
-                                   (= 2 (count dimension)))
-                            (second dimension)
-                            (if (and (seq? dimension)
-                                     (not (contains? '#{extent unknown-dimension} (first dimension))))
-                              (let [decline! (fn [rule message data] (fail! rule message data))
-                                    scope (set (filter #(integral-scalar-value? (get values %))
-                                                       (util/free-syms dimension)))
-                                    ;; This is AbstractValue dimension algebra, not a host
-                                    ;; scalar expression. Its operations are mathematical extents
-                                    ;; (scan's n+1), so no source arithmetic dtype is inferred.
-                                    index (index-expression/lower dimension scope decline!)]
-                                (index-expression/to-launch-expression index decline!))
-                              dimension)))
+                          (index-expression/project-dimension
+                           dimension #(get-in values [% :dtype])
+                           (fn [rule message data] (fail! rule message data))))
         shape (mapv dimension-value (:shape value))
         elements (cond
                    (empty? shape) 1
@@ -692,7 +675,10 @@
                  (and (= fields (set (keys allocation)))
                       (integer? (:source-binding-id allocation))
                       (not (neg? (:source-binding-id allocation)))
-                      (= elements (:extent allocation))
+                      (or (= elements (:extent allocation))
+                          (and (symbol? (:extent allocation))
+                               (integral-scalar-value?
+                                (get-in parallel-program [:values (:extent allocation)]))))
                       (= dtype (:dtype allocation))
                       (contains? #{:zero :copy :unspecified}
                                  (:initialization allocation))))]
@@ -709,7 +695,7 @@
   [values descriptor role]
   (let [id (:id descriptor)
         value (get values id)]
-    (graph/buffer id (:dtype descriptor) (:elements descriptor)
+    (graph/buffer id (:dtype descriptor) (swr/descriptor-launch-elements descriptor)
                   (or (:memory-space value) :device) role)))
 
 (defn- plan-public-scalars
@@ -748,8 +734,22 @@
                                   {:allocations output-allocations})})
         input-buffers (mapv #(descriptor-buffer (:values body) % :input) (:operands plan))
         output-buffer (descriptor-buffer (:values body) (:output plan) :output)
-        scalars (plan-public-scalars (:values body) plan)
-        scalar-ids (set (map :id scalars))
+        plan-scalars (plan-public-scalars (:values body) plan)
+        scalar-ids (set (map :id plan-scalars))
+        allocation-extent (:extent (first output-allocations))
+        allocation-check? (and allocation-extent
+                               (not= allocation-extent (get-in plan [:output :elements])))
+        available (set (concat (:inputs body)
+                               (mapcat :results (filter #(get-in % [:attributes :host-only])
+                                                        (:equations body)))))
+        _ (when (and allocation-check? (not (contains? available allocation-extent)))
+            (fail! :segmented-plan-allocation-scope
+                   "output allocation guard requires an earlier typed host scalar"
+                   {:extent allocation-extent :available available}))
+        scalars (cond-> plan-scalars
+                  (and allocation-check? (not (contains? scalar-ids allocation-extent)))
+                  (conj (graph/scalar allocation-extent
+                                      (get-in body [:values allocation-extent :dtype]))))
         uses (into (mapv #(graph/->ValueUse (:id %) :read) input-buffers)
                    [(graph/->ValueUse (:id output-buffer) :write)])
         node (graph/->ScheduledKernel
@@ -759,6 +759,10 @@
          {:inputs input-buffers
           :outputs [output-buffer]
           :scalars scalars
+          :preconditions (if allocation-check?
+                           [{:expression allocation-extent :op :=
+                             :value (swr/descriptor-launch-elements (:output plan))}]
+                           [])
           :nodes [node]
           :effects {:semantic (:effects equation)}
           :provenance {:source-dialect :segmented-weighted-reduction

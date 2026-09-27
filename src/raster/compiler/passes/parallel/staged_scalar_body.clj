@@ -10,7 +10,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
-            [raster.compiler.passes.parallel.index-expression :as index]
+            [raster.compiler.ir.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
             [raster.compiler.passes.parallel.packed-stage-fragment :as packed-stage]
             [raster.compiler.passes.parallel.staged-scalar-admission :as admission]))

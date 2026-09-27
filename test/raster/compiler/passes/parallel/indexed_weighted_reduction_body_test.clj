@@ -2,10 +2,13 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.compiler.backend.gpu.segop-opencl :as graph-emission]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]))
 
@@ -33,12 +36,12 @@
   ([plan scalar-dtype]
    (let [fields (indexed-body/dynamic-fields plan)
          scalar-ids (vec (distinct (mapcat (comp launch/expression-references :value) fields)))
-         inputs (mapv (fn [{:keys [id dtype elements]}]
-                        (graph/buffer id dtype elements :device :input))
+         inputs (mapv (fn [{:keys [id dtype] :as descriptor}]
+                        (graph/buffer id dtype (swr/descriptor-launch-elements descriptor) :device :input))
                       (:operands plan))
          output-description (:output plan)
          output (graph/buffer (:id output-description) (:dtype output-description)
-                              (:elements output-description) :device :output)
+                              (swr/descriptor-launch-elements output-description) :device :output)
          uses (into (mapv #(graph/->ValueUse (:id %) :read) inputs)
                     [(graph/->ValueUse (:id output) :write)])
          node (graph/->ScheduledKernel
@@ -141,6 +144,26 @@
         (is (= :scheduled-kernel-body-artifact-projection
                (reason #(scheduled-body/validate-artifact-projection!
                          scheduled (assoc-in artifact [:arguments 0] 'different-input)))))))))
+
+(deftest semantic-reference-graph-emits-through-the-common-certified-route
+  (let [plan (plan)
+        source (source-graph plan)
+        node (first (:nodes source))
+        scheduled (indexed-body/schedule-reference-for-node plan node source {})
+        certificates {(:id node) scheduled}
+        values {'n-nodes 3 'n-edges 0 'emb-dim 5 'n-heads 2 'dk 2}
+        runtime-values (into {} (map (fn [[id value]] [id {:type :long :value value}])) values)]
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (let [emitted (graph-emission/generate-kernel-graph
+                     source :target-dialect dialect :scheduled-bodies certificates)]
+        (is (graph/dataflow-equivalent? source emitted))
+        (is (= scheduled (get-in emitted [:nodes 0 :operation :provenance :scheduled-operation])))
+        (is (= emitted (graph-call/preflight! emitted runtime-values)))
+        (is (= :kernel-precondition-failed
+               (reason #(graph-call/preflight!
+                         emitted (assoc-in runtime-values ['dk :value] 8)))))))
+    (is (= :kernel-graph-scheduled-body-coverage
+           (reason #(graph-emission/generate-kernel-graph source :scheduled-bodies {}))))))
 
 (deftest reference-schedule-rejects-unproved-representations-and-graph-drift
   (let [plan (plan)

@@ -156,9 +156,10 @@ through the same public API. Both entry points now share precision-policy valida
 pre-emission feasibility gate; equation-first retains the resolved schedule instead of silently
 stripping the deprecated precision option. This is not candidate parity: its portable contraction
 graph still lacks the descriptor route's alternative-selection machinery. The public
-`resident-structured-reduction-probe` now retains its recognized reduction plan in equation-first
-compilation and reaches the source-located `:segmented-weighted-reduction-unscheduled` boundary;
-the descriptor route already executes it. Keep those gaps explicit rather than equating schedule metadata
+`resident-structured-reduction-probe` now retains its recognized reduction plan through equation-first
+compilation, fixed-reference scheduling, checked C-family emission and public linking. The reference
+path executes on local OpenCL and Level Zero; optimized graph/dispatch selection remains open.
+Keep those gaps explicit rather than equating schedule metadata
 with implemented optimization. Equation-first compilation captures its target description once
 for fusion costs, schedule admission, launch planning and C-family projection; direct low-level
 callers may still resolve a descriptor when none is supplied. The equation-first prepared-template
@@ -196,11 +197,23 @@ through the existing `:result-storage` contract.
    Literal dimensions are explicitly widened; public int32 shape leaves still decline rather
    than acquiring an implicit conversion. The semantic equation/value validator is shared by
    compilation stages, and C-family emission reads the verified graph scalar interface instead
-   of reconstructing it from operation families. This prerequisite is not yet public execution:
-   semantic graph construction, initialization coverage and equation-envelope integration remain.
+   of reconstructing it from operation families. Semantic graph construction and equation-envelope
+   integration now preserve exact outer values/allocation contracts. Reference completeness is
+   proved by rederiving the exact generated schedule (including empty-segment and row-tail stores),
+   not from an ABI write flag; the emitted artifact must project that same certificate. Public
+   replay matches the independent plan oracle on OpenCL and Level Zero. Arbitrary schedules still
+   need their own coverage proof. An entirely empty edge list remains a runtime gap: the local
+   OpenCL allocator rejects zero-byte index buffers; empty destination segments are tested.
 4. Generalize the existing executable slot to graph-or-dispatch. Each alternative must retain
    its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
    common arguments once and allocate only the selected alternative's scratch.
+
+Invocation shape realization now reuses the graph's checked dimension-to-launch projection.
+The shared index algebra lives under compiler IR (the former pass namespace is removed), so
+materialization and linking do not interpret arbitrary source or guess types. Shape products are
+checked for overflow and exact backing length. Bound scalar preconditions run before session setup
+or allocation. Canonical semantic equality preserves NaN bits and numeric widths when rederiving a
+certificate; printing is not an equality operation. No surface-language change is introduced.
 
 The source frontend now projects each ordinary numerical equation once, shared by dependency
 selection and final construction, and uses one numerical-description predicate for admission

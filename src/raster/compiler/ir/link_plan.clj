@@ -10,6 +10,8 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
@@ -803,7 +805,13 @@
                                                   (second dimension) source-value)
                              [:view :shape])))
 
-            :else (kgcall/resolve-integer scalar-values dimension)))]
+            :else
+            (kgcall/resolve-integer
+             scalar-values
+             (index-expression/project-dimension
+              dimension #(get-in scalar-values [% :type])
+              (fn [reason message data]
+                (throw (ex-info message (assoc data :reason reason))))))))]
     (try
       (reduce (fn [elements dimension]
                 (Math/multiplyExact (long elements) (long (resolve-dimension dimension))))
@@ -921,7 +929,14 @@
                   (let [capacity (reduce *' 1 (get-in node [:view :shape]))]
                     (or (coverage/dense-result-covers? algorithm result capacity resolve-dimension)
                         (coverage/rectangular-effect-covers? algorithm result capacity scalars))))]
-    (into #{}
+    (into (into #{}
+                (keep (fn [[physical extent]]
+                        (let [node (program-value-node! nodes values instance physical
+                                                        (get (:buffers step) physical))]
+                          (when (= (resolve-dimension extent)
+                                   (reduce *' 1 (get-in node [:view :shape])))
+                            (:id node)))))
+                (emitted-equation/complete-write-domains operation))
           (mapcat (fn [equation]
                     (mapcat (fn [[result physical]]
                               (let [base (when (contains? (:buffers step) physical)
@@ -932,7 +947,9 @@
                                                                  (get (:outputs step) result)))]
                                 (keep #(when (and % (covers? result %)) (:id %)) [base child])))
                             (map vector (nth equation 2) (soac/physical-results algorithm equation)))))
-          (soac/equations algorithm))))
+          ;; Ordinary SOAC coverage remains semantic; protected plans require exact schedule
+          ;; rederivation above, never a mere graph/ABI write permission.
+          (when (soac/program-form? algorithm) (soac/equations algorithm)))))
 
 (defn- validate-program-instance-bindings!
   [nodes values instance]
@@ -947,16 +964,18 @@
           (let [complete (program-complete-writes nodes values id step (:scalar-values call))
                 operation (first (get-in step [:equation :operations]))
                 algorithm (:algorithm operation)
-                equation (first (soac/equations algorithm))
+                equation (when (soac/program-form? algorithm)
+                           (first (soac/equations algorithm)))
                 logical-preservation-nodes
                 (into #{}
                       (keep (fn [[_ physical storage]]
                               (when (= :read-write (:access storage))
                                 (:id (program-value-node! nodes values id physical
                                                           (get (:buffers step) physical))))))
-                      (map vector (nth equation 2)
-                           (soac/physical-results algorithm equation)
-                           (soac/result-storage algorithm (second equation))))
+                      (when equation
+                        (map vector (nth equation 2)
+                             (soac/physical-results algorithm equation)
+                             (soac/result-storage algorithm (second equation)))))
                 graph-fact
                 (program-graph-fact nodes values id step-index
                                     (get-in step [:equation :id])
