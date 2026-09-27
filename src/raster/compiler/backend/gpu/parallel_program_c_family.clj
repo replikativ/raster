@@ -49,6 +49,7 @@
      :array-types (:array-types opts)
      :target-dialect (get opts :target-dialect :opencl-intel)
      :target-device (:target-device opts)
+     :schedule (:schedule opts)
      :contraction-facts (:contraction-facts opts)
      :scheduled-equation-algorithm (:scheduled-equation-algorithm opts)
      :scheduled-equation-body (:scheduled-equation-body opts))))

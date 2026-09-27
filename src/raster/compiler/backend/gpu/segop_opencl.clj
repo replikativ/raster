@@ -841,7 +841,7 @@
     (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
 
 (defn- generate-reduction-kernel-graph
-  [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts
+  [graph {:keys [scalar-types array-types target-dialect target-device contraction-facts schedule
                  scheduled-equation-algorithm scheduled-equation-body]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel
                contraction-facts {}}}]
@@ -868,9 +868,10 @@
                                        {:reason :kernel-graph-segmented-reduction-facts
                                         :operation (:id operation) :fallback :none})))
                      descriptor (hw/descriptor-for target-device)
-                     scheduled (contraction-schedule/schedule-portable-for-node
+                     scheduled (contraction-schedule/schedule-for-node
                                 node graph facts descriptor
-                                {:array-types array-types :scalar-types scalar-types})]
+                                {:array-types array-types :scalar-types scalar-types
+                                 :schedule schedule})]
                  (kernel-body-target/emit-artifact
                   (str "graph_contraction_" (gensym "")) scheduled target-dialect))
                ;; Scalar reductions are certified against their complete graph context before

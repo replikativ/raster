@@ -103,7 +103,7 @@
 (def ^:private valid-grf-modes #{:grf128 :grf256})
 (def ^:private valid-segmented-reduction-strategies
   #{:auto :reference :subgroup-score-reuse})
-(def ^:private valid-typed-contraction-strategies #{:auto})
+(def ^:private valid-typed-contraction-strategies #{:auto :portable :register-tiled})
 (def ^:private valid-matrix-tile-spaces #{:default :finite})
 
 (defn- valid-matrix-tile-space?
@@ -277,6 +277,11 @@
       (throw (ex-info
               "schedule: measured typed contraction selectors must map dispatch IDs to selector maps"
               {:measured-selectors typed-contraction-selectors})))
+    (when (and (seq typed-contraction-selectors)
+               (not= :auto typed-contraction-strategy))
+      (throw (ex-info "schedule: measured typed contraction selectors require :strategy :auto"
+                      {:strategy typed-contraction-strategy
+                       :measured-selectors typed-contraction-selectors})))
     (doseq [[field value] [[:target-fill-multiple target-fill-multiple]
                            [:min-split-chunk min-split-chunk]
                            [:max-splits max-splits]]]
