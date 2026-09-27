@@ -525,7 +525,8 @@
                                sites (distinct operands)))
                      {} (:equations emitted))
         inputs (set (:inputs emitted))
-        outputs (set (:outputs emitted))]
+        semantic-outputs (set (:outputs emitted))
+        escaped-storage (set (:outputs plan))]
     (doseq [[compiler-value storage-id] bindings]
       (when-not (contains? (:values report) storage-id)
         (fail! :invocation-memory-binding
@@ -550,7 +551,8 @@
                                       {:kind :program-input})
                                     {:kind :storage-only})
                     :uses (get uses compiler-value [])
-                    :public-output? (contains? outputs compiler-value)}]))
+                    :semantic-output? (contains? semantic-outputs compiler-value)
+                    :public-output? (contains? escaped-storage storage-id)}]))
            bindings)
      :public-buffer-bindings (:public-buffer-bindings certificate)
      :semantic-outputs (:semantic-outputs certificate)
@@ -558,10 +560,25 @@
      :value-versions :unproven}))
 
 (defn certify
-  "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness."
-  [plan]
-  (let [{:keys [plan effect-evidence]} (link/validate-with-effect-evidence! plan)]
-    ;; Construction and certificate derivation share the same validated immutable plan. External
-    ;; boundaries retain `verify!` for independent re-derivation; repeating it here proves no new
-    ;; fact and made every equation-first preparation pay for the certificate twice.
-    (->CertifiedInvocationLink plan (derive-certificate plan effect-evidence))))
+  "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness.
+
+   An explicit output vector declares every escaped physical node (including taps and donations)
+   before validation. It may extend/reorder, but never drop, the original semantic boundary.
+   This retains physical storage; it does not snapshot earlier SSA versions sharing that storage."
+  ([plan]
+   (let [{:keys [plan effect-evidence]} (link/validate-with-effect-evidence! plan)]
+     ;; Construction and certificate derivation share the same validated immutable plan. External
+     ;; boundaries retain `verify!` for independent re-derivation; repeating it here proves no new
+     ;; fact and made every equation-first preparation pay for the certificate twice.
+     (->CertifiedInvocationLink plan (derive-certificate plan effect-evidence))))
+  ([plan outputs]
+   (when-not (vector? outputs)
+     (fail! :invocation-link-output-boundary
+            "escaped invocation outputs must be an ordered vector"
+            {:outputs outputs}))
+   (let [missing (set/difference (set (:outputs plan)) (set outputs))]
+     (when (seq missing)
+       (fail! :invocation-link-output-boundary
+              "escaped invocation outputs must retain the semantic output boundary"
+              {:missing missing :outputs outputs})))
+   (certify (assoc plan :outputs outputs))))

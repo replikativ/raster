@@ -34,6 +34,11 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
    earlier if a concrete hardware question blocks the design. Compilation, execution and
    competitive performance are separate claims.
 
+The equation-first public result boundary now includes explicit outputs, donations and taps in
+the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
+the existing initialization and storage analysis; it does not enable reuse through inspectable
+resident handles or promise versioned AD tape snapshots.
+
 ## Current control/effect slice
 
 Pure counted loops with terminal effects use the existing scalar or product Fold followed by

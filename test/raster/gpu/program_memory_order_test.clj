@@ -8,6 +8,7 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.passes.local-storage-reuse :as reuse]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]
             [raster.gpu.device-probe :as opencl]
@@ -45,6 +46,25 @@
         (assoc :plan (:id linked) :target (:target linked))
         (update :per-replay
                 #(mapv (fn [entry] (assoc-in entry [:source :instance] (:id instance))) %)))))
+
+(deftest public-tap-prevents-private-storage-reuse
+  (doseq [[target available? skip!] [[:ocl:0 opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 device/gpu-available? device/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "retained intermediate on " target))
+      (let [[w b x :as args] (arguments)
+            prepared (compiled/lower #'four-layers args
+                                     {:compiler :equation-first :target target :dtype :double
+                                      :taps '[a]})
+            linked (compiled/plan prepared)
+            expected {:result (vec (apply four-layers args))
+                      :a (vec (nn/dense w x b))}
+            result (link/evaluate! linked)]
+        (is (= 0 (get-in result [:memory :allocations-saved])))
+        (is (= 2 (count (:outputs result))))
+        (doseq [{:keys [key node]} (:out-tree prepared)]
+          (is (= (get expected key) (vec (get-in result [:outputs node])))
+              (str target " " key)))))))
 
 (deftest typed-program-order-meets-complete-write-evidence
   (let [linked (lowered :ocl:0 (arguments))

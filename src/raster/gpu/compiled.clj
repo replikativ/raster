@@ -686,7 +686,7 @@
             (throw (ex-info "equation-first outputs require unique semantic keys"
                             {:reason :compiled-equation-first-output-keys
                              :keys duplicate-keys})))
-        lowering (invocation-link/certify plan)
+        lowering (invocation-link/certify plan (mapv :node out-tree))
         lowering-ns (- (System/nanoTime) lowering-started)
         steps (mapv (fn [index kernel]
                       {:convention :kernel-body
