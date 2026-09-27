@@ -589,6 +589,14 @@ peak storage, transferred bytes and execution time. External comparisons and hea
 stay outside the local hot loop. Use device events where available and label CPU OpenCL results as
 CPU results. No SOTA claim follows from successful vendor compilation alone.
 
+The first scientific-stencil canary now exercises the public periodic heat `deftm` with an
+independent oracle and resident Level Zero event timing. It exposed a one-work-item serial loop
+at `128×128`; spelling independent cells as a SOAC map with the store indexed by the map lane
+made uniqueness provable and changed the launch to 256 lanes/workgroup. The local median fell
+from 3.18 ms to 19.8 µs with exact oracle parity. This is a measured schedule correction, not
+a vendor-library comparison. Raw samples and the nonstationary `256×256` result are retained in
+the generated-kernel comparison protocol.
+
 Use the measurements to shortlist legal schedules and validate selective autotuning/cache replay.
 If comparable accelerator hardware is unavailable, complete harnesses and correctness gates but
 leave accelerator competitiveness explicitly unmeasured.

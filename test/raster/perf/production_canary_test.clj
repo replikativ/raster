@@ -4,6 +4,7 @@
             [raster.arrays :as arrays]
             [raster.gpu.link :as link]
             [raster.perf.production-canary :as canary]
+            [raster.ode.pde :as pde]
             [raster.runtime.hardware :as hardware]
             [raster.runtime.microbench :as microbench]
             [raster.gpu.compiled :as compiled]
@@ -14,6 +15,18 @@
 (defn- once-only [f & _]
   (f)
   {:median-ns 100 :stationary? true})
+
+(deftest periodic-heat-canary-reference-is-independent-and-shape-checked
+  (doseq [shape [[3 5] [8 8]]]
+    (let [[_ input nx ny alpha dt inv-dx2 inv-dy2 :as args]
+          (canary/heat-arguments shape)
+          expected (canary/heat-reference args)
+          actual (double-array (* nx ny))]
+      (pde/periodic-heat-step-2d! actual input nx ny alpha dt inv-dx2 inv-dy2)
+      (is (every? true? (map #(<= (Math/abs (- %1 %2)) 1.0e-12)
+                             expected actual)))))
+  (doseq [shape [[2 5] [5 2] [4096 4096] [1 2 3]]]
+    (is (thrown? clojure.lang.ExceptionInfo (canary/heat-arguments shape)))))
 
 (deftm static-gemm-relu! [A :- (Array float) B :- (Array float) C :- (Array float)] :- (Array float)
   (let [product (raster.par/contract C [[i 3] [j 4]] [[p 5]]

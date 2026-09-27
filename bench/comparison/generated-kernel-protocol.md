@@ -20,6 +20,33 @@ establishes accelerator competitiveness.
    in that order as their generated routes become measurable. Retain regression cases
    even when another schedule is faster on the aggregate.
 
+### Periodic heat stencil canary (opt-in)
+
+`raster.perf.production-canary/heat!` measures the public equation-first TypedSOAC route on
+a periodic double-precision grid. It uses an independent primitive-array five-point oracle,
+validates resident output before and after timing, and records four warmups followed by twelve
+device-event spans. Compilation, lowering, binding, transfers and validation are separate from
+the timed samples. For example, in a `:test` or `:bench` REPL with a real Intel device:
+
+```clojure
+(require '[raster.perf.production-canary :as canary])
+(canary/heat! {:environment-tag "machine-driver-label"
+               :compiler-revision "git-revision"
+               :target :ze:0 :shape [128 128]})
+```
+
+The [first Arc diagnostic](../results/periodic-heat-arc-20260927.edn) caught a scheduling
+cliff: nested source loops launched one work item and took 3.18 ms at `128×128`.
+Expressing independent cells with `par/map-void!` and storing through its original lane
+index lets the compiler prove disjoint outputs; it launches 256 work items per group and
+takes 19.8 µs in the corresponding local run. Both runs matched the independent oracle and
+met the sampler's stationarity heuristic. The `256×256` run retained a slow first sample and
+was nonstationary. These observations validate an important source-to-schedule change, not
+competitive stencil throughput against an external library or a tuning-cache decision.
+The same laptop session's [RMSNorm and strict-FP32 GEMM ladder](../results/arc-kernel-ladder-20260927.edn)
+retains validated but nonstationary or transient-contaminated observations. It does not supersede
+the existing CLBlast comparison or establish a cross-workload performance ranking.
+
 ## Baseline selection
 
 ### Strict-FP32 OpenCL SGEMM reference (opt-in)

@@ -1,0 +1,28 @@
+{:status :diagnostic-not-tuning-evidence
+ :date "2026-09-27"
+ :base-revision "9970500ddc367a12739dc12c72b33bbc27cf75f5"
+ :device "Intel(R) Arc(TM) Graphics"
+ :driver "26.05.37020.3"
+ :java-version "25.0.1+8-LTS-jvmci-b01"
+ :notes "Other JVMs were active on this laptop. Every result passed its independent numerical oracle. RMSNorm used raster.perf.production-canary/rmsnorm! on Level Zero with resident device-event timing; the short 30 ms budgets yielded nonstationary distributions, so only summaries are retained. Strict-FP32 GEMM used raster-strict-gemm/benchmark! on Intel OpenCL with four warmups and twelve resident device-event spans; the first samples show large transients. These are not paired/interleaved with a vendor baseline and must not update tuning policy. See periodic-heat-arc-20260927.edn for the stencil source-to-schedule comparison."
+ :rmsnorm
+ [{:shape [1 640] :target :ze:0 :validated? true
+   :median-ns 4166.666666666667 :p75-ns 4270.833333333334
+   :cv 0.9190093157491176 :n 2384 :stationary? false}
+  {:shape [8 640] :target :ze:0 :validated? true
+   :median-ns 5520.833333333334 :p75-ns 5833.333333333334
+   :cv 0.4425299925117602 :n 2083 :stationary? false}
+  {:shape [512 640] :target :ze:0 :validated? true
+   :median-ns 236666.6666666667 :p75-ns 310625.0
+   :cv 0.6765000498190468 :n 94 :stationary? false}]
+ :strict-f32-gemm
+ [{:shape [8 256 256] :target :ocl:0 :strategy :regtiled
+   :schedule-precision :f32-scalar :max-absolute-error 0.0
+   :compile-ns 3116694663 :bind-ns 506084836
+   :samples-ns [223125 231770 83020 82916 83437 81770
+                81145 79270 79375 79062 78541 78645]}
+  {:shape [256 256 256] :target :ocl:0 :strategy :regtiled
+   :schedule-precision :f32-scalar :max-absolute-error 0.0
+   :compile-ns 86386286 :bind-ns 223193514
+   :samples-ns [836458 685625 255208 258958 258749 263854
+                257604 257083 257187 213541 213750 213229]}]}
