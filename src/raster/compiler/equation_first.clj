@@ -75,6 +75,7 @@
     (merge {:resident-reductions? true}
            options
            {:dtype effective-dtype
+            :segmented-plans? true
             :target-device target
             :active-params parameters
             :public-parameters parameters
@@ -152,8 +153,11 @@
                              represented-source pipeline/gpu-semantic-post-soa-passes
                              compiler-options :write-read-fused)
          semantic (case (:dialect semantic-candidate)
-                    :typed-parallel semantic-candidate
-                    :typed-soac (structured-route/promote-soac-program
+                    :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
+                                      semantic-candidate
+                                      (structured-route/promote-program
+                                       semantic-candidate compiler-options))
+                    :typed-soac (structured-route/promote-program
                                  semantic-candidate compiler-options)
                     semantic-candidate)
          _ (when-not (= :typed-parallel (:dialect semantic))

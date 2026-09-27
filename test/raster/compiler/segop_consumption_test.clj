@@ -110,9 +110,18 @@
                               :scalar-types {'n :long}
                               :array-types {'X :double}}))
         equation (first (:equations program))
-        compiled (run program)]
+        source-options (atom nil)
+        schedule-source slp/schedule-source-program
+        compiled (with-redefs [slp/schedule-source-program
+                               (fn [source opts]
+                                 (reset! source-options opts)
+                                 (schedule-source source opts))]
+                   (run program))]
     (is (= 1 (count (:results equation))))
     (is (some? (:algorithm equation)))
+    (is (= :double (get-in @source-options [:array-types 'X])))
+    (is (not (contains? (:array-types @source-options) (first (:results equation))))
+        "physical scalar reduction storage must not become a source array declaration")
     (is (= 2 (count (:kernels compiled))))
     (is (= 1 (get-in compiled [:stats :ze-reduces])))
     (is (= 1 (get-in compiled [:stats :segop-reused])))

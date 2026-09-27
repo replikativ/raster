@@ -26,9 +26,11 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.patterns :as patterns]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
             [raster.compiler.passes.scalar.effects :as effects]))
 
 (defn- fail!
@@ -2670,6 +2672,30 @@
 (defn- operation-description
   [id symbol expression default-dtype array-types scalar-types]
   (cond
+    ;; The recognizer has already proved this generic algebra and attached its exact plan to the
+    ;; marker. Recover that plan here, at the same source-description boundary as every ordinary
+    ;; SOAC operation; do not rediscover attention or infer a second semantic operation.
+    (swr-fuse/marker? expression)
+    (let [storage (second expression)
+          result-tag (types/sym-type-tag symbol)
+          emitted-dtype (dtype/canon
+                         (or (dtype/dtype-for-array-tag result-tag)
+                             (dtype/dtype-for-scalar-tag result-tag)
+                             (get array-types storage)
+                             default-dtype))
+          plan (swr-fuse/marker-plan expression emitted-dtype)
+          inputs (swr/ordered-input-ids plan)
+          runtime-values (swr/runtime-parameter-values plan)]
+      {:kind :segmented-weighted-reduction-plan
+       :id id :sym symbol :expr expression :plan plan
+       :results [symbol]
+       :inputs inputs
+       :scalars (vec (filter symbol? runtime-values))
+       :outputs #{(get-in plan [:output :id])}
+       :result-storage [{:destination (get-in plan [:output :id])
+                         :access :write :host-return :buffer}]
+       :host-binding symbol})
+
     ;; A scalar reduction stored directly into element zero is precisely the resident
     ;; `reduce-into` contract.  Fixpoint reduction recovery produces this form from ordinary
     ;; Clojure loops; recognize the algebra here instead of sending the nested reduction to a
@@ -4054,7 +4080,9 @@
     (first (descriptor/call-args expression))))
 
 (defn- source-descriptions
-  [pairs default-dtype array-types scalar-types]
+  ([pairs default-dtype array-types scalar-types]
+   (source-descriptions pairs default-dtype array-types scalar-types false))
+  ([pairs default-dtype array-types scalar-types segmented-plans?]
   ;; Earlier local allocations are authoritative array-type facts for later effects. Thread those
   ;; facts in source order instead of falling back to the program-wide arithmetic dtype: a local
   ;; float-array reduced by a strided scatter remains FP32 even in a mixed-precision program.
@@ -4065,9 +4093,10 @@
          [id [symbol expression]]]
       (let [expression (retain-free-scalar-reference-types expression local-scalar-types)
             description
-            (or (binding [*scalar-definitions* scalar-definitions]
-                  (operation-description id symbol expression default-dtype array-types
-                                         local-scalar-types))
+            (or (when (or segmented-plans? (not (swr-fuse/marker? expression)))
+                  (binding [*scalar-definitions* scalar-definitions]
+                    (operation-description id symbol expression default-dtype array-types
+                                           local-scalar-types)))
                 (if (par/par-form? expression)
                   {:kind :unsupported :id id :sym symbol :expr expression}
                   {:kind :scalar :id id :sym symbol :expr expression}))
@@ -4133,8 +4162,12 @@
             ;; A functional map result is a typed array value available to later source
             ;; descriptions. This is the map's declared element contract, not a consumer guess;
             ;; a resident map binding may name a different caller-owned physical destination.
-            (when (contains? #{:map :scatter} (:kind description))
-              (some-> (:elem-type description) dtype/canon))]
+            (when (contains? #{:map :scatter :segmented-weighted-reduction-plan}
+                             (:kind description))
+              (some-> (if (= :segmented-weighted-reduction-plan (:kind description))
+                        (get-in description [:plan :output :dtype])
+                        (:elem-type description))
+                      dtype/canon))]
         (cond-> (update state :descriptions conj description)
           (or (not= :scalar (:kind description))
               (and (nil? allocation-dtype)
@@ -4150,7 +4183,7 @@
           scalar-definition (assoc-in [:scalar-definitions symbol] scalar-definition))))
     {:descriptions [] :array-types array-types :scalar-definitions {}
      :local-scalar-types scalar-types :stageable-prefix? true :before-parallel? true}
-    (map-indexed vector pairs))))
+    (map-indexed vector pairs)))))
 
 (defn- canonical-extent
   [equalities values extent]
@@ -4238,13 +4271,21 @@
                :product-reduce :segmented-fold-map :scan}
              (:kind description)))
 
+(defn- swr-description?
+  [description]
+  (= :segmented-weighted-reduction-plan (:kind description)))
+
+(defn- semantic-description?
+  [description]
+  (or (soac-description? description) (swr-description? description)))
+
 (defn- physical-output-symbols
   "Every buffer some operation writes, closed under host renamings: a binding that merely
    renames a buffer (`out y`) shares its physical identity, so a write through the alias is a
    write to the allocation it names and that allocation is generated scaffolding as well."
   [descriptions]
   (let [written (reduce set/union #{}
-                        (map #(if (soac-description? %)
+                        (map #(if (semantic-description? %)
                                 (:outputs %) #{})
                              descriptions))
         renamings (keep #(when (and (= :scalar (:kind %)) (symbol? (:expr %)))
@@ -4315,6 +4356,14 @@
     :scan (and (= 1 (count (:result-storage description)))
                (= (:primary-out description)
                   (get-in description [:result-storage 0 :destination])))
+    :segmented-weighted-reduction-plan
+    (and (swr/plan? (:plan description))
+         (= [(:sym description)] (:results description))
+         (= (swr/ordered-input-ids (:plan description)) (:inputs description))
+         (= #{(get-in description [:plan :output :id])} (:outputs description))
+         (= [{:destination (get-in description [:plan :output :id])
+              :access :write :host-return :buffer}]
+            (:result-storage description)))
     false))
 
 (defn- supported-descriptions?
@@ -5070,13 +5119,14 @@
 (defn- terminal-results
   [descriptions body]
   (let [physical-outputs (physical-output-symbols descriptions)
-        operations (filter soac-description? descriptions)
+        operations (filter semantic-description? descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter :effect-map :stencil) (:results %)
                                               :scan [(:sym %)]
                                               (:reduce :contract :segmented-reduce) (:results %)
                                               :product-reduce (:results %)
                                               :segmented-fold-map (:results %)
+                                              :segmented-weighted-reduction-plan (:results %)
                                               (:outputs %))
                                            operations))
         terminal-operation-definitions
@@ -5088,6 +5138,7 @@
                         (if (:effect-only? %) [] (:results %))
                         :product-reduce (if (:effect-only? %) [] (:results %))
                         :segmented-fold-map (if (:effect-only? %) [] (:results %))
+                        :segmented-weighted-reduction-plan (:results %)
                         (:outputs %))
                      operations))
         typed-scalars (filter #(and (= :scalar (:kind %))
@@ -5152,7 +5203,7 @@
            (filter #(generated-scaffolding? % physical-outputs) descriptions))))
 
 (defn- selected-scalars
-  [descriptions operation-equations outputs]
+  [descriptions operation-equations outputs semantic-scalar-roots]
   (let [physical-outputs (physical-output-symbols descriptions)
         by-symbol (into {}
                         (keep #(when (and (= :scalar (:kind %))
@@ -5175,6 +5226,7 @@
         roots (set (concat outputs
                            allocation-capacity-roots
                            ordered-evaluation-roots
+                           semantic-scalar-roots
                            (mapcat (fn [equation]
                                      (into (dialect/operation-inputs equation)
                                            (filter dialect/value-id?
@@ -5348,6 +5400,22 @@
                                           [(apply max (map second accesses))]))]))
           (group-by first requirements))))
 
+(defn- swr-description-values
+  "Project the exact logical and physical tensor contracts already carried by a protected plan.
+   Runtime scalars remain ordinary source scalar values and are checked below; this helper neither
+   infers their types nor changes the plan's storage layout."
+  [{:keys [sym plan]}]
+  (let [plan (swr/validate! plan)
+        output (:output plan)]
+    ;; Source arrays are flat contiguous buffers. Mathematical rank remains authoritative in the
+    ;; plan; the shared boundary checks the exact physical footprint without teaching pmap a
+    ;; second tensor layout convention.
+    (into {sym (tensor-value (:dtype output) [(:elements output)])
+           (:id output) (tensor-value (:dtype output) [(:elements output)])}
+          (map (fn [{:keys [id dtype elements]}]
+                 [id (tensor-value dtype [elements])]))
+          (:operands plan))))
+
 (defn- merge-value
   ([values id contract] (merge-value values id contract {}))
   ([values id contract shape-equalities]
@@ -5408,7 +5476,23 @@
                                                              values)
             *region-local-counter* (atom -1)
             *region-local-source-symbols* (source-symbols source)]
-    (form->program* source options)))
+    (let [projection (form->program* source options)]
+      (when (and projection (not (:segmented-plans? projection)))
+        (:typed-program projection)))))
+
+(defn form->program-components
+  "Construct the shared analyzed-source projection used for staged generic-plan admission.
+
+   This compiler-private boundary is enabled explicitly so existing descriptor compilation keeps
+   its current route until the equation-first scheduler can consume the protected plan. Ordinary
+   callers should use form->program; no second source walk or semantic operation is introduced."
+  [source {:keys [array-types scalar-types values segmented-plans?] :as options}]
+  (when segmented-plans?
+    (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types
+                                                               values)
+              *region-local-counter* (atom -1)
+              *region-local-source-symbols* (source-symbols source)]
+      (form->program* source options))))
 
 (defn- allocation-contracts
   "Allocation leaves the equation spine as host scaffolding, but initialization is semantic.
@@ -5432,7 +5516,7 @@
           descriptions)))
 
 (defn- form->program*
-  [source {:keys [dtype array-types scalar-types values shape-equalities]
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
@@ -5440,12 +5524,15 @@
           pairs (vec (partition 2 bindings))
           array-types (binder-array-types pairs array-types dtype)
           descriptions (preserve-map-storage-inputs
-                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
+                         (normalize-extents (source-descriptions pairs dtype array-types scalar-types
+                                                                 segmented-plans?)
                                             shape-equalities values)
                          values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
-                 (some soac-description? descriptions)
+                 (some semantic-description? descriptions)
+                 (or segmented-plans?
+                     (not-any? swr-description? descriptions))
                  ;; Body expressions are projected as host results, not equations. They therefore
                  ;; cannot contain an unrepresented parallel leaf; structured control or the
                  ;; compatibility scheduler must retain that lexical operation instead.
@@ -5453,6 +5540,7 @@
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
               (filterv soac-description? descriptions)
+              swr-descriptions (filterv swr-description? descriptions)
               physical-outputs (physical-output-symbols descriptions)
               ;; Source descriptions retain the same authoritative local scalar contracts used
               ;; during admission.  Thread them into AbstractValue construction as well: a
@@ -5468,7 +5556,13 @@
               operation-equations-by-id (zipmap (map :id operation-descriptions)
                                                 operation-equations)
               outputs (terminal-results descriptions body)
-              required-scalars (selected-scalars descriptions operation-equations outputs)
+              semantic-scalar-roots
+              (into []
+                    (comp (mapcat #(swr/runtime-parameter-values (:plan %)))
+                          (filter symbol?))
+                    swr-descriptions)
+              required-scalars (selected-scalars descriptions operation-equations outputs
+                                                 semantic-scalar-roots)
               scalar-descriptions
               (into {}
                     (keep #(when (and (= :scalar (:kind %))
@@ -5486,7 +5580,7 @@
                     descriptions)
               graph-shape-scalar-ids
               (set/union allocation-capacity-scalar-ids normalized-extent-scalar-ids)
-              {:keys [equations equation-descriptions]}
+              {:keys [equations equation-descriptions entries]}
               (reduce (fn [{:keys [scalar-dtypes] :as state} description]
                         (cond
                           (= :scalar (:kind description))
@@ -5497,18 +5591,27 @@
                               (-> state
                                   (update :equations conj equation)
                                   (update :equation-descriptions conj description)
+                                  (update :entries conj {:kind :typed-soac
+                                                         :equation-id (:id description)})
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
                           (soac-description? description)
                           (-> state
                               (update :equations conj (get operation-equations-by-id (:id description)))
-                              (update :equation-descriptions conj description))
+                              (update :equation-descriptions conj description)
+                              (update :entries conj {:kind :typed-soac
+                                                     :equation-id (:id description)}))
+
+                          (swr-description? description)
+                          (update state :entries conj
+                                  {:kind :segmented-weighted-reduction
+                                   :description description})
 
                           :else
                           (fail! :unsupported-operation-description
                                  "admitted source description has no equation projection"
                                  {:description description})))
-                      {:equations [] :equation-descriptions [] :scalar-dtypes {}}
+                      {:equations [] :equation-descriptions [] :entries [] :scalar-dtypes {}}
                       descriptions)
               equation-info (mapv (fn [equation]
                                     {:results (nth equation 2)
@@ -5520,6 +5623,7 @@
                                              (filter dialect/value-id? (:extents %)))
                                       equation-info))
               inputs (vec (sort-by pr-str (set/difference references definitions)))
+              semantic-descriptions (into equation-descriptions swr-descriptions)
               logical-result-types
               (into {}
                     (mapcat (fn [description]
@@ -5528,7 +5632,7 @@
                                                           dtype array-types)])
                                    (:results description)
                                    (:result-storage description))))
-                    (filter :result-storage equation-descriptions))
+                    (filter :result-storage semantic-descriptions))
               array-types' (merge array-types logical-result-types)
               destination-values
               (into {}
@@ -5543,9 +5647,11 @@
                                          ;; A scalar reduction's explicit storage contract is
                                          ;; exactly one resident element.
                                          :reduce [1]
+                                         :segmented-weighted-reduction-plan
+                                         [(get-in description [:plan :output :elements])]
                                          [(list 'unknown-dimension destination)]))])
                                    (:result-storage description))))
-                    equation-descriptions)
+                    semantic-descriptions)
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
                                                    (equation-values equation dtype array-types'
@@ -5554,8 +5660,35 @@
                                       (merge destination-values
                                              (contraction-storage-values equations dtype array-types' values))
                                       equations)
+              inferred-values
+              (reduce (fn [contracts description]
+                        (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
+                                   (swr-description-values description)))
+                      inferred-values swr-descriptions)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                 inferred-values values)
+              values
+              (reduce (fn [contracts id]
+                        (if-let [value (get contracts id)]
+                          (do
+                            (when-not (and (empty? (:shape value))
+                                           (contains? #{:int :long}
+                                                      (some-> (:dtype value) dtype/canon)))
+                              (fail! :source-value-conflict
+                                     "protected reduction runtime values require declared integral scalars"
+                                     {:id id :value value}))
+                            contracts)
+                          (if-let [declared (some-> (get source-scalar-types id) dtype/canon)]
+                            (if (contains? #{:int :long} declared)
+                              (assoc contracts id (tensor-value declared []))
+                              (fail! :source-value-conflict
+                                     "protected reduction runtime values require integral declarations"
+                                     {:id id :dtype declared}))
+                            (fail! :typed-soac-unknown-value
+                                   "protected reduction runtime value has no retained scalar type"
+                                   {:id id}))))
+                      values (distinct semantic-scalar-roots))
+              _ (validate-declared-array-values! array-types values)
               allocations (allocation-contracts descriptions array-types source-scalar-types values
                                                 shape-equalities)
               ;; An allocation-only public dimension need not appear in a numerical equation.
@@ -5598,12 +5731,16 @@
               (filterv #(and (= :scalar (:kind %))
                              (not (supported-description? physical-outputs %)))
                        descriptions)
-              host-binding-ids (mapv :id host-descriptions)
+              ;; Protected markers stay in the reconstructed host form until their existing plan
+              ;; becomes a scheduled equation. Keeping the source binding is provenance and
+              ;; compatibility materialization, not a second execution path after admission.
+              host-control-descriptions (into host-descriptions swr-descriptions)
+              host-binding-ids (mapv :id host-control-descriptions)
               ;; Program values a host-controlled binding reads are uses of those values: a
               ;; producer read by the host must stay materialized, whatever fusion does with
               ;; its typed consumers.
               host-read-values
-              (->> host-descriptions
+              (->> host-control-descriptions
                    (mapcat #(util/free-syms (:expr %)))
                    (filter #(contains? values %))
                    distinct
@@ -5621,6 +5758,22 @@
                                            {:source-binding-id id
                                             :values (set (filter #(contains? values %)
                                                                  (util/free-syms expr)))})
-                                         host-descriptions)
+                                         host-control-descriptions)
                                    :allocations allocations}})]
-          (dialect/make facts equations outputs))))))
+          (let [segmented? (boolean (seq swr-descriptions))
+                ;; For a mixed projection this is an equation catalog used to build maximal
+                ;; ordinary SOAC chunks. Its broad outputs prevent validation from discarding a
+                ;; producer at a protected-plan boundary; each chunk receives its exact live-out
+                ;; boundary in typed-soac-route before fusion.
+                typed-outputs (if segmented?
+                                (vec (distinct (mapcat #(nth % 2) equations)))
+                                outputs)
+                typed-program (when (seq equations)
+                                (dialect/make facts equations typed-outputs))]
+            {:typed-program typed-program
+             :segmented-plans? segmented?
+             :entries entries
+             :outputs outputs
+             :values values
+             :facts facts
+             :source source}))))))

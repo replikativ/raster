@@ -1,10 +1,16 @@
 (ns raster.compiler.passes.parallel.segmented-weighted-reduction-fuse-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [clojure.walk :as walk]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as fuse]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.reference.segmented-weighted-reduction :as reference]
             [raster.core :refer [deftm]]
@@ -97,6 +103,179 @@
            (:runtime-parameters plan)))
     (is (= 'entities2 (get-in plan [:segment-axes 0 :extent])))
     (is (= 'width2 (get-in plan [:storage :total-dim])))))
+
+(deftest protected-marker-enters-the-shared-typed-program-only-when-enabled
+  (let [{:keys [form]} (fuse/fuse (chain) :float)
+        marker (second (last (mapv vec (partition 2 (second form)))))
+        plan (fuse/marker-plan marker :float)
+        array-types (into {} (map (juxt :id :dtype)) (:operands plan))
+        scalar-types (zipmap (filter symbol? (swr/runtime-parameter-values plan))
+                             (repeat :long))
+        values (into {} (map (fn [{:keys [id dtype elements]}]
+                              [id (av/tensor {:dtype dtype :shape [elements]})]))
+                     (:operands plan))
+        disabled (typed-route/attempt form :float array-types
+                                      {:scalar-types scalar-types :values values})
+        enabled (typed-route/attempt form :float array-types
+                                     {:scalar-types scalar-types :values values
+                                      :segmented-plans? true})
+        program (:program enabled)
+        plan-equation (some #(when (swr/plan? (:algorithm %)) %) (:equations program))]
+    (is (nil? disabled) "the existing descriptor route remains selected by default")
+    (is (= :typed-parallel (:dialect program)))
+    (is (nil? (get-in enabled [:stats :typed-validated]))
+        "the pipeline, not the cyclic frontend route, owns mixed-union validation")
+    (is (= plan (:algorithm plan-equation)))
+    (is (= (vec (distinct (concat (swr/ordered-input-ids plan)
+                                  (filter symbol? (swr/runtime-parameter-values plan)))))
+           (:operands plan-equation)))
+    (is (= '[normalized] (:results plan-equation)))
+    (is (identical? program (structured-route/validate-typed-program! program)))
+    (is (= :segmented-weighted-reduction-unscheduled
+           (try
+             (structured-route/schedule-program program {})
+             nil
+             (catch clojure.lang.ExceptionInfo exception
+               (:reason (ex-data exception))))))))
+
+(deftest protected-plan-preserves-ordinary-equations-on-both-sides
+  (let [{:keys [form]} (fuse/fuse (chain) :float)
+        [[storage allocation] [result marker]] (mapv vec (partition 2 (second form)))
+        source (list 'let*
+                     ['q-ready '(raster.par/map! Q i n-nodes float
+                                                  (clojure.core/aget Q 0))
+                      storage allocation
+                      result marker
+                      'post '(raster.par/pmap j n-nodes float
+                                              (clojure.core/aget normalized 0))]
+                     'post)
+        plan (fuse/marker-plan marker :float)
+        array-types (into {} (map (juxt :id :dtype)) (:operands plan))
+        scalar-types (zipmap (filter symbol? (swr/runtime-parameter-values plan))
+                             (repeat :long))
+        values (into {} (map (fn [{:keys [id dtype elements]}]
+                              [id (av/tensor {:dtype dtype :shape [elements]})]))
+                     (:operands plan))
+        program (:program (typed-route/attempt
+                           source :float array-types
+                           {:scalar-types scalar-types :values values
+                            :segmented-plans? true}))
+        descriptor-attempt (typed-route/attempt
+                            source :float array-types
+                            {:scalar-types scalar-types :values values})
+        algorithms (filterv
+                    #(or (swr/plan? %)
+                         (some (fn [equation] (not= 'scalar (soac/operation-kind equation)))
+                               (soac/equations %)))
+                    (map :algorithm (:equations program)))]
+    (is (= 3 (count algorithms)))
+    (is (= :typed-soac (get-in descriptor-attempt [:stats :route])))
+    (is (some fuse/marker? (tree-seq coll? seq (get-in descriptor-attempt [:program :source])))
+        "descriptor compilation keeps the protected binding between its typed SOAC islands")
+    (is (soac/program-form? (first algorithms)))
+    (is (= plan (second algorithms)))
+    (is (soac/program-form? (last algorithms)))
+    (is (= 1 (count (get-in program [:attributes :allocations]))))
+    (is (every? empty?
+                (map #(get-in (soac/facts %) [:attributes :allocations])
+                     [(first algorithms) (last algorithms)]))
+        "the plan output allocation is not replayed by adjacent SOAC initialization passes")
+    (is (= '[post] (:outputs program)))
+    (is (identical? program (structured-route/validate-typed-program! program)))))
+
+(deftest functional-producer-is-a-live-plan-operand
+  (let [static-chain (walk/postwalk-replace
+                      {'n-nodes 2 'n-edges 3 'emb-dim 5 'n-heads 1 'dk 5}
+                      (chain))
+        {fused :form} (fuse/fuse static-chain :float)
+        [[storage allocation] [result marker]] (mapv vec (partition 2 (second fused)))
+        [_ marker-output marker-inputs runtime-values] marker
+        rebound-marker (with-meta
+                         (list fuse/marker-op marker-output
+                               (assoc marker-inputs 0 'q-ready) runtime-values)
+                         (meta marker))
+        plan (fuse/marker-plan rebound-marker :float)
+        source (list 'let*
+                     ['q-ready '(raster.par/pmap i 10 float (clojure.core/aget Q i))
+                      storage allocation
+                      result rebound-marker
+                      'post '(raster.par/pmap j 2 float
+                                              (clojure.core/aget normalized 0))]
+                     'post)
+        external-descriptors (remove #(= 'q-ready (:id %)) (:operands plan))
+        array-types (into {} (map (juxt :id :dtype)) external-descriptors)
+        values (into {} (map (fn [{:keys [id dtype elements]}]
+                              [id (av/tensor {:dtype dtype :shape [elements]})]))
+                     external-descriptors)
+        program (:program (typed-route/attempt source :float array-types
+                                               {:values values :segmented-plans? true}))
+        [producer protected consumer] (:equations program)]
+    (is (soac/program-form? (:algorithm producer)))
+    (is (= '[q-ready] (:results producer)))
+    (is (= 'q-ready (first (:operands protected))))
+    (is (= plan (:algorithm protected)))
+    (is (soac/program-form? (:algorithm consumer)))
+    (is (some #{'normalized} (:operands consumer)))
+    (is (= '[post] (:outputs program)))
+    (is (identical? program (structured-route/validate-typed-program! program)))))
+
+(deftest public-equation-first-reaches-the-named-unscheduled-boundary
+  (let [failure (try
+                  (equation-first/compile
+                   #'resident-structured-reduction-probe {:target :ze:0 :dtype :float})
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception (ex-data exception)))]
+    (is (= :segmented-weighted-reduction-unscheduled (:reason failure)))
+    (is (= [:binding 'normalized] (:site failure)))
+    (is (= :segmented-weighted-reduction (first (:plan-id failure))))))
+
+(deftest mixed-components-initialize-shared-scratch-only-once
+  (let [{:keys [form]} (fuse/fuse (chain) :float)
+        [[storage allocation] [result marker]] (mapv vec (partition 2 (second form)))
+        plan (fuse/marker-plan marker :float)
+        effect '(raster.par/map-void! i 1
+                  (raster.par/atomic-add! scratch 0 (float 1.0)))
+        source (list 'let* ['scratch '(clojure.core/float-array 1)
+                           'before effect storage allocation result marker 'after effect]
+                     [result 'scratch])
+        attempt (typed-route/attempt
+                 source :float (into {} (map (juxt :id :dtype)) (:operands plan))
+                 {:segmented-plans? true :resident-initialization? true
+                  :scalar-types (zipmap (:runtime-parameters plan) (repeat :long))})
+        program (:program attempt)]
+    (is (some? program) (pr-str (:declined attempt)))
+    (is (= 1 (get-in attempt [:stats :initialization-fills])))
+    (is (identical? program (structured-route/validate-typed-program! program)))
+    (let [[before [_ & after]] (split-with #(not (swr/plan? (:algorithm %)))
+                                         (:equations program))
+          fills (fn [equations]
+                  (filter #(= :zero (get-in % [:attributes :initialization])) equations))]
+      (is (= 1 (count (fills before))))
+      (is (empty? (fills after))
+          "the suffix must observe the prefix update, not reset the allocation"))))
+
+(deftest protected-source-admission-does-not-infer-missing-or-conflicting-types
+  (let [{:keys [form]} (fuse/fuse (chain) :float)
+        marker (last (second form))
+        plan (fuse/marker-plan marker :float)
+        array-types (into {} (map (juxt :id :dtype)) (:operands plan))
+        options {:segmented-plans? true
+                 :scalar-types (zipmap (:runtime-parameters plan) (repeat :long))}]
+    (doseq [[arrays opts reason]
+            [[(assoc array-types 'Q :double) options :source-value-conflict]
+             [array-types (update options :scalar-types dissoc 'dk) :typed-soac-unknown-value]
+             [array-types (assoc-in options [:scalar-types 'dk] :float) :source-value-conflict]]]
+      (let [attempt (typed-route/attempt form :float arrays opts)]
+        (is (nil? (:program attempt)))
+        (is (= reason (get-in attempt [:declined :reason])))))
+    (let [unproved (assoc-in (vec form) [1 (dec (count (second form)))]
+                             (with-meta marker nil))
+          unproved (apply list unproved)]
+      (is (= :segmented-reduction-marker-missing-plan
+             (try (typed-route/attempt unproved :float array-types options)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+          "losing the recognized algebra proof must not become a fallback or inferred plan"))))
 
 (deftest marker-rebinding-deduplicates-identified-single-head-dimensions
   (let [single-head (walk/postwalk-replace
@@ -249,7 +428,7 @@
                      (:allocs descriptor)))
         node-id (merge param->key alloc->key)
         views (into {}
-                    (map (fn [[sym key]]
+                    (map (fn [[_sym key]]
                            [key (gpu/->ResidentBufferView
                                  :test-session key
                                  {:byte-length (* 4 (get capacities key)) :dtype :float})]))

@@ -155,9 +155,10 @@ include retained binding-time admission/tuning evidence and attention dispatch w
 through the same public API. Both entry points now share precision-policy validation and the
 pre-emission feasibility gate; equation-first retains the resolved schedule instead of silently
 stripping the deprecated precision option. This is not candidate parity: its portable contraction
-graph still lacks the descriptor route's alternative-selection machinery. A direct probe of
-`resident-structured-reduction-probe` also declines equation-first semantic coverage, while the
-descriptor route accepts it. Keep those gaps explicit rather than equating schedule metadata
+graph still lacks the descriptor route's alternative-selection machinery. The public
+`resident-structured-reduction-probe` now retains its recognized reduction plan in equation-first
+compilation and reaches the source-located `:segmented-weighted-reduction-unscheduled` boundary;
+the descriptor route already executes it. Keep those gaps explicit rather than equating schedule metadata
 with implemented optimization. Equation-first compilation captures its target description once
 for fusion costs, schedule admission, launch planning and C-family projection; direct low-level
 callers may still resolve a descriptor when none is supplied. The equation-first prepared-template
@@ -185,6 +186,10 @@ through the existing `:result-storage` contract.
    support alone does **not** close public equation-first coverage.
 3. Certify fixed-reference `ScheduledKernelBody` emission against the source plan and exercise
    public resident execution on OpenCL and Level Zero, including empty/unequal segments.
+   Move the existing indexed leaf's exact algebra/layout admission check from its backend wrapper
+   to the shared schedule lowering before reusing the KernelBody builder. The builder currently
+   relies on that caller check; generic plan validity alone does not prove that its specialized
+   score/weight/normalization implementation preserves every valid plan.
 4. Generalize the existing executable slot to graph-or-dispatch. Each alternative must retain
    its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
    common arguments once and allocate only the selected alternative's scratch.
@@ -195,6 +200,23 @@ and storage analysis. This removes duplication before mixed-plan admission; it d
 the supported source language. The plan's older private scalar vocabulary is separate cleanup
 debt: reuse its validator now, then converge it on the canonical typed scalar authority rather
 than enlarging or copying the whitelist.
+
+Steps 1–2 now have internal/source coverage. The same description/value builder yields maximal
+ordinary SOAC runs interleaved with the exact protected plans; fusion, resident scalar handling,
+initialization and ownership use one shared component optimizer. Source-facing JVM arrays retain
+flat `[elements]` AbstractValues while the plan retains mathematical axes. Only an exact plain
+contiguous flattening is admitted; neither arbitrary reshapes nor missing scalar types are inferred.
+Initialization belongs to the first component that accesses each allocation, not every subsequent
+component. A scratch read-modify-write before and after a plan has one initialization fill.
+When the first access is the protected plan itself, its allocation obligation stays in the common
+program facts; executable scheduling must realize or explicitly decline it before permitting reads.
+
+The common invocation attachment now handles both ordinary and mixed loop-free programs.
+Pipeline admission validates the mixed union before treating it as accepted. The internal
+`:segmented-plans?` gate is enabled by equation-first compilation only until executable scheduling
+lands; existing descriptor compilation is unchanged, not replaced with an unscheduled path.
+There is no fallback after a mixed plan is admitted. Remove this staged gate as part of retiring
+descriptor orchestration, after reference execution and certified dispatch are covered.
 
 Both orchestration paths now use one typed contraction boundary validator before emission.
 It joins the equation identity and checks dtype, iteration space and physical input/output storage;

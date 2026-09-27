@@ -57,13 +57,6 @@
   [{:keys [shape elements]}]
   (= elements (shape-elements shape)))
 
-(defn- tensor-contract?
-  [value {:keys [dtype shape] :as descriptor}]
-  (and (descriptor-shape-contract? descriptor)
-       value
-       (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape shape}))
-       (= shape (:shape value))))
-
 (defn- storage-contract?
   [value {:keys [dtype elements] :as descriptor}]
   (and (descriptor-shape-contract? descriptor)
@@ -71,6 +64,13 @@
        (seq (:shape value))
        (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape [elements]}))
        (= elements (shape-elements (:shape value)))))
+
+(defn- plan-value-contract?
+  "Source arrays are flat contiguous values; the plan retains its mathematical axes. Accept that
+   exact flattening as well as the plan's own logical shape, not an arbitrary reshaped tensor."
+  [value {:keys [shape elements] :as descriptor}]
+  (and (or (= shape (:shape value)) (= [elements] (:shape value)))
+       (storage-contract? value descriptor)))
 
 (defn- runtime-value-ids
   "The current protected marker transports only normalized shape scalars or integer literals.
@@ -126,10 +126,10 @@
            (= #{:memory/read :memory/write} (:effects equation))
            (= storage (get-in equation [:attributes :result-storage]))
            (every? (fn [{:keys [id] :as descriptor}]
-                     (tensor-contract? (get values id) descriptor))
+                     (plan-value-contract? (get values id) descriptor))
                    input-descriptors)
            (storage-contract? (get values (:id output-descriptor)) output-descriptor)
-           (tensor-contract? (get values (first results)) output-descriptor)
+           (plan-value-contract? (get values (first results)) output-descriptor)
            (every? (fn [id]
                      (let [value (get values id)]
                        (and value (empty? (:shape value))
@@ -513,7 +513,7 @@
   (reduce
    (fn [values equation]
      (let [algorithm (:algorithm equation)
-           facts (soac/facts algorithm)]
+           facts (when (soac/program-form? algorithm) (soac/facts algorithm))]
        (reduce
         (fn [values inner]
           (let [id (second inner)
@@ -530,11 +530,11 @@
                    values)
                  values))
              values (map vector (nth inner 2) (soac/result-storage facts id)))))
-        values (soac/equations algorithm))))
+        values (when facts (soac/equations algorithm)))))
    values equations))
 
-(defn promote-soac-program
-  "Promote one analyzed, loop-free TypedSOAC ParallelProgram into the common typed program union.
+(defn promote-program
+  "Attach the public invocation contract to an analyzed loop-free typed ParallelProgram.
 
    The numerical equations are unchanged. This pass adds only the public invocation contract:
    direct parameters map by identity, while the transitive non-equation host prefix becomes typed
@@ -542,10 +542,12 @@
    therefore share scheduling, emission, ProgramCall, LinkPlan, and runtime lowering."
   [parallel-program {:keys [public-parameters active-params array-types scalar-types]
                      :as options}]
-  (when-not (= :typed-soac (:dialect parallel-program))
+  (when-not (contains? #{:typed-soac :typed-parallel} (:dialect parallel-program))
     (fail! :structured-control-soac-promotion
-           "loop-free promotion requires an analyzed :typed-soac ParallelProgram"
+           "loop-free promotion requires an analyzed typed ParallelProgram"
            {:dialect (:dialect parallel-program)}))
+  (when (= :typed-parallel (:dialect parallel-program))
+    (validate-typed-program! parallel-program))
   (when-let [providers (seq (get-in parallel-program [:attributes :native-initialization-providers]))]
     (fail! :structured-control-native-initialization
            "source-independent promotion cannot discard native allocation and host writes"
@@ -655,7 +657,7 @@
                :program-storage external-result-storage
                :program-outputs (:outputs parallel-program)
                :attributes {:source-dialect :closed-clojure
-                            :algorithm-dialect :typed-soac
+                            :algorithm-dialect (:dialect parallel-program)
                             :target-dialect :typed-invocation}})]
     (-> promoted
         (update :attributes assoc
