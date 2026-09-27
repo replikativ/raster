@@ -49,6 +49,36 @@
     (is (= (count rows) (count (set (map #(nth % 2) rows)))))
     (is (= (set (map str (range 16))) (set (map first rows))))))
 
+(deftest opencl-shards-preserve-every-gated-namespace-once
+  (let [run (fn [mode shard]
+              (shell/sh "bash" "scripts/ci-test-shard.sh" mode
+                        :env (assoc (into {} (System/getenv))
+                                    "RASTER_TEST_SELECTION" "opencl"
+                                    "CIRCLE_NODE_TOTAL" "4"
+                                    "CIRCLE_NODE_INDEX" (str shard))))
+        plan (run "--plan" 0)
+        rows (mapv #(str/split % #"\t") (str/split-lines (:out plan)))
+        expected (into #{}
+                       (for [path (vals (weights/test-paths))
+                             :when (re-find #"opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?"
+                                            (slurp path))]
+                         path))
+        selected (mapv (fn [shard]
+                         (let [result (run "--list" shard)]
+                           (is (zero? (:exit result)) (:err result))
+                           (str/split-lines (:out result))))
+                       (range 4))]
+    (is (zero? (:exit plan)) (:err plan))
+    (is (= expected (set (map last rows))))
+    (is (= (count expected) (count rows)))
+    (is (= (count expected) (count (distinct (mapcat identity selected)))))
+    (is (= (set (map #(nth % 2) rows)) (set (mapcat identity selected))))
+    (is (= #{"0" "1" "2" "3"} (set (map first rows))))
+    (is (not (zero? (:exit (shell/sh
+                            "bash" "scripts/ci-test-shard.sh" "--plan"
+                            :env (assoc (into {} (System/getenv))
+                                        "RASTER_TEST_SELECTION" "unknown"))))))))
+
 (deftest malformed-timing-data-fails-before-test-selection
   (let [file (java.io.File/createTempFile "raster-invalid-weights-" ".tsv")]
     (try

@@ -153,6 +153,7 @@ jobs:
     # opt-in via RASTER_CI_OPENCL_RUNTIME=intel: its JIT segfaults inside this container image
     # as of 2026-09, while it runs the full gated set locally in ~80 s.
     executor: clojure-java24
+    parallelism: 4
     steps:
       - attach_workspace:
           at: ~/
@@ -181,7 +182,9 @@ jobs:
             clinfo -l
       - run:
           name: Run OpenCL-gated tests on the CPU OpenCL device
-          command: scripts/ci-opencl-cpu.sh
+          command: >-
+            RASTER_TEST_TIMING_REPORT="test-results/opencl-timings-${CIRCLE_NODE_INDEX}.edn"
+            scripts/ci-opencl-cpu.sh
       - store_artifacts:
           path: test-results
           destination: test-timings
