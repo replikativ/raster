@@ -4,6 +4,8 @@
             [raster.compiler.passes.parallel.city-workload-fixture :as city]
             [raster.dl.gpu-grad-parity :as probe]
             [raster.gpu.device-probe :as opencl]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.value :as value]
             [raster.gpu.core :as gpu]))
 
 (defn- inputs []
@@ -87,11 +89,25 @@
       (skip! (str "three carried values on " device))
       (doseq [nc [0 1 2 7]]
         (let [expected (int-array 9)
-              _ (city/three-carry-effects! expected 3 nc)
-              actual (run-device :three-carry-effects #'city/three-carry-effects!
-                                 {:out [:int 9 (int-array 9)]}
-                                 {"n" 3 "nc" nc} 3 [:out] device)]
-          (is (= (vec expected) (:out actual)) (str device " trips=" nc)))))))
+              initial (int-array 9)
+              prepared (compiled/lower #'city/three-carry-effects! [initial 3 nc]
+                                       {:compiler :equation-first :target device :dtype :double
+                                        :outputs '[out]})
+              prior (volatile! nil)
+              live (compiled/instantiate! prepared)]
+          (try
+            (dotimes [_ 2]
+              (city/three-carry-effects! expected 3 nc)
+              (let [old @prior
+                    result (:out (live {}))]
+                (when old
+                  (is (not (value/live? old)) "replay invalidates the previous state view"))
+                (vreset! prior result)
+                (is (= (vec expected) (vec (value/->host result)))
+                    (str device " trips=" nc))))
+            (is (= (vec (int-array 9)) (vec initial)) "resident atomics do not mutate host inputs")
+            (finally (compiled/close! live)))
+          (is (not (value/live? @prior)) "close invalidates the final explicit output"))))))
 
 (deftest terminal-moments-match-jvm-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]

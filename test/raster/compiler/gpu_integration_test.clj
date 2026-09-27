@@ -16,6 +16,8 @@
             [raster.dl.attention :as attention]
             [raster.dl.nn :as nn]
             [raster.gpu.link :as gpu-link]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.value :as value]
             [raster.gpu.device-probe :as opencl]
             [raster.linalg.contract :as contract]
             [raster.ode.pde :as pde]))
@@ -108,15 +110,14 @@
         nsteps 3
         [u0 target alpha inv-dx2 dt] (setup-heat-problem n)
         arguments [u0 target alpha inv-dx2 dt nsteps]
-        compilation (equation-first/compile
-                     #'pde/heat-loss-rk4 {:target device :dtype :double})
-        plan (equation-first/lower compilation arguments)]
+        prepared (compiled/lower #'pde/heat-loss-rk4 arguments
+                                 {:compiler :equation-first :target device :dtype :double
+                                  ;; u0 is cloned by staging; only target is a public device input.
+                                  :constants '[target]})
+        plan (get-in prepared [:lowering :plan])]
     (testing "compilation and lowering are inspectable and allocate no driver resources"
-      (is (equation-first/equation-first-compilation? compilation))
-      (is (= :typed-parallel (get-in compilation [:semantic :dialect])))
-      (is (= :scheduled-parallel (get-in compilation [:scheduled :dialect])))
-      (is (= :opencl-parallel (get-in compilation [:emitted :dialect])))
-      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= :equation-first (get-in prepared [:schedule :compiler])))
+      (is (= :none (get-in prepared [:schedule :stats :fallback])))
       (is (link-plan/link-plan? plan))
       (is (= 0 (get-in plan [:attributes :driver-allocations])))
       (is (= 1 (count (:outputs plan)))))
@@ -125,17 +126,19 @@
         (skip! (str "gpu-rk4-equation-first-execution on " device))
                 (let [expected (pde/heat-loss-rk4 (aclone u0) (aclone target)
                                                   alpha inv-dx2 dt nsteps)
-                      executable (gpu-link/instantiate! plan)]
+                      executable (compiled/instantiate! prepared)
+                      result (volatile! nil)]
                   (try
-                    (gpu-link/run! executable)
+                    (vreset! result (:result (executable {})))
                     (let [actual (double (aget ^doubles
-                                          (gpu-link/download executable
-                                                             (first (:outputs plan)))
+                                          (value/->host @result)
                                                0))]
                       (is (< (Math/abs (- (double expected) actual)) 1.0e-10)
                           (format "CPU=%.15g GPU=%.15g" (double expected) actual)))
                     (finally
-                      (gpu-link/close! executable)))))))))
+                      (compiled/close! executable)))
+                  (is (not (value/live? @result))
+                      "the public scalar result has the executable's lifetime")))))))
 
 (deftest softmax-counted-initializers-execute-through-the-direct-vertical
   (when-gpu "softmax-counted-initializers"
