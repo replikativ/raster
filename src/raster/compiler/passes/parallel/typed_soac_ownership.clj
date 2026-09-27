@@ -210,7 +210,11 @@
                           (empty? (set/intersection forbidden-index-symbols form-symbols))
                           (= expected-digits (set (keys (:terms form))))
                           (= expected-digits (:leaves form))
-                          (empty? (:parents form))
+                          ;; Index analysis may discover quotient/remainder digits in locals
+                          ;; used only by a value or predicate. They cannot weaken an address
+                          ;; proof unless a derived digit actually occurs in that address.
+                          (not-any? (:parents form)
+                                    (set/union (:leaves form) (set (keys (:terms form)))))
                           (nil? (:fixed-leaves form)))
                  (clojure.walk/postwalk-replace capture-substitutions form))))
            loop-indices))]
