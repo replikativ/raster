@@ -176,6 +176,7 @@
         (is (pos? (:total-ns construction)))
         (is (every? #(and (integer? %) (not (neg? %)))
                     (vals (:phases-ns construction))))
+        (is (contains? (:phases-ns construction) :initialization-contract))
         (is (= 1 (:instances construction)))
         (is (= 1 (:bound-phases construction)))
         (gpu-link/run! executable)

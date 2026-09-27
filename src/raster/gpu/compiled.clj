@@ -613,6 +613,7 @@
                        #(equation-first/compile fn-var compilation-options target-descriptor)))
         lowering-started (System/nanoTime)
         raw-plan (equation-first/lower compilation args)
+        equation-lower-ns (- (System/nanoTime) lowering-started)
         attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)
         public-defaults (:public-buffer-roles attributes)
@@ -633,12 +634,14 @@
                                         (when-let [role (get token-roles token)]
                                           [compiler-value role])))
                              compiler-bindings)
+        validation-started (System/nanoTime)
         plan (-> (reduce-kv (fn [plan token role]
                               (assoc-in plan [:nodes token :role] role))
                             raw-plan token-roles)
                  (assoc-in [:instances 0 :roles] compiler-roles)
                  (assoc-in [:attributes :public-buffer-roles] effective-roles)
                  link-plan/validate!)
+        link-plan-validation-ns (- (System/nanoTime) validation-started)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         argument-map (zipmap (map :symbol parameters) args)
         donate-set (set donate)
@@ -693,7 +696,9 @@
             (throw (ex-info "equation-first outputs require unique semantic keys"
                             {:reason :compiled-equation-first-output-keys
                              :keys duplicate-keys})))
+        certification-started (System/nanoTime)
         lowering (invocation-link/certify plan (mapv :node out-tree))
+        invocation-certification-ns (- (System/nanoTime) certification-started)
         lowering-ns (- (System/nanoTime) lowering-started)
         steps (mapv (fn [index kernel]
                       {:convention :kernel-body
@@ -717,6 +722,9 @@
                 :total-ns (- (System/nanoTime) preparation-started)
                 :template @template-report
                 :link-plan-lowering-ns lowering-ns
+                :phases-ns {:equation-lower equation-lower-ns
+                            :link-plan-validation link-plan-validation-ns
+                            :invocation-certification invocation-certification-ns}
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
     (seal-prepared

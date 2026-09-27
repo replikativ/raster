@@ -323,6 +323,13 @@
       (is (= [false false true]
              (mapv #(get-in (compiled/preparation-report %) [:template :cache-hit?])
                    [automatic register-tiled register-tiled-again])))
+      (doseq [prepared [automatic register-tiled register-tiled-again]
+              :let [report (compiled/preparation-report prepared)
+                    phases (:phases-ns report)]]
+        (is (= #{:equation-lower :link-plan-validation :invocation-certification}
+               (set (keys phases))))
+        (is (every? #(and (integer? %) (not (neg? %))) (vals phases)))
+        (is (<= (reduce + (vals phases)) (:link-plan-lowering-ns report))))
       (is (= 2 (:entries (compiled/compilation-cache-stats)))))
     (finally
       (compiled/clear-compilation-cache!))))

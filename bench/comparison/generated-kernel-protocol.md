@@ -78,6 +78,17 @@ report and the linked executable's instantiation-phase report beside the coarse 
 so a long first invocation can be attributed to template compilation, plan lowering, allocation,
 or backend binding rather than being mistaken for device execution.
 
+A [bounded cold/warm preparation probe](../results/q4-preparation-phases-20260927.edn) on the
+same shared Arc showed a compiler-template cache hit on the second preparation, but LinkPlan
+lowering still took about 39 seconds and instantiation about 22 seconds. A separate cold run
+with finer phase reporting attributed about 26 seconds to equation lowering, 8 seconds to plan
+validation and 9 seconds to invocation certification; runtime validation and initialization
+analysis each took another roughly 8 seconds. Background load makes the durations diagnostic,
+not thresholds. The structural finding is repeated derivation/validation of a large immutable
+emitted plan despite one compiled kernel and nine resident nodes. Any optimization should reuse
+verified effect/certificate evidence only when the exact plan and its role/output boundary remain
+bound to that evidence; removing checks by convention would weaken the compiler contract.
+
 ## Baseline selection
 
 ### Strict-FP32 OpenCL SGEMM reference (opt-in)
