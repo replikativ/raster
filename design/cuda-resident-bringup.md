@@ -25,11 +25,16 @@ The path must be `deftm → typed SOAC → schedule → KernelBody → CUDA sour
    is recorded separately and is not used to assert a speedup.
 
 The initial adapter should use the CUDA Driver API for context, memory, module, launch and
-event operations. NVRTC can compile generated CUDA source in-process at JIT time; loading
-PTX or cubin through the driver API avoids an `nvcc` subprocess on every compilation. Keep
+event operations. The hardware-free `raster.gpu.cuda-nvrtc` transport now compiles generated
+CUDA source to PTX in-process; the Driver API load/launch part is still missing. Loading
+PTX or cubin through the driver API will avoid an `nvcc` subprocess on every compilation. Keep
 the existing `nvcc` compile gate. Record compilation identity and driver/toolkit compatibility
 in the artifact cache key. A precompiled PTX fixture is acceptable for the *first* transport
 smoke, but the gate above is not complete until Raster compiles its generated source itself.
+NVRTC requires explicit toolkit include paths and uses small virtual C headers for the
+`stdint.h`/`math.h` names in the current CUDA preamble; host glibc headers are not a valid
+substitute. The public equation-first map fixture has compiled to PTX with NVRTC 12.4 on
+this machine, without an NVIDIA device. This is transport evidence only.
 
 Do not mark `:cuda` a resident backend merely because a library or `nvcc` is present.
 The backend entry must declare its memory space, coherence, slice ownership, transfer
