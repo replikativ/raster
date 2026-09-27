@@ -2118,7 +2118,7 @@
                                    -1.0e30
                                    (if (> (clojure.core/- 0 distance) right-limit)
                                      -1.0e30
-                                     (aget sc (clojure.core/+ scb j))))]
+                                     (double (aget sc (clojure.core/+ scb j)))))]
                        (recur (inc j) (n/max mm score)))
                      mm))
               sum (loop [j 0 s 0.0]
@@ -2128,7 +2128,7 @@
                                     -1.0e30
                                     (if (> (clojure.core/- 0 distance) right-limit)
                                       -1.0e30
-                                      (aget sc (clojure.core/+ scb j))))
+                                      (double (aget sc (clojure.core/+ scb j)))))
                             e (m/exp (- score mx))]
                         (aset sc (clojure.core/+ scb j) e)
                         (recur (inc j) (+ s e)))
