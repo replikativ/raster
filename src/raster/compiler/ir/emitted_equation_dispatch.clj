@@ -82,3 +82,8 @@
 (defn make
   [alternatives selection numerical-policy]
   (validate! (->EmittedEquationDispatch alternatives selection numerical-policy)))
+
+(defn candidates
+  "Return each independently certified equation in its dispatch alternative order."
+  [value]
+  (:alternatives (validate! value)))
