@@ -325,6 +325,41 @@
              {:expected (:outputs parallel-program) :actual (keys outputs)}))
     call))
 
+(defn execution-order
+  "Project straight-line selected graph order without allocating device storage.
+
+   Emitted equation calls retain validated, fully selected KernelGraphs. The optional observer
+   receives [step-index graph] and supplies the actually bound order instead; both projections
+   retain source indices across host equations. Neither projection proves completion or escape.
+   Structured control requires a loop-aware witness and deliberately declines."
+  ([call]
+   (execution-order call
+                    (fn [_ graph]
+                      {:record-time-prologue []
+                       :per-replay (mapv #(hash-map :kernel-phase (:id %)) (:nodes graph))})))
+  ([call graph-order]
+   (let [call (validate! call)]
+     (when (some loop-call/structured-loop-call? (:steps call))
+       (throw (ex-info "structured program execution order requires a loop-aware witness"
+                       {:reason :parallel-program-structured-execution-order})))
+     (reduce
+      (fn [order [step-index step]]
+        (if (evaluated-host-equation? step)
+          order
+          (let [selected (graph-order step-index (:graph step))
+                annotate #(mapv (fn [entry] (assoc entry :source {:step step-index})) %)]
+            (when-not (and (map? selected)
+                           (every? #(and (vector? (get selected %))
+                                         (every? map? (get selected %)))
+                                   [:record-time-prologue :per-replay]))
+              (throw (ex-info "graph did not supply a structured execution-order witness"
+                              {:reason :parallel-program-graph-order :step step-index})))
+            (-> order
+                (update :record-time-prologue into (annotate (:record-time-prologue selected)))
+                (update :per-replay into (annotate (:per-replay selected)))))))
+      {:record-time-prologue [] :per-replay [] :completion :unproven}
+      (map-indexed vector (:steps call))))))
+
 (defn- remap-buffer-map
   [remap buffers]
   (into (empty buffers) (map (fn [[id buffer]] [id (remap buffer)])) buffers))

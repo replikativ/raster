@@ -200,27 +200,11 @@
    than expanding trip counts or confusing one-time preparation with repeated execution."
   [prepared graph-order]
   (ensure-prepared! prepared :execution-order)
-  (when (some loop-call/structured-loop-call? (get-in prepared [:call :steps]))
-    (throw (ex-info "structured program execution order requires a loop-aware witness"
-                    {:reason :parallel-program-structured-execution-order})))
-  (reduce
-   (fn [order [step-index step]]
-     (if (program-call/evaluated-host-equation? step)
-       order
-       (let [key (get-in prepared [:plan :step-keys step-index])
-             selected (graph-order (get (:handles prepared) key))
-             annotate #(mapv (fn [entry] (assoc entry :source {:step step-index})) %)]
-         (when-not (and (map? selected)
-                        (every? #(and (vector? (get selected %))
-                                      (every? map? (get selected %)))
-                                [:record-time-prologue :per-replay]))
-           (throw (ex-info "prepared graph did not supply a structured execution-order witness"
-                           {:reason :parallel-program-graph-order :step step-index})))
-         (-> order
-             (update :record-time-prologue into (annotate (:record-time-prologue selected)))
-             (update :per-replay into (annotate (:per-replay selected)))))))
-   {:record-time-prologue [] :per-replay [] :completion :unproven}
-   (map-indexed vector (get-in prepared [:call :steps]))))
+  (program-call/execution-order
+   (:call prepared)
+   (fn [step-index _]
+     (let [key (get-in prepared [:plan :step-keys step-index])]
+       (graph-order (get (:handles prepared) key))))))
 
 (defn profile-prepared!
   "Replay a prepared program in exact program order through `profile-handle!` and aggregate its

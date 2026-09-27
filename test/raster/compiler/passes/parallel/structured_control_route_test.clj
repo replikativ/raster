@@ -780,6 +780,10 @@
                          :instances [instance] :outputs [output-id]})]
     (is (link/program-link-instance? instance))
     (is (link/link-plan? plan))
+    (with-redefs [gpu-link/instantiate!
+                  (fn [& _] (throw (AssertionError. "loop proof must decline before allocation")))]
+      (is (= :parallel-program-structured-execution-order
+             (reason-of #(gpu-link/evaluate! plan)))))
     (is (= #{:state} (set (vals (link/instance-roles plan instance)))))
     (is (every? #(= 1 (count (:leaves %))) (vals (:values plan))))
     (is (false? (get-in remapped [:attributes :source-inspected])))
