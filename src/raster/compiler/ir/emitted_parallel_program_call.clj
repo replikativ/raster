@@ -119,7 +119,8 @@
   (let [{equation :equation call-graph :graph buffers :buffers
          scalar-values :scalar-values outputs :outputs} call
         operation (first (:operations equation))
-        emitted (equation-dispatch/boundary-equation operation)
+        emitted (emitted-equation/validate!
+                 (equation-dispatch/boundary-equation operation))
         expected-graphs (if (equation-dispatch/emitted-equation-dispatch? operation)
                           (mapv :graph (equation-dispatch/candidates operation))
                           [(:graph emitted)])
@@ -159,7 +160,8 @@
   (when-not (map? result-views)
     (fail! :emitted-program-result-views "result views must be a map" {:result-views result-views}))
   (let [emitted (first (:operations equation))
-        boundary (equation-dispatch/boundary-equation emitted)
+        boundary (emitted-equation/validate!
+                  (equation-dispatch/boundary-equation emitted))
         algorithm (:algorithm boundary)
         physical (emitted-equation/physical-results boundary)]
     (doseq [[result destination] result-views]
@@ -177,7 +179,8 @@
 (defn- prepare-equation-call
   [equation values buffers scalars result-views]
   (let [operation (first (:operations equation))
-        emitted (equation-dispatch/boundary-equation operation)
+        emitted (emitted-equation/validate!
+                 (equation-dispatch/boundary-equation operation))
         common-graph (:graph emitted)
         result-storage (emitted-equation/physical-results emitted)
         result-views (validate-result-views! equation (select-keys result-views (:results equation)))

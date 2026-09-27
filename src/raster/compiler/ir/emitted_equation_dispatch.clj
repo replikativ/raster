@@ -100,14 +100,15 @@
     (some #(when (= default (:graph %)) %) (:alternatives value))))
 
 (defn boundary-equation
-  "Return the validated exact equation for shared storage/ABI inspection.
+  "Return the exact equation for shared storage/ABI inspection.
 
    For a dispatch, all candidates have already proved the same external boundary. This accessor
-   never selects a runtime schedule; binding-time admission still owns that choice."
+   never selects a runtime schedule; binding-time admission still owns that choice. A single
+   equation is returned unmodified: conservative coverage probes may inspect a modified graph,
+   while whole-program and call validation certify executable equations separately."
   [operation]
   (cond
     (emitted-equation-dispatch? operation) (default-equation operation)
-    (equation/emitted-equation? operation) (equation/validate! operation)
     :else operation))
 
 (defn boundary-graph
