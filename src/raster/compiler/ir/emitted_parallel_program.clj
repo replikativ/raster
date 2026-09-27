@@ -5,6 +5,7 @@
    ordered program dataflow remain authoritative. Host-only scalar equations are the only
    equations with an empty emitted operation sequence."
   (:require [clojure.set :as set]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -23,7 +24,16 @@
 (defn emitted-operation?
   [operation]
   (or (emitted-loop/emitted-loop? operation)
+      (equation-dispatch/emitted-equation-dispatch? operation)
       (emitted-equation/emitted-equation? operation)))
+
+(defn- equation-candidates
+  [operation]
+  (cond
+    (emitted-equation/emitted-equation? operation) [(emitted-equation/validate! operation)]
+    (equation-dispatch/emitted-equation-dispatch? operation)
+    (equation-dispatch/candidates operation)
+    :else []))
 
 (defn emitted-boundary?
   [equation algorithm]
@@ -61,12 +71,14 @@
 
     (swr/plan? algorithm)
     (and (= 1 (count (:operations equation)))
-         (let [operation (first (:operations equation))]
-           (and (emitted-equation/emitted-equation? operation)
-                (let [emitted (emitted-equation/validate! operation)]
-                  (and (= algorithm (:algorithm emitted))
-                       (swr/equation-boundary? (get-in emitted [:body :values])
-                                               equation algorithm))))))
+         (let [operation (first (:operations equation))
+               candidates (equation-candidates operation)]
+           (and (seq candidates)
+                (every? (fn [emitted]
+                          (and (= algorithm (:algorithm emitted))
+                               (swr/equation-boundary? (get-in emitted [:body :values])
+                                                       equation algorithm)))
+                        candidates))))
 
     :else false))
 
@@ -88,8 +100,8 @@
       (if (true? (get-in equation [:attributes :host-only]))
         (recur (conj host-prefix equation) (next remaining))
         (let [operation (first (:operations equation))]
-          (when (emitted-equation/emitted-equation? operation)
-            (let [body (:body operation)
+          (doseq [candidate (equation-candidates operation)]
+            (let [body (:body candidate)
                   body-equations (:equations body)
                   actual-prefix (filterv #(true? (get-in % [:attributes :host-only]))
                                          body-equations)
@@ -149,9 +161,12 @@
         _ (validate-host-prefix-slices! parallel-program)
         artifacts
         (vec
-         (for [equation (:equations parallel-program)
+        (for [equation (:equations parallel-program)
                operation (:operations equation)
-               node (:nodes (:graph operation))]
+               kernel-graph (if (emitted-loop/emitted-loop? operation)
+                              [(:graph operation)]
+                              (mapv :graph (equation-candidates operation)))
+               node (:nodes kernel-graph)]
            (artifact/validate! (:operation node))))
         mismatches (filterv #(not= expected-target (:target %)) artifacts)]
     (when (seq mismatches)

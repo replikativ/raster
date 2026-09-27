@@ -2,20 +2,19 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.gpu.indexed-attention-device-test :as indexed-fixture]
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
 
-(defn- candidate
+(defn- compilation
   [strategy]
-  (let [compilation
-        (equation-first/compile
-         #'indexed-fixture/resident-indexed-attention-probe
-         {:target target :dtype :float
-          :schedule {:segmented-weighted-reduction {:strategy strategy}}})]
-    (-> compilation :emitted :equations last :operations first)))
+  (equation-first/compile
+   #'indexed-fixture/resident-indexed-attention-probe
+   {:target target :dtype :float
+    :schedule {:segmented-weighted-reduction {:strategy strategy}}}))
 
 (defn- reason
   [thunk]
@@ -31,8 +30,10 @@
     :vendor "Intel"
     :capabilities {:warp-size 16 :subgroup-sizes [16]
                    :max-workgroup-size 256 :shared-local-memory 65536 :total-eus 32}})
-  (let [reference (candidate :reference)
-        subgroup (candidate :subgroup-score-reuse)
+  (let [reference-program (:emitted (compilation :reference))
+        subgroup-program (:emitted (compilation :subgroup-score-reuse))
+        reference (-> reference-program :equations last :operations first)
+        subgroup (-> subgroup-program :equations last :operations first)
         alternatives [reference subgroup]
         selector (dispatch/make
                   {:id "certified-indexed-equation"
@@ -42,8 +43,13 @@
                               :strategy :indexed-segmented-reduction-subgroup-score-reuse}})
         exact-only {:permitted-modes #{:exact}}
         reassociation {:permitted-modes #{:exact :reassociated}}
-        certified (equation-dispatch/make alternatives selector reassociation)]
+        certified (equation-dispatch/make alternatives selector reassociation)
+        program (update reference-program :equations
+                        (fn [equations]
+                          (update equations (dec (count equations)) assoc
+                                  :operations [certified])))]
     (is (equation-dispatch/emitted-equation-dispatch? certified))
+    (is (= program (emitted-program/validate! program)))
     (is (= [:exact :reassociated]
            (mapv #(get-in (last (get-in % [:body :equations]))
                           [:operations 0 :numerics :mode]) alternatives)))

@@ -225,9 +225,10 @@ through the existing `:result-storage` contract.
    The reduction-specific `EmittedEquationDispatch` now groups independently validated emitted
    equations behind one `KernelDispatch`. It requires the same semantic plan, physical result
    mapping and complete-write proof for every candidate, an exact default, and an explicit set
-   of permitted numerical modes. This is a compiler IR contract, not yet a public equation call:
-   the enclosing program must still validate every candidate's host-scalar prefix, and runtime
-   binding must select and preflight a candidate before allocating its private storage.
+   of permitted numerical modes. The emitted program validator also checks every alternative's
+   enclosing host-scalar prefix and target, not just the selected candidate. This is not yet a
+   public equation call: runtime binding must select and preflight a candidate before allocating
+   its private storage.
 
 Invocation shape realization now reuses the graph's checked dimension-to-launch projection.
 The shared index algebra lives under compiler IR (the former pass namespace is removed), so
