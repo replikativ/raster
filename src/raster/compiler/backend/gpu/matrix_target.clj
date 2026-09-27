@@ -6,6 +6,7 @@
    fork at which DPAS and MMA diverge; callers may not select a target template directly or pass a
    second tile/launch/ABI description beside the body."
   (:require [raster.compiler.backend.gpu.cuda-codegen :as cuda-codegen]
+            [raster.compiler.backend.gpu.matrix-fragment-source :as fragment-source]
             [raster.compiler.backend.gpu.matrix-target-names :as target-names]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
@@ -18,7 +19,10 @@
   [body target-dialect plan]
   (let [body (kernel-body/validate! body)
         dialect (c-dialect/resolve! target-dialect)
-        pointer-alignment (when (= :cuda (:id dialect)) 32)
+        pointer-alignment (case (:id dialect)
+                            :cuda 32
+                            :hip 16
+                            nil)
         intel? (= :opencl-intel (:id dialect))
         requirements (when intel? (block-io/body-requirements body))]
     (merge {:preconditions [] :parameter-alignments
@@ -28,19 +32,20 @@
                      [id pointer-alignment])))
            (:parameters body))
      :target-facts
-     {:target-dialect (:id dialect)
-      :instruction (:instruction plan)
-      :instruction-family (get-in plan [:instruction :family])
-      :pointer-alignment pointer-alignment}}
+     (cond-> {:target-dialect (:id dialect)
+              :instruction (:instruction plan)
+              :instruction-family (get-in plan [:instruction :family])
+              :pointer-alignment pointer-alignment}
+       (= :hip (:id dialect)) (assoc :required-gfx-arch :gfx90a))}
            requirements)))
 
 (defn emit-matrix-kernel
   "Emit `body` for one C-family target dialect.
 
    Returns the target module together with the validated body and concrete artifact target. The
-   optional parameter-name map controls spelling only on the Intel OpenCL row; CUDA derives its
-   ordered signature from KernelBody parameter roles. Unsupported target/instruction pairs fail
-   loudly in the selected target lowerer."
+   optional parameter-name map controls spelling only on the Intel OpenCL row; CUDA and HIP derive
+   their ordered signatures from KernelBody parameter roles. Unsupported target/instruction pairs
+   fail loudly in the selected target lowerer."
   ([kernel-name body target-dialect]
    (emit-matrix-kernel kernel-name body target-dialect {}))
   ([kernel-name body target-dialect {:keys [parameter-names]}]
@@ -55,10 +60,13 @@
                           kernel-name body
                           (target-names/parameter-names body parameter-names))
          default-names (target-names/parameter-names body nil)
-         _ (when (and (= :cuda (:id dialect)) (not= default-names parameter-names))
-             (throw (ex-info "CUDA matrix lowering does not support ABI spelling overrides"
-                             {:reason :cuda-mma-parameter-spelling-unsupported
-                              :target :cuda :requested parameter-names
+         _ (when (and (contains? #{:cuda :hip} (:id dialect))
+                      (not= default-names parameter-names))
+             (throw (ex-info "vendor matrix lowering does not support ABI spelling overrides"
+                             {:reason (if (= :cuda (:id dialect))
+                                        :cuda-mma-parameter-spelling-unsupported
+                                        :hip-mfma-parameter-spelling-unsupported)
+                              :target (:id dialect) :requested parameter-names
                               :required default-names})))
          source
          (case (:id dialect)
@@ -68,6 +76,9 @@
 
            :cuda
            (cuda-codegen/emit-matrix-kernel kernel-name body)
+
+           :hip
+           (fragment-source/emit-matrix-kernel kernel-name body :hip)
 
            (throw (ex-info "matrix KernelBody target lowering is not implemented for this dialect"
                            {:reason :matrix-target-dialect-not-lowered

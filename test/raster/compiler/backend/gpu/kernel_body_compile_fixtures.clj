@@ -5,7 +5,6 @@
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.gemm :as gemm-emit]
             [raster.compiler.backend.gpu.cuda-codegen :as cuda-emit]
-            [raster.compiler.backend.gpu.matrix-fragment-source :as fragment-emit]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.backend.gpu.hip-matrix-candidate-test :as hip-matrix-fixture]
             [raster.compiler.backend.gpu.indexed-attention :as indexed-attention-emit]
@@ -27,6 +26,7 @@
             [raster.compiler.ir.paged-kv-append :as paged-append]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
@@ -244,6 +244,18 @@
       (throw (ex-info "verified direct matrix fixture did not schedule"
                       (assoc planned :family family))))
     (:body planned)))
+
+(defn- verified-matrix-artifact
+  [kernel-name body dialect]
+  (let [arguments (mapv :id (:parameters body))
+        scheduled (scheduled-body/make
+                   {:source (:id body) :body body :arguments arguments
+                    :effects {:kind :tensor-contraction-stage
+                              :uses (scheduled-body/derive-uses body arguments)}
+                    :legality {:kind :matrix-instruction-tiling}
+                    :numerics {:mode :reassociated :policy :tiled-contraction
+                               :rounding :nearest-even :accumulator-dtype :float}})]
+    (body-target/emit-artifact kernel-name scheduled dialect)))
 
 (defn- outer-product-artifact
   [dialect]
@@ -796,12 +808,13 @@
              (let [matrix-directory (io/file root "hip-matrix")]
                (.mkdirs matrix-directory)
                [(write-source! matrix-directory suffix "mfma-uniform-epilogue"
-                               (fragment-emit/emit-matrix-kernel
-                                "mfma_uniform_epilogue" (hip-matrix-fixture/candidate-body) :hip))
+                               (:source (verified-matrix-artifact
+                                         "mfma_uniform_epilogue"
+                                         (hip-matrix-fixture/candidate-body) :hip)))
                 (write-source! matrix-directory suffix "mfma-verified-contract"
-                               (fragment-emit/emit-matrix-kernel
-                                "mfma_verified_contract"
-                                (verified-direct-matrix-body :mfma) :hip))]))
+                               (:source (verified-matrix-artifact
+                                         "mfma_verified_contract"
+                                         (verified-direct-matrix-body :mfma) :hip)))]))
            (when (= :cuda target)
              [(write-source!
                directory suffix "matrix-uniform-epilogue"

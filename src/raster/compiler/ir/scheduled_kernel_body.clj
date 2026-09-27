@@ -368,5 +368,13 @@
                  (not= 32 pointer-alignment))
         (fail! :scheduled-kernel-body-artifact-projection
                "CUDA MMA projection requires its verified pointer alignment"
-               {:required 32 :actual pointer-alignment})))
+               {:required 32 :actual pointer-alignment}))
+      (when (and (= :hip (:target-dialect target-facts))
+                 (= :mfma (:instruction-family target-facts))
+                 (not (and (= :gfx90a (:required-gfx-arch target-facts))
+                           (= 16 pointer-alignment))))
+        (fail! :scheduled-kernel-body-artifact-projection
+               "HIP MFMA projection requires gfx90a and its verified pointer alignment"
+               {:required-gfx-arch :gfx90a :required-alignment 16
+                :target-facts target-facts})))
     emitted))
