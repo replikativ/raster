@@ -12,20 +12,6 @@ if command -v clinfo >/dev/null 2>&1; then
   clinfo -l
 fi
 
-mapfile -t files < <(grep -Elr 'opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?' test --include='*_test.clj' | sort)
-if (( ${#files[@]} == 0 )); then
-  echo "no OpenCL-gated test namespaces found" >&2
-  exit 2
-fi
-
-args=()
-for file in "${files[@]}"; do
-  ns="${file#test/}"
-  ns="${ns%.clj}"
-  ns="${ns//\//.}"
-  ns="${ns//_/-}"
-  args+=(-n "$ns")
-done
-
-echo "running ${#files[@]} OpenCL-gated namespaces on ${RASTER_OCL_DEVICE_TYPE} device(s)"
-exec clojure -M:test:ci-timed "${args[@]}"
+export RASTER_TEST_SELECTION=opencl
+export RASTER_TEST_TIMINGS="${RASTER_TEST_TIMINGS:-test/resources/ci_opencl_timings.tsv}"
+exec scripts/ci-test-shard.sh

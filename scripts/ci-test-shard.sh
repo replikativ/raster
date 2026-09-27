@@ -5,6 +5,7 @@ set -euo pipefail
 mode="${1:-run}"
 shard_count="${CIRCLE_NODE_TOTAL:-${RASTER_TEST_SHARDS:-1}}"
 shard_index="${CIRCLE_NODE_INDEX:-${RASTER_TEST_SHARD:-0}}"
+selection="${RASTER_TEST_SELECTION:-all}"
 
 if [[ ! "${shard_count}" =~ ^[1-9][0-9]*$ ]]; then
   echo "shard count must be a positive integer, got: ${shard_count}" >&2
@@ -24,6 +25,14 @@ case "${mode}" in
     ;;
 esac
 
+case "${selection}" in
+  all|opencl) ;;
+  *)
+    echo "unknown test selection: ${selection}" >&2
+    exit 2
+    ;;
+esac
+
 # Greedy largest-processing-time assignment from reviewed CI measurements. New files use a
 # source-size estimate in the same units; an absent default baseline retains byte balancing.
 # No test is selected or excluded based on its timing.
@@ -32,8 +41,19 @@ if [[ ! -f "${timings}" && -z "${RASTER_TEST_TIMINGS+x}" ]]; then
   timings=""
 fi
 
-plan() {
+selected_files() {
   find test -type f -name '*_test.clj' -printf '%s\t%p\n' \
+    | while IFS=$'\t' read -r bytes file; do
+        if [[ "${selection}" == "opencl" ]] \
+           && ! grep -Eq 'opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?' "${file}"; then
+          continue
+        fi
+        printf '%s\t%s\n' "${bytes}" "${file}"
+      done
+}
+
+plan() {
+  selected_files \
     | awk -F '\t' -v timings="${timings}" -f scripts/ci-test-weights.awk \
     | sort -t $'\t' -k1,1nr -k2,2 \
     | awk -F '\t' -v shards="${shard_count}" '
