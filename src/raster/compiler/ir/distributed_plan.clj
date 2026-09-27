@@ -805,7 +805,18 @@
                 (fail! "transfer byte count must be a non-negative integer"
                        :distributed-transfer-bytes
                        {:step (:id step) :bytes (:bytes step)}))
-              (route-links! topology step)))
+              (let [links (route-links! topology step)
+                    serialized-on (get-in step [:attributes :serialized-on])
+                    route-devices (conj (set (map :source links)) (:target step))]
+                (when (and (contains? (:attributes step) :serialized-on)
+                           (not (and (vector? serialized-on)
+                                     (= (count serialized-on)
+                                        (count (distinct serialized-on)))
+                                     (set/subset? (set serialized-on) route-devices))))
+                  (fail! "transfer compute serialization must name unique devices on its route"
+                         :distributed-transfer-serialization
+                         {:step (:id step) :serialized-on serialized-on
+                          :route-devices route-devices})))))
           (recur (next remaining) (conj available (:id step))))
         (do
           (when-not (and (vector? outputs) (seq outputs)

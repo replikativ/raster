@@ -84,6 +84,42 @@
             :transferred-bytes 1000000}
            (:cost-vector simulation)))))
 
+(deftest transfer-compute-serialization-requires-a-route-device
+  (let [base (training-plan)
+        transfer-index 2
+        with-serialization (fn [value]
+                             (assoc-in base [:steps transfer-index :attributes :serialized-on]
+                                       value))]
+    (let [simulation (distributed/simulate (with-serialization [:gpu-1]))]
+      (is (= [[:link :gpu-0->gpu-1] [:compute :gpu-1]]
+             (get-in simulation [:timeline :send-gradient :resources])))
+      (is (= 500 (get-in simulation [:timeline :send-gradient :start-ns]))
+          "the serialized transfer waits for the endpoint's compute lane"))
+    (doseq [invalid [[:other-device] [:gpu-1 :gpu-1] :gpu-1 nil]]
+      (let [error (try (distributed/validate! (with-serialization invalid))
+                       nil
+                       (catch clojure.lang.ExceptionInfo exception exception))]
+        (is (= :distributed-transfer-serialization (:reason (ex-data error)))
+            (str "invalid compute-lane reservation: " (pr-str invalid))))))
+  (let [base (training-plan)
+        topology (distributed/topology
+                  (conj (vec (vals (get-in base [:topology :devices])))
+                        (distributed/device {:id :relay
+                                             :memory-capacity-bytes 16000000000}))
+                  [(distributed/link {:id :gpu-0->relay :source :gpu-0 :target :relay
+                                      :kind :pcie :bandwidth-bytes-s 25.0e9
+                                      :latency-ns 1000})
+                   (distributed/link {:id :relay->gpu-1 :source :relay :target :gpu-1
+                                      :kind :pcie :bandwidth-bytes-s 25.0e9
+                                      :latency-ns 1000})])
+        routed (-> base
+                   (assoc :topology topology)
+                   (assoc-in [:steps 2 :route] [:gpu-0->relay :relay->gpu-1])
+                   (assoc-in [:steps 2 :attributes :serialized-on] [:relay]))]
+    (is (= [[:link :gpu-0->relay] [:link :relay->gpu-1] [:compute :relay]]
+           (get-in (distributed/simulate routed)
+                   [:timeline :send-gradient :resources])))))
+
 (deftest sharding-certifies-partition-coverage-and-replication
   (let [certified (distributed/certify (training-plan))
         certificate (:certificate certified)]
