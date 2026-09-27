@@ -730,7 +730,10 @@
         report (link/memory-report plan)
         bindings (:compiler-buffer-bindings certificate)
         ;; verify! already revalidates the bound EmittedParallelProgramCall through LinkPlan.
-        emitted (get-in plan [:instances 0 :call :program])
+        call (get-in plan [:instances 0 :call])
+        emitted (:program call)
+        actual-bindings (set (program-call/buffer-bindings call))
+        reported-bindings (set bindings)
         definitions (into {}
                           (mapcat (fn [{:keys [id results]}]
                                     (map (fn [value] [value {:kind :equation :id id}]) results)))
@@ -742,8 +745,15 @@
                      {} (:equations emitted))
         inputs (set (:inputs emitted))
         semantic-outputs (set (:outputs emitted))
-        version-witness (value-retention-witness plan certificate report emitted bindings
-                                                 definitions uses)]
+        version-witness
+        (cond-> (value-retention-witness plan certificate report emitted bindings definitions uses)
+          (not= actual-bindings reported-bindings)
+          (assoc :status :unknown)
+          (not= actual-bindings reported-bindings)
+          (update :unknown conj
+                  {:reason :incomplete-compiler-buffer-bindings
+                   :missing (set/difference actual-bindings reported-bindings)
+                   :unexpected (set/difference reported-bindings actual-bindings)}))]
     (doseq [[compiler-value storage-id] bindings]
       (when-not (contains? (:values report) storage-id)
         (fail! :invocation-memory-binding

@@ -683,6 +683,21 @@
                                    plan (conj (:outputs plan) ::unknown-output)))))
           "an escaped identity must name storage in the validated plan"))))
 
+(deftest retention-requires-complete-call-binding-coverage
+  (let [prepared (compiled/lower #'c-family-elementwise [(float-array 8) 8]
+                                 {:compiler :equation-first :target cuda-target :dtype :float})
+        original (compiled/plan prepared)
+        bindings (get-in original [:attributes :compiler-buffer-bindings])]
+    (is (seq bindings))
+    (doseq [incomplete [{} (dissoc bindings (first (keys bindings)))]]
+      (let [changed (assoc-in original [:attributes :compiler-buffer-bindings] incomplete)
+            report (invocation-link/memory-witness (invocation-link/certify changed))]
+        (is (= :typed-invocation (get-in changed [:attributes :source])))
+        (is (= :unknown (get-in report [:value-versions :status])))
+        (is (some #(and (= :incomplete-compiler-buffer-bindings (:reason %))
+                        (seq (:missing %)))
+                  (get-in report [:value-versions :unknown])))))))
+
 (deftest trusted-equation-first-construction-derives-its-link-witness-once
   (compiled/clear-compilation-cache!)
   (try
