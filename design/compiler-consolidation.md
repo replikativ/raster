@@ -214,6 +214,14 @@ through the existing `:result-storage` contract.
    its semantic refinement proof; ABI agreement alone does not establish equivalence. Bind the
    common arguments once and allocate only the selected alternative's scratch.
 
+   A single certified KernelBody graph now carries its verified schedule strategy into the emitted
+   executable. The reference and subgroup indexed reduction graphs pass the existing KernelDispatch
+   common-interface and pure admission checks with different, explicit numerical contracts.
+   This establishes candidate compatibility; public equation calls still bind one fixed graph.
+   The remaining step is to carry both certified alternatives through the equation/program/call
+   boundary, select and preflight one before allocation, and keep the numerical policy in tuning
+   identity. A graph strategy label by itself does not authorize a numerical substitution.
+
 Invocation shape realization now reuses the graph's checked dimension-to-launch projection.
 The shared index algebra lives under compiler IR (the former pass namespace is removed), so
 materialization and linking do not interpret arbitrary source or guess types. Shape products are

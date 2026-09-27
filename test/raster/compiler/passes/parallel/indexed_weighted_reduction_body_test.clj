@@ -3,6 +3,8 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.backend.gpu.segop-opencl :as graph-emission]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -131,6 +133,63 @@
       (is (= :indexed-reference-graph-storage
              (reason #(indexed-body/schedule-score-reuse-for-node
                        plan (first (:nodes source)) source descriptor)))))))
+
+(deftest reference-and-subgroup-graphs-share-one-dispatch-interface
+  (let [plan (plan)
+        source (source-graph plan)
+        node (first (:nodes source))
+        descriptor (subgroup-descriptor 16)
+        emit (fn [certificate]
+               (graph-emission/generate-kernel-graph
+                source :target-dialect :opencl-intel
+                :scheduled-bodies {(:id node) certificate}))
+        reference (emit (indexed-body/schedule-reference-for-node
+                         plan node source descriptor))
+        subgroup (emit (indexed-body/schedule-score-reuse-for-node
+                        plan node source descriptor))
+        reference-strategy :indexed-segmented-reduction-reference
+        subgroup-strategy :indexed-segmented-reduction-subgroup-score-reuse
+        selection (dispatch/make
+                   {:id "indexed-score-reuse-probe"
+                    :alternatives [reference subgroup]
+                    :default-strategy reference-strategy
+                    :selector {:kind :fixed-strategy :strategy subgroup-strategy
+                               :fallback :none}})
+        scalars {'n-nodes {:type :long :value 3}
+                 'n-edges {:type :long :value 0}
+                 'emb-dim {:type :long :value 5}
+                 'n-heads {:type :long :value 2}
+                 'dk {:type :long :value 2}}
+        arguments (mapv (fn [slot value]
+                          (if (= :scalar (:kind slot)) (get scalars value) value))
+                        (executable/abi reference) (executable/arguments reference))]
+    (is (= [reference-strategy subgroup-strategy]
+           (mapv executable/strategy (:alternatives selection))))
+    (is (= (executable/common-view reference) (executable/common-view subgroup)))
+    (is (= :exact (get-in reference [:nodes 0 :operation :attributes :numerics :mode])))
+    (is (= :reassociated (get-in subgroup [:nodes 0 :operation :attributes :numerics :mode])))
+    (is (= subgroup (dispatch/select-alternative selection arguments)))
+    (is (= subgroup
+           (:executable
+            (dispatch/admit-alternative
+             selection arguments
+             (fn [candidate]
+               (graph-call/preflight! candidate scalars)
+               [])))))
+    (is (= :kernel-dispatch-inapplicable
+           (reason #(dispatch/admit-alternative
+                     selection arguments
+                     (fn [candidate]
+                       (if (= subgroup-strategy (executable/strategy candidate))
+                         [{:reason :declined-for-probe}]
+                         []))))))
+    (is (= :kernel-graph-certified-strategy
+           (reason #(graph-emission/generate-kernel-graph
+                     (assoc-in source [:attributes :strategy] :different-strategy)
+                     :target-dialect :opencl-intel
+                     :scheduled-bodies
+                     {(:id node) (indexed-body/schedule-reference-for-node
+                                  plan node source descriptor)}))))))
 
 (deftest reference-schedule-certifies-an-independent-semantic-graph
   (let [plan (plan)
