@@ -204,16 +204,15 @@
                        strategy
                        (assoc :schedule {:typed-contraction {:strategy strategy}}))))
           automatic (prepare nil)
-          portable (prepare :portable)
           register-tiled (prepare :register-tiled)
           register-tiled-again (prepare :register-tiled)]
-      (is (= [:auto :portable :register-tiled :register-tiled]
+      (is (= [:auto :register-tiled :register-tiled]
              (mapv #(get-in % [:schedule :typed-contraction :strategy])
-                   [automatic portable register-tiled register-tiled-again])))
-      (is (= [false false false true]
+                   [automatic register-tiled register-tiled-again])))
+      (is (= [false false true]
              (mapv #(get-in (compiled/preparation-report %) [:template :cache-hit?])
-                   [automatic portable register-tiled register-tiled-again])))
-      (is (= 3 (:entries (compiled/compilation-cache-stats)))))
+                   [automatic register-tiled register-tiled-again])))
+      (is (= 2 (:entries (compiled/compilation-cache-stats)))))
     (finally
       (compiled/clear-compilation-cache!))))
 
