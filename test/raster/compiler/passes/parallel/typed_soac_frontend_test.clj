@@ -97,6 +97,43 @@
     (is (nil? (split '(if p (recur (inc k) a) (recur (inc k) b)) 'k 1 false))
         "carried branch results require a value-yielding effect region, not re-evaluation")))
 
+(deftest carried-recurrence-recognition-preserves-lexical-branches
+  (let [split (ns-resolve 'raster.compiler.passes.parallel.typed-soac-frontend
+                          'split-branching-recur-many)
+        source '(let* [before (+ a 1.0)]
+                  (do (aset state i before)
+                      (if p
+                        (let* [choice (+ before b)]
+                          (aset out i choice)
+                          (recur (inc k) b choice))
+                        (recur (+ k 1) a b))))
+        tree (split source 'k 2 false)]
+    (is (= :let (:kind tree)))
+    (is (= :sequence (get-in tree [:body :kind])))
+    (is (= :branch (get-in tree [:body :body :kind])))
+    (is (= '[b choice] (get-in tree [:body :body :then :body :updates])))
+    (is (= '[a b] (get-in tree [:body :body :else :updates])))
+    (doseq [unsupported ['(if p (recur (inc k) a b) nil)
+                         '(if p (recur (inc k) a b) (recur (+ k 2) a b))
+                         '(if p (recur (inc k) a b) (recur (inc k) a))
+                         '(if p (recur (inc k) a) (recur (inc k) a b))
+                         '(if p a (recur (inc k) a b))]]
+      (is (nil? (split unsupported 'k 2 false))))))
+
+(deftest carried-local-continuations-do-not-hoist-across-effects
+  (let [frontend-ns 'raster.compiler.passes.parallel.typed-soac-frontend
+        split (ns-resolve frontend-ns 'split-branching-recur-many)
+        project (ns-resolve frontend-ns 'store-recur-tree)
+        source '(do (clojure.core/aset out i 1.0)
+                    (let* [^double v (clojure.core/aget out i)]
+                      (if p (recur (inc k) v b) (recur (inc k) a v))))
+        tree (split source 'k 2 false)]
+    (is (some? tree))
+    (with-bindings {(ns-resolve frontend-ns '*region-local-counter*) (atom 0)
+                   (ns-resolve frontend-ns '*region-local-source-symbols*) '#{out i v p k a b}}
+      (is (nil? (project tree 'i [:double :double]))
+          "an unsupported result scope declines instead of lifting the post-store read"))))
+
 (deftest counted-store-loops-use-the-existing-effect-dialect
   (let [source '(let* [result (dotimes [i n]
                                (aset out i 1.0)

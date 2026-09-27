@@ -60,7 +60,8 @@ After the observation and witness seams, alternate memory slices with the existi
 effectful-loop/helper/constant work and Laya attention/quantized-kernel benchmarks. The immediate
 city gate is the day-kernel episode loop with a guarded inner search followed by an atomic effect;
 the nested pure two-exit spelling now uses the same ordered while-fold as the single-exit form.
-Effectful multiple recurrence sites remain open. Those are
+Counted effect loops now retain branch-local carried recurrence tuples when every arm proves
+the same unit step; mixed effectful early exits remain open. Those are
 real workload oracles for the broader compiler agenda, not reasons to postpone memory planning
 until a cluster scheduler exists. Revisit external JAX/MLIR/Mojo and scientific/LLM baselines at
 measured milestones, not in every edit/test cycle.

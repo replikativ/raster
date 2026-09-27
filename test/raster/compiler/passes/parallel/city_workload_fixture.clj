@@ -22,6 +22,39 @@
             (aset out i (unchecked-int (+ (aget out i) v)))
             (recur (inc k))))))))
 
+(deftm branch-local-carried-steps!
+  [state :- (Array double), out :- (Array double), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [k 0 a 1.0 b 2.0]
+      (when (< k nc)
+        (let [before (+ a (aget state i))]
+          (if (> (aget state i) 0.0)
+            (let [choice (+ a before)]
+              (aset state i -1.0)
+              (aset out i (+ (* 10.0 a) b))
+              (recur (inc k) b choice))
+            (if (== k 2)
+              (let [choice (+ b before)]
+                (aset state i 1.0)
+                (aset out i (+ (* 10.0 choice) a))
+                (recur (inc k) b choice))
+              (let [choice (- a before)]
+                (aset state i 1.0)
+                (aset out i (+ (* 10.0 b) a))
+                (recur (inc k) choice a)))))))))
+
+(deftm carried-steps-with-empty-arm!
+  [state :- (Array double), out :- (Array double), n :- Long, nc :- Long] :- Void
+  (par/map-void! i n
+    (loop [k 0 a 1.0 b 2.0]
+      (when (< k nc)
+        (if (> a b)
+          (recur (inc k) b a)
+          (do
+            (aset state i a)
+            (aset out i (+ a b))
+            (recur (inc k) (+ a 2.0) b)))))))
+
 (deftm two-exit-walk!
   [weights :- (Array double), targets :- (Array double), out :- (Array int),
    n :- Long, nc :- Long] :- Void

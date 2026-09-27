@@ -120,6 +120,32 @@
           (is (= (vec expected-state) (vec state)))
           (is (= (vec expected-out) (vec out))))))))
 
+(deftest carried-branches-yield-at-their-effect-position
+  (doseq [kernel [#'city/branch-local-carried-steps! #'city/carried-steps-with-empty-arm!]]
+    (let [{:keys [operation]}
+          (emitted-body kernel {'state :double 'out :double} {'n :long 'nc :long})
+          execute (eval (list 'fn '[state out n nc] (segop-simd/compile-effect-segmap operation)))
+          effects (get-in operation [:scalar-region :effects])
+          branches (filter :branch (tree-seq coll? seq effects))
+          merge-results (into #{} (mapcat #(map :result (get-in % [:branch :results]))) branches)
+          carries (mapcat #(get-in % [:loop :carries]) (filter :loop (tree-seq coll? seq effects)))]
+      (is (seq branches) "source branch results remain first-class, not reconstructed conditional updates")
+      (is (and (seq carries) (every? merge-results (map :update carries)))
+          "loop updates consume the arm's merged tuple directly")
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body
+               (get-in (segop-opencl/generate-scheduled-segmap-kernel
+                        operation :target-dialect target :array-types {'state :double 'out :double}
+                        :scalar-types {'n :long 'nc :long}) [:attributes :emission-route]))))
+      (doseq [nc [0 1 2 7]]
+        (let [state (double-array [-1 1 -1]) out (double-array [-77 -77 -77])
+              expected-state (aclone state) expected-out (aclone out)]
+          (dotimes [_ 2]
+            (kernel expected-state expected-out 3 nc)
+            (execute state out 3 nc)
+            (is (= (vec expected-state) (vec state)))
+            (is (= (vec expected-out) (vec out)))))))))
+
 (deftest effectful-tuples-initialize-sequentially-and-update-simultaneously
   (let [{:keys [scheduled artifact operation]}
         (emitted-body #'city/three-carry-effects! {'out :int} {'n :long 'nc :long})
