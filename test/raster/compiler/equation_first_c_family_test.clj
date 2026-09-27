@@ -397,6 +397,67 @@
       (is (identical? descriptor (get-in compilation [:options :target-descriptor])))
       (is (seq (:kernels compilation))))))
 
+(deftest equation-template-identity-and-emission-share-the-target-snapshot
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [base (compiler-hardware/descriptor-for cuda-target)
+          first-target (assoc base :calibration-version 11)
+          second-target (assoc base :calibration-version 12)
+          descriptions [first-target second-target first-target]
+          reads (atom 0)
+          built (atom [])
+          original equation-first/compile]
+      (with-redefs [compiler-hardware/descriptor-for
+                    (fn [_] (nth descriptions (dec (swap! reads inc))))
+                    equation-first/compile
+                    (fn [operation options descriptor]
+                      (let [result (original operation options descriptor)]
+                        (swap! built conj (get-in result [:options :target-descriptor]))
+                        result))]
+        (let [prepared (mapv (fn [_]
+                               (compiled/lower
+                                #'c-family-elementwise [(float-array 8) 8]
+                                {:compiler :equation-first :target cuda-target :dtype :float}))
+                             (range 3))
+              reports (mapv #(get-in (compiled/preparation-report %) [:template]) prepared)
+              identities (mapv :semantic-fingerprint reports)]
+          (is (= 3 @reads) "one capture per request, including cache hits")
+          (is (= [first-target second-target] @built))
+          (is (= [false false true] (mapv :cache-hit? reports)))
+          (is (= (first identities) (last identities)))
+          (is (not= (first identities) (second identities)))
+          (is (= 2 (:entries (compiled/compilation-cache-stats)))))))
+    (finally (compiled/clear-compilation-cache!))))
+
+(deftest captured-target-must-match-the-requested-device
+  (let [descriptor (compiler-hardware/descriptor-for cuda-target)
+        error (try
+                (equation-first/compile #'c-family-elementwise
+                                        {:target hip-target :dtype :float} descriptor)
+                nil
+                (catch clojure.lang.ExceptionInfo exception exception))]
+    (is (= :equation-first-target-description (:reason (ex-data error))))
+    (is (= cuda-target (:descriptor-target (ex-data error))))))
+
+(deftest invalid-target-snapshots-cannot-hit-a-warm-template
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [descriptor (compiler-hardware/descriptor-for cuda-target)
+          current (atom descriptor)
+          prepare #(compiled/lower #'c-family-elementwise [(float-array 8) 8]
+                                   {:compiler :equation-first :target cuda-target :dtype :float})]
+      (with-redefs [compiler-hardware/descriptor-for (fn [_] @current)]
+        (prepare)
+        (doseq [[invalid expected]
+                [[(assoc descriptor :device-id hip-target) :equation-first-target-description]
+                 [(assoc descriptor :non-data-probe (fn [] nil)) :semantic-fingerprint-unsupported]]]
+          (reset! current invalid)
+          (let [error (try (prepare) nil
+                           (catch clojure.lang.ExceptionInfo exception exception))]
+            (is (= expected (:reason (ex-data error))))
+            (is (= 1 (:entries (compiled/compilation-cache-stats))))))))
+    (finally (compiled/clear-compilation-cache!))))
+
 (defn- reason-of
   [thunk]
   (try

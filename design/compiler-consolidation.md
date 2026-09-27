@@ -149,8 +149,11 @@ graph still lacks the descriptor route's alternative-selection machinery. A dire
 descriptor route accepts it. Keep those gaps explicit rather than equating schedule metadata
 with implemented optimization. Equation-first compilation captures its target description once
 for fusion costs, schedule admission, launch planning and C-family projection; direct low-level
-callers may still resolve a descriptor when none is supplied. This snapshot is not an admission
-lease against later runtime device changes. Cache canonicalization of equivalent policy spellings
+callers may still resolve a descriptor when none is supplied. The equation-first prepared-template
+cache fingerprints that same capture and passes it into compilation; each subsequent preparation
+captures current facts, so changed calibration creates a new specialization. Unknown/non-data
+descriptors fail rather than collapsing into a shared nil cache identity. This snapshot is not an
+admission lease against later runtime device changes. Cache canonicalization of equivalent policy spellings
 remains a follow-up. Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
