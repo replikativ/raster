@@ -7,12 +7,12 @@ Arc device, not independent vendor acceptance.
 
 | Workload | Executed evidence | Boundary still open |
 | --- | --- | --- |
-| City day kernels, three-carry effects and two-exit search | JVM parity on OpenCL and Level Zero; original city fixture retained | Multiple effectful recurrence sites; broader irregular language coverage |
+| City day kernels, carried effect branches and two-exit search | JVM parity on OpenCL and Level Zero; original city fixture retained; nested recurrence branches and effect-empty arms replayed | Effectful early exits and post-effect local-result scopes; broader irregular language coverage |
 | Q4_K/Q6_K projection, two activation rows | Exact float-bit parity with ggml reference through public compiled/equation-first paths on both local backends | Large-shape throughput and external end-to-end decoder baseline |
 | Full AD linear/MSE/SGD step | Two resident mutable-weight updates match CPU AD on both local backends; no host weight reupload | General tape lifetime/reuse and frontier training scale |
 | RK4 heat solver | Public equation-first compile/link, 64 points and three steps, CPU agreement within 1e-10 on both local backends | Distributed halo exchange, large grids and measured solver throughput |
 | Routed attention | Existing tests executed: dense F32 and bidirectional packed segments on Level Zero; tiled history with dense/CSR routes and visibility on OpenCL | Full Laya packed-agent benchmark and independent cross-vendor numerical execution |
-| Temporary storage reuse | One 16-byte allocation removed in a four-layer program; two optimized replays match JVM on both backends | Reusable resident nonescape interface, loop order and broader AD retention |
+| Temporary storage reuse | One 16-byte allocation removed in a four-layer program; one private binding reused with refreshed inputs and detached snapshots on both backends | Zero-copy resident output leases, loop order and broader AD retention |
 
 Validation batches in the reusable bounded REPL: initial quant/attention/AD selection 6 tests,
 53 assertions; expanded dual-backend quant/AD selection 3 tests, 52 assertions; dual-backend

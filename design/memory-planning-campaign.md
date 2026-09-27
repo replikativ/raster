@@ -117,6 +117,16 @@ model savings or a measured latency improvement. The former baseline binding is 
 runtime verification remains mandatory. No-candidate plans retain distinct storage. Public outputs, host-initialized
 buffers, borrowed storage, incompatible coherence and partial-allocation views are excluded.
 
-A reusable resident facade with explicit private temporaries is the next ownership step; do
-not silently apply this rewrite to an inspectable `LinkedExecutable`. This first GPU-local proof
-does not supersede the JVM/source memory passes, so none is deleted on that claim.
+`gpu.link/private-executor!` extends this same host-result boundary across repeated invocations.
+It prepares/binds once, keeps private storage resident, and accepts checked host input/state
+updates. All updates are validated before upload, including rejection of overlapping views.
+Invocation and close are serialized; runtime failures close the scope, while invalid requests
+leave it unchanged. The callable is not an inspectable `LinkedExecutable`. Each result remains
+a detached host snapshot, valid after later invocations or close. `evaluate!` delegates to this
+scope rather than maintaining a second lifecycle implementation.
+
+This is not yet a zero-copy resident-output facade. AD residuals must be declared plan outputs
+before reuse analysis; runtime taps are not a substitute for that escape evidence. In particular,
+the existing `Compiled` wrapper exposes its executable and cannot silently opt into private
+reuse. Resident leases, structured replay and AD tape lifetime integration remain open. This
+GPU-local proof does not supersede the JVM/source memory passes, so none is deleted on that claim.
