@@ -163,6 +163,14 @@ callers can still inspect internal views and the session, and direct session mut
 this lease. An opaque composition capability plus asynchronous event/AD-tape retention is required
 before a private resident-result executor can safely realize reuse while outputs escape.
 
+Session-owned asynchronous range transfers also retain their resident buffer registrations.
+Submission records the validated buffer keys, physical allocation identities and buffer objects;
+`free-buffer!` rejects release through any of those aliases until `await-event!` has established
+completion and released backend staging. A nonblocking `event-complete?` observation is not a
+release certificate. Session close continues to drain outstanding events. This closes a concrete
+use-after-free path, but it does not yet provide a general read/write dependency scheduler for
+other operations submitted against the same ranges while a transfer is pending.
+
 `Compiled/invoke-leased` now projects its ordinary external `DeviceArray` results and acquires
 the Link output lease in one locked invocation. Only declared LinkPlan outputs may be projected;
 ownership is rejected before input writes or donation, and exactly one completed replay is

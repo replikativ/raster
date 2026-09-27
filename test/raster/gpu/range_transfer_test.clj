@@ -99,6 +99,56 @@
           (is (= @submitted @awaited @released))
           (is (empty? (:events @session))))))))
 
+(deftest pending-transfer-retains-only-its-resident-buffer
+  (let [buffer {:dtype :float :n-elements 8 :byte-size 32}
+        idle-buffer (assoc buffer :test-id :idle)
+        allocation (fn [id]
+                     (bview/allocation
+                      {:id id :byte-size 32 :memory-space :device
+                       :device :ze:0 :coherence :host-coherent :ownership :owned}))
+        session (atom {:device-id :ze:0 :session-id :transfer-lifetime
+                       :buffers {:busy buffer :busy-alias buffer :idle idle-buffer}
+                       :allocations {:busy (allocation :busy-allocation)
+                                     :busy-alias (allocation :busy-allocation)
+                                     :idle (allocation :idle-allocation)}
+                       :kernel-graphs {} :events {} :closed? false})
+        freed (atom [])]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [_ name]
+         (case name
+           "plan-range" (fn [_ _ _ _] {:n-bytes 32})
+           "submit-range-batch!" (fn [_ _] :submitted)
+           "event-complete?" (constantly true)
+           "await-event!" (constantly {:bytes 32 :commands 1})
+           "release-event!" (constantly nil)
+           "free-buffer!" #(swap! freed conj %)
+           (throw (ex-info "unexpected mocked runtime function" {:name name}))))}
+      (fn []
+        (let [event (g/submit-upload-ranges!
+                     session [[(g/buffer-view session :busy) (float-array 8) {:elements 8}]])]
+          (is (= #{:busy} (get-in @session [:events (:id event) :buffer-keys])))
+          (g/free-buffer! session :idle)
+          (is (= [idle-buffer] @freed))
+          (is (= :buffer-pending-transfer
+                 (try (g/free-buffer! session :busy)
+                      (catch clojure.lang.ExceptionInfo error
+                        (:reason (ex-data error))))))
+          (is (= :buffer-pending-transfer
+                 (try (g/free-buffer! session :busy-alias)
+                      (catch clojure.lang.ExceptionInfo error
+                        (:reason (ex-data error))))))
+          (is (some? (g/buffer session :busy)))
+          (is (g/event-complete? session event))
+          (is (= :buffer-pending-transfer
+                 (try (g/free-buffer! session :busy)
+                      (catch clojure.lang.ExceptionInfo error
+                        (:reason (ex-data error))))))
+          (g/await-event! session event)
+          (g/free-buffer! session :busy)
+          (is (= [idle-buffer buffer] @freed))
+          (g/release-event! session event))))))
+
 (deftest transfer-capabilities-preserve-backend-and-device-identity
   (let [session (atom {:device-id :ocl:3})]
     (with-redefs-fn
