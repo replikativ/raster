@@ -1001,6 +1001,43 @@
    (:executable c) :invoke-compiled
    #(invoke-compiled-unleased c inputs)))
 
+(defn invoke-leased
+  "Invoke a Compiled artifact and pin its owned resident DeviceArray outputs until close.
+
+   Returns a Closeable/IDeref lease. Deref yields the ordinary output map while live. Closing the
+   lease invalidates those external DeviceArray wrappers and permits the next invocation or
+   artifact close; it never frees the underlying session-owned buffers. Ownership is checked
+   before input writes or donation, and projection plus lease acquisition are one serialized
+   operation. This is a synchronous output-lifetime contract, not a value-version snapshot or
+   authorization for private temporary reuse."
+  [^Compiled c inputs]
+  (let [output-nodes (set (get-in c [:executable :plan :outputs]))
+        projected-nodes (mapv :node (:out-tree c))
+        _ (when-not (and (seq projected-nodes)
+                         (every? output-nodes projected-nodes))
+            (throw (ex-info "leased compiled results must project declared LinkPlan outputs"
+                            {:reason :compiled-output-lease-boundary
+                             :projected projected-nodes :outputs output-nodes})))
+        {:keys [result lease]}
+        (gpu-link/execute-and-lease!
+         (:executable c) :invoke-leased
+         #(invoke-compiled-unleased c inputs))
+        released? (atom false)]
+    (reify
+      java.io.Closeable
+      (close [_]
+        (when (compare-and-set! released? false true)
+          (try
+            (doseq [device-array (vals result)] (v/free! device-array))
+            (finally (.close ^java.io.Closeable lease)))))
+      clojure.lang.IDeref
+      (deref [_]
+        (when @released?
+          (throw (ex-info "compiled output lease has been released"
+                          {:reason :compiled-output-lease-released})))
+        @lease
+        result))))
+
 ;; ================================================================
 ;; Inspection (§2.1) + lifecycle
 ;; ================================================================

@@ -43,7 +43,10 @@ local milestone. FPGA spatial scheduling and distributed optimization are later 
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable
-resident handles or promise versioned AD tape snapshots.
+resident handles or promise versioned AD tape snapshots. The ordinary `Compiled/invoke-leased`
+boundary now pins one completed owned resident result across callers and invalidates its external
+wrappers on release; private temporary reuse still needs opaque composition and completion/AD
+retention evidence.
 
 ## Current control/effect slice
 
