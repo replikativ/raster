@@ -23,29 +23,20 @@
    the GPU dependency graph so `raster.gpu.compiled` / `raster.gpu.core` can build on it
    without a cycle."
   (:require [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.ir.buffer-view :as bview])
+            [raster.compiler.ir.buffer-view :as bview]
+            [raster.gpu.runtime-backend :as runtime-backend])
   (:import [java.lang.ref Cleaner]
            [java.util.concurrent.atomic AtomicBoolean]))
 
 ;; ================================================================
-;; Backend dispatch (mirror of core/rt-resolve; kept local so this
-;; ns depends on neither the session nor a specific runtime)
+;; Backend dispatch through the shared resident-backend contract. This value
+;; layer depends on neither the session nor a specific runtime.
 ;; ================================================================
-
-(defn- backend-ns
-  [device-id]
-  (let [s (name device-id)]
-    (cond
-      (.startsWith s "ze")  'raster.gpu.ze-runtime
-      (.startsWith s "ocl") 'raster.gpu.ocl-runtime
-      :else (throw (ex-info (str "Unknown GPU backend for device " device-id
-                                 " — use :ze:N or :ocl:N")
-                            {:device-id device-id})))))
 
 (defn- rt-fn
   "Resolve a runtime fn by name for the given device-id's backend."
   [device-id fn-name]
-  (let [ns-sym (backend-ns device-id)]
+  (let [ns-sym (runtime-backend/runtime-namespace device-id)]
     (or (requiring-resolve (symbol (str ns-sym) fn-name))
         (throw (ex-info (str "Cannot resolve " fn-name " in " ns-sym)
                         {:device-id device-id :fn fn-name})))))

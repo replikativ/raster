@@ -40,6 +40,7 @@
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
             [raster.gpu.measurement :as measurement]
+            [raster.gpu.runtime-backend :as runtime-backend]
             [raster.gpu.resident-value :as resident-value])
   (:import [java.lang AutoCloseable]))
 
@@ -48,32 +49,21 @@
 ;; ================================================================
 
 (defn backend-type
-  "Determine GPU backend from device-id keyword.
-   :ze:0 → :ze, :ocl:0 → :ocl"
+  "Determine the supported resident GPU backend from a device ID."
   [device-id]
-  (let [s (name device-id)]
-    (cond
-      (str/starts-with? s "ze")  :ze
-      (str/starts-with? s "ocl") :ocl
-      :else (throw (ex-info (str "Unknown GPU backend: " device-id
-                                 ". Use :ze:N or :ocl:N")
-                            {:device-id device-id})))))
+  (runtime-backend/backend-type device-id))
 
 (defn- rt-resolve-soft
   "Like rt-resolve but returns nil instead of throwing when the backend lacks the fn.
   Used for the bound-dispatch destroyers, which are ze-only."
   [device-id fn-name]
-  (let [ns-sym (case (backend-type device-id)
-                 :ze  'raster.gpu.ze-runtime
-                 :ocl 'raster.gpu.ocl-runtime)]
+  (let [ns-sym (runtime-backend/runtime-namespace device-id)]
     (requiring-resolve (symbol (str ns-sym) fn-name))))
 
 (defn- rt-resolve
   "Resolve a function from the appropriate runtime namespace."
   [device-id fn-name]
-  (let [ns-sym (case (backend-type device-id)
-                 :ze  'raster.gpu.ze-runtime
-                 :ocl 'raster.gpu.ocl-runtime)]
+  (let [ns-sym (runtime-backend/runtime-namespace device-id)]
     (or (requiring-resolve (symbol (str ns-sym) fn-name))
         (throw (ex-info (str "Cannot resolve " fn-name " in " ns-sym)
                         {:device-id device-id :fn fn-name})))))
@@ -81,9 +71,7 @@
 (defn- rt-arena-var
   "Get the *current-arena* var for the backend."
   [device-id]
-  (let [ns-sym (case (backend-type device-id)
-                 :ze  'raster.gpu.ze-runtime
-                 :ocl 'raster.gpu.ocl-runtime)]
+  (let [ns-sym (runtime-backend/runtime-namespace device-id)]
     (requiring-resolve (symbol (str ns-sym) "*current-arena*"))))
 
 ;; ================================================================
@@ -204,15 +192,14 @@
 
 (defn- allocation-contract
   [device-id session-id key buffer ownership opts]
-  (let [backend (backend-type device-id)]
+  (let [{:keys [memory-space coherence]} (runtime-backend/descriptor device-id)]
     (bview/allocation
      {:id (or (:allocation-id opts) [session-id key (random-uuid)])
       :byte-size (:byte-size buffer)
-      :memory-space (or (:memory-space opts) (case backend :ze :shared :ocl :device))
+      :memory-space (or (:memory-space opts) memory-space)
       :device device-id
       :alignment (or (:alignment opts) (:alignment buffer) 1)
-      :coherence (or (:coherence opts)
-                     (case backend :ze :host-coherent :ocl :explicit-transfer))
+      :coherence (or (:coherence opts) coherence)
       :ownership ownership})))
 
 (defn- free-session-buffers!
@@ -1340,13 +1327,9 @@
     ;; sibling view of the same allocation.
     (if whole-buffer?
       {:buffer buffer :owned-view? false}
-      (case (backend-type device-id)
-        :ze {:buffer ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
-                                                            (:byte-length view) view-dtype)
-             :owned-view? false}
-        :ocl {:buffer ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
-                                                             (:byte-length view) view-dtype)
-              :owned-view? true}))))
+      {:buffer ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
+                                                          (:byte-length view) view-dtype)
+       :owned-view? (:owned-slice? (runtime-backend/descriptor device-id))})))
 
 (defn- materialize-external-buffers!
   "Turn checked external BufferViews into backend ABI buffers. Level Zero slices are non-owning

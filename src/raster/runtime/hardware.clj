@@ -220,13 +220,13 @@
 (defn- clojurecuda-available?
   "Check if CUDA device detection is available.
   Currently returns false — CUDA support will be reimplemented
-  via Level Zero or native CUDA driver API when targeted."
+  via the native CUDA driver API when targeted."
   []
   false)
 
 (defn- detect-cuda-devices
   "Detect CUDA devices. Currently a stub — CUDA support will be
-  reimplemented via native CUDA driver API when targeted."
+  reimplemented via the native CUDA driver API when targeted."
   []
   [])
 
