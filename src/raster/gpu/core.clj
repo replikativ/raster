@@ -1816,6 +1816,19 @@
      :per-replay (mapv (fn [prepared] {:kernel-phase (:phase prepared)}) (:prepareds entry))
      :completion :unproven}))
 
+(defn kernel-graph-execution-info
+  "Describe the fixed executable actually bound to a graph handle, without replay or selection.
+   No dispatch alternatives were attempted by this binding path; absent precision/strategy facts
+   remain absent rather than borrowing the requested compiler policy."
+  [sess handle]
+  (when (:closed? @sess)
+    (throw (ex-info "cannot inspect a closed GPU session"
+                    {:reason :gpu-execution-info-closed})))
+  (let [entry (resolve-kernel-graph-entry sess handle)
+        executable (or (get-in entry [:graph-call :graph])
+                       (get-in entry [:kernel-call :artifact]))]
+    (assoc (kexec/description executable) :selection :fixed :admission [])))
+
 (defn submit-kernel-graph!
   "Submit a bound graph without waiting and return a session-owned GPUEvent.
 
@@ -2001,15 +2014,12 @@
                          #(executable-alias-violations % ordered-args)))
             selected (if admission (:executable admission) artifact)
             execution-info
-            {:kind (kexec/kind selected)
-             :strategy (kexec/strategy selected)
-             :precision (:precision (kexec/attributes selected))
-             :entry-points (kexec/entry-points selected)
+            (assoc (kexec/description selected)
              ;; Keep reasons, not live buffer bindings or full executable/source objects.
              :admission (mapv (fn [{:keys [strategy violations]}]
                                 {:strategy strategy
                                  :reasons (mapv :reason violations)})
-                              (:attempts admission))}
+                              (:attempts admission)))
             constant-buffer-ids
             (when (= :kernel-graph (kexec/kind selected))
               (into #{}

@@ -96,6 +96,9 @@
               prior (volatile! nil)
               live (compiled/instantiate! prepared)]
           (try
+            (is (= [:fixed]
+                   (mapv #(get-in % [:executable :selection]) (compiled/execution-info live)))
+                "the public report describes the bound graph, not an unperformed dispatch search")
             (dotimes [_ 2]
               (city/three-carry-effects! expected 3 nc)
               (let [old @prior

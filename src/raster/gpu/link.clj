@@ -771,15 +771,16 @@
    One entry per bound phase, in phase order; :executable is nil for manual/non-executable phases
    that do not retain compiler admission evidence.
    Entry points describe the bound executable, including any prologue, not measured replay events.
-   Equation-first prepared programs do not yet retain this evidence and are explicitly declined."
+   Equation-first programs report their fixed graph bindings, once per distinct carry variant,
+   without pretending they performed dispatch selection or expanding structured-loop trip counts."
   [executable]
   (let [executable (ensure-live! executable :execution-info)]
-    (when (:prepared-program executable)
-      (throw (ex-info "equation-first execution reporting is not yet available"
-                      {:reason :link-program-execution-info-unsupported})))
-    (mapv (fn [phase]
-            {:phase phase :executable (gpu/execution-info (:session executable) phase)})
-          (:phases executable))))
+    (if-let [prepared (:prepared-program executable)]
+      (parallel-program/execution-info
+       prepared #(gpu/kernel-graph-execution-info (:session executable) %))
+      (mapv (fn [phase]
+              {:phase phase :executable (gpu/execution-info (:session executable) phase)})
+            (:phases executable)))))
 
 (defn- annotate-program-order
   [plan order]

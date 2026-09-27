@@ -173,6 +173,18 @@
   [executable]
   (mapv :kernel-name (artifacts (validate! executable))))
 
+(defn description
+  "Compact source-free description of a validated executable, without runtime selection claims."
+  [executable]
+  (let [executable (validate! executable)]
+    {:kind (kind executable)
+     :strategy (get-in executable [:attributes :strategy])
+     :precision (get-in executable [:attributes :precision])
+     :entry-points (case (kind executable)
+                     :kernel-artifact [(:kernel-name executable)]
+                     :kernel-graph (mapv #(get-in % [:operation :kernel-name])
+                                         (:nodes executable)))}))
+
 (defn- cast-runtime-scalar
   [dtype value]
   (case dtype

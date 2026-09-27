@@ -839,6 +839,12 @@
           :run! #(swap! events conj [:run %])
           :release! #(swap! events conj [:release %])})]
     (is (program-runtime/prepared-parallel-program? prepared))
+    (let [before @events
+          info (program-runtime/execution-info prepared :key)]
+      (is (= (:binding-order prepared) (mapv :phase info) (mapv :executable info)))
+      (is (= before @events) "inspection neither rebinds nor replays"))
+    (is (= :parallel-program-execution-info-observer
+           (reason-of #(program-runtime/execution-info prepared nil))))
     (is (= :parallel-program-structured-execution-order
            (reason-of #(program-runtime/execution-order
                         prepared (fn [_] (throw (AssertionError. "must decline before visiting")))))))
@@ -850,6 +856,8 @@
     (is (= 4 (count (filter #(= :release (first %)) @events))))
     (is (= :parallel-program-closed
            (reason-of #(program-runtime/run-prepared! prepared))))
+    (is (= :parallel-program-closed
+           (reason-of #(program-runtime/execution-info prepared identity))))
     (is (nil? (program-runtime/release-prepared! prepared)))))
 
 (deftest prepared-parallel-program-profiles-the-exact-replay-order
@@ -892,6 +900,12 @@
   (let [call (:call (prepared-mixed-call 1000000000))]
     (is (= 4 (count (program-runtime/staging-plan call :execution)))
         "one billion iterations still prepare three carry variants and one suffix")
+    (with-open [prepared (program-runtime/prepare-with!
+                          call {:bind! (fn [key & _] key)
+                                :run! (fn [_] (throw (AssertionError. "inspection must not launch")))
+                                :release! (fn [_])})]
+      (is (= 4 (count (program-runtime/execution-info prepared identity)))
+          "execution descriptions are bounded by bindings, not a billion replay iterations"))
     (let [events (atom [])
           launches (atom 0)]
       (is (thrown-with-msg?
