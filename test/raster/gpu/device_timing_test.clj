@@ -1,5 +1,5 @@
 (ns raster.gpu.device-timing-test
-  "S1 gate: Level-Zero device-event kernel timing over linked executables.
+  "Device-event kernel timing over linked executables on Level Zero and OpenCL.
 
    Asserts, on a small 2-kernel resident program:
      • fixture/profile! returns one device-time row per recorded kernel, in
@@ -18,6 +18,7 @@
             [raster.compiler.pipeline :as pl]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as opencl]
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.link :as link]))
 
@@ -34,19 +35,21 @@
     arr))
 
 (deftest device-timing-profile-linked-executable
-  (if-not @gp/gpu-available?
-    (gp/gpu-skip! "device-timing")
+  (doseq [[device available? skip!] [[:ze:0 gp/gpu-available? gp/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+   (if-not @available?
+    (skip! (str "device-timing on " device))
     (let [n 262144
           a (fa n 1) b (fa n 2)
           args [a b n]
-          prog (pl/compile-gpu-program #'dt-two-step :ze:0 :dtype :float)
+          prog (pl/compile-gpu-program #'dt-two-step device :dtype :float)
           _ (is (some? prog) "dt-two-step must extract as a resident program")
           step-names (set (keep :kernel-name (:steps prog)))
           ;; host reference
           expected ^floats (apply dt-two-step args)]
       (when prog
         ;; ── profiled session ────────────────────────────────────────────────
-        (let [sess (gpu/make-session :ze:0)]
+        (let [sess (gpu/make-session device)]
           (try
             (let [program (fixture/instantiate! sess prog args {} {:profile? true})
                   ;; Warmup replay also exercises event reset between ordinary and profiled runs.
@@ -82,7 +85,7 @@
                   (is (every? #(>= (:ms %) 0.0) (:profile p2))))))
             (finally (gpu/close-session! sess))))
         ;; ── unprofiled session: the fast path is untouched ──────────────────
-        (let [sess (gpu/make-session :ze:0)]
+        (let [sess (gpu/make-session device)]
           (try
             (let [program (fixture/instantiate! sess prog args)
                   out ^floats (get (fixture/run! program args) (:result-sym prog))
@@ -94,4 +97,4 @@
                 (is (false? (:profile? executable))))
               (testing "profiling an unprofiled executable fails loud"
                 (is (thrown? clojure.lang.ExceptionInfo (link/profile! executable)))))
-            (finally (gpu/close-session! sess))))))))
+            (finally (gpu/close-session! sess)))))))))
