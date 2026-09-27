@@ -106,7 +106,12 @@
         operation (-> dispatched :emitted :equations last :operations first)
         arguments [(float-array 15) (float-array 15) (float-array 15)
                    (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
-        linked (equation-first/lower dispatched arguments)]
+        wide-arguments [(float-array (* 3 1024)) (float-array (* 3 1024))
+                        (float-array (* 3 1024))
+                        (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 1024 2]
+        linked (equation-first/lower dispatched arguments)
+        wide-linked (equation-first/lower dispatched wide-arguments)
+        selection (:dispatch operation)]
     (is (not (equation-dispatch/emitted-equation-dispatch?
               (-> auto :emitted :equations last :operations first)))
         "existing :auto retains exact fixed-reference numerics")
@@ -114,6 +119,35 @@
     (is (= :dispatch-reassociated
            (get-in dispatched [:options :schedule :segmented-weighted-reduction :strategy])))
     (is (= 2 (count (:kernels dispatched))))
+    (is (= :runtime-scalar-threshold (get-in selection [:selector :kind])))
+    (is (= 256 (get-in selection [:selector :threshold])))
+    (is (= #{:exact :reassociated}
+           (get-in selection [:attributes :tuning :numerical-mode :permitted-modes])))
+    (is (= :indexed-segmented-reduction-reference
+           (executable/strategy (-> linked :instances first :call :steps last :graph))))
+    (is (= :indexed-segmented-reduction-subgroup-score-reuse
+           (executable/strategy (-> wide-linked :instances first :call :steps last :graph))))))
+
+(deftest public-dispatch-consumes-measured-selector-with-stable-identity
+  (register-target!)
+  (let [baseline (compilation :dispatch-reassociated)
+        dispatch-id (-> baseline :emitted :equations last :operations first :dispatch :id)
+        selector {:kind :fixed-strategy
+                  :strategy :indexed-segmented-reduction-subgroup-score-reuse}
+        measured (equation-first/compile
+                  #'indexed-fixture/resident-indexed-attention-probe
+                  {:target target :dtype :float
+                   :schedule {:segmented-weighted-reduction
+                              {:strategy :dispatch-reassociated
+                               :measured-selectors {dispatch-id selector}}}})
+        arguments [(float-array 15) (float-array 15) (float-array 15)
+                   (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
+        linked (equation-first/lower measured arguments)]
+    (is (= dispatch-id
+           (-> measured :emitted :equations last :operations first :dispatch :id)))
+    (is (= :measured-runtime-shape
+           (-> measured :emitted :equations last :operations first
+               :dispatch :attributes :selection)))
     (is (= :indexed-segmented-reduction-subgroup-score-reuse
            (executable/strategy (-> linked :instances first :call :steps last :graph))))))
 

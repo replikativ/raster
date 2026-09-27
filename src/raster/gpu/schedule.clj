@@ -249,8 +249,9 @@
                    (every? map? (vals measured-selectors)))
       (throw (ex-info "schedule: measured segmented reduction selectors must map dispatch IDs to selector maps"
                       {:measured-selectors measured-selectors})))
-    (when (and (seq measured-selectors) (not= :auto reduction-strategy))
-      (throw (ex-info "schedule: measured selectors require :strategy :auto"
+    (when (and (seq measured-selectors)
+               (not (contains? #{:auto :dispatch-reassociated} reduction-strategy)))
+      (throw (ex-info "schedule: measured selectors require an emitting dispatch strategy"
                       {:strategy reduction-strategy
                        :measured-selectors measured-selectors})))
     (when-not (valid-typed-contraction-strategies typed-contraction-strategy)

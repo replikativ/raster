@@ -24,6 +24,7 @@
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.device :as device]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.schedule :as gpu-schedule]
@@ -121,11 +122,13 @@
 
    This runs after TypedSOAC construction: it neither repeats source analysis nor recognizes
    a model operation from target code. Non-reduction equations must be identical."
-  [function-id reference subgroup]
+  [function-id schedule target-descriptor reference subgroup]
   (let [reference-program (emitted-program/validate! (:program reference))
         subgroup-program (emitted-program/validate! (:program subgroup))
         ref-equations (:equations reference-program)
-        subgroup-equations (:equations subgroup-program)]
+        subgroup-equations (:equations subgroup-program)
+        measured-selectors (get-in schedule
+                                   [:segmented-weighted-reduction :measured-selectors] {})]
     (when-not (and (= (dissoc reference-program :equations)
                       (dissoc subgroup-program :equations))
                    (= (count ref-equations) (count subgroup-equations)))
@@ -139,14 +142,38 @@
                                     (dissoc subgroup-equation :operations))
                          (fail! :equation-dispatch-equation-spine
                                 "reduction alternatives changed their semantic equation" {}))
+                     plan (:algorithm reference-equation)
                      candidates (mapv (comp first :operations)
                                       [reference-equation subgroup-equation])
-                     selection (kernel-dispatch/make
-                                {:id (str function-id "/reduction-" (:id reference-equation))
-                                 :alternatives (mapv :graph candidates)
-                                 :default-strategy :indexed-segmented-reduction-reference
-                                 :selector {:kind :fixed-strategy
-                                            :strategy :indexed-segmented-reduction-subgroup-score-reuse}})
+                     id (str function-id "/reduction-" (:id reference-equation))
+                     reference-strategy :indexed-segmented-reduction-reference
+                     subgroup-strategy :indexed-segmented-reduction-subgroup-score-reuse
+                     subgroup-size (long (:subgroup-size target-descriptor))
+                     multiple (long (get-in schedule
+                                            [:segmented-weighted-reduction
+                                             :score-reuse-subgroup-multiple]))
+                     measured-selector (get measured-selectors id)
+                     selection (cond->
+                                (kernel-dispatch/make
+                                 {:id id
+                                  :alternatives (mapv :graph candidates)
+                                  :default-strategy reference-strategy
+                                  :selector {:kind :runtime-scalar-threshold
+                                             :argument (get-in plan [:value :components])
+                                             :threshold (*' subgroup-size multiple)
+                                             :at-least subgroup-strategy
+                                             :otherwise reference-strategy}
+                                  :attributes
+                                  {:algebra :segmented-weighted-reduction
+                                   :algebra-key (swr/algebra-key plan)
+                                   :tuning (update (swr-route/tuning-contract plan id)
+                                                   :numerical-mode assoc
+                                                   :permitted-modes #{:exact :reassociated})
+                                   :selection (if measured-selector
+                                                :measured-runtime-shape
+                                                :analytic-runtime-shape)}})
+                                 measured-selector
+                                 (kernel-dispatch/with-selector measured-selector))
                      operation (equation-dispatch/make
                                 candidates selection
                                 {:permitted-modes #{:exact :reassociated}})]
@@ -254,7 +281,8 @@
                                     subgroup-scheduled
                                     (assoc subgroup-options :target-dialect target-dialect))]
              (dispatch-reduction-emissions
-              (function-symbol f-var) reference-emission subgroup-emission))
+              (function-symbol f-var) resolved-schedule target-descriptor
+              reference-emission subgroup-emission))
            reference-emission)
          invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
          _ (when-not invocation-plan

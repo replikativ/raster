@@ -11,7 +11,9 @@
   [{:id :indexed-edge-list-subgroup-score-reuse :route indexed-leaf/route-dynamic-score-reuse}
    {:id :indexed-edge-list-reference :route indexed-leaf/route-dynamic}])
 
-(defn- tuning-contract
+(defn tuning-contract
+  "Describe the stable numerical/layout identity of a segmented-reduction dispatch.
+   Both the resident descriptor and equation-first graph routes use this contract."
   [plan dispatch-id]
   (let [{:keys [operands output accumulator-dtype] :as plan} (swr/validate! plan)
         schedule-key (swr/schedule-key plan)]
