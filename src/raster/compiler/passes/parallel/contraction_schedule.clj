@@ -549,54 +549,57 @@
       (scheduled-body/validate-against-node! scheduled node graph))))
 
 (defn plan-register-tiled-for-node
-  "Admit a fixed FP32 register tile through the common graph/body certificate.
+  "Admit an explicitly requested FP32 register tile through the common graph/body certificate.
 
-   This is an explicit candidate constructor, not an automatic selector. The initial candidate
-   requires static extents and the permissive scheduling policy, which permits target multiply/add
-   contraction. It never narrows storage to FP16. Strict arithmetic and dynamic shapes retain
-   the portable candidate until their separate numerical/index-domain obligations are met."
+   This is an explicit candidate constructor, not an automatic selector. Symbolic scalar extents
+   retain their positive, dense-capacity, and padded-coordinate obligations as checked scheduled
+   preconditions. The permissive numerical policy allows target multiply/add contraction but never
+   narrows storage to FP16."
   [node graph contract-facts descriptor {:keys [precision] :as options}]
-  (cond
-    (not= :mixed-f16-f32 precision)
-    {:ok false :reason :register-tiled-numerical-policy}
+  (let [dimensions (mapv second (concat (:free-axes contract-facts)
+                                        (:contract-axes contract-facts)))]
+    (cond
+      (not= :mixed-f16-f32 precision)
+      {:ok false :reason :register-tiled-numerical-policy}
 
-    (not= :float (:dtype contract-facts))
-    {:ok false :reason :register-tiled-fp32-candidate}
+      (not= :float (:dtype contract-facts))
+      {:ok false :reason :register-tiled-fp32-candidate}
 
-    (not-every? #(and (integer? %) (pos? %))
-                (map second (concat (:free-axes contract-facts) (:contract-axes contract-facts))))
-    {:ok false :reason :register-tiled-static-candidate}
+      (not-every? #(or (symbol? %) (and (integer? %) (pos? %))) dimensions)
+      {:ok false :reason :symbolic-dims}
 
-    (and (= [2 1] [(count (:free-axes contract-facts)) (count (:contract-axes contract-facts))])
-         (let [[m n] (map second (:free-axes contract-facts))
-               k (second (first (:contract-axes contract-facts)))]
-           (some #(> % Integer/MAX_VALUE) [(*' m n) (*' m k) (*' k n)])))
-    {:ok false :reason :register-tiled-static-capacity}
+      (and (= [2 1] [(count (:free-axes contract-facts)) (count (:contract-axes contract-facts))])
+           (register-tiled/static-capacity-overflow? dimensions))
+      {:ok false :reason :register-tiled-static-capacity}
 
-    :else
-    (try
-      (let [operation (:operation node)
-            lowered (register-tiled/lower
-                     contract-facts (assoc options :descriptor descriptor :operation-id (:id operation)))
-            kernel-body (:kernel-body lowered)
-            arguments (mapv :id (:parameters kernel-body))
-            scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
-            scheduled (scheduled-body/make
-                       {:source operation :body kernel-body :arguments arguments
-                        :scalar-bindings (scheduled-body/derive-scalar-bindings
-                                          kernel-body arguments scalar-types)
-                        :effects {:kind :pure-contraction
-                                  :uses (scheduled-body/derive-uses kernel-body arguments)}
-                        :legality {:kind :register-tiled-contraction :tile (:tile lowered)}
-                        :numerics {:mode :reassociated :policy :ordered-k-target-contraction
-                                   :accumulator-dtype :float :rounding :implementation-defined}
-                        :attributes {:strategy :register-tiled :precision :f32
-                                     :out-elems (:output-count lowered)}})]
-        {:ok true :scheduled (scheduled-body/validate-against-node! scheduled node graph)})
-      (catch clojure.lang.ExceptionInfo exception
-        (if (register-tiled/declined? exception)
-          {:ok false :reason (:missing-rule (ex-data exception)) :detail (ex-data exception)}
-          (throw exception))))))
+      :else
+      (try
+        (let [operation (:operation node)
+              graph-scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
+              lowering-options (-> options
+                                   (assoc :descriptor descriptor :operation-id (:id operation))
+                                   (update :scalar-types #(merge (or % {}) graph-scalar-types)))
+              lowered (register-tiled/lower contract-facts lowering-options)
+              kernel-body (:kernel-body lowered)
+              arguments (mapv :id (:parameters kernel-body))
+              scheduled (scheduled-body/make
+                         {:source operation :body kernel-body :arguments arguments
+                          :scalar-bindings (scheduled-body/derive-scalar-bindings
+                                            kernel-body arguments graph-scalar-types)
+                          :preconditions (register-tiled/admission-preconditions
+                                          (:dims lowered) (:tile lowered))
+                          :effects {:kind :pure-contraction
+                                    :uses (scheduled-body/derive-uses kernel-body arguments)}
+                          :legality {:kind :register-tiled-contraction :tile (:tile lowered)}
+                          :numerics {:mode :reassociated :policy :ordered-k-target-contraction
+                                     :accumulator-dtype :float :rounding :implementation-defined}
+                          :attributes {:strategy :register-tiled :precision :f32
+                                       :out-elems (:output-count lowered)}})]
+          {:ok true :scheduled (scheduled-body/validate-against-node! scheduled node graph)})
+        (catch clojure.lang.ExceptionInfo exception
+          (if (register-tiled/declined? exception)
+            {:ok false :reason (:missing-rule (ex-data exception)) :detail (ex-data exception)}
+            (throw exception)))))))
 
 (defn schedule-for-node
   "Select a graph-certified body from a resolved public schedule.
