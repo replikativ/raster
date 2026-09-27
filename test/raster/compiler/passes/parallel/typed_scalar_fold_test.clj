@@ -10,12 +10,56 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.dl.array-ops :as array-ops]
             [raster.dl.nn :as dl-nn]
             [raster.nn :as nn]))
+
+(deftest multiple-exit-projection-preserves-branch-local-scope-and-laziness
+  (doseq [body ['(if (>= q limit) (+ q 100)
+                    (let* [acc (+ acc (clojure.core/aget weights q))]
+                      (if (> acc target) q (recur (inc q) acc))))
+                '(let* [end? (>= q limit)]
+                   (if end? (+ q 100)
+                     (if (> acc target) (- q)
+                       (if (odd? q)
+                         (recur (inc q) (+ acc 2.0))
+                         (recur (inc q) (+ acc 1.0))))))]]
+    (let [source (list 'loop* '[q 0 acc 0.0] body)
+          {:keys [carry-syms carry-inits continue-expr update-exprs exit-expr]}
+          (patterns/match-ordered-while-loop source)
+          projected (list 'loop* (vec (interleave carry-syms carry-inits))
+                          (list 'if continue-expr (list* 'recur update-exprs) exit-expr))
+          evaluate #(eval (list 'fn '[weights limit target] %))
+          reference (evaluate source) actual (evaluate projected)]
+      (doseq [limit [0 1 2 5] target [-1.0 0.0 1.5 3.0 100.0]]
+        ;; The array has exactly the legal extent, including zero. Speculation would throw.
+        (let [weights (double-array (range 1 (inc limit)))]
+          (is (= (reference weights limit target) (actual weights limit target)))))))
+  (is (nil? (patterns/match-ordered-while-loop
+             '(loop* [q 0 acc 0.0] (if (> q 2) q (recur (inc q)))))))
+  (is (nil? (patterns/match-ordered-while-loop
+             '(loop* [q 0] (recur (inc q))))) "no exit is not an ordered while fold"))
+
+(deftest multiple-exit-projection-does-not-admit-hidden-effects
+  (doseq [source
+          ['(loop* [^long q 0]
+              (if (> q 2) (clojure.core/aset output 0 q) (recur (inc q))))
+           '(loop* [^long q 0]
+              (if (do (clojure.core/aset output 0 q) (> q 2)) q (recur (inc q))))
+           '(loop* [^long q 0]
+              (if (> q 2) q
+                  (let* [effect (clojure.core/aset output 0 q)] (recur (inc q)))))
+           '(loop* [^long q 0]
+              (let* [effect (raster.par/atomic-add! output 0 1)]
+                (if (> q 2) q (recur (inc q)))))
+           '(loop* [^long q 0]
+              (if (> q 2) q (recur (clojure.core/aset output 0 (inc q)))))]]
+    (is (some? (patterns/match-ordered-while-loop source)))
+    (is (nil? (#'frontend/source-while-fold-info source)))))
 
 (deftest product-fold-components-share-one-multi-carry-loop
   (let [product

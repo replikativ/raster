@@ -41,6 +41,20 @@
   (testing "quoted data is data, not code to scan"
     (is (not (util/effectful? '(quote (raster.arrays/aset O 0 1.0)))))))
 
+(deftest effectful-traverses-evaluated-collections-but-not-quoted-data
+  (doseq [expression ['(let* [x (raster.arrays/aset out 0 1)] x)
+                      '(let* [x (raster.par/atomic-add! out 0 1)] x)
+                      '[(raster.arrays/aset out 0 1)]
+                      '{:value (raster.arrays/aset out 0 1)}
+                      '#{(raster.arrays/aset out 0 1)}]]
+    (is (util/effectful? expression))
+    (is (not (util/effectful? (list 'quote expression)))))
+  (let [source '(let* [x (let* [effect (raster.par/atomic-add! out 0 1)] 2)] (+ x x))]
+    (is (= :impure-binding
+           (try (util/inline-pure-lets source)
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "a nested effectful initializer must not be substituted into both uses")))
+
 (deftest effect-loop-statements-have-no-terminal-value
   (is (util/effect-loop-statement?
        '(loop* [i 0]

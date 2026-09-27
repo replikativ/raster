@@ -7,7 +7,7 @@ Arc device, not independent vendor acceptance.
 
 | Workload | Executed evidence | Boundary still open |
 | --- | --- | --- |
-| City day kernels and three-carry effects | JVM parity on OpenCL and Level Zero; original city fixture retained | Multiple source exits/recurrence sites; broader irregular language coverage |
+| City day kernels, three-carry effects and two-exit search | JVM parity on OpenCL and Level Zero; original city fixture retained | Multiple effectful recurrence sites; broader irregular language coverage |
 | Q4_K/Q6_K projection, two activation rows | Exact float-bit parity with ggml reference through public compiled/equation-first paths on both local backends | Large-shape throughput and external end-to-end decoder baseline |
 | Full AD linear/MSE/SGD step | Two resident mutable-weight updates match CPU AD on both local backends; no host weight reupload | General tape lifetime/reuse and frontier training scale |
 | RK4 heat solver | Public equation-first compile/link, 64 points and three steps, CPU agreement within 1e-10 on both local backends | Distributed halo exchange, large grids and measured solver throughput |

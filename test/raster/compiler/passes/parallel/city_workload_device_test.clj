@@ -64,6 +64,22 @@
                (set (map :name (filter #(= :no-write-alias (:aliasing %)) (:abi ki))))))
       (finally (gpu/close-session! session)))))
 
+(deftest two-exit-search-matches-jvm-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-fp64-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "two-exit search on " device))
+      (doseq [nc [1 5]]
+        (let [weights (double-array [1 2 3 4])
+              targets (double-array [-1 0.5 1 2.5 6 100])
+              expected (int-array 6)
+              _ (city/two-exit-walk! weights targets expected 6 nc)
+              actual (run-device :two-exit-search #'city/two-exit-walk!
+                                 {:weights [:double 4 weights] :targets [:double 6 targets]
+                                  :out [:int 6 (int-array (repeat 6 -77))]}
+                                 {"n" 6 "nc" nc} 6 [:out] device)]
+          (is (= (vec expected) (:out actual)) (str device " width=" nc)))))))
+
 (deftest three-carry-effects-match-jvm-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
