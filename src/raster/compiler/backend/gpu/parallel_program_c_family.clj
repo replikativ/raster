@@ -8,7 +8,6 @@
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
             [raster.compiler.core.hardware :as hardware]
-            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
@@ -23,7 +22,7 @@
             [raster.compiler.passes.parallel.product-consumer-region :as product-consumer-region]
             [raster.compiler.passes.parallel.product-consumer-route :as product-consumer-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
-            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
 
 (defn- fail!
   [reason message data]
@@ -60,19 +59,12 @@
    The target emitter receives verified facts keyed by the immutable SegRed identity; it never
    reparses retained Clojure source or guesses that an arbitrary segmented reduction is GEMM."
   [algorithm operations]
-  (let [equations (into {} (map (juxt second identity)) (soac/equations algorithm))]
-    (into {}
-          (keep (fn [operation]
-                  (when (= :contraction (:phase operation))
-                    (let [equation (or (get equations (:id operation))
-                                       (fail! :c-family-contraction-equation
-                                              "scheduled contraction lacks its typed equation"
-                                              {:operation (:id operation)}))]
-                      [(:id operation)
-                       (contraction-facts/from-components
-                        (typed-projection/segmented-reduce-contract-components
-                         algorithm equation))]))))
-          operations)))
+  (into {}
+        (keep (fn [operation]
+                (when (= :contraction (:phase operation))
+                  [(:id operation)
+                   (:facts (contraction-context/validate! algorithm operation))])))
+        operations))
 
 (defn- target-program-dialect
   [target-dialect]

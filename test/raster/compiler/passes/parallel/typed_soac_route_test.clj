@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.hardware :as hardware]
@@ -23,6 +24,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
@@ -1289,6 +1291,26 @@
     (is (= :typed-soac (:source-dialect stats)))
     (is (instance? raster.compiler.ir.segop.SegRed operation))
     (is (= :contraction (:phase operation)))
+    (let [context (contraction-context/validate! algorithm operation)]
+      ;; Projection allocates a fresh reduction accumulator. Compare the retained physical
+      ;; facts, not that locally bound identity from two independent projections.
+      (is (= (dissoc (:facts context) :reduction)
+             (dissoc (get (#'c-family/contraction-facts-by-operation algorithm [operation])
+                          (:id operation)) :reduction)))
+      (doseq [[reason changed]
+              [[:typed-contraction-equation (assoc operation :id :missing-equation)]
+               [:typed-contraction-operation-dtype (assoc operation :dtype :double)]
+               [:typed-contraction-space (assoc-in operation [:space :dims 0 :bound] 999)]
+               [:typed-contraction-storage (assoc operation :inputs '#{other-A B})]
+               [:typed-contraction-storage (assoc operation :outputs '#{other-C})]]
+              project [(fn [op] (contraction-context/validate! algorithm op))
+                       (fn [op] (#'c-family/contraction-facts-by-operation algorithm [op]))]]
+        (is (= reason
+               (try (project changed)
+                    nil
+                    (catch clojure.lang.ExceptionInfo exception
+                      (:reason (ex-data exception)))))
+            "both orchestration paths reject the same mismatched physical boundary")))
     (is (= :hardware-contraction-candidates (get-in operation [:schedule :strategy])))
     (is (some? (:artifact directly-routed)))
     (is (= [:register-tiled :portable] (mapv :family (:candidates candidate-routes))))

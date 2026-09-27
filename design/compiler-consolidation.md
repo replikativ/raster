@@ -112,6 +112,14 @@ with implemented optimization. Cache canonicalization of equivalent policy spell
 single captured target descriptor remain follow-ups. Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
+Both orchestration paths now use one typed contraction boundary validator before emission.
+It joins the equation identity and checks dtype, iteration space and physical input/output storage;
+the older router's private implementation and the weaker equation-first projection are removed.
+This boundary check is not a proof that an arbitrary modified reduction body is equivalent.
+ScheduledKernelBody and equation/graph certificates remain necessary for optimized schedules.
+The next optimized equation-first slice must preserve those certificates and explicit numerical
+policy rather than copying the descriptor route or silently enabling FP16/FMA changes.
+
 Equation-first execution reporting now observes actual fixed graph bindings through the public
 compiled API. It shares compact executable descriptions with descriptor admission reports and
 does not infer precision from the requested policy. Loop carry variants are reported once per
