@@ -73,6 +73,9 @@
   [device capability]
   (case capability
     :fp16 (contains? (extension-set device) "cl_khr_fp16")
+    :fp64 (let [extensions (extension-set device)]
+            (or (contains? extensions "cl_khr_fp64")
+                (contains? extensions "cl_amd_fp64")))
     ;; Tuned dispatch alternatives (subgroup score reuse, matrix leaves) are emitted for GPU
     ;; descriptors only; a CPU OpenCL device such as PoCL executes the portable kernels.
     :gpu-device (= :gpu (:type device))
@@ -97,6 +100,9 @@
 
 (def opencl-fp16-available?
   (delay (= :available (:status (opencl-status-for :fp16)))))
+
+(def opencl-fp64-available?
+  (delay (= :available (:status (opencl-status-for :fp64)))))
 
 (def opencl-gpu-available?
   (delay (= :available (:status (opencl-status-for :gpu-device)))))
@@ -128,7 +134,7 @@
 (defn opencl-skip!
   "Record one visible OpenCL skip marker, or fail when the runtime is broken/required.
 
-   `capability` is nil, :fp16, :gpu-device or :subgroups.  Missing optional capabilities remain honest skips;
+   `capability` is nil, :fp16, :fp64, :gpu-device or :subgroups. Missing optional capabilities remain honest skips;
    RASTER_EXPECT_OPENCL requires a usable device but does not imply every optional extension."
   ([test-label] (opencl-skip! test-label nil))
   ([test-label capability]

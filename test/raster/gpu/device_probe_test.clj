@@ -37,9 +37,14 @@
                      :selected-device-info (constantly selected)))]
     (is (= :available (:status result)))
     (is (= selected (:device result)))
+    (is (true? (probe/capability-supported? (:device result) :fp64)))
     (is (false? (probe/capability-supported? (:device result) :fp16))))
   (is (probe/capability-supported?
        {:extensions "cl_khr_fp64 cl_khr_fp16 cl_khr_subgroups"} :fp16)))
+
+(deftest fp64-gate-does-not-confuse-precision-capabilities
+  (is (probe/capability-supported? {:extensions "cl_amd_fp64"} :fp64))
+  (is (not (probe/capability-supported? {:extensions "cl_khr_fp16"} :fp64))))
 
 (defn- capture-skip
   [status expected?]

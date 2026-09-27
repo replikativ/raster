@@ -14,6 +14,7 @@
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as opencl]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.value :as value]
             [raster.quant.ggml :as ggml]
@@ -125,8 +126,11 @@
            (mapv #(Float/floatToRawIntBits %) y)))))
 
 (deftest q6-k-product-subgroup-executes-bit-identically-through-equation-first
-  (if-not @gp/gpu-available?
-    (gp/gpu-skip! "equation-first Q6_K subgroup product")
+  (doseq [[device available? skip!] [[:ze:0 gp/gpu-available? gp/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-subgroups-available?
+                                     #(opencl/opencl-skip! % :subgroups)]]]
+   (if-not @available?
+    (skip! (str "equation-first Q6_K subgroup product on " device))
     (let [in 256 out 3 nrows 2
           wfloats (values (* out in) 41 0.05)
           xfloats (values (* nrows in) 42 1.5)
@@ -148,7 +152,7 @@
                      output
                      (long in) (long out) (long nrows)]
           compilation (equation-first/compile #'gk/qdot-q6-K-rows!
-                                              {:target :ze:0 :dtype :float})
+                                              {:target device :dtype :float})
           plan (equation-first/lower compilation arguments)
           output-node (some (fn [[id node]]
                               (when (identical? output (:source node)) id))
@@ -159,11 +163,14 @@
         (gpu-link/run! live)
         (is (= expected
                (mapv #(Float/floatToRawIntBits %)
-                     (gpu-link/download live output-node))))))))
+                     (gpu-link/download live output-node)))))))))
 
 (deftest q4-k-product-subgroup-executes-bit-identically-through-public-compiled-artifact
-  (if-not @gp/gpu-available?
-    (gp/gpu-skip! "equation-first Q4_K subgroup product")
+  (doseq [[device available? skip!] [[:ze:0 gp/gpu-available? gp/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-subgroups-available?
+                                     #(opencl/opencl-skip! % :subgroups)]]]
+   (if-not @available?
+    (skip! (str "equation-first Q4_K subgroup product on " device))
     (let [in 256 out 3 nrows 2
           wfloats (values (* out in) 43 0.05)
           xfloats (values (* nrows in) 44 1.5)
@@ -187,7 +194,7 @@
                      (long in) (long out) (long nrows)]
           prepared (compiled/lower #'gk/qdot-q4-K-rows! arguments
                                    {:compiler :equation-first
-                                    :target :ze:0 :dtype :float
+                                    :target device :dtype :float
                                     :outputs '[y]})
           live (compiled/instantiate! prepared)]
       (try
@@ -198,7 +205,7 @@
                  (mapv #(Float/floatToRawIntBits %)
                        (value/->host (:y result))))))
         (finally
-          (compiled/close! live))))))
+          (compiled/close! live)))))))
 
 (deftest dot-kernels-match-the-generic-reference
   (if-not @gp/gpu-available?

@@ -1,7 +1,7 @@
 (ns raster.compiler.gpu-integration-test
   "Numerical and GPU-compiler ratchets for representative scientific/ML workloads.
 
-  These tests require a Level Zero GPU device. They skip gracefully
+  Device tests require Level Zero or their explicitly listed OpenCL capability. They skip visibly
   when no GPU is available (CI, CPU-only machines).
 
   Verifies:
@@ -16,6 +16,7 @@
             [raster.dl.attention :as attention]
             [raster.dl.nn :as nn]
             [raster.gpu.link :as gpu-link]
+            [raster.gpu.device-probe :as opencl]
             [raster.linalg.contract :as contract]
             [raster.ode.pde :as pde]))
 
@@ -100,12 +101,15 @@
                         label (double cpu-loss) analytical tol))))))))
 
 (deftest gpu-rk4-uses-the-public-equation-first-vertical-test
-  (let [n 64
+  (doseq [[device available? skip!] [[:ze:0 gp/gpu-available? gp/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-fp64-available?
+                                     #(opencl/opencl-skip! % :fp64)]]]
+   (let [n 64
         nsteps 3
         [u0 target alpha inv-dx2 dt] (setup-heat-problem n)
         arguments [u0 target alpha inv-dx2 dt nsteps]
         compilation (equation-first/compile
-                     #'pde/heat-loss-rk4 {:target :ze:0 :dtype :double})
+                     #'pde/heat-loss-rk4 {:target device :dtype :double})
         plan (equation-first/lower compilation arguments)]
     (testing "compilation and lowering are inspectable and allocate no driver resources"
       (is (equation-first/equation-first-compilation? compilation))
@@ -117,7 +121,8 @@
       (is (= 0 (get-in plan [:attributes :driver-allocations])))
       (is (= 1 (count (:outputs plan)))))
     (testing "the public LinkPlan executes the same numerical program on an available GPU"
-      (when-gpu "gpu-rk4-equation-first-execution"
+      (if-not @available?
+        (skip! (str "gpu-rk4-equation-first-execution on " device))
                 (let [expected (pde/heat-loss-rk4 (aclone u0) (aclone target)
                                                   alpha inv-dx2 dt nsteps)
                       executable (gpu-link/instantiate! plan)]
@@ -130,7 +135,7 @@
                       (is (< (Math/abs (- (double expected) actual)) 1.0e-10)
                           (format "CPU=%.15g GPU=%.15g" (double expected) actual)))
                     (finally
-                      (gpu-link/close! executable))))))))
+                      (gpu-link/close! executable)))))))))
 
 (deftest softmax-counted-initializers-execute-through-the-direct-vertical
   (when-gpu "softmax-counted-initializers"

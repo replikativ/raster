@@ -1,0 +1,43 @@
+{:kind :public-linear-schedule-diagnostic
+ :revision "5c0fbafbf0721ecd22d18cdad856540cc78da21f"
+ :environment "arc-local-consolidation-20260927-shared-laptop"
+ :device {:name "Intel(R) Arc(TM) Graphics" :id "0x64a0"
+          :opencl-version "OpenCL 3.0 NEO" :driver-build :not-recorded}
+ :shape [8 256 256] :shape-order [:rows :input-width :output-width]
+ :precision :mixed-f16-f32 :residency :constant-weights
+ :warmups 3 :rounds 8 :timing-source :device-event
+ :transfers-included? false :one-time-weight-prologue-included? false
+ :binding-included? false :promotion? false
+ :oracle :exact-host-binary16-rounded-dot-plus-f32-bias
+ :every-candidate-valid? true
+ :stationary? false
+ :samples-unit :nanoseconds
+ :samples
+ {:ze:0
+  {:portable-segred [103229.16666666667 103958.33333333334 122812.5 58229.16666666667
+                    121875.0 58958.333333333336 58645.833333333336 57916.66666666667]
+   :xmx-direct [32083.33333333334 37500.0 96250.0 28645.833333333336
+                97500.0 28645.833333333336 28645.833333333336 28645.833333333336]
+   :xmx-direct-dynamic-lhs [48333.333333333336 51041.66666666667 1356145.8333333335
+                            92708.33333333334 32604.16666666667 31979.166666666668
+                            33333.333333333336 31666.666666666668]
+   :xmx-direct-tile-inputs [242083.33333333334 241354.1666666667 275416.6666666667
+                           133645.83333333334 169062.5 134166.6666666667
+                           135416.6666666667 133541.6666666667]}
+  :ocl:0
+  {:portable-segred [53645.0 56041.0 64686.99999999999 54791.0 56979.0 57187.0 58333.0 57708.0]
+   :xmx-direct [344063.0 608853.0 549166.0 551666.0 519062.0 466561.0 505729.0 468020.0]
+   :xmx-direct-dynamic-lhs [35833.0 30416.0 23541.0 33437.0 30729.0 25625.0 32187.0 32187.0]
+   :xmx-direct-tile-inputs [143020.0 142500.0 127395.00000000001 149166.0
+                           143541.0 127187.0 149583.0 152395.0]}}
+ :materialized-profile-unit :milliseconds
+ :materialized-profile-columns [:device-wall-ms :kernel-total-ms]
+ :materialized-profiles
+ {:ze:0 [[0.03208333333333334 0.030833333333333338]
+         [0.0375 0.036041666666666666] [0.09625 0.09510416666666667]
+         [0.028645833333333336 0.027500000000000004] [0.0975 0.09635416666666669]
+         [0.028645833333333336 0.027500000000000004]
+         [0.028645833333333336 0.0275] [0.028645833333333336 0.0275]]
+  :ocl:0 [[0.344063 0.017499] [0.608853 0.025624] [0.549166 0.027603]
+          [0.551666 0.021145] [0.519062 0.024375] [0.466561 0.021145]
+          [0.505729 0.027708] [0.46802 0.024166]]}}

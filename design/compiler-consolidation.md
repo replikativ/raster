@@ -76,6 +76,10 @@ scope inconsistency before generalizing effect-loop result tuples; it adds no ne
 
 ## Working rhythm
 
+The current executed workload matrix and bounded projection diagnostic are recorded in
+[local compiler evidence](local-compiler-evidence.md). This separates exact/parity gates from
+nonstationary timing samples and from still-unexecuted native CUDA/HIP claims.
+
 Memory proof progress: straight-line equation-first replay order now joins real typed complete
 writes. An opt-in host-result-only execution scope realizes one full-allocation temporary pair
 and checks the selected order after rebinding. The four-layer OpenCL/Level Zero oracle saves
