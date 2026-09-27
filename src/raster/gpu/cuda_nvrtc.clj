@@ -69,13 +69,13 @@
                      "typedef signed char int8_t; typedef unsigned char uint8_t;\n"
                      "typedef short int16_t; typedef unsigned short uint16_t;\n"
                      "typedef int int32_t; typedef unsigned int uint32_t;\n"
-                     "typedef long long int64_t; typedef unsigned long long uint64_t;\n"
+                     "typedef long int64_t; typedef unsigned long uint64_t;\n"
                      "#endif\n")]
    ["math.h" "/* CUDA math declarations are supplied by cuda_runtime.h. */\n"]])
 
 (def virtual-header-version
   "Cache identity for Raster's NVRTC C-header adaptation."
-  1)
+  2)
 
 (defn- pointer-array
   ^MemorySegment [^Arena arena strings]
@@ -134,7 +134,7 @@
 (defn compile-ptx
   "Compile generated CUDA C++ source for a virtual architecture such as `compute_80`.
    Returns PTX bytes and the compiler log. A real device is not needed.
-   `:include-paths` are explicit host/toolkit directories, not inferred from a
+   `:include-paths` are explicit CUDA toolkit header directories, not inferred from a
    device descriptor; they participate in the caller's compilation cache key."
   [source kernel-name virtual-architecture & {:keys [include-paths] :or {include-paths []}}]
   (when-not (and (string? source) (not (empty? source))
