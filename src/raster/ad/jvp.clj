@@ -15,12 +15,8 @@
   decomposition; jvp only consumes reverse's shared pieces (ad-prepare,
   resolve-deftm-var, grad-acc as the ⊕ kernel).
 
-  Not yet supported (fail loud, forward loop rules are follow-up work):
-  par/map!, par/reduce, par/scan, dotimes, loop — the differentiable loop
-  forms have reverse orchestrators but no forward fold yet. (par/scan's JVP
-  is itself a scan over the linearized recurrence — δout[i] = ∂body/∂acc ·
-  δacc_{i-1} ⊕ Σ ∂body/∂free · δfree — a natural follow-up once the SOAC
-  forward-fold family lands as a group.)"
+  A double-carry par/scan has a forward rule: a second scan over its
+  linearized recurrence. Other loop/SOAC forms still fail loud when active."
   (:require [raster.ad.reverse :as rev]
             [raster.ad.templates :as tmpl]
             [raster.ad.tangent :as tangent]
@@ -143,13 +139,62 @@
                 {:op op :canonical canonical :sym sym
                  :active-args (filterv identity tangent-args)}))))))
 
+(declare jvp-fold)
+
+(defn- fold-double-scan
+  "Linearize an inclusive double scan using its output as the primal carry
+  tape. The tangent is another ordered scan; at step i, the prior primal
+  carry is init (i=0) or primal-out[i-1]. Narrowing casts require a separate
+  unrounded carry tape and are deliberately not reconstructed this way."
+  [tenv sym scan-form tag]
+  (let [[_ out acc init idx bound cast body] scan-form]
+    (when-not (and (or (contains? '#{double clojure.core/double} cast)
+                       (and (nil? cast)
+                            (= 'double (:raster.type/tag (meta acc)))))
+                   (contains? '#{doubles (Array double)}
+                              (:raster.type/tag (meta out))))
+      (throw (ex-info "jvp: scan carry reconstruction requires double storage and cast"
+                      {:reason :jvp-scan-carry-precision
+                       :cast cast :out-tag (:raster.type/tag (meta out))
+                       :form scan-form})))
+    (when (and (seq? init) (any-active? tenv init))
+      (throw (ex-info "jvp: active scan init must be bound before the scan"
+                      {:reason :jvp-scan-active-init :init init})))
+    (let [dout (jvp-gensym (str "d_" (name sym) "_out") tag)
+          dacc (jvp-gensym (str "d_" (name acc) "_carry") 'double)
+          step (jvp-gensym "scan_step" 'double)
+          [body-bindings body-exprs] (extract-let-parts body)
+          body-result (if (= 1 (count body-exprs))
+                        (first body-exprs)
+                        (cons 'do body-exprs))
+          [step-bindings step-result]
+          (anf/normalize-for-ad
+           (vec (concat body-bindings [step body-result]))
+           [step] jvp-gensym)
+          {:keys [bindings] step-tenv :tenv}
+          (jvp-fold step-bindings (assoc tenv acc dacc))
+          dstep (or (get step-tenv step-result)
+                    (branch-tangent-zero step-result))
+          prior (list 'if (list 'clojure.core/zero? idx)
+                      init
+                      (list 'clojure.core/aget sym
+                            (list 'clojure.core/dec idx)))
+          step-body (list 'let* (vec (concat [acc prior] bindings)) dstep)
+          dinit (if (symbol? init) (or (get tenv init) 0.0) 0.0)
+          alloc (list 'raster.arrays/zeros-like sym
+                      (list 'raster.arrays/alength sym))
+          scan (list 'raster.par/scan dout dacc dinit idx bound cast step-body)
+          result (jvp-gensym (str "d_" (name sym)) tag)]
+      [result [dout alloc result scan]])))
+
 (defn- jvp-fold
   "A2: ONE pure reduce over the normalized ANF bindings threading
   {:tenv (tangent env, sym → tangent-sym), :bindings (flat primal+tangent)}.
   Per binding: inactive → passthrough; alias → tangent alias; templated call
   → paired tangent bindings via the op's (derived) :jvp-fn; templated-but-no-
   jvp-fn or un-templated-active → FAIL LOUD; `if` → branch-selected tangent
-  with a typed zero for the inactive branch; loops/par forms → FAIL LOUD."
+  with a typed zero for the inactive branch; double scans → a tangent scan;
+  other loops/par forms → FAIL LOUD."
   [norm-bindings param-tangents]
   (reduce
    (fn [{:keys [tenv bindings]} [sym init]]
@@ -182,7 +227,28 @@
                                    (or t-else (branch-tangent-zero else)))]))
                  (done tenv [])))
 
-             ;; loops / par forms / other control flow: no forward rules yet
+             ;; A scan's output carries the prior primal states. Use it as
+             ;; the tape for a second scan over the linearized recurrence.
+             (= 'raster.par/scan head)
+             (let [[_ out acc scan-init idx _bound _cast body] init
+                   free-tenv (dissoc tenv acc idx)
+                   active? (or (and (symbol? scan-init)
+                                    (contains? free-tenv scan-init))
+                               (and (seq? scan-init)
+                                    (any-active? free-tenv scan-init))
+                               (any-active? free-tenv body))]
+               (cond
+                 (contains? free-tenv out)
+                 (throw (ex-info "jvp: scan mutates an active input buffer"
+                                 {:reason :jvp-scan-active-output :out out}))
+
+                 active?
+                 (let [[dscan extra] (fold-double-scan tenv sym init tag)]
+                   (done (assoc tenv sym dscan) extra))
+
+                 :else (done tenv [])))
+
+             ;; Remaining control flow has no forward rule yet.
              (contains? unsupported-forward-heads head)
              (if (any-active? tenv init)
                (throw (ex-info

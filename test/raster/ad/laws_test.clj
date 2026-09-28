@@ -1247,6 +1247,19 @@
                       (n/+ (n/* w acc) (n/+ xc (n/* 0.1 xp)))))]
     (ra/aget h (dec sn))))
 
+;; A float output rounds the carry at every step. The double-scan JVP's
+;; output-as-tape rule must not infer the unrounded carry from this buffer.
+(deftm laws-scan-float-carry [w :- Double, x :- (Array float), sn :- Long] :- Float
+  (let [out (float-array sn)
+        h (par/scan out acc 0.0 i sn float
+                    (n/+ (n/* w acc) (ra/aget x i)))]
+    (ra/aget h (dec sn))))
+
+(deftm laws-scan-inactive [w :- Double, sn :- Long] :- Double
+  (let [out (float-array sn)
+        h (par/scan out acc 0.0 i sn float (n/+ acc 1.0))]
+    (n/+ w (double (ra/aget h (dec sn))))))
+
 (defn- fd-wrt-slot
   "Central FD of scalar-valued f in one array slot k."
   ^double [f ^doubles x k]
@@ -1314,12 +1327,59 @@
            clojure.lang.ExceptionInfo #"par/scan"
            (rev/value+grad #'laws-loop-fn))))
 
-    (testing "forward mode (jvp) on scan fails LOUD — no forward SOAC fold yet"
-      ;; When the scan jvp lands (a second scan over the linearized
-      ;; recurrence), FLIP this to a jvp-vs-directional-FD law.
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"raster\.par/scan"
-           ((jvp/jvp #'laws-scan-lin) [w h0 x sn] [1.0 0.0 (double-array sn) nil]))))))
+    (testing "forward scan JVP agrees with a mixed scalar/array directional FD"
+      (let [dw 0.7 dh0 -0.2
+            dx (double-array [0.2 -0.1 0.3 -0.4])
+            eps 1e-6
+            perturb (fn [scale]
+                      (double-array (map + x (map #(* scale %) dx))))
+            [v dv] ((jvp/jvp #'laws-scan-lin) w h0 x sn dw dh0 dx)
+            fd (/ (- (laws-scan-lin (+ w (* eps dw)) (+ h0 (* eps dh0))
+                                    (perturb eps) sn)
+                     (laws-scan-lin (- w (* eps dw)) (- h0 (* eps dh0))
+                                    (perturb (- eps)) sn))
+                  (* 2.0 eps))]
+        (is (close? v (laws-scan-lin w h0 x sn) tol-double))
+        (is (close? dv fd tol-double))))
+
+    (testing "nonlinear and shifted-read scan JVPs retain their local scope"
+      (let [dw 0.7
+            dx (double-array [0.2 -0.1 0.3 -0.4])
+            eps 1e-6
+            perturb (fn [scale]
+                      (double-array (map + x (map #(* scale %) dx))))]
+        (doseq [f [#'laws-scan-tanh #'laws-scan-shift]]
+          (let [[v dv] ((jvp/jvp f) w x sn dw dx)
+                fd (/ (- (f (+ w (* eps dw)) (perturb eps) sn)
+                         (f (- w (* eps dw)) (perturb (- eps)) sn))
+                      (* 2.0 eps))]
+            (is (close? v (f w x sn) tol-double))
+            (is (close? dv fd tol-double) (str "JVP of " (-> f meta :name)))))))
+
+    (testing "scan JVP composes with MSE on all output cells"
+      (let [tgt (double-array [0.1 -0.2 0.3 0.2])
+            dx (double-array [0.2 -0.1 0.3 -0.4])
+            dw 0.7 eps 1e-6
+            perturb (fn [scale]
+                      (double-array (map + x (map #(* scale %) dx))))
+            [_ dv] ((jvp/jvp #'laws-scan-mse)
+                    ;; MSE's current AD template freezes the target input.
+                    w x tgt sn dw dx (double-array sn))
+            fd (/ (- (laws-scan-mse (+ w (* eps dw)) (perturb eps) tgt sn)
+                     (laws-scan-mse (- w (* eps dw)) (perturb (- eps)) tgt sn))
+                  (* 2.0 eps))]
+        (is (close? dv fd tol-double))))
+
+    (testing "narrowing scan carry declines rather than using a rounded tape"
+      (is (= :jvp-scan-carry-precision
+             (:reason (ex-data
+                       (try (jvp/jvp #'laws-scan-float-carry)
+                            (catch clojure.lang.ExceptionInfo e e)))))))
+
+    (testing "an inactive float scan does not block an independent tangent"
+      (let [[v dv] ((jvp/jvp #'laws-scan-inactive) 2.0 sn 0.3)]
+        (is (close? v (laws-scan-inactive 2.0 sn) tol-double))
+        (is (== 0.3 dv))))))
 
 ;; ================================================================
 ;; Corpus — O10 loop canonicalization (framework §15.2)
@@ -1475,6 +1535,16 @@
         (dotimes [k sn]
           (is (== (ra/aget dx1 k) (ra/aget dx2 k))
               (str "δx_" k " commutes exactly")))))
+
+    (testing "loop-to-scan canonicalization commutes with the forward rule"
+      (let [dx (double-array [0.2 -0.1 0.3 -0.4])
+            direction [0.7 -0.2 dx]
+            [loop-v loop-d] (apply (jvp/jvp #'laws-o10-rnn-loop)
+                                   w h0 x sn direction)
+            [scan-v scan-d] (apply (jvp/jvp #'laws-scan-lin)
+                                   w h0 x sn direction)]
+        (is (== loop-v scan-v))
+        (is (== loop-d scan-d))))
 
     (testing "pure-carry loop (no store) differentiates — was fail-loud"
       (let [x0 0.5 wc 0.8 cn 6
