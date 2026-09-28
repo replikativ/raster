@@ -477,8 +477,11 @@ independent of AD.
   (§3); compose transparently or use `reified-grad`.
 - **Skipped frules** (documented A3 skips — reverse works, forward fails loud
   naming the op): `solve`, `einsum`, `maxpool2d` (needs a gather-at-argmax kernel),
-  `array-det`, effectful `dgemm!`. `par/scan` forward mode also fails loud (a
-  forward SOAC fold is not landed).
+  `array-det`, effectful `dgemm!`. Forward mode now handles double-carry
+  `par/scan` and loop-to-scan recurrences using the output as its carry tape;
+  narrowing float carries still decline until an unrounded residual is
+  represented. HVP through loop pullback closures remains guarded rather than
+  silently returning an incorrect zero.
 - **Kinks** — differentiation through `if` and through activation kinks (relu) is
   correct almost-everywhere; there is no oracle *at* a nondifferentiable point, so
   the laws sample away from kinks.
