@@ -228,6 +228,13 @@ one ordered loop, evaluating each step once. This covers parameterized initial
 states and zero-trip reductions without a tape; non-double carries still
 decline until their precision contract is represented.
 
+For nonescaping `defvalue` locals, AD preparation now uses the same generic
+field projection as the SoA lowering: a constructed distribution such as
+`(->Normal mu sigma)` can be inlined into `logpdf` and differentiated with
+respect to its numeric fields, without a distribution-specific constructor
+rule. Value objects that escape projection remain values; this pass does not
+claim a general product tangent for them.
+
 Tail-accumulation loops lift to `par/reduce`:
 
 ```clojure

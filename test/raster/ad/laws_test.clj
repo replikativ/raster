@@ -1562,6 +1562,38 @@
                            x :- Double] :- Double
   (dist/logpdf d x))
 
+(deftm laws-normal-constructed [mu :- Double, sigma :- Double, x :- Double]
+  :- Double
+  (dist/logpdf (dist/->Normal mu sigma) x))
+
+(deftest constructed-normal-parameters-have-log-density-gradients
+  (let [mu 0.3 sigma 1.2 x 1.0
+        [value dmu dsigma dx]
+        ((rev/value+grad #'laws-normal-constructed) mu sigma x)
+        delta (- x mu)
+        [jv jmu] ((jvp/jvp #'laws-normal-constructed)
+                  mu sigma x 1.0 0.0 0.0)
+        [vv pullback] (rev/vjp #'laws-normal-constructed mu sigma x)
+        [hvp-grad hvp-col] ((jvp/hvp #'laws-normal-constructed)
+                            mu sigma x 1.0 0.0 0.0)]
+    (is (close? value (dist/logpdf (dist/->Normal mu sigma) x) 1e-12))
+    (is (close? dmu (/ delta (* sigma sigma)) 1e-10))
+    (is (close? dsigma (+ (- (/ 1.0 sigma))
+                          (/ (* delta delta) (* sigma sigma sigma))) 1e-10))
+    (is (close? dx (- (/ delta (* sigma sigma))) 1e-10))
+    (is (close? jv value 1e-12))
+    (is (close? jmu dmu 1e-10))
+    (is (close? vv value 1e-12))
+    (is (every? true? (map #(close? %1 %2 1e-10)
+                           (pullback 1.0) [dmu dsigma dx])))
+    (is (every? true? (map #(close? %1 %2 1e-10)
+                           hvp-grad [dmu dsigma dx])))
+    (is (every? true? (map #(close? %1 %2 1e-9)
+                           hvp-col [(- (/ 1.0 (* sigma sigma)))
+                                    (- (/ (* 2.0 delta)
+                                          (* sigma sigma sigma)))
+                                    (/ 1.0 (* sigma sigma))])))))
+
 (deftest normal-log-density-differentiates-through-variadic-arithmetic
   (let [d (dist/->Normal 0.3 1.2)
         x 1.0

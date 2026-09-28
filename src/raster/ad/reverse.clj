@@ -33,6 +33,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -2718,6 +2719,8 @@
   ;; a caller already holding a closure may continue to use that snapshot.
   (atom {:registry-revision nil :entries {}}))
 
+(declare ad-prepare)
+
 (defn- get-vjp-fn
   "Get or compile the AD-transformed function for a deftm var.
   Cached by [template-registry revision, var-identity, walked-body] to avoid
@@ -2749,7 +2752,11 @@
                                        (fn [i p]
                                          (when (differentiable-tag? (nth tags i nil)) p))
                                        all-params))
-              transformed (transform-body (first walked-body) diff-active-params)
+              transformed (with-ad-gensym
+                            (transform-body
+                             (ad-prepare (first walked-body)
+                                         (zipmap all-params tags))
+                             diff-active-params))
               ;; transformed is (let* bindings [primal pullback-fn])
               ;; The pullback returns gradients for diff-active-params only;
               ;; wrap it so it returns gradients aligned with all-params (nil
@@ -3085,7 +3092,8 @@
   (`raster.ad.jvp/jvp`):
 
     anf-wrap-bare-body → lower-composites (inline un-templated composites to
-    a fixpoint) → lift-parallel-forms (loop → SOAC canonicalization, §15.2)
+    a fixpoint) → project nonescaping value constructors →
+    lift-parallel-forms (loop → SOAC canonicalization, §15.2)
     → canonicalize-carry-loops (AD-only carry → scan materializer) →
     materialize-pass (pure par/map → alloc + par/map!) →
     hoist-nested-lets (flat ANF).
@@ -3095,12 +3103,15 @@
   the pipeline's :loop-lift pass runs too late (post-fixpoint) for AD and
   never on the runtime path, so ad-prepare runs the same pure form→form fn
   here. Loops the gates decline are left untouched for the existing paths."
-  [body]
-  (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
+  ([body] (ad-prepare body nil))
+  ([body param-env]
+   (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
         ;; and multi-level composites fully lower before AD (lower-composites
         ;; runs anf-wrap-bare-body itself).
-        lowered (-> body binaryize-core-arithmetic lower-composites
-                    binaryize-core-arithmetic inline-qualified-constants)
+        lowered (binding [inline/*param-env* param-env]
+                  (-> body binaryize-core-arithmetic lower-composites
+                      binaryize-core-arithmetic inline-qualified-constants))
+        lowered (soa-lower/lower-local-constructors lowered)
         ;; §15.2 (1): recover SOAC structure from raw loop syntax — dotimes →
         ;; par/map!, tail-accumulation → par/reduce, carry+aset → par/scan —
         ;; with the lift's proven-soundness gates (stats are discarded here;
@@ -3113,7 +3124,7 @@
         ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
         materialized (:form (materialize/materialize-pass canonical nil))]
     ;; Hoist nested lets out of call args into flat ANF for AD.
-    (hoist-nested-lets materialized)))
+     (hoist-nested-lets materialized))))
 
 (defn grad-expr
   "Transform a quoted S-expression for reverse-mode AD.
@@ -3134,7 +3145,12 @@
   ;; RESETS *gensym-counter* to 0 and can re-mint colliding anf__ temps across
   ;; the phase boundary → silent gradient miscompile.
   (with-ad-gensym
-    (transform-body (ad-prepare form) (vec active-params))))
+    (transform-body
+     (ad-prepare form (into {} (keep (fn [p]
+                                      (when-let [tag (:raster.type/tag (meta p))]
+                                        [p tag])))
+                            active-params))
+     (vec active-params))))
 
 (defn numerical-gradient
   "Compute gradient by finite differences (for testing).
@@ -3354,7 +3370,9 @@
         ;; this shared counter is now belt-and-braces rather than load-bearing for that reason.)
         {:keys [fwd-bindings result-sym body-sym pullback-form]}
         (call-with-shared-ad-gensym
-         (fn [] (reify-pullback (ad-prepare (first walked-body)) diff-params)))
+         (fn [] (reify-pullback
+                 (ad-prepare (first walked-body) (zipmap all-params tags))
+                 diff-params)))
         [_ rev-bindings grad-slots] pullback-form
         grad-slot (nth (vec grad-slots) slot-idx)
         c-sym (when array-param?
@@ -3881,7 +3899,8 @@
                   (if (some #{'floats 'float} tags) :float :double))
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
-          hoisted (ad-prepare (first walked-body))
+          hoisted (ad-prepare (first walked-body)
+                              (zipmap all-params tags))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
           ad-form (transform-body hoisted diff-active-params)

@@ -6,6 +6,7 @@
             [raster.core :refer [deftm defvalue]]
             [raster.numeric]
             [raster.arrays]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.passes.scalar.soa-lower :as sl])
   (:import [com.dylibso.chicory.wasm Parser]
@@ -14,6 +15,35 @@
 (defvalue Cplx [re :- Double, im :- Double])
 
 (defvalue ArrayBundle [positions :- (Array float), labels :- (Array int)])
+
+(deftest value-factories-retain-their-result-tag
+  (is (= 'Cplx (:raster.core/return-tag (meta #'->Cplx))))
+  (is (= 'Cplx
+         (inference/infer-arg-tag
+          '(raster.compiler.passes.scalar.soa-lower-test/->Cplx a b)
+          {'a 'double 'b 'double}))))
+
+(deftest local-constructor-projection-is-escape-aware
+  (let [projected '(let* [a 1.0 b 2.0 p (->Cplx a b)]
+                     (clojure.core/+ (.re p) (.im p)))
+        escaping '(let* [a 1.0 b 2.0 p (->Cplx a b)] p)
+        effectful '(let* [b 2.0 p (->Cplx (println "effect") b)] (.re p))
+        shadowed '(let* [a 1.0 p (->Cplx a a)]
+                    (let* [p 3.0] (clojure.core/+ p 1.0)))
+        quoted '(let* [a 1.0 p (->Cplx a a)]
+                  (clojure.core/list (.re p) (quote p)))
+        nested-fn '(let* [a 1.0 p (->Cplx a a)]
+                     (fn* [p] (clojure.core/+ p 1.0)))]
+    (is (= '(let* [a 1.0 b 2.0] (clojure.core/+ a b))
+           (sl/lower-local-constructors projected)))
+    (is (= escaping (sl/lower-local-constructors escaping)))
+    (is (= effectful (sl/lower-local-constructors effectful)))
+    (is (= '(let* [a 1.0] (let* [p 3.0] (clojure.core/+ p 1.0)))
+           (sl/lower-local-constructors shadowed)))
+    (is (= '(let* [a 1.0]
+              (clojure.core/list a (quote p)))
+           (sl/lower-local-constructors quoted)))
+    (is (= nested-fn (sl/lower-local-constructors nested-fn)))))
 
 (deftm cadd-soa! [as :- CplxSoA, bs :- CplxSoA, os :- CplxSoA, n :- Long] :- nil
   (dotimes [i n]

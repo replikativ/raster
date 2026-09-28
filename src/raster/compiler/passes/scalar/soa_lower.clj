@@ -141,7 +141,8 @@
   [ctx sym]
   (when (symbol? sym)
     (or (get (:soa ctx) (symbol (name sym)))
-        (when-let [scalar (get @types/soa-reverse-registry (:tag (meta sym)))]
+        (when-let [scalar (when-not (:local-only? ctx)
+                           (get @types/soa-reverse-registry (:tag (meta sym))))]
           {:scalar-tag scalar :fields (:fields (get @types/soa-registry scalar))}))))
 
 (defn- relist
@@ -181,10 +182,13 @@
   "Scalar-replace SoA/value-type access. ctx threads SoA params + exploded locals."
   [ctx form]
   (cond
+    ;; Quoted data is not an expression and must not see projected locals.
+    (and (seq? form) (= 'quote (first form))) form
+
     ;; bare exploded local reaching a non-projection position → escape (unsupported v1)
     (and (symbol? form) (contains? (:exploded ctx) form))
     (throw (ex-info (str "value-type local escapes (used non-projectively): " form)
-                    {:sym form}))
+                    {:reason :value-type-local-escape :sym form}))
 
     ;; (.field x) where x explodes → the field expr
     (and (seq? form) (field-access-head? (first form)))
@@ -198,9 +202,14 @@
     (and (seq? form) (= 'let* (first form)))
     (let [[_ binds & body] form
           [ctx' out] (reduce (fn [[c bs] [s e]]
-                               (if-let [ex (explode c e)]
+                             (if-let [ex (explode c e)]
                                  [(assoc-in c [:exploded s] ex) bs]   ; virtual: drop binding
-                                 [c (conj bs s (lower c e))]))
+                                 (let [e' (lower c e)]
+                                   ;; A later or nested binding can shadow an exploded
+                                   ;; local. Its initializer sees the old scope; its body
+                                   ;; must see the new, ordinary local.
+                                   [(update c :exploded dissoc s)
+                                    (conj bs s e')])))
                              [ctx []] (partition 2 binds))]
       (apply list 'let* (vec out) (map #(lower ctx' %) body)))
 
@@ -235,7 +244,8 @@
 
     ;; a value-type value reaching a generic (non-consuming) position → escape
     (and (seq? form) (explode ctx form))
-    (throw (ex-info "value-type value in a non-consuming position (escapes)" {:form form}))
+    (throw (ex-info "value-type value in a non-consuming position (escapes)"
+                    {:reason :value-type-local-escape :form form}))
 
     (seq? form) (relist form (map #(lower ctx %) form))
     (vector? form) (mapv #(lower ctx %) form)
@@ -256,6 +266,29 @@
                                                     (:fields info)))])
                                soa-env))]
     (lower {:soa soa-env :exploded exploded} body)))
+
+(defn lower-local-constructors
+  "Project nonescaping defvalue constructor locals onto their scalar fields.
+   Intended after ANF: every constructor argument must already be a value, so
+   removing the allocation cannot drop or reorder argument effects. A value
+   that escapes a field projection leaves the original form untouched; its
+   caller may still handle it as a value or reject active AD explicitly."
+  [body]
+  (let [forms (tree-seq coll? seq body)
+        ctors (filter #(and (seq? %) (constructor->scalar-tag (first %))) forms)
+        ;; The shared projector currently models let* scopes, not fn-parameter
+        ;; binding scopes. Do not run this optional AD simplification through a
+        ;; nested function until that binding rule is represented explicitly.
+        nested-fn? (some #(and (seq? %) (#{'fn 'fn* 'clojure.core/fn} (first %))) forms)]
+    (if (and (seq ctors) (not nested-fn?)
+             (every? (fn [ctor] (every? #(not (coll? %)) (rest ctor))) ctors))
+      (try
+        (lower {:soa {} :exploded {} :local-only? true} body)
+        (catch clojure.lang.ExceptionInfo e
+          (if (= :value-type-local-escape (:reason (ex-data e)))
+            body
+            (throw e))))
+      body)))
 
 (defn soa-lower
   "Expand SoA/array-bundle params and scalar-replace value-type access.
