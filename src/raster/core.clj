@@ -1245,6 +1245,8 @@
                        (let [~@(mapcat (fn [p i] [p (list 'nth args-sym i)])
                                        factory-params (range))]
                          (new ~name ~@factory-params)))))
+               (alter-meta! (var ~factory-sym) assoc
+                            :raster.core/return-tag '~name)
                (try (dispatch/register-tc-ann!
                      '~(ns-name *ns*)
                      '~(symbol (str (ns-name *ns*)) (str factory-sym))
@@ -1292,6 +1294,8 @@
                  (and (instance? ~name ~'other)
                       ~@(map (fn [p] `(clojure.core/= ~p (. ~'other ~(symbol (str "-" (clojure.core/name p)))))) params)))
                (~'hashCode [~'_] (clojure.core/hash [~@params])))
+             (alter-meta! (var ~factory-sym) assoc
+                          :raster.core/return-tag '~name)
              (defmethod print-method ~name [~'v ~'w]
                (.write ^java.io.Writer ~'w
                        (str "#" '~name

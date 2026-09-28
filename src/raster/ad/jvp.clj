@@ -422,7 +422,8 @@
                                  " — every param tag is ⊥ (no tangent space)")
                             {:var f-var :tags tags})))
         ;; Shared pre-AD prep (identical to the reverse path).
-        prepared (rev/ad-prepare (first walked-body))
+        prepared (rev/ad-prepare (first walked-body)
+                                 (zipmap all-params tags))
         [bindings body-exprs] (extract-let-parts prepared)
         [norm-bindings body-sym] (anf/normalize-for-ad bindings body-exprs jvp-gensym)
         ;; Tangent params: one per differentiable param, tagged like its primal.
@@ -505,7 +506,10 @@
         ;; 0 and re-minting colliding anf__ temps across the phase boundary.
         {:keys [fwd-bindings result-sym body-sym pullback-form]}
         (rev/call-with-shared-ad-gensym
-         (fn [] (rev/reify-pullback (rev/ad-prepare (first walked-body)) diff-params)))
+         (fn [] (rev/reify-pullback
+                 (rev/ad-prepare (first walked-body)
+                                 (zipmap all-params tags))
+                 diff-params)))
         [_ rev-bindings grad-vec] pullback-form
         grad-slots (vec grad-vec)
         ;; ANF-normalize: the reverse engine's grad-acc chains nest calls in

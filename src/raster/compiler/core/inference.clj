@@ -2110,15 +2110,16 @@ stable physical-leaf order on every backend."}
             (and (symbol? head) (namespace head))
             (try
               (when-let [v (resolve head)]
-                (when-let [dt-atom (:raster.core/dispatch-table (meta v))]
-                  (let [arg-tags (mapv #(infer-arg-tag % env) (rest expr))
-                        entries (get @dt-atom (count (rest expr)))]
-                    (when (and (every? some? arg-tags) (seq entries))
-                      (when-let [match (first (filter #(= (vec arg-tags) (vec (:tags %))) entries))]
-                        (let [mn (str (types/mangle (symbol (name head)) (:tags match)))
-                              ms (symbol (str (:mangled-ns match)) mn)]
-                          (when-let [mv (resolve ms)]
-                            (or (:raster.core/return-tag (meta mv))
-                                (:tag (meta mv))))))))))
+                (or (:raster.core/return-tag (meta v))
+                    (when-let [dt-atom (:raster.core/dispatch-table (meta v))]
+                      (let [arg-tags (mapv #(infer-arg-tag % env) (rest expr))
+                            entries (get @dt-atom (count (rest expr)))]
+                        (when (and (every? some? arg-tags) (seq entries))
+                          (when-let [match (first (filter #(= (vec arg-tags) (vec (:tags %))) entries))]
+                            (let [mn (str (types/mangle (symbol (name head)) (:tags match)))
+                                  ms (symbol (str (:mangled-ns match)) mn)]
+                              (when-let [mv (resolve ms)]
+                                (or (:raster.core/return-tag (meta mv))
+                                    (:tag (meta mv)))))))))))
               (catch Exception _ nil))
             :else nil)))))
