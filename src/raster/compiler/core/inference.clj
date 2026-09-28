@@ -1958,7 +1958,10 @@ stable physical-leaf order on every backend."}
         (:tag (meta expr))
         (let [head (first expr)]
           (cond
-            (contains? #{'double 'float 'long 'int 'byte 'short 'char 'boolean} head) head
+            (and (not (contains? env head))
+                 (descriptor/cast-result-tag head))
+            (descriptor/cast-result-tag head)
+            (contains? #{'short 'char 'boolean} head) head
             ;; par/reduce needs no arm here — the :result-type facet arm below
             ;; types it ([:arg 1], the init accumulator; see op-descriptor).
             ;; par/scan stays inline: it returns its OUT array (arg 0) looked up

@@ -247,10 +247,12 @@ field projection as the SoA lowering: a constructed distribution such as
 respect to its numeric fields, without a distribution-specific constructor
 rule. Value objects that escape projection remain values; this pass does not
 claim a general product tangent for them.
-The same preparation also inlines constructor-bearing bodies after a source
-loop becomes a structured `par/scan` or `par/reduce`. It preserves the SOAC's
-accumulator/index scope, then projects the fields. Ordinary recurrence bodies
-pass through unchanged; data-dependent loops gain no new AD rule.
+The same preparation also inlines constructor-bearing reduction initializers
+and bodies, including those of source loops that become `par/reduce`. It keeps
+the initializer in the enclosing scope and the body in the accumulator/index
+scope, then projects the fields. Active initializer gradients flow into the
+initial carry. Ordinary recurrence bodies pass through unchanged;
+data-dependent loops gain no new AD rule.
 
 Tail-accumulation loops lift to `par/reduce`:
 

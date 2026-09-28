@@ -2861,8 +2861,9 @@
             :else (recur relifted (inc i))))))))
 
 (defn- lower-recurrence-bodies
-  "Inline constructor-bearing code inside a structured scan or reduction.
-  Rebuild through the shared scope descriptor so no binding escapes it."
+  "Inline constructor-bearing code inside a structured scan or reduction,
+  including its initial value in the enclosing scope. Rebuild through the
+  shared scope descriptor so no binding escapes it."
   [body]
   (letfn [(step [expr]
             (cond
@@ -2879,7 +2880,12 @@
                                      (lower-composites inner)
                                      inner)))
                                inner-exprs)
-                         (mapv step outer-exprs)))
+                         (mapv (fn [outer]
+                                 (let [outer (step outer)]
+                                   (if (soa-lower/contains-local-constructor? outer)
+                                     (lower-composites outer)
+                                     outer)))
+                               outer-exprs)))
               (seq? expr) (with-meta (apply list (map step expr)) (meta expr))
               (vector? expr) (mapv step expr)
               :else expr))]
@@ -3112,11 +3118,12 @@
   (`build-grad-walked-body`, `grad-expr`) AND the forward/JVP path
   (`raster.ad.jvp/jvp`):
 
+    project constructor-bearing source scan/reduce scopes →
     anf-wrap-bare-body → lower-composites (inline un-templated composites to
     a fixpoint) → project nonescaping value constructors →
     lift-parallel-forms (loop → SOAC canonicalization, §15.2)
     → canonicalize-carry-loops (AD-only carry → scan materializer) →
-    inline constructor-bearing scan/reduce bodies → project their fields →
+    inline constructor-bearing scan/reduce bodies and initializers → project their fields →
     materialize-pass (pure par/map → alloc + par/map!) →
     hoist-nested-lets (flat ANF).
 
@@ -3127,11 +3134,17 @@
   here. Loops the gates decline are left untouched for the existing paths."
   ([body] (ad-prepare body nil))
   ([body param-env]
-   (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
+   (let [;; A source-written reduction must project its initializer and step
+        ;; before broad ANF is allowed to move either across the binder.
+        source-scoped (binding [inline/*param-env* param-env]
+                        (-> body lower-recurrence-bodies
+                            binaryize-core-arithmetic inline-qualified-constants
+                            soa-lower/lower-local-constructors))
+        ;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
         ;; and multi-level composites fully lower before AD (lower-composites
         ;; runs anf-wrap-bare-body itself).
         lowered (binding [inline/*param-env* param-env]
-                  (-> body binaryize-core-arithmetic lower-composites
+                  (-> source-scoped binaryize-core-arithmetic lower-composites
                       binaryize-core-arithmetic inline-qualified-constants))
         lowered (soa-lower/lower-local-constructors lowered)
         ;; §15.2 (1): recover SOAC structure from raw loop syntax — dotimes →
@@ -3694,6 +3707,23 @@
           (apply list let-sym (into flat-bindings (vec inner-binds)) inner-body))
         (apply list let-sym flat-bindings hoisted-body)))
 
+    ;; A reduction initializer is evaluated in the enclosing scope, after
+    ;; its bound and before the first step. AD needs an active compound init
+    ;; as an ordinary let binding so its pullback flows into the initial
+    ;; accumulator. The reduction body remains inside its own acc/index scope.
+    (par-ir/par-reduce-form? form)
+    (let [[head acc init idx bound body] form
+          init' (hoist-nested-lets init)
+          bound' (hoist-nested-lets bound)
+          body' (hoist-nested-lets body)]
+      (if (seq? init')
+        (let [bound-sym (gensym "reduce_bound__")
+              init-sym (gensym "reduce_init__")
+              reduction (with-meta (list head acc init-sym idx bound-sym body') (meta form))]
+          (hoist-nested-lets
+           (list 'let* [bound-sym bound' init-sym init'] reduction)))
+        (with-meta (list head acc init' idx bound' body') (meta form))))
+
     ;; Scope-introducing forms — recurse but don't hoist across scope boundaries.
     ;; This includes every par/* SOAC (form/introduces-scope?): their bodies
     ;; close over the loop index/accumulator, so splicing a body let* out into
@@ -3923,10 +3953,16 @@
                   float  :float
                   double :double
                   (if (some #{'floats 'float} tags) :float :double))
+        ;; Entry bodies can still use source-ns aliases (e.g. dist/->Normal).
+        ;; Qualify before inference/inlining: infer-arg-tag recognizes the
+        ;; registered constructor by its canonical symbol, not a caller alias.
+          qualified-source (inf/qualify-body-symbols
+                            (first walked-body) source-ns (set params))
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
-          hoisted (ad-prepare (first walked-body)
-                              (zipmap all-params tags))
+          hoisted (binding [*ns* source-ns]
+                    (ad-prepare qualified-source
+                                (zipmap all-params tags)))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
           ad-form (transform-body hoisted diff-active-params)
