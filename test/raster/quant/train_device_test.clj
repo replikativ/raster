@@ -98,6 +98,8 @@
             (vreset! prior next-A)))
         (is (= initial-codes (vec codes)))
         (is (= initial-scales (vec scales)))
+        (is (not= (vec A) (vec expected-A)) "the A adapter receives a nonzero update")
+        (is (not= (vec B) (vec expected-B)) "the B adapter receives a nonzero update")
         (finally (compiled/close! artifact)))
       (is (not (value/live? @prior)) "closing the owner invalidates projected state"))))
 
