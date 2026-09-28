@@ -100,6 +100,22 @@
 
 (def ^:private template-identity-schema :raster.compiled/template-identity-v1)
 
+(deftype WeakIdentity [^java.lang.ref.WeakReference reference ^int identity-hash]
+  Object
+  (hashCode [_] identity-hash)
+  (equals [this other]
+    (or (identical? this other)
+        (and (instance? WeakIdentity other)
+             (let [root (.get reference)
+                   other-root (.get (.-reference ^WeakIdentity other))]
+               (and (some? root) (identical? root other-root)))))))
+
+(defn- weak-identity [root]
+  ;; A hash only selects a map bucket. Actual process-cache reuse must compare the live Var
+  ;; roots by identity, even when two roots happen to have the same 32-bit identity hash.
+  (WeakIdentity. (java.lang.ref.WeakReference. root)
+                 (System/identityHashCode root)))
+
 (def ^:dynamic *compilation-template-observer*
   "Internal per-request observer. It receives only cache/timing facts, never source or artifacts."
   nil)
@@ -190,7 +206,7 @@
      :source-dependency-blockers (:blockers dependency-evidence)
      ;; Redefinition with textually equal source must not retain compiler state tied to an old Var
      ;; root (for example a changed closed-over helper or dispatch table).
-     :root-identity (System/identityHashCode @resolved)}))
+     :root-identity (weak-identity @resolved)}))
 
 (defn- target-specialization-identity
   ([target]
@@ -530,7 +546,7 @@
            {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
             :on-non-resident on-non-resident :schedule schedule}
            ;; Keeps with-redefs and hot compiler reloads honest.
-           (System/identityHashCode @#'pl/compile-gpu-program)))
+           (weak-identity @#'pl/compile-gpu-program)))
         prog (binding [*compilation-template-observer* #(reset! template-report %)]
                (stable-compilation-template
                 template-key :resident-descriptor
@@ -609,7 +625,7 @@
            revision
            target-identity
            compilation-options
-           (System/identityHashCode @#'equation-first/compile)))
+           (weak-identity @#'equation-first/compile)))
         compilation (binding [*compilation-template-observer* #(reset! template-report %)]
                       (stable-compilation-template
                        template-key :equation-first
