@@ -3857,16 +3857,51 @@
            pairs)]
       (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source)))))
 
+(defn- erase-array-type-witnesses
+  "Replace a pure array `oftype` witness with its declared element conversion.
+
+   The array is not a runtime operand of the conversion. Only a proven array symbol
+   may disappear: an arbitrary witness expression could have effects, and an
+   untyped symbol is not permission to infer a device representation."
+  [source array-types]
+  (util/postwalk-preserving-meta
+   (fn [expression]
+     (if (and (seq? expression)
+              (= 'raster.numeric/oftype (descriptor/semantic-op expression))
+              (= 2 (count (descriptor/call-args expression))))
+       (let [[witness value] (descriptor/call-args expression)
+             element (when (and (symbol? witness)
+                                (contains? (:arrays *declared-kinds*) witness))
+                       (or (some-> (get array-types witness) dtype/canon)
+                           (some-> (types/sym-type-tag witness)
+                                   dtype/dtype-for-array-tag dtype/canon)))
+             result (some-> (retained-expression-tag expression)
+                            dtype/dtype-for-scalar-tag dtype/canon)
+             cast (get {:float 'clojure.core/float
+                        :double 'clojure.core/double
+                        :long 'clojure.core/long
+                        :int 'clojure.core/int} element)]
+         (if (and cast (or (nil? result) (= result element)))
+           (with-meta (list cast value)
+             (-> (meta expression)
+                 (dissoc :raster.op/original)
+                 (assoc :tag (symbol (name element))
+                        :raster.type/tag (symbol (name element)))))
+           expression))
+       expression))
+   source))
+
 (defn- normalize-source*
-  [source scalar-types]
+  [source array-types scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (->> source
-                    (util/uniquify-rebindings (util/free-syms source))
-                    lift-nested-scalar-reductions)]
+  (let [source (util/uniquify-rebindings (util/free-syms source) source)
+        source (-> source
+                   (erase-array-type-witnesses array-types)
+                   lift-nested-scalar-reductions)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
@@ -4478,7 +4513,8 @@
                                (tagged #(contains? #{:long :int}
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
-       (normalize-source* (copy-allocations->maps source array-types) scalar-types)))))
+       (normalize-source* (copy-allocations->maps source array-types)
+                          array-types scalar-types)))))
 
 (declare coverage-decline*)
 

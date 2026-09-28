@@ -41,6 +41,65 @@
     (is (= source (frontend/normalize-source source {:dtype :float}))
         "an untyped/object clone does not acquire a guessed device representation")))
 
+(deftest array-oftype-witness-is-a-typed-conversion-not-a-device-input
+  (let [y (with-meta 'y {:tag 'floats :raster.type/tag 'floats})
+        converted (with-meta
+                    (list '.invk 'raster.numeric/oftype_m_floats_long-impl
+                          y '(clojure.core/aget codes i))
+                    {:tag 'float :raster.type/tag 'float
+                     :raster.op/original 'raster.numeric/oftype})
+        source (list 'let* [y '(clojure.core/float-array n)
+                            'write (list 'raster.par/map-void! 'i 'n
+                                         (list 'clojure.core/aset y 'i converted))]
+                     y)
+        options {:dtype :float :array-types {'codes :byte}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)]
+    (is (some #{'(clojure.core/float (clojure.core/aget codes i))}
+              (tree-seq coll? seq normalized)))
+    (is (not-any? #(= 'raster.numeric/oftype (descriptor/semantic-op %))
+                  (tree-seq coll? seq normalized)))
+    (is (= normalized (frontend/normalize-source normalized options))
+        "normalization is a fixpoint")))
+
+(deftest array-oftype-does-not-erase-an-effectful-or-untyped-witness
+  (let [value '(clojure.core/aget codes i)
+        effectful '(do (clojure.core/aset scratch 0 1.0) y)
+        source (list 'let* ['y '(clojure.core/float-array n)
+                            'write (list 'raster.par/map-void! 'i 'n
+                                         (list 'clojure.core/aset 'y 'i
+                                               (list 'raster.numeric/oftype effectful value)))]
+                     'y)
+        options {:dtype :float :array-types {'codes :byte 'scratch :float}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)
+        unknown (frontend/normalize-source
+                 '(let* [write (raster.par/map-void! i n
+                                 (raster.arrays/aset output i
+                                   (raster.numeric/oftype unknown
+                                     (raster.arrays/aget codes i))))]
+                    output)
+                 {:dtype :float :array-types {'output :float 'codes :byte}
+                  :scalar-types {'n :long}})]
+    (is (some #{'(raster.numeric/oftype
+                 (do (clojure.core/aset scratch 0 1.0) y)
+                 (clojure.core/aget codes i))}
+              (tree-seq coll? seq normalized)))
+    (is (some #{'(raster.numeric/oftype unknown (raster.arrays/aget codes i))}
+              (tree-seq coll? seq unknown)))))
+
+(deftest array-oftype-does-not-confuse-a-shadowed-scalar-with-an-array
+  (let [source '(let* [x (clojure.core/aget input 0)
+                       x (clojure.core/float x)
+                       result (raster.numeric/oftype x 1.0)]
+                  result)
+        normalized (frontend/normalize-source
+                    source {:array-types {'x :float 'input :float}})]
+    (is (some #(and (seq? %)
+                    (= 'raster.numeric/oftype (descriptor/semantic-op %)))
+              (tree-seq coll? seq normalized))
+        "the scalar rebinding is not the public array type witness")))
+
 (deftest direct-allocation-lengths-are-partially-evaluated-before-shape-analysis
   (let [source '(let* [buffer (clojure.core/float-array
                                (clojure.core/alength (raster.arrays/zeros-like input n)))
