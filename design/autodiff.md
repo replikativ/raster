@@ -261,6 +261,13 @@ the initializer in the enclosing scope and the body in the accumulator/index
 scope, then projects the fields. Active initializer gradients flow into the
 initial carry. Ordinary recurrence bodies pass through unchanged;
 data-dependent loops gain no new AD rule.
+When a counted carry loop has a `let` immediately before its only `recur`,
+the ordered-loop matcher can retain that lexical step in the scan body. AD
+accepts this shape only if every pre-recur initializer is proven pure and its
+array reads are from explicitly constant AD inputs, since the reverse scan
+recomputes the step without an array-scatter residual for this lift. Other
+preludes stay on the existing AD path. The same let-tail binding normalization allows
+constructed densities to project inside explicit reductions.
 
 Tail-accumulation loops lift to `par/reduce`:
 

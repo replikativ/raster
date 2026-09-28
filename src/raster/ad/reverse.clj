@@ -2873,7 +2873,19 @@
   including its initial value in the enclosing scope. Rebuild through the
   shared scope descriptor so no binding escapes it."
   [body]
-  (letfn [(step [expr]
+  (letfn [(bind-tail [expr]
+            ;; The composite inliner visits binding initializers, not a let's
+            ;; bare result expression. Keep the result inside this lexical
+            ;; region while giving nested calls an ANF binding to inline into.
+            (if (and (form/binding-form? expr) (= 3 (count expr))
+                     (not (symbol? (last expr))))
+              (let [[head bindings result] expr
+                    result-sym (ad-gensym "recurrence_result")]
+                (with-meta
+                  (list head (into (vec bindings) [result-sym result]) result-sym)
+                  (meta expr)))
+              expr))
+          (step [expr]
             (cond
               (and (seq? expr) (#{'quote 'clojure.core/quote} (first expr))) expr
               (and (seq? expr)
@@ -2885,7 +2897,7 @@
                          (mapv (fn [inner]
                                  (let [inner (step inner)]
                                    (if (soa-lower/contains-local-constructor? inner)
-                                     (lower-composites inner)
+                                     (lower-composites (bind-tail inner))
                                      inner)))
                                inner-exprs)
                          (mapv (fn [outer]
@@ -3096,7 +3108,44 @@
                            :cast (case dtype :float 'float :double 'double)
                            :acc acc-sym :idx index-sym
                            :bound bound-expr :init acc-init
-                           :body body}))))))
+                           :body body}))))
+   ;; A pure let prelude whose tail is the sole recur remains one ordered
+   ;; recurrence step. Retain its lexical bindings inside the scan body;
+   ;; reverse AD recomputes that body, so effectful initializers must decline.
+   (when-let [{:keys [acc-sym acc-init index-sym index-init bound-expr bound-mode
+                      then-branch else-expr scoped-update-expr]}
+              (patterns/match-ordered-reduce-loop loop-form)]
+     (let [bindings (when (and (form/binding-form? then-branch)
+                               (= 3 (count then-branch))
+                               (seq? (last then-branch))
+                               (= 'recur (first (last then-branch))))
+                      (partition 2 (second then-branch)))
+           dtype (or (carry-scan-dtype acc-init)
+                     (carry-scan-dtype scoped-update-expr))]
+       (when (and (seq bindings)
+                  (= 0 index-init)
+                  (= :exclusive bound-mode)
+                  (patterns/acc-ref? else-expr acc-sym)
+                  (not (patterns/contains-sym? bound-expr index-sym))
+                  (not (patterns/contains-sym? bound-expr acc-sym))
+                  (every? (fn [[_ init]] (= :pure (effects/analyze-effect init)))
+                          bindings)
+                  ;; The scan pullback reconstructs the step, but this narrow
+                  ;; lift has no scatter residual for an active array read in
+                  ;; the let prelude. Keep such loops on their existing AD path.
+                  (every? (fn [read]
+                            (contains? *constant-gradient-arrays* (second read)))
+                          (filter #(and (seq? %) (op/aget-op? (first %)))
+                                  (mapcat (fn [[_ init]] (tree-seq coll? seq init))
+                                          bindings)))
+                  (some? dtype)
+                  (carry-dtype-consistent? dtype scoped-update-expr))
+         (emit-carry-scan {:out nil
+                           :dtype dtype
+                           :cast (case dtype :float 'float :double 'double)
+                           :acc acc-sym :idx index-sym
+                           :bound bound-expr :init acc-init
+                           :body scoped-update-expr}))))))
 
 (defn- canonicalize-carry-loops
   "Walk a (post-lift) prep form and materialize surviving carry loops as
@@ -3963,6 +4012,8 @@
                                                 (or (nil? wrt-indices)
                                                     (contains? wrt-indices i))) p))
                                    all-params))
+          constant-gradient-arrays (set (remove (set diff-active-params)
+                                                all-params))
           source-ns (or (:ns m) *ns*)
         ;; Π: the SEED is the cotangent of the RESULT of the differentiated
         ;; GRAPH, so its dtype derives from the walked body's TAIL tag (the
@@ -3983,13 +4034,13 @@
                             (first walked-body) source-ns (set params))
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
-          hoisted (binding [*ns* source-ns]
+          hoisted (binding [*ns* source-ns
+                            *constant-gradient-arrays* constant-gradient-arrays]
                     (ad-prepare qualified-source
                                 (zipmap all-params tags)))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
-          ad-form (binding [*constant-gradient-arrays*
-                            (set (remove (set diff-active-params) all-params))]
+          ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays]
                     (transform-body hoisted diff-active-params))
           flat (binding [ad-flatten/*flatten-dtype* dtype]
                  (ad-flatten/flatten-for-gradient ad-form))
