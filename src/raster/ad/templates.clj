@@ -392,6 +392,11 @@
           reconstructed (if ns-str (symbol ns-str n) (symbol n))]
       ;; 1. Direct lookup key
       (or (when (get-template reconstructed) reconstructed)
+          ;; Source qualification spells Java's Math statics with their full
+          ;; class name. Keep one AD rule for both legal spellings.
+          (when (= ns-str "java.lang.Math")
+            (let [short-op (symbol "Math" n)]
+              (when (get-template short-op) short-op)))
           ;; 2. Qualified numeric op → base (raster.numeric/* → *)
           (get qualified->base-op reconstructed)
           ;; 3. Mangled arithmetic/math name (_plus_m_... → '+, sin_m_... → 'Math/sin)
