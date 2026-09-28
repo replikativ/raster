@@ -26,6 +26,7 @@
             [raster.sym.core :as sym]
             [raster.sym.diff :as sdiff]
             [raster.sci.special :as special]
+            [raster.sci.distributions :as dist]
             [raster.nn :as rnn]
             [raster.dl.nn :as nn]
             [raster.dl.loss :as loss]
@@ -1366,6 +1367,83 @@
     (if (< i rn)
       (recur (inc i) (n/+ acc (n/* (ra/aget xs i) (ra/aget xs i))))
       acc)))
+
+(deftm laws-o10-square [x :- Double] :- Double (n/* x x))
+
+(deftm laws-o10-loop-helper [x :- Double, rn :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i rn)
+      (recur (inc i) (n/+ acc (laws-o10-square (n/* x (double i)))))
+      acc)))
+
+(deftest o10-loop-inlines-per-step-deftm-before-reverse-ad
+  (let [[value dx] ((rev/value+grad #'laws-o10-loop-helper) 1.5 4)]
+    (is (close? value 31.5 1e-12))
+    (is (close? dx 42.0 1e-12))
+    (is (close? dx (central-fd #(laws-o10-loop-helper % 4) 1.5 1e-6)
+                1e-7))))
+
+(deftm laws-normal-logpdf [d :- raster.sci.distributions.Normal,
+                           x :- Double] :- Double
+  (dist/logpdf d x))
+
+(deftest normal-log-density-differentiates-through-variadic-arithmetic
+  (let [d (dist/->Normal 0.3 1.2)
+        x 1.0
+        [value dd dx] ((rev/value+grad #'laws-normal-logpdf) d x)]
+    (is (close? value (dist/logpdf d x) 1e-12))
+    (is (nil? dd) "the distribution record is not an active scalar parameter")
+    (is (close? dx (/ (- 0.3 x) (* 1.2 1.2)) 1e-12))
+    (is (close? dx (central-fd #(dist/logpdf d %) x 1e-6) 1e-7))))
+
+(deftm laws-variadic-core-arithmetic [x :- Double] :- Double
+  (+ 1.0 x (* x x)))
+
+(deftest variadic-core-arithmetic-commutes-across-ad-modes
+  (let [x 1.5
+        [v dx] ((rev/value+grad #'laws-variadic-core-arithmetic) x)
+        [jv jdx] ((jvp/jvp #'laws-variadic-core-arithmetic) x 1.0)
+        [grad hv] ((jvp/hvp #'laws-variadic-core-arithmetic) x 1.0)]
+    (is (close? v 4.75 1e-12))
+    (is (close? dx 4.0 1e-12))
+    (is (close? jv v 1e-12))
+    (is (close? jdx dx 1e-12))
+    (is (close? (first grad) dx 1e-12))
+    (is (close? (first hv) 2.0 1e-12))))
+
+(deftm laws-arithmetic-identities [x :- Double] :- Double
+  (+ (*) (+ x) (* x x)))
+
+(deftest arithmetic-identity-and-single-operand-arities-have-correct-ad
+  (let [[value dx] ((rev/value+grad #'laws-arithmetic-identities) 2.0)
+        [_ jdx] ((jvp/jvp #'laws-arithmetic-identities) 2.0 1.0)]
+    (is (close? value 7.0 1e-12))
+    (is (close? dx 5.0 1e-12))
+    (is (close? jdx dx 1e-12))))
+
+(deftm laws-variadic-subdiv [x :- Double] :- Double
+  (- (/ x 2.0 3.0) 1.0 x))
+
+(deftest ordered-variadic-subtraction-and-division-have-correct-ad
+  (let [[value dx] ((rev/value+grad #'laws-variadic-subdiv) 6.0)
+        [_ jdx] ((jvp/jvp #'laws-variadic-subdiv) 6.0 1.0)]
+    (is (close? value -6.0 1e-12))
+    (is (close? dx (- (/ 1.0 6.0) 1.0) 1e-12))
+    (is (close? jdx dx 1e-12))))
+
+(deftest o10-loop-hvp-does-not-silently-drop-the-tangent
+  (let [xs (double-array [1.0 2.0 3.0])
+        direction (double-array [1.0 0.0 0.0])
+        ;; The analytic H·direction is [2, 0, 0]. The old HVP fold returned
+        ;; zeros because the active dependence was hidden in a loop-tape closure.
+        error (try
+                ((jvp/hvp #'laws-o10-ssq) xs 3 direction)
+                nil
+                (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? error) "loop HVP must reject until its forward rule is present")
+    (is (= :hvp-unlinearized-scope (:reason (ex-data error))))
+    (is (contains? '#{loop loop* raster.par/reduce raster.par/scan}
+                   (:form-head (ex-data error))))))
 
 ;; dotimes + aset (SGD-ish elementwise shape) — regression on the map! path.
 (deftm laws-o10-scale [xs :- (Array double), a :- Double, mn :- Long] :- Double
