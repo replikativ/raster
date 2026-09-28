@@ -31,6 +31,7 @@
             [raster.ad.reverse.normalize :as anf]
             [raster.ad.tangent :as tangent]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.par :as par-ir]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
@@ -41,7 +42,10 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.support.mangled :as mangled]
             [raster.core :as rcore]
-            [raster.arrays :as arrays]))
+            [raster.arrays :as arrays]
+            ;; Generated pullbacks can call residual-add and other layer helpers.
+            ;; Their namespace must exist when the generated function is eval'd.
+            [raster.dl.nn]))
 
 ;; ================================================================
 ;; Inline callbacks — breaks inline↔reverse cycle.
@@ -2856,6 +2860,31 @@
                                       {:body body}))
             :else (recur relifted (inc i))))))))
 
+(defn- lower-recurrence-bodies
+  "Inline constructor-bearing code inside a structured scan or reduction.
+  Rebuild through the shared scope descriptor so no binding escapes it."
+  [body]
+  (letfn [(step [expr]
+            (cond
+              (and (seq? expr) (#{'quote 'clojure.core/quote} (first expr))) expr
+              (and (seq? expr)
+                   (or (par-ir/par-reduce-form? expr)
+                       (par-ir/par-scan-form? expr)))
+              (let [{:keys [scoped-syms inner-exprs outer-exprs rebuild]}
+                    (par-ir/par-scope-info expr)]
+                (rebuild scoped-syms
+                         (mapv (fn [inner]
+                                 (let [inner (step inner)]
+                                   (if (soa-lower/contains-local-constructor? inner)
+                                     (lower-composites inner)
+                                     inner)))
+                               inner-exprs)
+                         (mapv step outer-exprs)))
+              (seq? expr) (with-meta (apply list (map step expr)) (meta expr))
+              (vector? expr) (mapv step expr)
+              :else expr))]
+    (step body)))
+
 (def ^:private variadic-core-arithmetic
   '#{clojure.core/+ clojure.core/- clojure.core/* clojure.core//
      + - * /})
@@ -3087,6 +3116,7 @@
     a fixpoint) → project nonescaping value constructors →
     lift-parallel-forms (loop → SOAC canonicalization, §15.2)
     → canonicalize-carry-loops (AD-only carry → scan materializer) →
+    inline constructor-bearing scan/reduce bodies → project their fields →
     materialize-pass (pure par/map → alloc + par/map!) →
     hoist-nested-lets (flat ANF).
 
@@ -3112,9 +3142,13 @@
         ;; §15.2 (2): materialize surviving pure-carry recurrences as par/scan
         ;; (the synthesized out IS the tape — store-the-carry checkpointing).
         canonical (canonicalize-carry-loops lifted)
+        scoped (binding [inline/*param-env* param-env]
+                 (-> canonical lower-recurrence-bodies
+                     binaryize-core-arithmetic inline-qualified-constants
+                     soa-lower/lower-local-constructors))
         ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
         ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
-        materialized (:form (materialize/materialize-pass canonical nil))]
+        materialized (:form (materialize/materialize-pass scoped nil))]
     ;; Hoist nested lets out of call args into flat ANF for AD.
      (hoist-nested-lets materialized))))
 

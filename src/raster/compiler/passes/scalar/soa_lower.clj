@@ -121,6 +121,13 @@
       (let [t (symbol (subs local 2))]
         (when (get @types/soa-registry t) t)))))
 
+(defn contains-local-constructor?
+  "Whether a form contains a registered scalar value constructor. AD uses
+  this to limit scoped composite inlining to bodies needing projection."
+  [body]
+  (boolean (some #(and (seq? %) (constructor->scalar-tag (first %)))
+                 (tree-seq coll? seq body))))
+
 (defn- field-access-head? [head]
   (and (symbol? head)
        (let [s (str head)]
