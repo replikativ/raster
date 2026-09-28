@@ -219,7 +219,10 @@ The scan reverse pass also emits its per-step scalar gradient as flat bindings
 inside the backward loop, rather than allocating a pullback closure at each
 step. This makes the step residual explicit, but does not by itself make the
 backward loop differentiable for HVP; ordered loop and scatter linearization
-remain separate obligations. Generic `par/reduce` still uses a closure tape.
+remain separate obligations. A proven-pure double-carry `par/reduce` now uses
+one primitive carry tape and replays the scalar step during the ordered reverse
+sweep; other supported reductions retain the closure tape. This does not yet
+make the reduction pullback differentiable for HVP.
 
 Tail-accumulation loops lift to `par/reduce`:
 
