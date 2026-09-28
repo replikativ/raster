@@ -46,7 +46,8 @@
         sealed (with-meta evidence
                  {::validation-seal
                   (fn [candidate-plan candidate-evidence]
-                    (when (and (identical? (.get plan-ref) candidate-plan)
+                    (when (and (some? candidate-plan)
+                               (identical? (.get plan-ref) candidate-plan)
                                (identical? @owner candidate-evidence))
                       effect-evidence-seal-token))})]
     (vreset! owner sealed)

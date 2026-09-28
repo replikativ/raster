@@ -146,6 +146,7 @@
     (is (not (link-plan/retained-effect-evidence? (:plan lowering) rebound-evidence))
         "rebinding host sources changes the exact plan object")
     (is (link-plan/retained-effect-evidence? (:plan exact) evidence))
+    (is (not (link-plan/retained-effect-evidence? nil evidence)))
     (is (not (link-plan/retained-effect-evidence? (:plan forged-plan) evidence)))
     (is (not (link-plan/retained-effect-evidence? (:plan exact)
                                                  (get-in forged-evidence
