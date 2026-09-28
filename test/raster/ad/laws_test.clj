@@ -1454,6 +1454,13 @@
   :- Double
   (par/reduce acc a i rn (double (n/+ (n/* 0.5 acc) (ra/aget xs i)))))
 
+(deftm laws-reduce-const-init [xs :- (Array double), rn :- Long] :- Double
+  (par/reduce acc 0.0 i rn (double (n/+ acc (ra/aget xs i)))))
+
+(deftm laws-reduce-float-carry [a :- Float, xs :- (Array float), rn :- Long]
+  :- Float
+  (par/reduce acc a i rn (float (n/+ acc (ra/aget xs i)))))
+
 (deftm laws-reduce-repeated-read [xs :- (Array double), rn :- Long] :- Double
   (par/reduce acc 0.0 i rn
               (let [left (ra/aget xs i)
@@ -1511,6 +1518,30 @@
     (is (safe? '(.invk raster.numeric/_star__m_double_double-impl x y)))
     (is (not (safe? '(do (println "effect") (.invk raster.numeric/_star__m_double_double-impl x y)))))
     (is (not (safe? '(.invk missing.namespace/unknown_m_double-impl x))))))
+
+(deftest o10-reduce-jvp-linearizes-the-ordered-carry
+  (let [xs (double-array [0.4 -0.7 0.2 1.1])
+        dx (double-array [0.2 0.3 -0.5 0.7])
+        da -0.6]
+    (doseq [n [-2 0 4]]
+      (let [[value tangent] ((jvp/jvp #'laws-reduce-decay) 0.8 xs n da dx)
+            steps (max 0 n)
+            expected (+ (* (Math/pow 0.5 steps) da)
+                        (reduce + (map-indexed
+                                   (fn [i x] (* (Math/pow 0.5 (- steps 1 i)) x))
+                                   (take steps dx))))]
+        (is (close? value (laws-reduce-decay 0.8 xs n) tol-double))
+        (is (close? tangent expected tol-double)
+            (str "JVP through " n " ordered reduction steps"))))
+    (let [[value tangent] ((jvp/jvp #'laws-reduce-const-init) xs 4 dx)]
+      (is (close? value (reduce + xs) tol-double))
+      (is (close? tangent (reduce + dx) tol-double)
+          "literal double init also has a forward rule"))
+    (is (= :jvp-reduce-carry-precision
+           (:reason (ex-data
+                     (try (jvp/jvp #'laws-reduce-float-carry)
+                          (catch clojure.lang.ExceptionInfo e e)))))
+        "a narrowing float carry declines until its tangent precision is modeled")))
 
 (deftm laws-o10-square [x :- Double] :- Double (n/* x x))
 
