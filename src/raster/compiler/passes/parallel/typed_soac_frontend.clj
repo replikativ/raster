@@ -3881,7 +3881,7 @@
                         :double 'clojure.core/double
                         :long 'clojure.core/long
                         :int 'clojure.core/int} element)]
-         (if (and cast (or (nil? result) (= result element)))
+         (if (and cast (= result element))
            (with-meta (list cast value)
              (-> (meta expression)
                  (dissoc :raster.op/original)
@@ -3899,8 +3899,11 @@
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
   (let [source (util/uniquify-rebindings (util/free-syms source) source)
+        ;; A locally bound scalar can reuse a public array's name. Only free array
+        ;; parameters may borrow the entry type; local arrays need their own tag.
+        public-array-types (select-keys array-types (util/free-syms source))
         source (-> source
-                   (erase-array-type-witnesses array-types)
+                   (erase-array-type-witnesses public-array-types)
                    lift-nested-scalar-reductions)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source

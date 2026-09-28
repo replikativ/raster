@@ -89,16 +89,19 @@
               (tree-seq coll? seq unknown)))))
 
 (deftest array-oftype-does-not-confuse-a-shadowed-scalar-with-an-array
-  (let [source '(let* [x (clojure.core/aget input 0)
-                       x (clojure.core/float x)
-                       result (raster.numeric/oftype x 1.0)]
-                  result)
-        normalized (frontend/normalize-source
-                    source {:array-types {'x :float 'input :float}})]
-    (is (some #(and (seq? %)
-                    (= 'raster.numeric/oftype (descriptor/semantic-op %)))
-              (tree-seq coll? seq normalized))
-        "the scalar rebinding is not the public array type witness")))
+  (doseq [source ['(let* [x (double 1.0)
+                           result (raster.numeric/oftype x 2.0)]
+                      result)
+                  '(let* [x (clojure.core/aget input 0)
+                           x (clojure.core/float x)
+                           result (raster.numeric/oftype x 1.0)]
+                      result)]]
+    (let [normalized (frontend/normalize-source
+                      source {:array-types {'x :float 'input :float}})]
+      (is (some #(and (seq? %)
+                      (= 'raster.numeric/oftype (descriptor/semantic-op %)))
+                (tree-seq coll? seq normalized))
+          "a local scalar must not borrow the public array's type"))))
 
 (deftest direct-allocation-lengths-are-partially-evaluated-before-shape-analysis
   (let [source '(let* [buffer (clojure.core/float-array
