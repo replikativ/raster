@@ -612,7 +612,10 @@
                        template-key :equation-first
                        #(equation-first/compile fn-var compilation-options target-descriptor)))
         lowering-started (System/nanoTime)
-        raw-plan (equation-first/lower compilation args)
+        equation-lower-phases (atom nil)
+        raw-plan (binding [equation-first/*lower-observer*
+                           #(reset! equation-lower-phases %)]
+                   (equation-first/lower compilation args))
         equation-lower-ns (- (System/nanoTime) lowering-started)
         attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)
@@ -727,6 +730,7 @@
                 :phases-ns {:equation-lower equation-lower-ns
                             :role-projection role-projection-ns
                             :invocation-certification invocation-certification-ns}
+                :equation-lower-phases-ns @equation-lower-phases
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
     (seal-prepared

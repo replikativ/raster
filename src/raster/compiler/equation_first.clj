@@ -33,6 +33,10 @@
 (defrecord EquationFirstCompilation
            [id function target dtype source-ns options semantic scheduled emitted kernels stats])
 
+(def ^:dynamic *lower-observer*
+  "Internal timing observer for invocation materialization and LinkPlan construction."
+  nil)
+
 (defn equation-first-compilation?
   [value]
   (instance? EquationFirstCompilation value))
@@ -315,20 +319,28 @@
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
-  (let [source-ns (:source-ns compilation)
+  (let [started (System/nanoTime)
+        source-ns (:source-ns compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         materialized
         (materialization/materialize
          invocation-plan (vec arguments)
          (partial scalar/evaluate-invocation-step source-ns))
+        materialization-ns (- (System/nanoTime) started)
         buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
                             (:program-buffers materialized))
         evaluate-host (fn [equation context]
                         (scalar/evaluate-host-equation
-                         source-ns equation (assoc context :buffer-shapes buffer-shapes)))]
-    (invocation-link/lower
-     materialized (:emitted compilation) (:target compilation)
-     evaluate-host)))
+                         source-ns equation (assoc context :buffer-shapes buffer-shapes)))
+        construction-started (System/nanoTime)
+        plan (invocation-link/lower
+              materialized (:emitted compilation) (:target compilation)
+              evaluate-host)]
+    (when *lower-observer*
+      (*lower-observer* {:materialization-ns materialization-ns
+                         :link-plan-construction-ns
+                         (- (System/nanoTime) construction-started)}))
+    plan))
 
 (defn compile-link-plan
   "Convenience composition of `compile` and `lower`; still performs no runtime allocation."
