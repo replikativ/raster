@@ -2743,12 +2743,22 @@
   '#{clojure.core/+ clojure.core/- clojure.core/* clojure.core//
      + - * /})
 
+(defn- postwalk-code
+  "Postwalk executable forms, leaving quoted data untouched."
+  [f body]
+  (letfn [(step [form]
+            (if (and (seq? form)
+                     (contains? '#{quote clojure.core/quote} (first form)))
+              form
+              (f (walk/walk step identity form))))]
+    (step body)))
+
 (defn- binaryize-core-arithmetic
   "Express core arithmetic's variadic contract using identities, aliases,
   unary calls, and ordered binary folds. This matches the fixed-arity AD
   templates without changing evaluation order or inventing per-arity rules."
   [body]
-  (walk/postwalk
+  (postwalk-code
    (fn [form]
      (if (and (seq? form) (contains? variadic-core-arithmetic (first form)))
        (let [op (first form)
@@ -2774,7 +2784,7 @@
   evaluated in the caller's namespace. Only immutable scalar constants are
   eligible; ordinary Vars remain runtime references."
   [body]
-  (walk/postwalk
+  (postwalk-code
    (fn [form]
      (if (and (symbol? form) (namespace form))
        (if-let [v (when (find-ns (symbol (namespace form)))
