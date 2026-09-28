@@ -71,6 +71,8 @@
 (defn compiled? [x] (instance? Compiled x))
 (defn prepared? [x] (instance? Prepared x))
 
+(def ^:private prepared-seal-token (Object.))
+
 (defn- seal-prepared
   "Bind in-process provenance to one exact immutable Prepared object. A copied or associated
    record may retain the closure but cannot satisfy its identity check. This is an optimization
@@ -78,13 +80,14 @@
   [prepared]
   (let [owner (volatile! nil)
         sealed (assoc prepared :provenance-seal
-                      (fn [candidate] (identical? candidate @owner)))]
+                      (fn [candidate]
+                        (when (identical? candidate @owner) prepared-seal-token)))]
     (vreset! owner sealed)
     sealed))
 
 (defn- sealed-prepared? [prepared]
   (let [seal (:provenance-seal prepared)]
-    (and (fn? seal) (true? (seal prepared)))))
+    (and (fn? seal) (identical? prepared-seal-token (seal prepared)))))
 
 ;; Compilation templates are immutable and argument-independent.  LinkPlan lowering below still
 ;; runs for every invocation, so shapes, weights, roles, views, and ownership never enter this
@@ -760,7 +763,11 @@
                      {:reason :compiled-prepared-type :actual (type prepared)})))
    (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args
                  preparation-report]} prepared
-         executable (gpu-link/instantiate! (:plan lowering) opts)]
+         evidence (get-in lowering [:certificate :effect-evidence])
+         executable (if (and (sealed-prepared? prepared)
+                             (link-plan/retained-effect-evidence? (:plan lowering) evidence))
+                      (gpu-link/instantiate-certified! lowering opts)
+                      (gpu-link/instantiate! (:plan lowering) opts))]
      (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
                  preparation-report
                  (atom nil)))))

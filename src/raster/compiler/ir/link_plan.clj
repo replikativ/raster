@@ -36,6 +36,31 @@
 (defrecord LinkEffectEvidence
            [source-dialect target-dialect plan-id target step-facts initialization])
 
+(def ^:private effect-evidence-seal-token (Object.))
+
+(defn- seal-effect-evidence
+  "Authorize reuse only for the exact in-process plan and evidence objects just validated."
+  [plan evidence]
+  (let [plan-ref (java.lang.ref.WeakReference. plan)
+        owner (volatile! nil)
+        sealed (with-meta evidence
+                 {::validation-seal
+                  (fn [candidate-plan candidate-evidence]
+                    (when (and (some? candidate-plan)
+                               (identical? (.get plan-ref) candidate-plan)
+                               (identical? @owner candidate-evidence))
+                      effect-evidence-seal-token))})]
+    (vreset! owner sealed)
+    sealed))
+
+(defn ^:no-doc retained-effect-evidence?
+  "True only for an exact plan/evidence pair returned by this process's LinkPlan validator."
+  [plan evidence]
+  (let [seal (when (instance? LinkEffectEvidence evidence)
+               (::validation-seal (meta evidence)))]
+    (and (fn? seal)
+         (identical? effect-evidence-seal-token (seal plan evidence)))))
+
 (defn link-node? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkNode" (.getName (class x)))))
 
@@ -1147,8 +1172,9 @@
         initialization (analyze-effects! plan step-facts)]
     {:plan plan
      :effect-evidence
-     (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
-                           step-facts initialization)}))
+     (seal-effect-evidence
+      plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
+                                 step-facts initialization))}))
 
 (defn ^:no-doc validate-with-certified-effect-facts!
   "Validate plan structure and derive a new effect witness from already certified step facts.
@@ -1168,8 +1194,9 @@
         initialization (analyze-effects! plan step-facts)]
     {:plan plan
      :effect-evidence
-     (->LinkEffectEvidence :certified-component-effects :link-effects
-                           (:id plan) (:target plan) step-facts initialization)}))
+     (seal-effect-evidence
+      plan (->LinkEffectEvidence :certified-component-effects :link-effects
+                                 (:id plan) (:target plan) step-facts initialization))}))
 
 (defn validate!
   "Validate a LinkPlan without allocating storage, registering kernels, or contacting a driver."

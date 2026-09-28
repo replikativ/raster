@@ -325,7 +325,10 @@
                    [automatic register-tiled register-tiled-again])))
       (doseq [prepared [automatic register-tiled register-tiled-again]
               :let [report (compiled/preparation-report prepared)
-                    phases (:phases-ns report)]]
+                    phases (:phases-ns report)
+                    lowering (:lowering prepared)]]
+        (is (link-plan/retained-effect-evidence?
+             (:plan lowering) (get-in lowering [:certificate :effect-evidence])))
         (is (= #{:equation-lower :role-projection :invocation-certification}
                (set (keys phases))))
         (is (every? #(and (integer? %) (not (neg? %))) (vals phases)))

@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.compiled :as compiled]
@@ -126,6 +127,52 @@
     (is (pos? (:total-ns (compiled/preparation-report composite))))
     (is (= 2 (count (compiled/ir composite))))
     (is (= {:map 2} (:steps (compiled/cache-key composite))))))
+
+(deftest certified-instantiation-requires-an-exact-validated-plan-and-evidence
+  (let [prepared (with-redefs [pipeline/compile-gpu-program (fn [& _] (descriptor))]
+                   (compiled/lower #'component [(float-array 16) (float-array 16) 16]
+                                   {:target :ze:0}))
+        copied (assoc prepared :preparation-report {:copied true})
+        lowering (:lowering prepared)
+        rebound-evidence (get-in lowering [:certificate :effect-evidence])
+        validated (link-plan/validate-with-effect-evidence! (:plan lowering))
+        exact (assoc lowering :plan (:plan validated)
+                     :certificate (assoc (:certificate lowering)
+                                         :effect-evidence (:effect-evidence validated)))
+        evidence (get-in exact [:certificate :effect-evidence])
+        forged-plan (assoc exact :plan (assoc (:plan exact) :outputs []))
+        forged-evidence (assoc-in exact [:certificate :effect-evidence]
+                                  (assoc evidence :step-facts []))]
+    (is (not (link-plan/retained-effect-evidence? (:plan lowering) rebound-evidence))
+        "rebinding host sources changes the exact plan object")
+    (is (link-plan/retained-effect-evidence? (:plan exact) evidence))
+    (is (not (link-plan/retained-effect-evidence? nil evidence)))
+    (is (not (link-plan/retained-effect-evidence? (:plan forged-plan) evidence)))
+    (is (not (link-plan/retained-effect-evidence? (:plan exact)
+                                                 (get-in forged-evidence
+                                                         [:certificate :effect-evidence]))))
+    (with-redefs [link-plan/validate-with-effect-evidence!
+                  (fn [_] (throw (ex-info "raw plan validation reached" {})))
+                  gpu/make-session
+                  (fn [_] (throw (ex-info "session setup reached" {})))]
+      (is (= "raw plan validation reached"
+             (try (compiled/instantiate! prepared)
+                  (catch clojure.lang.ExceptionInfo error (.getMessage error)))))
+      (is (= "session setup reached"
+             (try (gpu-link/instantiate-certified! exact {})
+                  (catch clojure.lang.ExceptionInfo error (.getMessage error)))))
+      (is (= "raw plan validation reached"
+             (try (compiled/instantiate! copied)
+                  (catch clojure.lang.ExceptionInfo error (.getMessage error)))))
+      (is (= "raw plan validation reached"
+             (try (compiled/instantiate!
+                   (assoc prepared :provenance-seal (constantly true)))
+                  (catch clojure.lang.ExceptionInfo error (.getMessage error)))))
+      (doseq [invalid [forged-plan forged-evidence]]
+        (is (= :link-certified-effect-evidence
+               (try (gpu-link/instantiate-certified! invalid {})
+                    (catch clojure.lang.ExceptionInfo error
+                      (:reason (ex-data error))))))))))
 
 (deftest exact-prepared-values-compose-without-rederiving-component-certificates
   (let [weight (float-array 16)
