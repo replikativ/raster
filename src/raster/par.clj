@@ -40,6 +40,15 @@
         s4 (unchecked-multiply s3 SM-MIX2)]
     (bit-xor s4 (unsigned-bit-shift-right s4 31))))
 
+(deftm uniform-open01
+  "Counter-based uniform draw strictly inside (0,1). The upper 52 SplitMix64
+  bits form an exactly representable integer; adding half a unit avoids both
+  endpoints before scaling. A caller supplies a stable seed and draw counter,
+  so execution order does not determine the random stream."
+  [base-seed :- Long counter :- Long] :- Double
+  (let [bits (unsigned-bit-shift-right (splitmix64 base-seed counter) 12)]
+    (* (+ (double bits) 0.5) 2.220446049250313e-16)))
+
 ;; ================================================================
 ;; Runtime macros (fallback expansion when eval'd)
 ;; ================================================================

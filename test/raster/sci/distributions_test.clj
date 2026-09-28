@@ -1,5 +1,6 @@
 (ns raster.sci.distributions-test
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.par :as par]
             [raster.sci.distributions :refer [->Normal ->Uniform ->Exponential ->Gamma ->Poisson
                                               ->Beta ->Cauchy ->LogNormal ->StudentT
                                               ->Weibull ->Rayleigh ->Pareto ->Chisq
@@ -16,6 +17,34 @@
 (defn- approx=
   ([^double a ^double b] (< (Math/abs (- a b)) EPS))
   ([^double a ^double b ^double tol] (< (Math/abs (- a b)) tol)))
+
+(deftest keyed-sampling-is-order-independent
+  (let [seed 42
+        counters [0 17 1 3 17]
+        normal (->Normal 0.3 1.2)
+        uniform (->Uniform -2.0 3.0)
+        exponential (->Exponential 2.0)
+        draw (fn [d] (mapv #(sample d seed %) counters))]
+    (is (= "a759ea27d4727622"
+           (Long/toUnsignedString (par/splitmix64 seed 0) 16)))
+    (is (= 0.6537157389870546 (par/uniform-open01 seed 0)))
+    (is (= (draw normal) (draw normal)))
+    (is (= (draw uniform) (draw uniform)))
+    (is (= (draw exponential) (draw exponential)))
+    (is (= (nth (draw normal) 1) (nth (draw normal) 4)))
+    (is (not= (sample normal seed 0) (sample normal seed 1)))
+    (is (every? #(and (< 0.0 %) (< % 1.0))
+                (map #(par/uniform-open01 seed %) (range 1000))))
+    (is (every? #(and (< -2.0 %) (< % 3.0)) (draw uniform)))
+    (is (every? #(and (Double/isFinite %) (<= 0.0 %))
+                (draw exponential)))
+    (is (every? #(Double/isFinite %) (draw normal)))
+    (is (approx= (sample normal seed 17)
+                 (+ 0.3 (* 1.2 (sample (->Normal 0.0 1.0) seed 17)))
+                 1e-12))
+    (is (approx= (sample exponential seed 17)
+                 (/ (- (Math/log (par/uniform-open01 seed 17))) 2.0)
+                 1e-12))))
 
 ;; ================================================================
 ;; Normal distribution
