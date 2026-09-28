@@ -241,6 +241,14 @@ their tangents, and two-argument `nth` projects the corresponding tangent.
 Active indices, nested active vector expressions not lifted to ANF, and active
 maps/sets decline explicitly rather than silently discarding dependence.
 
+`value+grad` and `grad` accept `:wrt` as zero-based parameter indices for
+reverse AD. Unselected inputs remain primal inputs but have `nil` gradient
+slots. This lets a log-density keep observations constant while differentiating
+model parameters; it does not change the default, which still differentiates
+eligible array inputs. Indexed reads of an explicitly constant array are
+recomputed as scalar values rather than routed through the array-scatter
+pullback. Active array gradients retain their existing index restrictions.
+
 For nonescaping `defvalue` locals, AD preparation now uses the same generic
 field projection as the SoA lowering: a constructed distribution such as
 `(->Normal mu sigma)` can be inlined into `logpdf` and differentiated with

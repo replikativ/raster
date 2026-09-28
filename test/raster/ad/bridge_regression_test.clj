@@ -44,6 +44,43 @@
                                      (aget ys i))))
         sum))))
 
+(deftm normal-strided-observations [mu :- Double, ys :- (Array double), count :- Long,
+                                   sigma :- Double] :- Double
+  (loop [i 0 sum 0.0]
+    (if (< i count)
+      (recur (inc i)
+             (n/+ sum (dist/logpdf (dist/->Normal mu sigma)
+                                   (aget ys (* 2 i)))))
+      sum)))
+
+(deftm normal-strided-reduce [mu :- Double, ys :- (Array double), count :- Long,
+                             sigma :- Double] :- Double
+  (par/reduce sum 0.0 i count
+    (n/+ sum (dist/logpdf (dist/->Normal mu sigma) (aget ys (* 2 i))))))
+
+(deftest selected-gradient-inputs-allow-strided-observations
+  (let [ys (double-array [0.1 9.0 0.7 9.0 -0.3 9.0])
+        expected (reduce + (map #(dist/logpdf (dist/->Normal 0.2 1.4) %)
+                                [0.1 0.7 -0.3]))]
+    (doseq [source [#'normal-strided-observations
+                    #'normal-strided-reduce]]
+      (let [[value dmu dys dcount dsigma]
+            ((rev/value+grad source :wrt [0 3]) 0.2 ys 3 1.4)]
+        (is (< (Math/abs (- value expected)) 1e-10))
+        (is (< (Math/abs (- dmu (reduce + (map #(/ (- % 0.2) (* 1.4 1.4))
+                                                  [0.1 0.7 -0.3])))) 1e-9))
+        (is (nil? dys))
+        (is (nil? dcount))
+        (is (number? dsigma))))
+    (let [[dmu dys dcount dsigma]
+          ((rev/grad #'normal-strided-reduce :wrt [0 3]) 0.2 ys 3 1.4)]
+      (is (number? dmu))
+      (is (nil? dys))
+      (is (nil? dcount))
+      (is (number? dsigma)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-differentiable"
+                          (rev/value+grad #'normal-strided-observations :wrt [2])))))
+
 (deftest generated-gradient-helper-namespace-is-available
   (is (some? (find-ns 'raster.dl.nn))))
 
