@@ -61,6 +61,16 @@
   nil means uninitialized — callers should use `with-ad-gensym`."
   nil)
 
+(def ^:private ^:dynamic *constant-gradient-arrays* #{})
+
+(defn- gradient-bearing-array-read?
+  "Only reads from differentiated arrays need scatter cotangents. Reads from
+  explicitly constant parameter arrays stay ordinary scalar expressions."
+  [form]
+  (and (seq? form) (op/aget-op? (first form))
+       (= 3 (count form))
+       (not (contains? *constant-gradient-arrays* (second form)))))
+
 (defn- ad-gensym
   "Generate a unique symbol for AD-generated code.
   Optional type-tag stamps :raster.type/tag metadata so downstream
@@ -1851,8 +1861,7 @@
           [[] body-expr])]
     ;; (1) let*-bound agets
     (doseq [[sym init] bindings]
-      (if (and (seq? init)
-               (op/aget-op? (first init)))
+      (if (gradient-bearing-array-read? init)
         (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
         (swap! scalar-bindings conj [sym init])))
     ;; (2) lift inline (aget arr idx-sym) reads to synthetic aget bindings (dedup by
@@ -1860,8 +1869,8 @@
     (let [seen (atom {})
           lift (fn lift [form]
                  (cond
-                   (and (seq? form) (op/aget-op? (first form))
-                        (= 3 (count form)) (= idx-sym (nth form 2)))
+                   (and (gradient-bearing-array-read? form)
+                        (= idx-sym (nth form 2)))
                    (let [arr (nth form 1)
                          k (if (symbol? arr) arr form)]
                      (or (get @seen k)
@@ -2091,8 +2100,7 @@
           [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
           [[] body-expr])]
     (doseq [[sym init] bindings]
-      (if (and (seq? init)
-               (op/aget-op? (first init)))
+      (if (gradient-bearing-array-read? init)
         (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
         (swap! scalar-bindings conj [sym init])))
     ;; Lift inline (aget arr idx-sym) reads to synthetic aget bindings (dedup
@@ -2101,8 +2109,8 @@
     (let [seen (atom {})
           lift (fn lift [form]
                  (cond
-                   (and (seq? form) (op/aget-op? (first form))
-                        (= 3 (count form)) (= idx-sym (nth form 2)))
+                   (and (gradient-bearing-array-read? form)
+                        (= idx-sym (nth form 2)))
                    (let [arr (nth form 1)
                          k (if (symbol? arr) arr form)]
                      (or (get @seen k)
@@ -3884,7 +3892,7 @@
   Returns {:walked-body [form], :params [sym ...], :source-ns ns}
   where form is a flat let* returning [primal grad1 ... gradN].
   Returns nil if AD transform fails."
-  [f-var]
+  [f-var wrt]
   ;; ONE shared gensym counter across the whole reverse lowering. ad-prepare
   ;; (lower-composites) and transform-body each open their OWN with-ad-gensym;
   ;; without this enclosing scope each RESETS *gensym-counter* to 0 and re-emits
@@ -3931,6 +3939,19 @@
                                  (with-meta base {:raster.type/tag tag})
                                  (with-meta base nil))))
                            params))
+          wrt-indices (when (some? wrt)
+                        (let [requested (set wrt)
+                              valid (set (range (count params)))]
+                          (when-not (and (sequential? wrt)
+                                         (= (count wrt) (count requested))
+                                         (every? valid requested))
+                            (throw (ex-info ":wrt must be a sequence of distinct zero-based parameter indices"
+                                            {:wrt wrt :parameter-count (count params)})))
+                          (doseq [i requested]
+                            (when-not (differentiable-tag? (nth tags i nil))
+                              (throw (ex-info ":wrt selects a non-differentiable parameter"
+                                              {:index i :tag (nth tags i nil)}))))
+                          requested))
         ;; Only differentiable-tag params seed activity analysis. Non-diff
         ;; params (Long/longs scalars, indices, etc.) are constants for AD —
         ;; expressions involving only them stay inactive and don't need AD
@@ -3938,7 +3959,9 @@
         ;; (via all-params) so positional consumers don't shift.
           diff-active-params (vec (keep-indexed
                                    (fn [i p]
-                                     (when (differentiable-tag? (nth tags i nil)) p))
+                                     (when (and (differentiable-tag? (nth tags i nil))
+                                                (or (nil? wrt-indices)
+                                                    (contains? wrt-indices i))) p))
                                    all-params))
           source-ns (or (:ns m) *ns*)
         ;; Π: the SEED is the cotangent of the RESULT of the differentiated
@@ -3965,7 +3988,9 @@
                                 (zipmap all-params tags)))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
-          ad-form (transform-body hoisted diff-active-params)
+          ad-form (binding [*constant-gradient-arrays*
+                            (set (remove (set diff-active-params) all-params))]
+                    (transform-body hoisted diff-active-params))
           flat (binding [ad-flatten/*flatten-dtype* dtype]
                  (ad-flatten/flatten-for-gradient ad-form))
         ;; Pad the gradient output vector so positional consumers see one slot
@@ -4166,6 +4191,9 @@
 
   Options:
     :mode  - :reverse (default), :forward, or :auto
+    :wrt   - distinct zero-based parameter indices to differentiate in reverse
+             mode; other gradient slots are nil (e.g. :wrt [0 3 4] keeps an
+             observation array at index 1 constant)
 
   Usage:
     ;; Runtime
@@ -4177,10 +4205,10 @@
         (axpy! W W (- lr) d_W)
         loss))"
   ([f-var] (value+grad f-var :mode :reverse))
-  ([f-var & {:keys [mode] :or {mode :reverse}}]
+  ([f-var & {:keys [mode wrt] :or {mode :reverse}}]
    (case mode
      :reverse
-     (let [bgw (build-grad-walked-body f-var)
+     (let [bgw (build-grad-walked-body f-var wrt)
            ;; Fail loud, never return a broken IFn: flatten-for-gradient returns
            ;; nil when the AD form isn't the flat [primal (fn* [dy] ...)] shape —
            ;; today that's a body that IS (or tail-lifts to) a raw loop, whose
@@ -4218,6 +4246,10 @@
             :raster.core/deftm-tags tags})))
 
      :forward
+     (do
+       (when (some? wrt)
+         (throw (ex-info ":wrt is not yet supported in forward AD"
+                         {:mode mode :wrt wrt})))
      ;; Forward-mode gradient via Dual numbers on the walked body.
      ;; Un-devirtualize .invk → generic dispatch so Dual numbers propagate.
      ;; Admissibility is checked at CONSTRUCTION time (framework §11): fail
@@ -4275,7 +4307,7 @@
                            0.0)]
                (clojure.core/aset grads i deriv)))
            (vec (cons (if (.isInstance dual-class value) (get-v value) value)
-                      (seq grads))))))
+                      (seq grads)))))))
 
      :auto
      ;; Mode selection = argmin cost over ADMISSIBLE interpretations
@@ -4290,7 +4322,7 @@
            selected (if (and (<= n-params 1) (forward-admissible? f-var))
                       :forward
                       :reverse)]
-       (value+grad f-var :mode selected)))))
+       (value+grad f-var :mode (if (some? wrt) :reverse selected) :wrt wrt)))))
 
 (defn grad
   "Composable gradient operator.
@@ -4305,14 +4337,16 @@
 
   Options:
     :mode  - :reverse (default), :forward, or :auto
+    :wrt   - distinct zero-based parameter indices to differentiate in reverse
+             mode; other gradient slots are nil
 
   Usage:
     ((grad #'my-loss) 3.0 4.0)   ;; => [6.0 8.0]
     ((grad #'square) 3.0)        ;; => 6.0        (1-param: bare scalar)
     ((grad (grad #'cube)) 2.0)   ;; => 12.0       (f'' composes directly)"
   ([f-var] (grad f-var :mode :reverse))
-  ([f-var & {:keys [mode] :or {mode :reverse}}]
-   (let [vg-fn (value+grad f-var :mode mode)
+  ([f-var & {:keys [mode wrt] :or {mode :reverse}}]
+   (let [vg-fn (value+grad f-var :mode mode :wrt wrt)
          vg-meta (meta vg-fn)]
      ;; Build a grad-specific walked body that drops the primal
      (if-let [wb (:raster.core/deftm-walked-body vg-meta)]
