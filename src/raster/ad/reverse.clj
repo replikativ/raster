@@ -21,6 +21,7 @@
             [clojure.string :as str]
             [clojure.walk :as walk]
             [raster.ad.forward :as fwd]
+            [raster.ad.purity :as purity]
             [raster.numeric :as numeric]
             [raster.ad.templates :as tmpl]
             [raster.compiler.ad.bind-ctx :as bind-ctx]
@@ -31,6 +32,7 @@
             [raster.ad.tangent :as tangent]
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -750,8 +752,9 @@
 
 (defmethod emit-backward :par-reduce
   [{:keys [sym read-arrs d-read-arr-syms d-scalar-syms active-free
-           shadow-allocs backward-maps backward-reduces d-acc-sym]}
-   _adj-sym _activity {:keys [adj-env rev-ctx]}]
+           shadow-allocs backward-maps backward-reduces d-acc-sym
+           bwd-result-sym init-expr]}
+   _adj-sym activity {:keys [adj-env rev-ctx]}]
   (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
         ;; par/reduce returns a SCALAR — a typed scalar zero (Π on the reduce
         ;; result's tag) for the empty case; untagged stays the double 0.0
@@ -762,9 +765,19 @@
                    0.0)
         rev-ctx (bindings-into rev-ctx [d-acc-sym (sum-contribs (get adj-env sym) acc-zero)])
         rev-ctx (reduce bindings-into rev-ctx backward-maps)
-        rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
+        rev-ctx (reduce bindings-into rev-ctx backward-reduces)
+        adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms
+                                    active-free d-scalar-syms)
+        ;; The carry cotangent after reversing iteration zero belongs to the
+        ;; reduction init, including the zero-trip case.
+        adj-env (if (and (symbol? init-expr) (get activity init-expr false))
+                  (update adj-env init-expr (fnil conj [])
+                          (list 'nth bwd-result-sym
+                                (clojure.core/+ (count read-arrs)
+                                                (count active-free))))
+                  adj-env)]
     {:rev-ctx rev-ctx
-     :adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms active-free d-scalar-syms)}))
+     :adj-env adj-env}))
 
 (defmethod emit-backward :par-scan
   [{:keys [sym written-arrs read-arrs active-free shadow-allocs backward-loop
@@ -2029,6 +2042,35 @@
 ;; Par reduce reverse-mode AD (preserves parallel structure)
 ;; ================================================================
 
+(declare ^:private carry-scan-dtype)
+(declare ^:private carry-dtype-consistent?)
+
+(defn- replay-pure-reduce-expr?
+  "A narrow proof that a scalar reduction step may be evaluated again in reverse.
+  Devirtualized calls can lose their original-op metadata in AD preparation, so
+  resolve and check the concrete implementation var rather than trusting `.invk`
+  or guessing a name from its mangle. Unknown calls keep the closure-tape route."
+  [expr]
+  (cond
+    (seq? expr)
+    (let [head (first expr)]
+      (cond
+        (contains? #{'let 'let*} head)
+        (and (every? replay-pure-reduce-expr? (map second (partition 2 (second expr))))
+             (every? replay-pure-reduce-expr? (drop 2 expr)))
+        (contains? #{'if 'do} head)
+        (every? replay-pure-reduce-expr? (rest expr))
+        (= '.invk head)
+        (let [impl-var (when (symbol? (second expr)) (resolve (second expr)))]
+          (and (var? impl-var)
+               (= :pure (effects/analyze-var-effect impl-var))
+               (every? replay-pure-reduce-expr? (nnext expr))))
+        :else
+        (and (= :pure (purity/pure-op? head))
+             (every? replay-pure-reduce-expr? (rest expr)))))
+    (vector? expr) (every? replay-pure-reduce-expr? expr)
+    :else true))
+
 (defn- analyze-par-reduce-body
   "Analyze a par/reduce body for aget references and free scalars.
   Similar to analyze-par-map-body but for reduce body context — including
@@ -2087,26 +2129,53 @@
 
   Forward form: (raster.par/reduce acc init idx bound body-expr)
 
-  Strategy (closures-as-tape):
-  - Forward: run the reduce as-is (sequential), also store per-element
-    pullback closures in an object-array tape.
-  - Backward: for array inputs, emit par/map! applying pullback[i] * d_acc
-    for scalar inputs, emit par/reduce summing pullback contributions.
-
-  For simple reductions (acc + f(x[i])):
-  d_x[i] = d_acc * df/d(x[i]) → par/map!
+  Proven-pure double-carry steps use one primitive carry tape and replay the
+  scalar step during the ordered reverse sweep. Other supported steps retain
+  their per-step closure tape; neither route reorders the carry dependence.
 
   Returns a record map for gen-reverse-let to use."
   [par-reduce-form active-params]
   (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
+        _ (when (and (seq? init-expr)
+                     (some (set active-params)
+                           (free-syms-excluding init-expr #{})))
+            (throw (ex-info
+                    "par/reduce AD: active compound init must be let-bound before the reduction"
+                    {:reason :par-reduce-active-compound-init
+                     :init init-expr})))
         {:keys [agets scalar-bindings body-result free-syms]}
         (analyze-par-reduce-body body-expr idx-sym acc-sym)
+        typed-double? (and (every? (comp replay-pure-reduce-expr? second)
+                                  scalar-bindings)
+                           (replay-pure-reduce-expr? body-result)
+                           (= :double (or (carry-scan-dtype acc-sym)
+                                          (carry-scan-dtype init-expr)
+                                          (some (fn [p]
+                                                  (when (= p init-expr)
+                                                    (carry-scan-dtype p)))
+                                                active-params)))
+                           (= 'double (or (:raster.type/tag (meta body-result))
+                                          (inf/infer-rewritten-tag body-result)))
+                           (carry-dtype-consistent? :double body-expr))
 
         ;; Read arrays (via aget in body)
         read-arrs (vec (distinct (map :arr agets)))
 
         ;; Active free symbols
         active-free (filterv (fn [p] (contains? free-syms p)) active-params)
+        _ (doseq [p active-free]
+            (when (= :array (:kind (tangent/tangent-kind
+                                    (:raster.type/tag (meta p)))))
+              (throw (ex-info
+                      "par/reduce AD: active arrays must be read through a recognized aget"
+                      {:reason :par-reduce-untracked-array-read
+                       :array p :body body-expr}))))
+        _ (doseq [{:keys [idx]} agets]
+            (when-not (= idx-sym idx)
+              (throw (ex-info
+                      "par/reduce AD: shifted array reads require an indexed scatter residual"
+                      {:reason :par-reduce-shifted-read
+                       :index idx :reduction-index idx-sym}))))
 
         ;; For each iteration, differentiate the body w.r.t. its inputs
         ;; The body of a reduce uses acc + some per-element function
@@ -2127,6 +2196,7 @@
         val-result-sym (ad-gensym "val")
         pb-sym (ad-gensym "pb")
         fwd-idx-sym (ad-gensym "fi")
+        d-acc-chain-sym (ad-gensym "d_acc_chain")
 
         ;; Per-iteration scalar transform
         scalar-transform
@@ -2134,27 +2204,33 @@
           (let [binds (if (seq pure-scalar-bindings)
                         (vec (concat pure-scalar-bindings [val-result-sym body-result]))
                         [val-result-sym body-result])]
-            (gen-reverse-let binds [val-result-sym] iter-active)))
+            (if typed-double?
+              (gen-inline-step-gradients binds [val-result-sym]
+                                         iter-active d-acc-chain-sym)
+              (gen-reverse-let binds [val-result-sym] iter-active))))
 
         ;; === Forward code ===
         ;; Run the reduce sequentially, storing pullbacks in tape
         fwd-loop-body
         (when scalar-transform
-          (let [aget-bindings (vec (mapcat (fn [{:keys [sym arr idx]}]
-                                             [sym (list 'aget arr idx)])
-                                           agets))
-                transform-bindings [vpb-sym scalar-transform
-                                    val-result-sym (list 'nth vpb-sym 0)
-                                    pb-sym (list 'nth vpb-sym 1)]
-                store-binding [(ad-gensym "_store") (list 'aset tape-sym fwd-idx-sym pb-sym)]
-                all-bindings (vec (concat aget-bindings transform-bindings store-binding))]
-            ;; The forward loop binds the ALPHA-RENAMED index (fwd-idx-sym) —
-            ;; rewrite any surviving reference to the original reduce index
-            ;; (aget-binding index exprs, index refs in scalar-binding inits)
-            ;; onto it, capture-avoidingly. Without this the emitted loop body
-            ;; references an unbound symbol.
-            (util/subst-syms {idx-sym fwd-idx-sym}
-                             (list 'let* all-bindings val-result-sym))))
+          (if typed-double?
+            (util/subst-syms
+             {idx-sym fwd-idx-sym}
+             (list 'let* [val-result-sym body-expr
+                          (ad-gensym "_store")
+                          (list 'aset tape-sym fwd-idx-sym val-result-sym)]
+                   val-result-sym))
+            (let [aget-bindings (vec (mapcat (fn [{:keys [sym arr idx]}]
+                                               [sym (list 'aget arr idx)])
+                                             agets))
+                  transform-bindings [vpb-sym scalar-transform
+                                      val-result-sym (list 'nth vpb-sym 0)
+                                      pb-sym (list 'nth vpb-sym 1)]
+                  store-binding [(ad-gensym "_store") (list 'aset tape-sym fwd-idx-sym pb-sym)]
+                  all-bindings (vec (concat aget-bindings transform-bindings store-binding))]
+              ;; The forward loop binds the ALPHA-RENAMED index (fwd-idx-sym).
+              (util/subst-syms {idx-sym fwd-idx-sym}
+                               (list 'let* all-bindings val-result-sym)))))
 
         ;; Forward code packs [tape, reduce-result] in an object-array pair.
         ;; The caller (gen-reverse-let) unpacks tape and result from the pair.
@@ -2164,7 +2240,8 @@
         forward-code
         (when fwd-loop-body
           (let [pair-arr-sym (ad-gensym "pair")]
-            (list 'let* [tape-sym (list 'object-array bound-expr)
+            (list 'let* [tape-sym (list (if typed-double? 'double-array 'object-array)
+                                          bound-expr)
                          reduce-result-sym
                          (list 'loop* [fwd-idx-sym 0 acc-sym init-expr]
                                (list 'if (list 'clojure.core/< fwd-idx-sym bound-expr)
@@ -2177,9 +2254,9 @@
 
         ;; === Backward code ===
         d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
+        arr->d-sym (zipmap read-arrs d-read-arr-syms)
         d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
         d-acc-sym (ad-gensym "d_acc")
-        bwd-idx-sym (ad-gensym "bi")
         iter-pb-sym (ad-gensym "iter_pb")
         grads-iter-sym (ad-gensym "grads_iter")
 
@@ -2218,21 +2295,33 @@
 
         ;; Sequential backward loop: iterate from n-1 to 0
         j-sym (ad-gensym "j")
-        d-val-sym (ad-gensym "d_val")
-        d-acc-chain-sym (ad-gensym "d_acc_chain")
-
         bwd-body-bindings
         (vec (concat
-              [iter-pb-sym (list 'aget tape-sym j-sym)
-               grads-iter-sym (list iter-pb-sym d-acc-chain-sym)]
+              (if typed-double?
+                (concat
+                 [acc-sym (list 'if (list 'clojure.core/zero? j-sym)
+                                init-expr
+                                (list 'aget tape-sym (list 'clojure.core/dec j-sym)))]
+                 (mapcat (fn [{:keys [sym arr idx]}]
+                           [sym (util/subst-syms
+                                 {idx-sym j-sym} (list 'aget arr idx))])
+                         agets)
+                 [grads-iter-sym
+                  (util/subst-syms {idx-sym j-sym} scalar-transform)])
+                [iter-pb-sym (list 'aget tape-sym j-sym)
+                 grads-iter-sym (list iter-pb-sym d-acc-chain-sym)])
               ;; aset into shadow arrays for aget'd inputs
               ;; acc is iter-active[0], aget-syms are [1..n-agets]
-              (mapcat (fn [i _aget-info d-arr-sym]
-                        (let [scatter-sym (ad-gensym "_scatter")]
+              (mapcat (fn [i {:keys [arr]}]
+                        (let [scatter-sym (ad-gensym "_scatter")
+                              d-arr-sym (get arr->d-sym arr)]
                           [scatter-sym
                            (list 'aset d-arr-sym j-sym
-                                 (list 'nth grads-iter-sym (clojure.core/+ 1 i)))]))
-                      (range) agets d-read-arr-syms)))
+                                 (list 'raster.ad.reverse/grad-acc
+                                       (list 'aget d-arr-sym j-sym)
+                                       (list 'nth grads-iter-sym
+                                             (clojure.core/+ 1 i))))]))
+                      (range) agets)))
 
         ;; Recur: update j, chain d_acc through, accumulate scalar grads
         bwd-recur-args
@@ -2256,7 +2345,8 @@
                d-acc-chain-sym d-acc-sym]
               (mapcat (fn [s] [s nil]) d-scalar-syms)))
 
-        bwd-return (vec (concat d-read-arr-syms d-scalar-syms))
+        bwd-return (vec (concat d-read-arr-syms d-scalar-syms
+                                [d-acc-chain-sym]))
 
         backward-loop
         (list 'let* [n-bwd-sym bound-expr]
@@ -2271,6 +2361,7 @@
         bwd-result-sym (ad-gensym "red_bwd")]
 
     {:type :par-reduce
+     :residual-kind (if typed-double? :double-carry :closure-tape)
      :forward-code forward-code
      :tape-sym tape-sym
      :d-acc-sym d-acc-sym
@@ -2296,6 +2387,8 @@
            d-scalar-syms))
      :bound-expr bound-expr
      :reduce-result-sym reduce-result-sym
+     :bwd-result-sym bwd-result-sym
+     :init-expr init-expr
      :result-pair-sym result-pair-sym}))
 
 ;; ================================================================
