@@ -41,11 +41,12 @@
 (defn- seal-effect-evidence
   "Authorize reuse only for the exact in-process plan and evidence objects just validated."
   [plan evidence]
-  (let [owner (volatile! nil)
+  (let [plan-ref (java.lang.ref.WeakReference. plan)
+        owner (volatile! nil)
         sealed (with-meta evidence
                  {::validation-seal
                   (fn [candidate-plan candidate-evidence]
-                    (when (and (identical? plan candidate-plan)
+                    (when (and (identical? (.get plan-ref) candidate-plan)
                                (identical? @owner candidate-evidence))
                       effect-evidence-seal-token))})]
     (vreset! owner sealed)
