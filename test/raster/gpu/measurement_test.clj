@@ -77,7 +77,9 @@
   (let [executable
         (link/map->LinkedExecutable
          {:plan {:nodes {:cache {:role :state}}}
-          :pending-inputs (atom #{}) :closed? (atom false)})]
+          :pending-inputs (atom #{}) :closed? (atom false)
+          :lifetime-lock (Object.) :output-leases (atom 0)
+          :output-ready? (atom false)})]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :before-sample!"
                           (link/measure! executable :budget-ms 1)))))
 
@@ -90,6 +92,8 @@
           :session :session
           :prepared-program :prepared
           :pending-inputs (atom #{})
+          :lifetime-lock (Object.) :output-leases (atom 0)
+          :output-ready? (atom false) :completed-replays (atom 0)
           :closed? (atom false)})]
     (with-redefs [parallel-program/profile-prepared!
                   (fn [prepared profile-handle!]
@@ -100,6 +104,7 @@
                      :kernel-total-ms 0.001
                      :device-wall-ms 0.002
                      :host-wall-ms 99.0
+                     :timing-scope :single-graph-span
                      :program-graph-count 1})
                   measurement/measure!
                   (fn [sample! & options]
@@ -110,9 +115,26 @@
                                   :budget-ms 7)]
         (is (= 2000.0 (:sample-ns result)))
         (is (= :device-event (get-in result [:options :timing-source])))
+        (is (= :single-graph-span (:timing-scope result)))
         (is (= 7 (get-in result [:options :budget-ms])))
         (is (= 1 @restores)))
       (is (= 2 @profiles)))))
+
+(deftest profiling-and-measurement-respect-output-leases
+  (let [executable
+        (link/map->LinkedExecutable
+         {:plan {:nodes {}} :session :session :prepared-program :prepared
+          :pending-inputs (atom #{}) :closed? (atom false)
+          :lifetime-lock (Object.) :output-leases (atom 1)
+          :output-ready? (atom true) :completed-replays (atom 1)})]
+    (is (= :link-output-lease-active
+           (try (link/profile! executable)
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :link-output-lease-active
+           (try (link/measure! executable :budget-ms 1)
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (true? @(:output-ready? executable)))
+    (is (= 1 @(:completed-replays executable)))))
 
 (deftest bound-graph-profile-preserves-device-span-and-kernel-breakdown
   (let [calls (atom []) session (atom {:device-id :probe})]
@@ -142,7 +164,7 @@
   (let [calls (atom [])
         session (atom {:device-id :probe})
         candidates (mapv (fn [id] {:id id :handle id
-                                  :before-sample! #(swap! calls conj [:restore id])}) [:a :b])]
+                                   :before-sample! #(swap! calls conj [:restore id])}) [:a :b])]
     (with-redefs-fn
       {(ns-resolve 'raster.gpu.core 'resolve-kernel-graph-entry)
        (fn [_ handle] {:profile? (not= :unprofiled handle) :runtime-graph handle})
@@ -162,6 +184,6 @@
         (let [result (gpu/measure-bound-kernel-graphs-interleaved!
                       session candidates :warmup-rounds 1 :rounds 2)]
           (is (= (vec (mapcat (fn [id] [[:restore id] [:replay id] [:timestamp id]])
-                             [:a :b :a :b :b :a])) @calls))
+                              [:a :b :a :b :b :a])) @calls))
           (is (= [1000.0 1000.0] (get-in result [:measurements :a :samples-ns])))
           (is (= :device-event (get-in result [:measurements :b :timing-source]))))))))

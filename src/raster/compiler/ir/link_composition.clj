@@ -413,6 +413,8 @@
                               node (cond-> (assoc-in node [:view :allocation :id] allocation-id')
                                      (contains? connected-sources node-id)
                                      (assoc :role :internal)
+                                     (contains? connected-sources node-id)
+                                     (assoc :source nil)
                                      (contains? shared-source-by-node node-id)
                                      (assoc :source (get shared-source-by-node node-id)))]
                           [node-id node]))))

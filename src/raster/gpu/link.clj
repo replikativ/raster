@@ -140,7 +140,7 @@
 
    Attached executables own only their phases or prepared equation graphs, graph recording and
    allocation registrations. Their close does not close the caller session and never frees
-   caller-owned buffers. The initial equation-first runtime accepts one ProgramLinkInstance; mixed
+   caller-owned buffers. Ordered equation-first programs share one resident LinkPlan; mixed
    descriptor/program scheduling remains a fail-loud compiler boundary."
   ([plan] (instantiate! plan {}))
   ([plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false}}]
@@ -161,7 +161,8 @@
          ;; facts. Re-running initialization-contract would parse and analyze the plan again.
          initialization (get-in validated [:effect-evidence :initialization])
          program-instances (filterv link-plan/program-link-instance? (:instances plan))
-         _ (when (and (seq program-instances) (not= 1 (count (:instances plan))))
+         _ (when (and (seq program-instances)
+                      (not= (count program-instances) (count (:instances plan))))
              (throw (ex-info
                      "runtime composition of emitted programs with other instances is not yet scheduled"
                      {:reason :link-runtime-mixed-program-instances
@@ -243,59 +244,62 @@
                      :when source]
                (gpu/upload-range! session (get node-views node-id) source
                                   {:elements (reduce * 1 (:shape view))})))
-           (if-let [instance (first program-instances)]
+           (if (seq program-instances)
              (vreset!
               prepared-program
               (timed-phase!
                timings :binding
-               (fn [] (parallel-program/prepare-with!
-                 (:call instance)
-                 {:buffer-view (fn [value-id]
-                               (:view (resident-link-value plan node-views value-id)))
-                :bind! (fn [key graph buffers scalars]
-                         (let [resident-buffers
-                               (into {}
-                                     (map (fn [[compiler-value value-id]]
-                                            [compiler-value
-                                             (resident-link-value plan node-views value-id)]))
-                                     buffers)
-                               extent-scalars
-                               (into {}
-                                     (keep (fn [[compiler-value resident]]
-                                             (when-let [extent (first (get-in resident [:view :shape]))]
-                                               [(list 'extent compiler-value)
-                                                {:type :long :value extent}])))
-                                     resident-buffers)]
-                           (gpu/bind-kernel-graph!
-                            session [::program-graph execution-id key] graph
-                            resident-buffers (merge extent-scalars scalars)
-                            {:profile? profile?})))
-                  :run! #(gpu/run-kernel-graph! session %)
-                  :release! #(gpu/release-kernel-graph! session %)}))))
+               (fn []
+                 (let [executor {:buffer-view (fn [value-id]
+                                                (:view (resident-link-value plan node-views value-id)))
+                                 :bind! (fn [key graph buffers scalars]
+                                          (let [resident-buffers
+                                                (into {}
+                                                      (map (fn [[compiler-value value-id]]
+                                                             [compiler-value
+                                                              (resident-link-value plan node-views value-id)]))
+                                                      buffers)
+                                                extent-scalars
+                                                (into {}
+                                                      (keep (fn [[compiler-value resident]]
+                                                              (when-let [extent (first (get-in resident [:view :shape]))]
+                                                                [(list 'extent compiler-value)
+                                                                 {:type :long :value extent}])))
+                                                      resident-buffers)]
+                                            (gpu/bind-kernel-graph!
+                                             session [::program-graph execution-id key] graph
+                                             resident-buffers (merge extent-scalars scalars)
+                                             {:profile? profile?})))
+                                 :run! #(gpu/run-kernel-graph! session %)
+                                 :release! #(gpu/release-kernel-graph! session %)}]
+                   (if (= 1 (count program-instances))
+                     (parallel-program/prepare-with! (:call (first program-instances)) executor)
+                     (parallel-program/prepare-sequence-with!
+                      (mapv #(select-keys % [:id :call]) program-instances) executor))))))
              (do
                (timed-phase!
                 timings :binding
                 (fn [] (doseq [instance (:instances plan)
-                         [step-index step]
-                         (map-indexed vector (get-in instance [:descriptor :steps]))]
-                 (let [phase (phase-key execution-id (:id instance) step-index)
-                       bindings (:bindings instance)]
-                   (gpu/bind-step!
-                    session (assoc step :phase phase) (link-plan/instance-arguments instance)
-                    (fn [symbol]
-                      (let [value-id (get bindings symbol)]
-                        (try (resident-link-value plan node-views value-id)
-                             (catch clojure.lang.ExceptionInfo error
-                               (throw (ex-info (.getMessage error)
-                                               (assoc (ex-data error)
-                                                      :instance (:id instance) :symbol symbol)
-                                               error))))))
-                    {:schedule (or (:schedule instance)
-                                   (get-in instance [:descriptor :schedule]))
+                               [step-index step]
+                               (map-indexed vector (get-in instance [:descriptor :steps]))]
+                         (let [phase (phase-key execution-id (:id instance) step-index)
+                               bindings (:bindings instance)]
+                           (gpu/bind-step!
+                            session (assoc step :phase phase) (link-plan/instance-arguments instance)
+                            (fn [symbol]
+                              (let [value-id (get bindings symbol)]
+                                (try (resident-link-value plan node-views value-id)
+                                     (catch clojure.lang.ExceptionInfo error
+                                       (throw (ex-info (.getMessage error)
+                                                       (assoc (ex-data error)
+                                                              :instance (:id instance) :symbol symbol)
+                                                       error))))))
+                            {:schedule (or (:schedule instance)
+                                           (get-in instance [:descriptor :schedule]))
                      ;; Constant transforms may execute while recording, before run!'s input
                      ;; gate. Only captured, locally unwritten values can enter that prologue.
-                     :roles (instance-runtime-roles plan instance initialization)})
-                   (vswap! phases conj phase)))))
+                             :roles (instance-runtime-roles plan instance initialization)})
+                           (vswap! phases conj phase)))))
                (let [gkey (graph-key execution-id)]
                  (timed-phase! timings :graph-recording
                                #(gpu/record-graph! session @phases gkey {:profile? profile?}))
@@ -955,31 +959,33 @@
   [executable]
   (let [executable (ensure-live! executable :execution-order)]
     (if-let [prepared (:prepared-program executable)]
-      (annotate-program-order
-       (:plan executable)
-       (parallel-program/execution-order
-        prepared #(gpu/kernel-graph-execution-order (:session executable) %)))
+      (let [order (parallel-program/execution-order
+                   prepared #(gpu/kernel-graph-execution-order (:session executable) %))]
+        (if (parallel-program/prepared-sequence? prepared)
+          (assoc order :plan (get-in executable [:plan :id])
+                 :target (get-in executable [:plan :target]))
+          (annotate-program-order (:plan executable) order)))
       (let [phases (:phases executable)
-          sources (vec (for [instance (:instances (:plan executable))
-                             [step-index _] (map-indexed vector
-                                                         (get-in instance [:descriptor :steps]))]
-                         {:instance (:id instance) :step step-index}))]
-      (when-not (= (count phases) (count sources))
-        (throw (ex-info "linked phase count differs from source descriptor steps"
-                        {:reason :link-execution-order-phase-count
-                         :phases (count phases) :steps (count sources)})))
-      (let [source-by-phase (zipmap phases sources)
-            annotate (fn [entry]
-                       (if-let [source (get source-by-phase (:phase entry))]
-                         (assoc entry :source source)
-                         (throw (ex-info "recorded kernel phase has no linked source step"
-                                         {:reason :link-execution-order-phase
-                                          :phase (:phase entry)}))))]
-        (-> (gpu/graph-execution-order (:session executable) (:graph-key executable))
-            (assoc :plan (:id (:plan executable))
-                   :target (:target (:plan executable)))
-            (update :record-time-prologue #(mapv annotate %))
-            (update :per-replay #(mapv annotate %))))))))
+            sources (vec (for [instance (:instances (:plan executable))
+                               [step-index _] (map-indexed vector
+                                                           (get-in instance [:descriptor :steps]))]
+                           {:instance (:id instance) :step step-index}))]
+        (when-not (= (count phases) (count sources))
+          (throw (ex-info "linked phase count differs from source descriptor steps"
+                          {:reason :link-execution-order-phase-count
+                           :phases (count phases) :steps (count sources)})))
+        (let [source-by-phase (zipmap phases sources)
+              annotate (fn [entry]
+                         (if-let [source (get source-by-phase (:phase entry))]
+                           (assoc entry :source source)
+                           (throw (ex-info "recorded kernel phase has no linked source step"
+                                           {:reason :link-execution-order-phase
+                                            :phase (:phase entry)}))))]
+          (-> (gpu/graph-execution-order (:session executable) (:graph-key executable))
+              (assoc :plan (:id (:plan executable))
+                     :target (:target (:plan executable)))
+              (update :record-time-prologue #(mapv annotate %))
+              (update :per-replay #(mapv annotate %))))))))
 
 (defn profile!
   "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready.
@@ -989,40 +995,46 @@
    but callers need not decode generated kernel names or execution UUIDs to attribute costs."
   [executable]
   (let [executable (ensure-live! executable :profile!)]
-    (when (seq @(:pending-inputs executable))
-      (throw (ex-info "linked executable has inputs or state that have not been initialized"
-                      {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
-    (if-let [prepared (:prepared-program executable)]
-      (parallel-program/profile-prepared!
-       prepared #(gpu/profile-bound-kernel-graph! (:session executable) %))
-      (let [profile (gpu/profile-recorded-graph! (:session executable) (:graph-key executable))
-            instances (into {} (map (juxt :id identity)) (get-in executable [:plan :instances]))]
-        (update profile :profile
-                (fn [events]
-                  (mapv
-                   (fn [{:keys [phase] :as event}]
-                     (let [nested? (and (vector? phase)
-                                        (= ::gpu/graph-node-phase (first phase)))
-                           parent-phase (if nested? (second phase) phase)
-                           node-id (when nested? (nth phase 2 nil))
-                           [kind _ instance-id step-index]
-                           (when (vector? parent-phase) parent-phase)
-                           step (when (and (= ::phase kind) (integer? step-index)
-                                           (not (neg? step-index)))
-                                  (get-in instances [instance-id :descriptor :steps step-index]))]
-                       (if step
-                         (assoc event :compiler-step
-                                (cond->
-                                 {:instance-id instance-id
-                                  :step-index step-index
-                                  :convention (:convention step)
-                                  :provenance (select-keys (get-in step [:artifact :provenance])
-                                                           [:semantic-op :dialect :source-dialect
-                                                            :segop-id :operation-id :strategy
-                                                            :variant])}
-                                  nested? (assoc :graph-node-id node-id)))
-                         event)))
-                   events)))))))
+    (with-unleased-execution! executable :profile!
+      (fn []
+        (when (seq @(:pending-inputs executable))
+          (throw (ex-info "linked executable has inputs or state that have not been initialized"
+                          {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
+        (reset! (:output-ready? executable) false)
+        (let [result (if-let [prepared (:prepared-program executable)]
+                       (parallel-program/profile-prepared!
+                        prepared #(gpu/profile-bound-kernel-graph! (:session executable) %))
+                       (let [profile (gpu/profile-recorded-graph! (:session executable) (:graph-key executable))
+                             instances (into {} (map (juxt :id identity)) (get-in executable [:plan :instances]))]
+                         (update profile :profile
+                                 (fn [events]
+                                   (mapv
+                                    (fn [{:keys [phase] :as event}]
+                                      (let [nested? (and (vector? phase)
+                                                         (= ::gpu/graph-node-phase (first phase)))
+                                            parent-phase (if nested? (second phase) phase)
+                                            node-id (when nested? (nth phase 2 nil))
+                                            [kind _ instance-id step-index]
+                                            (when (vector? parent-phase) parent-phase)
+                                            step (when (and (= ::phase kind) (integer? step-index)
+                                                            (not (neg? step-index)))
+                                                   (get-in instances [instance-id :descriptor :steps step-index]))]
+                                        (if step
+                                          (assoc event :compiler-step
+                                                 (cond->
+                                                  {:instance-id instance-id
+                                                   :step-index step-index
+                                                   :convention (:convention step)
+                                                   :provenance (select-keys (get-in step [:artifact :provenance])
+                                                                            [:semantic-op :dialect :source-dialect
+                                                                             :segop-id :operation-id :strategy
+                                                                             :variant])}
+                                                   nested? (assoc :graph-node-id node-id)))
+                                          event)))
+                                    events)))))]
+          (swap! (:completed-replays executable) inc)
+          (reset! (:output-ready? executable) true)
+          result)))))
 
 (defn measure!
   "Measure a profiled LinkedExecutable with device events. Stateful plans require the explicit
@@ -1032,27 +1044,33 @@
         state-nodes (into #{} (keep (fn [[node-id node]]
                                       (when (= :state (:role node)) node-id)))
                           (get-in executable [:plan :nodes]))]
-    (when (seq @(:pending-inputs executable))
-      (throw (ex-info "linked executable has inputs or state that have not been initialized"
-                      {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
-    (when (and (seq state-nodes) (nil? before-sample!))
-      (throw (ex-info "stateful linked executables require :before-sample! restoration"
-                      {:reason :link-stateful-measurement :state-nodes state-nodes})))
-    (if-let [prepared (:prepared-program executable)]
-      (let [sample! (fn []
-                      (when before-sample! (before-sample!))
-                      (* 1.0e6
-                         (double
-                          (:device-wall-ms
-                           (parallel-program/profile-prepared!
-                            prepared
-                            #(gpu/profile-bound-kernel-graph! (:session executable) %))))))
-            measurement-options (-> opts
-                                    (dissoc :before-sample!)
-                                    (assoc :timing-source :device-event))]
-        (apply measurement/measure! sample! (mapcat identity measurement-options)))
-      (apply gpu/measure-recorded-graph! (:session executable) (:graph-key executable)
-             (mapcat identity opts)))))
+    (with-unleased-execution! executable :measure!
+      (fn []
+        (when (seq @(:pending-inputs executable))
+          (throw (ex-info "linked executable has inputs or state that have not been initialized"
+                          {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
+        (when (and (seq state-nodes) (nil? before-sample!))
+          (throw (ex-info "stateful linked executables require :before-sample! restoration"
+                          {:reason :link-stateful-measurement :state-nodes state-nodes})))
+        (reset! (:output-ready? executable) false)
+        (if-let [prepared (:prepared-program executable)]
+          (let [timing-scope (volatile! nil)
+                sample! (fn []
+                          (when before-sample! (before-sample!))
+                          (let [profile (parallel-program/profile-prepared!
+                                         prepared
+                                         #(gpu/profile-bound-kernel-graph!
+                                           (:session executable) %))]
+                            (vreset! timing-scope (:timing-scope profile))
+                            (* 1.0e6 (double (:device-wall-ms profile)))))
+                measurement-options (-> opts
+                                        (dissoc :before-sample!)
+                                        (assoc :timing-source :device-event))]
+            (assoc (apply measurement/measure! sample!
+                          (mapcat identity measurement-options))
+                   :timing-scope @timing-scope))
+          (apply gpu/measure-recorded-graph! (:session executable) (:graph-key executable)
+                 (mapcat identity opts)))))))
 
 (defn download
   "Download one complete contiguous LinkNode view. Debug/host-boundary helper, not invocation."
