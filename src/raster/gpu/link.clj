@@ -149,6 +149,9 @@
          timings (volatile! {})
          retained-evidence (when (identical? plan (:plan *certified-plan-evidence*))
                              (:evidence *certified-plan-evidence*))
+         retained-evidence (when (link-plan/retained-effect-evidence?
+                                  plan retained-evidence)
+                             retained-evidence)
          validated (timed-phase! timings :plan-validation
                                  #(if retained-evidence
                                     {:plan plan :effect-evidence retained-evidence}
@@ -342,9 +345,7 @@
                     {:reason :link-certified-lowering :actual (type lowering)})))
   (let [plan (:plan lowering)
         evidence (get-in lowering [:certificate :effect-evidence])]
-    (when-not (and (link-plan/effect-evidence? evidence)
-                   (= (:id plan) (:plan-id evidence))
-                   (= (:target plan) (:target evidence)))
+    (when-not (link-plan/retained-effect-evidence? plan evidence)
       (throw (ex-info "certified instantiation has no matching LinkPlan effect evidence"
                       {:reason :link-certified-effect-evidence :plan (:id plan)})))
     (binding [*certified-plan-evidence* {:plan plan :evidence evidence}]

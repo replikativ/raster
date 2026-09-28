@@ -763,7 +763,9 @@
                      {:reason :compiled-prepared-type :actual (type prepared)})))
    (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args
                  preparation-report]} prepared
-         executable (if (sealed-prepared? prepared)
+         evidence (get-in lowering [:certificate :effect-evidence])
+         executable (if (and (sealed-prepared? prepared)
+                             (link-plan/retained-effect-evidence? (:plan lowering) evidence))
                       (gpu-link/instantiate-certified! lowering opts)
                       (gpu-link/instantiate! (:plan lowering) opts))]
      (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args

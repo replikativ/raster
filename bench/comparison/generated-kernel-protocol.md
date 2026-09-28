@@ -97,9 +97,11 @@ The preparation report now divides `:equation-lower` into invocation materializa
 construction. These nested timings are diagnostic and must not be added to the outer phase totals.
 They identify which work remains after a compiler-template cache hit before a plan-template or
 certificate-reuse change is justified.
-An exact in-process `Prepared` now carries its already validated LinkPlan effect witness into
-instantiation. The runtime still checks the same external buffers, session target and backend
-binding after that reuse; a copied Prepared or a raw LinkPlan rederives plan validation. The
+An exact in-process `Prepared` may carry its already validated LinkPlan effect witness into
+instantiation when that witness is sealed to the same plan object. The runtime still checks the
+same external buffers, session target and backend binding after that reuse; a copied Prepared,
+a raw LinkPlan, or a resident descriptor rebound from a source-free template rederives plan
+validation. The
 instantiation report names `:sealed-prepared` or `:rederived` as its validation source. This
 removes one repeated host proof pass, not invocation materialization or LinkPlan construction;
 the next Q4 probe must measure those separately before claiming a preparation speedup.
