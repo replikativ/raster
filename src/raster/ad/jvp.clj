@@ -15,8 +15,8 @@
   decomposition; jvp only consumes reverse's shared pieces (ad-prepare,
   resolve-deftm-var, grad-acc as the ⊕ kernel).
 
-  A double-carry par/scan has a forward rule: a second scan over its
-  linearized recurrence. Other loop/SOAC forms still fail loud when active."
+  Double-carry par/scan and par/reduce have forward rules. Other loop/SOAC
+  forms still fail loud when active."
   (:require [raster.ad.reverse :as rev]
             [raster.ad.templates :as tmpl]
             [raster.ad.tangent :as tangent]
@@ -191,6 +191,59 @@
           result (jvp-gensym (str "d_" (name sym)) tag)]
       [result [dout alloc result scan]])))
 
+(defn- fold-double-reduce
+  "Run a reduction's primal and tangent carries together in one ordered loop.
+  Each scalar step is ANF-normalized once, so effects and reads are not replayed.
+  This is a forward rule for a double carry, not a reassociation of the fold."
+  [tenv sym reduce-form tag]
+  (let [[_ acc init idx bound body] reduce-form
+        init-tag (or (:raster.type/tag (meta init))
+                     (some (fn [p]
+                             (when (= p init) (:raster.type/tag (meta p))))
+                           (keys tenv))
+                     (when (instance? Double init) 'double))]
+    (when-not (and (= 'double tag)
+                   (= 'double init-tag)
+                   (= 'double (or (:raster.type/tag (meta body))
+                                  (inf/infer-rewritten-tag body))))
+      (throw (ex-info "jvp: reduction requires a proven double carry"
+                      {:reason :jvp-reduce-carry-precision
+                       :result-tag tag :init-tag init-tag
+                       :body-tag (inf/infer-rewritten-tag body)
+                       :form reduce-form})))
+    (when (and (seq? init) (any-active? tenv init))
+      (throw (ex-info "jvp: active reduction init must be bound before the fold"
+                      {:reason :jvp-reduce-active-init :init init})))
+    (let [dacc (jvp-gensym (str "d_" (name acc) "_carry") 'double)
+          step (jvp-gensym "reduce_step" 'double)
+          [body-bindings body-exprs] (extract-let-parts body)
+          body-result (if (= 1 (count body-exprs))
+                        (first body-exprs)
+                        (cons 'do body-exprs))
+          [step-bindings step-result]
+          (anf/normalize-for-ad
+           (vec (concat body-bindings [step body-result]))
+           [step] jvp-gensym)
+          {:keys [bindings] step-tenv :tenv}
+          (jvp-fold step-bindings (assoc tenv acc dacc))
+          dstep (or (get step-tenv step-result)
+                    (branch-tangent-zero step-result))
+          dinit (if (symbol? init) (or (get tenv init) 0.0) 0.0)
+          loop-body (list 'let* (vec bindings)
+                          (list 'recur (list 'clojure.core/inc idx)
+                                step-result dstep))
+          count-sym (jvp-gensym "reduce_count" 'int)
+          pair (jvp-gensym "reduce_pair")
+          result (jvp-gensym (str "d_" (name sym)) tag)
+          pair-expr (list 'loop* [idx 0 acc init dacc dinit]
+                          (list 'if (list 'clojure.core/< idx count-sym)
+                                loop-body
+                                [acc dacc]))]
+      [result [count-sym (list 'clojure.core/int bound)
+               pair pair-expr
+               sym (list 'nth pair 0)
+               result (list 'nth pair 1)]])))
+
 (defn- jvp-fold
   "A2: ONE pure reduce over the normalized ANF bindings threading
   {:tenv (tangent env, sym → tangent-sym), :bindings (flat primal+tangent)}.
@@ -198,11 +251,13 @@
   → paired tangent bindings via the op's (derived) :jvp-fn; templated-but-no-
   jvp-fn or un-templated-active → FAIL LOUD; `if` → branch-selected tangent
   with a typed zero for the inactive branch; double scans → a tangent scan;
+  double reductions → paired primal/tangent carries;
   other loops/par forms → FAIL LOUD."
   [norm-bindings param-tangents]
   (reduce
    (fn [{:keys [tenv bindings]} [sym init]]
-     (let [bindings (conj bindings sym init)
+     (let [prior-bindings bindings
+           bindings (conj bindings sym init)
            tag (:raster.type/tag (meta sym))
            done (fn [tenv' extra] {:tenv tenv' :bindings (into bindings extra)})]
        (cond
@@ -251,6 +306,20 @@
                    (done (assoc tenv sym dscan) extra))
 
                  :else (done tenv [])))
+
+             (= 'raster.par/reduce head)
+             (let [[_ acc reduce-init idx _bound body] init
+                   free-tenv (dissoc tenv acc idx)
+                   active? (or (and (symbol? reduce-init)
+                                    (contains? free-tenv reduce-init))
+                               (and (seq? reduce-init)
+                                    (any-active? free-tenv reduce-init))
+                               (any-active? free-tenv body))]
+               (if active?
+                 (let [[dreduce extra] (fold-double-reduce tenv sym init tag)]
+                   {:tenv (assoc tenv sym dreduce)
+                    :bindings (into prior-bindings extra)})
+                 (done tenv [])))
 
              ;; Remaining control flow has no forward rule yet.
              (contains? unsupported-forward-heads head)

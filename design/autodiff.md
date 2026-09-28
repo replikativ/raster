@@ -223,6 +223,10 @@ remain separate obligations. A proven-pure double-carry `par/reduce` now uses
 one primitive carry tape and replays the scalar step during the ordered reverse
 sweep; other supported reductions retain the closure tape. This does not yet
 make the reduction pullback differentiable for HVP.
+Forward-mode AD can carry a proven-double `par/reduce` primal and tangent in
+one ordered loop, evaluating each step once. This covers parameterized initial
+states and zero-trip reductions without a tape; non-double carries still
+decline until their precision contract is represented.
 
 Tail-accumulation loops lift to `par/reduce`:
 
