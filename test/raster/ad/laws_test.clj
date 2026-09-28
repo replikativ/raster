@@ -1519,12 +1519,13 @@
   (let [xs (double-array [0.4 -0.7 0.2 1.1])
         dx (double-array [0.2 0.3 -0.5 0.7])
         da -0.6]
-    (doseq [n [0 4]]
+    (doseq [n [-2 0 4]]
       (let [[value tangent] ((jvp/jvp #'laws-reduce-decay) 0.8 xs n da dx)
-            expected (+ (* (Math/pow 0.5 n) da)
+            steps (max 0 n)
+            expected (+ (* (Math/pow 0.5 steps) da)
                         (reduce + (map-indexed
-                                   (fn [i x] (* (Math/pow 0.5 (- n 1 i)) x))
-                                   (take n dx))))]
+                                   (fn [i x] (* (Math/pow 0.5 (- steps 1 i)) x))
+                                   (take steps dx))))]
         (is (close? value (laws-reduce-decay 0.8 xs n) tol-double))
         (is (close? tangent expected tol-double)
             (str "JVP through " n " ordered reduction steps"))))
