@@ -2234,17 +2234,21 @@
 
         ;; Forward code packs [tape, reduce-result] in an object-array pair.
         ;; The caller (gen-reverse-let) unpacks tape and result from the pair.
+        ;; par/reduce evaluates (int bound) exactly once before its loop. A
+        ;; negative bound runs zero steps, so the tape length clamps at zero.
+        count-sym (ad-gensym "red_count")
         reduce-result-sym (ad-gensym "red_val")
         result-pair-sym (ad-gensym "red_pair")
 
         forward-code
         (when fwd-loop-body
           (let [pair-arr-sym (ad-gensym "pair")]
-            (list 'let* [tape-sym (list (if typed-double? 'double-array 'object-array)
-                                          bound-expr)
+            (list 'let* [count-sym (list 'clojure.core/int bound-expr)
+                         tape-sym (list (if typed-double? 'double-array 'object-array)
+                                        (list 'clojure.core/max 0 count-sym))
                          reduce-result-sym
                          (list 'loop* [fwd-idx-sym 0 acc-sym init-expr]
-                               (list 'if (list 'clojure.core/< fwd-idx-sym bound-expr)
+                               (list 'if (list 'clojure.core/< fwd-idx-sym count-sym)
                                      (list 'recur (list 'clojure.core/+ fwd-idx-sym 1) fwd-loop-body)
                                      acc-sym))
                          pair-arr-sym (list 'object-array 2)
@@ -2349,7 +2353,7 @@
                                 [d-acc-chain-sym]))
 
         backward-loop
-        (list 'let* [n-bwd-sym bound-expr]
+        (list 'let* [n-bwd-sym (list 'clojure.core/alength tape-sym)]
               (list 'loop* bwd-loop-init
                     (list 'if (list 'clojure.core/>= j-sym 0)
                           bwd-loop-body

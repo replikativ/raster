@@ -1462,7 +1462,7 @@
 
 (deftest o10-reduce-active-init-and-empty-bound
   (let [xs (double-array [1.0 -2.0 3.0])]
-    (doseq [n [0 3]]
+    (doseq [n [-2 0 3]]
       (let [[v da dx] ((rev/value+grad #'laws-reduce-active-init) 0.7 xs n)]
         (is (close? v (+ 0.7 (reduce + (map #(* % %) (take n xs)))) tol-double))
         (is (== 1.0 da) (str "initial carry adjoint at n=" n))
@@ -1485,17 +1485,18 @@
     (is (= 1 (count (filter #(= 'double-array (first %)) forms)))
         "the carry residual is one primitive double array")
     (let [xs (double-array [0.4 -0.7 0.2 1.1])]
-      (doseq [n [0 4]]
+      (doseq [n [-2 0 4]]
         (let [[value da dx] ((rev/value+grad source) 0.8 xs n)
-              expected (+ (* (Math/pow 0.5 n) 0.8)
+              steps (max 0 n)
+              expected (+ (* (Math/pow 0.5 steps) 0.8)
                           (reduce + (map-indexed
-                                     (fn [i x] (* (Math/pow 0.5 (- n 1 i)) x))
-                                     (take n xs))))]
+                                     (fn [i x] (* (Math/pow 0.5 (- steps 1 i)) x))
+                                     (take steps xs))))]
           (is (close? value expected tol-double))
-          (is (close? da (Math/pow 0.5 n) tol-double))
+          (is (close? da (Math/pow 0.5 steps) tol-double))
           (dotimes [i 4]
             (is (close? (ra/aget dx i)
-                        (if (< i n) (Math/pow 0.5 (- n 1 i)) 0.0)
+                        (if (< i steps) (Math/pow 0.5 (- steps 1 i)) 0.0)
                         tol-double))))))))
 
 (deftest o10-reduce-repeated-read-scatter-adds
