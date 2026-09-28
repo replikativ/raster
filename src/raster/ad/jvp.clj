@@ -162,6 +162,22 @@
                      (some #{out} (tree-seq coll? seq init)))
                    (subvec pairs (inc alloc-idx))))))
 
+(defn- pure-map-step?
+  "Ask the shared effect analysis about the source operation, not an opaque
+  devirtualized call. AD's existing template resolver is the authority for
+  that identity; an unknown .invk stays unknown and therefore declines."
+  [body]
+  (let [semantic-body
+        (walk/postwalk
+         (fn [form]
+           (if (and (seq? form) (= '.invk (first form)))
+             (if-let [[_ canonical] (tmpl/resolve-template (second form))]
+               (with-meta (cons canonical (nnext form)) (meta form))
+               form)
+             form))
+         body)]
+    (effects/removable-expr? semantic-body)))
+
 (defn- fold-fresh-map!
   "Linearize a pure indexed map into a freshly allocated buffer. The primal
   map has already run; the tangent map evaluates the same scalar step with
@@ -170,7 +186,7 @@
   (let [[_ out idx bound & tail] map-form
         [cast body] (when (= 2 (count tail)) tail)]
     (when-not (and (= 2 (count tail)) (symbol? out) (symbol? idx)
-                   (effects/removable-expr? body)
+                   (pure-map-step? body)
                    (not (some #{out} (tree-seq coll? seq body))))
       (throw (ex-info "jvp: map! needs a pure body and a non-self-reading output"
                       {:reason :jvp-map-effect-or-alias :form map-form})))

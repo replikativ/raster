@@ -1665,6 +1665,12 @@
     (par/map! xs i mn nil (n/* a (ra/aget xs i)))
     (ra/aget xs (dec mn))))
 
+(deftm laws-o10-float-map-scale [xs :- (Array float), a :- Float, mn :- Long]
+  :- Float
+  (let [out (float-array mn)]
+    (par/map! out i mn float (n/* a (ra/aget xs i)))
+    (ra/aget out (dec mn))))
+
 (deftest forward-map-into-fresh-array-has-independent-tangent-storage
   (let [xs (double-array [0.3 -0.7 1.1])
         dxs (double-array [0.2 0.4 -0.3])
@@ -1689,7 +1695,13 @@
                   nil
                   (catch clojure.lang.ExceptionInfo e e))]
       (is (some? error))
-      (is (= :jvp-map-active-output (:reason (ex-data error)))))))
+      (is (= :jvp-map-active-output (:reason (ex-data error)))))
+    (let [[fv fd] ((jvp/jvp #'laws-o10-float-map-scale)
+                   (float-array [0.3 1.1]) (float 2.5) 2
+                   (float-array [0.2 -0.3]) (float 0.7))]
+      (is (close? fv 2.75 1e-6))
+      (is (close? fd 0.02 1e-6)
+          "typed float calls use the same AD identity and independent shadow"))))
 
 ;; DATA-DEPENDENT trip count: the bound reads the carry. Every gate on the
 ;; soundness ladder must decline (lift, materializer), leaving the loud
