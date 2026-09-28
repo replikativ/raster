@@ -414,15 +414,13 @@
 (defmethod ad-record :par-reduce [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
         pr-info (assoc (gen-reverse-par-reduce init-expr active-set) :sym sym)
-        tape-sym (:tape-sym pr-info)
-        pair-sym (:result-pair-sym pr-info)]
+        reduce-result-sym (:reduce-result-sym pr-info)]
     {:record pr-info
      :fwd-patch (fn [bs]
                   (let [without-last (vec (drop-last 2 bs))]
                     (vec (concat without-last
-                                 [pair-sym (:forward-code pr-info)
-                                  tape-sym (list 'aget pair-sym 0)
-                                  sym (list 'aget pair-sym 1)]))))}))
+                                 (:forward-bindings pr-info)
+                                 [sym reduce-result-sym]))))}))
 
 (defmethod ad-record :par-scan [_ sym init-expr activity]
   ;; NO :fwd-patch — this is the point of scan-as-recurrence: out[i] = acc_i,
@@ -2233,29 +2231,24 @@
               (util/subst-syms {idx-sym fwd-idx-sym}
                                (list 'let* all-bindings val-result-sym)))))
 
-        ;; Forward code packs [tape, reduce-result] in an object-array pair.
-        ;; The caller (gen-reverse-let) unpacks tape and result from the pair.
+        ;; Expose the tape and result as flat bindings. The forward and reverse
+        ;; engines already consume flat SSA-like bindings; wrapping these in
+        ;; an object array only hid the tape's ownership from later passes.
         ;; par/reduce evaluates (int bound) exactly once before its loop. A
         ;; negative bound runs zero steps, so the tape length clamps at zero.
         count-sym (ad-gensym "red_count")
         reduce-result-sym (ad-gensym "red_val")
-        result-pair-sym (ad-gensym "red_pair")
 
-        forward-code
+        forward-bindings
         (when fwd-loop-body
-          (let [pair-arr-sym (ad-gensym "pair")]
-            (list 'let* [count-sym (list 'clojure.core/int bound-expr)
-                         tape-sym (list (if typed-double? 'double-array 'object-array)
-                                        (list 'clojure.core/max 0 count-sym))
-                         reduce-result-sym
-                         (list 'loop* [fwd-idx-sym 0 acc-sym init-expr]
-                               (list 'if (list 'clojure.core/< fwd-idx-sym count-sym)
-                                     (list 'recur (list 'clojure.core/+ fwd-idx-sym 1) fwd-loop-body)
-                                     acc-sym))
-                         pair-arr-sym (list 'object-array 2)
-                         (ad-gensym "_s0") (list 'aset pair-arr-sym 0 tape-sym)
-                         (ad-gensym "_s1") (list 'aset pair-arr-sym 1 reduce-result-sym)]
-                  pair-arr-sym)))
+          [count-sym (list 'clojure.core/int bound-expr)
+           tape-sym (list (if typed-double? 'double-array 'object-array)
+                          (list 'clojure.core/max 0 count-sym))
+           reduce-result-sym
+           (list 'loop* [fwd-idx-sym 0 acc-sym init-expr]
+                 (list 'if (list 'clojure.core/< fwd-idx-sym count-sym)
+                       (list 'recur (list 'clojure.core/+ fwd-idx-sym 1) fwd-loop-body)
+                       acc-sym))])
 
         ;; === Backward code ===
         d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
@@ -2367,7 +2360,7 @@
 
     {:type :par-reduce
      :residual-kind (if typed-double? :double-carry :closure-tape)
-     :forward-code forward-code
+     :forward-bindings forward-bindings
      :tape-sym tape-sym
      :d-acc-sym d-acc-sym
      :written-arrs []
@@ -2393,8 +2386,7 @@
      :bound-expr bound-expr
      :reduce-result-sym reduce-result-sym
      :bwd-result-sym bwd-result-sym
-     :init-expr init-expr
-     :result-pair-sym result-pair-sym}))
+     :init-expr init-expr}))
 
 ;; ================================================================
 ;; Par scan reverse-mode AD — the differentiable RECURRENCE primitive

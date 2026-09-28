@@ -1486,11 +1486,20 @@
         prepared (rev/ad-prepare (first (raster.core/ensure-walked-body! v)))
         reified (rev/reify-pullback prepared (subvec params 0 2))
         program (list (:primal-form reified) (:pullback-form reified))
-        forms (filter seq? (tree-seq coll? seq program))]
+        forms (filter seq? (tree-seq coll? seq program))
+        forward-pairs (vec (partition 2 (:fwd-bindings reified)))]
     (is (empty? (filter #(= 'fn* (first %)) forms))
         "double-carry reduction stores values, not pullback closures")
     (is (= 1 (count (filter #(= 'double-array (first %)) forms)))
         "the carry residual is one primitive double array")
+    (is (some #(and (seq? (second %))
+                    (= 'double-array (first (second %)))) forward-pairs)
+        "the residual is a first-class forward binding")
+    (is (some #(and (seq? (second %))
+                    (= 'loop* (first (second %)))) forward-pairs)
+        "the ordered reduction result is a first-class forward binding")
+    (is (empty? (filter #(= 'object-array (first %)) forms))
+        "the residual and result do not need a temporary object-array pair")
     (let [xs (double-array [0.4 -0.7 0.2 1.1])]
       (doseq [n [-2 0 4]]
         (let [[value da dx] ((rev/value+grad source) 0.8 xs n)

@@ -222,11 +222,20 @@ backward loop differentiable for HVP; ordered loop and scatter linearization
 remain separate obligations. A proven-pure double-carry `par/reduce` now uses
 one primitive carry tape and replays the scalar step during the ordered reverse
 sweep; other supported reductions retain the closure tape. This does not yet
-make the reduction pullback differentiable for HVP.
+make the reduction pullback differentiable for HVP. The primitive tape and
+result are now separate forward bindings, rather than an object-array pair;
+that makes their allocation, lifetime, and writes visible to a subsequent
+linearization pass without changing reduction order.
 Forward-mode AD can carry a proven-double `par/reduce` primal and tangent in
 one ordered loop, evaluating each step once. This covers parameterized initial
 states and zero-trip reductions without a tape; non-double carries still
 decline until their precision contract is represented.
+
+A pure `par/map!` into a proven fresh, zero-initialized floating buffer has an
+independent tangent map and buffer. In-place aliases, prior uses of the output,
+effectful bodies, and self-reads decline. This is not yet the effect-aware
+ordered-loop rule required by reduction HVP: the forward carry tape and the
+reverse gradient scatter both need tangent shadows and ordered store semantics.
 
 For nonescaping `defvalue` locals, AD preparation now uses the same generic
 field projection as the SoA lowering: a constructed distribution such as
