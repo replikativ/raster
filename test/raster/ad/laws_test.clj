@@ -1661,6 +1661,20 @@
     (is (contains? '#{loop loop* raster.par/reduce raster.par/scan}
                    (:form-head (ex-data error))))))
 
+(deftest forward-fold-rejects-active-structured-values
+  (let [fold @#'jvp/jvp-fold
+        seed {'x 'dx}]
+    (doseq [value [['x 1.0] {:value 'x} #{'x}]]
+      (let [error (try (fold ['packed value] seed)
+                       nil
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :jvp-unlinearized-structured-value
+               (:reason (ex-data error)))
+            (str "active collection must not silently lose its tangent: " value))))
+    (is (= ['packed [1.0 2.0]]
+           (:bindings (fold ['packed [1.0 2.0]] seed)))
+        "a collection independent of active values remains a constant")))
+
 ;; dotimes + aset (SGD-ish elementwise shape) — regression on the map! path.
 (deftm laws-o10-scale [xs :- (Array double), a :- Double, mn :- Long] :- Double
   (let [out (double-array mn)]
