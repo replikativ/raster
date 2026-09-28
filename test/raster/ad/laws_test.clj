@@ -1457,6 +1457,10 @@
 (deftm laws-reduce-const-init [xs :- (Array double), rn :- Long] :- Double
   (par/reduce acc 0.0 i rn (double (n/+ acc (ra/aget xs i)))))
 
+(deftm laws-reduce-float-carry [a :- Float, xs :- (Array float), rn :- Long]
+  :- Float
+  (par/reduce acc a i rn (float (n/+ acc (ra/aget xs i)))))
+
 (deftm laws-reduce-repeated-read [xs :- (Array double), rn :- Long] :- Double
   (par/reduce acc 0.0 i rn
               (let [left (ra/aget xs i)
@@ -1532,7 +1536,12 @@
     (let [[value tangent] ((jvp/jvp #'laws-reduce-const-init) xs 4 dx)]
       (is (close? value (reduce + xs) tol-double))
       (is (close? tangent (reduce + dx) tol-double)
-          "literal double init also has a forward rule"))))
+          "literal double init also has a forward rule"))
+    (is (= :jvp-reduce-carry-precision
+           (:reason (ex-data
+                     (try (jvp/jvp #'laws-reduce-float-carry)
+                          (catch clojure.lang.ExceptionInfo e e)))))
+        "a narrowing float carry declines until its tangent precision is modeled")))
 
 (deftm laws-o10-square [x :- Double] :- Double (n/* x x))
 
