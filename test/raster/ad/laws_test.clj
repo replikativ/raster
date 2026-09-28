@@ -1661,19 +1661,53 @@
     (is (contains? '#{loop loop* raster.par/reduce raster.par/scan}
                    (:form-head (ex-data error))))))
 
-(deftest forward-fold-rejects-active-structured-values
+(deftest forward-fold-structured-values-and-projections
   (let [fold @#'jvp/jvp-fold
         seed {'x 'dx}]
-    (doseq [value [['x 1.0] {:value 'x} #{'x}]]
+    (let [{:keys [tenv bindings]}
+          (fold ['packed ['x 1.0]
+                 'selected '(clojure.core/nth packed 0)] seed)
+          run (eval (list 'fn '[x dx]
+                          (list 'let* bindings
+                                ['selected (get tenv 'selected)])))]
+      (is (= [4.0 2.0] (run 4.0 2.0))
+          "vector construction and nth project the corresponding tangent"))
+    (doseq [value [{:value 'x} #{'x} ['(clojure.core/* x x)]]]
       (let [error (try (fold ['packed value] seed)
                        nil
                        (catch clojure.lang.ExceptionInfo e e))]
         (is (= :jvp-unlinearized-structured-value
                (:reason (ex-data error)))
             (str "active collection must not silently lose its tangent: " value))))
+    (is (= :jvp-active-index
+           (:reason (ex-data
+                     (try (fold ['packed [1.0 2.0]
+                                 'selected '(nth packed index)]
+                                {'index 'dindex})
+                          nil
+                          (catch clojure.lang.ExceptionInfo e e))))))
+    (is (= :jvp-nth-arity
+           (:reason (ex-data
+                     (try (fold ['packed [1.0]
+                                 'selected '(nth packed 0 x)] seed)
+                          nil
+                          (catch clojure.lang.ExceptionInfo e e))))))
     (is (= ['packed [1.0 2.0]]
            (:bindings (fold ['packed [1.0 2.0]] seed)))
         "a collection independent of active values remains a constant")))
+
+(deftm laws-jvp-vector-projection [x :- Double] :- Double
+  (let [square (n/* x x)
+        values [x square]]
+    (n/+ (nth values 0) (nth values 1))))
+
+(deftest forward-vector-projection-surface-law
+  (let [[value directional] ((jvp/jvp #'laws-jvp-vector-projection) 2.0 1.0)]
+    (is (= 6.0 value))
+    (is (= 5.0 directional))
+    (is (close? directional
+                (central-fd laws-jvp-vector-projection 2.0 1e-6)
+                tol-double))))
 
 ;; dotimes + aset (SGD-ish elementwise shape) — regression on the map! path.
 (deftm laws-o10-scale [xs :- (Array double), a :- Double, mn :- Long] :- Double

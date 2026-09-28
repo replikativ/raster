@@ -70,7 +70,7 @@
   tagged branch syms get a static typed zero; untagged fall back to the
   runtime zero-like on the primal (dynamically-typed Π — cannot mis-shape)."
   [branch]
-  (let [btag (and (symbol? branch) (:raster.type/tag (meta branch)))]
+  (let [btag (when (symbol? branch) (:raster.type/tag (meta branch)))]
     (if (some? btag)
       (tangent/zero-expr btag (list 'raster.arrays/alength branch))
       (list 'raster.ad.tangent/zero-like branch))))
@@ -407,6 +407,30 @@
 
                  :else (done tenv [])))
 
+             ;; A projection is linear in its collection, provided the index
+             ;; is discrete. Keep the tangent collection separate from the
+             ;; primal; this works for vector residuals and array tangents.
+             (contains? '#{nth clojure.core/nth} head)
+             (let [[_ coll index & more] init
+                   dcoll (and (symbol? coll) (get tenv coll))]
+               (cond
+                 (or (seq more) (not= 3 (count init)))
+                 (if (any-active? tenv init)
+                   (throw (ex-info "jvp: only two-argument nth has a forward rule"
+                                   {:reason :jvp-nth-arity :form init}))
+                   (done tenv []))
+
+                 (and (symbol? index) (contains? tenv index))
+                 (throw (ex-info "jvp: an active nth index has no tangent rule"
+                                 {:reason :jvp-active-index :form init}))
+
+                 dcoll
+                 (let [dt (jvp-gensym (str "d_" (name sym)) tag)]
+                   (done (assoc tenv sym dt)
+                         [dt (list 'clojure.core/nth dcoll index)]))
+
+                 :else (done tenv [])))
+
              ;; Remaining control flow has no forward rule yet.
              (contains? unsupported-forward-heads head)
              (if (any-active? tenv init)
@@ -445,9 +469,26 @@
 
                  :else (done tenv [])))))
 
-         ;; ANF leaves collection literals intact. A vector/map/set that captures
-         ;; an active value is a structured primal, not a constant: passing it
-         ;; through here would silently erase the tangent when it is unpacked.
+         ;; ANF leaves vector literals intact. Their tangent is the pointwise
+         ;; tangent vector; inactive positions get zeros shaped like their
+         ;; primals. Nested active expressions still require ANF lifting.
+         (vector? init)
+         (if (any-active? tenv init)
+           (if (every? anf/trivial-expr? init)
+             (let [dt (jvp-gensym (str "d_" (name sym)))
+                   entries (mapv (fn [v]
+                                   (or (and (symbol? v) (get tenv v))
+                                       (branch-tangent-zero v)))
+                                 init)]
+               (done (assoc tenv sym dt) [dt entries]))
+             (throw (ex-info
+                     "jvp: active vector elements must be ANF values"
+                     {:reason :jvp-unlinearized-structured-value
+                      :sym sym :form init})))
+           (done tenv []))
+
+         ;; Maps and sets have no structural tangent rule yet. Treating an
+         ;; active one as a constant would silently erase its dependence.
          :else (if (and (coll? init) (any-active? tenv init))
                  (throw (ex-info
                          "jvp: structured value containing an active value has no forward rule"
