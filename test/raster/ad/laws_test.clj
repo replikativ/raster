@@ -1446,6 +1446,72 @@
       (recur (inc i) (n/+ acc (n/* (ra/aget xs i) (ra/aget xs i))))
       acc)))
 
+(deftm laws-reduce-active-init [a :- Double, xs :- (Array double), rn :- Long]
+  :- Double
+  (par/reduce acc a i rn (n/+ acc (n/* (ra/aget xs i) (ra/aget xs i)))))
+
+(deftm laws-reduce-decay [a :- Double, xs :- (Array double), rn :- Long]
+  :- Double
+  (par/reduce acc a i rn (double (n/+ (n/* 0.5 acc) (ra/aget xs i)))))
+
+(deftm laws-reduce-repeated-read [xs :- (Array double), rn :- Long] :- Double
+  (par/reduce acc 0.0 i rn
+              (let [left (ra/aget xs i)
+                    right (ra/aget xs i)]
+                (n/+ acc (n/* left right)))))
+
+(deftest o10-reduce-active-init-and-empty-bound
+  (let [xs (double-array [1.0 -2.0 3.0])]
+    (doseq [n [-2 0 3]]
+      (let [[v da dx] ((rev/value+grad #'laws-reduce-active-init) 0.7 xs n)]
+        (is (close? v (+ 0.7 (reduce + (map #(* % %) (take n xs)))) tol-double))
+        (is (== 1.0 da) (str "initial carry adjoint at n=" n))
+        (dotimes [i 3]
+          (is (== (if (< i n) (* 2.0 (ra/aget xs i)) 0.0)
+                  (ra/aget dx i))))))))
+
+(deftest o10-reduce-typed-carry-residual
+  (let [source #'laws-reduce-decay
+        v (rev/resolve-deftm-var source)
+        {:raster.core/keys [deftm-params deftm-tags]} (meta v)
+        params (mapv (fn [p tag] (with-meta p {:raster.type/tag tag}))
+                     deftm-params deftm-tags)
+        prepared (rev/ad-prepare (first (raster.core/ensure-walked-body! v)))
+        reified (rev/reify-pullback prepared (subvec params 0 2))
+        program (list (:primal-form reified) (:pullback-form reified))
+        forms (filter seq? (tree-seq coll? seq program))]
+    (is (empty? (filter #(= 'fn* (first %)) forms))
+        "double-carry reduction stores values, not pullback closures")
+    (is (= 1 (count (filter #(= 'double-array (first %)) forms)))
+        "the carry residual is one primitive double array")
+    (let [xs (double-array [0.4 -0.7 0.2 1.1])]
+      (doseq [n [-2 0 4]]
+        (let [[value da dx] ((rev/value+grad source) 0.8 xs n)
+              steps (max 0 n)
+              expected (+ (* (Math/pow 0.5 steps) 0.8)
+                          (reduce + (map-indexed
+                                     (fn [i x] (* (Math/pow 0.5 (- steps 1 i)) x))
+                                     (take steps xs))))]
+          (is (close? value expected tol-double))
+          (is (close? da (Math/pow 0.5 steps) tol-double))
+          (dotimes [i 4]
+            (is (close? (ra/aget dx i)
+                        (if (< i steps) (Math/pow 0.5 (- steps 1 i)) 0.0)
+                        tol-double))))))))
+
+(deftest o10-reduce-repeated-read-scatter-adds
+  (let [xs (double-array [0.4 -0.7 0.2 1.1])
+        [value dx] ((rev/value+grad #'laws-reduce-repeated-read) xs 4)]
+    (is (close? value (reduce + (map #(* % %) xs)) tol-double))
+    (dotimes [i 4]
+      (is (close? (ra/aget dx i) (* 2.0 (ra/aget xs i)) tol-double)))))
+
+(deftest o10-reduce-replay-requires-proven-purity
+  (let [safe? @#'rev/replay-pure-reduce-expr?]
+    (is (safe? '(.invk raster.numeric/_star__m_double_double-impl x y)))
+    (is (not (safe? '(do (println "effect") (.invk raster.numeric/_star__m_double_double-impl x y)))))
+    (is (not (safe? '(.invk missing.namespace/unknown_m_double-impl x))))))
+
 (deftm laws-o10-square [x :- Double] :- Double (n/* x x))
 
 (deftm laws-o10-loop-helper [x :- Double, rn :- Long] :- Double
