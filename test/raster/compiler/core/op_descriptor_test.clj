@@ -54,3 +54,22 @@
                                      'i))))
   (is (not (descriptor/wrapping-addition-op? 'clojure.core/+)))
   (is (= 1 (descriptor/affine-step '(clojure.core/+ i 1) 'i))))
+
+(deftest gemm-literal-folding-does-not-discard-an-oftype-witness-effect
+  (let [array-witness (with-meta 'A {:tag 'floats :raster.type/tag 'floats})
+        wrapped (fn [witness value]
+                  (with-meta (list '.invk 'raster.numeric/oftype-impl witness value)
+                    {:raster.op/original 'raster.numeric/oftype
+                     :tag 'float :raster.type/tag 'float}))]
+    (is (= 1.0 (descriptor/gemm-scalar-literal (wrapped array-witness '(float 1.0)))))
+    (is (= 0.0 (descriptor/gemm-scalar-literal (wrapped array-witness '(float 0.0)))))
+    (is (= 1.0 (descriptor/gemm-scalar-literal
+                 (list 'double (wrapped array-witness 1.00000001)))))
+    (is (nil? (descriptor/gemm-scalar-literal (wrapped 'A '(float 1.0))))
+        "an untyped witness does not authorize removing the operation")
+    (is (nil? (descriptor/gemm-scalar-literal
+               (wrapped '(do (clojure.core/aset scratch 0 1.0) A)
+                        '(float 1.0)))))
+    (is (nil? (descriptor/gemm-scalar-literal
+               (wrapped '(do (clojure.core/aset scratch 0 1.0) A)
+                        '(float 0.0)))))))

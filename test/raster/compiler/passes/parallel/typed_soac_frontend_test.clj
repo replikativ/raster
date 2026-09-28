@@ -1948,6 +1948,33 @@
               (tree-seq coll? seq normalized))
         "declining canonicalization must retain the witness effect")))
 
+(deftest literal-gemm-factors-cannot-hide-an-effectful-type-witness
+  (let [witness '(do (clojure.core/aset scratch 0 1.0) A)
+        wrapped (fn [value]
+                  (with-meta
+                    (list '.invk 'raster.numeric/oftype_m_floats_float-impl
+                          witness value)
+                    {:raster.op/original 'raster.numeric/oftype
+                     :tag 'float :raster.type/tag 'float}))]
+    (doseq [[alpha beta] [[(wrapped '(float 1.0)) '(float 0.0)]
+                          ['(float 1.0) (wrapped '(float 0.0))]]]
+      (let [call (with-meta
+                   (list '.invk
+                         'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                         'A 'B 'C 'm 'k 'n alpha beta)
+                   {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                    :tag 'floats :raster.type/tag 'floats})
+            source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n))
+                                'result call] 'result)
+            normalized (frontend/normalize-source
+                        source {:dtype :float
+                                :array-types {'A :float 'B :float 'scratch :float}
+                                :scalar-types {'m :long 'k :long 'n :long}})]
+        (is (not-any? #(and (seq? %) (= 'raster.par/contract (first %)))
+                      (tree-seq coll? seq normalized)))
+        (is (some #{'(clojure.core/aset scratch 0 1.0)}
+                  (tree-seq coll? seq normalized)))))))
+
 (deftest batched-blas-gemm-is-the-same-contraction-with-one-more-free-axis
   (doseq [[operation variant]
           [['raster.linalg.blas/batched-gemm-nn! :nn]
