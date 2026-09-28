@@ -1913,11 +1913,16 @@
         options {:dtype :float :array-types {'A :float 'B :float}
                  :scalar-types {'m :long 'k :long 'n :long 'scale :double}}
         program (frontend/form->program (frontend/normalize-source source options) options)
+        routed (route/attempt source :float {'A :float 'B :float}
+                              {:scalar-types (:scalar-types options)})
         contraction (some #(when (= 'segmented-reduce (dialect/operation-kind %)) %)
                           (dialect/equations program))
         transform (-> contraction dialect/operation-parts :attributes :result-transform)]
     (is contraction)
     (is (= ['scale] (mapv :value (:scalars transform))))
+    (is (= [:double] (mapv :dtype (:scalars transform))))
+    (is (some #{'clojure.core/float} (flatten (:lambda transform))))
+    (is (= :typed-soac (get-in routed [:stats :route])))
     (is (= program (dialect/validate! program)))))
 
 (deftest batched-blas-gemm-is-the-same-contraction-with-one-more-free-axis

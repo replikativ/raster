@@ -4,6 +4,7 @@
             [raster.dl.attention-reference :as attention-reference]
             [raster.dl.array-ops :as ops]
             [raster.dl.nn :as nn]
+            [raster.gpu.compiled :as compiled]
             [raster.ad.templates :as tmpl]
             [raster.linalg.blas :as blas]))
 
@@ -49,6 +50,16 @@
     (let [actual ^doubles (attn/bidirectional-sdpa q k v rows heads head-dim scale)]
       (is (arr-approx= expected actual 1.0e-12)
           "head-major batched contractions preserve the token-major staged API semantics"))))
+
+(deftest bidirectional-sdpa-double-scale-has-a-typed-equation-first-closure
+  (let [input (float-array 8)
+        prepared (compiled/lower
+                  #'attn/bidirectional-sdpa
+                  [input input input (long 2) (long 2) (long 2) (double 0.5)]
+                  {:compiler :equation-first :target :cuda:0 :dtype :float
+                   :on-non-resident :throw})]
+    (is (compiled/prepared? prepared))
+    (is (= 5 (count (get-in prepared [:descriptor :steps]))))))
 
 (deftest packed-prefill-views-match-materialized-inputs
   (let [rows 3
