@@ -156,6 +156,26 @@
              :error :unscheduled-effect-map :declines nil}]
            (coverage/ratchet-violations baseline report)))))
 
+(deftest new-scalar-or-compatibility-routes-require-a-baseline-decision
+  (let [baseline {:vars [{:var 'existing-scalar :route :scalar}]}
+        report {:vars [{:var 'existing-scalar :route :scalar}
+                       {:var 'new-typed :route :typed-soac :typed-validated true}
+                       {:var 'new-host :route :host-only :host-contract :explicit}
+                       {:var 'new-scalar :route :scalar :declines []}
+                       {:var 'new-compatible :route :compatibility
+                        :declines [{:reason :uncovered}]}]}]
+    (is (= [{:var 'new-scalar :violation :new-untyped-route
+             :route :scalar :declines []}
+            {:var 'new-compatible :violation :new-untyped-route
+             :route :compatibility :declines [{:reason :uncovered}]}]
+           (coverage/ratchet-violations baseline report)))
+    (is (empty? (coverage/ratchet-violations
+                 {:vars (conj (:vars baseline)
+                              {:var 'new-scalar :route :scalar}
+                              {:var 'new-compatible :route :compatibility})}
+                 report))
+        "an intentional reviewed baseline update accepts the classified route")))
+
 (deftest emitted-artifact-summary-does-not-change-the-portable-ratchet
   (let [rows [{:var 'a :dtype :float :route :typed-soac :typed-validated true :declines []
                :emission-declines 0 :emission {:routes {:kernel-body 2} :declines []}}
