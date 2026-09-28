@@ -344,7 +344,9 @@
                                                      :operation-id :scores
                                                      :debug-only :excluded}}}]}}]}
                      :session :session :graph-key :graph
-                     :pending-inputs (atom #{}) :closed? (atom false)})]
+                     :pending-inputs (atom #{}) :closed? (atom false)
+                     :lifetime-lock (Object.) :output-leases (atom 0)
+                     :output-ready? (atom false) :completed-replays (atom 0)})]
     (with-redefs [gpu/profile-recorded-graph! (fn [session graph]
                                                 (is (= [:session :graph] [session graph]))
                                                 measured)]
