@@ -76,9 +76,15 @@
   (is (some? ((var rev/carry-loop->scan)
               '(loop* [i 0 sum 0.0]
                  (if (< i count)
-                   (let* [y (aget ys i)]
+                   (let* [y (* 2.0 i)]
                      (recur (inc i) (+ sum y)))
                    sum)))))
+  (is (nil? ((var rev/carry-loop->scan)
+             '(loop* [i 0 sum 0.0]
+                (if (< i count)
+                  (let* [y (aget ys i)]
+                    (recur (inc i) (+ sum y)))
+                  sum)))))
   (is (nil? ((var rev/carry-loop->scan)
              '(loop* [i 0 sum 0.0]
                 (if (< i count)

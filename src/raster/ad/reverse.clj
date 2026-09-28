@@ -3130,6 +3130,14 @@
                   (not (patterns/contains-sym? bound-expr acc-sym))
                   (every? (fn [[_ init]] (= :pure (effects/analyze-effect init)))
                           bindings)
+                  ;; The scan pullback reconstructs the step, but this narrow
+                  ;; lift has no scatter residual for an active array read in
+                  ;; the let prelude. Keep such loops on their existing AD path.
+                  (every? (fn [read]
+                            (contains? *constant-gradient-arrays* (second read)))
+                          (filter #(and (seq? %) (op/aget-op? (first %)))
+                                  (mapcat (fn [[_ init]] (tree-seq coll? seq init))
+                                          bindings)))
                   (some? dtype)
                   (carry-dtype-consistent? dtype scoped-update-expr))
          (emit-carry-scan {:out nil
@@ -4004,6 +4012,8 @@
                                                 (or (nil? wrt-indices)
                                                     (contains? wrt-indices i))) p))
                                    all-params))
+          constant-gradient-arrays (set (remove (set diff-active-params)
+                                                all-params))
           source-ns (or (:ns m) *ns*)
         ;; Π: the SEED is the cotangent of the RESULT of the differentiated
         ;; GRAPH, so its dtype derives from the walked body's TAIL tag (the
@@ -4024,13 +4034,13 @@
                             (first walked-body) source-ns (set params))
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
-          hoisted (binding [*ns* source-ns]
+          hoisted (binding [*ns* source-ns
+                            *constant-gradient-arrays* constant-gradient-arrays]
                     (ad-prepare qualified-source
                                 (zipmap all-params tags)))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
-          ad-form (binding [*constant-gradient-arrays*
-                            (set (remove (set diff-active-params) all-params))]
+          ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays]
                     (transform-body hoisted diff-active-params))
           flat (binding [ad-flatten/*flatten-dtype* dtype]
                  (ad-flatten/flatten-for-gradient ad-form))
