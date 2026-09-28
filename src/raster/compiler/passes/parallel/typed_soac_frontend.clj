@@ -3333,7 +3333,15 @@
                          (some? literal) literal
                          (and (seq? argument)
                               (= 'raster.numeric/oftype (descriptor/semantic-op argument))
-                              (= 2 (count (descriptor/call-args argument))))
+                              (= 2 (count (descriptor/call-args argument)))
+                              (symbol? (first (descriptor/call-args argument)))
+                              (= elem-type
+                                 (some-> (first (descriptor/call-args argument))
+                                         types/sym-type-tag dtype/dtype-for-array-tag
+                                         dtype/canon))
+                              (= elem-type
+                                 (some-> (retained-expression-tag argument)
+                                         dtype/dtype-for-scalar-tag dtype/canon)))
                          (let [cast (get {:float 'clojure.core/float
                                           :double 'clojure.core/double} elem-type)]
                            (if cast
@@ -3356,10 +3364,14 @@
                            (when id
                              (when-let [source-dtype (retained-scalar-dtype id scalar-types)]
                                {:sym id :dtype (dtype/canon source-dtype)}))))
+        alpha-value (when variant (scalar-value alpha alpha-literal))
+        scale-acc? (not= 1.0 alpha-literal)
         beta-value (when variant (scalar-value beta beta-literal))
         accumulate? (and (not batched?) (not= 0.0 beta-literal))]
     (if (and variant (= 8 (count arguments))
              (symbol? A) (symbol? B) (symbol? C)
+             (or (not scale-acc?) (number? alpha-value)
+                 (scalar-capture alpha-value))
              (or (not accumulate?)
                  (and elem-type (or (number? beta-value)
                                     (scalar-capture beta-value)))))
@@ -3402,8 +3414,6 @@
                     (if scalar-tag
                       (with-meta form {:raster.type/tag scalar-tag :tag scalar-tag})
                       form))
-            alpha-value (scalar-value alpha alpha-literal)
-            scale-acc? (not= 1.0 alpha-literal)
             body (typed (list 'clojure.core/*
                               (typed (list 'clojure.core/aget A a-index))
                               (typed (list 'clojure.core/aget B b-index))))
