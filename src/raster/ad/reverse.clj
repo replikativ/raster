@@ -913,19 +913,44 @@
 (defn- loop-init? [init]
   (and (seq? init) (contains? #{'loop 'loop*} (first init))))
 
+(defn- let-gradient-pieces
+  "Run the shared reverse engine once and expose its flat forward and reverse
+  bindings. Both a reified pullback and an in-loop step gradient consume this
+  representation; the latter must not allocate a closure per iteration."
+  [bindings body-exprs active-params dy-sym]
+  (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
+        {:keys [fwd-bindings rev-ctx param-adj-syms]}
+        (process-bindings norm-bindings active-params
+                          {:seed-adj-env {body-sym [dy-sym]}})]
+    {:body-sym body-sym
+     :fwd-bindings fwd-bindings
+     :rev-bindings (vec (:bindings rev-ctx))
+     :param-adj-syms param-adj-syms}))
+
 (defn- gen-reverse-let-core
   "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
   assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
-  (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-        dy-sym 'dy__rad
-        {:keys [fwd-bindings rev-ctx param-adj-syms]}
-        (process-bindings norm-bindings active-params {:seed-adj-env {body-sym [dy-sym]}})
-        pullback-body (list 'let* (vec (:bindings rev-ctx)) (vec param-adj-syms))
+  (let [dy-sym 'dy__rad
+        {:keys [body-sym fwd-bindings rev-bindings param-adj-syms]}
+        (let-gradient-pieces bindings body-exprs active-params dy-sym)
+        pullback-body (list 'let* rev-bindings (vec param-adj-syms))
         pullback-fn   (list 'fn* [dy-sym] pullback-body)
         result-sym    (ad-gensym "result")
         augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
     (list 'let* augmented-bindings (vector result-sym pullback-fn))))
+
+(defn- gen-inline-step-gradients
+  "Emit a closure-free scalar-step pullback inside an enclosing ordered loop.
+  The caller has already bound `adjoint`; every primal and reverse binding is
+  evaluated in that loop iteration and the result is the ordered gradient
+  vector for `active-params`."
+  [bindings body-exprs active-params adjoint]
+  (let [dy-sym (ad-gensym "step_dy")
+        {:keys [fwd-bindings rev-bindings param-adj-syms]}
+        (let-gradient-pieces bindings body-exprs active-params dy-sym)]
+    (list 'let* (vec (concat fwd-bindings [dy-sym adjoint] rev-bindings))
+          (vec param-adj-syms))))
 
 (defn- gen-reverse-let
   "Generate reverse-mode AD code for a let* form.
@@ -2368,15 +2393,16 @@
                                                     (contains? (set aget-syms) sym))
                                                   scalar-bindings)))
 
-        ;; Per-step scalar transform (primal recompute + pullback closure) —
-        ;; evaluated in the BACKWARD loop at the reconstructed inputs. This is
-        ;; recompute-from-carry: no forward-time tape stores it.
+        ;; Per-step scalar transform (primal recompute + flat gradient program)
+        ;; — evaluated in the BACKWARD loop at the reconstructed inputs. This
+        ;; is recompute-from-carry: no forward-time tape or closure stores it.
         val-result-sym (ad-gensym "val")
+        total-sym (ad-gensym "d_total")
         scalar-transform
         (let [binds (if (seq pure-scalar-bindings)
                       (vec (concat pure-scalar-bindings [val-result-sym body-result]))
                       [val-result-sym body-result])]
-          (gen-reverse-let binds [val-result-sym] iter-active))
+          (gen-inline-step-gradients binds [val-result-sym] iter-active total-sym))
 
         ;; === Backward code ===
         out-array-tag (or (some-> out-sym meta :raster.type/tag)
@@ -2391,10 +2417,7 @@
         d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
         n-bwd-sym (ad-gensym "n_bwd")
         d-carry-sym (ad-gensym "d_carry")
-        vpb-sym (ad-gensym "vpb")
-        pb-sym (ad-gensym "pb")
         grads-sym (ad-gensym "grads")
-        total-sym (ad-gensym "d_total")
         n-agets (count agets)
 
         shadow-allocs (vec (mapcat (fn [d-arr-sym arr-sym]
@@ -2415,9 +2438,7 @@
               (mapcat (fn [{:keys [sym arr idx]}] [sym (list 'aget arr idx)]) agets)
               [total-sym (list 'raster.ad.reverse/grad-acc
                                (list 'aget d-out-sym idx-sym) d-carry-sym)
-               vpb-sym scalar-transform
-               pb-sym (list 'nth vpb-sym 1)
-               grads-sym (list pb-sym total-sym)]
+               grads-sym scalar-transform]
               ;; Scatter-ADD each read's cotangent at the read's own index
               ;; (read-modify-write: correct for repeated reads of one array
               ;; and for shifted indices like (aget x (- idx 1))).

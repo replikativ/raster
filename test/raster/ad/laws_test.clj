@@ -1269,6 +1269,24 @@
     (aset xm (int k) (- (aget x (int k)) h))
     (/ (- (double (f xp)) (double (f xm))) (* 2.0 h))))
 
+(deftest o9-scan-pullback-has-no-step-closures
+  (doseq [source [#'laws-scan-lin #'laws-scan-tanh #'laws-scan-shift]]
+    (let [v (rev/resolve-deftm-var source)
+          {:raster.core/keys [deftm-params deftm-tags]} (meta v)
+          params (mapv (fn [p tag]
+                         (with-meta p {:raster.type/tag tag}))
+                       deftm-params deftm-tags)
+          active (filterv (fn [p]
+                            (tangent/differentiable?
+                             (:raster.type/tag (meta p))))
+                          params)
+          prepared (rev/ad-prepare (first (raster.core/ensure-walked-body! v)))
+          pullback (:pullback-form (rev/reify-pullback prepared active))
+          closures (filter #(and (seq? %) (= 'fn* (first %)))
+                           (tree-seq coll? seq pullback))]
+      (is (empty? closures)
+          (str (-> source meta :name) " reifies scalar step gradients as bindings")))))
+
 (deftest o9-scan-recurrence-law
   (let [w 0.6 h0 0.8 sn 4
         x (double-array [0.7 -1.3 0.4 0.9])]
