@@ -2277,6 +2277,16 @@
 ;; Par scan reverse-mode AD — the differentiable RECURRENCE primitive
 ;; ================================================================
 
+(declare lower-composites)
+
+(defn- untemplated-scan-call?
+  [body]
+  (boolean
+   (some (fn [form]
+           (and (seq? form) (= '.invk (first form))
+                (nil? (tmpl/resolve-template (second form)))))
+         (tree-seq coll? seq body))))
+
 (defn- gen-reverse-par-scan
   "Generate reverse-mode AD code for a raster.par/scan form — the sanctioned
   differentiable recurrence (the carry chains across steps AND every per-step
@@ -2310,6 +2320,13 @@
   Returns a record map for the reverse-pass engine (emit-backward :par-scan)."
   [par-scan-form active-params]
   (let [[_ out-sym acc-sym init-expr idx-sym bound-expr _cast-fn body-expr] par-scan-form
+        ;; The outer AD preparation runs before a carry loop becomes a scan.
+        ;; Its body is therefore still a nested expression at that point, and
+        ;; untemplated deftm helpers inside it have not been inlined. Prepare
+        ;; the per-step scalar program before building its pullback as well.
+        body-expr (if (untemplated-scan-call? body-expr)
+                    (lower-composites body-expr)
+                    body-expr)
         ;; Same body analysis as par/map!: let*-bound agets + inline agets at
         ;; the scan index join the scatter path. acc-sym lands in :free-syms
         ;; but is never an active param, so it cannot leak into active-free.
@@ -2722,6 +2739,66 @@
                                       {:body body}))
             :else (recur relifted (inc i))))))))
 
+(def ^:private variadic-core-arithmetic
+  '#{clojure.core/+ clojure.core/- clojure.core/* clojure.core//
+     + - * /})
+
+(defn- postwalk-code
+  "Postwalk executable forms, leaving quoted data untouched."
+  [f body]
+  (letfn [(step [form]
+            (if (and (seq? form)
+                     (contains? '#{quote clojure.core/quote} (first form)))
+              form
+              (f (walk/walk step identity form))))]
+    (step body)))
+
+(defn- binaryize-core-arithmetic
+  "Express core arithmetic's variadic contract using identities, aliases,
+  unary calls, and ordered binary folds. This matches the fixed-arity AD
+  templates without changing evaluation order or inventing per-arity rules."
+  [body]
+  (postwalk-code
+   (fn [form]
+     (if (and (seq? form) (contains? variadic-core-arithmetic (first form)))
+       (let [op (first form)
+             args (rest form)
+             n (count args)
+             name (name op)
+             normalized (cond
+                          (and (= name "+") (zero? n)) 0
+                          (and (= name "*") (zero? n)) 1
+                          (and (#{"+" "*"} name) (= n 1)) (first args)
+                          (> n 2) (reduce (fn [acc arg] (list op acc arg))
+                                          (first args) (rest args))
+                          :else form)]
+         (if (and (instance? clojure.lang.IObj normalized) (meta form))
+           (with-meta normalized (meta form))
+           normalized))
+       form))
+   body))
+
+(defn- inline-qualified-constants
+  "Lower qualified ^:const primitive vars in inlined callees. The source
+  namespace may keep such vars private, while the generated AD function is
+  evaluated in the caller's namespace. Only immutable scalar constants are
+  eligible; ordinary Vars remain runtime references."
+  [body]
+  (postwalk-code
+   (fn [form]
+     (if (and (symbol? form) (namespace form))
+       (if-let [v (when (find-ns (symbol (namespace form)))
+                    (find-var form))]
+         (if (:const (meta v))
+           (let [value @v]
+             (if (or (number? value) (string? value) (boolean? value))
+               value
+               form))
+           form)
+         form)
+       form))
+   body))
+
 ;; ================================================================
 ;; Loop canonicalization (framework §15.2) — carry→scan materializer
 ;;
@@ -2904,7 +2981,8 @@
   (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
         ;; and multi-level composites fully lower before AD (lower-composites
         ;; runs anf-wrap-bare-body itself).
-        lowered (lower-composites body)
+        lowered (-> body binaryize-core-arithmetic lower-composites
+                    binaryize-core-arithmetic inline-qualified-constants)
         ;; §15.2 (1): recover SOAC structure from raw loop syntax — dotimes →
         ;; par/map!, tail-accumulation → par/reduce, carry+aset → par/scan —
         ;; with the lift's proven-soundness gates (stats are discarded here;

@@ -83,11 +83,34 @@
   reaching them is a shape REFERENCE, not a differentiable dependence."
   '#{raster.arrays/alength clojure.core/alength alength})
 
+(def ^:private opaque-forward-scopes
+  "These bind local values or carry closure state. A free-variable scan of their
+   enclosing ANF binding cannot prove that a tangent is inactive: reverse AD's
+   loop tape may contain pullback closures that capture an active parameter."
+  '#{loop loop* dotimes raster.par/map! raster.par/reduce raster.par/scan})
+
 (def ^:private unsupported-forward-heads
   "Differentiable-in-reverse forms with NO forward fold yet (follow-up):
   fail loud when they carry an active value, never silently drop a tangent."
-  '#{loop loop* dotimes raster.par/map! raster.par/reduce raster.par/scan
-     fn* do case case* try letfn letfn* new monitor-enter monitor-exit})
+  (into opaque-forward-scopes
+        '#{fn* do case case* try letfn letfn* new monitor-enter monitor-exit}))
+
+(defn- reject-unlinearized-hvp-scopes!
+  "The gradient program can hide active values inside loop-tape pullback
+   closures. Until those scopes have forward rules, HVP cannot establish that
+   a zero tangent is valid merely because the outer binding appears inactive."
+  [bindings]
+  (when-let [form (some (fn [form]
+                         (when (and (seq? form)
+                                    (contains? opaque-forward-scopes (first form)))
+                           form))
+                       (tree-seq coll? seq bindings))]
+    (throw (ex-info
+            (str "hvp: forward linearization of `" (first form)
+                 "` is not implemented; its pullback may capture active values")
+            {:reason :hvp-unlinearized-scope
+             :form-head (first form)
+             :form form}))))
 
 (defn- fold-call
   "Emit the paired tangent bindings for one active :call binding.
@@ -355,6 +378,7 @@
                                     ['dy__rad 1.0]
                                     rev-bindings))
                        jvp-gensym)
+        _ (reject-unlinearized-hvp-scopes! grad-bindings)
         ;; Seed tangents: one v per differentiable param, tagged like it.
         tangent-params (mapv (fn [p] (with-meta (symbol (str "d" (name p) "__jt"))
                                        (meta p)))
