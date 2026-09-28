@@ -1,6 +1,7 @@
 (ns raster.gpu.compiled-composition-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -10,7 +11,88 @@
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
-            [raster.gpu.parallel-program :as parallel-program]))
+            [raster.gpu.parallel-program :as parallel-program]
+            [raster.gpu.value :as value]))
+
+(deftest invalid-later-donation-does-not-consume-earlier-adapter-or-write-inputs
+  (let [buffer-a {:id :a :dtype :float :n-elements 4 :byte-size 16}
+        buffer-b {:id :b :dtype :float :n-elements 4 :byte-size 16}
+        foreign-b {:id :foreign :dtype :float :n-elements 4 :byte-size 16}
+        view (fn [id]
+               (bview/view
+                (bview/allocation {:id id :byte-size 16 :memory-space :device
+                                   :device :ze:0 :ownership :owned})
+                {:dtype :float :shape [4]}))
+        view-a (view :a)
+        view-b (view :b)
+        a (value/wrap-external-view buffer-a :ze:0 view-a)
+        b (value/wrap-external-view foreign-b :ze:0 view-b)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :two-adapters :target :ze:0}
+                     :session ::session
+                     :node-views {:a (gpu/->ResidentBufferView ::session :a view-a)
+                                  :b (gpu/->ResidentBufferView ::session :b view-b)}
+                     :closed? (atom false) :lifetime-lock (Object.)
+                     :output-leases (atom 0) :pending-inputs (atom #{})
+                     :output-ready? (atom true) :completed-replays (atom 0)})
+        artifact (compiled/map->Compiled
+                  {:executable executable :target :ze:0
+                   :in-tree [{:key :A :node :a :role :state :dtype :float :shape [4]}
+                             {:key :B :node :b :role :state :dtype :float :shape [4]}
+                             {:key :x :node :x :role :input :dtype :float :shape [4]}]
+                   :donated (array-map :A :A' :B :B')
+                   :out-tree [] :live-outputs (atom nil)})
+        writes (atom 0)
+        replays (atom 0)]
+    (with-redefs [gpu/buffer (fn [_ key] ({:a buffer-a :b buffer-b} key))
+                  gpu-link/write! (fn [& _] (swap! writes inc))
+                  gpu-link/run! (fn [& _] (swap! replays inc))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not this artifact's resident view"
+                            (compiled/invoke-compiled artifact
+                                                      {:A a :B b :x (float-array 4)}))))
+    (is (value/live? a))
+    (is (value/live? b))
+    (is (zero? @writes))
+    (is (zero? @replays))
+    (is (true? @(:output-ready? executable)))))
+
+(deftest profiling-and-measurement-preflight-leases-before-mutating-inputs-or-outputs
+  (let [view (bview/view
+              (bview/allocation {:id :output :byte-size 16 :memory-space :device
+                                 :device :ze:0 :ownership :owned})
+              {:dtype :float :shape [4]})
+        output (value/wrap-external-view
+                {:id :output :dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :profile-lease :target :ze:0}
+                     :session ::session :closed? (atom false) :lifetime-lock (Object.)
+                     :output-leases (atom 1) :pending-inputs (atom #{})})
+        artifact (compiled/map->Compiled
+                  {:executable executable
+                   :in-tree [{:node :input :role :input :default (float-array 4)}]
+                   :out-tree [] :live-outputs (atom [output])})
+        writes (atom 0)
+        profiles (atom 0)
+        measures (atom 0)
+        reason (fn [f] (try (f) nil
+                            (catch clojure.lang.ExceptionInfo error
+                              (:reason (ex-data error)))))]
+    (with-redefs [gpu-link/write! (fn [& _] (swap! writes inc))
+                  gpu-link/profile! (fn [& _] (swap! profiles inc) {:profile []})
+                  gpu-link/measure! (fn [& _] (swap! measures inc) {:samples []})]
+      (is (= :link-output-lease-active (reason #(compiled/profile artifact))))
+      (is (= :link-output-lease-active (reason #(compiled/measure artifact))))
+      (is (zero? @writes))
+      (is (zero? @profiles))
+      (is (zero? @measures))
+      (is (value/live? output))
+      (reset! (:output-leases executable) 0)
+      (is (= {:profile [] :result {}} (compiled/profile artifact)))
+      (is (not (value/live? output)))
+      (is (= {:samples []} (compiled/measure artifact)))
+      (is (= 2 @writes))
+      (is (= 1 @profiles))
+      (is (= 1 @measures)))))
 
 (defn component [_x _w _n])
 
