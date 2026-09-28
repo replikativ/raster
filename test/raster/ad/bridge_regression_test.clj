@@ -58,12 +58,42 @@
   (par/reduce sum 0.0 i count
     (n/+ sum (dist/logpdf (dist/->Normal mu sigma) (aget ys (* 2 i))))))
 
+(deftm normal-strided-let-reduce [mu :- Double, ys :- (Array double), count :- Long,
+                                 sigma :- Double] :- Double
+  (par/reduce sum 0.0 i count
+    (let [y (aget ys (* 2 i))]
+      (n/+ sum (dist/logpdf (dist/->Normal mu sigma) y)))))
+
+(deftm normal-strided-let-loop [mu :- Double, ys :- (Array double), count :- Long,
+                               sigma :- Double] :- Double
+  (loop [i 0 sum 0.0]
+    (if (< i count)
+      (let [y (aget ys (* 2 i))]
+        (recur (inc i) (n/+ sum (dist/logpdf (dist/->Normal mu sigma) y))))
+      sum)))
+
+(deftest let-prelude-scan-lift-requires-purity
+  (is (some? ((var rev/carry-loop->scan)
+              '(loop* [i 0 sum 0.0]
+                 (if (< i count)
+                   (let* [y (aget ys i)]
+                     (recur (inc i) (+ sum y)))
+                   sum)))))
+  (is (nil? ((var rev/carry-loop->scan)
+             '(loop* [i 0 sum 0.0]
+                (if (< i count)
+                  (let* [y (do (aset touched i 1.0) (aget ys i))]
+                    (recur (inc i) (+ sum y)))
+                  sum))))))
+
 (deftest selected-gradient-inputs-allow-strided-observations
   (let [ys (double-array [0.1 9.0 0.7 9.0 -0.3 9.0])
         expected (reduce + (map #(dist/logpdf (dist/->Normal 0.2 1.4) %)
                                 [0.1 0.7 -0.3]))]
     (doseq [source [#'normal-strided-observations
-                    #'normal-strided-reduce]]
+                    #'normal-strided-reduce
+                    #'normal-strided-let-reduce
+                    #'normal-strided-let-loop]]
       (let [[value dmu dys dcount dsigma]
             ((rev/value+grad source :wrt [0 3]) 0.2 ys 3 1.4)]
         (is (< (Math/abs (- value expected)) 1e-10))
