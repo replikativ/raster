@@ -94,6 +94,22 @@
       (is (= 1 @profiles))
       (is (= 1 @measures)))))
 
+(deftest template-cache-guards-compare-live-roots-not-only-identity-hashes
+  (let [first-root (Object.)
+        second-root (Object.)
+        token (fn [root]
+                (compiled/->WeakIdentity
+                 (java.lang.ref.WeakReference. root) 17))
+        first (token first-root)
+        same (token first-root)
+        second (token second-root)]
+    (is (= 17 (.hashCode first)))
+    (is (= (hash first) (hash second)) "force an identity-hash collision")
+    (is (= first same))
+    (is (not= first second))
+    (is (= :first (get {first :first} same)))
+    (is (nil? (get {first :first} second)))))
+
 (defn component [_x _w _n])
 
 (deftest execution-info-observes-linked-binding-and-rejects-unavailable-evidence
