@@ -502,6 +502,12 @@
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
                          (inline/expand-for-backends current 3 (:param-env opts)))
+              ;; GPU aggregate locals must disappear before the fixpoint
+              ;; typedness census and TypedSOAC construction. The same shared
+              ;; projector already serves AD; keep JVM value identity intact.
+              expanded (if (device/gpu-target? (:target-device opts))
+                         (soa-lower/lower-local-constructors expanded)
+                         expanded)
               ;; Step 2: Normalize + Rewalk only if expand introduced NEW
               ;; undevirtualized calls (e.g. from composable AD body inlining).
               ;; Regular expand (compound deftm inlining) produces pre-walked code

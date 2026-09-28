@@ -21,6 +21,7 @@
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.types :as types]
+            [raster.compiler.passes.scalar.effects :as effects]
             [clojure.walk :as walk]))
 
 (defn field-arr-sym [soa-sym field-name]
@@ -269,8 +270,8 @@
 
 (defn lower-local-constructors
   "Project nonescaping defvalue constructor locals onto their scalar fields.
-   Intended after ANF: every constructor argument must already be a value, so
-   removing the allocation cannot drop or reorder argument effects. A value
+   Constructor arguments must be values or proven pure/total scalar expressions,
+   so removing the allocation cannot drop or reorder argument effects. A value
    that escapes a field projection leaves the original form untouched; its
    caller may still handle it as a value or reject active AD explicitly."
   [body]
@@ -281,7 +282,14 @@
         ;; nested function until that binding rule is represented explicitly.
         nested-fn? (some #(and (seq? %) (#{'fn 'fn* 'clojure.core/fn} (first %))) forms)]
     (if (and (seq ctors) (not nested-fn?)
-             (every? (fn [ctor] (every? #(not (coll? %)) (rest ctor))) ctors))
+             ;; A pure, total scalar argument can be duplicated by field
+             ;; projection without changing effects or exceptional control.
+             ;; Allocations and unknown calls remain unprojected; their
+             ;; identities/effects would need explicit bindings.
+             (every? (fn [ctor]
+                       (every? #(or (not (coll? %))
+                                    (effects/cse-safe-expr? %))
+                               (rest ctor))) ctors))
       (try
         (lower {:soa {} :exploded {} :local-only? true} body)
         (catch clojure.lang.ExceptionInfo e

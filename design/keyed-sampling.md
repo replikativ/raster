@@ -28,3 +28,8 @@ targets. The keyed Gamma/Poisson/Beta overloads establish replayable host
 semantics; this does not claim their unbounded rejection loops are an optimized
 GPU route. Remaining distributions retain only their one-argument API until
 their draw structure and target lowering are validated.
+
+A keyed Normal draw constructed inside a pointwise map projects the local
+`Normal` value before TypedSOAC construction and emits one typed GPU map. The
+Intel CPU OpenCL/JVM parity test covers this route; it is not yet a performance
+claim for CUDA, HIP, or accelerator hardware.

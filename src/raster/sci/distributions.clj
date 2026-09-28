@@ -305,7 +305,7 @@
         u1 (par/uniform-open01 seed c0)
         u2 (par/uniform-open01 seed (unchecked-inc c0))
         z (* (Math/sqrt (* -2.0 (Math/log u1)))
-             (Math/cos (* 2.0 Math/PI u2)))]
+             (Math/cos (* 2.0 mn/pi u2)))]
     (mn/+ (.mu d) (mn/* (.sigma d) z))))
 
 (deftm sample [d :- Uniform] :- Double

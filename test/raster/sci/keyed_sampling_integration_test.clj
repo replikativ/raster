@@ -19,6 +19,12 @@
   [out :- (Array double), n :- Long, seed :- Long] :- (Array double)
   (par/map! out i n double (par/uniform-open01 seed (long i))))
 
+(deftm keyed-normal-fill!
+  [out :- (Array double), n :- Long, mu :- Double, sigma :- Double,
+   seed :- Long] :- (Array double)
+  (par/map! out i n double
+            (dist/sample (dist/->Normal mu sigma) seed (long i))))
+
 (deftest keyed-normal-is-reparameterizable
   (let [seed 42 counter 17
         mu 0.3 sigma 1.2
@@ -58,3 +64,31 @@
               (is (= expected (vec actual))))
             (finally (fixture/close! program))))))
     (opencl-probe/opencl-skip! "keyed uniform map")))
+
+(deftest keyed-normal-constructor-projects-before-typed-gpu-map
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'keyed-normal-fill! :ocl:0 :dtype :double)]
+    (is (= [:map] (mapv :convention (:steps descriptor))))
+    (is (kernel-body/kernel-body?
+         (get-in descriptor [:steps 0 :artifact :attributes :kernel-body])))
+    (is (empty? (:allocs descriptor)))))
+
+(deftest keyed-normal-opencl-matches-jvm
+  (if @opencl-probe/opencl-available?
+    (let [n 32 mu 0.3 sigma 1.2 seed 42
+          out (double-array n)
+          arguments [out (long n) (double mu) (double sigma) (long seed)]
+          descriptor (pipeline/compile-gpu-program
+                      #'keyed-normal-fill! :ocl:0 :dtype :double)
+          expected (mapv #(dist/sample (dist/->Normal mu sigma) seed %) (range n))]
+      (gpu/with-gpu-session [session :ocl:0]
+        (let [program (fixture/instantiate!
+                       session descriptor arguments {'out :output})]
+          (try
+            (let [actual (vec (get (fixture/run! program arguments) 'out))]
+              (is (= n (count actual)))
+              (doseq [[want got] (map vector expected actual)]
+                (is (Double/isFinite got))
+                (is (< (Math/abs (- want got)) 1e-9))))
+            (finally (fixture/close! program))))))
+    (opencl-probe/opencl-skip! "keyed Normal map")))

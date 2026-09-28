@@ -1008,6 +1008,24 @@
                   (lower (normalized-form (list 'clojure.core/- (second expression) 1)
                                           expected expression) expected env)
 
+                  ;; Unchecked steppers carry modular integral semantics. Route
+                  ;; through the existing wrapping binary intrinsic rather than
+                  ;; treating them as checked Clojure inc/dec or inventing a
+                  ;; target-specific unary operation.
+                  (and (seq? expression) (= 2 (count expression))
+                       (contains? '#{unchecked-inc clojure.core/unchecked-inc}
+                                  (first expression)))
+                  (lower (normalized-form
+                          (list 'clojure.core/unchecked-add (second expression) 1)
+                          expected expression) expected env)
+
+                  (and (seq? expression) (= 2 (count expression))
+                       (contains? '#{unchecked-dec clojure.core/unchecked-dec}
+                                  (first expression)))
+                  (lower (normalized-form
+                          (list 'clojure.core/unchecked-subtract (second expression) 1)
+                          expected expression) expected env)
+
                   ;; Unary subtraction is the existing negation intrinsic for floating values:
                   ;; spelling it as 0-x would lose the sign of zero. Integral negation instead
                   ;; uses the checked/wrapping subtraction machinery, including MIN_VALUE.

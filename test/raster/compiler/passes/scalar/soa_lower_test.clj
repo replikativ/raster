@@ -28,6 +28,9 @@
                      (clojure.core/+ (.re p) (.im p)))
         escaping '(let* [a 1.0 b 2.0 p (->Cplx a b)] p)
         effectful '(let* [b 2.0 p (->Cplx (println "effect") b)] (.re p))
+        pure-casts '(let* [p (->Cplx (clojure.core/double a)
+                                      (clojure.core/double b))]
+                      (clojure.core/+ (.re p) (.im p)))
         shadowed '(let* [a 1.0 p (->Cplx a a)]
                     (let* [p 3.0] (clojure.core/+ p 1.0)))
         quoted '(let* [a 1.0 p (->Cplx a a)]
@@ -38,6 +41,10 @@
            (sl/lower-local-constructors projected)))
     (is (= escaping (sl/lower-local-constructors escaping)))
     (is (= effectful (sl/lower-local-constructors effectful)))
+    (is (= '(let* []
+              (clojure.core/+ (clojure.core/double a)
+                              (clojure.core/double b)))
+           (sl/lower-local-constructors pure-casts)))
     (is (= '(let* [a 1.0] (let* [p 3.0] (clojure.core/+ p 1.0)))
            (sl/lower-local-constructors shadowed)))
     (is (= '(let* [a 1.0]
