@@ -966,12 +966,51 @@
     (reset! live-outputs nil))
   c)
 
+(defn- checked-donations
+  "Validate all provided resident donation handles before any invocation mutation. This is a
+   deterministic preflight, not a transaction against another owner concurrently freeing a value."
+  [executable in-nodes donated inputs]
+  (reduce
+   (fn [checked [k _out]]
+     (if-let [val (get inputs k)]
+       (do
+         (when-not (v/device-array? val)
+           (throw (ex-info (str "invoke: donated input " k " must be a DeviceArray naming "
+                                "this artifact's exact resident view")
+                           {:key k :actual (type val)})))
+         (when-not (v/live? val)
+           (throw (ex-info "donated input is no longer live"
+                           {:reason :compiled-donation-dead :key k})))
+         (when (= ::v/aliased (:owner val))
+           (throw (ex-info "an aliased DeviceArray cannot be donated"
+                           {:reason :compiled-donation-alias :key k})))
+         (when (some #(identical? val %) checked)
+           (throw (ex-info "one DeviceArray cannot fill multiple donated slots"
+                           {:reason :compiled-donation-duplicate :key k})))
+         (let [{node-id :node :as input-node} (get in-nodes k)
+               resident (gpu-link/node-view executable node-id)
+               resident-buffer (gpu/buffer (:session executable) (:key resident))]
+           (when-not (and (identical? (:buffer val) resident-buffer)
+                          (bview/same-range? (:view val) (:view resident)))
+             (throw (ex-info (str "invoke: donated input " k " is not this artifact's resident "
+                                  "view — thread the exact donated output back")
+                             {:key k :node node-id})))
+           (when-not (= [(:dtype input-node) (:shape input-node)]
+                        [(:dtype val) (:shape val)])
+             (throw (ex-info (str "invoke: donated input " k " dtype/shape differs from its slot")
+                             {:key k :expected (select-keys input-node [:dtype :shape])
+                              :actual (select-keys val [:dtype :shape])})))
+           (conj checked val)))
+       checked))
+   [] donated))
+
 (defn- invoke-compiled-unleased
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
-     1. write each dynamic input (host upload, exact-view no-op, or device-to-device copy);
-     2. consume exact resident donated values (donation-invalidation, §1.3);
-     3. replay the linked graph with no output download;
-     4. project out-tree nodes as external DeviceArrays over stable LinkPlan views.
+     1. preflight all donations before any mutation;
+     2. write each dynamic input (host upload, exact-view no-op, or device-to-device copy);
+     3. consume exact resident donated values (donation-invalidation, §1.3);
+     4. replay the linked graph with no output download;
+     5. project out-tree nodes as external DeviceArrays over stable LinkPlan views.
    Mutation of resident :state is invisible: the caller sees fresh output values and the old
    donated inputs invalidated — never a mutation."
   [^Compiled c inputs]
@@ -988,41 +1027,23 @@
                                    (vec input-keys) " or donated slots " (vec donated-keys)
                                    " may be passed; a :constant/:state slot is captured at bind")
                               {:key k :inputs (keys inputs)}))))
-        ;; 1. Every dynamic input is refreshed on every invocation, preserving the resident-program
+        ;; 1. An invalid later adapter must not consume an earlier handle or write inputs.
+        checked-donations (checked-donations executable in-nodes donated inputs)
+        ;; 2. Every dynamic input is refreshed on every invocation, preserving the resident-program
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
         _ (doseq [{:keys [key node default]} input-nodes]
             (gpu-link/write! executable node (get inputs key default)))
-        ;; 2. Donation remains stricter than an ordinary input: the passed value must already be
-        ;;    this exact state view. Moving a foreign value and then calling it donation would hide
-        ;;    a copy and misrepresent ownership.
-        _ (doseq [[k _out] donated]
-            (when-let [val (get inputs k)]
-              (when-not (v/device-array? val)
-                (throw (ex-info (str "invoke: donated input " k " must be a DeviceArray naming "
-                                     "this artifact's exact resident view")
-                                {:key k :actual (type val)})))
-              (let [{node-id :node :as input-node} (get in-nodes k)
-                    resident (gpu-link/node-view executable node-id)
-                    resident-buffer (gpu/buffer (:session executable) (:key resident))]
-                (when-not (and (identical? (:buffer val) resident-buffer)
-                               (bview/same-range? (:view val) (:view resident)))
-                  (throw (ex-info (str "invoke: donated input " k " is not this artifact's resident "
-                                       "view — thread the exact donated output back")
-                                  {:key k :node node-id})))
-                (when-not (= [(:dtype input-node) (:shape input-node)]
-                             [(:dtype val) (:shape val)])
-                  (throw (ex-info (str "invoke: donated input " k " dtype/shape differs from its slot")
-                                  {:key k :expected (select-keys input-node [:dtype :shape])
-                                   :actual (select-keys val [:dtype :shape])})))
-                (v/consume! val))))]
-    ;; 3. invalidate the PREVIOUS batch of outputs — they alias resident buffers this replay
+        ;; 3. Only after every provided donated view and dynamic write has passed may its old
+        ;;    wrapper be invalidated. The buffers remain resident and owned by the executable.
+        _ (doseq [val checked-donations] (v/consume! val))]
+    ;; 4. invalidate the PREVIOUS batch of outputs — they alias resident buffers this replay
     ;;    overwrites, so a retained old wrapper would observe a silent mutation (§2.3). ::external
     ;;    free! only marks the wrapper dead; it never frees the session-owned buffer.
     (invalidate-live-outputs! c)
-    ;; 4. replay, no download.
+    ;; 5. replay, no download.
     (gpu-link/run! executable)
-    ;; 5. project outputs as resident device values; record them for next-call invalidation.
+    ;; 6. project outputs as resident device values; record them for next-call invalidation.
     (let [out (into {} (map (fn [{:keys [key] :as node}]
                               [key (project-node executable node target)]))
                     out-tree)]
@@ -1128,13 +1149,16 @@
   "Device-event profile of one linked replay. The artifact must have been compiled with
    `{:profile? true}`. Returns the historical profile map, including downloaded semantic results."
   [^Compiled c]
-  (refresh-captured-inputs! c)
-  (invalidate-live-outputs! c)
-  (let [profile-result (gpu-link/profile! (:executable c))
-        result (into {} (map (fn [{:keys [key node]}]
-                               [key (gpu-link/download (:executable c) node)]))
-                     (:out-tree c))]
-    (assoc profile-result :result result)))
+  (gpu-link/with-unleased-execution!
+   (:executable c) :profile
+   (fn []
+     (refresh-captured-inputs! c)
+     (invalidate-live-outputs! c)
+     (let [profile-result (gpu-link/profile! (:executable c))
+           result (into {} (map (fn [{:keys [key node]}]
+                                  [key (gpu-link/download (:executable c) node)]))
+                        (:out-tree c))]
+       (assoc profile-result :result result)))))
 
 (defn measure
   "Explicit offline device-event measurement of a Compiled artifact.
@@ -1143,9 +1167,12 @@
    options are those of gpu-link/measure!, including the required :before-sample! restore hook
    for stateful programs. This does not choose or cache a schedule by itself."
   [^Compiled c & {:as opts}]
-  (refresh-captured-inputs! c)
-  (invalidate-live-outputs! c)
-  (apply gpu-link/measure! (:executable c) (mapcat identity opts)))
+  (gpu-link/with-unleased-execution!
+   (:executable c) :measure
+   (fn []
+     (refresh-captured-inputs! c)
+     (invalidate-live-outputs! c)
+     (apply gpu-link/measure! (:executable c) (mapcat identity opts)))))
 
 (defn cache-key
   "The serializable identity of the artifact minus closures (§2b C5): in/out trees, donation,
