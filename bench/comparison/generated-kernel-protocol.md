@@ -93,6 +93,10 @@ validates the final role/output projection once, and runtime validation returns 
 contract from the same effect analysis. A post-change bounded Arc replay in the raw record still
 matches ggml bit-for-bit. Background load and separate runs preclude a claimed wall-time speedup;
 the remaining equation-lowering and certification phases are the next compiler-cost targets.
+The preparation report now divides `:equation-lower` into invocation materialization and LinkPlan
+construction. These nested timings are diagnostic and must not be added to the outer phase totals.
+They identify which work remains after a compiler-template cache hit before a plan-template or
+certificate-reuse change is justified.
 
 ## Baseline selection
 

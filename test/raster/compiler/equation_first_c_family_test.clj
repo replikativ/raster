@@ -329,7 +329,14 @@
         (is (= #{:equation-lower :role-projection :invocation-certification}
                (set (keys phases))))
         (is (every? #(and (integer? %) (not (neg? %))) (vals phases)))
-        (is (<= (reduce + (vals phases)) (:link-plan-lowering-ns report))))
+        (is (<= (reduce + (vals phases)) (:link-plan-lowering-ns report)))
+        (let [equation-phases (:equation-lower-phases-ns report)]
+          (is (= #{:materialization-ns :link-plan-construction-ns}
+                 (set (keys equation-phases))))
+          (is (every? #(and (integer? %) (not (neg? %)))
+                      (vals equation-phases)))
+          (is (<= (reduce + (vals equation-phases))
+                  (:equation-lower phases)))))
       (is (= 2 (:entries (compiled/compilation-cache-stats)))))
     (finally
       (compiled/clear-compilation-cache!))))
