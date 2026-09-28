@@ -15,6 +15,7 @@
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :refer [deftm defvalue defabstract broadcast reduce!]]
             [raster.arrays :refer [aget aset alength aclone acopy!]]
+            [raster.par :as par]
             [raster.math :as m]
             [raster.numeric :as mn]
             [raster.sci.special :as special])
@@ -296,13 +297,31 @@
   (let [rng (ThreadLocalRandom/current)]
     (mn/+ (.mu d) (mn/* (.sigma d) (.nextGaussian rng)))))
 
+(deftm sample [d :- Normal, seed :- Long, counter :- Long] :- Double
+  ;; Two draws per site, with adjacent counters reserved for this one sample.
+  ;; The random bits are reproducible; transcendental results may differ by
+  ;; target math library, so CPU/GPU equality is numerical, not bitwise.
+  (let [c0 (unchecked-multiply counter 2)
+        u1 (par/uniform-open01 seed c0)
+        u2 (par/uniform-open01 seed (unchecked-inc c0))
+        z (* (Math/sqrt (* -2.0 (Math/log u1)))
+             (Math/cos (* 2.0 Math/PI u2)))]
+    (mn/+ (.mu d) (mn/* (.sigma d) z))))
+
 (deftm sample [d :- Uniform] :- Double
   (let [rng (ThreadLocalRandom/current)]
     (mn/+ (.a d) (mn/* (.nextDouble rng) (mn/- (.b d) (.a d))))))
 
+(deftm sample [d :- Uniform, seed :- Long, counter :- Long] :- Double
+  (mn/+ (.a d)
+        (mn/* (par/uniform-open01 seed counter) (mn/- (.b d) (.a d)))))
+
 (deftm sample [d :- Exponential] :- Double
   (let [rng (ThreadLocalRandom/current)]
     (mn// (- (m/log (.nextDouble rng))) (.lambda d))))
+
+(deftm sample [d :- Exponential, seed :- Long, counter :- Long] :- Double
+  (mn// (- (m/log (par/uniform-open01 seed counter))) (.lambda d)))
 
 (deftm sample [d :- Gamma] :- Double
   ;; Marsaglia and Tsang's method for alpha >= 1
