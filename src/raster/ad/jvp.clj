@@ -445,7 +445,15 @@
 
                  :else (done tenv [])))))
 
-         :else (done tenv []))))
+         ;; ANF leaves collection literals intact. A vector/map/set that captures
+         ;; an active value is a structured primal, not a constant: passing it
+         ;; through here would silently erase the tangent when it is unpacked.
+         :else (if (and (coll? init) (any-active? tenv init))
+                 (throw (ex-info
+                         "jvp: structured value containing an active value has no forward rule"
+                         {:reason :jvp-unlinearized-structured-value
+                          :sym sym :form init}))
+                 (done tenv [])))))
    {:tenv param-tangents :bindings []}
    (partition 2 norm-bindings)))
 
