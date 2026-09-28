@@ -1659,6 +1659,62 @@
       (ra/aset out i (n/* a (ra/aget xs i))))
     (ra/aget out (dec mn))))
 
+(deftm laws-o10-inplace-scale [xs :- (Array double), a :- Double, mn :- Long]
+  :- Double
+  (do
+    (par/map! xs i mn nil (n/* a (ra/aget xs i)))
+    (ra/aget xs (dec mn))))
+
+(deftm laws-o10-float-map-scale [xs :- (Array float), a :- Float, mn :- Long]
+  :- Float
+  (let [out (float-array mn)]
+    (par/map! out i mn float (n/* a (ra/aget xs i)))
+    (ra/aget out (dec mn))))
+
+(deftm laws-o10-discrete-map-cast [xs :- (Array double), a :- Double,
+                                   mn :- Long] :- Double
+  (let [out (double-array mn)]
+    (par/map! out i mn int (n/* a (ra/aget xs i)))
+    (ra/aget out (dec mn))))
+
+(deftest forward-map-into-fresh-array-has-independent-tangent-storage
+  (let [xs (double-array [0.3 -0.7 1.1])
+        dxs (double-array [0.2 0.4 -0.3])
+        a 2.5 da 0.7
+        [primal directional]
+        ((jvp/jvp #'laws-o10-scale) xs a 3 dxs da)]
+    (is (close? primal (* a (aget xs 2)) 0.0))
+    (is (close? directional
+                (+ (* a (aget dxs 2)) (* da (aget xs 2))) 1e-12))
+    (is (close? directional
+                (/ (- (laws-o10-scale
+                       (double-array (mapv #(+ %1 (* 1e-6 %2)) xs dxs))
+                       (+ a (* 1e-6 da)) 3)
+                      (laws-o10-scale
+                       (double-array (mapv #(- %1 (* 1e-6 %2)) xs dxs))
+                       (- a (* 1e-6 da)) 3))
+                   2e-6)
+                1e-9))
+    (is (= [0.3 -0.7 1.1] (vec xs)) "primal input is not modified")
+    (let [error (try
+                  (jvp/jvp #'laws-o10-inplace-scale)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? error))
+      (is (= :jvp-map-active-output (:reason (ex-data error)))))
+    (let [[fv fd] ((jvp/jvp #'laws-o10-float-map-scale)
+                   (float-array [0.3 1.1]) (float 2.5) 2
+                   (float-array [0.2 -0.3]) (float 0.7))]
+      (is (close? fv 2.75 1e-6))
+      (is (close? fd 0.02 1e-6)
+          "typed float calls use the same AD identity and independent shadow"))
+    (let [error (try
+                  (jvp/jvp #'laws-o10-discrete-map-cast)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :jvp-map-unverified-step (:reason (ex-data error)))
+          "an integral cast cannot be treated as a floating tangent map"))))
+
 ;; DATA-DEPENDENT trip count: the bound reads the carry. Every gate on the
 ;; soundness ladder must decline (lift, materializer), leaving the loud
 ;; reject that points at par/scan and the fixed-point rule.

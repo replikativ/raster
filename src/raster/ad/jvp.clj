@@ -15,14 +15,15 @@
   decomposition; jvp only consumes reverse's shared pieces (ad-prepare,
   resolve-deftm-var, grad-acc as the ⊕ kernel).
 
-  Double-carry par/scan and par/reduce have forward rules. Other loop/SOAC
-  forms still fail loud when active."
+  Double-carry par/scan and par/reduce and pure maps into fresh buffers have
+  forward rules. Other loop/SOAC forms still fail loud when active."
   (:require [raster.ad.reverse :as rev]
             [raster.ad.templates :as tmpl]
             [raster.ad.tangent :as tangent]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.op-descriptor :as opdesc]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.core :as rcore]
             [clojure.string :as string]
             [clojure.walk :as walk]
@@ -141,6 +142,71 @@
 
 (declare jvp-fold)
 
+(defn- fresh-map-output?
+  "A map! tangent may shadow only a private, zero-initialized allocation.
+  Reject aliases and buffers with earlier uses: their prior contents could
+  contribute to the result even when the map writes fewer than all elements."
+  [prior-bindings out]
+  (let [pairs (vec (partition 2 prior-bindings))
+        alloc-idx (first (keep-indexed
+                          (fn [i [s init]]
+                            (when (= s out) i)) pairs))]
+    (and (some? alloc-idx)
+         (let [[_ init] (nth pairs alloc-idx)]
+           (and (seq? init)
+                (symbol? (first init))
+                (= :zero (opdesc/allocation-initialization (first init)))
+                (contains? '#{doubles floats (Array double) (Array float)}
+                           (:raster.type/tag (meta out)))))
+         (not-any? (fn [[_ init]]
+                     (some #{out} (tree-seq coll? seq init)))
+                   (subvec pairs (inc alloc-idx))))))
+
+(defn- pure-map-step?
+  "Ask the shared effect analysis about the source operation, not an opaque
+  devirtualized call. AD's existing template resolver is the authority for
+  that identity; an unknown .invk stays unknown and therefore declines."
+  [body]
+  (let [semantic-body
+        (walk/postwalk
+         (fn [form]
+           (if (and (seq? form) (= '.invk (first form)))
+             (if-let [[_ canonical] (tmpl/resolve-template (second form))]
+               (with-meta (cons canonical (nnext form)) (meta form))
+               form)
+             form))
+         body)]
+    (effects/removable-expr? semantic-body)))
+
+(defn- fold-fresh-map!
+  "Linearize a pure indexed map into a freshly allocated buffer. The primal
+  map has already run; the tangent map evaluates the same scalar step with
+  tangent inputs, writing to an independent zero-initialized shadow."
+  [tenv sym map-form tag]
+  (let [[_ out idx bound & tail] map-form
+        [cast body] (when (= 2 (count tail)) tail)]
+    (when-not (and (= 2 (count tail)) (symbol? out) (symbol? idx)
+                   (contains? '#{nil float double clojure.core/float
+                                 clojure.core/double} cast)
+                   (pure-map-step? body)
+                   (not (some #{out} (tree-seq coll? seq body))))
+      (throw (ex-info "jvp: map! needs a floating cast, pure body and non-self-reading output"
+                      {:reason :jvp-map-unverified-step :form map-form})))
+    (let [[step-bindings step-result]
+          (anf/normalize-for-ad [] [body] jvp-gensym)
+          {:keys [bindings] step-tenv :tenv}
+          (jvp-fold step-bindings (dissoc tenv idx))
+          dstep (or (get step-tenv step-result)
+                    (branch-tangent-zero step-result))
+          dout (jvp-gensym (str "d_" (name out))
+                            (or (:raster.type/tag (meta out)) tag))
+          map-result (jvp-gensym (str "d_" (name sym)) tag)
+          tangent-body (list 'let* (vec bindings) dstep)]
+      [dout map-result
+       [dout (list 'raster.arrays/zeros-like out
+                   (list 'raster.arrays/alength out))
+        map-result (list 'raster.par/map! dout idx bound cast tangent-body)]])))
+
 (defn- fold-double-scan
   "Linearize an inclusive double scan using its output as the primal carry
   tape. The tangent is another ordered scan; at step i, the prior primal
@@ -252,6 +318,7 @@
   jvp-fn or un-templated-active → FAIL LOUD; `if` → branch-selected tangent
   with a typed zero for the inactive branch; double scans → a tangent scan;
   double reductions → paired primal/tangent carries;
+  pure fresh-buffer maps → an independent tangent map;
   other loops/par forms → FAIL LOUD."
   [norm-bindings param-tangents]
   (reduce
@@ -320,6 +387,25 @@
                    {:tenv (assoc tenv sym dreduce)
                     :bindings (into prior-bindings extra)})
                  (done tenv [])))
+
+             (= 'raster.par/map! head)
+             (let [[_ out idx _bound & tail] init
+                   body (last tail)
+                   active? (any-active? (dissoc tenv idx) body)]
+               (cond
+                 (contains? tenv out)
+                 (throw (ex-info "jvp: map! mutates an active input buffer"
+                                 {:reason :jvp-map-active-output :out out}))
+
+                 (and active? (not (fresh-map-output? prior-bindings out)))
+                 (throw (ex-info "jvp: map! output is not proven fresh"
+                                 {:reason :jvp-map-unproven-output :out out}))
+
+                 active?
+                 (let [[dout dmap extra] (fold-fresh-map! tenv sym init tag)]
+                   (done (assoc tenv out dout sym dmap) extra))
+
+                 :else (done tenv [])))
 
              ;; Remaining control flow has no forward rule yet.
              (contains? unsupported-forward-heads head)
