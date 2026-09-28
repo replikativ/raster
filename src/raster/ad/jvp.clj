@@ -186,10 +186,12 @@
   (let [[_ out idx bound & tail] map-form
         [cast body] (when (= 2 (count tail)) tail)]
     (when-not (and (= 2 (count tail)) (symbol? out) (symbol? idx)
+                   (contains? '#{nil float double clojure.core/float
+                                 clojure.core/double} cast)
                    (pure-map-step? body)
                    (not (some #{out} (tree-seq coll? seq body))))
-      (throw (ex-info "jvp: map! needs a pure body and a non-self-reading output"
-                      {:reason :jvp-map-effect-or-alias :form map-form})))
+      (throw (ex-info "jvp: map! needs a floating cast, pure body and non-self-reading output"
+                      {:reason :jvp-map-unverified-step :form map-form})))
     (let [[step-bindings step-result]
           (anf/normalize-for-ad [] [body] jvp-gensym)
           {:keys [bindings] step-tenv :tenv}
