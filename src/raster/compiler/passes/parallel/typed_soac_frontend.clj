@@ -3321,6 +3321,8 @@
         beta-literal (when (and projection (not batched?))
                        (descriptor/gemm-scalar-literal beta))
         alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))
+        elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                          dtype/dtype-for-array-tag dtype/canon)
         ;; `alpha`/`beta` arrive as `(oftype witness value)` from the source spelling; the scalar
         ;; factor is its value, not the type witness array.
         scalar-value (fn [argument literal]
@@ -3332,11 +3334,19 @@
                               (= 'raster.numeric/oftype (descriptor/semantic-op argument))
                               (= 2 (count (descriptor/call-args argument))))
                          (second (descriptor/call-args argument))
+                         ;; A source-level typed cast of a scalar denotes the same uniform
+                         ;; factor. The result-transform capture owns its element conversion.
+                         (and (seq? argument)
+                              (= 1 (count (descriptor/call-args argument)))
+                              (symbol? (first (descriptor/call-args argument)))
+                              (= elem-type
+                                 (some-> (descriptor/semantic-op argument)
+                                         descriptor/cast-result-tag
+                                         dtype/dtype-for-scalar-tag dtype/canon)))
+                         (first (descriptor/call-args argument))
                          :else argument))
         beta-value (when variant (scalar-value beta beta-literal))
-        accumulate? (and (not batched?) (not= 0.0 beta-literal))
-        elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
-                          dtype/dtype-for-array-tag dtype/canon)]
+        accumulate? (and (not batched?) (not= 0.0 beta-literal))]
     (if (and variant (= 8 (count arguments))
              (symbol? A) (symbol? B) (symbol? C)
              (or (not accumulate?)

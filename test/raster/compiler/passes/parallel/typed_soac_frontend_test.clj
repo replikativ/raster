@@ -1899,6 +1899,27 @@
     (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
 
+(deftest a-typed-array-witness-in-gemm-alpha-remains-a-scalar-capture
+  (let [alpha (with-meta (list 'raster.numeric/oftype 'A 'scale)
+                {:tag 'float :raster.type/tag 'float})
+        call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n alpha '(float 0.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n))
+                            'result call] 'result)
+        options {:dtype :float :array-types {'A :float 'B :float}
+                 :scalar-types {'m :long 'k :long 'n :long 'scale :double}}
+        program (frontend/form->program (frontend/normalize-source source options) options)
+        contraction (some #(when (= 'segmented-reduce (dialect/operation-kind %)) %)
+                          (dialect/equations program))
+        transform (-> contraction dialect/operation-parts :attributes :result-transform)]
+    (is contraction)
+    (is (= ['scale] (mapv :value (:scalars transform))))
+    (is (= program (dialect/validate! program)))))
+
 (deftest batched-blas-gemm-is-the-same-contraction-with-one-more-free-axis
   (doseq [[operation variant]
           [['raster.linalg.blas/batched-gemm-nn! :nn]
