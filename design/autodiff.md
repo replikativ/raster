@@ -236,6 +236,10 @@ independent tangent map and buffer. In-place aliases, prior uses of the output,
 effectful bodies, and self-reads decline. This is not yet the effect-aware
 ordered-loop rule required by reduction HVP: the forward carry tape and the
 reverse gradient scatter both need tangent shadows and ordered store semantics.
+Forward AD also carries a vector of already-normalized values as a vector of
+their tangents, and two-argument `nth` projects the corresponding tangent.
+Active indices, nested active vector expressions not lifted to ANF, and active
+maps/sets decline explicitly rather than silently discarding dependence.
 
 For nonescaping `defvalue` locals, AD preparation now uses the same generic
 field projection as the SoA lowering: a constructed distribution such as
