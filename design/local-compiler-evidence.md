@@ -24,6 +24,22 @@ The ordinary test suite remains untimed. CI discovers generic and precision/subg
 OpenCL gates; missing optional capabilities produce visible skips rather than claiming execution.
 Compilation-only CUDA/HIP gates remain separate from device acceptance.
 
+## Scalar-route census
+
+The committed OpenCL corpus baseline now contains 251 source functions: 238 flat TypedSOAC,
+one typed structured-control, six explicitly host-only, and six scalar routes. Five scalar
+rows are value helpers rather than standalone GPU programs: `fast-exp` and the four
+learning-rate schedules (`cosine-lr`, `linear-warmup-lr`, `step-lr`,
+`warmup-cosine-lr`). They may be used inside compiled programs, but a scalar-only source
+function has no parallel launch of its own.
+
+The sixth, `gqa-decode-attention-weights!`, is different: it allocates score/output arrays
+inside a nested head/token algorithm and accumulates a head-averaged alignment signal. The
+Moonshine ASR path in pretrained-rstr calls it. Its scalar route is not evidence of a resident
+GPU implementation; a future migration should expose explicit scratch/output ownership and
+test the weight-capture result against that external workload. New scalar or compatibility
+rows now require an intentional corpus-baseline update rather than entering silently.
+
 The private host-result memory boundary projects order from already selected, validated equation
 graphs before allocating; it no longer binds a baseline executable. It still compares the actual
 bound order before launch and checks the owned allocation delta. This does not extend reuse to

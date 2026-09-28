@@ -7,7 +7,8 @@
    explicit `:host-only`, `:compatibility`, `:scalar`), every
    route decline with its reason and operation, and any hard error. A committed baseline turns
    this into a ratchet (`ratchet-violations`): a function that took the typed route may not fall
-   back, and a function that compiled may not start failing.
+   back, a function that compiled may not start failing, and a new source function may not
+   silently enter a scalar or compatibility route.
 
    This namespace only enumerates vars and calls `raster.compiler.pipeline/compile-report`; it
    never inspects source forms or infers operations."
@@ -146,15 +147,20 @@
   "Ways in which `report` regressed against `baseline`.
 
    A var may not move to a worse route (typed → compatibility → scalar → error) and a validated
-   typed program may not lose its validation. New vars are admitted without a baseline edit
-   unless they fail compilation; removed vars do not violate the ratchet."
+   typed program may not lose its validation. A new scalar/compatibility route needs an explicit
+   baseline update; new typed or explicitly host-only vars are admitted without one. Removed
+   vars do not violate the ratchet."
   [baseline report]
   (let [before (into {} (map (juxt :var identity)) (:vars baseline))]
     (vec
      (for [row (:vars report)
            :let [old (get before (:var row))]
-           :when (or old (= :error (:route row)))
+           :when (or old (#{:scalar :compatibility :error} (:route row)))
            violation (cond-> []
+                       (and (nil? old) (#{:scalar :compatibility} (:route row)))
+                       (conj {:var (:var row) :violation :new-untyped-route
+                              :route (:route row) :declines (:declines row)})
+
                        (and (nil? old) (= :error (:route row)))
                        (conj {:var (:var row) :violation :new-compilation-error
                               :error (:error row) :declines (:declines row)})
