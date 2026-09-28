@@ -213,7 +213,15 @@ JAX, which makes you convert `while`→`scan`). A loop-written linear RNN and it
 
 `par/scan` is the sanctioned differentiable recurrence: because `out[i] = acc_i`,
 the output array *is* the carry tape — no closure tape, no residual stack (Griewank
-store-the-carry at every step). Tail-accumulation loops lift to `par/reduce`:
+store-the-carry at every step).
+
+The scan reverse pass also emits its per-step scalar gradient as flat bindings
+inside the backward loop, rather than allocating a pullback closure at each
+step. This makes the step residual explicit, but does not by itself make the
+backward loop differentiable for HVP; ordered loop and scatter linearization
+remain separate obligations. Generic `par/reduce` still uses a closure tape.
+
+Tail-accumulation loops lift to `par/reduce`:
 
 ```clojure
 (deftm doc-ssq [xs :- (Array double) rn :- Long] :- Double
