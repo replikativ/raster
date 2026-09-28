@@ -13,11 +13,13 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as parallel-program]
@@ -52,6 +54,8 @@
     (try (f)
          (finally
            (vswap! timings update phase (fnil + 0) (- (System/nanoTime) started))))))
+
+(def ^:dynamic ^:private *certified-plan-evidence* nil)
 
 (defn- allocation-groups [plan]
   (group-by #(get-in % [:view :allocation :id]) (vals (:nodes plan))))
@@ -143,8 +147,12 @@
    ;; This is intentionally the first operation. Everything below may contact a backend.
    (let [instantiation-started (System/nanoTime)
          timings (volatile! {})
+         retained-evidence (when (identical? plan (:plan *certified-plan-evidence*))
+                             (:evidence *certified-plan-evidence*))
          validated (timed-phase! timings :plan-validation
-                                 #(link-plan/validate-with-effect-evidence! plan))
+                                 #(if retained-evidence
+                                    {:plan plan :effect-evidence retained-evidence}
+                                    (link-plan/validate-with-effect-evidence! plan)))
          plan (:plan validated)
          ;; The same validation already derived ordered initialization from its verified ABI
          ;; facts. Re-running initialization-contract would parse and analyze the plan again.
@@ -292,6 +300,8 @@
            (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
                                @allocation-keys node-views
                                {:timing-source :host-monotonic
+                                :validation-source (if retained-evidence
+                                                     :sealed-prepared :rederived)
                                 :total-ns (- (System/nanoTime) instantiation-started)
                                 :phases-ns @timings
                                 :owned-allocations (count owned-specs)
@@ -320,6 +330,25 @@
                                    @allocation-keys)
                 (catch Throwable _)))
          (throw error))))))
+
+(defn ^:no-doc instantiate-certified!
+  "Instantiate an exact in-process certified lowering whose enclosing Prepared identity was
+   checked by the compiler. Public raw LinkPlan instantiation always rederives effect evidence."
+  [lowering opts]
+  (when-not (or (invocation-link/certified-link? lowering)
+                (resident-plan/certified-plan? lowering)
+                (link-composition/certified-composition? lowering))
+    (throw (ex-info "certified instantiation requires a compiler lowering witness"
+                    {:reason :link-certified-lowering :actual (type lowering)})))
+  (let [plan (:plan lowering)
+        evidence (get-in lowering [:certificate :effect-evidence])]
+    (when-not (and (link-plan/effect-evidence? evidence)
+                   (= (:id plan) (:plan-id evidence))
+                   (= (:target plan) (:target evidence)))
+      (throw (ex-info "certified instantiation has no matching LinkPlan effect evidence"
+                      {:reason :link-certified-effect-evidence :plan (:id plan)})))
+    (binding [*certified-plan-evidence* {:plan plan :evidence evidence}]
+      (instantiate! plan opts))))
 
 (defn- ensure-live! [executable operation]
   (when-not (linked-executable? executable)
