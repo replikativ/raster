@@ -11,7 +11,8 @@
   Compiler passes and op libraries should register and query metadata directly
   through this registry."
   (:require [raster.compiler.support.mangled :as mangled]
-            [raster.compiler.core.dtype :as dtype]))
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]))
 
 (defonce ^:private descriptor-registry (atom {}))
 
@@ -1206,10 +1207,19 @@
    'raster.linalg.blas/batched-gemm-nn! {:layout :nn :batched? true}
    'raster.linalg.blas/batched-gemm-nt! {:layout :nt :batched? true}})
 
+(defn- gemm-converted-literal
+  [result-dtype value]
+  (case result-dtype
+    :float (double (float value))
+    :double (double value)
+    nil))
+
 (defn gemm-scalar-literal
   "The compile-time numeric VALUE of a GEMM alpha/beta operand, or nil if it is not a
    literal. Sees through the two wrappers the walker leaves on a `(n/oftype x 1.0)`
-   argument — the devirtualized oftype .invk, and the primitive cast around the literal:
+   argument — the devirtualized oftype .invk, and the primitive cast around the literal.
+   Each conversion rounds at its own source boundary; an unsupported or untyped
+   conversion is not a foldable literal:
 
      (.invk raster.numeric/oftype_m_floats_float-impl x (float 1.0))  →  1.0
 
@@ -1220,14 +1230,28 @@
   [expr]
   (cond
     (number? expr) (double expr)
-    (and (seq? expr) (contains? '#{float double long int
-                                   clojure.core/float clojure.core/double
-                                   clojure.core/long clojure.core/int}
-                                (first expr)))
-    (gemm-scalar-literal (second expr))
+    (and (seq? expr) (contains? '#{float double
+                                   clojure.core/float clojure.core/double}
+                                (first expr))
+         (= 2 (count expr)))
+    (when-let [value (gemm-scalar-literal (second expr))]
+      (gemm-converted-literal (some-> (first expr) cast-result-tag
+                                      dtype/dtype-for-scalar-tag dtype/canon)
+                              value))
     (and (seq? expr) (= '.invk (first expr))
-         (= 'raster.numeric/oftype (:raster.op/original (meta expr))))
-    (gemm-scalar-literal (last expr))
+         (= 'raster.numeric/oftype (:raster.op/original (meta expr)))
+         (= 2 (count (call-args expr)))
+         (symbol? (first (call-args expr))))
+    (let [witness (first (call-args expr))
+          witness-tag (types/sym-type-tag witness)
+          witness-dtype (or (some-> witness-tag dtype/dtype-for-array-tag dtype/canon)
+                            (some-> witness-tag dtype/dtype-for-scalar-tag dtype/canon))
+          result-tag (or (:raster.type/tag (meta expr)) (:tag (meta expr)))
+          result-dtype (some-> result-tag dtype/dtype-for-scalar-tag dtype/canon)]
+      (when (and (= witness-dtype result-dtype)
+                 (contains? #{:float :double} result-dtype))
+        (when-let [value (gemm-scalar-literal (second (call-args expr)))]
+          (gemm-converted-literal result-dtype value))))
     :else nil))
 
 (defn gemm-default-alpha-beta?

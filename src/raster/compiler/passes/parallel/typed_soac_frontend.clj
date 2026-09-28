@@ -3306,7 +3306,7 @@
    `:inout` parameter. A `beta` that is neither a literal nor a scalar value id, or a call whose
    element type is unknown, stays a host call.  A batched call adds one free logical axis; it
    does not introduce a different numerical operation or kernel kind."
-  [ordinal expression]
+  [ordinal scalar-types expression]
   (let [source-operation (when (and (seq? expression) (= '.invk (first expression)))
                            (:raster.op/original (meta expression)))
         {:keys [layout batched?] :as projection}
@@ -3321,8 +3321,11 @@
         beta-literal (when (and projection (not batched?))
                        (descriptor/gemm-scalar-literal beta))
         alpha-literal (when variant (descriptor/gemm-scalar-literal alpha))
-        ;; `alpha`/`beta` arrive as `(oftype witness value)` from the source spelling; the scalar
-        ;; factor is its value, not the type witness array.
+        elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
+                          dtype/dtype-for-array-tag dtype/canon)
+        ;; `alpha`/`beta` may use an array only as an element-type witness. Keep the
+        ;; conversion in the result transform; capturing the underlying Double as Float
+        ;; would contradict both source rounding and the authoritative scalar ABI.
         scalar-value (fn [argument literal]
                        (cond
                          ;; A literal factor (`-1`, `(float 2.0)`) is the element-typed number
@@ -3330,17 +3333,48 @@
                          (some? literal) literal
                          (and (seq? argument)
                               (= 'raster.numeric/oftype (descriptor/semantic-op argument))
-                              (= 2 (count (descriptor/call-args argument))))
-                         (second (descriptor/call-args argument))
+                              (= 2 (count (descriptor/call-args argument)))
+                              (symbol? (first (descriptor/call-args argument)))
+                              (= elem-type
+                                 (some-> (first (descriptor/call-args argument))
+                                         types/sym-type-tag dtype/dtype-for-array-tag
+                                         dtype/canon))
+                              (= elem-type
+                                 (some-> (retained-expression-tag argument)
+                                         dtype/dtype-for-scalar-tag dtype/canon)))
+                         (let [cast (get {:float 'clojure.core/float
+                                          :double 'clojure.core/double} elem-type)]
+                           (if cast
+                             (with-meta (list cast (second (descriptor/call-args argument)))
+                               {:tag (symbol (name elem-type))
+                                :raster.type/tag (symbol (name elem-type))})
+                             argument))
                          :else argument))
+        scalar-capture (fn [factor]
+                         (let [id (cond
+                                    (symbol? factor) factor
+                                    (and (seq? factor)
+                                         (= 1 (count (descriptor/call-args factor)))
+                                         (= elem-type
+                                            (some-> (descriptor/semantic-op factor)
+                                                    descriptor/cast-result-tag
+                                                    dtype/dtype-for-scalar-tag dtype/canon))
+                                         (symbol? (first (descriptor/call-args factor))))
+                                    (first (descriptor/call-args factor)))]
+                           (when id
+                             (when-let [source-dtype (retained-scalar-dtype id scalar-types)]
+                               {:sym id :dtype (dtype/canon source-dtype)}))))
+        alpha-value (when variant (scalar-value alpha alpha-literal))
+        scale-acc? (not= 1.0 alpha-literal)
         beta-value (when variant (scalar-value beta beta-literal))
-        accumulate? (and (not batched?) (not= 0.0 beta-literal))
-        elem-type (some-> (or (:raster.type/tag (meta expression)) (:tag (meta expression)))
-                          dtype/dtype-for-array-tag dtype/canon)]
+        accumulate? (and (not batched?) (not= 0.0 beta-literal))]
     (if (and variant (= 8 (count arguments))
              (symbol? A) (symbol? B) (symbol? C)
+             (or (not scale-acc?) (number? alpha-value)
+                 (scalar-capture alpha-value))
              (or (not accumulate?)
-                 (and elem-type (or (number? beta-value) (symbol? beta-value)))))
+                 (and elem-type (or (number? beta-value)
+                                    (scalar-capture beta-value)))))
       (let [batch-axis (clojure.core/symbol (str "rstr_gemm_batch_" ordinal))
             i (clojure.core/symbol (str "rstr_gemm_i_" ordinal))
             j (clojure.core/symbol (str "rstr_gemm_j_" ordinal))
@@ -3380,8 +3414,6 @@
                     (if scalar-tag
                       (with-meta form {:raster.type/tag scalar-tag :tag scalar-tag})
                       form))
-            alpha-value (scalar-value alpha alpha-literal)
-            scale-acc? (not= 1.0 alpha-literal)
             body (typed (list 'clojure.core/*
                               (typed (list 'clojure.core/aget A a-index))
                               (typed (list 'clojure.core/aget B b-index))))
@@ -3409,10 +3441,8 @@
                              [{:sym C :map (axis-map/of-axes [[i m] [j n]])
                                :dtype elem-type}]
                              [])
-                 :scalars (->> [(when (and scale-acc? (symbol? alpha-value))
-                                  {:sym alpha-value :dtype elem-type})
-                                (when (and accumulate? (symbol? beta-value))
-                                  {:sym beta-value :dtype elem-type})]
+                 :scalars (->> [(when scale-acc? (scalar-capture alpha-value))
+                                (when accumulate? (scalar-capture beta-value))]
                                (remove nil?) distinct vec)
                  :dtype elem-type}))]
         (with-meta (cond-> (list 'raster.par/contract C
@@ -3451,7 +3481,14 @@
                                     (assoc symbol retained))
                    expression (->> expression
                                    (canonicalize-strided-indexed-operation ordinal)
-                                   (canonicalize-blas-gemm ordinal))
+                                   (canonicalize-blas-gemm ordinal
+                                                           (into {}
+                                                                 (keep (fn [[id facts]]
+                                                                         (when-let [tag (or (:raster.type/tag facts)
+                                                                                            (:tag facts))]
+                                                                           (when-let [dt (dtype/dtype-for-scalar-tag tag)]
+                                                                             [id dt]))))
+                                                                 retained-types)))
                    ;; An accumulating GEMM has a result-transform operand. The whole TypedSOAC
                    ;; route represents that boundary, but compatibility scheduling cannot yet do
                    ;; so for every dynamic/mixed-dtype leaf. It is therefore not independently
@@ -3857,16 +3894,54 @@
            pairs)]
       (with-meta (list* head (vec (mapcat identity lifted)) body) (meta source)))))
 
+(defn- erase-array-type-witnesses
+  "Replace a pure array `oftype` witness with its declared element conversion.
+
+   The array is not a runtime operand of the conversion. Only a proven array symbol
+   may disappear: an arbitrary witness expression could have effects, and an
+   untyped symbol is not permission to infer a device representation."
+  [source array-types]
+  (util/postwalk-preserving-meta
+   (fn [expression]
+     (if (and (seq? expression)
+              (= 'raster.numeric/oftype (descriptor/semantic-op expression))
+              (= 2 (count (descriptor/call-args expression))))
+       (let [[witness value] (descriptor/call-args expression)
+             element (when (and (symbol? witness)
+                                (contains? (:arrays *declared-kinds*) witness))
+                       (or (some-> (get array-types witness) dtype/canon)
+                           (some-> (types/sym-type-tag witness)
+                                   dtype/dtype-for-array-tag dtype/canon)))
+             result (some-> (retained-expression-tag expression)
+                            dtype/dtype-for-scalar-tag dtype/canon)
+             cast (get {:float 'clojure.core/float
+                        :double 'clojure.core/double
+                        :long 'clojure.core/long
+                        :int 'clojure.core/int} element)]
+         (if (and cast (= result element))
+           (with-meta (list cast value)
+             (-> (meta expression)
+                 (dissoc :raster.op/original)
+                 (assoc :tag (symbol (name element))
+                        :raster.type/tag (symbol (name element)))))
+           expression))
+       expression))
+   source))
+
 (defn- normalize-source*
-  [source scalar-types]
+  [source array-types scalar-types]
   ;; Direct backend entry may see source before the ordinary pipeline's SSA cleanup. Clojure
   ;; permits sequential rebinding (most commonly repeated `_` effect binders), while TypedSOAC
   ;; deliberately requires one logical definition per value. Use the shared scope-aware
   ;; alpha-renamer so later references keep their lexical meaning; inventing identities only in
   ;; operation-description would disconnect host materialization from the semantic equation.
-  (let [source (->> source
-                    (util/uniquify-rebindings (util/free-syms source))
-                    lift-nested-scalar-reductions)]
+  (let [source (util/uniquify-rebindings (util/free-syms source) source)
+        ;; A locally bound scalar can reuse a public array's name. Only free array
+        ;; parameters may borrow the entry type; local arrays need their own tag.
+        public-array-types (select-keys array-types (util/free-syms source))
+        source (-> source
+                   (erase-array-type-witnesses public-array-types)
+                   lift-nested-scalar-reductions)]
     (if (and (seq? source) (contains? #{'let 'let*} (first source)))
       (let [[head bindings & body] source
             pairs (vec (partition 2 bindings))
@@ -3919,7 +3994,7 @@
                      local-scalar-types (:local-scalar-types state)
                      expression (->> expression
                                      (canonicalize-strided-indexed-operation ordinal)
-                                     (canonicalize-blas-gemm ordinal))
+                                     (canonicalize-blas-gemm ordinal local-scalar-types))
                      ;; Host scalar identities: a binding that renames a scalar, or recomputes
                      ;; a pure scalar expression an earlier binding already computed, denotes
                      ;; that earlier value. Extents are compared in these canonical names so
@@ -4478,7 +4553,8 @@
                                (tagged #(contains? #{:long :int}
                                                    (some-> % dtype/dtype-for-scalar-tag
                                                            dtype/canon))))}]
-       (normalize-source* (copy-allocations->maps source array-types) scalar-types)))))
+       (normalize-source* (copy-allocations->maps source array-types)
+                          array-types scalar-types)))))
 
 (declare coverage-decline*)
 

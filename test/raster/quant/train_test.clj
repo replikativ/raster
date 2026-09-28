@@ -9,6 +9,7 @@
             [raster.arrays :as ra]
             [raster.dl.nn :as nn]
             [raster.ad.reverse :as rev]
+            [raster.gpu.compiled :as compiled]
             [raster.compiler.pipeline :as pl]))
 
 (defn- fa ^floats [n seed]
@@ -38,6 +39,21 @@
           err (reduce max (map #(Math/abs (- (aget ^floats y %) (aget ^floats ref %)))
                                (range (* m out))))]
       (is (< err 1e-5) (str "forward vs dense err=" err)))))
+
+(deftest q8-forward-and-pullback-have-hardware-free-equation-first-lowerings
+  (let [in 32 out 2 rows 2
+        weights (float-array (repeat (* in out) 0.125))
+        {:keys [codes scales]} (qt/q8-quantize weights out in)
+        x (float-array (repeat (* rows in) 0.25))
+        dy (float-array (repeat (* rows out) 0.5))]
+    (doseq [[kernel input] [[#'qt/qlinear-q8 x]
+                            [#'qt/qlinear-q8-dx dy]]]
+      (let [prepared (compiled/lower
+                      kernel [input codes scales (long rows) (long in) (long out)]
+                      {:compiler :equation-first :target :cuda:0 :dtype :float
+                       :on-non-resident :throw})]
+        (is (compiled/prepared? prepared))
+        (is (seq (get-in prepared [:descriptor :steps])))))))
 
 (deftm qt-loss [x :- (Array float) codes :- (Array byte) scales :- (Array float)
                 tgt :- (Array float) m :- Long in :- Long out :- Long] :- Double

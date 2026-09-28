@@ -41,6 +41,68 @@
     (is (= source (frontend/normalize-source source {:dtype :float}))
         "an untyped/object clone does not acquire a guessed device representation")))
 
+(deftest array-oftype-witness-is-a-typed-conversion-not-a-device-input
+  (let [y (with-meta 'y {:tag 'floats :raster.type/tag 'floats})
+        converted (with-meta
+                    (list '.invk 'raster.numeric/oftype_m_floats_long-impl
+                          y '(clojure.core/aget codes i))
+                    {:tag 'float :raster.type/tag 'float
+                     :raster.op/original 'raster.numeric/oftype})
+        source (list 'let* [y '(clojure.core/float-array n)
+                            'write (list 'raster.par/map-void! 'i 'n
+                                         (list 'clojure.core/aset y 'i converted))]
+                     y)
+        options {:dtype :float :array-types {'codes :byte}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)]
+    (is (some #{'(clojure.core/float (clojure.core/aget codes i))}
+              (tree-seq coll? seq normalized)))
+    (is (not-any? #(= 'raster.numeric/oftype (descriptor/semantic-op %))
+                  (tree-seq coll? seq normalized)))
+    (is (= normalized (frontend/normalize-source normalized options))
+        "normalization is a fixpoint")))
+
+(deftest array-oftype-does-not-erase-an-effectful-or-untyped-witness
+  (let [value '(clojure.core/aget codes i)
+        effectful '(do (clojure.core/aset scratch 0 1.0) y)
+        source (list 'let* ['y '(clojure.core/float-array n)
+                            'write (list 'raster.par/map-void! 'i 'n
+                                         (list 'clojure.core/aset 'y 'i
+                                               (list 'raster.numeric/oftype effectful value)))]
+                     'y)
+        options {:dtype :float :array-types {'codes :byte 'scratch :float}
+                 :scalar-types {'n :long}}
+        normalized (frontend/normalize-source source options)
+        unknown (frontend/normalize-source
+                 '(let* [write (raster.par/map-void! i n
+                                 (raster.arrays/aset output i
+                                   (raster.numeric/oftype unknown
+                                     (raster.arrays/aget codes i))))]
+                    output)
+                 {:dtype :float :array-types {'output :float 'codes :byte}
+                  :scalar-types {'n :long}})]
+    (is (some #{'(raster.numeric/oftype
+                 (do (clojure.core/aset scratch 0 1.0) y)
+                 (clojure.core/aget codes i))}
+              (tree-seq coll? seq normalized)))
+    (is (some #{'(raster.numeric/oftype unknown (raster.arrays/aget codes i))}
+              (tree-seq coll? seq unknown)))))
+
+(deftest array-oftype-does-not-confuse-a-shadowed-scalar-with-an-array
+  (doseq [source ['(let* [x (double 1.0)
+                           result (raster.numeric/oftype x 2.0)]
+                      result)
+                  '(let* [x (clojure.core/aget input 0)
+                           x (clojure.core/float x)
+                           result (raster.numeric/oftype x 1.0)]
+                      result)]]
+    (let [normalized (frontend/normalize-source
+                      source {:array-types {'x :float 'input :float}})]
+      (is (some #(and (seq? %)
+                      (= 'raster.numeric/oftype (descriptor/semantic-op %)))
+                (tree-seq coll? seq normalized))
+          "a local scalar must not borrow the public array's type"))))
+
 (deftest direct-allocation-lengths-are-partially-evaluated-before-shape-analysis
   (let [source '(let* [buffer (clojure.core/float-array
                                (clojure.core/alength (raster.arrays/zeros-like input n)))
@@ -1836,6 +1898,82 @@
         "the nt variant reads B as [n,k]: B[j*k + l]")
     (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
+
+(deftest a-typed-array-witness-in-gemm-alpha-remains-a-scalar-capture
+  (let [alpha (with-meta (list 'raster.numeric/oftype 'A 'scale)
+                {:tag 'float :raster.type/tag 'float})
+        call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n alpha '(float 0.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n))
+                            'result call] 'result)
+        options {:dtype :float :array-types {'A :float 'B :float}
+                 :scalar-types {'m :long 'k :long 'n :long 'scale :double}}
+        program (frontend/form->program (frontend/normalize-source source options) options)
+        routed (route/attempt source :float {'A :float 'B :float}
+                              {:scalar-types (:scalar-types options)})
+        contraction (some #(when (= 'segmented-reduce (dialect/operation-kind %)) %)
+                          (dialect/equations program))
+        transform (-> contraction dialect/operation-parts :attributes :result-transform)]
+    (is contraction)
+    (is (= ['scale] (mapv :value (:scalars transform))))
+    (is (= [:double] (mapv :dtype (:scalars transform))))
+    (is (some #{'clojure.core/float} (flatten (:lambda transform))))
+    (is (= :typed-soac (get-in routed [:stats :route])))
+    (is (= program (dialect/validate! program)))))
+
+(deftest an-effectful-gemm-type-witness-cannot-be-erased
+  (let [alpha (with-meta
+                '(raster.numeric/oftype
+                  (do (clojure.core/aset scratch 0 1.0) A) scale)
+                {:tag 'float :raster.type/tag 'float})
+        call (with-meta
+               (list '.invk
+                     'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                     'A 'B 'C 'm 'k 'n alpha '(float 0.0))
+               {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                :raster.type/tag 'floats :tag 'floats})
+        source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n))
+                            'result call] 'result)
+        normalized (frontend/normalize-source
+                    source {:dtype :float
+                            :array-types {'A :float 'B :float 'scratch :float}
+                            :scalar-types {'m :long 'k :long 'n :long 'scale :double}})]
+    (is (not-any? #(and (seq? %) (= 'raster.par/contract (first %)))
+                  (tree-seq coll? seq normalized)))
+    (is (some #{'(clojure.core/aset scratch 0 1.0)}
+              (tree-seq coll? seq normalized))
+        "declining canonicalization must retain the witness effect")))
+
+(deftest literal-gemm-factors-cannot-hide-an-effectful-type-witness
+  (let [witness '(do (clojure.core/aset scratch 0 1.0) A)
+        wrapped (fn [value]
+                  (with-meta
+                    (list '.invk 'raster.numeric/oftype_m_floats_float-impl
+                          witness value)
+                    {:raster.op/original 'raster.numeric/oftype
+                     :tag 'float :raster.type/tag 'float}))]
+    (doseq [[alpha beta] [[(wrapped '(float 1.0)) '(float 0.0)]
+                          ['(float 1.0) (wrapped '(float 0.0))]]]
+      (let [call (with-meta
+                   (list '.invk
+                         'raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                         'A 'B 'C 'm 'k 'n alpha beta)
+                   {:raster.op/original 'raster.linalg.blas/dgemm-nt!
+                    :tag 'floats :raster.type/tag 'floats})
+            source (list 'let* ['C '(clojure.core/float-array (clojure.core/* m n))
+                                'result call] 'result)
+            normalized (frontend/normalize-source
+                        source {:dtype :float
+                                :array-types {'A :float 'B :float 'scratch :float}
+                                :scalar-types {'m :long 'k :long 'n :long}})]
+        (is (not-any? #(and (seq? %) (= 'raster.par/contract (first %)))
+                      (tree-seq coll? seq normalized)))
+        (is (some #{'(clojure.core/aset scratch 0 1.0)}
+                  (tree-seq coll? seq normalized)))))))
 
 (deftest batched-blas-gemm-is-the-same-contraction-with-one-more-free-axis
   (doseq [[operation variant]
