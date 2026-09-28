@@ -1133,13 +1133,16 @@
   "Device-event profile of one linked replay. The artifact must have been compiled with
    `{:profile? true}`. Returns the historical profile map, including downloaded semantic results."
   [^Compiled c]
-  (refresh-captured-inputs! c)
-  (invalidate-live-outputs! c)
-  (let [profile-result (gpu-link/profile! (:executable c))
-        result (into {} (map (fn [{:keys [key node]}]
-                               [key (gpu-link/download (:executable c) node)]))
-                     (:out-tree c))]
-    (assoc profile-result :result result)))
+  (gpu-link/with-unleased-execution!
+   (:executable c) :profile
+   (fn []
+     (refresh-captured-inputs! c)
+     (invalidate-live-outputs! c)
+     (let [profile-result (gpu-link/profile! (:executable c))
+           result (into {} (map (fn [{:keys [key node]}]
+                                  [key (gpu-link/download (:executable c) node)]))
+                        (:out-tree c))]
+       (assoc profile-result :result result)))))
 
 (defn measure
   "Explicit offline device-event measurement of a Compiled artifact.
@@ -1148,9 +1151,12 @@
    options are those of gpu-link/measure!, including the required :before-sample! restore hook
    for stateful programs. This does not choose or cache a schedule by itself."
   [^Compiled c & {:as opts}]
-  (refresh-captured-inputs! c)
-  (invalidate-live-outputs! c)
-  (apply gpu-link/measure! (:executable c) (mapcat identity opts)))
+  (gpu-link/with-unleased-execution!
+   (:executable c) :measure
+   (fn []
+     (refresh-captured-inputs! c)
+     (invalidate-live-outputs! c)
+     (apply gpu-link/measure! (:executable c) (mapcat identity opts)))))
 
 (defn cache-key
   "The serializable identity of the artifact minus closures (§2b C5): in/out trees, donation,

@@ -56,6 +56,44 @@
     (is (zero? @replays))
     (is (true? @(:output-ready? executable)))))
 
+(deftest profiling-and-measurement-preflight-leases-before-mutating-inputs-or-outputs
+  (let [view (bview/view
+              (bview/allocation {:id :output :byte-size 16 :memory-space :device
+                                 :device :ze:0 :ownership :owned})
+              {:dtype :float :shape [4]})
+        output (value/wrap-external-view
+                {:id :output :dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :profile-lease :target :ze:0}
+                     :session ::session :closed? (atom false) :lifetime-lock (Object.)
+                     :output-leases (atom 1) :pending-inputs (atom #{})})
+        artifact (compiled/map->Compiled
+                  {:executable executable
+                   :in-tree [{:node :input :role :input :default (float-array 4)}]
+                   :out-tree [] :live-outputs (atom [output])})
+        writes (atom 0)
+        profiles (atom 0)
+        measures (atom 0)
+        reason (fn [f] (try (f) nil
+                            (catch clojure.lang.ExceptionInfo error
+                              (:reason (ex-data error)))))]
+    (with-redefs [gpu-link/write! (fn [& _] (swap! writes inc))
+                  gpu-link/profile! (fn [& _] (swap! profiles inc) {:profile []})
+                  gpu-link/measure! (fn [& _] (swap! measures inc) {:samples []})]
+      (is (= :link-output-lease-active (reason #(compiled/profile artifact))))
+      (is (= :link-output-lease-active (reason #(compiled/measure artifact))))
+      (is (zero? @writes))
+      (is (zero? @profiles))
+      (is (zero? @measures))
+      (is (value/live? output))
+      (reset! (:output-leases executable) 0)
+      (is (= {:profile [] :result {}} (compiled/profile artifact)))
+      (is (not (value/live? output)))
+      (is (= {:samples []} (compiled/measure artifact)))
+      (is (= 2 @writes))
+      (is (= 1 @profiles))
+      (is (= 1 @measures)))))
+
 (defn component [_x _w _n])
 
 (deftest execution-info-observes-linked-binding-and-rejects-unavailable-evidence
