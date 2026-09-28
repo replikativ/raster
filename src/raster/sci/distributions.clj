@@ -323,6 +323,40 @@
 (deftm sample [d :- Exponential, seed :- Long, counter :- Long] :- Double
   (mn// (- (m/log (par/uniform-open01 seed counter))) (.lambda d)))
 
+(deftm gamma-log-accept [x :- Double, v :- Double, d :- Double] :- Double
+  ;; Marsaglia-Tsang log acceptance threshold. The + log(v) sign is essential;
+  ;; a minus sign biases both small- and large-shape Gamma samples downward.
+  (mn/+ (mn/* 0.5 (mn/* x x))
+        (mn/* d (mn/+ (mn/- 1.0 v) (m/log v)))))
+
+(deftm keyed-gamma-unit [shape :- Double, site-seed :- Long] :- Double
+  ;; Each rejection attempt has independent normal and acceptance substreams.
+  ;; The number of attempts at one site cannot perturb any other site's draws.
+  (let [normal-seed (par/splitmix64 site-seed 0)
+        accept-seed (par/splitmix64 site-seed 1)
+        d (mn/- shape (mn// 1.0 3.0))
+        c (mn// 1.0 (mn/sqrt (mn/* 9.0 d)))]
+    (loop [attempt 0]
+      (let [x (sample (->Normal 0.0 1.0) normal-seed attempt)
+            tmp (mn/+ 1.0 (mn/* c x))
+            v (mn/* tmp tmp tmp)]
+        (if (and (> v 0.0)
+                 (< (m/log (par/uniform-open01 accept-seed attempt))
+                    (gamma-log-accept x v d)))
+          (mn/* d v)
+          (recur (unchecked-inc attempt)))))))
+
+(deftm sample [d :- Gamma, seed :- Long, counter :- Long] :- Double
+  (let [site-seed (par/splitmix64 seed counter)
+        a (.alpha d)
+        b (.beta d)]
+    (if (< a 1.0)
+      (mn/* b
+            (keyed-gamma-unit (mn/+ a 1.0) site-seed)
+            (mn/pow (par/uniform-open01 (par/splitmix64 site-seed 2) 0)
+                    (mn// 1.0 a)))
+      (mn/* b (keyed-gamma-unit a site-seed)))))
+
 (deftm sample [d :- Gamma] :- Double
   ;; Marsaglia and Tsang's method for alpha >= 1
   ;; For alpha < 1, use the transformation: X = Y^(1/alpha) where Y ~ Gamma(alpha+1)
@@ -339,7 +373,7 @@
                                (* tmp tmp tmp))]
                        (if (and (> v 0.0)
                                 (< (m/log (.nextDouble rng))
-                                   (mn/+ (* 0.5 x x) (mn/* d (- 1.0 v (m/log v))))))
+                                   (gamma-log-accept x v d)))
                          (mn/* d v)
                          (recur)))))]
         (* b g-a1 (mn/pow (.nextDouble rng) (mn// 1.0 a))))
@@ -352,24 +386,42 @@
                     (* tmp tmp tmp))]
             (if (and (> v 0.0)
                      (< (m/log (.nextDouble rng))
-                        (mn/+ (* 0.5 x x) (mn/* d (- 1.0 v (m/log v))))))
+                        (gamma-log-accept x v d)))
               (* b d v)
               (recur))))))))
 
 (deftm sample [d :- Poisson] :- Double
   ;; Knuth's algorithm for small lambda; for large lambda use normal approx
   (let [lam (.lambda d)]
-    (if (< lam 30.0)
-      ;; Knuth's method
-      (let [rng (ThreadLocalRandom/current)
-            L (m/exp (- lam))]
-        (loop [k 0 p 1.0]
-          (if (<= p L)
-            (double (dec k))
-            (recur (inc k) (mn/* p (.nextDouble rng))))))
-      ;; Normal approximation for large lambda
-      (let [rng (ThreadLocalRandom/current)]
-        (m/round (mn/+ lam (mn/* (mn/sqrt lam) (.nextGaussian rng))))))))
+    (if (zero? lam)
+      0.0
+      (if (< lam 30.0)
+        ;; Knuth's method
+        (let [rng (ThreadLocalRandom/current)
+              L (m/exp (- lam))]
+          (loop [k 0 p 1.0]
+            (if (<= p L)
+              (double (dec k))
+              (recur (inc k) (mn/* p (.nextDouble rng))))))
+        ;; Normal approximation for large lambda
+        (let [rng (ThreadLocalRandom/current)]
+          (m/round (mn/+ lam (mn/* (mn/sqrt lam) (.nextGaussian rng)))))))))
+
+(deftm sample [d :- Poisson, seed :- Long, counter :- Long] :- Double
+  (let [site-seed (par/splitmix64 seed counter)
+        lam (.lambda d)]
+    (if (zero? lam)
+      0.0
+      (if (< lam 30.0)
+        (let [threshold (m/exp (- lam))]
+          (loop [k 0 p 1.0]
+            (if (<= p threshold)
+              (double (dec k))
+              (recur (unchecked-inc k)
+                     (mn/* p (par/uniform-open01 site-seed k))))))
+        (m/round (mn/+ lam
+                       (mn/* (mn/sqrt lam)
+                             (sample (->Normal 0.0 1.0) site-seed 0))))))))
 
 (deftm sample-n [d :- Distribution, n :- Long]
   (let [out (double-array n)]
@@ -739,6 +791,14 @@
   ;; Beta(a,b) = Gamma(a,1) / (Gamma(a,1) + Gamma(b,1))
   (let [x (sample (->Gamma (.alpha d) 1.0))
         y (sample (->Gamma (.beta d) 1.0))]
+    (mn// x (mn/+ x y))))
+
+(deftm sample [d :- Beta, seed :- Long, counter :- Long] :- Double
+  (let [site-seed (par/splitmix64 seed counter)
+        x (sample (->Gamma (.alpha d) 1.0)
+                  (par/splitmix64 site-seed 0) 0)
+        y (sample (->Gamma (.beta d) 1.0)
+                  (par/splitmix64 site-seed 1) 0)]
     (mn// x (mn/+ x y))))
 
 (deftm sample [d :- Cauchy] :- Double

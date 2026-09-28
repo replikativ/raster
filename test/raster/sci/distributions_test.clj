@@ -46,6 +46,41 @@
                  (/ (- (Math/log (par/uniform-open01 seed 17))) 2.0)
                  1e-12))))
 
+(deftest keyed-rejection-samples-use-site-local-substreams
+  (let [seed 491
+        counters [0 13 1 13 8]
+        distributions [(->Gamma 0.4 2.0) (->Gamma 2.5 1.3)
+                       (->Poisson 3.0) (->Poisson 45.0) (->Beta 2.0 5.0)]
+        draw (fn [d order] (mapv #(sample d seed %) order))]
+    (doseq [d distributions]
+      (let [forward (draw d counters)
+            reverse-by-counter (zipmap (reverse counters)
+                                      (draw d (reverse counters)))]
+        (is (= forward (draw d counters)))
+        (is (= (nth forward 1) (nth forward 3))
+            "revisiting a site reproduces its rejection path")
+        (is (every? true?
+                    (map = forward (map reverse-by-counter counters)))
+            "other sites do not consume this site's substream")
+        (is (every? #(and (Double/isFinite %) (<= 0.0 %)) forward))))
+    (is (every? #(< % 1.0)
+                (draw (->Beta 2.0 5.0) (range 64))))
+    (is (= 0.0 (sample (->Poisson 0.0) seed 17)))
+    (is (= 0.0 (sample (->Poisson 0.0))))))
+
+(deftest gamma-acceptance-and-fixed-seed-moments
+  (is (approx= (+ 0.5 (* 2.0 (+ -1.0 (Math/log 2.0))))
+               (raster.sci.distributions/gamma-log-accept 1.0 2.0 2.0)
+               1e-12))
+  (doseq [[distribution expected tolerance]
+          [[(->Gamma 0.4 2.0) 0.8 0.12]
+           [(->Gamma 2.5 1.3) 3.25 0.18]
+           [(->Beta 2.0 5.0) (/ 2.0 7.0) 0.035]]]
+    (let [draws (mapv #(sample distribution 491 %) (range 3000))
+          mean (/ (reduce + draws) (double (count draws)))]
+      (is (approx= mean expected tolerance)
+          (str "fixed-seed sample mean for " (class distribution))))))
+
 ;; ================================================================
 ;; Normal distribution
 ;; ================================================================
