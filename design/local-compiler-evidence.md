@@ -197,3 +197,11 @@ new public validation and each changed call is independently checked. This remov
 program-call validations per Q4 preparation in the observed path (five down to three, including
 the constructor), not the two separate LinkPlan proofs around role/output projection. Those
 proofs need a single final-boundary lowering design rather than an unchecked persistent cache.
+
+The final-boundary lowering now normalizes storage identities, applies public role and escaped
+output projection synchronously, and validates only the projected LinkPlan. The resulting effect
+evidence is sealed to that exact plan and reused for its invocation certificate; standalone
+`equation-first/lower` still constructs a validated plan and public `certify` still rederives a
+proof. A focused test counts one complete LinkPlan proof during `Compiled` preparation and checks
+that modifying the certified plan invalidates its retained evidence. This reduces redundant
+host-side proof work, not emitted device work; production Q4 timing still needs a controlled run.

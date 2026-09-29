@@ -315,7 +315,9 @@
    Returns a validated, allocation-free LinkPlan. Public buffers retain their stable host source
    identity until instantiation; scalar prefix and host-only equations execute through the same
    typed JVM reference backend."
-  [compilation arguments]
+  ([compilation arguments]
+   (:plan (lower compilation arguments (fn [plan] {:plan plan}))))
+  ([compilation arguments project]
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
@@ -333,14 +335,20 @@
                         (scalar/evaluate-host-equation
                          source-ns equation (assoc context :buffer-shapes buffer-shapes)))
         construction-started (System/nanoTime)
-        plan (invocation-link/lower
+        projection-ns (volatile! 0)
+        result (invocation-link/lower
               materialized (:emitted compilation) (:target compilation)
-              evaluate-host)]
+              evaluate-host
+              (fn [plan]
+                (let [started (System/nanoTime)
+                      projected (project plan)]
+                  (vswap! projection-ns + (- (System/nanoTime) started))
+                  projected)))]
     (when *lower-observer*
       (*lower-observer* {:materialization-ns materialization-ns
                          :link-plan-construction-ns
-                         (- (System/nanoTime) construction-started)}))
-    plan))
+                         (- (System/nanoTime) construction-started @projection-ns)}))
+    result)))
 
 (defn compile-link-plan
   "Convenience composition of `compile` and `lower`; still performs no runtime allocation."
