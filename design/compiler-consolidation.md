@@ -458,6 +458,15 @@ values under ordinary/core-name shadowing and nested function bindings. Generate
 composition and the resident RMSNorm oracle still pass; this is a scope-correctness fix, not
 a numerical reassociation or performance-policy change.
 
+Tuple projection folding also requires an already-evaluated element, not merely a vector
+source form. Calls, collection construction and global reads must retain their saved value;
+copying their source into an `nth` use can replay mutation or observe later state. CSE now
+folds only scalar literals and source-order-proven lexical locals, excluding rebound element
+and vector names and retaining other projections. Differential
+JVM regressions cover effects in body/initializer projections, array mutation and dynamic Var
+rebinding; evaluated local projections still fold. This is the same evaluate-once requirement
+as conditional residuals, without an AD-specific rule or effect-based speculation.
+
 1. Converge AD preparation on the same canonical typed scalar/control facts as the compiler:
    one result dtype and effect classification per operation, explicit lexical scope and
    constructor-field projection, and one retained scan/reduction algebra. Remove duplicate

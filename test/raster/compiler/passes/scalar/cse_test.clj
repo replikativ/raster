@@ -86,3 +86,30 @@
                      (let* [values [9.0]] (clojure.core/nth values 0)))]]
     (let [optimized (:form (cse/cse-let source))]
       (is (= (eval source) (eval optimized)) (str optimized)))))
+
+(deftest vector-projection-retains-evaluate-once-semantics
+  (doseq [source ['(let* [counter (atom 0) values [(swap! counter inc)]]
+                     (clojure.core/nth values 0))
+                  '(let* [counter (atom 0) values [(swap! counter inc)]
+                          result (clojure.core/nth values 0)] result)
+                  '(let* [storage (double-array [3.0]) values [(aget storage 0)]
+                          ignored (aset storage 0 9.0)]
+                     (clojure.core/nth values 0))
+                  '(let* [values [clojure.core/*print-length*]]
+                     (binding [clojure.core/*print-length* 17]
+                       (clojure.core/nth values 0)))
+                  '(let* [values [count] count 7]
+                     (clojure.core/nth values 0))
+                  '(let* [x 3 values [x] x 9]
+                     (clojure.core/nth values 0))
+                  '(let* [values [3] values (vector 9)]
+                     (clojure.core/nth values 0))]]
+    (let [optimized (:form (cse/cse-let source))]
+      (is (= (eval source) (eval optimized)) (str optimized)))))
+
+(deftest evaluated-local-vector-projection-still-folds
+  (let [source '(let* [counter (atom 0) saved (swap! counter inc) values [saved]]
+                  (clojure.core/nth values 0))
+        optimized (:form (cse/cse-let source))]
+    (is (= 'saved (last optimized)))
+    (is (= (eval source) (eval optimized)))))

@@ -20,7 +20,9 @@
 
 (defn- try-fold-nth
   "If expr is (clojure.core/nth <sym> <const-idx>) and sym is bound to a
-   vector literal, return the element at that index. Otherwise nil."
+   vector literal of evaluated values, return the element at that index. Otherwise nil.
+   Calls, collection constructors and global reads are not evaluated values: copying their
+   source expression would replay work instead of projecting the saved vector element."
   [expr vec-bindings]
   (when (and (seq? expr) (= 'clojure.core/nth (first expr)) (= 3 (count expr)))
     (let [target (second expr)
@@ -32,7 +34,12 @@
       (when (and (symbol? target) (integer? idx))
         (when-let [v (get vec-bindings target)]
           (when (and (>= idx 0) (< idx (count v)))
-            (clojure.core/nth v idx)))))))
+            (let [value (clojure.core/nth v idx)]
+              (when (or (nil? value) (boolean? value) (number? value)
+                        (string? value) (char? value) (keyword? value)
+                        (and (symbol? value)
+                             (contains? util/*shadowing-locals* value)))
+                value))))))))
 
 (defn- subst-blind
   "Scope-BLIND symbol substitution — the fast path, valid only under the precondition that
@@ -72,9 +79,11 @@
                                           (take-nth 2 (second form)))]
       (let [[let-sym bindings-vec & body-exprs] form
           pairs (partition 2 bindings-vec)
+          binding-counts (frequencies (take-nth 2 bindings-vec))
           {:keys [new-pairs cache aliases vec-bindings sym-subst]}
           (reduce
-           (fn [{:keys [new-pairs cache aliases vec-bindings sym-subst]} [sym expr]]
+           (fn [{:keys [new-pairs cache aliases vec-bindings sym-subst projection-locals]}
+                [sym expr]]
              (let [;; Apply pending substitutions to this binding's expr
                    expr (if (seq sym-subst) (subst-syms-in sym-subst expr) expr)
                    ;; Note: alias chains (dp__3→dp) are resolved by the SOAC fusion
@@ -83,8 +92,13 @@
                    ;; Try vector-literal nth folding
                    folded (try-fold-nth expr vec-bindings)
                    expr (or folded expr)
-                   ;; Track vector-literal bindings for nth folding
-                   vec-bindings (if (vector? expr)
+                   ;; A symbol captured by a vector must already be lexical, and must not
+                   ;; be rebound later in this spine. The all-binder scope-check context
+                   ;; above is not an evaluation-time witness for sequential initializers.
+                   vec-bindings (if (and (= 1 (get binding-counts sym))
+                                         (vector? expr)
+                                         (every? #(or (not (symbol? %))
+                                                      (contains? projection-locals %)) expr))
                                   (assoc vec-bindings sym expr)
                                   vec-bindings)
                    ;; If folded to a symbol, register as substitution
@@ -94,15 +108,21 @@
                    ;; CSE
                    norm (when (effects/cse-safe-expr? expr) (normalize-expr expr))
                    cached (when norm (get cache norm))]
-               (if cached
-                 {:new-pairs (conj new-pairs [sym cached])
-                  :cache cache :aliases (inc aliases)
-                  :vec-bindings vec-bindings :sym-subst (assoc sym-subst sym cached)}
-                 {:new-pairs (conj new-pairs [sym expr])
-                  :cache (if norm (assoc cache norm sym) cache)
-                  :aliases aliases
-                  :vec-bindings vec-bindings :sym-subst sym-subst})))
-           {:new-pairs [] :cache {} :aliases 0 :vec-bindings {} :sym-subst {}}
+               (assoc
+                (if cached
+                  {:new-pairs (conj new-pairs [sym cached])
+                   :cache cache :aliases (inc aliases)
+                   :vec-bindings vec-bindings :sym-subst (assoc sym-subst sym cached)}
+                  {:new-pairs (conj new-pairs [sym expr])
+                   :cache (if norm (assoc cache norm sym) cache)
+                   :aliases aliases
+                   :vec-bindings vec-bindings :sym-subst sym-subst})
+                :projection-locals
+                (cond-> projection-locals
+                  (= 1 (get binding-counts sym)) (conj sym)))))
+           {:new-pairs [] :cache {} :aliases 0 :vec-bindings {} :sym-subst {}
+            :projection-locals (apply disj util/*shadowing-locals*
+                                      (take-nth 2 bindings-vec))}
            pairs)
           ;; Apply substitutions and nth folding to body expressions
           resolve-body-expr (fn resolve-body-expr [expr]
