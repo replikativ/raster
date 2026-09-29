@@ -1,0 +1,51 @@
+{:kind :public-q4-k-warmup-diagnostic
+ :protocol "bench/comparison/generated-kernel-protocol.md"
+ :compiler-revision "445894c4"
+ :device "Intel(R) Arc(TM) Graphics via Level Zero"
+ :driver-version :not-reported-by-device-signature
+ :shape [1 1024 640]
+ :precision {:weights :q4_K :activation :q8_K :output :float}
+ :validation {:oracle :raster.quant.ggml/vec-dot
+              :comparison :raw-float-bits
+              :every-replay? true :passed? true}
+ :scope {:public-compiled-lifecycle? true :timing-source :device-event
+         :cache-state :warm-resident :transfers-included? false
+         :validation-included? false :shared-laptop? true :promotion? false}
+ :sample-unit :microseconds-rounded-to-three-decimals
+ :candidate-order [:generated-product :serial-source]
+ :order :rotating-round-robin
+ :runs
+ [{:id :first :warmups 4 :rounds 12
+   :samples-us
+   {:generated-product [107.917 105.104 104.896 109.167 38.229 37.083
+                        37.500 37.396 37.604 37.708 37.500 36.563]
+    :serial-source [314.271 313.646 313.646 314.375 101.875 101.771
+                    102.188 102.292 102.292 102.083 102.292 101.979]}
+   :stationary? {:generated-product false :serial-source false}
+   :host-ms {:generated-prepare 45689.429 :generated-bind 2645.826
+             :generated-link-plan-construction 15775.487
+             :generated-invocation-certification 4898.654}}
+  {:id :immediate-repeat :warmups 4 :rounds 12
+   :samples-us
+   {:generated-product [145.417 141.458 225.000 120.833 106.250 104.583
+                        104.167 108.021 104.896 105.000 106.250 108.125]
+    :serial-source [435.729 426.875 504.271 416.458 321.250 314.792
+                    314.063 313.958 313.438 314.167 314.479 313.958]}
+   :stationary? {:generated-product false :serial-source false}
+   :host-ms {:generated-prepare 20278.087 :generated-bind 2434.978
+             :generated-link-plan-construction 15462.589
+             :generated-invocation-certification 4807.952}
+   :compiler-template-hit? true}
+  {:id :longer-warmup :warmups 16 :rounds 12
+   :samples-us
+   {:generated-product [149.167 144.063 149.688 148.229 143.333 107.396
+                        101.354 98.854 102.396 100.833 99.167 102.917]
+    :serial-source [432.708 437.604 431.458 430.521 439.167 370.729
+                    293.854 291.563 293.021 291.771 291.250 292.604]}
+   :stationary? {:generated-product false :serial-source false}
+   :host-ms {:generated-prepare 19805.240 :generated-bind 2405.603
+             :generated-link-plan-construction 15027.692
+             :generated-invocation-certification 4773.457}
+   :compiler-template-hit? true}]
+ :interpretation
+ "Both candidates move together across distinct speed states, even with 16 warmups. This is not stationary evidence for schedule selection or an external-performance claim. The two warm template hits still rebuild the LinkPlan and certify it for roughly 15 and 4.8 seconds, respectively."}

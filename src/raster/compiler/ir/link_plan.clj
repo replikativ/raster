@@ -36,6 +36,8 @@
 (defrecord LinkEffectEvidence
            [source-dialect target-dialect plan-id target step-facts initialization])
 
+(def ^:dynamic ^:private *validated-program-instances* nil)
+
 (def ^:private effect-evidence-seal-token (Object.))
 
 (defn- seal-effect-evidence
@@ -341,7 +343,7 @@
   [{:keys [id descriptor bindings scalars schedule roles arguments] :or {scalars {} roles {}}}]
   (validate-instance! (->LinkInstance id descriptor bindings scalars schedule roles arguments)))
 
-(defn validate-program-instance!
+(defn- validate-program-instance-uncached!
   [instance]
   (when-not (program-link-instance? instance)
     (throw (ex-info "expected a ProgramLinkInstance"
@@ -366,6 +368,16 @@
                       {:reason :program-link-instance-attributes
                        :instance id :attributes attributes}))))
   instance)
+
+(defn validate-program-instance!
+  [instance]
+  (if (and *validated-program-instances*
+           (.containsKey ^java.util.IdentityHashMap *validated-program-instances* instance))
+    instance
+    (let [checked (validate-program-instance-uncached! instance)]
+      (when *validated-program-instances*
+        (.put ^java.util.IdentityHashMap *validated-program-instances* checked Boolean/TRUE))
+      checked)))
 
 (defn program-instance
   "Construct an equation-first emitted program instance whose call buffers are LinkValue IDs.
@@ -1167,14 +1179,15 @@
   "Validate a LinkPlan and retain the exact ordered effect facts derived from its executable ABIs.
    The evidence is immutable compiler data: it allocates no storage and contacts no driver."
   [plan]
-  (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
-        step-facts (vec (instance-access-facts plan))
-        initialization (analyze-effects! plan step-facts)]
-    {:plan plan
-     :effect-evidence
-     (seal-effect-evidence
-      plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
-                                 step-facts initialization))}))
+  (binding [*validated-program-instances* (java.util.IdentityHashMap.)]
+    (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
+          step-facts (vec (instance-access-facts plan))
+          initialization (analyze-effects! plan step-facts)]
+      {:plan plan
+       :effect-evidence
+       (seal-effect-evidence
+        plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
+                                   step-facts initialization))})))
 
 (defn ^:no-doc validate-with-certified-effect-facts!
   "Validate plan structure and derive a new effect witness from already certified step facts.

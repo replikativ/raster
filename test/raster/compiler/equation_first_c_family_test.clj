@@ -898,6 +898,29 @@
       (is (= 1 (count (:outputs linked))))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
+(deftest link-plan-validates-an-exact-program-instance-once-per-check
+  (let [compilation (equation-first/compile
+                     #'nn/dense-backward-db {:target cuda-target :dtype :float})
+        plan (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])
+        validate-call! program-call/validate!
+        calls (atom 0)]
+    (with-redefs [program-call/validate!
+                  (fn [call]
+                    (swap! calls inc)
+                    (validate-call! call))]
+      (is (link-plan/link-plan? (link-plan/validate! plan)))
+      (is (= 1 @calls) "structure and effect derivation share one exact-object check")
+      (reset! calls 0)
+      (is (link-plan/link-plan? (link-plan/validate! plan)))
+      (is (= 1 @calls) "a new public validation independently checks the program"))
+    (let [forged (assoc-in plan [:instances 0 :call :program :dialect] :hip-parallel)
+          reason (try (link-plan/validate! forged)
+                      nil
+                      (catch clojure.lang.ExceptionInfo exception
+                        (:reason (ex-data exception))))]
+      (is (= :emitted-parallel-program-target reason)
+          "a changed embedded program cannot reuse a previous validation"))))
+
 (deftest allocating-dense-weight-gradient-elides-its-dead-zero-fill
   (doseq [target [cuda-target hip-target]]
     (let [compilation (equation-first/compile
