@@ -1583,13 +1583,19 @@ algebra/schedule seam on a real decode bottleneck without introducing an RMSNorm
 ### 2026-09-25 — city language-coverage follow-up (not a current upgrade gate)
 
 The city-rstr GPU day kernels now compile and agree with their JVM counterparts on Raster
-0.2.951, including the multi-carry effectful episode loop. Keep the remaining probes in
-`~/.cache/claude-city/raster-probe` on the language-coverage agenda: P10/P13 have nested
-two-exit search loops, P14 has multiple `recur` sites, and P20f still declines with
-`:no-lowering-rule`. City can use the supported one-exit/one-recur spellings, so these
-do not block the present generated-kernel performance work. When revisiting them, first
-retain a typed control-flow region and its effect/SSA ownership facts, then check GPU/JVM
-results for the full city kernels. Do not quietly reintroduce source-level fallback or
+0.2.951, including the multi-carry effectful episode loop. On current Raster main at #907,
+the external P10 two-exit search and P14 multiple-`recur` probes also compile on Level Zero
+and match the JVM exactly; Raster's city fixture independently covers a two-exit search and
+branched effectful recurrences. P20f, which nests a seeded SplitMix draw inside a multi-carry
+effectful episode walk, still declines with `:no-lowering-rule`. Direct source-region probing
+isolated its `unchecked-add-int` induction against a `Long` bound: replacing only that step
+with widened addition makes the whole region recognizable, while the other unchecked SplitMix
+arithmetic stays unchanged. This is a legality gap, not evidence that SplitMix cannot be emitted;
+accepting the int step without a bound proof would risk wraparound. Its full shape now has a
+device parity-or-explicit-decline regression. This is not an upgrade gate for city, which
+uses supported spellings, nor proof that every P13 variant is admitted. When revisiting the
+remaining gap, retain a typed control-flow region and its effect/SSA ownership facts, then
+check GPU/JVM results for the full city kernels. Do not reintroduce source-level fallback or
 interpret a successful compile as numerical validation.
 
 ### 2026-09-25 — runtime-shaped cooperative register tiling
