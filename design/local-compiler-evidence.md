@@ -169,6 +169,13 @@ on both local backends and agrees with its JVM result for all four documented wi
 claim that pretrained-rstr's routed paged-storage graph has migrated to equation-first or that
 either attention schedule is fastest for a production decoder.
 
+The public `Compiled` boundary now independently replays the same indexed reduction dispatch
+on local OpenCL and Level Zero: 5-wide/nonempty selects the exact reference; 515-wide/empty
+selects the subgroup candidate and writes the complete zero result. Both match the plan oracle
+and preserve zeroed row tails (two focused device tests, 20 assertions, no skips). This checks
+role/output projection and instantiation beyond the lower-level equation/link path; it does not
+convert pretrained's physical page-route graph into a source-derived TypedSOAC equation.
+
 The [September 29 Q4_K probe](../bench/results/q4-public-arc-20260929.edn) preserves raw
 float-bit ggml parity through public compilation and warm resident replay. Its four-round
 generated series is nonstationary, so it is not a tuning decision. A true compiler-template
