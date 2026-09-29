@@ -130,6 +130,13 @@
                              :input role)])))
           (link-plan/instance-roles plan instance))))
 
+(defn- ordered-program-handles
+  [prepared program-instances]
+  (let [handles (parallel-program/straight-line-handles prepared)]
+    (if (parallel-program/prepared-sequence? prepared)
+      handles
+      (mapv #(assoc % :instance (:id (first program-instances))) handles))))
+
 (defn instantiate!
   "Instantiate a validated LinkPlan as one replayable LinkedExecutable.
 
@@ -165,9 +172,13 @@
                                     (:instances plan))
          mixed? (and (seq program-instances)
                      (not= (count program-instances) (count (:instances plan))))
+         static-programs? (and (seq program-instances)
+                               (every? #(or (link-plan/graph-link-instance? %)
+                                            (parallel-program/straight-line-call? (:call %)))
+                                       program-instances))
          _ (when mixed?
              (doseq [instance program-instances
-                     :when (and (link-plan/program-link-instance? instance)
+                  :when (and (link-plan/program-link-instance? instance)
                                 (not (parallel-program/straight-line-call? (:call instance))))]
                (throw (ex-info
                        "mixed descriptor/program recording requires static emitted graph order"
@@ -290,7 +301,7 @@
                                        (:call instance))})
                             program-instances)
                       executor)))))))
-           (when (or mixed? (empty? program-instances))
+           (when (or static-programs? (empty? program-instances))
                (timed-phase!
                 timings :binding
                 (fn [] (doseq [instance (:instances plan)
@@ -316,11 +327,11 @@
                            (vswap! phases conj phase)))))
                (let [gkey (graph-key execution-id)
                      handles-by-instance
-                     (when mixed?
+                     (when static-programs?
                        (group-by :instance
-                                 (parallel-program/straight-line-handles @prepared-program)))
+                                 (ordered-program-handles @prepared-program program-instances)))
                      sources
-                     (when mixed?
+                     (when static-programs?
                        (vec
                         (mapcat
                          (fn [instance]
@@ -335,7 +346,7 @@
                                   (get handles-by-instance (:id instance)))))
                          (:instances plan))))]
                  (timed-phase! timings :graph-recording
-                               #(if mixed?
+                               #(if static-programs?
                                   (gpu/record-bound-sequence! session sources gkey
                                                               {:profile? profile?})
                                   (gpu/record-graph! session @phases gkey {:profile? profile?})))
@@ -1000,9 +1011,14 @@
       :else
       (let [phase-by-source (set/map-invert (descriptor-source-map executable))
             program-info (when-let [prepared (:prepared-program executable)]
-                           (parallel-program/execution-info
-                            prepared #(gpu/kernel-graph-execution-info
-                                      (:session executable) %)))
+                           (let [info (parallel-program/execution-info
+                                       prepared #(gpu/kernel-graph-execution-info
+                                                 (:session executable) %))]
+                             (if (parallel-program/prepared-sequence? prepared)
+                               info
+                               (let [instance-id (:id (first (filter link-plan/program-link-instance?
+                                                                     (get-in executable [:plan :instances]))))]
+                                 (mapv #(assoc % :instance instance-id) info)))))
             programs-by-instance (group-by :instance program-info)]
         (vec
          (mapcat
@@ -1046,10 +1062,15 @@
                          [handle (cond-> {:instance instance}
                                    (some? step) (assoc :step step))]))
                   (when-let [prepared (:prepared-program executable)]
-                    (parallel-program/straight-line-handles prepared)))
+                    (ordered-program-handles
+                     prepared
+                     (filterv #(or (link-plan/program-link-instance? %)
+                                   (link-plan/graph-link-instance? %))
+                              (get-in executable [:plan :instances])))))
             annotate (fn [entry]
                        (if-let [source (get source-by-phase (:phase entry))]
-                         (assoc entry :source source)
+                         (cond-> (assoc entry :source source)
+                           (gpu/kernel-graph-handle? (:phase entry)) (dissoc :phase))
                          (throw (ex-info "recorded kernel phase has no linked source step"
                                          {:reason :link-execution-order-phase
                                           :phase (:phase entry)}))))]
