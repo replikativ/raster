@@ -451,11 +451,15 @@ ownership, aliases and producer/consumer effects before runtime allocation.
 An emitted `KernelGraph` now also binds directly to LinkValues and typed scalars as a
 `GraphLinkInstance`: the graph retains its public ABI, private temporaries and node dependencies,
 while the plan retains the physical views and cross-instance effect order. Direct graphs and
-equation-first emitted programs share one prepared, ordered replay sequence. This is a local
-composition boundary, not an attention-specific ABI. Legacy descriptor instances still use their
-recorded replay graph; mixing those with the prepared sequence requires a later explicit runtime
-ordering/profiling lowering. A graph ABI write proves an access, not full output coverage; no
-private storage reuse is justified from that permission alone.
+equation-first emitted programs share one prepared, ordered sequence. Straight-line mixtures of
+those emitted graphs and descriptor instances flatten their already-bound kernels into one
+recorded replay graph, with source-order and profiling attribution. Without a whole-plan
+dependency certificate, mixed recording keeps descriptor constant transforms in replay order
+instead of hoisting them across emitted graphs. Structured emitted loops retain their bounded
+runner and fail before allocation when mixed with descriptors; recording a whole emitted-only
+straight-line program as one graph is the remaining replay consolidation. This is a local
+composition boundary, not an attention-specific ABI. A graph ABI write proves an access, not
+full output coverage; no private storage reuse is justified from that permission alone.
 Instantiation allocates internal nodes once and returns an owned executable
 value over one replay graph. It can also attach to a caller session and import
 borrowed/external allocations without taking ownership, which is the boundary
