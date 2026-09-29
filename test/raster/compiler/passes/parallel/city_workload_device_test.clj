@@ -240,17 +240,18 @@
             expected (int-array 8)
             _ (city/episode-splitmix-histogram! locations expected n len seed)]
         (try
-        (let [actual (run-device :episode-splitmix-histogram
-                                 #'city/episode-splitmix-histogram!
-                                 {:locations [:int (* n len) locations]
-                                  :counts [:int 8 (int-array 8)]}
-                                 {"n" n "len" len "seed" seed} n [:counts] device)]
-          (is (= (vec expected) (:counts actual)) (str device " vs JVM")))
+          (let [actual (run-device :episode-splitmix-histogram
+                                   #'city/episode-splitmix-histogram!
+                                   {:locations [:int (* n len) locations]
+                                    :counts [:int 8 (int-array 8)]}
+                                   {"n" n "len" len "seed" seed} n [:counts] device)]
+            (is (= (vec expected) (:counts actual)) (str device " vs JVM")))
           (catch clojure.lang.ExceptionInfo e
-          (is (= :unscheduled-effect-map (:reason (ex-data e)))
-              "only the known fail-closed scheduling gap is permitted")
-          (is (= :no-lowering-rule
-                 (get-in (ex-data e) [:scheduling :segops-declined 0 :reason])))))))))
+            (is (= :unscheduled-effect-map (:reason (ex-data e)))
+                "only the known fail-closed scheduling gap is permitted")
+            (is (= :unchecked-int-induction-unbounded
+                   (get-in (ex-data e) [:admission-decline :reason])))
+            (is (re-find #"unchecked int induction" (.getMessage e)))))))))
 
 (deftest plain-diary-store-before-choice-loop-matches-jvm
   (if-not @probe/gpu-available?

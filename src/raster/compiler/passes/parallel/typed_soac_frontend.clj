@@ -56,6 +56,7 @@
     :typed-soac-syntax
     :typed-soac-unbound-scalar
     :typed-soac-unknown-value
+    :unchecked-int-induction-unbounded
     :unique-index-not-provable})
 
 (defn source-decline?
@@ -1014,7 +1015,19 @@
                                       then loop-index (count parameters) int-bounded?)
                                 branch-tree (when (and (nil? flat) (seq parameters))
                                               (split-branching-recur-many
-                                               then loop-index (count parameters) int-bounded?))]
+                                               then loop-index (count parameters) int-bounded?))
+                                unsafe-int-step?
+                                (and (not int-bounded?) (nil? flat) (nil? branch-tree)
+                                     (or (split-trailing-recur-many
+                                          then loop-index (count parameters) true)
+                                         (and (seq parameters)
+                                              (split-branching-recur-many
+                                               then loop-index (count parameters) true))))]
+                            (when unsafe-int-step?
+                              (fail! :unchecked-int-induction-unbounded
+                                     "unchecked int induction requires an int-bounded exclusive loop"
+                                     {:index loop-index :lower lower :bound (nth test 2)
+                                      :source-form form}))
                             (when (or flat branch-tree)
                             {:index loop-index :lower lower
                              :upper-bound (if (contains? '#{<= clojure.core/<=} (first test))

@@ -1025,7 +1025,9 @@
                            (or direct-mini-program? parallel-program))
                     (throw
                      (ex-info
-                      "GPU effect map has no verified TypedSOAC schedule"
+                      (str "GPU effect map has no verified TypedSOAC schedule"
+                           (when-let [message (get-in direct-schedule [:declined :message])]
+                             (str ": " message)))
                       {:reason :unscheduled-effect-map
                        :source form
                        :target-dialect :kernel-body
