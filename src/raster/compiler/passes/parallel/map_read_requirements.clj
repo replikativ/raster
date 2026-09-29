@@ -205,7 +205,10 @@
           span-references (reduce set/union #{}
                                   (map #(launch/expression-references (:span %))
                                        (remove nil? raw-read-facts)))
-          local-extents (uniform-local-extents source-locals scalar-types span-references)
+          local-extents (uniform-local-extents
+                         source-locals
+                         (select-keys scalar-types (segop/operation-scalars operation))
+                         span-references)
           read-facts (mapv #(when % (update % :span launch/rebind-expression local-extents))
                            raw-read-facts)]
       (when (and (seq source-reads)
