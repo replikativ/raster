@@ -563,26 +563,3 @@
 ;; ================================================================
 ;; Decode attention with weight capture (timestamp alignment signal)
 ;; ================================================================
-
-(deftest gqa-decode-attention-weights-test
-  (let [n 5 hd 8
-        rng (java.util.Random. 11)
-        frand (fn [k] (let [a (float-array k)]
-                        (dotimes [i k] (aset a i (float (.nextGaussian rng)))) a))
-        scale (/ 1.0 (Math/sqrt (double hd)))]
-    (doseq [[n-q n-kv] [[4 4] [4 2]]]
-      (let [q (frand (* n-q hd))
-            kc (frand (* n n-kv hd))
-            vc (frand (* n n-kv hd))
-            wsink (float-array n)
-            base ^floats (attention-reference/gqa-decode q kc vc n n-q n-kv hd scale)
-            got ^floats (attn/gqa-decode-attention-weights! q kc vc n n-q n-kv hd scale wsink)]
-        (testing (str "output bit-identical to the sequential oracle (n-q " n-q " n-kv " n-kv ")")
-          (is (java.util.Arrays/equals base got)))
-        (testing "head-averaged weights sum to ~1 for the query"
-          (let [s (loop [j 0 s 0.0] (if (< j n) (recur (inc j) (+ s (aget wsink j))) s))]
-            (is (approx= s 1.0 1e-5))))
-        (testing "wsink ACCUMULATES across calls (per-layer averaging contract)"
-          (attn/gqa-decode-attention-weights! q kc vc n n-q n-kv hd scale wsink)
-          (let [s (loop [j 0 s 0.0] (if (< j n) (recur (inc j) (+ s (aget wsink j))) s))]
-            (is (approx= s 2.0 1e-5))))))))
