@@ -435,6 +435,15 @@ repair retained allocation expressions across hygienic renaming, with a hardware
 compile regression and the real resident gradient oracle. Do not weaken lexical validation
 or classify it as an unavailable-device skip.
 
+The allocation follow-up retains recognized allocation extents in the existing source-order
+dimension table and keeps established known contracts when a later consumer proves an equivalent
+shape. Unknown shapes can still refine to known contracts; incompatible shapes still decline.
+This prevents equality evidence from introducing a forward/circular scheduling dependency.
+Hardware-free regressions cover the SOAC producer/consumer boundary and the public RMSNorm
+gradient wrapper on OpenCL/Level Zero targets. The existing Level Zero resident oracle now
+executes both gradients, with relative errors about `1.17e-7` (input) and `8.05e-8` (weight).
+These are correctness measurements, not a speedup or other-vendor execution claim.
+
 1. Converge AD preparation on the same canonical typed scalar/control facts as the compiler:
    one result dtype and effect classification per operation, explicit lexical scope and
    constructor-field projection, and one retained scan/reduction algebra. Remove duplicate

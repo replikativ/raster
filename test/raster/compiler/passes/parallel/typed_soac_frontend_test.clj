@@ -2199,6 +2199,42 @@
            (get-in (dialect/facts program) [:values 'z :shape]))
         "the allocation and its consumer agree on one shape")))
 
+(deftest allocation-extents-precede-later-effect-map-shape-reads
+  (let [source '(let* [tmp (clojure.core/float-array ^long n)
+                       fill (raster.par/map-void! i n
+                              (clojure.core/aset tmp i (clojure.core/aget input i)))
+                       ^long copied-length (clojure.core/alength tmp)
+                       copy (raster.par/map-void! j copied-length
+                              (clojure.core/aset out j (clojure.core/aget tmp j)))]
+                      out)
+        program (frontend/form->program source
+                                        {:dtype :float
+                                         :array-types {'input :float 'out :float}
+                                         :scalar-types {'n :long}})
+        maps (filter #(contains? '#{map effect-map} (dialect/operation-kind %))
+                     (dialect/equations program))]
+    (is (some? program))
+    (is (= '[n n] (mapv dialect/operation-extent maps))
+        "both launches use the preceding allocation extent, not the later shape read")
+    (is (= '[n] (get-in (dialect/facts program) [:values 'tmp :shape])))
+    (is (not= '[copied-length]
+              (get-in (dialect/facts program) [:values 'tmp :shape])))))
+
+(deftest equivalent-shapes-preserve-producers-but-still-refine-unknowns
+  (let [producer (av/tensor {:dtype :float :shape '[n]})
+        consumer (av/tensor {:dtype :float :shape '[later-length]})
+        unknown (av/tensor {:dtype :float :shape '[(unknown-dimension tmp)]})]
+    (is (= producer
+           (get (#'frontend/merge-value {'tmp producer} 'tmp consumer
+                                       {'later-length 'n}) 'tmp)))
+    (is (= producer
+           (get (#'frontend/merge-value {'tmp unknown} 'tmp producer
+                                       {'(unknown-dimension tmp) 'n}) 'tmp)))
+    (is (= :source-value-conflict
+           (try (#'frontend/merge-value {'tmp producer} 'tmp consumer {})
+                nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest a-recomputed-array-read-is-not-an-alias-across-a-kernel
   ;; `n1 = (aget counts 0)` recomputed after a kernel that writes `counts` is a fresh value; only
   ;; array-free scalars and array lengths alias across kernels.

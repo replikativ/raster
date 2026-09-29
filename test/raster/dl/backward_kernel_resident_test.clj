@@ -15,6 +15,7 @@
             [raster.dl.loss :as loss]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
+            [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]))
 
 ;; ── input builders ──────────────────────────────────────────────────────────────
@@ -176,6 +177,23 @@
                          seq-len :- Long heads :- Long head-dim :- Long theta :- Double] :- Double
   (let [y (raster.dl.attention/rope x 1 seq-len heads head-dim theta)]
     (raster.dl.loss/mse-loss y tgt (clojure.core/* seq-len (clojure.core/* heads head-dim)))))
+
+(deftm rmsn-parity-gradient-x!
+  [x :- (Array float), w :- (Array float), tgt :- (Array float),
+   rows :- Long, feat :- Long, eps :- Double, go :- Double,
+   out :- (Array float)] :- (Array float)
+  (let [vg ((rev/value+grad #'rmsn-parity-loss) x w tgt rows feat eps go)
+        gradient (nth vg 1)
+        copied (gp/copy-into! gradient out (ra/alength gradient))]
+    out))
+
+(deftest rms-norm-gradient-allocation-shapes-compile-without-a-device
+  (doseq [target [:ocl:0 :ze:0]]
+    (let [descriptor (pipeline/compile-gpu-program #'rmsn-parity-gradient-x! target
+                                                  :dtype :float :on-non-resident :nil
+                                                  :gemm-precision :f32-scalar)]
+      (is (some? descriptor))
+      (is (seq (:steps descriptor))))))
 
 (deftest rms-norm-value+grad-resident-parity
   (if-not @gp/gpu-available?
