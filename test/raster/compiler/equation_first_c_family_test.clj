@@ -782,8 +782,11 @@
         opts {:compiler :equation-first :target cuda-target :dtype :float}
         original link-plan/validate-with-effect-evidence!
         validate-call! program-call/validate!
+        validate-boundary! emitted-equation/validate!
+        lower-storage @#'invocation-link/lower-equation-storage
         checks (atom 0)
         call-checks (atom 0)
+        boundary-checks (atom 0)
         prepared (with-redefs [link-plan/validate-with-effect-evidence!
                                (fn [plan]
                                  (swap! checks inc)
@@ -791,13 +794,22 @@
                                program-call/validate!
                                (fn [call]
                                  (swap! call-checks inc)
-                                 (validate-call! call))]
+                                 (validate-call! call))
+                               invocation-link/lower-equation-storage
+                               (fn [& arguments]
+                                 (with-redefs [emitted-equation/validate!
+                                               (fn [boundary]
+                                                 (swap! boundary-checks inc)
+                                                 (validate-boundary! boundary))]
+                                   (apply lower-storage arguments)))]
                    (compiled/lower #'c-family-elementwise arguments opts))
         plan (compiled/plan prepared)
         evidence (get-in prepared [:lowering :certificate :effect-evidence])]
     (is (= 1 @checks) "the projected public boundary is proved once, not twice")
     (is (= 1 @call-checks)
         "only the projected instance is checked; its pre-projection candidate does not escape")
+    (is (= 1 @boundary-checks)
+        "storage projection checks its boundary once, independent of template warmth")
     (is (link-plan/retained-effect-evidence? plan evidence))
     (is (false? (link-plan/retained-effect-evidence?
                  (assoc plan :outputs []) evidence)))
