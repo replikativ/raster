@@ -401,14 +401,39 @@ handle escapes; ordinary inspectable `LinkedExecutable` and `Compiled` behavior 
 This removes repeated construction within that confined scope, not host output copies or the
 remaining resident-composition ownership obligations.
 
-### Deferred AD consolidation checkpoint (2026-09-29)
+### Interleaved AD consolidation checkpoint (2026-09-29)
 
-Keep this as a tracked follow-up to the completion order above, not a new prerequisite for
+Keep this as a bounded interleaved track in the completion order above, not a new prerequisite for
 Q4 preparation, local execution evidence, or the remaining pretrained routes. #880–#882 and
 #892–#893 close the observed Gaussian bridge shapes: selected differentiable parameters,
 interleaved constant observations, constructed priors in let-bound and direct loop initializers,
 both public array-read spellings, and a typed compound reduction initializer. They do not prove
 that arbitrary source loops or constructed values differentiate.
+
+The current conditional-AD slice corrects a separate semantic defect: shared normalization
+must not eagerly evaluate both arms of an `if`. Untaken square roots and checked array reads
+are not safe to speculate merely because they do not mutate memory. Reverse AD saves the
+selected arm's primal residual; JVP linearizes inside the selected lexical region. The
+pullback must consume saved reads, not replay them against potentially changed arrays.
+Focused tests cover analytic/finite-difference gradients, JVP/HVP, lexical locals, inactive
+reads and mutation between primal evaluation and pullback.
+
+This is not yet a completed compiled conditional-AD vertical. Its selected residual is a host
+vector. GPU compilation explicitly declines it with `:ad-conditional-residual-not-lowered`
+until scalar replacement or continuation sinking gives it a verified primitive representation.
+Do not exempt the vector from typedness checks or guess a scalar tag. Reverse-over-reverse
+also needs structural tuple rules or tuple elimination; forward-over-reverse HVP evidence does
+not establish that capability. This accepted-domain change replaces unsafe speculation with
+correct JVM evaluation and an explicit GPU boundary, not a new GPU performance claim.
+
+The local resident RMSNorm gradient gate exposed an independent compilation failure:
+`rms-norm-value+grad-resident-parity` rejects an allocation operand with
+`:invocation-prefix-free-value`. It reproduces with unchanged HEAD (`541f6a41`) loaded into
+the same bounded REPL, as well as with this conditional-AD slice. No device launch or parity
+claim is possible for that gate yet. Keep this in the original workload/ownership campaign:
+repair retained allocation expressions across hygienic renaming, with a hardware-free
+compile regression and the real resident gradient oracle. Do not weaken lexical validation
+or classify it as an unavailable-device skip.
 
 1. Converge AD preparation on the same canonical typed scalar/control facts as the compiler:
    one result dtype and effect classification per operation, explicit lexical scope and

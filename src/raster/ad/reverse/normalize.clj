@@ -3,7 +3,7 @@
 
    Flattens walked S-expressions so that:
    - All call arguments are trivial (symbols or literals)
-   - If-expression branches are lifted to separate bindings
+   - If-expression arms retain their lexical evaluation regions
    - Body is reduced to a single symbol
 
    This is required before the reverse pass can track operations."
@@ -30,14 +30,16 @@
     (let [head (first expr)
           extras (atom [])]
       (cond
-        ;; If expressions: normalize recursively in each position
+        ;; An if is a region boundary, not a call with eagerly evaluated arguments.
+        ;; Normalize and snapshot the predicate only; each AD mode transforms the selected
+        ;; arm locally. Purity does not license speculation (sqrt/checked reads are partial).
         (= 'if head)
         (let [[_ test then else] expr
               [te tn] (anf-normalize-expr test gensym-fn)
-              [the thn] (anf-normalize-expr then gensym-fn)
-              [ee en] (anf-normalize-expr (or else nil) gensym-fn)]
-          [(vec (concat @extras te the ee))
-           (list 'if tn thn en)])
+              decision (if (trivial-expr? tn) tn
+                           (with-meta (gensym-fn "br") (meta test)))]
+          [(cond-> (vec te) (not (trivial-expr? tn)) (into [decision tn]))
+           (with-meta (list 'if decision then else) (meta expr))])
 
         ;; Do expressions: flatten side-effect forms, return last
         (= 'do head)
@@ -70,7 +72,7 @@
                           (swap! extras into (concat sub-extras [s normalized]))
                           s)))
                     args)]
-          [@extras (cons head norm-args)])))
+          [@extras (with-meta (cons head norm-args) (meta expr))])))
 
     :else [[] expr]))
 
@@ -81,7 +83,15 @@
   [bindings gensym-fn]
   (let [result (atom [])]
     (doseq [[sym init] (partition 2 bindings)]
-      (let [[extras normalized] (anf-normalize-expr init gensym-fn)]
+      (let [;; Shared hoisting can retain call identity on its binding rather than the
+            ;; reconstructed initializer. Project that retained identity, never decode an impl.
+            init (if (and (seq? init) (= '.invk (first init))
+                          (nil? (:raster.op/original (meta init)))
+                          (:raster.op/original (meta sym)))
+                   (vary-meta init assoc :raster.op/original
+                              (:raster.op/original (meta sym)))
+                   init)
+            [extras normalized] (anf-normalize-expr init gensym-fn)]
         (swap! result into extras)
         (swap! result conj sym normalized)))
     @result))
@@ -94,79 +104,16 @@
   Guarantees:
   - Body is a single symbol
   - All call arguments are trivial (symbols or literals) — ANF
-  - If-expression branches in bindings are lifted to separate bindings
-  - Branch conditions stored as bindings"
+  - Conditional arms remain lexical regions, never eager sibling bindings
+  - Nontrivial branch conditions are snapshotted before the selected arm"
   [bindings body-exprs gensym-fn]
-  (let [;; === Step 0: ANF normalize — flatten nested calls ===
-        anf-bindings (anf-normalize-bindings bindings gensym-fn)
-        [body-extras body-exprs]
-        (let [body-expr (if (= 1 (count body-exprs))
-                          (first body-exprs)
-                          (cons 'do body-exprs))
-              [extras norm-body] (anf-normalize-expr body-expr gensym-fn)]
-          [extras (list norm-body)])
-        bindings (vec (concat anf-bindings body-extras))
-
+  (let [anf-bindings (anf-normalize-bindings bindings gensym-fn)
         body-expr (if (= 1 (count body-exprs))
                     (first body-exprs)
                     (cons 'do body-exprs))
-        result (atom []) ;; accumulates [sym init sym init ...]
-
-        ;; Process existing bindings, lifting if-branches
-        _ (doseq [[sym init] (partition 2 bindings)]
-            (if (and (seq? init) (= 'if (first init)))
-              ;; If-init: lift branches and condition
-              (let [[_ test then else] init
-                    ;; Lift non-trivial then branch
-                    [then-sym] (if (trivial-expr? then)
-                                 [then]
-                                 (let [s (gensym-fn "then_v")]
-                                   (swap! result conj s then)
-                                   [s]))
-                    ;; Lift non-trivial else branch
-                    [else-sym] (if (or (nil? else) (trivial-expr? else))
-                                 [(or else nil)]
-                                 (let [s (gensym-fn "else_v")]
-                                   (swap! result conj s else)
-                                   [s]))
-                    ;; Store branch condition
-                    branch-sym (gensym-fn "br")]
-                (swap! result conj
-                       branch-sym test
-                       sym (list 'if branch-sym then-sym else-sym)))
-              ;; Normal binding
-              (swap! result conj sym init)))
-
-        ;; Normalize body
-        [extra body-sym]
-        (cond
-          ;; Already a symbol
-          (symbol? body-expr)
-          [[] body-expr]
-
-          ;; If-body: lift branches, condition, and result
-          (and (seq? body-expr) (= 'if (first body-expr)))
-          (let [[_ test then else] body-expr
-                extra (atom [])
-                then-sym (if (trivial-expr? then)
-                           then
-                           (let [s (gensym-fn "then_v")]
-                             (swap! extra conj s then)
-                             s))
-                else-sym (if (or (nil? else) (trivial-expr? else))
-                           (or else nil)
-                           (let [s (gensym-fn "else_v")]
-                             (swap! extra conj s else)
-                             s))
-                branch-sym (gensym-fn "br")
-                result-sym (gensym-fn "if_r")]
-            [(vec (concat @extra [branch-sym test
-                                  result-sym (list 'if branch-sym then-sym else-sym)]))
-             result-sym])
-
-          ;; Other expression: bind it
-          :else
-          (let [s (gensym-fn "body")]
-            [[s body-expr] s]))]
-
-    [(vec (concat @result extra)) body-sym]))
+        [extras normalized] (anf-normalize-expr body-expr gensym-fn)
+        body-sym (if (symbol? normalized) normalized
+                     (with-meta (gensym-fn "body") (meta body-expr)))]
+    [(cond-> (into (vec anf-bindings) extras)
+       (not (symbol? normalized)) (into [body-sym normalized]))
+     body-sym]))

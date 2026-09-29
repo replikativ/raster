@@ -22,7 +22,9 @@
             [raster.ad.tangent :as tangent]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as opdesc]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.core :as rcore]
             [clojure.string :as string]
@@ -141,6 +143,20 @@
                  :active-args (filterv identity tangent-args)}))))))
 
 (declare jvp-fold)
+
+(defn- linearize-region
+  "Keep primal and tangent work in one lexical region and evaluate it once."
+  [expression tenv]
+  (let [[bindings body] (extract-let-parts (util/alpha-convert expression))
+        [normalized result] (anf/normalize-for-ad bindings body jvp-gensym)
+        {linear-bindings :bindings local-tenv :tenv} (jvp-fold normalized tenv)]
+    (list 'let* (vec linear-bindings)
+          [result (or (get local-tenv result) (branch-tangent-zero result))])))
+
+(defn- active-region?
+  "Lexical region dependence excludes its own local binders."
+  [tenv expression]
+  (boolean (some #(contains? tenv %) (util/free-syms expression))))
 
 (defn- fresh-map-output?
   "A map! tangent may shadow only a private, zero-initialized allocation.
@@ -339,19 +355,46 @@
          (seq? init)
          (let [head (first init)]
            (cond
+             ;; Predicate snapshots retain their semantic operator; they are discrete,
+             ;; not a differentiable call merely because their operands have tangents.
+             (or (opdesc/comparison-op? (opdesc/semantic-op init))
+                 (opdesc/comparison-kind (opdesc/semantic-op init)))
+             (done tenv [])
+
              ;; if: tangent = (if test Δthen Δelse), typed zero on the
              ;; inactive branch (tangent protocol).
              (= 'if head)
              (let [[_ test then else] init
                    t-then (and (symbol? then) (get tenv then))
                    t-else (and (symbol? else) (get tenv else))]
-               (if (or t-then t-else)
-                 (let [dt (jvp-gensym (str "dt_" (name sym)) tag)]
-                   (done (assoc tenv sym dt)
-                         [dt (list 'if test
-                                   (or t-then (branch-tangent-zero then))
-                                   (or t-else (branch-tangent-zero else)))]))
-                 (done tenv [])))
+               (if (and (not (every? anf/trivial-expr? [then else]))
+                        (or (active-region? tenv then) (active-region? tenv else)))
+                 (let [pair (jvp-gensym "branch_pair")
+                       dt (jvp-gensym (str "dt_" (name sym)) tag)]
+                   {:tenv (assoc tenv sym dt)
+                    :bindings (into prior-bindings
+                                    [pair (list 'if test (linearize-region then tenv)
+                                                       (linearize-region else tenv))
+                                     sym (list 'clojure.core/nth pair 0)
+                                     dt (list 'clojure.core/nth pair 1)])})
+                 (if (or t-then t-else)
+                   (let [dt (jvp-gensym (str "dt_" (name sym)) tag)]
+                     (done (assoc tenv sym dt)
+                           [dt (list 'if test
+                                     (or t-then (branch-tangent-zero then))
+                                     (or t-else (branch-tangent-zero else)))]))
+                   (done tenv []))))
+
+             (form/binding-form? init)
+             (if (active-region? tenv init)
+               (let [pair (jvp-gensym "region_pair")
+                     dt (jvp-gensym (str "dt_" (name sym)) tag)]
+                 {:tenv (assoc tenv sym dt)
+                  :bindings (into prior-bindings
+                                  [pair (linearize-region init tenv)
+                                   sym (list 'clojure.core/nth pair 0)
+                                   dt (list 'clojure.core/nth pair 1)])})
+               (done tenv []))
 
              ;; A scan's output carries the prior primal states. Use it as
              ;; the tape for a second scan over the linearized recurrence.
