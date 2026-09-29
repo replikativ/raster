@@ -13,6 +13,9 @@
 (deftm conditional-root [x :- Double] :- Double
   (if (n/> x 0.0) (n/sqrt x) (n/sqrt (n/- x))))
 
+(deftm conditional-core-name [count :- Double] :- Double
+  (if (n/> count 0.0) (n/sqrt count) (n/sqrt (n/- count))))
+
 (deftm conditional-root-local [x :- Double] :- Double
   (let [result (if (n/> x 0.0)
                  (let [argument x] (n/sqrt argument))
@@ -90,6 +93,17 @@
       (is (= (conditional-root x) value primal))
       (is (close? gradient expected))
       (is (close? gradient fd))
+      (is (close? tangent expected))
+      (is (close? (first gradients) expected))
+      (is (close? (first hv) -0.03125)))))
+
+(deftest declared-parameters-can-shadow-core-var-names
+  (doseq [[x expected] [[4.0 0.25] [-4.0 -0.25]]]
+    (let [[value gradient] ((rev/value+grad #'conditional-core-name) x)
+          [primal tangent] ((jvp/jvp #'conditional-core-name) x 1.0)
+          [gradients hv] ((jvp/hvp #'conditional-core-name) x 1.0)]
+      (is (= 2.0 value primal))
+      (is (close? gradient expected))
       (is (close? tangent expected))
       (is (close? (first gradients) expected))
       (is (close? (first hv) -0.03125)))))

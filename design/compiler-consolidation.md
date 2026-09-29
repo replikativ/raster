@@ -444,6 +444,12 @@ gradient wrapper on OpenCL/Level Zero targets. The existing Level Zero resident 
 executes both gradients, with relative errors about `1.17e-7` (input) and `8.05e-8` (weight).
 These are correctness measurements, not a speedup or other-vendor execution claim.
 
+AD free-value discovery now delegates to the compiler's scope-aware `util/free-syms` grammar:
+the reverse pass's duplicate recursive symbol collector and JVP's binder-blind tree scan are
+removed. Local shadowing and quoted data do not create outer dependence; genuine captured
+values still do. This consolidates dependency discovery, not derivative rules or support for
+arbitrary effects/loops. Existing unsupported active tape/closure checks remain mandatory.
+
 1. Converge AD preparation on the same canonical typed scalar/control facts as the compiler:
    one result dtype and effect classification per operation, explicit lexical scope and
    constructor-field projection, and one retained scan/reduction algebra. Remove duplicate
