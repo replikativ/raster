@@ -775,6 +775,28 @@
                                    plan (conj (:outputs plan) ::unknown-output)))))
           "an escaped identity must name storage in the validated plan"))))
 
+(deftest equation-first-final-boundary-has-one-link-proof
+  (let [arguments [(float-array 8) 8]
+        opts {:compiler :equation-first :target cuda-target :dtype :float}
+        original link-plan/validate-with-effect-evidence!
+        checks (atom 0)
+        prepared (with-redefs [link-plan/validate-with-effect-evidence!
+                               (fn [plan]
+                                 (swap! checks inc)
+                                 (original plan))]
+                   (compiled/lower #'c-family-elementwise arguments opts))
+        plan (compiled/plan prepared)
+        evidence (get-in prepared [:lowering :certificate :effect-evidence])]
+    (is (= 1 @checks) "the projected public boundary is proved once, not twice")
+    (is (link-plan/retained-effect-evidence? plan evidence))
+    (is (false? (link-plan/retained-effect-evidence?
+                 (assoc plan :outputs []) evidence)))
+    (is (= :link-outputs
+           (:reason (reason-of
+                     #(link-plan/make-with-final-projection
+                       plan (fn [candidate]
+                              {:plan (assoc candidate :outputs [::unknown])}))))))))
+
 (deftest retention-requires-complete-call-binding-coverage
   (let [prepared (compiled/lower #'c-family-elementwise [(float-array 8) 8]
                                  {:compiler :equation-first :target cuda-target :dtype :float})

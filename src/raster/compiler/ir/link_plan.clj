@@ -1319,6 +1319,17 @@
   [request]
   (validate-with-effect-evidence! (normalize-plan request)))
 
+(defn ^:no-doc make-with-final-projection
+  "Normalize a construction request, project its final boundary, then validate exactly that plan.
+
+   The projection is synchronous and its candidate must not escape: only the validated final plan
+   and projection metadata are returned. This is for callers whose public roles or escaped outputs
+   are known only after storage identities have been normalized."
+  [request project]
+  (let [{:keys [plan projection]} (project (normalize-plan request))
+        {:keys [plan effect-evidence]} (validate-with-effect-evidence! plan)]
+    {:plan plan :effect-evidence effect-evidence :projection projection}))
+
 (defn ^:no-doc make-with-certified-effect-facts
   "Construct a LinkPlan by composing step facts from immediately verified component evidence."
   [request step-facts]

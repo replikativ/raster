@@ -368,7 +368,10 @@
    `evaluate-host` is passed unchanged to EmittedParallelProgramCall for closed, effect-free host
    scalar equations. The returned plan is allocation-free; runtime contact starts only in
    raster.gpu.link/instantiate!."
-  [materialized parallel-program target evaluate-host]
+  ([materialized parallel-program target evaluate-host]
+   (:plan (lower materialized parallel-program target evaluate-host
+                 (fn [plan] {:plan plan}))))
+  ([materialized parallel-program target evaluate-host project]
   (let [materialized (materialization/validate! materialized)
         parallel-program (emitted-program/validate! parallel-program)
         _ (when-let [providers (seq (get-in parallel-program
@@ -466,7 +469,7 @@
         instance (link/program-instance
                   {:id [invocation-id :emitted-program] :call call
                    :attributes {:source :typed-invocation}})]
-    (link/make
+    (link/make-with-final-projection
      {:id [invocation-id :link-plan]
       :target target
       :nodes nodes
@@ -483,7 +486,8 @@
                    :public-buffer-roles public-buffer-roles
                    :semantic-outputs resident-outputs
                    :host-outputs (into {} (filter (comp typed-scalar? val)) (:outputs call))
-                   :driver-allocations 0}})))
+                   :driver-allocations 0}}
+     project))))
 
 (defn- derive-certificate
   [plan effect-evidence]
@@ -834,3 +838,13 @@
               "escaped invocation outputs must retain the semantic output boundary"
               {:missing missing :outputs outputs})))
    (certify (assoc plan :outputs outputs))))
+
+(defn ^:no-doc certify-final-projection
+  "Certify the exact final LinkPlan just validated during construction. The retained effect
+   witness is valid only for that same in-process plan; arbitrary callers use `certify`."
+  [{:keys [plan effect-evidence]}]
+  (when-not (link/retained-effect-evidence? plan effect-evidence)
+    (fail! :invocation-link-effect-evidence
+           "final projection requires evidence sealed to its exact validated plan"
+           {:plan (:id plan)}))
+  (->CertifiedInvocationLink plan (derive-certificate plan effect-evidence)))

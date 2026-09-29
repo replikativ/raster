@@ -604,39 +604,10 @@
     (instance? clojure.lang.Named value) (keyword (name value))
     :else (keyword (str "result-" index))))
 
-(defn- lower-equation-first
-  [fn-var args {:keys [target dtype donate constants outputs taps roles]
-                :or {target :ze:0 dtype :float}
-                :as opts}]
-  (let [preparation-started (System/nanoTime)
-        template-report (atom nil)
-        target-descriptor (equation-first/validate-target-description!
-                           target (hardware/descriptor-for target))
-        target-identity (target-specialization-identity target target-descriptor)
-        compilation-options (apply dissoc opts
-                                   [:compiler :donate :constants :outputs :taps :roles
-                                    :profile? :on-non-resident])
-        compilation-options (assoc compilation-options :target target :dtype dtype)
-        template-key
-        (fn [revision]
-          (template-cache-key
-           ::equation-first-template
-           (source-specialization-identity fn-var dtype)
-           revision
-           target-identity
-           compilation-options
-           (weak-identity @#'equation-first/compile)))
-        compilation (binding [*compilation-template-observer* #(reset! template-report %)]
-                      (stable-compilation-template
-                       template-key :equation-first
-                       #(equation-first/compile fn-var compilation-options target-descriptor)))
-        lowering-started (System/nanoTime)
-        equation-lower-phases (atom nil)
-        raw-plan (binding [equation-first/*lower-observer*
-                           #(reset! equation-lower-phases %)]
-                   (equation-first/lower compilation args))
-        equation-lower-ns (- (System/nanoTime) lowering-started)
-        attributes (:attributes raw-plan)
+(defn- project-equation-first-boundary
+  "Choose public roles and escaped outputs on the normalized candidate, before its sole proof."
+  [raw-plan compilation args {:keys [donate constants outputs taps roles]}]
+  (let [attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)
         public-defaults (:public-buffer-roles attributes)
         public-symbols (set (keys public-bindings))
@@ -656,13 +627,11 @@
                                         (when-let [role (get token-roles token)]
                                           [compiler-value role])))
                              compiler-bindings)
-        role-projection-started (System/nanoTime)
         plan (-> (reduce-kv (fn [plan token role]
                               (assoc-in plan [:nodes token :role] role))
                             raw-plan token-roles)
                  (assoc-in [:instances 0 :roles] compiler-roles)
                  (assoc-in [:attributes :public-buffer-roles] effective-roles))
-        role-projection-ns (- (System/nanoTime) role-projection-started)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         argument-map (zipmap (map :symbol parameters) args)
         donate-set (set donate)
@@ -705,8 +674,6 @@
                      (output-entry (keyword (name value)) value :tap))
                    taps)
         out-tree (reduce (fn [entries entry]
-                           ;; One physical result has one value wrapper/lifetime. An explicit,
-                           ;; donated, or tap key takes precedence over the implicit result key.
                            (if (some #(= (:node %) (:node entry)) entries)
                              entries
                              (conj entries entry)))
@@ -717,11 +684,61 @@
             (throw (ex-info "equation-first outputs require unique semantic keys"
                             {:reason :compiled-equation-first-output-keys
                              :keys duplicate-keys})))
+        escaped (mapv :node out-tree)
+        missing (set/difference (set (:outputs plan)) (set escaped))
+        _ (when (seq missing)
+            (throw (ex-info "escaped invocation outputs must retain the semantic output boundary"
+                            {:reason :invocation-link-output-boundary
+                             :missing missing :outputs escaped})))]
+    {:plan (assoc plan :outputs escaped)
+     :projection {:in-tree in-tree :out-tree out-tree}}))
+
+(defn- lower-equation-first
+  [fn-var args {:keys [target dtype donate constants outputs taps roles]
+                :or {target :ze:0 dtype :float}
+                :as opts}]
+  (let [preparation-started (System/nanoTime)
+        template-report (atom nil)
+        target-descriptor (equation-first/validate-target-description!
+                           target (hardware/descriptor-for target))
+        target-identity (target-specialization-identity target target-descriptor)
+        compilation-options (apply dissoc opts
+                                   [:compiler :donate :constants :outputs :taps :roles
+                                    :profile? :on-non-resident])
+        compilation-options (assoc compilation-options :target target :dtype dtype)
+        template-key
+        (fn [revision]
+          (template-cache-key
+           ::equation-first-template
+           (source-specialization-identity fn-var dtype)
+           revision
+           target-identity
+           compilation-options
+           (weak-identity @#'equation-first/compile)))
+        compilation (binding [*compilation-template-observer* #(reset! template-report %)]
+                      (stable-compilation-template
+                       template-key :equation-first
+                       #(equation-first/compile fn-var compilation-options target-descriptor)))
+        lowering-started (System/nanoTime)
+        equation-lower-phases (atom nil)
+        projection-ns (atom 0)
+        result (binding [equation-first/*lower-observer*
+                         #(reset! equation-lower-phases %)]
+                 (equation-first/lower
+                  compilation args
+                  (fn [plan]
+                    (let [started (System/nanoTime)
+                          projected (project-equation-first-boundary plan compilation args opts)]
+                      (reset! projection-ns (- (System/nanoTime) started))
+                      projected))))
+        equation-lower-ns (- (System/nanoTime) lowering-started @projection-ns)
+        plan (:plan result)
+        {:keys [in-tree out-tree]} (:projection result)
+        attributes (:attributes plan)
+        public-bindings (:public-buffer-bindings attributes)
+        parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         certification-started (System/nanoTime)
-        ;; certify revalidates the projected roles and escaped output boundary together. A
-        ;; separate validate! here repeated the same executable/effect derivation before the
-        ;; final output vector was known, without establishing an additional fact.
-        lowering (invocation-link/certify plan (mapv :node out-tree))
+        lowering (invocation-link/certify-final-projection result)
         invocation-certification-ns (- (System/nanoTime) certification-started)
         lowering-ns (- (System/nanoTime) lowering-started)
         steps (mapv (fn [index kernel]
@@ -747,7 +764,7 @@
                 :template @template-report
                 :link-plan-lowering-ns lowering-ns
                 :phases-ns {:equation-lower equation-lower-ns
-                            :role-projection role-projection-ns
+                            :role-projection @projection-ns
                             :invocation-certification invocation-certification-ns}
                 :equation-lower-phases-ns @equation-lower-phases
                 :nodes (count (get-in lowering [:plan :nodes]))
