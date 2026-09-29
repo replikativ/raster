@@ -62,6 +62,10 @@
     :epilogue {:acc acc :expr (max (float 0.0) acc)
                :operands [] :scalars [] :dtype :float}))
 
+(deftm double-resident! [input :- (Array float) result :- (Array float) n :- Long] :- Void
+  (raster.par/map-void! i n
+    (arrays/aset result i (* 2.0 (arrays/aget input i)))))
+
 (defn- valid-measurement? [result]
   (let [median (get-in result [:measurement :median-ns])]
     (and (true? (:validated? result)) (number? median)
@@ -439,6 +443,61 @@
          :measurement (measure #(link/run! resident))})
       (finally (compiled/close! c)))))
 
+(defn composition!
+  "Opt-in three-stage public composition canary. Compile, composition and binding are
+   reported separately; only the resident replay is measured with device events.
+   This measures the graph/link path, not transformer throughput."
+  [{:keys [environment-tag target compiler-revision shape budget-ms]
+    :or {target :ze:0 shape [4096] budget-ms 800.0}}]
+  (when-not (and (vector? shape) (= 1 (count shape))
+                 (integer? (first shape)) (<= 1 (first shape) Integer/MAX_VALUE))
+    (throw (ex-info "composition canary requires positive int-sized [n]" {:shape shape})))
+  (let [n (first shape)
+        identity (identity-for :three-stage-composed-resident target :float shape
+                               :device-event environment-tag)
+        input (float-array (map #(float (/ (mod % 17) 17.0)) (range n)))
+        prepare (fn []
+                  (compiled/lower #'double-resident!
+                                  [input (float-array n) (long n)]
+                                  {:compiler :equation-first :target target :dtype :float
+                                   :outputs '[result] :on-non-resident :throw}))
+        started (System/nanoTime)
+        stages (vec (repeatedly 3 prepare))
+        compile-ns (- (System/nanoTime) started)
+        started (System/nanoTime)
+        prepared (compiled/compose
+                  {:id :three-stage-composition-canary
+                   :components (mapv (fn [id program] {:id id :program program})
+                                     [:first :second :third] stages)
+                   :connections [{:from [:first :result] :to [:second :input]}
+                                 {:from [:second :result] :to [:third :input]}]
+                   :outputs [{:key :result :from [:third :result]}]})
+        compose-ns (- (System/nanoTime) started)
+        started (System/nanoTime)
+        live (compiled/instantiate! prepared {:profile? true})
+        bind-ns (- (System/nanoTime) started)]
+    (try
+      (when-not (some? (get-in live [:executable :graph-key]))
+        (throw (ex-info "straight-line composition did not record one replay graph" {})))
+      (let [profile (compiled/profile live)
+            actual ^floats (get-in profile [:result :result])
+            error (if (and actual (= n (alength actual)))
+                    (reduce max 0.0
+                            (map (fn [want got] (Math/abs (- (* 8.0 (double want))
+                                                            (double got))))
+                                 input actual))
+                    ##Inf)
+            _ (when (> error 1.0e-5)
+                (throw (ex-info "composed device result differs from independent reference"
+                                {:shape shape :max-absolute-error error})))
+            measurement (compiled/measure live :budget-ms budget-ms :cv-threshold 0.08)]
+        {:identity identity :compiler-revision compiler-revision :validated? true
+         :compile-ns compile-ns :compose-ns compose-ns :bind-ns bind-ns
+         :component-count 3 :kernel-count (count (:profile profile))
+         :instantiation (compiled/instantiation-report live)
+         :max-absolute-error error :measurement measurement})
+      (finally (compiled/close! live)))))
+
 (defn -main [options-file]
   (let [{:keys [case baseline output] :as opts} (edn/read-string (slurp options-file))]
     (when-not (and (string? (:compiler-revision opts)) (not-empty (:compiler-revision opts)))
@@ -446,8 +505,9 @@
     (when (and baseline output
                (= (.getCanonicalPath (io/file baseline)) (.getCanonicalPath (io/file output))))
       (throw (ex-info "canary output must not overwrite its baseline" {})))
-    (let [result ((clojure.core/case case :cpu cpu! :gemm gemm! :rmsnorm rmsnorm! :heat heat!
-                       (throw (ex-info "canary :case must be :cpu, :gemm, :rmsnorm or :heat" {}))) opts)
+    (let [result ((clojure.core/case case :cpu cpu! :gemm gemm! :rmsnorm rmsnorm!
+                       :heat heat! :composition composition!
+                       (throw (ex-info "canary :case must be :cpu, :gemm, :rmsnorm, :heat or :composition" {}))) opts)
           baseline (when (and baseline (.exists (io/file baseline)))
                      (edn/read-string (slurp baseline)))
           result (assoc result :verdict (verdict baseline result))]

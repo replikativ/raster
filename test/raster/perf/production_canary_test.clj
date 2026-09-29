@@ -127,6 +127,42 @@
         (is (= :pass (get-in result [:performance-contract :status])))
         (is (= [:close] (last @calls)))))))
 
+(deftest composition-canary-separates-preparation-binding-and-device-time
+  (doseq [shape [[0] [1 2] [-1] [2147483648]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (canary/composition! {:shape shape}))))
+  (let [calls (atom [])]
+    (with-redefs [hardware/init! (constantly nil)
+                  hardware/device-signature (fn [target] {:target target})
+                  compiled/lower (fn [_ _ opts]
+                                   (swap! calls conj [:lower opts])
+                                   {:stage (count @calls)})
+                  compiled/compose (fn [plan]
+                                     (swap! calls conj [:compose plan])
+                                     {:plan plan})
+                  compiled/instantiate! (fn [_ opts]
+                                          (swap! calls conj [:instantiate opts])
+                                          {:executable {:graph-key :one}})
+                  compiled/profile (fn [_]
+                                     {:result {:result (float-array
+                                                       (map #(* 8.0 (/ % 17.0)) (range 4)))}
+                                      :profile (repeat 3 {:kernel-name "generated"})})
+                  compiled/measure (fn [_ & _]
+                                     {:median-ns 100.0 :stationary? true
+                                      :timing-source :device-event})
+                  compiled/instantiation-report (constantly {:graph-count 1})
+                  compiled/close! (fn [_] (swap! calls conj [:close]))]
+      (let [result (canary/composition! {:shape [4] :target :ocl:0
+                                         :environment-tag "fixture"
+                                         :compiler-revision "test"})]
+        (is (:validated? result))
+        (is (= 3 (:kernel-count result)))
+        (is (= 0.0 (:max-absolute-error result)))
+        (is (= :device-event (get-in result [:measurement :timing-source])))
+        (is (= 3 (count (filter #(= :lower (first %)) @calls))))
+        (is (= :equation-first (get-in (first @calls) [1 :compiler])))
+        (is (= [:close] (last @calls)))))))
+
 (deftest dynamic-prebound-composition-retains-one-generated-step
   (let [shape [3 4 5]
         args (canary/gemm-arguments shape)
