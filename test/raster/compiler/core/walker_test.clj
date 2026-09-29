@@ -95,6 +95,21 @@
                                 :source-ns (the-ns 'raster.compiler.core.walker-test)})]
       (is (= :array-op (walker/classify-form '(aget a 0) ctx))))))
 
+(deftest reduction-uses-typed-compound-initializer-result
+  (let [walked (wb '(raster.par/reduce total
+                     (raster.numeric/+
+                      (raster.sci.distributions/logpdf
+                       (raster.sci.distributions/->Normal 0.0 s0) mu)
+                      (raster.sci.distributions/logpdf
+                       (raster.sci.distributions/->Normal mu s) y))
+                     i count
+                     (raster.numeric/+ total (aget ys i)))
+                   {'s0 'double 'mu 'double 's 'double 'y 'double
+                    'ys 'doubles 'count 'long})]
+    (is (= 'double (:raster.type/tag (meta walked))))
+    (is (= 'double (:raster.type/tag (meta (nth walked 2)))))
+    (is (= :double (:raster.type/elem-type (meta walked))))))
+
 (deftest classify-vector-test
   (testing "vector forms"
     (let [ctx (walker/make-ctx {})]

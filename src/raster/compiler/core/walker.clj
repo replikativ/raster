@@ -1085,7 +1085,14 @@
                         double 'double
                         nil))
                     ;; Infer from type-env if init is a symbol
-                    (when (symbol? init-expr) (ctx-get-tag ctx init-expr)))
+                    (when (symbol? init-expr) (ctx-get-tag ctx init-expr))
+                    ;; A compound initializer may already have a certified
+                    ;; scalar result from typed dispatch (e.g. a sum of two
+                    ;; log-densities). Reuse that stamp, rather than guessing
+                    ;; from the source operator or requiring a duplicate hint.
+                    (let [tag (:raster.type/tag (meta walked-init))]
+                      (when (contains? #{'float 'double 'int 'long} tag)
+                        tag)))
         _ (when-not acc-tag
             (throw (ex-info (str "par/reduce: cannot infer accumulator type from init expression `"
                                  (pr-str init-expr) "`. "
