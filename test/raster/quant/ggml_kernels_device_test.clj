@@ -8,6 +8,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.gpu-grad-parity :as gp]
@@ -249,10 +250,17 @@
 (deftest q8-head-uniform-block-count-is-not-a-public-scalar
   (let [compilation (equation-first/compile #'gk/qdot-q8-0-rows!
                                             {:target :ze:debug :dtype :float})
-        [kernel] (:kernels compilation)]
+        [kernel] (:kernels compilation)
+        graph (-> compilation :emitted :equations second :operations first :graph)
+        graph-scalars (set (map :id (:scalars graph)))
+        capacity-scalars (into #{} (mapcat (comp launch/expression-references :elements))
+                               (:inputs graph))]
     (is (= :none (:fallback (:stats compilation))))
     (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
-    (is (= 1 (count (:kernels compilation))))))
+    (is (= 1 (count (:kernels compilation))))
+    (is (not (contains? graph-scalars 'rstr_local_2)))
+    (is (not (contains? capacity-scalars 'rstr_local_2)))
+    (is (contains? graph-scalars 'in))))
 
 (deftest dot-kernels-match-the-generic-reference
   (if-not @gp/gpu-available?
