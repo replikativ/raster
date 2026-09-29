@@ -268,22 +268,6 @@
       (with-meta (cons qualified-head (rest expr)) (meta expr)))
     expr))
 
-(defn- free-syms-excluding
-  "Collect free symbols in an expression, excluding those in bound-set.
-  Does not count seq heads as free (they are operators)."
-  [expr bound-set]
-  (cond
-    (symbol? expr)
-    (if (contains? bound-set expr) #{} #{expr})
-
-    (seq? expr)
-    (reduce into #{} (map #(free-syms-excluding % bound-set) (rest expr)))
-
-    (vector? expr)
-    (reduce into #{} (map #(free-syms-excluding % bound-set) expr))
-
-    :else #{}))
-
 ;; Forward declaration for circular dependency: gen-reverse-let <-> gen-reverse-dotimes/par
 (declare ^:private gen-reverse-dotimes)
 (declare ^:private gen-reverse-par-map)
@@ -319,26 +303,21 @@
         ;; Par forms: active iff any free var in the body is active
         (= 'raster.par/map! head)
         (let [[_ _out _idx _bound _cast body] init-expr]
-          (boolean (some #(get activity % false) (free-syms-excluding body #{_idx}))))
+          (boolean (some #(get activity % false) (util/free-syms body #{_idx}))))
 
         (= 'raster.par/reduce head)
         (let [[_ _acc _init _idx _bound body] init-expr]
-          (boolean (some #(get activity % false) (free-syms-excluding body #{_idx _acc}))))
+          (boolean (some #(get activity % false) (util/free-syms body #{_idx _acc}))))
 
         (= 'raster.par/scan head)
         (let [[_ _out _acc init _idx _bound _cast body] init-expr]
           (boolean (some #(get activity % false)
-                         (into (free-syms-excluding body #{_idx _acc})
-                               (free-syms-excluding init #{})))))
+                         (into (util/free-syms body #{_idx _acc})
+                               (util/free-syms init)))))
 
         ;; Loop: active iff any init or body references an active symbol
         (contains? #{'loop 'loop*} head)
-        (let [[_ bindings-vec & body-forms] init-expr
-              pairs (partition 2 bindings-vec)
-              loop-vars (set (map first pairs))
-              init-free (reduce into #{} (map #(free-syms-excluding % #{}) (map second pairs)))
-              body-free (reduce into #{} (map #(free-syms-excluding % loop-vars) body-forms))]
-          (boolean (some #(get activity % false) (into init-free body-free))))
+        (boolean (some #(get activity % false) (util/free-syms init-expr)))
 
         ;; Normal call / .invk: active iff any arg is active
         :else
@@ -976,11 +955,13 @@
   the raw pieces. Pure — no atoms. Wrappers assemble their own output shape.
   opts: {:seed-adj-env <map sym->[adj-expr]>}."
   [norm-bindings active-params {:keys [seed-adj-env]}]
-  (let [{:keys [activity fwd-bindings records]} (forward-pass norm-bindings active-params)
-        {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
-        {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
-    {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
-     :rev-ctx rev-ctx :param-adj-syms param-adj-syms}))
+  (binding [util/*shadowing-locals* (into (into util/*shadowing-locals* active-params)
+                                       (take-nth 2 norm-bindings))]
+    (let [{:keys [activity fwd-bindings records]} (forward-pass norm-bindings active-params)
+          {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
+          {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
+      {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
+       :rev-ctx rev-ctx :param-adj-syms param-adj-syms})))
 
 (declare gen-reverse-loop-with-let lift-loop-to-tail)
 
@@ -1933,11 +1914,11 @@
           scalar-bindings* (mapv (fn [[s init]] [s (lift init)]) @scalar-bindings)]
       (let [aget-syms (set (map :sym @agets))
             bound-syms (set (cons idx-sym (concat (map first scalar-bindings*) aget-syms)))
-            free-syms (free-syms-excluding body-result bound-syms)
+            free-syms (util/free-syms body-result bound-syms)
             ;; Also collect free syms from scalar binding inits
             all-free (reduce into free-syms
                              (map (fn [[_ init]]
-                                    (free-syms-excluding init bound-syms))
+                                    (util/free-syms init bound-syms))
                                   scalar-bindings*))]
         {:agets @agets
          :scalar-bindings scalar-bindings*
@@ -2173,10 +2154,10 @@
           scalar-bindings* (mapv (fn [[s init]] [s (lift init)]) @scalar-bindings)]
       (let [aget-syms (set (map :sym @agets))
             bound-syms (set (list* idx-sym acc-sym (concat (map first scalar-bindings*) aget-syms)))
-            free-syms (free-syms-excluding body-result bound-syms)
+            free-syms (util/free-syms body-result bound-syms)
             all-free (reduce into free-syms
                              (map (fn [[_ init]]
-                                    (free-syms-excluding init bound-syms))
+                                    (util/free-syms init bound-syms))
                                   scalar-bindings*))]
         {:agets @agets
          :scalar-bindings scalar-bindings*
@@ -2197,7 +2178,7 @@
   (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
         _ (when (and (seq? init-expr)
                      (some (set active-params)
-                           (free-syms-excluding init-expr #{})))
+                           (util/free-syms init-expr)))
             (throw (ex-info
                     "par/reduce AD: active compound init must be let-bound before the reduction"
                     {:reason :par-reduce-active-compound-init
@@ -2526,7 +2507,7 @@
         ;; reconstruct the value correctly but silently drop δinit (the final
         ;; carry only wires to a SYMBOL). Bind it outside the scan first.
         _ (when (and (seq? init-expr)
-                     (some (set active-params) (free-syms-excluding init-expr #{})))
+                     (some (set active-params) (util/free-syms init-expr)))
             (throw (ex-info
                     (str "par/scan AD: the scan init `" (pr-str init-expr)
                          "` depends on active params. Bind it to a let symbol "
@@ -3343,14 +3324,6 @@
 ;;    :active-params [p1 p2 ...]
 ;;    :captured-syms [c1 c2 ...]}
 
-(defn- collect-free-syms
-  "Collect unqualified, non-namespaced free symbols from an S-expression."
-  [e]
-  (cond (and (symbol? e) (not (namespace e))) #{e}
-        (seq? e)    (apply clojure.set/union #{} (map collect-free-syms e))
-        (vector? e) (apply clojure.set/union #{} (map collect-free-syms e))
-        :else       #{}))
-
 (defn- collect-bound-syms
   "Collect symbols bound in a let* bindings vector."
   [bindings-vec]
@@ -3389,9 +3362,9 @@
           ;; - defined within the reverse bindings themselves
           ;; - the dy symbol
           ;; - the active params (these flow separately)
-          rev-bound (collect-bound-syms rev-bindings)
-          rev-free  (collect-free-syms rev-bindings)
           fwd-bound (collect-bound-syms (vec fwd-bindings))
+          rev-free  (binding [util/*shadowing-locals* (into util/*shadowing-locals* fwd-bound)]
+                      (util/free-syms pullback-body #{dy-sym}))
           ;; Captured = free in reverse bindings ∩ bound in forward bindings
           captured  (clojure.set/intersection rev-free fwd-bound)
           ;; Maintain deterministic order: use forward binding order
@@ -4107,7 +4080,8 @@
                                 (zipmap all-params tags)))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
-          ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays]
+          ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays
+                            util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
                     (transform-body hoisted diff-active-params))
           flat (binding [ad-flatten/*flatten-dtype* dtype]
                  (ad-flatten/flatten-for-gradient ad-form))

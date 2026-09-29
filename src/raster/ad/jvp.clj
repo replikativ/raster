@@ -60,12 +60,11 @@
     [[] [form]]))
 
 (defn- any-active?
-  "Does `form` reference any symbol with a tangent in tenv? (Over-approximates
-  by scanning all symbols incl. op heads — heads are qualified/mangled and
-  never tenv keys, so this is safe.)"
+  "Does `form` lexically reference any symbol with a tangent in tenv?
+  Binder knowledge comes from the compiler's canonical scope grammar."
   [tenv form]
-  (boolean (some #(and (symbol? %) (contains? tenv %))
-                 (tree-seq coll? seq (if (seq? form) (vec form) form)))))
+  (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys tenv))]
+    (boolean (some #(contains? tenv %) (util/free-syms form)))))
 
 (defn- branch-tangent-zero
   "Typed zero tangent for the INACTIVE branch of an if (tangent protocol):
@@ -152,11 +151,6 @@
         {linear-bindings :bindings local-tenv :tenv} (jvp-fold normalized tenv)]
     (list 'let* (vec linear-bindings)
           [result (or (get local-tenv result) (branch-tangent-zero result))])))
-
-(defn- active-region?
-  "Lexical region dependence excludes its own local binders."
-  [tenv expression]
-  (boolean (some #(contains? tenv %) (util/free-syms expression))))
 
 (defn- fresh-map-output?
   "A map! tangent may shadow only a private, zero-initialized allocation.
@@ -368,7 +362,7 @@
                    t-then (and (symbol? then) (get tenv then))
                    t-else (and (symbol? else) (get tenv else))]
                (if (and (not (every? anf/trivial-expr? [then else]))
-                        (or (active-region? tenv then) (active-region? tenv else)))
+                        (or (any-active? tenv then) (any-active? tenv else)))
                  (let [pair (jvp-gensym "branch_pair")
                        dt (jvp-gensym (str "dt_" (name sym)) tag)]
                    {:tenv (assoc tenv sym dt)
@@ -386,7 +380,7 @@
                    (done tenv []))))
 
              (form/binding-form? init)
-             (if (active-region? tenv init)
+             (if (any-active? tenv init)
                (let [pair (jvp-gensym "region_pair")
                      dt (jvp-gensym (str "dt_" (name sym)) tag)]
                  {:tenv (assoc tenv sym dt)
