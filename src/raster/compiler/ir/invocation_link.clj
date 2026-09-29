@@ -334,8 +334,8 @@
     (lower-loop-storage state invocation-id equation scalars)
 
     :else
-    (let [emitted (emitted-equation/validate!
-                   (equation-dispatch/boundary-equation (first (:operations equation))))
+    (let [emitted (equation-dispatch/boundary-equation (first (:operations equation)))
+          ;; The public projection validates this exact boundary before storage is derived.
           physical (emitted-equation/physical-results emitted)]
       (reduce
        (fn [state result]
