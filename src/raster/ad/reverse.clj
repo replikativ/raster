@@ -2906,6 +2906,25 @@
                                      (lower-composites outer)
                                      outer)))
                                outer-exprs)))
+              ;; Loop canonicalization can introduce a let-bound scan initializer
+              ;; outside the scan itself. Inline calls that *consume* constructors
+              ;; in their own lexical binding; leave direct constructor bindings
+              ;; for the field projector, without moving an evaluation across
+              ;; the recurrence boundary.
+              (and (seq? expr) (form/binding-form? expr))
+              (let [[head bindings & body] expr]
+                (with-meta
+                  (apply list head
+                         (into [] (mapcat (fn [[s init]]
+                                            (let [init (step init)]
+                                              [s (if (and (seq? init)
+                                                          (some soa-lower/contains-local-constructor?
+                                                                (rest init)))
+                                                   (lower-composites init)
+                                                   init)])))
+                               (partition 2 bindings))
+                         (map step body))
+                  (meta expr)))
               (seq? expr) (with-meta (apply list (map step expr)) (meta expr))
               (vector? expr) (mapv step expr)
               :else expr))]

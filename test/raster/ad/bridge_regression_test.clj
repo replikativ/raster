@@ -1,6 +1,7 @@
 (ns raster.ad.bridge-regression-test
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
+            [raster.arrays :as ra]
             [raster.numeric :as n]
             [raster.par :as par]
             [raster.ad.reverse :as rev]
@@ -43,6 +44,27 @@
                (n/+ sum (dist/logpdf (dist/->Normal mu observation-sigma)
                                      (aget ys i))))
         sum))))
+
+(deftm normal-prior-then-loop-raster-aget
+  [mu :- Double, ys :- (Array double), count :- Long,
+   prior-sigma :- Double, observation-sigma :- Double] :- Double
+  (let [prior (dist/logpdf (dist/->Normal 0.0 prior-sigma) mu)]
+    (loop [i 0 sum prior]
+      (if (< i count)
+        (recur (inc i)
+               (n/+ sum (dist/logpdf (dist/->Normal mu observation-sigma)
+                                     (ra/aget ys i))))
+        sum))))
+
+(deftm normal-direct-prior-loop
+  [mu :- Double, ys :- (Array double), count :- Long,
+   prior-sigma :- Double, observation-sigma :- Double] :- Double
+  (loop [i 0 sum (dist/logpdf (dist/->Normal 0.0 prior-sigma) mu)]
+    (if (< i count)
+      (recur (inc i)
+             (n/+ sum (dist/logpdf (dist/->Normal mu observation-sigma)
+                                   (aget ys i))))
+      sum)))
 
 (deftm normal-strided-observations [mu :- Double, ys :- (Array double), count :- Long,
                                    sigma :- Double] :- Double
@@ -173,3 +195,16 @@
     (is (< (Math/abs (- ds (reduce + (map #(let [delta (- % mu)]
                                              (+ (- (/ 1.0 s))
                                                 (/ (* delta delta) (* s s s)))) ys)))) 1e-9))))
+
+(deftest constructed-prior-loop-read-spellings-and-direct-initializer
+  (let [ys (double-array [0.1 0.7 -0.3])
+        expected ((rev/value+grad #'normal-prior-then-loop :wrt [0 3 4])
+                  0.2 ys 3 2.7 1.4)]
+    (doseq [source [#'normal-prior-then-loop-raster-aget
+                    #'normal-direct-prior-loop]]
+      (let [actual ((rev/value+grad source :wrt [0 3 4]) 0.2 ys 3 2.7 1.4)]
+        (is (< (Math/abs (- (first actual) (first expected))) 1e-10))
+        (is (nil? (nth actual 2)))
+        (is (nil? (nth actual 3)))
+        (doseq [i [1 4 5]]
+          (is (< (Math/abs (- (nth actual i) (nth expected i))) 1e-9)))))))
