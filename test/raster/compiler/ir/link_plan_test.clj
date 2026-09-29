@@ -5,6 +5,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link]))
 
@@ -77,6 +78,64 @@
       :instances [(instance :layer-0 :x :w0 :hidden)
                   (instance :layer-1 :hidden :w1 :out)]
       :outputs [:out]})))
+
+(defn- emitted-graph []
+  (kgraph/make
+   {:inputs [(kgraph/buffer 'x :float 16 :device :input)
+             (kgraph/buffer 'w :float 16 :device :input)]
+    :outputs [(kgraph/buffer 'y :float 16 :device :output)]
+    :scalars [(kgraph/scalar 'n :long)]
+    :nodes [(kgraph/->ScheduledKernel
+             :map kernel
+             [(kgraph/->ValueUse 'x :read)
+              (kgraph/->ValueUse 'w :read)
+              (kgraph/->ValueUse 'y :write)]
+             #{'n} [])]
+    :abi (:abi kernel) :arguments (:arguments kernel)}))
+
+(deftest direct-graph-instance-retains-link-dataflow-contract
+  (let [graph (emitted-graph)
+        direct (link/graph-instance
+                {:id :direct :graph graph
+                 :bindings {'x :x 'w :w 'y :out}
+                 :scalar-values {'n {:type :long :value 16}}})
+        plan (link/make
+              {:id :graph-link :target :ze:0
+               :nodes [(n :x :input (float-array 16))
+                       (n :w :constant (float-array 16))
+                       (n :out :output)]
+               :instances [direct] :outputs [:out]})]
+    (is (link/graph-link-instance? direct))
+    (is (= plan (link/validate! plan)))
+    (is (= #{:x :w} (get-in (link/initialization-contract plan) [:reads])))
+    (is (= #{:out} (get-in (link/initialization-contract plan) [:writes])))
+    (is (= {'x :input 'w :constant 'y :output}
+           (link/instance-roles plan direct)))))
+
+(deftest direct-graph-instance-rejects-incomplete-and-mismatched-boundaries
+  (let [graph (emitted-graph)
+        request {:id :direct :graph graph
+                 :bindings {'x :x 'w :w 'y :out}
+                 :scalar-values {'n {:type :long :value 16}}}
+        reason (fn [f]
+                 (try (f) nil
+                      (catch clojure.lang.ExceptionInfo error
+                        (:reason (ex-data error)))))]
+    (is (= :graph-link-bindings
+           (reason #(link/graph-instance
+                     (update request :bindings dissoc 'w)))))
+    (is (= :kernel-graph-call-scalars
+           (reason #(link/graph-instance
+                     (assoc request :scalar-values {})))))
+    (is (= :program-link-graph-range
+           (reason #(link/make
+                     {:id :too-small :target :ze:0
+                      :nodes [(n :x :input (float-array 16))
+                              (n :w :constant (float-array 16))
+                              (link/node {:id :out :dtype :float :shape [8]
+                                          :device :ze:0 :role :output})]
+                      :instances [(link/graph-instance request)]
+                      :outputs [:out]}))))))
 
 (deftest certified-effect-facts-recheck-descriptor-binder-roles
   (let [{:keys [plan effect-evidence]}

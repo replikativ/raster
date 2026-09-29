@@ -64,6 +64,51 @@
                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
       (is (= [[:release :a]] @events)))))
 
+(deftest direct-graph-and-program-share-ordered-prepared-sequence
+  (let [events (atom [])
+        graph {:outputs [{:id :y}]}
+        executor {:bind! (fn [_ bound-graph buffers scalars]
+                           (is (= [graph {:x :input :y :output} {'n {:type :long :value 4}}]
+                                  [bound-graph buffers scalars]))
+                           (swap! events conj [:bind :graph])
+                           :graph)
+                  :run! (fn [handle] (swap! events conj [:run handle]))
+                  :release! (fn [handle] (swap! events conj [:release handle]))}
+        prepared (with-redefs [program/prepare-with!
+                               (fn [call _] (stub-program (:id call) events))]
+                   (program/prepare-sequence-with!
+                    [{:id :graph :kind :graph :call {:graph graph
+                                        :bindings {:x :input :y :output}
+                                        :scalar-values {'n {:type :long :value 4}}}}
+                     {:id :program :call {:id :after}}]
+                    executor))]
+    (try
+      (is (= {:graph {:y :output} :program {:after :after}}
+             (program/run-prepared! prepared)))
+      (is (= [[:bind :graph] [:run :graph] [:run :after]] @events))
+      (is (= [:graph :program]
+             (mapv :instance (program/execution-info prepared (constantly :observed)))))
+      (with-redefs [program-call/execution-order
+                    (fn [_ _] {:record-time-prologue []
+                               :per-replay [{:source {:step 0}}]
+                               :completion :unproven})]
+        (is (= [:graph :program]
+               (mapv #(get-in % [:source :instance])
+                     (:per-replay
+                      (program/execution-order
+                       prepared (fn [_] {:record-time-prologue []
+                                         :per-replay [{:source {:step 0}}]})))))))
+      (let [profile (program/profile-prepared!
+                     prepared (fn [handle]
+                                {:profile [{:phase handle}]
+                                 :kernel-total-ms 0.25
+                                 :device-wall-ms 0.5}))]
+        (is (= [:graph :program]
+               (mapv :instance (:profile profile))))
+        (is (= 1.0 (:device-wall-ms profile))))
+      (finally (program/release-prepared! prepared)))
+    (is (= [[:release :after] [:release :graph]] (take-last 2 @events)))))
+
 (deftest later-replay-failure-does-not-publish-partial-outputs
   (let [events (atom [])
         first-program (stub-program :a events)

@@ -122,6 +122,11 @@
            :id namespaced-id
            :call (program-call/map-buffers (:call instance) value-mapping))
 
+    (link-plan/graph-link-instance? instance)
+    (assoc instance
+           :id namespaced-id
+           :bindings (update-vals (:bindings instance) value-mapping))
+
     :else
     (throw (ex-info "link composition cannot namespace an unknown instance"
                     {:reason :link-composition-instance-type

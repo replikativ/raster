@@ -54,6 +54,13 @@ inventing an incompatible result buffer.
    source or inter-program transfer; packed weights and metadata remain shared constants.
    This proves one generated quantized projection chain and CPU-reference numerical parity,
    not the full Gemma decoder, its scheduling quality, or a performance win.
+   Emitted `KernelGraph`s can now enter `LinkPlan` directly with exact LinkValue and typed-scalar
+   bindings, and run in order beside equation-first program instances. This removes the need to
+   fabricate a resident descriptor for a graph at that boundary; the local indexed-attention
+   reference graph is the first dual-backend device oracle. Mixing legacy descriptor instances
+   into that prepared sequence is still an explicit runtime decline. Graph output ABI writes are
+   not by themselves evidence of full-element coverage; complete-write/initialization proofs
+   remain a separate compiler obligation before private reuse or an uninitialized partial output.
 4. **Local consolidation gate.** Publish a support/evidence matrix, retire covered duplicate
    paths, and record reproducible correctness, compilation, allocation, transfer and execution
    baselines on both local backends. Retain city irregular kernels, one PDE/stencil and a

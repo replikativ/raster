@@ -20,6 +20,13 @@
   java.io.Closeable
   (close [this] (release-prepared! this)))
 
+(defrecord PreparedKernelGraph [graph buffers handle run! release! closed?]
+  java.io.Closeable
+  (close [this] (release-prepared! this)))
+
+(defn prepared-kernel-graph? [value]
+  (instance? PreparedKernelGraph value))
+
 (defn prepared-sequence? [value]
   (instance? PreparedParallelSequence value))
 
@@ -163,18 +170,27 @@
           (throw error))))))
 
 (defn prepare-sequence-with!
-  "Prepare ordered, independently certified program calls over one shared resident binding.
+  "Prepare ordered emitted programs and direct graphs over one shared resident binding.
    A later binding failure releases all earlier programs before their storage is freed."
   [instances executor]
   (when-not (and (vector? instances) (seq instances)
-                 (every? #(and (contains? % :id) (contains? % :call)) instances)
+                 (every? #(and (contains? % :id) (contains? % :call)
+                               (contains? #{nil :program :graph} (:kind %))) instances)
                  (= (count instances) (count (distinct (map :id instances)))))
     (throw (ex-info "prepared sequence requires unique ordered instance calls"
                     {:reason :parallel-program-sequence-instances})))
   (let [prepared (volatile! [])]
     (try
-      (doseq [{:keys [id call]} instances]
-        (vswap! prepared conj {:id id :program (prepare-with! call executor)}))
+      (doseq [{:keys [id call kind]} instances]
+        (vswap! prepared conj {:id id :program
+                               (if (= :graph kind)
+                                 (let [{:keys [graph bindings scalar-values]} call
+                                       key [:parallel-program (random-uuid) id]
+                                       handle ((:bind! executor) key graph bindings scalar-values)]
+                                   (->PreparedKernelGraph graph bindings handle
+                                                          (:run! executor) (:release! executor)
+                                                          (atom false)))
+                                 (prepare-with! call executor))}))
       (->PreparedParallelSequence @prepared (atom false))
       (catch Throwable error
         (doseq [{:keys [program]} (rseq @prepared)]
@@ -217,7 +233,16 @@
   "Replay a prepared program and return its resident output bindings.
    A sequence keys each component's outputs by its stable LinkPlan instance identity."
   [prepared]
-  (if (prepared-sequence? prepared)
+  (cond
+    (prepared-kernel-graph? prepared)
+    (do
+      (when @(:closed? prepared)
+        (throw (ex-info "prepared graph is closed"
+                        {:reason :parallel-program-closed :operation :run-prepared!})))
+      ((:run! prepared) (:handle prepared))
+      (select-keys (:buffers prepared) (map :id (:outputs (:graph prepared)))))
+
+    (prepared-sequence? prepared)
     (do
       (when @(:closed? prepared)
         (throw (ex-info "prepared sequence is closed"
@@ -225,6 +250,8 @@
       (reduce (fn [outputs {:keys [id program]}]
                 (assoc outputs id (run-prepared! program)))
               {} (:instances prepared)))
+
+    :else
     (do
       (visit-handles! prepared :run-prepared! (:run! prepared))
       (:outputs (:call prepared)))))
@@ -234,7 +261,15 @@
    indices (including skipped host equations). Structured control deliberately declines rather
    than expanding trip counts or confusing one-time preparation with repeated execution."
   [prepared graph-order]
-  (if (prepared-sequence? prepared)
+  (cond
+    (prepared-kernel-graph? prepared)
+    (do
+      (when @(:closed? prepared)
+        (throw (ex-info "prepared graph is closed"
+                        {:reason :parallel-program-closed :operation :execution-order})))
+      (graph-order (:handle prepared)))
+
+    (prepared-sequence? prepared)
     (do
       (when @(:closed? prepared)
         (throw (ex-info "prepared sequence is closed"
@@ -249,6 +284,8 @@
                       (update :per-replay into (annotate (:per-replay selected))))))
               {:record-time-prologue [] :per-replay [] :completion :unproven}
               (:instances prepared)))
+
+    :else
     (do
       (ensure-prepared! prepared :execution-order)
       (program-call/execution-order
@@ -261,7 +298,15 @@
   "Describe each distinct prepared graph binding once, in binding order. Structured-loop carry
    variants stay bounded; this is neither expanded replay order nor measured execution evidence."
   [prepared graph-info]
-  (if (prepared-sequence? prepared)
+  (cond
+    (prepared-kernel-graph? prepared)
+    (do
+      (when @(:closed? prepared)
+        (throw (ex-info "prepared graph is closed"
+                        {:reason :parallel-program-closed :operation :execution-info})))
+      [{:phase (:handle prepared) :executable (graph-info (:handle prepared))}])
+
+    (prepared-sequence? prepared)
     (do
       (when @(:closed? prepared)
         (throw (ex-info "prepared sequence is closed"
@@ -270,6 +315,8 @@
                      (map #(assoc % :instance id)
                           (execution-info program graph-info)))
                    (:instances prepared))))
+
+    :else
     (do
       (ensure-prepared! prepared :execution-info)
       (when-not (ifn? graph-info)
@@ -286,7 +333,16 @@
    in the aggregate because they are distinct launches in the program schedule."
   [prepared profile-handle!]
   (let [started (System/nanoTime)
-        profiles (if (prepared-sequence? prepared)
+        profiles (cond
+                   (prepared-kernel-graph? prepared)
+                   [(do
+                      (when @(:closed? prepared)
+                        (throw (ex-info "prepared graph is closed"
+                                        {:reason :parallel-program-closed
+                                         :operation :profile-prepared!})))
+                      (profile-handle! (:handle prepared)))]
+
+                   (prepared-sequence? prepared)
                    (do
                      (when @(:closed? prepared)
                        (throw (ex-info "prepared sequence is closed"
@@ -296,6 +352,7 @@
                              (update (profile-prepared! program profile-handle!) :profile
                                      #(mapv (fn [event] (assoc event :instance id)) %)))
                            (:instances prepared)))
+                   :else
                    (visit-handles! prepared :profile-prepared! profile-handle!))
         finished (System/nanoTime)
         finite-nonnegative? #(and (number? %)
@@ -319,16 +376,24 @@
 (defn release-prepared!
   "Release every prepared graph in reverse binding order. Idempotent."
   [prepared]
-  (when-not (or (prepared-parallel-program? prepared) (prepared-sequence? prepared))
+  (when-not (or (prepared-parallel-program? prepared) (prepared-sequence? prepared)
+                (prepared-kernel-graph? prepared))
     (throw (ex-info "release-prepared! requires a prepared parallel program"
                     {:actual (type prepared)})))
   (when (compare-and-set! (:closed? prepared) false true)
     (let [failure (volatile! nil)]
-      (if (prepared-sequence? prepared)
+      (cond
+        (prepared-kernel-graph? prepared)
+        (try ((:release! prepared) (:handle prepared))
+             (catch Throwable error (vreset! failure error)))
+
+        (prepared-sequence? prepared)
         (doseq [{:keys [program]} (rseq (:instances prepared))]
           (try (release-prepared! program)
                (catch Throwable error
                  (when-not @failure (vreset! failure error)))))
+
+        :else
         (doseq [key (rseq (:binding-order prepared))]
           (try
             ((:release! prepared) (get (:handles prepared) key))

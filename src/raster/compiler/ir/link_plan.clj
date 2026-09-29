@@ -1,5 +1,5 @@
 (ns raster.compiler.ir.link-plan
-  "Pure, backend-neutral composition of compiled resident descriptors and emitted programs.
+  "Pure, backend-neutral composition of compiled resident descriptors, emitted programs and graphs.
 
    A LinkPlan names storage with stable LinkNodes and binds each descriptor's compiler symbols to
    those node identities. Validation closes shapes, dtypes, aliases, scalar environments and
@@ -32,6 +32,7 @@
 (defrecord LinkValue [id abstract physical-layout leaves])
 (defrecord LinkInstance [id descriptor bindings scalars schedule roles arguments])
 (defrecord ProgramLinkInstance [id call roles attributes])
+(defrecord GraphLinkInstance [id graph bindings scalar-values roles attributes])
 (defrecord LinkPlan [id target nodes values instances outputs aliases attributes])
 (defrecord LinkEffectEvidence
            [source-dialect target-dialect plan-id target step-facts initialization])
@@ -72,8 +73,11 @@
 (defn program-link-instance? [x]
   (and x (= "raster.compiler.ir.link_plan.ProgramLinkInstance" (.getName (class x)))))
 
+(defn graph-link-instance? [x]
+  (and x (= "raster.compiler.ir.link_plan.GraphLinkInstance" (.getName (class x)))))
+
 (defn plan-instance? [x]
-  (or (link-instance? x) (program-link-instance? x)))
+  (or (link-instance? x) (program-link-instance? x) (graph-link-instance? x)))
 
 (defn link-plan? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkPlan" (.getName (class x)))))
@@ -395,6 +399,41 @@
   [request]
   (validate-program-instance! (program-instance-candidate request)))
 
+(defn validate-graph-instance!
+  "Check the direct emitted-graph boundary without manufacturing a resident descriptor."
+  [instance]
+  (when-not (graph-link-instance? instance)
+    (throw (ex-info "expected a GraphLinkInstance"
+                    {:reason :graph-link-instance-type :actual (type instance)})))
+  (let [{:keys [id graph bindings scalar-values roles attributes]} instance
+        graph (kexec/validate! graph)
+        external (set (map :id (concat (:inputs graph) (:outputs graph))))]
+    (when (nil? id)
+      (throw (ex-info "a graph link instance requires a stable identity"
+                      {:reason :graph-link-instance-id})))
+    (when-not (and (map? bindings) (= external (set (keys bindings)))
+                   (every? some? (vals bindings)))
+      (throw (ex-info "graph link bindings must name exactly the external graph buffers"
+                      {:reason :graph-link-bindings :instance id :expected external
+                       :actual (when (map? bindings) (set (keys bindings)))})))
+    (when-not (and (map? roles) (every? binder-roles (vals roles))
+                   (set/subset? (set (keys roles)) external))
+      (throw (ex-info "graph link roles must refine external graph buffers"
+                      {:reason :graph-link-roles :instance id :roles roles})))
+    (when-not (map? attributes)
+      (throw (ex-info "graph link attributes must be a map"
+                      {:reason :graph-link-attributes :instance id})))
+    (kgcall/preflight! graph scalar-values))
+  instance)
+
+(defn graph-instance
+  "Bind an emitted KernelGraph directly to LinkValue identities and explicitly typed scalars.
+   Graph-private temporaries stay graph-owned; no synthetic descriptor or name inference is used."
+  [{:keys [id graph bindings scalar-values roles attributes]
+    :or {scalar-values {} roles {} attributes {}}}]
+  (validate-graph-instance!
+   (->GraphLinkInstance id graph bindings scalar-values roles attributes)))
+
 (defn instance-arguments
   "Return the descriptor's ordered specialization arguments. Explicit arguments retain array
    values for descriptor shape closures; absent arguments preserve the hand-built-plan
@@ -685,6 +724,7 @@
       (cond
         (link-instance? link-instance) (validate-instance! link-instance)
         (program-link-instance? link-instance) (validate-program-instance! link-instance)
+        (graph-link-instance? link-instance) (validate-graph-instance! link-instance)
         :else
         (throw (ex-info "link plan contains an unknown instance variant"
                         {:reason :link-instance-type :instance link-instance
@@ -1069,10 +1109,27 @@
                 (range (min 3 (:trip-count step))))))
       (map-indexed vector (:steps call))))))
 
+(defn- validate-graph-instance-bindings!
+  [nodes values {:keys [id graph bindings scalar-values roles] :as instance}]
+  (validate-graph-instance! instance)
+  (let [physical (into {}
+                       (map (fn [[compiler-value value-id]]
+                              (let [node (program-value-node! nodes values id compiler-value value-id)]
+                                (when (and (= :constant (get roles compiler-value))
+                                           (not= :constant (:role node)))
+                                  (throw (ex-info "a constant graph binding requires a constant LinkValue"
+                                                  {:reason :graph-link-role-mismatch :instance id
+                                                   :buffer compiler-value :value value-id})))
+                                [compiler-value (:view node)])))
+                       bindings)]
+    (kgcall/validate-binding-aliases! graph physical bview/overlaps?)
+    [(program-graph-fact nodes values id 0 :graph graph bindings scalar-values {})]))
+
 (defn- instance-access-facts [{:keys [nodes values instances]}]
-  (mapcat #(if (link-instance? %)
-             (validate-instance-bindings! nodes values %)
-             (validate-program-instance-bindings! nodes values %))
+  (mapcat #(cond
+             (link-instance? %) (validate-instance-bindings! nodes values %)
+             (program-link-instance? %) (validate-program-instance-bindings! nodes values %)
+             (graph-link-instance? %) (validate-graph-instance-bindings! nodes values %))
           instances))
 
 (defn- analyze-effects!
@@ -1208,8 +1265,12 @@
   [plan step-facts]
   (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
         _ (doseq [instance (:instances plan)]
-            (if (program-link-instance? instance)
+            (cond
+              (program-link-instance? instance)
               (validate-program-buffer-contracts! (:nodes plan) (:values plan) instance)
+              (graph-link-instance? instance)
+              (validate-graph-instance-bindings! (:nodes plan) (:values plan) instance)
+              :else
               (validate-instance-bindings! (:nodes plan) (:values plan) instance)))
         step-facts (vec step-facts)
         initialization (analyze-effects! plan step-facts)]
@@ -1420,6 +1481,19 @@
                            :internal :scratch
                            (get-in nodes [node-id :role]))]))
                     (:buffers call)))
+         roles))
+
+      (graph-link-instance? instance)
+      (let [{:keys [bindings roles]} (validate-graph-instance! instance)]
+        (merge
+         (into {}
+               (map (fn [[compiler-value value-id]]
+                      (let [node-id (get-in values [value-id :leaves 0 :node])]
+                        [compiler-value
+                         (case (get-in nodes [node-id :role])
+                           :internal :scratch
+                           (get-in nodes [node-id :role]))])))
+               bindings)
          roles))
 
       :else
