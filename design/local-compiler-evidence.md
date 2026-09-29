@@ -184,3 +184,16 @@ program and rejects a mutated embedded target artifact. A later true template-hi
 spent 19.7 s preparing the same shape, including 14.9 s constructing its LinkPlan and 4.8 s
 certifying the invocation. This shared-load observation does not isolate a reliable wall-clock
 speedup; the structural reduction is one complete program-validation pass per constructed call.
+
+The [longer September 29 warmup diagnostic](../bench/results/q4-warmup-arc-20260929.edn)
+used the merged compiler and the same public Q4_K canary for three interleaved, bit-exact runs.
+All six device-event series remained nonstationary. Both candidates shifted speed together after
+several measured rounds, even with 16 warmups; none licenses a selector change. Two true compiler
+template hits still spent about 15 s constructing the LinkPlan and 4.8 s certifying the
+invocation. A scoped proof-pass profile found that each LinkPlan validation checks the same exact
+program instance twice: once for structural validity and again while deriving access facts.
+The follow-up shares that checked instance only within one LinkPlan validation call, while each
+new public validation and each changed call is independently checked. This removes two repeated
+program-call validations per Q4 preparation in the observed path (five down to three, including
+the constructor), not the two separate LinkPlan proofs around role/output projection. Those
+proofs need a single final-boundary lowering design rather than an unchecked persistent cache.
