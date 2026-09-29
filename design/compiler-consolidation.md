@@ -42,9 +42,11 @@ inventing an incompatible result buffer.
    verified row-ownership proof and emits one TypedSOAC/KernelBody kernel: an unrelated remainder
    local no longer invalidates its row-major address certificate, while a remainder used in an
    address still declines. Its mixed float-load/double-sentinel join is explicitly typed in the
-   source. OpenCL CPU execution matches the JVM across four window shapes; local Level Zero
-   execution remains unverified because its driver probe fails in this sandbox. New corpus
-   compilation errors fail the ratchet instead of being invisible until a baseline refresh.
+   source. Public equation-first execution now matches the JVM across four window shapes on
+   local OpenCL and Level Zero, retaining one emitted kernel and no fallback in each case.
+   The older Level Zero sandbox probe failure no longer describes this local evidence. New
+   corpus compilation errors fail the ratchet instead of being invisible until a baseline
+   refresh.
 
    The public Q8_K cooperative padded-row quantizer and Q4_K product projection now have a
    composed B=2, width-640/padded-768 execution oracle on local Level Zero and OpenCL. The
