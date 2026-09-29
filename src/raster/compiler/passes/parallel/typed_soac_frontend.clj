@@ -4323,6 +4323,7 @@
       (case (:kind description)
         :scalar
         (let [expression (:expr description)
+              allocated-extent (allocation-length expression)
               array (alength-array expression)
               proved-extent (canonical-extent shape-equalities values expression)
               representative (cond
@@ -4333,11 +4334,16 @@
                                (and (not= proved-extent expression)
                                     (dialect/extent? proved-extent)) proved-extent
                                :else (:sym description))]
-          (-> state
-              (update :descriptions conj
-                      (assoc description :expr (if (= representative (:sym description))
-                                                 expression representative)))
-              (assoc-in [:scalar-representatives (:sym description)] representative)))
+          (cond-> (-> state
+                      (update :descriptions conj
+                              (assoc description :expr (if (= representative (:sym description))
+                                                         expression representative)))
+                      (assoc-in [:scalar-representatives (:sym description)] representative))
+            allocated-extent
+            (assoc-in [:extents (:sym description)]
+                      (if (symbol? allocated-extent)
+                        (get scalar-representatives allocated-extent allocated-extent)
+                        (canonical-extent shape-equalities values allocated-extent)))))
 
         (:map :scatter :effect-map :stencil :reduce :scan)
         (let [extent (:extent description)
@@ -5534,7 +5540,12 @@
               (mapv #(canonical-extent shape-equalities values %) (:shape contract)))]
        (cond
          (= prior contract) values
-         (and same-nonshape-contract? equivalent-shape?) (assoc values id contract)
+         ;; Equality proves compatibility, not that the consumer's dimension spelling is
+         ;; available at the producer. Replacing an allocation's retained extent with a
+         ;; later `(alength allocation)` binder creates a circular invocation dependency.
+         ;; Keep the established contract when both shapes are already known and equivalent.
+         (and same-nonshape-contract? equivalent-shape?
+              (not (unknown-shape? prior)) (not (unknown-shape? contract))) values
          (and same-nonshape-contract? (unknown-shape? prior)) (assoc values id contract)
          (and same-nonshape-contract? (unknown-shape? contract)) values
          :else
