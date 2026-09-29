@@ -284,6 +284,30 @@
       (invoke! (:kernel-name kernel) [out q] [{:type :int :value 7}] n)
       (is (every? true? (map-indexed (fn [i v] (= v (+ 7 (aget q i)))) out))))))
 
+(deftest ocl-identical-reregistration-retains-built-program
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "OpenCL repeated kernel registration")
+    (let [kernel (par-opencl/generate-par-map-void-kernel
+                  '(raster.par/map-void! i n (aset out i (+ (aget input i) 1.0)))
+                  :dtype :float :array-types {'out :float 'input :float})
+          kernel-name (:kernel-name kernel)
+          register! (resolve 'raster.gpu.ocl-runtime/register-kernel!)
+          entry (resolve 'raster.gpu.ocl-runtime/kernel-registry-entry)
+          invoke! (resolve 'raster.gpu.ocl-runtime/invoke-registered-map-void-kernel)
+          input (float-array [1.0 2.0 3.0])
+          output (float-array 3)]
+      (register! kernel-name kernel)
+      (invoke! kernel-name [input output] [] 3)
+      (let [built (entry kernel-name)]
+        (is (some? (:program built)))
+        (is (some? (:kernel-handle built)))
+        (register! kernel-name kernel)
+        (let [repeated (entry kernel-name)]
+          (is (identical? (:program built) (:program repeated)))
+          (is (identical? (:kernel-handle built) (:kernel-handle repeated)))))
+      (invoke! kernel-name [input output] [] 3)
+      (is (= [2.0 3.0 4.0] (vec output))))))
+
 (deftest ocl-nested-effect-map-mixed-storage-roundtrip
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "nested typed effect map")

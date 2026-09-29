@@ -914,7 +914,20 @@
    (let [_ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
          info (cond-> kernel-info
                 arena-id (assoc :arena-id arena-id))]
-     (swap! kernel-registry assoc kernel-name info))))
+     (swap! kernel-registry
+            (fn [registry]
+              (let [prior (get registry kernel-name)
+                    same-program? (and (:program prior) (:kernel-handle prior)
+                                       (= (:source prior) (:source info))
+                                       (= (kart/compilation prior) (kart/compilation info))
+                                       (= (:arena-id prior) (:arena-id info)))]
+                ;; Graph composition registers every emitted node before binding it. An
+                ;; identical registration must not discard a live cl_program and force
+                ;; clBuildProgram again for every instance of the same kernel.
+                (assoc registry kernel-name
+                       (if same-program?
+                         (merge info (select-keys prior [:program :kernel-handle]))
+                         info))))))))
 
 (defn register-kernel-dispatch!
   ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))
