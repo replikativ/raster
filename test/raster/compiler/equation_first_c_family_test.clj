@@ -780,15 +780,23 @@
   (let [arguments [(float-array 8) 8]
         opts {:compiler :equation-first :target cuda-target :dtype :float}
         original link-plan/validate-with-effect-evidence!
+        validate-call! program-call/validate!
         checks (atom 0)
+        call-checks (atom 0)
         prepared (with-redefs [link-plan/validate-with-effect-evidence!
                                (fn [plan]
                                  (swap! checks inc)
-                                 (original plan))]
+                                 (original plan))
+                               program-call/validate!
+                               (fn [call]
+                                 (swap! call-checks inc)
+                                 (validate-call! call))]
                    (compiled/lower #'c-family-elementwise arguments opts))
         plan (compiled/plan prepared)
         evidence (get-in prepared [:lowering :certificate :effect-evidence])]
     (is (= 1 @checks) "the projected public boundary is proved once, not twice")
+    (is (= 1 @call-checks)
+        "only the projected instance is checked; its pre-projection candidate does not escape")
     (is (link-plan/retained-effect-evidence? plan evidence))
     (is (false? (link-plan/retained-effect-evidence?
                  (assoc plan :outputs []) evidence)))
@@ -796,7 +804,14 @@
            (:reason (reason-of
                      #(link-plan/make-with-final-projection
                        plan (fn [candidate]
-                              {:plan (assoc candidate :outputs [::unknown])}))))))))
+                              {:plan (assoc candidate :outputs [::unknown])}))))))
+    (is (= :emitted-parallel-program-target
+           (:reason (reason-of
+                     #(link-plan/make-with-final-projection
+                       plan (fn [candidate]
+                              {:plan (assoc-in candidate
+                                               [:instances 0 :call :program :dialect]
+                                               :hip-parallel)}))))))))
 
 (deftest retention-requires-complete-call-binding-coverage
   (let [prepared (compiled/lower #'c-family-elementwise [(float-array 8) 8]

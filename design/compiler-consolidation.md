@@ -385,6 +385,35 @@ handle escapes; ordinary inspectable `LinkedExecutable` and `Compiled` behavior 
 This removes repeated construction within that confined scope, not host output copies or the
 remaining resident-composition ownership obligations.
 
+### Deferred AD consolidation checkpoint (2026-09-29)
+
+Keep this as a tracked follow-up to the completion order above, not a new prerequisite for
+Q4 preparation, local execution evidence, or the remaining pretrained routes. #880–#882 and
+#892–#893 close the observed Gaussian bridge shapes: selected differentiable parameters,
+interleaved constant observations, constructed priors in let-bound and direct loop initializers,
+both public array-read spellings, and a typed compound reduction initializer. They do not prove
+that arbitrary source loops or constructed values differentiate.
+
+1. Converge AD preparation on the same canonical typed scalar/control facts as the compiler:
+   one result dtype and effect classification per operation, explicit lexical scope and
+   constructor-field projection, and one retained scan/reduction algebra. Remove duplicate
+   form-spelling/type recovery only when a workload proves the replacement preserves the
+   frontend's dispatch, numeric policy, and failure boundary. Do not add density-specific AD
+   dispatch or a second function/type registry.
+2. Make the supported-domain boundary explicit: counted carry loops may become ordered scans;
+   other loops need a recorded residual/tape or a distinct implicit rule. Unsupported active
+   constructors, data-dependent loops, effects, and changing shapes must fail loudly rather
+   than return a zero or silently drop a contribution.
+3. Gate each new AD shape with primal JVM parity, analytic or finite-difference gradients,
+   zero-trip and nonzero-trip cases, `:wrt`/constant observations, and a composed compiled
+   caller. Keep device and training-step oracles distinct from a scalar AD unit test. This is
+   correctness evidence, not a claim of formal completeness; later proof work can build on
+   the typed scope and residual contracts.
+
+Return to the original local-first order now: finish public workload coverage and the
+support/evidence matrix, audit the still-expensive Q4 host preparation with exact proof
+boundaries, then perform matched execution/performance gates before vendor-device claims.
+
 - One bounded JVM/REPL; focused affected tests locally. Full suites run in CI.
 - One reviewer at structural boundaries or before landing a risky change; no permanent agent swarm.
 - Each slice states which existing path it replaces and what remains unsupported. Tests that
