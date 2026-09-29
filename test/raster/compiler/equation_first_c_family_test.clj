@@ -1023,10 +1023,22 @@
             make-call #(program-call/make (:program call)
                                           (assoc (:buffers call) result :unrelated-result)
                                           (:scalar-values call) {} nil %)
-            forged (make-call {result physical})
+            checked-step program-call/validate-equation-call!
+            checks (atom 0)
+            forged (with-redefs [program-call/validate-equation-call!
+                                 (fn [step]
+                                   (swap! checks inc)
+                                   (checked-step step))]
+                     (make-call {result physical}))
             binds (atom 0)
             executor {:bind! (fn [& _] (swap! binds inc)) :run! identity :release! identity}
             reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+        (is (= 1 @checks) "constructor checks its exact numerical step once")
+        (reset! checks 0)
+        (with-redefs [program-call/validate-equation-call!
+                      (fn [step] (swap! checks inc) (checked-step step))]
+          (program-call/validate! forged))
+        (is (= 1 @checks) "public call validation independently rechecks the step")
         (is (= :emitted-program-result-views (reason #(make-call {:not-a-result physical}))))
         (is (= :parallel-program-result-view-resolver
                (reason #(program-runtime/prepare-with! forged executor))))

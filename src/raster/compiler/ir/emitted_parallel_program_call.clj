@@ -294,9 +294,9 @@
      (:equations parallel-program))))
 
 (defn- validate-call-against-program!
-  "Check a call against the exact program validated by its constructor. Public callers still
-   enter through validate!, which independently validates the contained program."
-  [call parallel-program]
+  "Check a call against its exact validated program. A constructor may retain exact step objects
+   it already checked; public callers pass nil and independently validate every step."
+  [call parallel-program validated-equation-calls]
   (when-not (emitted-program-call? call)
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
@@ -327,7 +327,10 @@
                      "evaluated host step changed equation identity" {:equation (:id equation)})))
 
         (emitted-equation-call? step)
-        (do (validate-equation-call! step)
+        (do (when-not (and validated-equation-calls
+                           (.containsKey ^java.util.IdentityHashMap
+                                         validated-equation-calls step))
+              (validate-equation-call! step))
             (doseq [[result physical] (:result-views step)]
               (when-not (and (= (get buffers physical) (get (:buffers step) physical))
                              (= (get buffers result) (get (:outputs step) result))
@@ -365,7 +368,7 @@
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
   (validate-call-against-program!
-   call (emitted-program/validate! (:program call))))
+   call (emitted-program/validate! (:program call)) nil))
 
 (defn execution-order
   "Project straight-line selected graph order without allocating device storage.
@@ -539,6 +542,7 @@
    (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
   ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
   (let [parallel-program (emitted-program/validate! parallel-program)
+        validated-equation-calls (java.util.IdentityHashMap.)
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
                                              (filter #(emitted-equation/emitted-equation?
@@ -597,6 +601,7 @@
              :else
              (let [{:keys [call buffers]}
                    (prepare-equation-call equation values buffers scalars result-views)]
+               (.put validated-equation-calls call Boolean/TRUE)
                {:buffers buffers :steps (conj steps call)})))
          {:buffers buffers :steps []}
          (:equations parallel-program))
@@ -614,4 +619,4 @@
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) final-buffers scalars loop-scratch outputs
       {:execution :stage-once-host-repetition :source-inspected false})
-     parallel-program))))
+     parallel-program validated-equation-calls))))
