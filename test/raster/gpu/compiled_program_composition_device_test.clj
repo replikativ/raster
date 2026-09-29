@@ -3,6 +3,7 @@
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
@@ -61,6 +62,50 @@
   (if @gp/gpu-available?
     (run-case :ze:0)
     (gp/gpu-skip! "two composed equation programs on Level Zero")))
+
+(defn- run-mixed-graph-case [target]
+  (let [{:keys [prepared first second]} (compose-case target)
+        original (compiled/plan prepared)
+        second-instance (clojure.core/second (:instances original))
+        call (:call second-instance)
+        step (clojure.core/first (:steps call))
+        graph (:graph step)
+        external (set (map :id (concat (:inputs graph) (:outputs graph))))
+        graph-instance (link-plan/graph-instance
+                        {:id (:id second-instance) :graph graph
+                         :bindings (select-keys (:buffers step) external)
+                         :scalar-values (merge (:scalar-values call) (:scalar-values step))})
+        plan (link-plan/make
+              (assoc original :instances [(clojure.core/first (:instances original))
+                                          graph-instance]))
+        mapping (get-in prepared [:lowering :certificate :node-mapping])
+        input (get mapping [:first (get-in first [:in-tree 0 :node])])
+        output (get mapping [:second (get-in second [:out-tree 0 :node])])
+        intermediate (get mapping [:first (get-in first [:out-tree 0 :node])])
+        executable (link/instantiate! plan)]
+    (try
+      (is (nil? (get-in plan [:nodes intermediate :source])))
+      (is (= [false true]
+             (mapv link-plan/graph-link-instance? (:instances plan))))
+      (is (= (mapv :id (:instances plan))
+             (mapv #(get-in % [:source :instance])
+                   (:per-replay (link/execution-order executable)))))
+      (doseq [values [[1.0 2.0 3.0 4.0] [5.0 6.0 7.0 8.0]]]
+        (link/upload! executable input (float-array values))
+        (link/run! executable)
+        (is (= (mapv #(* 4.0 %) values)
+               (vec (link/download executable output)))))
+      (finally (link/close! executable)))))
+
+(deftest opencl-program-and-direct-graph-share-a-resident-intermediate
+  (if @opencl/opencl-available?
+    (run-mixed-graph-case :ocl:0)
+    (opencl/opencl-skip! "program and direct graph composition")))
+
+(deftest level-zero-program-and-direct-graph-share-a-resident-intermediate
+  (if @gp/gpu-available?
+    (run-mixed-graph-case :ze:0)
+    (gp/gpu-skip! "program and direct graph composition on Level Zero")))
 
 (deftest failed-second-bind-cleans-an-attached-session
   (if-not @opencl/opencl-available?

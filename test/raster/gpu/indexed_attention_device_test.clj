@@ -3,6 +3,8 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
@@ -152,6 +154,58 @@
   (if-not @device-probe/opencl-subgroups-available?
     (device-probe/opencl-skip! "indexed attention plan oracle" :subgroups)
     (run-case :ocl:0)))
+
+(defn- run-direct-graph-link-case [device-id]
+  (let [{:keys [plan shape-env buffers expected]} (test-case)
+        graph (:graph (route/route-dynamic!
+                       plan {:device-type :gpu :vendor "Intel" :subgroup-size 16
+                             :max-workgroup-size 256
+                             :segmented-weighted-reduction-schedule :reference}))
+        scalar-values (assoc (into {} (map (fn [[id value]]
+                                            [id {:type :long :value value}]) shape-env))
+                             (get-in plan [:output :elements])
+                             {:type :long :value 15})
+        external (into {} (map (juxt :id identity))
+                       (concat (:inputs graph) (:outputs graph)))
+        nodes (mapv (fn [[id graph-buffer]]
+                      (link-plan/node
+                       {:id id :device device-id :dtype (:dtype graph-buffer)
+                        :shape [(graph-call/resolve-integer scalar-values
+                                                           (:elements graph-buffer))]
+                        :role (if (= 'normalized id) :output :input)
+                        :source (get buffers id)}))
+                    external)
+        instance (link-plan/graph-instance
+                  {:id :attention :graph graph
+                   :bindings (zipmap (keys external) (keys external))
+                   :scalar-values scalar-values})
+        linked (link-plan/make
+                {:id :direct-indexed :target device-id :nodes nodes
+                 :instances [instance] :outputs ['normalized]})
+        executable (link/instantiate! linked)]
+    (try
+      (is (= 1 (count (:instances linked))))
+      (is (link-plan/graph-link-instance? (first (:instances linked))))
+      (is (= (vec (get buffers 'Q)) (vec (link/download executable 'Q))))
+      (is (seq (link/execution-info executable)))
+      (link/run! executable)
+      (let [actual (vec (link/download executable 'normalized))]
+        (is (= (count expected) (count actual)))
+        (is (every? true?
+                    (map #(< (Math/abs (- (double %1) (double %2))) 2.0e-5)
+                         expected actual))
+            (str "expected=" (vec expected) " actual=" actual)))
+      (finally (link/close! executable)))))
+
+(deftest direct-graph-link-replays-indexed-reference-on-level-zero
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "direct indexed graph LinkPlan on Level Zero")
+    (run-direct-graph-link-case :ze:0)))
+
+(deftest direct-graph-link-replays-indexed-reference-on-opencl
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "direct indexed graph LinkPlan")
+    (run-direct-graph-link-case :ocl:0)))
 
 (defn- run-equation-first-case
   ([device-id] (run-equation-first-case device-id :reference))

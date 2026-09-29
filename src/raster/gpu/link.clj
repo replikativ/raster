@@ -3,9 +3,9 @@
 
    The plan is validated completely before a session is created or touched. Instantiation allocates
    each unique owned allocation once, imports caller-owned allocations explicitly, materializes
-   node views, and binds either descriptor instances through raster.gpu.core/bind-step! or one
-   equation-first emitted program through reusable KernelGraphs. Attention, GEMM, reductions and
-   quant kernels are not special cases here."
+   node views, and binds either descriptor instances through raster.gpu.core/bind-step! or an
+   ordered sequence of equation-first emitted programs and direct KernelGraphs. Attention, GEMM,
+   reductions and quant kernels are not special cases here."
   (:refer-clojure :exclude [run!])
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
@@ -138,10 +138,10 @@
    - `:session` attaches to an existing same-device session; otherwise the executable owns one.
    - `:external-buffers` maps every borrowed/external allocation identity to a backend DeviceBuffer.
 
-   Attached executables own only their phases or prepared equation graphs, graph recording and
+   Attached executables own only their phases or prepared emitted graphs, graph recording and
    allocation registrations. Their close does not close the caller session and never frees
-   caller-owned buffers. Ordered equation-first programs share one resident LinkPlan; mixed
-   descriptor/program scheduling remains a fail-loud compiler boundary."
+   caller-owned buffers. Ordered equation-first programs and direct graphs share one resident
+   LinkPlan; mixed legacy-descriptor/prepared scheduling remains a fail-loud compiler boundary."
   ([plan] (instantiate! plan {}))
   ([plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false}}]
    ;; This is intentionally the first operation. Everything below may contact a backend.
@@ -160,11 +160,13 @@
          ;; The same validation already derived ordered initialization from its verified ABI
          ;; facts. Re-running initialization-contract would parse and analyze the plan again.
          initialization (get-in validated [:effect-evidence :initialization])
-         program-instances (filterv link-plan/program-link-instance? (:instances plan))
+         program-instances (filterv #(or (link-plan/program-link-instance? %)
+                                         (link-plan/graph-link-instance? %))
+                                    (:instances plan))
          _ (when (and (seq program-instances)
                       (not= (count program-instances) (count (:instances plan))))
              (throw (ex-info
-                     "runtime composition of emitted programs with other instances is not yet scheduled"
+                     "runtime composition of emitted programs/graphs with descriptors is not yet scheduled"
                      {:reason :link-runtime-mixed-program-instances
                       :instances (mapv :id (:instances plan))
                       :program-instances (mapv :id program-instances)})))
@@ -272,10 +274,19 @@
                                              {:profile? profile?})))
                                  :run! #(gpu/run-kernel-graph! session %)
                                  :release! #(gpu/release-kernel-graph! session %)}]
-                   (if (= 1 (count program-instances))
+                   (if (and (= 1 (count program-instances))
+                            (link-plan/program-link-instance? (first program-instances)))
                      (parallel-program/prepare-with! (:call (first program-instances)) executor)
                      (parallel-program/prepare-sequence-with!
-                      (mapv #(select-keys % [:id :call]) program-instances) executor))))))
+                      (mapv (fn [instance]
+                              {:id (:id instance)
+                               :kind (if (link-plan/graph-link-instance? instance)
+                                       :graph :program)
+                               :call (if (link-plan/graph-link-instance? instance)
+                                       (select-keys instance [:graph :bindings :scalar-values])
+                                       (:call instance))})
+                            program-instances)
+                      executor))))))
              (do
                (timed-phase!
                 timings :binding
@@ -479,8 +490,9 @@
   ([executable instance-selector step-selector]
    (let [executable (ensure-live! executable :linked-dispatch)
          instance (select-instance (:plan executable) instance-selector)]
-     (when (link-plan/program-link-instance? instance)
-       (throw (ex-info "equation-first program instances do not expose one descriptor dispatch"
+     (when (or (link-plan/program-link-instance? instance)
+               (link-plan/graph-link-instance? instance))
+       (throw (ex-info "emitted program/graph instances do not expose one descriptor dispatch"
                        {:reason :linked-program-has-no-descriptor-dispatch
                         :instance (:id instance)})))
      (assoc (select-dispatch-step (:descriptor instance) step-selector)
