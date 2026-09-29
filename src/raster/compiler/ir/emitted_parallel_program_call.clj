@@ -293,13 +293,17 @@
      {:scalars scalars :device-results #{} :host-steps {}}
      (:equations parallel-program))))
 
-(defn validate!
-  [call]
+(defn- validate-call-against-program!
+  "Check a call against the exact program validated by its constructor. Public callers still
+   enter through validate!, which independently validates the contained program."
+  [call parallel-program]
   (when-not (emitted-program-call? call)
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
-  (let [{:keys [program steps buffers scalar-values loop-scratch outputs attributes]} call
-        parallel-program (emitted-program/validate! program)]
+  (when-not (identical? (:program call) parallel-program)
+    (fail! :emitted-program-call-program-identity
+           "validated program is not the program contained in its call" {}))
+  (let [{:keys [steps buffers scalar-values loop-scratch outputs attributes]} call]
     (doseq [[field value] [[:buffers buffers] [:scalar-values scalar-values]
                            [:loop-scratch loop-scratch] [:outputs outputs]
                            [:attributes attributes]]]
@@ -353,6 +357,15 @@
              "emitted program call outputs differ from the program boundary"
              {:expected (:outputs parallel-program) :actual (keys outputs)}))
     call))
+
+(defn validate!
+  "Independently validate a call and its complete emitted program."
+  [call]
+  (when-not (emitted-program-call? call)
+    (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
+           {:actual (type call)}))
+  (validate-call-against-program!
+   call (emitted-program/validate! (:program call))))
 
 (defn execution-order
   "Project straight-line selected graph order without allocating device storage.
@@ -597,7 +610,8 @@
                            :else (fail! :emitted-program-output-binding
                                         "program output has no runtime binding" {:value id}))]))
               (:outputs parallel-program))]
-    (validate!
+    (validate-call-against-program!
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) final-buffers scalars loop-scratch outputs
-      {:execution :stage-once-host-repetition :source-inspected false})))))
+      {:execution :stage-once-host-repetition :source-inspected false})
+     parallel-program))))
