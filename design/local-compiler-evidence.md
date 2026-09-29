@@ -224,3 +224,13 @@ equation call was rechecked inside its own constructor; the follow-up now retain
 constructor-local object identity while leaving public call validation and LinkPlan validation
 independent. That is one fewer complete step validation, not a persistent cache or a new tuning
 decision. The remaining construction cost still matters for adaptive/JIT workloads.
+
+The subsequent exact-object Q4 preparation trace found zero canonical graph-equivalence
+comparisons after selected-graph identity admission, but repeated emitted-program validation
+remained. One duplicate had a precise lifetime: the invocation constructed and validated a
+temporary program instance, then public-role projection replaced that instance before the final
+LinkPlan proof. The internal candidate now stays unvalidated and cannot escape the synchronous
+final-boundary constructor; that constructor validates the projected instance once. The public
+`program-instance` constructor and each fresh public LinkPlan validation still recheck the
+complete call. A C-family test counts this distinction. Instrumented preparation wall time on
+the shared laptop is not a controlled speedup or a kernel-performance measurement.

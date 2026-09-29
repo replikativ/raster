@@ -379,13 +379,21 @@
         (.put ^java.util.IdentityHashMap *validated-program-instances* checked Boolean/TRUE))
       checked)))
 
+(defn ^:no-doc program-instance-candidate
+  "Construct an unvalidated instance only for synchronous final-boundary projection.
+
+   The candidate must not escape: make-with-final-projection validates its final roles,
+   call and bindings before returning a LinkPlan. Public callers use program-instance."
+  [{:keys [id call roles attributes] :or {roles {} attributes {}}}]
+  (->ProgramLinkInstance id call roles attributes))
+
 (defn program-instance
   "Construct an equation-first emitted program instance whose call buffers are LinkValue IDs.
 
    KernelGraph temporaries remain graph-private. `:roles` may refine residency policy for public
    program buffer values but never supplies or reconstructs a binding."
-  [{:keys [id call roles attributes] :or {roles {} attributes {}}}]
-  (validate-program-instance! (->ProgramLinkInstance id call roles attributes)))
+  [request]
+  (validate-program-instance! (program-instance-candidate request)))
 
 (defn instance-arguments
   "Return the descriptor's ordered specialization arguments. Explicit arguments retain array

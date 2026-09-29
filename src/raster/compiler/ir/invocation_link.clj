@@ -466,7 +466,11 @@
                                                                        (:buffers realized) storage))
                              :leaves [{:name :value :node token}]}))
               storage)
-        instance (link/program-instance
+        ;; Roles and escaped outputs are projected before the final LinkPlan proof.
+        ;; Keep this exact checked call inside an unescaped instance candidate;
+        ;; validating its pre-projection role map would recheck the same program
+        ;; and cannot certify the projected instance anyway.
+        instance (link/program-instance-candidate
                   {:id [invocation-id :emitted-program] :call call
                    :attributes {:source :typed-invocation}})]
     (link/make-with-final-projection
