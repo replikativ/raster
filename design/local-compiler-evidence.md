@@ -9,6 +9,7 @@ Arc device, not independent vendor acceptance.
 | --- | --- | --- |
 | City day kernels, carried effect branches and two-exit search | JVM parity on OpenCL and Level Zero; original city fixture retained; nested recurrence branches, effect-empty arms and post-store local-result scopes replayed | Effectful early exits; broader irregular language coverage |
 | Q4_K/Q6_K projection, two activation rows | Exact float-bit parity with ggml reference through public compiled/equation-first paths on both local backends | Large-shape throughput and external end-to-end decoder baseline |
+| Q8_K activation quantization → Q4_K projection | Public equation-first B=2 width-640/padded-768 composition on OpenCL and Level Zero; packed activation leaves share resident nodes without a host source, shared weights are captured, and output matches the independent CPU quantized reference within 1e-3 | Pretrained decoder migration and its logits/token anchors; complete-chain device-event performance |
 | Full AD linear/MSE/SGD step | Two resident mutable-weight updates match CPU AD on both local backends; no host weight reupload | General tape lifetime/reuse and frontier training scale |
 | RK4 heat solver | Public equation-first compile/link, 64 points and three steps, CPU agreement within 1e-10 on both local backends | Distributed halo exchange, large grids and measured solver throughput |
 | Routed attention | Existing tests executed: dense F32 and bidirectional packed segments on Level Zero; tiled history with dense/CSR routes and visibility on OpenCL | Full Laya packed-agent benchmark and independent cross-vendor numerical execution |
@@ -197,6 +198,13 @@ new public validation and each changed call is independently checked. This remov
 program-call validations per Q4 preparation in the observed path (five down to three, including
 the constructor), not the two separate LinkPlan proofs around role/output projection. Those
 proofs need a single final-boundary lowering design rather than an unchecked persistent cache.
+
+A [later Q4 canary after the final-boundary cleanup](../bench/results/q4-public-arc-20260929-followup.edn)
+repeated the public Gemma-shape comparison with twelve rotating rounds. Every resident replay
+passed the raw-bit ggml oracle, but both generated and serial event series changed speed state;
+neither is stationary or a tuning/performance promotion. The input was already Q8_K. Separate
+public B=2 quantizer→projection execution now checks the complete activation conversion seam,
+but is a correctness gate, not a timed full-decoder result.
 
 The final-boundary lowering now normalizes storage identities, applies public role and escaped
 output projection synchronously, and validates only the projected LinkPlan. The resulting effect
