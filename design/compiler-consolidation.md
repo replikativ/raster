@@ -450,6 +450,14 @@ removed. Local shadowing and quoted data do not create outer dependence; genuine
 values still do. This consolidates dependency discovery, not derivative rules or support for
 arbitrary effects/loops. Existing unsupported active tape/closure checks remain mandatory.
 
+The scalar CSE body path now uses the same canonical substitution safety check as its
+binding initializers. Alias replacement and vector projection expansion must not capture
+inner binders or rewrite quoted data. Unsafe body expressions use hygienic alias substitution
+and retain vector projections conservatively. Regressions compare original and optimized JVM
+values under ordinary/core-name shadowing and nested function bindings. Generated gradient
+composition and the resident RMSNorm oracle still pass; this is a scope-correctness fix, not
+a numerical reassociation or performance-policy change.
+
 1. Converge AD preparation on the same canonical typed scalar/control facts as the compiler:
    one result dtype and effect classification per operation, explicit lexical scope and
    constructor-field projection, and one retained scan/reduction algebra. Remove duplicate

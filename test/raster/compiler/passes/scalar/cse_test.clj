@@ -65,3 +65,24 @@
                       (+ a b))
           {:keys [stats]} (cse/cse-let form)]
       (is (= 1 (:cse-aliases stats))))))
+
+(deftest cse-body-substitution-preserves-lexical-values
+  (doseq [source ['(let* [x (Math/sin 0.5) y (Math/sin 0.5)]
+                     (let* [x 2.0] y))
+                  '(let* [count (Math/sin 0.5) y (Math/sin 0.5)]
+                     (let* [count 2.0] y))
+                  '(let* [x (Math/sin 0.5) y (Math/sin 0.5)]
+                     ((fn* [y] y) 7.0))
+                  '(let* [x (Math/sin 0.5) y (Math/sin 0.5)]
+                     (quote y))]]
+    (let [{:keys [form stats]} (cse/cse-let source)]
+      (is (= 1 (:cse-aliases stats)))
+      (is (= (eval source) (eval form)) (str form)))))
+
+(deftest vector-projections-do-not-cross-shadowing-body-scopes
+  (doseq [source ['(let* [x 3.0 values [x]]
+                     (let* [x 9.0] (clojure.core/nth values 0)))
+                  '(let* [values [3.0]]
+                     (let* [values [9.0]] (clojure.core/nth values 0)))]]
+    (let [optimized (:form (cse/cse-let source))]
+      (is (= (eval source) (eval optimized)) (str optimized)))))
