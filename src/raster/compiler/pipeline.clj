@@ -696,6 +696,19 @@
                :undevirtualized (count undevirt)
                :undevirtualized-ops (frequencies (map first undevirt))}]
     (swap! fixpoint-census conj entry)
+    (when (and (= label :final) (device/gpu-target? (:target-device opts)))
+      (when-let [binding
+                 (some (fn [value]
+                         (when (and (symbol? value)
+                                    (= :conditional
+                                       (get-in (meta value) [:raster.ad/residual :kind])))
+                           value))
+                       (tree-seq #(or (seq? %) (vector? %)) seq form))]
+        (throw (ex-info
+                "GPU compilation requires scalar replacement of the conditional AD residual; the selected branch tape is still a host vector"
+                {:reason :ad-conditional-residual-not-lowered
+                 :binding binding :target-device (:target-device opts)
+                 :source-form (get-in (meta binding) [:raster.ad/residual :source-form])}))))
     (when (and (= label :final)
                (device/gpu-target? (:target-device opts))
                (or (seq non-exempt) (seq undevirt)))

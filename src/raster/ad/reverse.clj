@@ -173,10 +173,9 @@
 ;; ================================================================
 ;; After normalization:
 ;; - The body is a single symbol
-;; - All if-expressions in binding inits have their branches
-;;   evaluated into separate bindings (both branches always evaluated)
-;; - A branch-flag binding stores the condition result
-;; - The if-binding selects via (if flag then-sym else-sym)
+;; - Conditional arms remain lexical regions; only the selected arm executes
+;; - A branch-flag binding stores a nontrivial condition result
+;; - Reverse records retain the selected arm's forward values, never replay its primal
 
 (def ^:private trivial-expr? anf/trivial-expr?)
 
@@ -266,7 +265,7 @@
   (if (seq? expr)
     (let [head (first expr)
           qualified-head (get numeric-op->qualified head head)]
-      (cons qualified-head (rest expr)))
+      (with-meta (cons qualified-head (rest expr)) (meta expr)))
     expr))
 
 (defn- free-syms-excluding
@@ -290,6 +289,8 @@
 (declare ^:private gen-reverse-par-map)
 (declare ^:private gen-reverse-par-reduce)
 (declare ^:private gen-reverse-par-scan)
+(declare ^:private let-gradient-pieces)
+(declare ^:private extract-let-parts)
 
 (defn- init-active?
   "Decide whether a binding init carries gradient (is active), given the current
@@ -305,13 +306,15 @@
     (let [head (first init-expr)]
       (cond
         ;; Comparison: returns a boolean, never active
-        (comparison-op? head) false
+        (or (comparison-op? (op/semantic-op init-expr))
+            (op/comparison-kind (op/semantic-op init-expr))) false
 
-        ;; If: active iff a branch symbol is active
+        ;; The predicate is discrete; activity comes from either lexical arm.
         (= 'if head)
         (let [[_ _test then else] init-expr]
-          (boolean (or (and (symbol? then) (get activity then false))
-                       (and (symbol? else) (get activity else false)))))
+          (boolean (some #(get activity % false)
+                         (set/union (util/free-syms then)
+                                    (util/free-syms else)))))
 
         ;; Par forms: active iff any free var in the body is active
         (= 'raster.par/map! head)
@@ -394,9 +397,34 @@
 (defmethod ad-record :alias [_ sym init-expr _activity]
   {:record {:type :alias :sym sym :source init-expr}})
 
-(defmethod ad-record :if [_ sym init-expr _activity]
-  (let [[_ branch-expr then-expr else-expr] init-expr]
-    {:record {:type :if :sym sym :branch branch-expr :then then-expr :else else-expr}}))
+(defmethod ad-record :if [_ sym init-expr activity]
+  (let [[_ branch then else] init-expr]
+    (if (every? trivial-expr? [then else])
+      {:record {:type :if :sym sym :branch branch :then then :else else}}
+      (let [free (set/union (util/free-syms then) (util/free-syms else))
+            params (vec (sort-by str (filter #(and (get activity %) (contains? free %))
+                                            (keys activity))))
+            dy (ad-gensym "branch_dy" (:raster.type/tag (meta sym)))
+            pieces (mapv (fn [arm]
+                           (let [[bindings body] (extract-let-parts (util/alpha-convert arm))]
+                             (let-gradient-pieces bindings body params dy)))
+                         [then else])
+            tape (vary-meta (ad-gensym "branch_tape") assoc
+                            :raster.ad/residual
+                            {:kind :conditional :representation :persistent-vector
+                             :source-form init-expr})
+            paired (mapv (fn [{:keys [fwd-bindings body-sym]}]
+                           (let [saved (ad-gensym "branch_saved")]
+                             (list 'let* (vec (concat fwd-bindings
+                                                     [saved (vec (take-nth 2 fwd-bindings))]))
+                                   [body-sym saved])))
+                         pieces)]
+        {:record {:type :if-region :sym sym :branch branch :params params
+                  :dy dy :tape tape :pieces pieces}
+         :fwd-patch (fn [bindings]
+                      (into (vec (drop-last 2 bindings))
+                            [tape (list 'if branch (first paired) (second paired))
+                             sym (list 'clojure.core/nth tape 0)]))}))))
 
 (defmethod ad-record :loop [_ sym _init-expr _activity]
   (throw (ex-info
@@ -735,6 +763,26 @@
                   (and else (symbol? else) (get activity else false))
                   (update else (fnil conj []) (list 'if branch @zero adj-sym)))]
     {:adj-env adj-env :rev-ctx rev-ctx}))
+
+(defmethod emit-backward :if-region
+  [{:keys [branch params dy tape pieces]} adj-sym _activity {:keys [adj-env rev-ctx]}]
+  (let [saved (ad-gensym "branch_saved")
+        arms (mapv (fn [{:keys [fwd-bindings rev-bindings param-adj-syms]}]
+                     (let [restore (mapcat (fn [index value]
+                                             [value (list 'clojure.core/nth saved index)])
+                                           (range) (take-nth 2 fwd-bindings))]
+                       (list 'let* (vec (concat restore [dy adj-sym] rev-bindings))
+                             (vec param-adj-syms))))
+                   pieces)
+        grads (ad-gensym "branch_grads")
+        rev-ctx (bindings-into rev-ctx
+                               [saved (list 'clojure.core/nth tape 1)
+                                grads (list 'if branch (first arms) (second arms))])]
+    {:rev-ctx rev-ctx
+     :adj-env (reduce (fn [env [index param]]
+                        (update env param (fnil conj [])
+                                (list 'clojure.core/nth grads index)))
+                      adj-env (map-indexed vector params))}))
 
 (defmethod emit-backward :alias
   [{:keys [source]} adj-sym activity {:keys [adj-env rev-ctx]}]
@@ -3836,8 +3884,8 @@
                      hoisted-args)]
       (if (seq (:bindings collected))
         (list 'let* (vec (:bindings collected))
-              (apply list f (:clean-args collected)))
-        (apply list f hoisted-args)))
+              (with-meta (apply list f (:clean-args collected)) (meta form)))
+        (with-meta (apply list f hoisted-args) (meta form))))
 
     :else form))
 
