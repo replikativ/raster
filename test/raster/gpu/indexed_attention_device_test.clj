@@ -215,32 +215,49 @@
     (device-probe/opencl-skip! "equation-first indexed reference")
     (run-equation-first-case :ocl:0)))
 
+(defn- synthetic-indexed-case
+  [edges total-dim]
+  (let [components (quot total-dim 2)
+        elements (* 3 total-dim)
+        values (fn [offset]
+                 (float-array
+                  (map (fn [i] (float (* 0.01 (- (mod (+ i offset) 17) 8))))
+                       (range elements))))
+        buffers {'Q (values 0) 'K (values 3) 'V (values 7)
+                 'dst (long-array (take edges [0 0 2 2]))
+                 'src (long-array (take edges [1 1 0 2]))}
+        shape-env {'n-nodes 3 'n-edges edges 'emb-dim total-dim
+                   'n-heads 2 'dk components}
+        plan (:plan (test-case))]
+    {:buffers buffers :shape-env shape-env :plan plan
+     :arguments (into (mapv buffers '[Q K V dst src]) [3 edges total-dim 2])
+     :expected (reference/evaluate plan {:buffers buffers :scalars shape-env})}))
+
 (defn- run-equation-first-dispatch-case
   [device-id]
   (let [compilation
         (equation-first/compile
          #'resident-indexed-attention-probe
          {:target device-id :dtype :float
-          :schedule {:segmented-weighted-reduction {:strategy :dispatch-reassociated}}})
-        {:keys [plan shape-env buffers]} (test-case)]
-    (doseq [edges [4 0]]
-      (let [buffers (assoc buffers
-                           'dst (long-array (take edges (get buffers 'dst)))
-                           'src (long-array (take edges (get buffers 'src))))
-            expected (reference/evaluate
-                      plan {:buffers buffers :scalars (assoc shape-env 'n-edges edges)})
-            arguments (into (mapv buffers '[Q K V dst src]) [3 edges 5 2])
+          :schedule {:segmented-weighted-reduction {:strategy :dispatch-reassociated}}})]
+    (doseq [[edges total-dim] [[4 5] [0 5] [4 515] [0 515]]]
+      (let [{:keys [arguments expected]} (synthetic-indexed-case edges total-dim)
             linked (equation-first/lower compilation arguments)
             selected (-> linked :instances first :call :steps last :graph)
             executable (link/instantiate! linked)]
         (try
-          (is (= :indexed-segmented-reduction-reference
+          (is (= (if (< (quot total-dim 2) 256)
+                   :indexed-segmented-reduction-reference
+                   :indexed-segmented-reduction-subgroup-score-reuse)
                  (get-in selected [:attributes :strategy])))
           (link/run! executable)
           (let [actual (vec (link/download executable (first (:outputs linked))))]
+            (is (= (count expected) (count actual)))
             (is (every? true?
                         (map #(< (Math/abs (- (double %1) (double %2))) 2.0e-5)
-                             expected actual))))
+                             expected actual)))
+            (is (every? zero? (map actual
+                                   (map #(+ (* % total-dim) (dec total-dim)) (range 3))))))
           (finally (link/close! executable)))))))
 
 (deftest equation-first-certified-dispatch-replays-on-opencl
@@ -251,39 +268,22 @@
       (run-equation-first-dispatch-case :ocl:0)
       (device-probe/opencl-skip! "equation-first certified dispatch" :intel-subgroups))))
 
+(deftest equation-first-certified-dispatch-replays-on-level-zero
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "equation-first certified dispatch on Level Zero")
+    (run-equation-first-dispatch-case :ze:0)))
+
 (defn- production-case
   [descriptor total-dim]
-  (let [entities 3
-        edges 4
-        heads 2
-        components (quot total-dim heads)
-        elements (* entities total-dim)
-        values (fn [offset]
-                 (float-array
-                  (map (fn [i]
-                         (float (* 0.01 (- (mod (+ i offset) 17) 8))))
-                       (range elements))))
-        q (values 0)
-        k (values 3)
-        v (values 7)
-        dst (long-array [0 0 2 2])
-        src (long-array [1 1 0 2])
-        args [q k v dst src entities edges total-dim heads]
-        shape-env {'n-nodes entities 'n-edges edges 'emb-dim total-dim
-                   'n-heads heads 'dk components}
-        plan (first (recognize/recognize (chain) :dtype :float
-                                         :accumulator-dtype :float))
-        expected (reference/evaluate
-                  plan {:buffers {'Q q 'K k 'V v 'dst dst 'src src}
-                        :scalars shape-env})]
+  (let [{:keys [arguments expected]} (synthetic-indexed-case 4 total-dim)]
     (gpu/with-gpu-session [session :ocl:0]
       (let [lowering (resident-plan/lower
                       {:id (random-uuid) :target :ocl:0 :descriptor descriptor
-                       :arguments args :outputs [(:result-sym descriptor)]})
+                       :arguments arguments :outputs [(:result-sym descriptor)]})
             executable (link/instantiate! (:plan lowering) {:session session})
             result-node (get-in lowering [:certificate :bindings (:result-sym descriptor)])]
         (try
-          (let [binding (link/dispatch-arguments executable args)
+          (let [binding (link/dispatch-arguments executable arguments)
                 selected (-> (kdispatch/select-alternative
                               (:dispatch binding) (:arguments binding))
                              :attributes :strategy)

@@ -35,8 +35,8 @@
     (equation-dispatch/candidates operation)
     :else []))
 
-(defn emitted-boundary?
-  [equation algorithm]
+(defn- emitted-boundary-with-candidates?
+  [equation algorithm candidates-for]
   (cond
     (control/loop-program? algorithm)
     (and (= 1 (count (:operations equation)))
@@ -51,7 +51,7 @@
       (and (= 1 (count (:operations equation)))
            (let [operation (first (:operations equation))]
              (and (emitted-equation/emitted-equation? operation)
-                  (let [emitted (emitted-equation/validate! operation)
+                  (let [emitted (first (candidates-for operation))
                         refinement (:refinement emitted)
                         compound? (seq (get-in equation
                                                [:attributes :emitted-source-equations]))
@@ -72,7 +72,7 @@
     (swr/plan? algorithm)
     (and (= 1 (count (:operations equation)))
          (let [operation (first (:operations equation))
-               candidates (equation-candidates operation)]
+               candidates (candidates-for operation)]
            (and (seq candidates)
                 (every? (fn [emitted]
                           (and (= algorithm (:algorithm emitted))
@@ -81,6 +81,11 @@
                         candidates))))
 
     :else false))
+
+(defn emitted-boundary?
+  "Independently validate an emitted equation's semantic boundary."
+  [equation algorithm]
+  (emitted-boundary-with-candidates? equation algorithm equation-candidates))
 
 (defn- scheduled-equation-view
   "The outer equation contract before target emission replaces its operation sequence."
@@ -94,13 +99,13 @@
    extent may also use a preceding host scalar.  This outer check prevents an isolated body from
    substituting a different (though locally valid) prefix: its host equations, terminal numerical
    equation, inferred inputs, outputs, and effects must be the exact slice of this program."
-  [parallel-program]
+  [parallel-program candidates-for]
   (loop [host-prefix [] remaining (:equations parallel-program)]
     (when-let [equation (first remaining)]
       (if (true? (get-in equation [:attributes :host-only]))
         (recur (conj host-prefix equation) (next remaining))
         (let [operation (first (:operations equation))]
-          (doseq [candidate (equation-candidates operation)]
+          (doseq [candidate (candidates-for operation)]
             (let [body (:body candidate)
                   body-equations (:equations body)
                   actual-prefix (filterv #(true? (get-in % [:attributes :host-only]))
@@ -155,17 +160,31 @@
                      :dialect (:dialect parallel-program)
                      :supported (set (keys dialect-targets))
                      :ir :emitted-parallel-program})))
-  (let [parallel-program
-        (program/validate! parallel-program emitted-operation? emitted-boundary?)
+  (let [candidate-cache (java.util.IdentityHashMap.)
+        candidates-for (fn [operation]
+                         ;; A validation invocation checks an immutable operation repeatedly:
+                         ;; semantic boundary, enclosing host prefix, and target membership.
+                         ;; Reuse only this exact object's checked candidates within this call;
+                         ;; no certificate or cached result escapes to a later invocation.
+                         (if (.containsKey candidate-cache operation)
+                           (.get candidate-cache operation)
+                           (let [candidates (equation-candidates operation)]
+                             (.put candidate-cache operation candidates)
+                             candidates)))
+        parallel-program
+        (program/validate! parallel-program emitted-operation?
+                           (fn [equation algorithm]
+                             (emitted-boundary-with-candidates?
+                              equation algorithm candidates-for)))
         expected-target (get dialect-targets (:dialect parallel-program))
-        _ (validate-host-prefix-slices! parallel-program)
+        _ (validate-host-prefix-slices! parallel-program candidates-for)
         artifacts
         (vec
         (for [equation (:equations parallel-program)
                operation (:operations equation)
                kernel-graph (if (emitted-loop/emitted-loop? operation)
                               [(:graph operation)]
-                              (mapv :graph (equation-candidates operation)))
+                              (mapv :graph (candidates-for operation)))
                node (:nodes kernel-graph)]
            (artifact/validate! (:operation node))))
         mismatches (filterv #(not= expected-target (:target %)) artifacts)]

@@ -157,3 +157,22 @@ rederivation before granting complete-write initialization. Public compile/lower
 passed both replays of both edge counts on OpenCL and Level Zero (36 assertions), and serialized
 artifact roundtrips preserve the selected schedule. `:auto` still selects reference; automatic
 dispatch/tuning and paged-storage equation coverage remain open.
+
+The September 29 follow-up exercises the public certified reassociation dispatch at both sides
+of its component-width crossover on OpenCL and Level Zero. The same compiled program binds
+5-wide and 515-wide inputs, including zero-edge cases, against the independent plan oracle;
+the narrow call selects exact reference and the wide call selects subgroup score reuse. The
+public `Compiled` equation-first path also executes the existing windowed prefill-softmax source
+on both local backends and agrees with its JVM result. These are route/correctness gates, not a
+claim that pretrained-rstr's routed paged-storage graph has migrated to equation-first or that
+either attention schedule is fastest for a production decoder.
+
+The [September 29 Q4_K probe](../bench/results/q4-public-arc-20260929.edn) preserves raw
+float-bit ggml parity through public compilation and warm resident replay. Its four-round
+generated series is nonstationary, so it is not a tuning decision. A true compiler-template
+hit still spent about 25 s in LinkPlan construction and 9 s in invocation certification.
+Instrumentation identified repeated emitted-candidate validation inside each program check;
+the validator now shares checked candidates only within one exact-object validation call.
+Subsequent shared-laptop phase probes ranged widely, including a 4.4 s program-validation
+subphase versus 16.5 s before the change, but are not controlled A/B evidence of a latency
+improvement. Remaining whole-call/certificate validation must be measured separately.
