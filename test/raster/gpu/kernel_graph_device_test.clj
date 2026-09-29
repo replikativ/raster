@@ -101,8 +101,14 @@
       (gpu/prepare! sess :double {"values" :values "scratch" :scratch} [] n)
       (let [handle (gpu/bind-kernel-graph!
                     sess :scan (emitted-graph) {'values :scratch 'out :out}
-                    {'n {:type :int :value n}})]
+                    {'n {:type :int :value n}} {:record? false})]
         (try
+          (is (nil? (get-in @sess [:kernel-graphs :scan :runtime-graph])))
+          (is (= :gpu-graph-not-recorded
+                 (try (gpu/submit-kernel-graph! sess handle)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error
+                        (:reason (ex-data error))))))
           (gpu/record-bound-sequence!
            sess [{:kind :phase :phase :double}
                  {:kind :graph :handle handle}]

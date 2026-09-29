@@ -285,7 +285,8 @@
                                             (gpu/bind-kernel-graph!
                                              session [::program-graph execution-id key] graph
                                              resident-buffers (merge extent-scalars scalars)
-                                             {:profile? profile?})))
+                                             {:profile? profile?
+                                              :record? (not static-programs?)})))
                                  :run! #(gpu/run-kernel-graph! session %)
                                  :release! #(gpu/release-kernel-graph! session %)}]
                    (if (and (not mixed?) (= 1 (count program-instances))
