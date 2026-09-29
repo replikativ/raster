@@ -214,3 +214,13 @@ hardware-free equation-first route emits one KernelBody without fallback. On loc
 two activation rows by 257 output channels match both the resident route and ggml's ordered dot
 reference raw float bits. This is a small generated-head arithmetic gate, not a complete pretrained
 head or real-vocabulary latency measurement.
+
+A later warm, preparation-only Q4_K diagnostic at `[1,1024,640]` on the shared laptop reported
+12.45 s for a true process-template hit after final-boundary validation moved into construction;
+the certificate wrap itself was about 0.04 ms. This is not a controlled speedup comparison to
+the earlier ~20 s samples. Narrow instrumentation attributed about 6.18 s to
+`EmittedParallelProgramCall/make` and 2.35 s to the final LinkPlan proof. One exact emitted
+equation call was rechecked inside its own constructor; the follow-up now retains only that
+constructor-local object identity while leaving public call validation and LinkPlan validation
+independent. That is one fewer complete step validation, not a persistent cache or a new tuning
+decision. The remaining construction cost still matters for adaptive/JIT workloads.
