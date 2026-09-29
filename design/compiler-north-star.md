@@ -456,8 +456,9 @@ those emitted graphs and descriptor instances flatten their already-bound kernel
 recorded replay graph, with source-order and profiling attribution. Without a whole-plan
 dependency certificate, mixed recording keeps descriptor constant transforms in replay order
 instead of hoisting them across emitted graphs. Structured emitted loops retain their bounded
-runner and fail before allocation when mixed with descriptors; recording a whole emitted-only
-straight-line program as one graph is the remaining replay consolidation. This is a local
+runner and fail before allocation when mixed with descriptors. Emitted-only straight-line
+programs likewise record one whole-program graph; only structured control keeps the bounded
+per-graph runner. This is a local
 composition boundary, not an attention-specific ABI. A graph ABI write proves an access, not
 full output coverage; no private storage reuse is justified from that permission alone.
 Instantiation allocates internal nodes once and returns an owned executable
