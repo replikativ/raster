@@ -7,6 +7,7 @@
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.core :as gpu]
             [raster.hardware-fixture :as hardware-fixture]
             [raster.runtime.hardware :as hardware]))
 
@@ -114,3 +115,16 @@
         (is (= :double (get-in default [:in-tree 0 :dtype])))
         (is (= :float (get-in mixed [:in-tree 0 :dtype])))))
     (finally (compiled/clear-compilation-cache!))))
+
+(deftest session-kernel-cache-does-not-cross-storage-policies
+  (let [session (atom {:device-id target}) calls (atom [])]
+    (with-redefs-fn {#'gpu/compile-deftm-internal!
+                    (fn [_ _ opts]
+                      (swap! calls conj opts)
+                      {:kernels [] :dispatches []})}
+      #(do
+         (gpu/compile! session :default #'storage/mixed-storage! {:dtype :double})
+         (gpu/compile! session :preserved #'storage/mixed-storage! (assoc policy :dtype :double))
+         (gpu/compile! session :again #'storage/mixed-storage! (assoc policy :dtype :double))
+         (is (= 2 (count @calls)))
+         (is (= [nil true] (mapv :preserve-declared-array-storage? @calls)))))))
