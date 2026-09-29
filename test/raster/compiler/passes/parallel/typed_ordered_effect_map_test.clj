@@ -12,6 +12,7 @@
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.compiler.passes.parallel.city-workload-fixture :as city]
             [raster.core]
             [raster.arrays]
             [raster.abm.firms.phases :as firms-phases]
@@ -896,3 +897,15 @@
                  :scalar-types {'rows :long 'feat :long})
                 nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest unchecked-int-effect-loop-step-needs-a-proved-int-bound
+  (let [source (-> #'city/episode-splitmix-histogram!
+                   (raster.core/resolve-deftm-var :double)
+                   raster.core/ensure-walked-body!
+                   first (nth 3) last)
+        error (try (#'frontend/counted-store-loop source 'i) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+    (is (= :unchecked-int-induction-unbounded (:reason (ex-data error))))
+    (is (= 'e (:index (ex-data error))))
+    (is (= '(clojure.core/long len) (:bound (ex-data error))))
+    (is (frontend/source-decline? error))))
