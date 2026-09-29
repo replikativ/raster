@@ -1,0 +1,27 @@
+{:kind :public-q4-k-schedule-comparison
+ :protocol "bench/comparison/generated-kernel-protocol.md"
+ :compiler-revision "b1e083ca"
+ :environment-tag "Arc-shared-2026-09-29"
+ :target :ze:0
+ :shape [1 1024 640]
+ :precision {:weights :q4_K :activation :q8_K :output :float}
+ :validation {:oracle :raster.quant.ggml/vec-dot
+              :comparison :raw-float-bits
+              :every-replay? true :output-reset :nan :passed? true}
+ :scope {:public-compiled-lifecycle? true :timing-source :device-event
+         :cache-state :warm-resident :transfers-included? false
+         :validation-included? false :shared-laptop? true :promotion? false
+         :rounds 12 :warmup-rounds 4}
+ :candidate-order [:generated-product :serial-source]
+ :order :rotating-round-robin
+ :sample-unit :microseconds-rounded-to-three-decimals
+ :samples-us
+ {:generated-product [92.292 92.917 37.604 79.479 46.042 69.271
+                      47.083 65.729 44.063 37.500 37.083 36.563]
+  :serial-source [266.667 267.188 101.771 101.875 133.854 100.000
+                  135.625 136.458 99.271 100.833 102.188 99.792]}
+ :stationary? {:generated-product false :serial-source false}
+ :host-ms {:generated-prepare 14046.534 :generated-bind 2320.039
+           :serial-prepare 60791.684 :serial-bind 113.564}
+ :interpretation
+ "Both candidate device-event series change speed state under shared-laptop load. Every replay passed the bit-exact oracle, but these timings cannot promote a schedule, establish a reliable speedup, or support an external-performance claim. The prepared inputs are already Q8_K; this does not time activation quantization or the full decoder."}
