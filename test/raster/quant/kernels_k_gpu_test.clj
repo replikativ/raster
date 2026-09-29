@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.quant.kernels-k :as qk]
             [raster.dl.nn :as nn]
+            [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.attention :as attn]
             [raster.dl.attention-reference :as attention-reference]
             [raster.compiler.backend.cpu.quant :as q]
@@ -15,6 +16,7 @@
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.descriptor-fixture :as fixture]
+            [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
 
 (defn- pack-i8 ^ints [^bytes b]
@@ -348,6 +350,73 @@
           (gpu/replay! sess)
           (is (< (maxerr yref (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
+
+(deftest public-q8k-quantization-and-q4k-projection-compose-resident
+  (doseq [target [:ze:0 :ocl:0]]
+    (if-not (case target
+              :ze:0 @gp/gpu-available?
+              :ocl:0 @opencl/opencl-subgroups-available?)
+      (case target
+        :ze:0 (gp/gpu-skip! "public Q8_K→Q4_K composition on Level Zero")
+        :ocl:0 (opencl/opencl-skip! "public Q8_K→Q4_K composition on OpenCL" :subgroups))
+      (let [nrows 2 width 640 padded-in 768 out 7
+            x (gen (* nrows width) 210)
+            weights (gen (* out padded-in) 211)
+            {:keys [wq da db aq bq]} (q/quantize-weight-q4k weights q/q4-K)
+            wp (bytes->ints-le wq)
+            xp (int-array (* nrows (quot padded-in 4)))
+            xs (float-array (* nrows (quot padded-in 256)))
+            bsums (int-array (* nrows (quot padded-in 32)))
+            y (float-array (* nrows out))
+            expected (float-array (* nrows out))
+            _ (dotimes [row nrows]
+                (let [padded (float-array padded-in)
+                      row-output (float-array out)]
+                  (System/arraycopy x (* row width) padded 0 width)
+                  (let [{:keys [xq xs bsums]} (q/quantize-act-q8k padded padded-in q/q4-K)]
+                    (qk/qmatmul-q4k-composable!
+                     xq xs bsums wq da db aq bq row-output padded-in out 0 out))
+                  (System/arraycopy row-output 0 expected (* row out) out)))
+            opts {:compiler :equation-first :target target :dtype :float}
+            quant (compiled/lower
+                   #'qk/quant-act-q8k-cooperative-padded-rows-gpu!
+                   [x xp xs bsums (long width) (long padded-in) (long nrows)]
+                   (assoc opts :outputs '[xp xs bsums]
+                          :roles '{xp :output xs :output bsums :output}))
+            project (compiled/lower
+                     #'qk/qmatmul-q4k-product-rows!
+                     [xp xs bsums wp da db aq bq y
+                      (long padded-in) (long out) (long nrows)]
+                     (assoc opts :outputs '[y] :roles '{y :output}
+                            :constants '[wp da db aq bq]))
+            prepared (compiled/compose
+                      {:id :public-q8k-q4k-projection
+                       :components [{:id :quant :program quant}
+                                    {:id :project :program project}]
+                       :connections [{:from [:quant :xp] :to [:project :xp]}
+                                     {:from [:quant :xs] :to [:project :xs]}
+                                     {:from [:quant :bsums] :to [:project :bsums]}]
+                       :outputs [{:key :y :from [:project :y]}]})
+            plan (compiled/plan prepared)
+            mapping (get-in prepared [:lowering :certificate :node-mapping])]
+        (is (= 2 (count (:instances plan))))
+        (is (= [[:quant :x]]
+               (mapv :key (filter #(= :input (:role %)) (:in-tree prepared)))))
+        (doseq [key [:xp :xs :bsums]
+                :let [producer (get mapping [:quant
+                                             (:node (first (filter #(= key (:key %))
+                                                                   (:out-tree quant))))])
+                      consumer (get mapping [:project
+                                             (:node (first (filter #(= key (:key %))
+                                                                   (:in-tree project))))])]]
+          (is (= producer consumer) (str key " has one resident allocation"))
+          (is (nil? (get-in plan [:nodes producer :source]))
+              (str key " is not re-uploaded between programs")))
+        (let [artifact (compiled/instantiate! prepared)]
+          (try
+            (let [result (artifact {[:quant :x] x})]
+              (is (< (maxerr expected (value/->host (:y result))) 1e-3)))
+            (finally (compiled/close! artifact))))))))
 
 (deftest q4k-public-abi-product-runs-as-one-cooperative-compiled-kernel
   (when (gpu-available?)

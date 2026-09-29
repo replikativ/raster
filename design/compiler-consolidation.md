@@ -45,6 +45,13 @@ inventing an incompatible result buffer.
    source. OpenCL CPU execution matches the JVM across four window shapes; local Level Zero
    execution remains unverified because its driver probe fails in this sandbox. New corpus
    compilation errors fail the ratchet instead of being invisible until a baseline refresh.
+
+   The public Q8_K cooperative padded-row quantizer and Q4_K product projection now have a
+   composed B=2, width-640/padded-768 execution oracle on local Level Zero and OpenCL. The
+   three packed activation leaves are connected as resident LinkPlan nodes with no host
+   source or inter-program transfer; packed weights and metadata remain shared constants.
+   This proves one generated quantized projection chain and CPU-reference numerical parity,
+   not the full Gemma decoder, its scheduling quality, or a performance win.
 4. **Local consolidation gate.** Publish a support/evidence matrix, retire covered duplicate
    paths, and record reproducible correctness, compilation, allocation, transfer and execution
    baselines on both local backends. Retain city irregular kernels, one PDE/stencil and a
