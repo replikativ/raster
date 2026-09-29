@@ -229,25 +229,27 @@
 (deftest nested-seeded-episode-draw-is-correct-or-explicitly-declined
   ;; City probe P20f still has no TypedSOAC schedule. Keep its complete source shape as a
   ;; differential oracle: future admission must match the JVM, never silently drop the draw.
-  (if-not @probe/gpu-available?
-    (probe/gpu-skip! "nested seeded episode draw")
-    (let [n 8 len 4 seed 42
-          locations (int-array [0 2 2 1, 2 0 1 2, 0 0 2 2, 2 2 2 0,
-                                1 2 0 1, 0 2 1 2, 2 1 2 0, 0 2 2 2])
-          expected (int-array 8)
-          _ (city/episode-splitmix-histogram! locations expected n len seed)]
-      (try
+  (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "nested seeded episode draw on " device))
+      (let [n 8 len 4 seed 42
+            locations (int-array [0 2 2 1, 2 0 1 2, 0 0 2 2, 2 2 2 0,
+                                  1 2 0 1, 0 2 1 2, 2 1 2 0, 0 2 2 2])
+            expected (int-array 8)
+            _ (city/episode-splitmix-histogram! locations expected n len seed)]
+        (try
         (let [actual (run-device :episode-splitmix-histogram
                                  #'city/episode-splitmix-histogram!
                                  {:locations [:int (* n len) locations]
                                   :counts [:int 8 (int-array 8)]}
-                                 {"n" n "len" len "seed" seed} n [:counts])]
-          (is (= (vec expected) (:counts actual))))
-        (catch clojure.lang.ExceptionInfo e
+                                 {"n" n "len" len "seed" seed} n [:counts] device)]
+          (is (= (vec expected) (:counts actual)) (str device " vs JVM")))
+          (catch clojure.lang.ExceptionInfo e
           (is (= :unscheduled-effect-map (:reason (ex-data e)))
               "only the known fail-closed scheduling gap is permitted")
           (is (= :no-lowering-rule
-                 (get-in (ex-data e) [:scheduling :segops-declined 0 :reason]))))))))
+                 (get-in (ex-data e) [:scheduling :segops-declined 0 :reason])))))))))
 
 (deftest plain-diary-store-before-choice-loop-matches-jvm
   (if-not @probe/gpu-available?
