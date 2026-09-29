@@ -1,6 +1,9 @@
 (ns raster.gpu.parallel-program-sequence-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.structured-loop-call :as loop-call]
+            [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]))
 
@@ -23,6 +26,9 @@
                     [{:id :first :call {:id :a}}
                      {:id :second :call {:id :b}}] {}))]
     (try
+      (is (= [{:instance :first :step 0 :handle :a}
+              {:instance :second :step 0 :handle :b}]
+             (program/straight-line-handles prepared)))
       (is (= {:first {:a :a} :second {:b :b}}
              (program/run-prepared! prepared)))
       (is (= [[:run :a] [:run :b]] @events))
@@ -83,6 +89,9 @@
                      {:id :program :call {:id :after}}]
                     executor))]
     (try
+      (is (= [{:instance :graph :step nil :handle :graph}
+              {:instance :program :step 0 :handle :after}]
+             (program/straight-line-handles prepared)))
       (is (= {:graph {:y :output} :program {:after :after}}
              (program/run-prepared! prepared)))
       (is (= [[:bind :graph] [:run :graph] [:run :after]] @events))
@@ -135,3 +144,34 @@
     (is (= [[:run :a]] @events))
     (is (false? @(:output-ready? executable)))
     (is (zero? @(:completed-replays executable)))))
+
+(deftest dynamic-mixed-order-declines-before-session-creation
+  (let [plan {:instances [(link-plan/map->LinkInstance {:id :descriptor})
+                          (link-plan/map->ProgramLinkInstance
+                           {:id :dynamic
+                            :call {:steps [(loop-call/map->StructuredLoopCall {})]}})]}
+        sessions (atom 0)]
+    (with-redefs [link-plan/validate-with-effect-evidence!
+                  (fn [_] {:plan plan :effect-evidence {:initialization {}}})
+                  gpu/make-session (fn [& _] (swap! sessions inc))]
+      (is (= :link-runtime-dynamic-mixed-order
+             (try (link/instantiate! plan)
+                  (catch clojure.lang.ExceptionInfo error
+                    (:reason (ex-data error))))))
+      (is (zero? @sessions)))))
+
+(deftest recorded-mixed-executable-replays-only-the-composite-graph
+  (let [runs (atom [])
+        prepared (stub-program :program runs)
+        executable (link/map->LinkedExecutable
+                    {:plan {:id :mixed} :session :session :graph-key :composite
+                     :prepared-program prepared :pending-inputs (atom #{})
+                     :output-ready? (atom false) :completed-replays (atom 0)
+                     :output-leases (atom 0) :closed? (atom false)
+                     :lifetime-lock (Object.)})]
+    (with-redefs [gpu/replay! (fn [_ key] (swap! runs conj [:replay key]))
+                  link/outputs (fn [_] {})]
+      (is (= {} (link/run! executable)))
+      (is (= [[:replay :composite]] @runs))
+      (is (= 1 @(:completed-replays executable)))
+      (is (true? @(:output-ready? executable))))))

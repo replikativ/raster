@@ -4,6 +4,7 @@
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.pipeline :as pipeline]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
@@ -106,6 +107,60 @@
   (if @gp/gpu-available?
     (run-mixed-graph-case :ze:0)
     (gp/gpu-skip! "program and direct graph composition on Level Zero")))
+
+(defn- run-descriptor-and-graph-case [target]
+  (let [{:keys [prepared first second]} (compose-case target)
+        original (compiled/plan prepared)
+        first-instance (clojure.core/first (:instances original))
+        second-instance (clojure.core/second (:instances original))
+        descriptor (pipeline/compile-gpu-program #'twice! target
+                                                 :dtype :float :on-non-resident :nil)
+        pointers (link-plan/descriptor-pointer-symbols descriptor)
+        descriptor-instance
+        (link-plan/instance
+         {:id (:id first-instance) :descriptor descriptor
+          :bindings (select-keys (get-in first-instance [:call :buffers]) pointers)
+          :scalars {'n 4}})
+        step (clojure.core/first (get-in second-instance [:call :steps]))
+        graph (:graph step)
+        external (set (map :id (concat (:inputs graph) (:outputs graph))))
+        graph-instance
+        (link-plan/graph-instance
+         {:id (:id second-instance) :graph graph
+          :bindings (select-keys (:buffers step) external)
+          :scalar-values (merge (get-in second-instance [:call :scalar-values])
+                                (:scalar-values step))})
+        plan (link-plan/make
+              (assoc original :instances [descriptor-instance graph-instance]))
+        mapping (get-in prepared [:lowering :certificate :node-mapping])
+        input (get mapping [:first (get-in first [:in-tree 0 :node])])
+        output (get mapping [:second (get-in second [:out-tree 0 :node])])
+        executable (link/instantiate! plan {:profile? true})]
+    (try
+      (is (some? (:graph-key executable)) "mixed LinkPlan records one replay graph")
+      (is (some? (:prepared-program executable)))
+      (is (= 2 (count (link/execution-info executable))))
+      (is (= [{:instance (:id descriptor-instance) :step 0}
+              {:instance (:id graph-instance)}]
+             (mapv :source (:per-replay (link/execution-order executable)))))
+      (doseq [values [[1.0 2.0 3.0 4.0] [5.0 6.0 7.0 8.0]]]
+        (link/upload! executable input (float-array values))
+        (link/run! executable)
+        (is (= (mapv #(* 4.0 %) values)
+               (vec (link/download executable output)))))
+      (is (= (mapv :source (:per-replay (link/execution-order executable)))
+             (mapv :source (:profile (link/profile! executable)))))
+      (finally (link/close! executable)))))
+
+(deftest opencl-descriptor-and-direct-graph-one-linked-replay
+  (if @opencl/opencl-available?
+    (run-descriptor-and-graph-case :ocl:0)
+    (opencl/opencl-skip! "descriptor and direct graph linked replay")))
+
+(deftest level-zero-descriptor-and-direct-graph-one-linked-replay
+  (if @gp/gpu-available?
+    (run-descriptor-and-graph-case :ze:0)
+    (gp/gpu-skip! "descriptor and direct graph linked replay on Level Zero")))
 
 (deftest failed-second-bind-cleans-an-attached-session
   (if-not @opencl/opencl-available?

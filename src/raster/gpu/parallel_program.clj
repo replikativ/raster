@@ -35,6 +35,14 @@
   (and value (= "raster.gpu.parallel_program.PreparedParallelProgram"
                 (.getName (class value)))))
 
+(defn straight-line-call?
+  "Whether an emitted call has one statically ordered graph sequence. Host equations are
+   already evaluated by the call; structured loops require the separate bounded runner."
+  [call]
+  (every? #(or (program-call/evaluated-host-equation? %)
+               (program-call/emitted-equation-call? %))
+          (:steps call)))
+
 (defn- ensure-prepared!
   [prepared operation]
   (when-not (prepared-parallel-program? prepared)
@@ -228,6 +236,42 @@
                        :step-index step-index :iteration iteration})))
             (visit-key! key)))))
     (persistent! @results)))
+
+(defn straight-line-handles
+  "Return bound handles in exact source order without expanding structured control. Each entry
+   carries its program step, and a prepared sequence also carries its LinkPlan instance id.
+   Used only when a caller will record one command graph from the existing bound kernels."
+  [prepared]
+  (cond
+    (prepared-kernel-graph? prepared)
+    (do
+      (when @(:closed? prepared)
+        (throw (ex-info "prepared graph is closed"
+                        {:reason :parallel-program-closed :operation :straight-line-handles})))
+      [{:step nil :handle (:handle prepared)}])
+
+    (prepared-sequence? prepared)
+    (do
+      (when @(:closed? prepared)
+        (throw (ex-info "prepared sequence is closed"
+                        {:reason :parallel-program-closed :operation :straight-line-handles})))
+      (vec (mapcat (fn [{:keys [id program]}]
+                     (map #(assoc % :instance id) (straight-line-handles program)))
+                   (:instances prepared))))
+
+    :else
+    (do
+      (ensure-prepared! prepared :straight-line-handles)
+      (when-not (straight-line-call? (:call prepared))
+        (throw (ex-info "structured program has no static command-graph replay order"
+                        {:reason :parallel-program-dynamic-recording-order})))
+      (vec (keep-indexed
+            (fn [step-index step]
+              (when (program-call/emitted-equation-call? step)
+                {:step step-index
+                 :handle (get (:handles prepared)
+                              (get-in prepared [:plan :step-keys step-index]))}))
+            (get-in prepared [:call :steps]))))))
 
 (defn run-prepared!
   "Replay a prepared program and return its resident output bindings.
