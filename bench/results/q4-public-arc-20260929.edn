@@ -1,0 +1,43 @@
+{:kind :public-q4-k-schedule-comparison
+ :protocol "bench/comparison/generated-kernel-protocol.md"
+ :compiler-revision "ab8cfa97+dispatch-test"
+ :environment-tag "Arc-shared-2026-09-29-driver-2026.20.3.0.19"
+ :target :ze:0
+ :shape [1 1024 640]
+ :precision {:weights :q4_K :activation :q8_K :output :float}
+ :validation {:oracle :raster.quant.ggml/vec-dot
+              :comparison :raw-float-bits
+              :every-replay? true
+              :passed? true}
+ :scope {:public-compiled-lifecycle? true
+         :timing-source :device-event
+         :cache-state :warm-resident
+         :transfers-included? false
+         :validation-included? false
+         :rounds 4
+         :warmup-rounds 2
+         :shared-laptop? true
+         :promotion? false}
+ :samples-ns {:generated-product [40729.1667 36354.1667 35520.8333 36666.6667]
+              :serial-source [100520.8333 100937.5 100000.0 99687.5]}
+ :stationary? {:generated-product false :serial-source true}
+ :host-phases-ms
+ {:generated-product {:prepare 42379.172 :bind 3486.235
+                      :invocation-materialization 41.076
+                      :link-plan-construction 22717.015
+                      :invocation-certification 7084.360}
+  :serial-source {:prepare 48740.801 :bind 36.369}}
+ :warm-preparation
+ {:first-after-unrelated-namespace-reload
+  {:template-cache-hit? false :miss-reason :invalidation
+   :wall-ms 36119.781 :link-plan-construction-ms 21914.918
+   :invocation-certification-ms 6970.682}
+  :immediate-repeat
+  {:template-cache-hit? true :wall-ms 34105.556
+   :invocation-materialization-ms 3.108
+   :link-plan-construction-ms 25308.878
+   :invocation-certification-ms 8791.075}}
+ :notes ["Both candidates were cold template-cache misses."
+         "One generated KernelBody stage versus one serial source stage."
+         "A true in-process template hit still rebuilt the specialized LinkPlan and certificate."
+         "This four-round shared-device diagnostic cannot promote a schedule or establish a speedup."]}
