@@ -373,6 +373,41 @@
     (is (empty? locals))
     (is (= 1 (count body-results)))))
 
+(deftest raw-result-cast-retains-its-recurrence-operand-precision
+  (let [acc (with-meta 'acc {:tag 'double :raster.type/tag 'double})
+        recurrence (list 'loop* ['i 0 acc 0.0]
+                         (list 'if '(< i n)
+                               (list 'recur '(inc i) (list '+ acc '(aget x i))) acc))]
+    (doseq [operand [recurrence '(raster.par/reduce acc 0.0 i n (+ acc (aget x i)))]]
+      (let [cast (list 'float operand)
+            result (#'frontend/canonicalize-scalar-folds cast :float)
+            nested (#'frontend/canonicalize-scalar-folds (list '+ 1.0 cast) :float)
+            folds (filter dialect/scalar-fold-form? (tree-seq coll? seq nested))]
+        (is (= 'float (first result)))
+        (is (dialect/scalar-fold-form? (second result)))
+        (is (= :double (get-in (dialect/scalar-fold-parts (second result)) [:attributes :dtype])))
+        (is (= [:double] (mapv #(get-in (dialect/scalar-fold-parts %) [:attributes :dtype]) folds)))))))
+
+(deftest raw-result-cast-does-not-widen-a-retained-float-carry
+  (let [acc (with-meta 'acc {:tag 'float :raster.type/tag 'float})
+        recurrence (list 'loop* ['i 0 acc 0.0]
+                         (list 'if '(< i n)
+                               (list 'recur '(inc i) (list '+ acc '(aget x i))) acc))
+        result (#'frontend/canonicalize-scalar-folds (list 'double recurrence) :double)]
+    (is (= 'double (first result)))
+    (is (dialect/scalar-fold-form? (second result)))
+    (is (= :float (get-in (dialect/scalar-fold-parts (second result)) [:attributes :dtype])))))
+
+(deftest lexical-functions-named-like-casts-remain-opaque
+  (let [acc (with-meta 'acc {:tag 'double :raster.type/tag 'double})
+        recurrence (list 'loop* ['i 0 acc 0.0]
+                         (list 'if '(< i n)
+                               (list 'recur '(inc i) (list '+ acc '(aget x i))) acc))]
+    (doseq [head '[float double]]
+      (let [expression (list head recurrence)]
+        (binding [util/*shadowing-locals* #{head}]
+          (is (= expression (#'frontend/canonicalize-scalar-folds expression :float))))))))
+
 (deftest canonical-result-conversion-canonicalizes-its-fold-at-the-source-dtype
   (let [attributes {:source-dtype :double :target-dtype :float
                     :rounding :nearest-even :overflow :ieee

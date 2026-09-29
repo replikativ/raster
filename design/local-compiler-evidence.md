@@ -17,6 +17,14 @@ numerical reassociation policy, or NVIDIA/AMD device evidence.
 
 ## Acceptance snapshot
 
+Raw source result casts now protect their operand recurrence's retained precision before
+canonical Fold construction, just as canonical conversion terms do. A Double recurrence stored
+as Float is not a Float fold, and a retained Float carry converted to Double is not widened.
+The row-local read/write integration oracle keeps each store in source order and preserves the
+parent tail over two resident replays, through both public compilers on OpenCL and Level Zero.
+Its first row starts at 16777216 with two unit contributions; an incorrectly Float-accumulated
+fold would lose them. No reassociation or new reduction schedule is enabled by this correction.
+
 This is a bounded acceptance snapshot, not a declaration that the compiler campaign is finished.
 The numerical workloads below use existing source programs and reference tests; no benchmark-only
 kernel implementation was substituted. OpenCL and Level Zero here both mean the same local Intel
