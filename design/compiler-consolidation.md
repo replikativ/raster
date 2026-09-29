@@ -71,6 +71,34 @@ inventing an incompatible result buffer.
    earlier if a concrete hardware question blocks the design. Compilation, execution and
    competitive performance are separate claims.
 
+### ASR resident-capture acceptance order
+
+Keep this inside item 3, not a replacement campaign or another attention ABI. The allocating
+`gqa-decode-attention-weights!` remains an explicit public resident decline. Its mandatory
+host oracles are separate from BLAS availability. The next implementation must:
+
+1. Retain physical score/output/sink storage precision independently of scalar computation
+   and normalization scratch precision. Use the shared declared-storage policy, including
+   source specialization and cache identities; do not reconstruct types in an emitter.
+2. Expose caller-owned output and scratch through ordinary public invocation/LinkPlan
+   contracts. Reuse the library's numerical stages rather than copying another target kernel.
+   Preserve score and exponential materialization, the sum's evaluation order, and the
+   inverse's precision. Reusing a normalized-probability buffer introduces another rounding
+   boundary and is not silently equivalent to the existing routine.
+3. Map independent sink positions in parallel and retain ordered, per-head typed sink stores
+   inside each work-item. The existing ordered effect-loop dialect can express this; neither
+   atomics nor a widened head sum followed by one store preserves Float rounding. A warm-REPL
+   prototype compiled through equation-first and executed on Level Zero preserves the
+   8388608 + three separately materialized thirds counterexample and an untouched sink tail.
+   This prototype is an investigation, not a landed resident attention implementation.
+4. Validate Float/Double, MHA/GQA, empty history, existing sink contents, untouched tails,
+   scratch ownership and repeated resident replay on both local backends against the host
+   oracle. Then migrate the external ASR consumer and measure preparation/execution separately.
+   Keep the debt-ledger decline until the public vertical actually passes those gates.
+
+AD consolidation and external training validation remain separate obligations. None of these
+inference-only checks establishes differentiability, general loop tapes, or higher-order AD.
+
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable
