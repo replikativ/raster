@@ -12,11 +12,13 @@
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as array-ops]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as device-probe]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.link :as link]
             [raster.gpu.tuning-cache :as cache]
+            [raster.gpu.value :as value]
             [raster.numeric])
   (:import [java.nio.file Files]))
 
@@ -272,6 +274,46 @@
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "equation-first certified dispatch on Level Zero")
     (run-equation-first-dispatch-case :ze:0)))
+
+(defn- run-public-compiled-dispatch-case
+  [device-id]
+  (doseq [[edges total-dim expected-strategy]
+          [[4 5 :indexed-segmented-reduction-reference]
+           [0 515 :indexed-segmented-reduction-subgroup-score-reuse]]]
+    (let [{:keys [arguments expected]} (synthetic-indexed-case edges total-dim)
+          prepared (compiled/lower
+                    #'resident-indexed-attention-probe arguments
+                    {:compiler :equation-first :target device-id :dtype :float
+                     :schedule {:segmented-weighted-reduction
+                                {:strategy :dispatch-reassociated}}})
+          selected (-> prepared :lowering :plan :instances first :call
+                       :steps last :graph :attributes :strategy)
+          artifact (compiled/instantiate! prepared)]
+      (try
+        (is (= expected-strategy selected))
+        (is (= [:result] (mapv :key (:out-tree prepared))))
+        (let [actual (vec (value/->host (:result (artifact {}))))]
+          (is (= (count expected) (count actual)))
+          (is (every? true?
+                      (map #(< (Math/abs (- (double %1) (double %2))) 2.0e-5)
+                           expected actual)))
+          (is (every? zero?
+                      (map actual
+                           (map #(+ (* % total-dim) (dec total-dim)) (range 3))))))
+        (finally (compiled/close! artifact))))))
+
+(deftest public-compiled-indexed-dispatch-replays-on-opencl
+  (if-not @device-probe/opencl-subgroups-available?
+    (device-probe/opencl-skip! "public Compiled indexed dispatch" :subgroups)
+    (if (= :supported (:status (capability/score-reuse (:plan (test-case))
+                                                        (hardware/descriptor-for :ocl:0))))
+      (run-public-compiled-dispatch-case :ocl:0)
+      (device-probe/opencl-skip! "public Compiled indexed dispatch" :intel-subgroups))))
+
+(deftest public-compiled-indexed-dispatch-replays-on-level-zero
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "public Compiled indexed dispatch on Level Zero")
+    (run-public-compiled-dispatch-case :ze:0)))
 
 (defn- production-case
   [descriptor total-dim]
