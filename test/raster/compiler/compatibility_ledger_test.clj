@@ -138,6 +138,17 @@
                  1 2 2 1 2])]
       (equation-first-signature compilation plan))
 
+    :asr-alignment-weights-gpu
+    (try
+      (equation-first/compile #'attention/gqa-decode-attention-weights!
+                              {:target target :dtype :float})
+      (throw (ex-info "ASR alignment admission changed; record its resident ownership evidence"
+                      {:workload id}))
+      (catch clojure.lang.ExceptionInfo exception
+        (if (= :equation-first-coverage (:reason (ex-data exception)))
+          {:declined {:reason :equation-first-coverage}}
+          (throw exception))))
+
     :prefix-sum-gpu
     (let [compilation (equation-first/compile
                        #'prefix-sum-gpu {:target target :dtype :float})
@@ -177,6 +188,7 @@
              :symbolic-dense-contraction-gpu
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu
+             :asr-alignment-weights-gpu
              :prefix-sum-gpu
              :heat-rhs-1d-jvm
              :heat-rhs-1d-gpu

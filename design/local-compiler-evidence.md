@@ -42,6 +42,19 @@ GPU implementation; a future migration should expose explicit scratch/output own
 test the weight-capture result against that external workload. New scalar or compatibility
 rows now require an intentional corpus-baseline update rather than entering silently.
 
+The September 30 public-entry probe confirms that both Float and Double requests for this
+alignment helper decline with `:equation-first-coverage` before executing sink effects. The
+compatibility-debt ledger now records that request explicitly. Its host numerical oracle has
+moved out of the BLAS-gated attention namespace: no BLAS or device is needed for bit-exact
+output parity, accumulated sink mass, preserved cache/query inputs, untouched sink tails and
+empty history. A large-magnitude Float counterexample pins per-head materialization: three
+separate `1/3` updates round away, while a single widened aggregate would add one. Resident
+capture must retain this ordered storage contract, not replace it with head atomics or an
+unqualified reassociation. The current floating kernel policy also specializes declared
+floating array storage; mixed-precision normalization scratch needs an explicit retained
+contract before being passed between kernels. These are migration obligations, not a landed
+resident alignment implementation or an external Moonshine model validation.
+
 The private host-result memory boundary projects order from already selected, validated equation
 graphs before allocating; it no longer binds a baseline executable. It still compares the actual
 bound order before launch and checks the owned allocation delta. This does not extend reuse to

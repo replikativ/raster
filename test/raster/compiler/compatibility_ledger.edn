@@ -89,6 +89,9 @@
               :emission-routes {:kernel-body 7}
               :kernel-body-declines {}}}
 
+  :asr-alignment-weights-gpu
+  {:declined {:reason :equation-first-coverage}}
+
   :prefix-sum-gpu
   {:route {:semantic-dialect :typed-parallel
            :scheduled-dialect :scheduled-parallel
