@@ -182,14 +182,20 @@
               {:var 'b :route :typed-soac :typed-validated true :declines []
                :emission-declines 1 :emission {:routes {:verified-segmap-opencl 1}
                                              :declines [{:reason :unsupported-loop}]}}
+              {:var 'policy :route :typed-soac :typed-validated true :declines []
+               :emission-declines 1 :emission {:routes {:kernel-body 1}
+                                              :declines [{:reason :schedule-family-disabled}]}}
               {:var 'c :route :error :error :unsupported}]]
     (with-redefs [coverage/corpus-vars (fn [_] rows)
                   coverage/report-var (fn [row _] row)]
       (let [report (coverage/corpus-report [] {:target-device :ocl:0})
             baseline (coverage/baseline-facts report)]
-        (is (= {:artifact-routes {:kernel-body 2 :verified-segmap-opencl 1}
-                :programs-with-declines 1} (:emission-summary report)))
-        (is (= {:total 3 :typed-soac 2 :error 1} (:summary report)))
+        (is (= {:artifact-routes {:kernel-body 3 :verified-segmap-opencl 1}
+                :programs-with-declines 2
+                :programs-with-lowering-declines 1
+                :decline-reasons {:unsupported-loop 1 :schedule-family-disabled 1}}
+               (:emission-summary report)))
+        (is (= {:total 4 :typed-soac 3 :error 1} (:summary report)))
         (is (not (contains? baseline :emission-summary)))
         (is (every? #(not-any? (set (keys %)) [:dtype :emission :emission-declines])
                     (:vars baseline)))

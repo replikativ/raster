@@ -122,10 +122,15 @@
             (assoc :admission-decline (:admission-decline (ex-data t)))))))))
 
 (defn corpus-report
-  "Route facts for every corpus var, with a summary by route."
+  "Route facts for every corpus var, with a summary by route. Candidate families
+   disabled by schedule policy remain visible in :decline-reasons but do not count
+   as actionable :programs-with-lowering-declines."
   ([opts] (corpus-report default-namespaces opts))
   ([namespaces opts]
-   (let [rows (mapv #(report-var % opts) (corpus-vars namespaces))]
+   (let [rows (mapv #(report-var % opts) (corpus-vars namespaces))
+         lowering-declines (fn [row]
+                             (remove #(= :schedule-family-disabled (:reason %))
+                                     (get-in row [:emission :declines])))]
      {:target-device (:target-device opts)
       :dtype (:dtype opts :float)
       :summary (merge {:total (count rows)}
@@ -133,7 +138,9 @@
       ;; Counts artifacts, including dispatch alternatives, not runtime launches or latency.
       :emission-summary
       {:artifact-routes (reduce #(merge-with + %1 (get-in %2 [:emission :routes] {})) {} rows)
-       :programs-with-declines (count (filter #(seq (get-in % [:emission :declines])) rows))}
+       :programs-with-declines (count (filter #(seq (get-in % [:emission :declines])) rows))
+       :programs-with-lowering-declines (count (filter #(seq (lowering-declines %)) rows))
+       :decline-reasons (frequencies (map :reason (mapcat #(get-in % [:emission :declines]) rows)))}
       :vars (vec (sort-by (comp str :var) rows))})))
 
 (def route-rank
