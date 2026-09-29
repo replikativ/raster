@@ -113,15 +113,15 @@
           [{:reason reason}]
           (throw exception))))))
 
-(defn validate-equation-call!
-  [call]
+(defn- validate-equation-call-against-boundary!
+  ;; Only synchronous callers below supply the exact boundary and physical-results projection
+  ;; just checked by emitted-equation/physical-results. No proof escapes into the call record.
+  [call emitted physical]
   (when-not (emitted-equation-call? call)
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
   (let [{equation :equation call-graph :graph buffers :buffers
          scalar-values :scalar-values outputs :outputs} call
         operation (first (:operations equation))
-        emitted (emitted-equation/validate!
-                 (equation-dispatch/boundary-equation operation))
         expected-graphs (if (equation-dispatch/emitted-equation-dispatch? operation)
                           (mapv :graph (equation-dispatch/candidates operation))
                           [(:graph emitted)])
@@ -155,18 +155,24 @@
       (fail! :emitted-program-equation-graph
              "emitted equation call graph is not a certified alternative"
              {:equation (:id equation)}))
-    (validate-result-views! equation (or (:result-views call) {}))
+    (validate-result-views! equation emitted physical (or (:result-views call) {}))
     call))
 
+(defn validate-equation-call!
+  [call]
+  (when-not (emitted-equation-call? call)
+    (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
+  (let [boundary (equation-dispatch/boundary-equation
+                  (first (:operations (:equation call))))
+        ;; This public projection independently validates the complete boundary before use.
+        physical (emitted-equation/physical-results boundary)]
+    (validate-equation-call-against-boundary! call boundary physical)))
+
 (defn- validate-result-views!
-  [equation result-views]
+  [equation boundary physical result-views]
   (when-not (map? result-views)
     (fail! :emitted-program-result-views "result views must be a map" {:result-views result-views}))
-  (let [emitted (first (:operations equation))
-        boundary (emitted-equation/validate!
-                  (equation-dispatch/boundary-equation emitted))
-        algorithm (:algorithm boundary)
-        physical (emitted-equation/physical-results boundary)]
+  (let [algorithm (:algorithm boundary)]
     (doseq [[result destination] result-views]
       (let [producer (when (soac/program-form? algorithm)
                        (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm)))]
@@ -182,11 +188,12 @@
 (defn- prepare-equation-call
   [equation values buffers scalars result-views]
   (let [operation (first (:operations equation))
-        emitted (emitted-equation/validate!
-                 (equation-dispatch/boundary-equation operation))
-        common-graph (:graph emitted)
+        emitted (equation-dispatch/boundary-equation operation)
+        ;; physical-results validates this exact boundary once for this preparation scope.
         result-storage (emitted-equation/physical-results emitted)
-        result-views (validate-result-views! equation (select-keys result-views (:results equation)))
+        common-graph (:graph emitted)
+        result-views (validate-result-views! equation emitted result-storage
+                                           (select-keys result-views (:results equation)))
         buffers
         (reduce
          (fn [bindings result]
@@ -234,10 +241,11 @@
                   #(preflight-violations % (:scalar-values bindings))))
                 common-graph)
         outputs (select-keys buffers (:results equation))]
-    {:call (validate-equation-call!
+    {:call (validate-equation-call-against-boundary!
             (assoc (->EmittedEquationCall equation graph (:buffers bindings)
                                          (:scalar-values bindings) outputs)
-                   :result-views result-views))
+                   :result-views result-views)
+            emitted result-storage)
      :buffers buffers}))
 
 (defn- evaluate-host-equations

@@ -251,3 +251,14 @@ final-boundary constructor; that constructor validates the projected instance on
 `program-instance` constructor and each fresh public LinkPlan validation still recheck the
 complete call. A C-family test counts this distinction. Instrumented preparation wall time on
 the shared laptop is not a controlled speedup or a kernel-performance measurement.
+
+The equation-preparation audit found another synchronous proof duplication: `physical-results`
+already validates its emitted boundary, but preparation, result-view checking and final step
+checking each rederived that same boundary again. Preparation now obtains the checked physical
+projection once and passes it with that exact immutable boundary to private call/result-view
+checks. No proof token or validation cache is stored on the resulting record. The focused staged
+contraction test counts two boundary validations during construction (the enclosing program and
+one equation preparation), with both empty and nonempty result views. A separate public step
+validation rederives the boundary once; changed artifacts and invalid result views remain rejected.
+This removes redundant host proof work without changing schedules, numerical order or device code;
+no preparation latency speedup is claimed from these validation-count tests.

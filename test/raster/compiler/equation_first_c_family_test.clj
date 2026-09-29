@@ -11,6 +11,7 @@
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
@@ -1040,16 +1041,23 @@
                                           (assoc (:buffers call) result :unrelated-result)
                                           (:scalar-values call) {} nil %)
             checked-step program-call/validate-equation-call!
+            checked-boundary emitted-equation/validate!
             checks (atom 0)
-            forged (with-redefs [program-call/validate-equation-call!
-                                 (fn [step]
+            forged (with-redefs [emitted-equation/validate!
+                                 (fn [boundary]
                                    (swap! checks inc)
-                                   (checked-step step))]
+                                   (checked-boundary boundary))]
                      (make-call {result physical}))
             binds (atom 0)
             executor {:bind! (fn [& _] (swap! binds inc)) :run! identity :release! identity}
             reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
-        (is (= 1 @checks) "constructor checks its exact numerical step once")
+        (is (= 2 @checks)
+            "constructor checks the program boundary and then its exact equation preparation once")
+        (reset! checks 0)
+        (with-redefs [emitted-equation/validate!
+                      (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
+          (program-call/make (:program call) (:buffers call) (:scalar-values call) {} nil))
+        (is (= 2 @checks) "empty result views do not cause extra schedule rederivation")
         (reset! checks 0)
         (with-redefs [program-call/validate-equation-call!
                       (fn [step] (swap! checks inc) (checked-step step))]
@@ -1062,6 +1070,20 @@
               copied-step (assoc step :graph copied)
               equivalent? semantic-fingerprint/equivalent?
               equivalence-checks (atom 0)]
+          (reset! checks 0)
+          (with-redefs [emitted-equation/validate!
+                        (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
+            (program-call/validate-equation-call! step))
+          (is (= 1 @checks) "public step validation independently rederives its boundary once")
+          (is (= :emitted-program-result-view
+                 (reason #(program-call/validate-equation-call!
+                           (assoc step :result-views {result :wrong-destination})))))
+          (is (= :scheduled-kernel-body-artifact-projection
+                 (reason #(program-call/validate-equation-call!
+                           (assoc-in step [:equation :operations 0 :graph :nodes 0
+                                           :operation :target]
+                                     (if (= module-target :cuda-c) :hip-cpp :cuda-c)))))
+              "a modified boundary cannot reuse the constructor's proof")
           (is (identical? expected graph) "selected graph is the validated alternative")
           (is (not (identical? graph copied)))
           (with-redefs [semantic-fingerprint/equivalent?
