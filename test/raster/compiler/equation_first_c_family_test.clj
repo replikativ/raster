@@ -991,6 +991,13 @@
         (is (= :emitted-program-result-view-bindings
                (reason #(program-call/validate!
                          (assoc-in forged [:steps 0 :outputs result] :wrong-logical-buffer)))))
+        (is (= :scheduled-kernel-body-artifact-projection
+               (reason #(program-call/validate!
+                         (assoc-in forged
+                                   [:program :equations 0 :operations 0 :graph :nodes 0
+                                    :operation :target]
+                                   (if (= module-target :cuda-c) :hip-cpp :cuda-c)))))
+            "public call validation still independently checks its embedded program")
         (is (= :parallel-program-result-view-shape
                (reason #(program-runtime/prepare-with!
                          forged (assoc executor :buffer-view
