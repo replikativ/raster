@@ -1,11 +1,19 @@
 (ns raster.gpu.kernel-graph-device-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.arrays :as arrays]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]
+            [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
-            [raster.gpu.device-probe :as device-probe]))
+            [raster.gpu.device-probe :as device-probe]
+            [raster.par :as par]))
+
+(deftm double-values!
+  [values :- (Array float), scratch :- (Array float), n :- Long] :- Void
+  (par/map-void! i n
+                 (arrays/aset scratch i (* 2.0 (arrays/aget values i)))))
 
 (defn- emitted-graph []
   (let [node (soac/par-form->soac
@@ -81,6 +89,45 @@
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "OpenCL KernelGraph inclusive scan")
     (assert-prefix! :ocl:0)))
+
+(defn- assert-mixed-recording!
+  [device-id]
+  (let [n 1025]
+    (gpu/with-gpu-session [sess device-id]
+      (gpu/compile! sess :double #'double-values!)
+      (gpu/alloc! sess {:values [:float n nil]
+                        :scratch [:float n nil]
+                        :out [:float n nil]})
+      (gpu/prepare! sess :double {"values" :values "scratch" :scratch} [] n)
+      (let [handle (gpu/bind-kernel-graph!
+                    sess :scan (emitted-graph) {'values :scratch 'out :out}
+                    {'n {:type :int :value n}})]
+        (try
+          (gpu/record-bound-sequence!
+           sess [{:kind :phase :phase :double}
+                 {:kind :graph :handle handle}]
+           :mixed)
+          (try
+            (is (= 4 (count (get-in (gpu/graph-execution-order sess :mixed)
+                                    [:per-replay]))))
+            (doseq [factor [1.0 3.0]]
+              (gpu/upload! sess :values (float-array n factor))
+              (gpu/replay! sess :mixed)
+              (let [result (gpu/download sess :out)]
+                (is (= (* 2.0 factor n) (double (aget ^floats result (dec n)))))))
+            (finally (gpu/release-recorded-graph! sess :mixed)))
+          (finally (gpu/release-kernel-graph! sess handle)
+                   (gpu/release-prepared! sess :double)))))))
+
+(deftest opencl-bound-phase-and-emitted-graph-one-replay
+  (if @device-probe/opencl-available?
+    (assert-mixed-recording! :ocl:0)
+    (device-probe/opencl-skip! "mixed bound replay")))
+
+(deftest level-zero-bound-phase-and-emitted-graph-one-replay
+  (if @gp/gpu-available?
+    (assert-mixed-recording! :ze:0)
+    (gp/gpu-skip! "mixed bound replay on Level Zero")))
 
 (deftest opencl-kernel-graph-binds-aligned-disjoint-views-of-one-allocation
   (if-not @device-probe/opencl-available?
