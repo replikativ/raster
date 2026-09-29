@@ -1532,11 +1532,13 @@
    conservative dependency-safe sequence. Current backends map the logical plan to one in-order
    compute queue; submit-kernel-graph! exposes asynchronous completion without native handles.
 
-   Option :profile? records device timestamp events for explicit offline measurement."
+   Option :profile? records device timestamp events for explicit offline measurement.
+   A linker that will record these prepared kernels in an enclosing graph may set
+   :record? false; that handle remains bindable/releasable but cannot be submitted alone."
   ([sess graph-key graph buffer-keys scalar-values]
    (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
-  ([sess graph-key graph buffer-keys scalar-values {:keys [profile?]
-                                                    :or {profile? false}}]
+  ([sess graph-key graph buffer-keys scalar-values {:keys [profile? record?]
+                                                    :or {profile? false record? true}}]
    (let [{:keys [device-id closed?]} @sess
          graph (kexec/validate! graph)
          external-ids (external-graph-buffer-ids graph)]
@@ -1586,8 +1588,9 @@
           ;; Graph verification proves every dependency names an earlier node and every hazard is
           ;; represented. Serial recording is therefore a safe implementation of that partial
           ;; order on today's single in-order compute queues; the logical plan retains the DAG.
-           (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true}
-                                                        profile? (assoc :profile? true))))
+           (when record?
+             (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true}
+                                                          profile? (assoc :profile? true)))))
            (let [entry {:graph-call graph-call
                         :execution-plan execution-plan
                         :runtime-graph @runtime-graph
@@ -1935,6 +1938,9 @@
                                        (= :pending (:status entry)))
                               (:event entry)))
                           events)]
+        (when-not runtime-graph
+          (throw (ex-info "kernel graph is bound only for enclosing-graph recording"
+                          {:reason :gpu-graph-not-recorded :handle handle})))
         (when pending
           (throw (ex-info "kernel graph already has an in-flight submission"
                           {:handle handle :event pending})))
