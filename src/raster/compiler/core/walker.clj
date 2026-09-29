@@ -1419,6 +1419,12 @@
         original-args (if use-narrowed? narrowed-orig original-args0)
         extra-tags (mapv (fn [orig rewr]
                            (or (inf/infer-aget-type orig type-env)
+                               ;; An alias-qualified raster.arrays/aget may be walked to
+                               ;; clojure.core/aget before overload selection. Read its
+                               ;; proven element type at this call-argument boundary;
+                               ;; infer-rewritten-tag deliberately does not stamp a
+                               ;; standalone aget because JVM case merges still box it.
+                               (inf/infer-aget-type rewr type-env)
                                (when (seq? rewr)
                                  (binding [*ns* source-ns]
                                    (inf/infer-rewritten-tag rewr orig type-env)))))

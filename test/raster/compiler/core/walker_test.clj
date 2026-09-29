@@ -1,6 +1,8 @@
 (ns raster.compiler.core.walker-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.walker :as walker]
+            [raster.arrays]
+            [raster.sci.distributions]
             [raster.numeric]))
 
 ;; Helper: build type-env from flat {sym → tag}
@@ -22,6 +24,18 @@
     (is (nil? (:tag (meta binder))) "Raster typing does not add a JVM primitive hint")
     (is (= 'if (first conditional)))
     (is (= 'boolean (:raster.type/tag (meta (nth conditional 2)))))))
+
+(deftest qualified-array-read-types-its-consuming-scalar-call
+  (let [walked (wb '(raster.numeric/+ sum
+                       (raster.sci.distributions/logpdf
+                        (raster.sci.distributions/->Normal mu sigma)
+                        (raster.arrays/aget ys i)))
+                   {'sum 'double 'mu 'double 'sigma 'double
+                    'ys 'doubles 'i 'long})]
+    (is (= 'double (:raster.type/tag (meta walked))))
+    (is (= 'raster.numeric/+ (:raster.op/original (meta walked))))
+    (is (= 'raster.sci.distributions/logpdf
+           (:raster.op/original (meta (last walked)))))))
 
 ;; ================================================================
 ;; classify-form
