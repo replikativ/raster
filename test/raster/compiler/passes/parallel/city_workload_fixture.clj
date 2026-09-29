@@ -133,6 +133,35 @@
                   (par/atomic-add! counts (unchecked-add-int 1 class) (int 1))))
               (recur (int (inc e))))))))))
 
+;; External city probe P20f: a seeded draw inside an effectful, multi-carry episode walk.
+;; Keep the full nested shape: the simpler episode-class-histogram! does not exercise it.
+(deftm episode-splitmix-histogram!
+  [locations :- (Array int), counts :- (Array int), n :- Long, len :- Long,
+   seed :- Long] :- Void
+  (par/map-void! i n
+    (let [xs (long (unchecked-add (unchecked-multiply seed 1000003) (long i)))
+          zs (long (unchecked-add xs -7046029254386353131))
+          zs (long (unchecked-multiply (bit-xor zs (unsigned-bit-shift-right zs 30)) -4658895280553007687))
+          zs (long (unchecked-multiply (bit-xor zs (unsigned-bit-shift-right zs 27)) -7723592293110705685))
+          key (long (bit-xor zs (unsigned-bit-shift-right zs 31)))
+          e0 (int 0)]
+      (loop [e (int e0) anchor (int 0)]
+        (when (< e len)
+          (let [location (int (aget locations (+ (* i len) e)))
+                k (int (unchecked-add-int e (- 0 e0)))]
+            (do
+              (when (== location (int 2))
+                (let [xc (long (unchecked-add key (long (unchecked-add-int k 100000))))
+                      zc (long (unchecked-add xc -7046029254386353131))
+                      zc (long (unchecked-multiply (bit-xor zc (unsigned-bit-shift-right zc 30)) -4658895280553007687))
+                      zc (long (unchecked-multiply (bit-xor zc (unsigned-bit-shift-right zc 27)) -7723592293110705685))
+                      zc (long (bit-xor zc (unsigned-bit-shift-right zc 31)))
+                      u (/ (double (unsigned-bit-shift-right zc 11)) 9007199254740992.0)
+                      bucket (int (* u 8.0))]
+                  (par/atomic-add! counts bucket (int 1))))
+              (recur (int (unchecked-add-int e 1))
+                     (int (if (== location (int 0)) 1 anchor))))))))))
+
 (deftm branch-diary-before-choice-loop!
   [diary :- (Array int), choice :- (Array int), n :- Long] :- Void
   (par/map-void! i n
