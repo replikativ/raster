@@ -58,7 +58,7 @@
      :specs (into {} (map (fn [[param arr]] (spec (keyword param) arr))) entries)
      :bindings (into {} (map (fn [[param _]] [param (keyword param)])) entries)}))
 
-(declare run-program)
+(declare run-program activation-inputs)
 
 (deftest q6-k-dot-is-a-typed-product-followed-by-an-ordered-map
   (let [descriptor (pipeline/compile-gpu-program #'gk/qdot-q6-K-rows!
@@ -283,6 +283,39 @@
       (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
                   kernels)
           (str (:name (meta kernel)) " must not depend on the GPU execution gate")))))
+
+(deftest q8-head-activation-quantizer-has-public-typed-route
+  (let [compilation (equation-first/compile #'gk/quant-act-q8-0-rows!
+                                            {:target :ze:debug :dtype :float})]
+    (is (= :none (:fallback (:stats compilation))))
+    (is (= 3 (count (:kernels compilation))))
+    (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))
+                (:kernels compilation)))))
+
+(deftest q8-head-activation-quantizer-matches-ggml-through-public-typed-route
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "public equation-first Q8_0 activation quantization")
+    (doseq [[label x nrows width] (take 2 (activation-inputs 640))]
+      (let [expected (ggml/kernel-layout :q8_0
+                                         (ggml/quantize :q8_0 x width nrows)
+                                         width nrows)
+            nblocks (* nrows (quot width 32))
+            arguments [x (int-array (alength ^ints (:q expected)))
+                       (float-array nblocks) (long nblocks)]
+            prepared (compiled/lower #'gk/quant-act-q8-0-rows! arguments
+                                     {:compiler :equation-first :target :ze:0
+                                      :dtype :float :outputs '[xq xd]})
+            live (compiled/instantiate! prepared)]
+        (try
+          (let [result (live {})
+                codes (value/->host (:xq result))
+                scales (value/->host (:xd result))
+                bits #(mapv Float/floatToRawIntBits %)]
+            (testing label
+              (is (= (vec (:q expected)) (vec codes)))
+              (is (= (bits (:d expected)) (bits scales)))))
+          (finally
+            (compiled/close! live)))))))
 
 (deftest cooperative-activation-quantizers-retain-reference-semantics-on-jvm
   (doseq [[fmt kernel width] [[:q8_0 gk/quant-act-q8-0-rows! 640]
