@@ -1610,3 +1610,21 @@ The opt-in public Arc oracle passes batch-one, multi-row, square and awkward-tai
 the generated symbolic body compiles to CUDA PTX and HIP syntax without hardware. The square
 shape's local device-event median moved from approximately 393 to 112 microseconds, with
 non-stationary early replays; see the raw comparison protocol for the measurement limits.
+
+### 2026-09-29 — whole-plan replay measurement boundary
+
+The opt-in production canary now composes three independently lowered typed effect maps through
+the public `Compiled/compose` API and checks one recorded graph, three profiled kernels, and an
+independent numerical reference. It reports component compilation, composition, instantiation,
+and warm resident device-event replay separately. Ordinary CI tests only the canary contract;
+no timing threshold enters the hot loop. One local Arc OpenCL run at width 1024 was numerically
+exact, but replay timing was nonstationary (median 93 microseconds, CV 1.34); it cannot establish
+a performance improvement. This is a mechanism canary, not a pretrained decoder substitute.
+
+Next, run the same phase accounting on pretrained-rstr's resident decode and chunked prefill,
+recording kernel/event attribution and transfer counts without changing its cache policy. The
+committed GPU corpus reports 238 typed SOAC, one typed structured-control, six explicit host-only,
+and six scalar routes out of 251 functions; it has no compatibility route. That is a coverage
+ratchet for the selected corpus, not proof that the compatibility pipeline is dead for external
+programs such as city-rstr. Remove compatibility lowering only after a production-path reachability
+audit and explicit fail-loud replacements for its remaining admitted forms.
