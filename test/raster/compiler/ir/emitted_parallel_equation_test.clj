@@ -8,6 +8,7 @@
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -135,6 +136,25 @@
         emitted (emit-graph source)]
     (is (emitted-equation/emitted-equation?
          (emitted-equation/make algorithm body emitted)))))
+
+(deftest equation-reconstruction-validates-its-scheduled-body-once
+  (let [{:keys [algorithm body source]} (scheduled-fixture)
+        emitted (emitted-equation/make algorithm body (emit-graph source))
+        checked (atom 0)
+        original program/validate!]
+    (with-redefs [program/validate!
+                  (fn [candidate & options]
+                    (when (identical? body candidate) (swap! checked inc))
+                    (apply original candidate options))]
+      (is (identical? emitted (emitted-equation/validate! emitted)))
+      (is (= 1 @checked))
+      (is (identical? emitted (emitted-equation/validate! emitted)))
+      (is (= 2 @checked) "a fresh public validation rederives the proof"))
+    (testing "changed scheduled operands are still rejected by the canonical constructor"
+      (is (= :parallel-program-algorithm
+             (reason-of
+              #(emitted-equation/validate!
+                (assoc emitted :body (assoc-in body [:equations 0 :operands] [])))))))))
 
 (deftest emitted-equation-certifies-both-links-of-a-one-to-many-schedule
   (let [{:keys [algorithm body refined witness]} (scheduled-fixture)

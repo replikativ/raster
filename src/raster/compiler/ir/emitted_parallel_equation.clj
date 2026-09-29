@@ -3,12 +3,10 @@
   (:require [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
-            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
-            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
@@ -24,12 +22,6 @@
 (defn- fail!
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :ir :emitted-parallel-equation))))
-
-(defn- algorithm-boundary?
-  [equation algorithm]
-  (and (= algorithm (soac/validate! algorithm))
-       (= (:operands equation) (:inputs (soac/facts algorithm)))
-       (= (:results equation) (soac/outputs algorithm))))
 
 (defn- expected-graph
   [algorithm body]
@@ -63,9 +55,10 @@
         (scheduled-body/validate-against-node!
          certificate (first (:nodes graph)) graph)
         graph))
-    (let [algorithm (soac/validate! algorithm)
-          body (program/validate! body segop/segop-node? algorithm-boundary?)]
-      (equation-graph/make algorithm body))))
+    ;; The canonical graph constructor validates the complete algorithm and scheduled body,
+    ;; including the same operand/result boundary. Do not repeat that proof immediately here.
+    ;; Each independent emitted-equation validation still reconstructs its graph from scratch.
+    (equation-graph/make algorithm body)))
 
 (defn validate!
   [emitted-equation]

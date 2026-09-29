@@ -270,3 +270,20 @@ A true template-hit preparation at `[1,1024,640]` before this last removal repor
 then 3.87 s in a stack-attributed repeat, with seven boundary validations. These shared-load
 observations are not a paired speedup result. The remaining enclosing invocation, program-call
 construction and final public LinkPlan proof remain independent checks.
+
+A subsequent warm preparation-only diagnostic on the same `[1,1024,640]` Q4_K problem
+reported about 3.4 s for a process-template hit. Scoped instrumentation attributed the bulk
+of a later 3.2 s sample to six emitted-equation reconstructions; structural KernelGraph checks
+were only about 19 ms in aggregate. Inclusive nested timings must not be added together.
+Ordinary reconstruction validated its typed algorithm and scheduled body immediately before
+the canonical graph constructor validated both again with the same boundary predicate.
+The follow-up delegates directly to that constructor and removes the duplicate local checker.
+The proof-count regression requires one scheduled-body validation per public reconstruction,
+fresh validation on the next call, and rejection at `:parallel-program-algorithm` for changed
+operands. No retained proof cache, accepted-domain expansion or device-code change is involved;
+these shared-load samples do not establish a latency speedup.
+
+The follow-up's public Q4_K canary executes both generated and serial schedules on Level Zero
+and OpenCL at `[1,1024,640]`: all ten validation/warmup/measurement replays per backend match
+the ggml oracle raw float bits after output poisoning. Two measured rounds are a correctness
+check, not a stationary performance series or a schedule-promotion decision.
