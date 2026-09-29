@@ -164,7 +164,8 @@ of its component-width crossover on OpenCL and Level Zero. The same compiled pro
 5-wide and 515-wide inputs, including zero-edge cases, against the independent plan oracle;
 the narrow call selects exact reference and the wide call selects subgroup score reuse. The
 public `Compiled` equation-first path also executes the existing windowed prefill-softmax source
-on both local backends and agrees with its JVM result. These are route/correctness gates, not a
+on both local backends and agrees with its JVM result for all four documented window shapes
+(two focused device tests, 40 assertions, no skips). These are route/correctness gates, not a
 claim that pretrained-rstr's routed paged-storage graph has migrated to equation-first or that
 either attention schedule is fastest for a production decoder.
 
