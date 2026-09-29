@@ -1587,7 +1587,11 @@ The city-rstr GPU day kernels now compile and agree with their JVM counterparts 
 the external P10 two-exit search and P14 multiple-`recur` probes also compile on Level Zero
 and match the JVM exactly; Raster's city fixture independently covers a two-exit search and
 branched effectful recurrences. P20f, which nests a seeded SplitMix draw inside a multi-carry
-effectful episode walk, still declines with `:no-lowering-rule`. Its full shape now has a
+effectful episode walk, still declines with `:no-lowering-rule`. Direct source-region probing
+isolated its `unchecked-add-int` induction against a `Long` bound: replacing only that step
+with widened addition makes the whole region recognizable, while the other unchecked SplitMix
+arithmetic stays unchanged. This is a legality gap, not evidence that SplitMix cannot be emitted;
+accepting the int step without a bound proof would risk wraparound. Its full shape now has a
 device parity-or-explicit-decline regression. This is not an upgrade gate for city, which
 uses supported spellings, nor proof that every P13 variant is admitted. When revisiting the
 remaining gap, retain a typed control-flow region and its effect/SSA ownership facts, then

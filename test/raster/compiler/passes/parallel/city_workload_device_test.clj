@@ -227,8 +227,9 @@
       (is (= (vec expected) (:counts device))))))
 
 (deftest nested-seeded-episode-draw-is-correct-or-explicitly-declined
-  ;; City probe P20f still has no TypedSOAC schedule. Keep its complete source shape as a
-  ;; differential oracle: future admission must match the JVM, never silently drop the draw.
+  ;; City probe P20f uses unchecked-add-int for an induction variable with a Long bound.
+  ;; Without a bound proof it must decline, or future admission must match the JVM; never
+  ;; silently drop the nested draw. Ordinary widened addition makes this region recognizable.
   (doseq [[device available? skip!] [[:ze:0 probe/gpu-available? probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
     (if-not @available?
