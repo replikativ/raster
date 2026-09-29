@@ -62,13 +62,15 @@
     (util/subst-syms smap expr)))
 
 (defn cse-let
-  "Apply CSE and constant propagation to a flat let* form.
+  "Apply CSE and constant propagation to a let* binding spine, preserving nested body scopes.
    Folds (nth vector-literal N) → element, propagates aliases.
    Returns {:form transformed-form :stats {:cse-aliases N}}."
   [form]
   (if-not (form/binding-form? form)
     {:form form :stats {:cse-aliases 0}}
-    (let [[let-sym bindings-vec & body-exprs] form
+    (binding [util/*shadowing-locals* (into util/*shadowing-locals*
+                                          (take-nth 2 (second form)))]
+      (let [[let-sym bindings-vec & body-exprs] form
           pairs (partition 2 bindings-vec)
           {:keys [new-pairs cache aliases vec-bindings sym-subst]}
           (reduce
@@ -116,8 +118,18 @@
                                               (if-let [m (meta expr)] (with-meta r m) r))
                                 (vector? expr) (mapv resolve-body-expr expr)
                                 :else expr))
-          resolved-body (map resolve-body-expr body-exprs)
+          ;; The body need not be a flat scalar leaf. Guard both alias substitution and
+          ;; vector projection expansion against nested binders and quotes, just as for
+          ;; initializer substitution above. An unsafe body uses the canonical hygienic
+          ;; substitution and conservatively retains its vector projections.
+          body-substitutions (merge sym-subst vec-bindings)
+          resolved-body (mapv (fn [expression]
+                               (if (util/scope-blind-substitution-safe?
+                                    body-substitutions expression)
+                                 (resolve-body-expr expression)
+                                 (subst-syms-in sym-subst expression)))
+                             body-exprs)
           new-bindings (vec (mapcat identity new-pairs))]
       {:form (let [r (list* let-sym new-bindings resolved-body)]
                (if-let [m (meta form)] (with-meta r m) r))
-       :stats {:cse-aliases aliases}})))
+       :stats {:cse-aliases aliases}}))))
