@@ -35,6 +35,15 @@
   (par/reduce sum (dist/logpdf (dist/->Normal 0.0 sigma) mu) i count
     (n/+ sum (dist/logpdf (dist/->Normal mu sigma) (aget ys i)))))
 
+(deftm normal-double-prior-reduce
+  [mu :- Double, ys :- (Array double), count :- Long,
+   prior-sigma :- Double, observation-sigma :- Double] :- Double
+  (par/reduce sum
+    (n/+ (dist/logpdf (dist/->Normal 0.0 prior-sigma) mu)
+         (dist/logpdf (dist/->Normal 1.0 prior-sigma) mu))
+    i count
+    (n/+ sum (dist/logpdf (dist/->Normal mu observation-sigma) (aget ys i)))))
+
 (deftm normal-prior-then-loop [mu :- Double, ys :- (Array double), count :- Long,
                               prior-sigma :- Double, observation-sigma :- Double] :- Double
   (let [prior (dist/logpdf (dist/->Normal 0.0 prior-sigma) mu)]
@@ -208,3 +217,24 @@
         (is (nil? (nth actual 3)))
         (doseq [i [1 4 5]]
           (is (< (Math/abs (- (nth actual i) (nth expected i))) 1e-9)))))))
+
+(deftest constructed-compound-reduction-initializer-has-gradient
+  (let [ys (double-array [0.1 0.7 -0.3])
+        mu 0.2 s0 2.7 s 1.4
+        expected (+ (dist/logpdf (dist/->Normal 0.0 s0) mu)
+                    (dist/logpdf (dist/->Normal 1.0 s0) mu)
+                    (reduce + (map #(dist/logpdf (dist/->Normal mu s) %) ys)))
+        [value dmu dys dcount ds0 ds]
+        ((rev/value+grad #'normal-double-prior-reduce :wrt [0 3 4]) mu ys 3 s0 s)]
+    (is (< (Math/abs (- value expected)) 1e-10))
+    (is (nil? dys))
+    (is (nil? dcount))
+    (is (< (Math/abs (- dmu (+ (/ (- 1.0 (* 2.0 mu)) (* s0 s0))
+                               (reduce + (map #(/ (- % mu) (* s s)) ys))))) 1e-9))
+    (is (< (Math/abs (- ds0 (+ (- (/ 2.0 s0))
+                                 (/ (+ (* mu mu) (* (- mu 1.0) (- mu 1.0)))
+                                    (* s0 s0 s0))))) 1e-9))
+    (is (< (Math/abs (- ds (reduce + (map #(let [delta (- % mu)]
+                                             (+ (- (/ 1.0 s))
+                                                (/ (* delta delta) (* s s s))))
+                                          ys)))) 1e-9))))
