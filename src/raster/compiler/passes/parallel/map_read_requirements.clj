@@ -6,6 +6,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.ir.index-algebra :as algebra]
+            [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scalar-range :as ranges]
@@ -21,6 +22,44 @@
       0 1
       1 (first operands)
       (apply launch/product operands))))
+
+(defn- uniform-local-extents
+  "Project only typed, integral map locals closed over public scalars into checked launch algebra.
+
+   A row/index-dependent local is never a graph scalar. Keeping this lexical proof separate from
+   address substitution lets dense-read spans use a uniform block count without promoting its
+   private binder into the public ABI. Unsupported or potentially wrapping arithmetic stays
+   unprojected, so the eventual graph must still decline an unresolved capacity."
+  [locals scalar-types span-references]
+  (let [needed (:needed
+                (reduce (fn [{:keys [needed] :as state} {:keys [id init]}]
+                          (if (contains? needed id)
+                            (assoc state :needed (into needed (util/free-syms init)))
+                            state))
+                        {:needed span-references} (reverse locals)))]
+    (:definitions
+     (reduce
+      (fn [{:keys [types definitions] :as state} {:keys [id init dtype]}]
+        (let [dependencies (util/free-syms init)]
+          (if (and (contains? needed id)
+                   (contains? #{:int :long} dtype)
+                   (every? #(contains? types %) dependencies))
+            (if-let [projected
+                     (try
+                       (let [decline! (fn [rule message data]
+                                        (throw (ex-info message (assoc data :reason rule))))
+                             lowered (index-expression/lower-typed
+                                      init (set (keys types)) types dtype decline!)
+                             projected (launch/rebind-expression
+                                        (index-expression/to-launch-expression lowered decline!)
+                                        definitions)]
+                         (when (launch/expression? projected) projected))
+                       (catch clojure.lang.ExceptionInfo _ nil))]
+              {:types (assoc types id dtype)
+               :definitions (assoc definitions id projected)}
+              state)
+            state)))
+      {:types scalar-types :definitions {}} locals))))
 
 (declare address-substitutions)
 (defn- local-dependencies
@@ -121,7 +160,8 @@
    reads, and undecidable arithmetic decline. `scalar-definitions` contains already checked
    KernelLaunch definitions from the host prefix. Only monomial definitions are substituted, so
    quotient relations are never invented here."
-  [operation {:keys [scalar-definitions] :or {scalar-definitions {}}}]
+  [operation {:keys [scalar-definitions scalar-types]
+              :or {scalar-definitions {} scalar-types {}}}]
   (when (and (segop/seg-map? operation)
              (= 1 (count (get-in operation [:space :dims])))
              (empty? (set/intersection (set (:inputs operation)) (set (:outputs operation))))
@@ -141,7 +181,7 @@
                           (mapcat #(lexical-read-sites % index bound source-locals expand))
                           (filter #(contains? (:inputs operation) (get-in % [:read :sym])))
                           vec)
-          read-facts
+          raw-read-facts
           (mapv (fn [{{:keys [sym idx]} :read site-locals :locals
                       loop-indices :loop-indices}]
                   (let [coordinate (algebra/canonical-arithmetic (expand idx))
@@ -161,7 +201,13 @@
                        :address-locals (local-dependencies site-locals idx)
                        :loop-indices loop-indices :form form
                        :span (span-expression span)})))
-                read-sites)]
+                read-sites)
+          span-references (reduce set/union #{}
+                                  (map #(launch/expression-references (:span %))
+                                       (remove nil? raw-read-facts)))
+          local-extents (uniform-local-extents source-locals scalar-types span-references)
+          read-facts (mapv #(when % (update % :span launch/rebind-expression local-extents))
+                           raw-read-facts)]
       (when (and (seq source-reads)
                  (= (count source-reads) (count read-sites))
                  (every? some? read-facts))
@@ -298,7 +344,8 @@
                             {:reason :map-address-certificate-missing})))
         recomputed (symbolic-read-certificate
                     operation
-                    {:scalar-definitions (:scalar-definitions attached)})
+                    {:scalar-definitions (:scalar-definitions attached)
+                     :scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))})
         _ (when-not (= attached recomputed)
             (throw (ex-info "map address certificate does not match its source operation"
                             {:reason :map-address-certificate-mismatch

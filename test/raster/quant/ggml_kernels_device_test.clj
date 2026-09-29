@@ -207,6 +207,53 @@
         (finally
           (compiled/close! live)))))))
 
+(deftest q8-head-dot-agrees-across-public-compiled-verticals
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "Q8_0 batched head route parity")
+    (let [in 640 out 257 nrows 2
+          weights (ggml/quantize :q8_0 (values (* out in) 71 0.02) in out)
+          activations (ggml/quantize :q8_0 (values (* nrows in) 72 1.5) in nrows)
+          wl (ggml/kernel-layout :q8_0 weights in out)
+          xl (ggml/kernel-layout :q8_0 activations in nrows)
+          wrow (ggml/row-bytes :q8_0 in)
+          xrow (ggml/row-bytes :q8_0 in)
+          expected (mapv (fn [row o]
+                           (Float/floatToRawIntBits
+                            (float (ggml/vec-dot :q8_0
+                                                 (row-bytes weights o wrow)
+                                                 (row-bytes activations row xrow) in))))
+                         (mapcat #(repeat out %) (range nrows))
+                         (cycle (range out)))
+          run (fn [compiler]
+                (let [arguments [(:q xl) (:d xl) (:q wl) (:d wl)
+                                 (float-array (* nrows out)) in out nrows]
+                      prepared (compiled/lower #'gk/qdot-q8-0-rows! arguments
+                                               {:compiler compiler :target :ze:0
+                                                :dtype :float :outputs '[y]})
+                      live (compiled/instantiate! prepared)]
+                  (try
+                    (let [result (live {})]
+                      {:bits (mapv #(Float/floatToRawIntBits %)
+                                   (value/->host (:y result)))
+                       :stages (count (get-in prepared [:descriptor :steps]))})
+                    (finally
+                      (compiled/close! live)))))
+          resident (run :resident-descriptor)
+          equation (run :equation-first)]
+      (is (= expected (:bits resident)) "resident route preserves ggml dot arithmetic")
+      (is (= expected (:bits equation)) "typed equation route preserves ggml dot arithmetic")
+      (is (= (:bits resident) (:bits equation)))
+      (is (pos? (:stages resident)))
+      (is (pos? (:stages equation))))))
+
+(deftest q8-head-uniform-block-count-is-not-a-public-scalar
+  (let [compilation (equation-first/compile #'gk/qdot-q8-0-rows!
+                                            {:target :ze:debug :dtype :float})
+        [kernel] (:kernels compilation)]
+    (is (= :none (:fallback (:stats compilation))))
+    (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+    (is (= 1 (count (:kernels compilation))))))
+
 (deftest dot-kernels-match-the-generic-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "ggml dot kernels")

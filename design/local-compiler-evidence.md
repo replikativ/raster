@@ -205,3 +205,12 @@ evidence is sealed to that exact plan and reused for its invocation certificate;
 proof. A focused test counts one complete LinkPlan proof during `Compiled` preparation and checks
 that modifying the certified plan invalidates its retained evidence. This reduces redundant
 host-side proof work, not emitted device work; production Q4 timing still needs a controlled run.
+
+The Q8_0 batched head source exposed a related typed-graph gap: its dense read-span proof retained
+the map-local uniform block count `(quot in 32)` as if it were a public scalar. The read certificate
+now projects only required, pure typed integral locals into checked launch algebra, and independently
+rederives that projection from the graph's scalar types before permitting address rewriting. The
+hardware-free equation-first route emits one KernelBody without fallback. On local Arc Level Zero,
+two activation rows by 257 output channels match both the resident route and ggml's ordered dot
+reference raw float bits. This is a small generated-head arithmetic gate, not a complete pretrained
+head or real-vocabulary latency measurement.
