@@ -17,6 +17,7 @@
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
@@ -1039,6 +1040,25 @@
                       (fn [step] (swap! checks inc) (checked-step step))]
           (program-call/validate! forged))
         (is (= 1 @checks) "public call validation independently rechecks the step")
+        (let [step (first (:steps forged))
+              graph (:graph step)
+              expected (get-in forged [:program :equations 0 :operations 0 :graph])
+              copied (assoc graph :attributes (into {} (:attributes graph)))
+              copied-step (assoc step :graph copied)
+              equivalent? semantic-fingerprint/equivalent?
+              equivalence-checks (atom 0)]
+          (is (identical? expected graph) "selected graph is the validated alternative")
+          (is (not (identical? graph copied)))
+          (with-redefs [semantic-fingerprint/equivalent?
+                        (fn [& arguments]
+                          (swap! equivalence-checks inc)
+                          (apply equivalent? arguments))]
+            (is (= step (program-call/validate-equation-call! step)))
+            (is (zero? @equivalence-checks)
+                "the already-validated graph needs no canonical comparison")
+            (is (= copied-step (program-call/validate-equation-call! copied-step))
+                "a reconstructed equivalent graph still takes the canonical fallback")
+            (is (= 1 @equivalence-checks))))
         (is (= :emitted-program-result-views (reason #(make-call {:not-a-result physical}))))
         (is (= :parallel-program-result-view-resolver
                (reason #(program-runtime/prepare-with! forged executor))))

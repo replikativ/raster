@@ -149,7 +149,9 @@
              "emitted equation outputs differ from its logical results"
              {:equation (:id equation) :expected (:results equation)
               :actual (keys outputs)}))
-    (when-not (some #(semantic-fingerprint/equivalent? % call-graph) expected-graphs)
+    (when-not (some #(or (identical? % call-graph)
+                        (semantic-fingerprint/equivalent? % call-graph))
+                    expected-graphs)
       (fail! :emitted-program-equation-graph
              "emitted equation call graph is not a certified alternative"
              {:equation (:id equation)}))
