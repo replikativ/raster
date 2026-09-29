@@ -66,9 +66,10 @@
 
 (deftest direct-graph-and-program-share-ordered-prepared-sequence
   (let [events (atom [])
-        executor {:bind! (fn [_ graph buffers scalars]
-                           (is (= [:graph {:x :input :y :output} {'n {:type :long :value 4}}]
-                                  [graph buffers scalars]))
+        graph {:outputs [{:id :y}]}
+        executor {:bind! (fn [_ bound-graph buffers scalars]
+                           (is (= [graph {:x :input :y :output} {'n {:type :long :value 4}}]
+                                  [bound-graph buffers scalars]))
                            (swap! events conj [:bind :graph])
                            :graph)
                   :run! (fn [handle] (swap! events conj [:run handle]))
@@ -76,13 +77,13 @@
         prepared (with-redefs [program/prepare-with!
                                (fn [call _] (stub-program (:id call) events))]
                    (program/prepare-sequence-with!
-                    [{:id :graph :kind :graph :call {:graph :graph
+                    [{:id :graph :kind :graph :call {:graph graph
                                         :bindings {:x :input :y :output}
                                         :scalar-values {'n {:type :long :value 4}}}}
                      {:id :program :call {:id :after}}]
                     executor))]
     (try
-      (is (= {:graph {:x :input :y :output} :program {:after :after}}
+      (is (= {:graph {:y :output} :program {:after :after}}
              (program/run-prepared! prepared)))
       (is (= [[:bind :graph] [:run :graph] [:run :after]] @events))
       (is (= [:graph :program]

@@ -240,7 +240,7 @@
         (throw (ex-info "prepared graph is closed"
                         {:reason :parallel-program-closed :operation :run-prepared!})))
       ((:run! prepared) (:handle prepared))
-      (:buffers prepared))
+      (select-keys (:buffers prepared) (map :id (:outputs (:graph prepared)))))
 
     (prepared-sequence? prepared)
     (do
