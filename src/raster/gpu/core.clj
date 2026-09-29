@@ -718,32 +718,61 @@
   (let [device-id (:device-id @sess)]
     ((rt-resolve device-id "synchronize-async!"))))
 
-(defn record-graph!
-  "Record an ordered sequence of prepared kernels into a replayable command graph (the AOT
-  decode-graph). Pays the per-launch host-append cost ONCE; replay! then runs the whole
-  sequence with a single queue execute — eliminating the per-token dispatch floor.
+(declare resolve-kernel-graph-entry)
 
-  phase-keys: ordered vector of phase-keys previously bound via prepare!. The kernel sequence
-  and buffer pointers are fixed; buffer CONTENTS may change between replays. Stored under :graph
-  (or graph-key). Re-record only if the sequence or a buffer is reallocated."
-  ([sess phase-keys] (record-graph! sess phase-keys :graph {}))
-  ([sess phase-keys graph-key] (record-graph! sess phase-keys graph-key {}))
-  ([sess phase-keys graph-key {:keys [profile?] :or {profile? false}}]
-   (let [device-id (:device-id @sess)
+(defn- bound-recording-source
+  [sess {:keys [kind phase handle] :as source}]
+  (case kind
+    :phase
+    (do
+      (when-not (and (contains? source :phase) (not (contains? source :handle)))
+        (throw (ex-info "phase recording source requires only :phase"
+                        {:reason :gpu-recording-invalid-source :source source})))
+      {:identity phase
+       :prepareds (prepared-bindings
+                   (or (get-in @sess [:prepared phase])
+                       (throw (ex-info (str "Phase not prepared: " phase " — call prepare! first")
+                                       {:reason :gpu-recording-unbound-phase
+                                        :phase phase :prepared (keys (:prepared @sess))}))))})
+    :graph
+    (do
+      (when-not (and (contains? source :handle) (not (contains? source :phase)))
+        (throw (ex-info "graph recording source requires only :handle"
+                        {:reason :gpu-recording-invalid-source :source source})))
+      {:identity handle
+       :prepareds (:prepareds (resolve-kernel-graph-entry sess handle))})
+    (throw (ex-info "recording source must be a bound phase or emitted graph"
+                    {:reason :gpu-recording-invalid-source :source source}))))
+
+(defn record-bound-sequence!
+  "Record one ordered command graph from already-bound descriptor phases and emitted
+   KernelGraphHandles. Sources are {:kind :phase :phase key} or {:kind :graph :handle handle}.
+   Every source must remain bound until release-recorded-graph!; buffer contents may change
+   between replays, but bindings and their storage may not. In a mixed sequence, even a
+   descriptor's constant-transform kernel runs in source order on each replay: without a
+   whole-plan dependency certificate it cannot safely move across an emitted graph."
+  ([sess sources] (record-bound-sequence! sess sources :graph {}))
+  ([sess sources graph-key] (record-bound-sequence! sess sources graph-key {}))
+  ([sess sources graph-key {:keys [profile?] :or {profile? false}}]
+   (when (or (:closed? @sess) (not (vector? sources)) (empty? sources))
+     (throw (ex-info "recording requires an open session and nonempty ordered source vector"
+                     {:reason :gpu-recording-invalid-sequence :graph-key graph-key})))
+   (let [resolved (mapv #(bound-recording-source sess %) sources)
+         _ (when (some (comp empty? :prepareds) resolved)
+             (throw (ex-info "recording source has no prepared kernels"
+                             {:reason :gpu-recording-empty-source :sources sources})))
+         device-id (:device-id @sess)
          record-fn (rt-resolve device-id "record-graph!")
-         entries (mapv (fn [pk]
-                         (or (get-in @sess [:prepared pk])
-                             (throw (ex-info (str "Phase not prepared: " pk " — call prepare! first")
-                                             {:prepared (keys (:prepared @sess))}))))
-                       phase-keys)
-         prepareds (vec (mapcat prepared-bindings entries))
-         ordered-bindings (vec (mapcat (fn [phase entry]
+         prepareds (vec (mapcat :prepareds resolved))
+         mixed? (some #(= :graph (:kind %)) sources)
+         ordered-bindings (vec (mapcat (fn [{:keys [identity prepareds]}]
                                         (map (fn [prepared]
-                                               {:phase phase
+                                               {:phase identity
                                                 :kernel-phase (:phase prepared)
-                                                :const-prologue? (boolean (:const-prologue? prepared))})
-                                             (prepared-bindings entry)))
-                                      phase-keys entries))
+                                                :const-prologue? (and (not mixed?)
+                                                                      (boolean (:const-prologue? prepared)))})
+                                             prepareds))
+                                      resolved))
          execution-order {:record-time-prologue
                           (mapv #(dissoc % :const-prologue?)
                                 (filter :const-prologue? ordered-bindings))
@@ -751,8 +780,9 @@
                           (mapv #(dissoc % :const-prologue?)
                                 (remove :const-prologue? ordered-bindings))
                           :completion :unproven}
-         prologue-prepareds (filterv :const-prologue? prepareds)
-         replay-prepareds (filterv (complement :const-prologue?) prepareds)
+         prologue-prepareds (if mixed? [] (filterv :const-prologue? prepareds))
+         replay-prepareds (if mixed? prepareds
+                               (filterv (complement :const-prologue?) prepareds))
          prologue-graph (when (seq prologue-prepareds) (record-fn prologue-prepareds))
          graph (try
                  (when prologue-graph
@@ -773,6 +803,16 @@
      (destroy-recorded-graph-entry! device-id (get-in @sess [:graphs graph-key]))
      (swap! sess assoc-in [:graphs graph-key] entry)
      graph)))
+
+(defn record-graph!
+  "Record ordered prepared phase keys into one replayable command graph. This is the
+   descriptor-only spelling of record-bound-sequence!."
+  ([sess phase-keys] (record-graph! sess phase-keys :graph {}))
+  ([sess phase-keys graph-key] (record-graph! sess phase-keys graph-key {}))
+  ([sess phase-keys graph-key options]
+   (record-bound-sequence! sess
+                           (mapv (fn [phase] {:kind :phase :phase phase}) phase-keys)
+                           graph-key options)))
 
 (defn graph-execution-order
   "Return the bound graph's selected record-time prologue and per-replay kernel order.

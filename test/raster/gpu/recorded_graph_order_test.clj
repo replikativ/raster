@@ -90,5 +90,64 @@
         (is (= {:record-time-prologue
                 [{:phase :phase :kernel-phase :constant-transform}]
                 :per-replay [{:phase :phase :kernel-phase :value-kernel}]
-                :completion :unproven}
+               :completion :unproven}
                (gpu/graph-execution-order sess :graph)))))))
+
+(deftest bound-phases-and-emitted-graphs-record-in-one-order
+  (let [calls (atom [])
+        handle (gpu/->KernelGraphHandle :emitted)
+        sess (atom {:device-id :ocl:0 :closed? false
+                    :prepared {:before {:phase :before}
+                               :constant {:phase :constant :const-prologue? true}
+                               :after {:phase :after}}
+                    :kernel-graphs {:emitted {:prepareds [{:phase :producer}
+                                                          {:phase :consumer}]}}
+                    :graphs {}})
+        resolve-runtime (fn [_device-id name]
+                          (case name
+                            "record-graph!" (fn [prepareds & [options]]
+                                              (swap! calls conj [:record (mapv :phase prepareds) options])
+                                              {:prepareds prepareds})
+                            "replay-graph!" (fn [graph]
+                                              (swap! calls conj [:replay
+                                                                 (mapv :phase (:prepareds graph))]))
+                            (throw (ex-info "unexpected runtime call" {:name name}))))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolve-runtime
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft)
+       (fn [_device-id name]
+         (when (= name "destroy-graph!")
+           (fn [graph]
+             (swap! calls conj [:destroy (mapv :phase (:prepareds graph))]))))}
+      (fn []
+        (gpu/record-bound-sequence!
+         sess [{:kind :phase :phase :before}
+               {:kind :graph :handle handle}
+               {:kind :phase :phase :constant}
+               {:kind :phase :phase :after}]
+         :mixed {:profile? true})
+        (is (= [[:record [:before :producer :consumer :constant :after]
+                 {:barriers? true :profile? true}]]
+               @calls))
+        (is (= {:record-time-prologue []
+                :per-replay [{:phase :before :kernel-phase :before}
+                             {:phase handle :kernel-phase :producer}
+                             {:phase handle :kernel-phase :consumer}
+                             {:phase :constant :kernel-phase :constant}
+                             {:phase :after :kernel-phase :after}]
+                :completion :unproven}
+               (gpu/graph-execution-order sess :mixed)))
+        (let [before @calls]
+          (is (= :gpu-recording-invalid-source
+                 (try (gpu/record-bound-sequence!
+                       sess [{:kind :graph :phase :before}] :mixed)
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+          (is (= before @calls))
+          (is (= :gpu-recording-unbound-phase
+                 (try (gpu/record-bound-sequence!
+                       sess [{:kind :phase :phase :missing}] :mixed)
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+          (is (= before @calls)))
+        (gpu/release-recorded-graph! sess :mixed)
+        (is (= [:destroy [:before :producer :consumer :constant :after]]
+               (last @calls)))))))
