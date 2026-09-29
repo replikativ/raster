@@ -491,7 +491,7 @@
     (vec (concat donate-nodes output-nodes result-node tap-nodes))))
 
 (defn- compilation-id
-  [fn-var target dtype descriptor args]
+  [fn-var target dtype descriptor args preserve-declared-array-storage?]
   (let [m (meta fn-var)
         qualified (symbol (str (ns-name (:ns m))) (str (:name m)))
         arrays (set (:array-params descriptor))
@@ -503,7 +503,9 @@
                                (java.lang.reflect.Array/getLength value)]
                               value)))
                         (:all-params descriptor))]
-    [::compiled qualified target dtype signature (:schedule descriptor)]))
+    (cond-> [::compiled qualified target dtype signature (:schedule descriptor)]
+      preserve-declared-array-storage?
+      (conj {:preserve-declared-array-storage? true}))))
 
 ;; ================================================================
 ;; Pure lowering, composition, and runtime compilation
@@ -516,6 +518,7 @@
            compile-gpu-program derives AND the eventual resident initializers.
    opts  — {:target :ze:0            device-id (default :ze:0)
             :dtype  :float           element dtype (default :float)
+            :preserve-declared-array-storage? true ; retain resolved pointer storage tags
             :donate  [sym …]         resident :state threaded as values (donation)
             :constants [sym …]       frozen, captured once at bind, never per-call
             :outputs [sym …]         additional written params to project as outputs
@@ -525,7 +528,7 @@
             :on-non-resident :nil|:throw
             :schedule <map>}         reserved S6 schedule (threaded into the cache key)"
   [fn-var args {:keys [target dtype donate constants outputs taps roles
-                       gemm-precision on-non-resident schedule]
+                       gemm-precision on-non-resident schedule preserve-declared-array-storage?]
                 :or {target :ze:0 dtype :float on-non-resident :nil}}]
   (let [preparation-started (System/nanoTime)
         template-report (atom nil)
@@ -535,7 +538,9 @@
           ;; forward the S6 schedule so it is resolved + gated by compile-gpu-program;
           ;; the RESOLVED schedule is read back off the descriptor below (never the raw
           ;; input). Harmless where compile-gpu-program predates :schedule (ignored kwarg).
-          schedule (conj :schedule schedule))
+          schedule (conj :schedule schedule)
+          preserve-declared-array-storage?
+          (conj :preserve-declared-array-storage? true))
         template-key
         (fn [revision]
           (template-cache-key
@@ -543,8 +548,10 @@
            (source-specialization-identity fn-var dtype)
            revision
            (target-specialization-identity target)
-           {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
-            :on-non-resident on-non-resident :schedule schedule}
+           (cond-> {:dtype dtype :gemm-precision (or gemm-precision :mixed-f16-f32)
+                    :on-non-resident on-non-resident :schedule schedule}
+             preserve-declared-array-storage?
+             (assoc :preserve-declared-array-storage? true))
            ;; Keeps with-redefs and hot compiler reloads honest.
            (weak-identity @#'pl/compile-gpu-program)))
         prog (binding [*compilation-template-observer* #(reset! template-report %)]
@@ -563,7 +570,7 @@
         public-symbols (vec (distinct (concat donate outputs
                                               (when result-sym [result-sym]) taps)))
         lowering-started (System/nanoTime)
-        plan-id (compilation-id fn-var target dtype prog args)
+        plan-id (compilation-id fn-var target dtype prog args preserve-declared-array-storage?)
         compiler-template-key (template-key (get @template-report :compiler-revision))
         plan-template-key
         {:kind ::resident-plan-template

@@ -149,9 +149,12 @@
   mapped to a floating-point KERNEL dtype (a single-precision kernel reads float buffers regardless of a
   parametric (All [T]) param's default).
   Integral kernel policies retain declared floating types rather than turning scales into bytes.
+  With :preserve-declared-array-storage? true, resolved array tags instead retain their
+  physical element dtype; scalar computation precision is unchanged.
   Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
   opencl-pass reads. ONE derivation, both compile paths."
-  [params tags dtype]
+  ([params tags dtype] (derive-param-types params tags dtype {}))
+  ([params tags dtype {:keys [preserve-declared-array-storage?]}]
   (when (and params tags)
     {:scalar-types (into {} (keep (fn [[p t]]
                                     (case (dtype/dtype-for-scalar-tag t)
@@ -163,9 +166,10 @@
                                   (map vector params tags)))
      :array-types (into {} (keep (fn [[p t]]
                                    (when-let [dt (dtype/dtype-for-array-tag t)]
-                                     [p (if (and (#{:float :double} dt) (dtype/fp-dtype? dtype))
+                                     [p (if (and (not preserve-declared-array-storage?)
+                                                 (#{:float :double} dt) (dtype/fp-dtype? dtype))
                                           dtype dt)]))
-                                 (map vector params tags)))}))
+                                 (map vector params tags)))})))
 
 (def ^:private fatal-reasons
   "A violated invariant is not \"the SegOp path does not cover this form\". Letting one fall through
@@ -419,7 +423,7 @@
      :min-elements  — minimum elements for GPU (default 4096)
      :compile-spirv? — compile to SPIR-V now (default false)"
   [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types
-                  buffer-projections schedule]
+                  buffer-projections schedule preserve-declared-array-storage?]
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
@@ -438,7 +442,8 @@
                                                     :binding binding :field field
                                                     :element-tag element-tag})))]
                                  [(soa-lower/field-arr-sym binding field)
-                                  (if (and (dtype/fp-dtype? field-dtype)
+                                  (if (and (not preserve-declared-array-storage?)
+                                           (dtype/fp-dtype? field-dtype)
                                            (dtype/fp-dtype? dtype))
                                     dtype field-dtype)]))
                              fields)))

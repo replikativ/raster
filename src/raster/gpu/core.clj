@@ -110,14 +110,17 @@
   "Compile a deftm var's par forms to GPU kernels and register them.
    Returns the complete backend result so a session retains first-class dispatches and graphs
    instead of reconstructing them later from the flat kernel list."
-  [v device-id {:keys [dtype min-elements] :or {dtype :float min-elements 0}}]
+  [v device-id {:keys [dtype min-elements preserve-declared-array-storage?]
+                :or {dtype :float min-elements 0}}]
   (let [walked-body (get-walked-body v dtype)
         resolved (or (resolve-deftm-var v) v)
         params (:raster.core/deftm-params (meta resolved))
         tags   (:raster.core/deftm-tags (meta resolved))
         ;; Declared scalar/array element types — the SINGLE shared derivation, used by the
         ;; pipeline's pass-backend too (opencl-pass/derive-param-types). One source of truth.
-        {:keys [scalar-types array-types]} (opencl-pass/derive-param-types params tags dtype)
+        {:keys [scalar-types array-types]}
+        (opencl-pass/derive-param-types params tags dtype
+                                       {:preserve-declared-array-storage? preserve-declared-array-storage?})
         form (let [f (if (= 1 (count walked-body))
                        (first walked-body)
                        (cons 'do walked-body))
@@ -134,6 +137,7 @@
         result (par-opencl scheduled
                            :device-id device-id
                            :dtype dtype
+                           :preserve-declared-array-storage? preserve-declared-array-storage?
                            :array-types array-types
                            :scalar-types scalar-types
                            :min-elements min-elements)]
@@ -455,7 +459,7 @@
    sess: session atom
    phase-key: keyword to identify this kernel group (e.g. :step, :colorize)
    v: var pointing to a deftm function
-   opts: {:dtype :float, :min-elements 0}"
+   opts: {:dtype :float, :min-elements 0, :preserve-declared-array-storage? false}"
   ([sess phase-key v] (compile! sess phase-key v {}))
   ([sess phase-key v opts]
    (let [device-id (:device-id @sess)
@@ -466,7 +470,9 @@
          ;; name → one SPIR-V compile. The bound path already mints a fresh handle per binding from
          ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
          ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
-         cache-key [v (get opts :dtype :float)]
+         cache-key (cond-> [v (get opts :dtype :float)]
+                     (:preserve-declared-array-storage? opts)
+                     (conj {:preserve-declared-array-storage? true}))
          compiled (or (get-in @sess [:kernel-cache cache-key])
                       (let [result (compile-deftm-internal! v device-id opts)]
                         (swap! sess assoc-in [:kernel-cache cache-key] result)
