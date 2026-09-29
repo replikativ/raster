@@ -986,10 +986,18 @@
    without pretending they performed dispatch selection or expanding structured-loop trip counts."
   [executable]
   (let [executable (ensure-live! executable :execution-info)]
-    (if (and (:prepared-program executable) (nil? (:graph-key executable)))
+    (cond
+      (nil? (:prepared-program executable))
+      (mapv (fn [phase]
+              {:phase phase :executable (gpu/execution-info (:session executable) phase)})
+            (:phases executable))
+
+      (nil? (:graph-key executable))
       (parallel-program/execution-info
        (:prepared-program executable)
        #(gpu/kernel-graph-execution-info (:session executable) %))
+
+      :else
       (let [phase-by-source (set/map-invert (descriptor-source-map executable))
             program-info (when-let [prepared (:prepared-program executable)]
                            (parallel-program/execution-info
