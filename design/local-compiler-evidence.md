@@ -176,3 +176,11 @@ the validator now shares checked candidates only within one exact-object validat
 Subsequent shared-laptop phase probes ranged widely, including a 4.4 s program-validation
 subphase versus 16.5 s before the change, but are not controlled A/B evidence of a latency
 improvement. Remaining whole-call/certificate validation must be measured separately.
+
+The call-construction follow-up removes a second validation of the identical emitted program
+inside `EmittedParallelProgramCall/make`: the constructor first validates that program, then
+checks the constructed call against that same object. Public `validate!` still rederives the
+program and rejects a mutated embedded target artifact. A later true template-hit Q4_K probe
+spent 19.7 s preparing the same shape, including 14.9 s constructing its LinkPlan and 4.8 s
+certifying the invocation. This shared-load observation does not isolate a reliable wall-clock
+speedup; the structural reduction is one complete program-validation pass per constructed call.
