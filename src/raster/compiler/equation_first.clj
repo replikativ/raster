@@ -77,7 +77,7 @@
         ;; Parametric deftm wrappers do not themselves retain dispatch tags; get-params and
         ;; build-param-env resolve the same dtype specialization used by get-walked-body.
         tags (mapv param-env parameters)
-        parameter-types (opencl-pass/derive-param-types parameters tags effective-dtype)]
+        parameter-types (opencl-pass/derive-param-types parameters tags effective-dtype options)]
     ;; A device reduction consumed by a later equation is storage, not a host ABI scalar.
     ;; Realize the retained cross-equation use before scheduling/emission, as the resident
     ;; compiler entry does; no binder may repair this by downloading a device result.
@@ -294,7 +294,9 @@
                     "equation-first semantic program has no retained public invocation plan"
                     {:function (function-symbol f-var)}))
          source-ns-symbol (source-namespace-symbol f-var)
-         id [::compilation (function-symbol f-var) target (:dtype compiler-options)]]
+         id (cond-> [::compilation (function-symbol f-var) target (:dtype compiler-options)]
+              (:preserve-declared-array-storage? compiler-options)
+              (conj {:preserve-declared-array-storage? true}))]
      (->EquationFirstCompilation
       id (function-symbol f-var) target (:dtype compiler-options) source-ns-symbol
       (-> compiler-options

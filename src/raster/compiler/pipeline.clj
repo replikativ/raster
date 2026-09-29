@@ -1089,6 +1089,8 @@
                 result (apply opencl-pass/opencl-pass form
                               (cond-> [:device-id target-device
                                        :dtype (:dtype opts)
+                                       :preserve-declared-array-storage?
+                                       (:preserve-declared-array-storage? opts)
                                        :schedule (:schedule opts)
                                        :buffer-projections (:buffer-projections opts)]
                                 ;; Resident buffers cannot be consumed by a host fallback merely
@@ -1375,11 +1377,12 @@
     :inline?         - inline deftm calls (default true)
     :simd?           - apply SIMD optimization to parallel forms (default true)
     :dtype           - numeric dtype (:double or :float, selects overload)
+    :preserve-declared-array-storage? - retain resolved array storage tags on JVM/GPU paths
     :target-device   - device-id for backend selection (e.g. :cuda:0 or :ze:0)
     :target          - :c routes to the native CPU-C backend (one fused C function
                        per deftm via Panama FFM, no per-op JVM dispatch). Bypasses
                        the bytecode/GPU path."
-  [f-var & {:keys [inline? simd? dtype target-device target]
+  [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?]
             :or {inline? true simd? true}}]
   (if (= target :c)
     ;; Native CPU-C backend: emit the whole fused body as one C function (no
@@ -1387,11 +1390,12 @@
     ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
      f-var (or dtype :double))
     (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
-                     :target-device target-device)))
+                     :target-device target-device
+                     :preserve-declared-array-storage? preserve-declared-array-storage?)))
 
 (defn- compile-aot-jvm
   "JVM/GPU compile-aot: bytecode (SIMD) or GPU (target-device) backend."
-  [f-var & {:keys [inline? simd? dtype target-device]
+  [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?]
             :or {inline? true simd? true}}]
   (let [;; Use the classloader that defined the target function's defrecord types.
         ;; Creating a child DCL causes class identity issues: defrecord classes
@@ -1447,9 +1451,11 @@
             parameter-types (opencl-pass/derive-param-types
                              (:raster.core/deftm-params (meta resolved-var))
                              (:raster.core/deftm-tags (meta resolved-var))
-                             effective-dtype)
+                             effective-dtype
+                             {:preserve-declared-array-storage? preserve-declared-array-storage?})
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
-                          :active-params active-params :dtype effective-dtype}
+                          :active-params active-params :dtype effective-dtype
+                          :preserve-declared-array-storage? preserve-declared-array-storage?}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns)
                    param-annotations (assoc :param-annotations param-annotations)
@@ -1868,6 +1874,9 @@
      :nil             — return nil, for probing callers that legitimately fall back to the
                         compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test).
 
+   :preserve-declared-array-storage? retains resolved array/SoA storage tags rather than
+   specializing all floating pointers to :dtype. Scalar computation precision is unchanged.
+
    :compiler-report? records the split resident pass run as it executes and attaches the normalized
    report under :compiler-report. It does not compile a second time. A successful resident extraction
    certifies zero internal host allocations/round-trips; descriptor :allocs are counted separately as
@@ -1895,7 +1904,8 @@
    KernelDispatch expression cases from ordinary typed contraction facts. LinkPlan instantiation
    selects and binds that compiler value; it does not recognize GEMM shapes or reconstruct
    conversion/split kernels."
-  [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?]
+  [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?
+                            preserve-declared-array-storage?]
                       :or {on-non-resident :throw gemm-precision :mixed-f16-f32}}]
   (when (dispatch/host-only? f-var)
     (throw (ex-info "GPU compilation was requested for an explicitly host-only deftm"
@@ -1957,13 +1967,15 @@
         ;; program dtype. Value-type signatures are derived only after SoA expansion below.
         (when-not value-fn?
           (opencl-pass/derive-param-types
-           (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype))
+           (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype
+           {:preserve-declared-array-storage? preserve-declared-array-storage?}))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
                           :active-params active-params :dtype effective-dtype
                           ;; Resident reduction realization is a TypedSOAC transform. The logical
                           ;; scalar remains rank zero while its explicit representation and SegOp
                           ;; roles keep the physical one-element buffer resident.
-                          :resident-reductions? true}
+                          :resident-reductions? true
+                          :preserve-declared-array-storage? preserve-declared-array-storage?}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns)
                    pre-gpu-param-types
@@ -1980,9 +1992,11 @@
           (soa-lower/soa-lower form-mat param-specs)
           {:body form-mat :params param-specs :soa-expansion {}})
         gpu-param-types (opencl-pass/derive-param-types
-                         (mapv :sym eff-param-specs) (mapv :tag eff-param-specs) effective-dtype)
+                         (mapv :sym eff-param-specs) (mapv :tag eff-param-specs) effective-dtype
+                         {:preserve-declared-array-storage? preserve-declared-array-storage?})
         original-param-types (opencl-pass/derive-param-types
-                              (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype)
+                              (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype
+                              {:preserve-declared-array-storage? preserve-declared-array-storage?})
         original-array-set (set (keys (:array-types original-param-types)))
         all-params (mapv :sym param-specs)
         array-params (filterv #(or (contains? soa-expansion %)
@@ -2012,6 +2026,7 @@
               soa-expansion))
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
                            :resident-gpu? true
+                           :preserve-declared-array-storage? preserve-declared-array-storage?
                            :active-params active-params :dtype effective-dtype
                            :schedule resolved-schedule
                            :buffer-projections (soa-lower/buffer-projections soa-expansion)}
@@ -2519,7 +2534,7 @@
     :target-device   - device-id for backend (e.g. :cuda:0)
     :inline?         - inline deftm calls (default true)"
   [f-var & {:keys [mode inline?
-                   simd? target-device dtype]
+                   simd? target-device dtype preserve-declared-array-storage?]
             :or {mode :forward
                  simd? true}}]
   (let [inline? (if (nil? inline?) true inline?)
@@ -2545,12 +2560,14 @@
         parameter-types (opencl-pass/derive-param-types
                          (:raster.core/deftm-params (meta resolved-var))
                          (:raster.core/deftm-tags (meta resolved-var))
-                         effective-dtype)
+                         effective-dtype
+                         {:preserve-declared-array-storage? preserve-declared-array-storage?})
         opts (cond-> {:inline? inline?
                       :diagnostic? true
                       :active-params active-params
                       :simd? simd? :target-device target-device
-                      :dtype effective-dtype}
+                      :dtype effective-dtype
+                      :preserve-declared-array-storage? preserve-declared-array-storage?}
                param-env (assoc :param-env param-env)
                source-ns (assoc :source-ns source-ns)
                parameter-types (assoc :scalar-types (:scalar-types parameter-types)

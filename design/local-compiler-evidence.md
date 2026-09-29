@@ -1,5 +1,22 @@
 # Local compiler evidence — 2026-09-27
 
+## Declared array storage — 2026-09-30
+
+The opt-in `:preserve-declared-array-storage? true` keeps resolved array element tags as
+physical pointer storage facts, independently of the kernel's scalar compute precision.
+The default precision specialization is unchanged. Both equation-first and resident-descriptor
+public lowering use the same parameter derivation; SoA fields follow the same policy. Template
+and compilation identities distinguish the policy before reuse. Explicitly typed allocations
+remain storage facts; dtype-polymorphic allocations still follow the compute specialization.
+
+Focused checks cover semantic values, pointer ABI/emitted source, default behavior and template
+separation. Mixed Float inputs and Double state/output match the JVM across two replays through
+both public compiler routes on local OpenCL and Level Zero (eight device assertions).
+This is a general mixed-storage contract, not a completed ASR weight-capture schedule, a new
+numerical reassociation policy, or NVIDIA/AMD device evidence.
+
+## Acceptance snapshot
+
 This is a bounded acceptance snapshot, not a declaration that the compiler campaign is finished.
 The numerical workloads below use existing source programs and reference tests; no benchmark-only
 kernel implementation was substituted. OpenCL and Level Zero here both mean the same local Intel

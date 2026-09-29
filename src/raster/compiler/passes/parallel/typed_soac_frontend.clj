@@ -1715,9 +1715,9 @@
    allocation such as an attention output would otherwise have no declared dtype and every map
    writing it would decline. Declared `array-types` take precedence.
 
-   Float-family tags follow the kernel dtype exactly as `derive-param-types` maps the
-   parameters: a kernel compiled at `:float` reads and writes float buffers throughout, so a
-   double-declared allocation inside it is a float buffer of that kernel, not a second precision."
+   Explicit allocation element types remain physical storage facts. Only dtype-polymorphic
+   allocations follow the kernel policy. Parameter facts come from `derive-param-types`, whose
+   optional declared-storage policy is resolved before this frontend; declared facts win here."
   [pairs array-types dtype]
   (let [kernel-dtype (some-> dtype dtype/canon)
         default-read-types
