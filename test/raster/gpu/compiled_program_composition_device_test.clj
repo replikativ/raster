@@ -50,6 +50,9 @@
                        (:per-replay (link/execution-order (:executable artifact)))))))
       (is (some? (get-in artifact [:executable :graph-key]))
           "straight-line emitted-only composition records one command graph")
+      (is (every? (comp nil? :runtime-graph)
+                  (vals (:kernel-graphs @(:session (:executable artifact)))))
+          "the enclosing replay does not record each emitted subgraph again")
       (doseq [input [[1.0 2.0 3.0 4.0] [5.0 6.0 7.0 8.0]]]
         (let [output (artifact {[:first :input] (float-array input)})]
           (is (= (mapv #(* 4.0 %) input)
