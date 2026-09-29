@@ -9,35 +9,39 @@ The current local-first landing order and completion gates are in
 [compiler-consolidation.md](compiler-consolidation.md). The checkpoint below and chronological
 notes retain the wider campaign and its implementation history.
 
-## Current eight-item checkpoint — 2026-09-23
+## Current eight-item checkpoint — 2026-09-29
 
 This section supersedes historical "next" and "still required" statements below where the cited
 implementation now exists. It records evidence, not a declaration that the campaign is complete.
-#562 and #563 landed after all seven final-head gates passed. #563 is on main at `c3678bcd`;
-do not infer a published release from a merge.
+The detailed local execution and preparation evidence is in
+[local-compiler-evidence.md](local-compiler-evidence.md). The wider campaign remains open;
+do not infer a published release from a merge, or device performance from source compilation.
 
 | Campaign item | Current evidence | Remaining acceptance |
 |---|---|---|
 | 1. CI feedback and coverage | `.circleci/config.yml` uses four deterministic test shards plus public CUDA/HIP compile and OpenCL CPU gates. Targeted laptop checks use one capped REPL. The OpenCL corpus gate now writes its complete same-compile report under `test-results/coverage`, which CircleCI already retains. | Continue measuring shard balance and skip reasons; preserve whole-suite coverage while reducing feedback latency. Green compile jobs alone do not permit merge. |
 | 2. Compatibility-debt ledger | `test/raster/compiler/compatibility_ledger.edn` has executable signature checks; `test/resources/coverage/gpu-corpus.edn` retains every corpus row, including errors. The baseline was refreshed through the real CPU OpenCL entry on 2026-09-21. | Keep the committed portable baseline and full target-specific CI report distinct; distinguish public invocation coverage from compatibility-entry census results. Never delete failed rows to improve the count. |
-| 3. Direct TypedSOAC and retirement | The measured 246-var corpus now has 227 flat TypedSOAC, 1 typed structured-control, 12 scalar and 6 explicit host-only rows, with no compatibility or error route. It emits 875 KernelBody artifacts and no compatibility artifacts. Explicit-seed SplitMix dropout is one portable typed map with no seed-array intermediate; only the convenience API that creates a host `java.util.Random` remains host-only. Masked MSE and stable cross-entropy forward/backward paths use resident product-reduction/map graphs, including caller-owned scalar-result boundaries. In-place im2col is one total unique-index layout map, including deterministic writes to padded cells in reused resident buffers; max-pool is an output-parallel ordered window fold plus value gather with stable global argmax indices. Group-norm reverse/forward derivatives and batch norm are explicit mean/variance/product reductions followed by dense maps rather than nested mutable scratch; batch norm keeps its train/eval state mutation explicit for later JIT specialization. Scheduled SegMaps fail closed at the common KernelBody boundary on every target instead of recovering through the source-shaped OpenCL emitter. The 26 programs recording declines are rejected faster matrix candidates even though KernelBody wins. Generated matrix/input-fusion, reductions, ordinary counted stores, AD/SGD, ABM effects and numerical operators use retained typed programs. | Classify the remaining 12 scalar rows as host scalar policies, superseded references, or missing parallel structure; then retire the remaining contraction/source compatibility entries. Source/emitter coverage is not proof of competitive scheduling or vendor device performance; matched accelerator execution and roofline evidence remain required. |
+| 3. Direct TypedSOAC and retirement | The committed portable corpus baseline contains 251 source functions: 238 flat TypedSOAC, 1 typed structured-control, 6 scalar and 6 explicit host-only rows, with no compatibility or error route. Five scalar rows are value helpers; the sixth is the allocating ASR alignment-weight routine `gqa-decode-attention-weights!`, not a resident GPU program. Generated matrix/input-fusion, reductions, counted stores, AD/SGD, ABM effects and numerical operators use retained typed programs and fail closed instead of recovering through the source-shaped OpenCL emitter. Disabled schedule-family policy is now distinct from a real lowering decline in coverage reports. City two-exit/multiple-recur probes have exact local parity; P20f retains an explicit unbounded unchecked-int induction decline. | Migrate the ASR weight-capture workload with explicit scratch/output ownership; keep source-language support broader than this fixed corpus visible through external regression cases. Preserve numerical, effect and overflow semantics rather than forcing unsupported loops through a fallback. Source coverage is not competitive scheduling or vendor device performance; matched accelerator execution and roofline evidence remain required. |
 | 4. CUDA/HIP public-source verticals | Public numerical, attention and matrix fixtures compile in hardware-free vendor gates; allocation-free LinkPlan lowering is tested separately from source emission. | Vendor compilation is not vendor device correctness or performance. Keep matched execution/benchmark campaigns outside the laptop/CI dependency chain. |
 | 5. Reusable training and external models | Direct equation-first AD/SGD and small resident Gemma/LoRA tests check state progress, numerical trajectories and admitted routes. | External forward/VJP/update adapter migration and real-weight validation in pretrained/finetune remain. The inspected finetune checkout still uses retired `bind-program!`/`run-program!`; do not resurrect them. |
 | 6. Hardware-free distributed simulation | `distributed_plan_test.clj` covers topology, dependency/resource overlap, directed routes, capacity gates, collectives, halos and certificate drift. | Calibrate against real execution and broaden workload projections without presenting analytic costs as measured performance. |
 | 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. | Real multi-device/fabric execution, overlap and distributed training collectives still need numerical validation. Co-location validates ownership/scheduling, not network performance. |
 | 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. | Production manifest publication/lineage realization, a numerical PDE evolution using coarse/fine exchange, convergence/conservation oracles, and later subcycling/reflux remain. A fixed transfer roundtrip is not an adaptive simulator. |
 
-External source audit rechecked at this checkpoint: pretrained-rstr `3b13ad4`, finetune-rstr
-`9e9ba5d`. No sibling code or dependency was modified. Finetune's declared released dependency is
-still Raster 0.2.287; its layer forward/backward code still names the retired binder. Existing
+External source audit rechecked at this checkpoint: pretrained-rstr `f4c2bb4` declares Raster
+0.2.545; finetune-rstr `9e9ba5d` still declares 0.2.287 and its layer forward/backward code names
+the retired binder. Both checkouts contain local work, so these observations are not clean
+external model-validation results. No sibling code or dependency was modified. Existing
 in-repository training evidence must not be substituted for those external gates.
 
 ### Execution order from this checkpoint
 
-1. #563 is merged after the reviewed #562 landing, with all seven current-head gates. Complete-write evidence must
-   remain distinct from conditional initialized postconditions; fresh prefix results must remain
-   legal without crediting untouched parent tails. Scalar reductions include their exact one-element
-   resident representation. Invalid shape diagnostics propagate; unsupported proofs may decline.
+1. Finish the local public workload/support matrix and host-preparation audit before adding
+   vendor-device claims. Keep complete-write evidence distinct from conditional initialized
+   postconditions; fresh prefix results must remain legal without crediting untouched parent
+   tails. Scalar reductions retain their exact one-element resident representation. Invalid
+   shape diagnostics propagate; unsupported proofs may decline. Public validations remain
+   independent; redundant proofs may be shared only inside an exact synchronous construction scope.
 2. Select the next compiler migration from a reproduced public workload, using the compatibility
    ledger to distinguish stale entry-point accounting from an actual semantic/emission gap. Preserve
    the corresponding JVM path and independent numerical tests while retiring the migrated fallback.
