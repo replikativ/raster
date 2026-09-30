@@ -114,8 +114,8 @@
           (throw exception))))))
 
 (defn- validate-equation-call-against-boundary!
-  ;; Only synchronous callers below supply the exact boundary and physical-results projection
-  ;; just checked by emitted-equation/physical-results. No proof escapes into the call record.
+  ;; Only synchronous callers below supply the exact boundary and storage projection just
+  ;; produced by emitted-equation validation. No proof escapes into the call record.
   [call emitted physical]
   (when-not (emitted-equation-call? call)
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
@@ -175,7 +175,7 @@
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
   (let [boundary (equation-dispatch/boundary-equation
                   (first (:operations (:equation call))))
-        ;; Independent outside a synchronous rename. Inside it, only the exact already-checked
+        ;; Independent outside checked construction. Inside it, only the exact already-checked
         ;; immutable boundary's projection may be reused; every call/binding check still runs.
         physical (checked-physical-results boundary)]
     (validate-equation-call-against-boundary! call boundary physical)))
@@ -389,8 +389,16 @@
   (when-not (emitted-program-call? call)
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
-  (validate-call-against-program!
-   call (emitted-program/validate! (:program call)) nil))
+  (let [{:keys [program projections]}
+        (emitted-program/validate-with-physical-results! (:program call))
+        checked (binding [*validated-boundary-projections* projections]
+                  (validate-call-against-program! call program nil))]
+    ;; Every public validation starts with a fresh complete program check and projection index.
+    ;; A synchronous enclosing rename may retain only facts from this successful check; mapper
+    ;; callbacks never inherit that rename context and no index is stored in the returned call.
+    (when *validated-boundary-projections*
+      (.putAll ^java.util.IdentityHashMap *validated-boundary-projections* projections))
+    checked))
 
 (defn execution-order
   "Project straight-line selected graph order without allocating device storage.

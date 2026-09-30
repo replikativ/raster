@@ -888,9 +888,9 @@
 (deftest buffer-remapping-rechecks-bindings-but-validates-its-unchanged-program-once
   (let [{:keys [call]} (prepared-mixed-call 3)
         validations (atom 0)
-        original emitted-program/validate!
+        original emitted-program/validate-with-physical-results!
         source-program (:program call)]
-    (with-redefs [emitted-program/validate! (fn [program]
+    (with-redefs [emitted-program/validate-with-physical-results! (fn [program]
                                             (when (identical? source-program program)
                                               (swap! validations inc))
                                             (original program))]
@@ -923,25 +923,59 @@
         numerical-step (first (filter program-call/emitted-equation-call? (:steps call)))
         boundary (first (get-in numerical-step [:equation :operations]))
         projections (atom 0)
-        original emitted-equation/physical-results]
-    (with-redefs [emitted-equation/physical-results
+        validations (atom 0)
+        original emitted-equation/validate-with-physical-results
+        original-validation emitted-equation/validate!]
+    (with-redefs [emitted-equation/validate-with-physical-results
                   (fn [equation]
                     (when (identical? boundary equation) (swap! projections inc))
-                    (original equation))]
+                    (original equation))
+                  emitted-equation/validate!
+                  (fn [equation]
+                    (when (identical? boundary equation) (swap! validations inc))
+                    (original-validation equation))]
       (let [remapped (program-call/map-buffers call #(vector :renamed %))]
         (is (= 1 @projections) "source and renamed call share only this exact projection")
+        (is (= 1 @validations) "the enclosing program and its calls share one boundary check")
+        (is (not (contains? remapped :projections)) "no proof index escapes into the call")
         (program-call/validate! remapped)
         (is (= 2 @projections) "later public validation is independent")
+        (is (= 2 @validations))
         (program-call/map-buffers call #(vector :again %))
-        (is (= 3 @projections) "a later rename has a fresh context"))
+        (is (= 3 @projections) "a later rename has a fresh context")
+        (is (= 3 @validations)))
       (reset! projections 0)
+      (reset! validations 0)
       (let [nested? (atom false)]
         (program-call/map-buffers
          call (fn [value]
                 (when (compare-and-set! nested? false true)
                   (program-call/validate! call))
                 [:nested value]))
-        (is (= 2 @projections) "mapper validation cannot borrow the rename's context")))))
+        (is (= 2 @projections) "mapper validation cannot borrow the rename's context")
+        (is (= 2 @validations))))))
+
+(deftest public-call-projections-are-fresh-and-published-only-after-complete-validation
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        step-index (first (keep-indexed (fn [i step]
+                                         (when (program-call/emitted-equation-call? step) i))
+                                       (:steps call)))
+        step (get-in call [:steps step-index])
+        boundary (first (get-in step [:equation :operations]))
+        context-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                '*validated-boundary-projections*)
+        inherited (java.util.IdentityHashMap.)]
+    (.put inherited boundary {:unverified :projection})
+    (with-bindings {context-var inherited}
+      (is (identical? call (program-call/validate! call))))
+    (is (= (emitted-equation/physical-results boundary) (.get inherited boundary))
+        "public validation does not borrow an enclosing projection")
+    (let [failed-context (java.util.IdentityHashMap.)]
+      (with-bindings {context-var failed-context}
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (program-call/validate!
+                      (assoc-in call [:steps step-index :outputs] {})))))
+      (is (.isEmpty failed-context) "failed call checks publish no derived facts"))))
 
 (deftest boundary-projection-reuse-does-not-accept-equal-copies-or-changed-bodies
   (let [{:keys [call]} (prepared-mixed-call 3)

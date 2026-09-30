@@ -144,15 +144,23 @@
                    (scheduled-body/scheduled-kernel-body? certificate))
           (contraction-schedule/complete-write-domain algorithm node source certificate))))))
 
+(defn ^:no-doc validate-with-physical-results
+  "Validate an equation and return its exact boundary with the derived storage projection.
+   This report is data, not authority to accept a later call without checking its bindings."
+  [emitted]
+  (let [{:keys [algorithm body] :as checked} (validate! emitted)]
+    {:boundary checked
+     :physical-results
+     (if (swr/plan? algorithm)
+       (let [equation (last (:equations body))]
+         (zipmap (:results equation)
+                 (map :destination (get-in equation [:attributes :result-storage]))))
+       (soac/physical-result-map algorithm))}))
+
 (defn physical-results
   "Project logical results to physical storage from the retained, validated semantic equation."
   [emitted]
-  (let [{:keys [algorithm body]} (validate! emitted)]
-    (if (swr/plan? algorithm)
-      (let [equation (last (:equations body))]
-        (zipmap (:results equation)
-                (map :destination (get-in equation [:attributes :result-storage]))))
-      (soac/physical-result-map algorithm))))
+  (:physical-results (validate-with-physical-results emitted)))
 
 (defn make
   ([algorithm body emitted]
