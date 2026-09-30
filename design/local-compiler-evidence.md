@@ -30,6 +30,39 @@ top-level `:override-deps` entry (which does not override this consumer dependen
 Initial runs accidentally used the released artifact; they established the released
 failure only and are excluded from candidate evidence. No sibling checkout was changed.
 
+The larger external synthetic composition also passes on both local backends: one
+ModernBERT encoder block → final norm → two Laya decision heads, instantiated through
+`compile-decision-hidden` and replayed twice through `decision-hidden`. Its 128 elements
+match the chained uncompiled JVM source with maximum absolute error
+8.64267349243164e-6. The external ModernBERT/Laya focused suites pass 8 tests/80 assertions.
+Weights are small synthetic tensors; model-loading, large contexts, performance and real
+checkpoint acceptance remain separate.
+
+## Structured AD invocation and external Gemma — 2026-09-30
+
+Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
+adapter as defmodel forward/AOT invocation. The duplicate rest-argument flattening loop
+was silently truncating surplus arguments and supplying nil for missing ports. Tree-shape
+and naked identity-alias validation also now run before the flat AD program. Gradient
+reconstruction, leaf ordering and underlying differentiation rules are unchanged. This is
+an intentional surface correction: malformed structured AD calls fail at the same boundary
+as forward calls, rather than proceeding with shifted values or ambiguous tied gradients.
+It does not introduce variadic deftm support or a new AD dispatch/type registry.
+
+Focused params/MLP tests pass 13 tests/45 assertions, including valid gradient equivalence
+and proof that invalid calls do not execute the flat AD program. A clean isolated snapshot
+of committed finetune-rstr `9e9ba5d` passes its FP32-vs-FP64 Gemma gradient test (1/16).
+Its synthetic CPU LoRA SFT test reduces loss from 3.8179 to 1.3685 over 150 updates.
+The one/two-block Params-tree gradient tests originally passed an obsolete extra batch
+argument to their own batchless declarations. Correcting only those four calls in the
+temporary snapshot yields 2 tests/32 finite-difference assertions passing across all fourteen
+adapter roles. These corrected tests are experimental evidence, not an unchanged consumer
+suite passing. The actual sibling checkout and its local work remain untouched.
+
+External GPU training migration, real weights and device optimizer acceptance still remain.
+The archived finetune adapter still names retired runtime entry points; this work neither
+restores them nor substitutes a Raster-side model twin for that external gate.
+
 ## Declared array storage — 2026-09-30
 
 The opt-in `:preserve-declared-array-storage? true` keeps resolved array element tags as

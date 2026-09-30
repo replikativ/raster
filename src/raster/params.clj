@@ -296,7 +296,9 @@
   trees of the same shape as the input tree (one entry per leaf,
   including Frozen leaves whose grads are typically zero arrays).
 
-  For non-tree args, the grad is the raw flat output from value+grad."
+  The returned function has the model's fixed arity and the same tree-shape and
+  identity-alias validation as forward invocation. For non-tree args, the grad
+  is the raw flat output from value+grad."
   [model-var]
   (let [m            (meta model-var)
         flat-var     (or (::flat-var m) (throw (ex-info "Not a defmodel var" {:var model-var})))
@@ -308,32 +310,25 @@
   [model-var m flat-var treedefs original-args]
   (let [;; Avoid hard-required dependency on ad.reverse at namespace load
         vg           (raster.ad.reverse/value+grad flat-var)]
-    (fn [& user-args]
-      (let [;; Same flatten as the forward adapter
-            flat (loop [args original-args, vals user-args, acc (transient [])]
-                   (if-let [a (first args)]
-                     (let [v (first vals)]
-                       (recur (rest args) (rest vals)
-                              (if-let [td (get treedefs a)]
-                                (reduce conj! acc (pf/flatten-value (:spec td) v))
-                                (conj! acc v))))
-                     (persistent! acc)))
-            flat-out (apply vg flat)
-            value    (first flat-out)
-            flat-grads (rest flat-out)]
-        ;; Walk arg list in lockstep with flat-grads, restructuring tree grads
-        (loop [args original-args
-               flat-grads flat-grads
-               out  (transient [value])]
-          (if-let [a (first args)]
-            (if-let [td (get treedefs a)]
-              (let [n (count (:leaves td))
-                    arg-grads (take n flat-grads)
-                    rest-flat (drop n flat-grads)
-                    structured (pf/unflatten-value (:spec td) (vec arg-grads))]
-                (recur (rest args) rest-flat (conj! out structured)))
-              (recur (rest args) (rest flat-grads) (conj! out (first flat-grads))))
-            (persistent! out)))))))
+    (compile-flatten-wrapper
+     (fn [& flat]
+       (let [flat-out (apply vg flat)
+             value    (first flat-out)
+             flat-grads (rest flat-out)]
+         ;; Walk arg list in lockstep with flat-grads, restructuring tree grads
+         (loop [args original-args
+                flat-grads flat-grads
+                out  (transient [value])]
+           (if-let [a (first args)]
+             (if-let [td (get treedefs a)]
+               (let [n (count (:leaves td))
+                     arg-grads (take n flat-grads)
+                     rest-flat (drop n flat-grads)
+                     structured (pf/unflatten-value (:spec td) (vec arg-grads))]
+                 (recur (rest args) rest-flat (conj! out structured)))
+               (recur (rest args) (rest flat-grads) (conj! out (first flat-grads))))
+             (persistent! out)))))
+     original-args treedefs)))
 
 (defn strip-leaf-wrappers
   "Walk a tree spec and remove Param/Frozen wrappers from every leaf,
