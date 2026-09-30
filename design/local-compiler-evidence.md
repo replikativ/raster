@@ -105,7 +105,24 @@ The same actual Gemma composition retains an exactly equal 247-node / 2-instance
 equation-call checks still run, while physical-result queries fall from 651 to 434. An instrumented
 sample reports 29.17 s total, 14.08 s remapping and 14.84 s final plan construction. This is not a
 controlled speedup comparison; independent final plan validation remains intact. The count reduction
-and unchanged plan are the proof, not the sampled timing. Full CI acceptance is pending for this slice.
+and unchanged plan are the proof, not the sampled timing. All seven CI gates passed; this slice
+squash-merged as #952 (`c7d54f84`).
+
+### Executable graph validation deduplication — 2026-09-30
+
+The next shared preparation cleanup removes the immediate `KernelGraph/validate!` call
+before `KernelExecutable/validate!` in emitted-equation validation. The latter already calls
+the former, then checks the external ABI, scalar dependencies, artifact bindings and targets.
+The two independent dataflow-contract projections remain. A regression counts three exact
+emitted-graph checks instead of four per equation validation, repeats the public validation
+to prove freshness, and checks malformed graph rejection. No retained proof or cache is added.
+
+The affected equation/semantic-composition/public-composition suites pass 35 tests / 180
+assertions. Native composition tests add 9 tests / 88 assertions on both OpenCL and Level Zero;
+availability is explicitly asserted afterward, not inferred from a passing suite. All checks
+reuse the existing source-verified REPL. The retained external Gemma profiling attempt exceeded
+its 60-second diagnostic limit under background load and was interrupted; it supplies no timing
+or speedup evidence for this change. Full CI acceptance remains separate.
 
 ## Structured AD invocation and external Gemma — 2026-09-30
 

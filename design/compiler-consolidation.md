@@ -7,6 +7,21 @@ Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/H
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.
 
+### Parallel CUDA ownership — 2026-09-30
+
+Native CUDA backend implementation and device acceptance are delegated to a separate
+collaborator. They do not gate the local consolidation campaign. Work here remains the shared
+TypedSOAC/control and AD semantics, generated scheduling vocabulary, ABI/LinkPlan ownership,
+preparation-cost deduplication and OpenCL/Level Zero workload acceptance. Keep the hardware-free
+vendor compile gates running to catch changes to that shared vocabulary.
+
+Backend-neutral does not mean hardware-oblivious: target descriptors constrain legal schedules,
+instruction shapes, memory spaces, subgroup widths and synchronization. CUDA may specialize
+those existing contracts; missing hardware operations should be proposed as explicit shared
+IR capabilities, not a second binding, ownership or compiler-cache convention. Local numerical
+oracles and vendor device execution remain separate acceptance evidence. Shared IR/ABI changes
+should include their compatibility impact for the collaborator.
+
 Verified dense f16 contractions now produce the same scheduled matrix-body vocabulary for
 the exact DPAS, CUDA MMA, and CDNA MFMA instruction shapes. Authoritative device facts must
 agree with the requested instruction and subgroup width. Direct CUDA/HIP schedules require

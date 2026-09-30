@@ -71,7 +71,9 @@
         expected (expected-graph algorithm body)
         refinement (when refinement (refinement/validate-against! refinement expected))
         scheduled (if refinement (refinement/scheduled-graph refinement) expected)
-        emitted (-> graph graph/validate! executable/validate!)]
+        ;; Executable validation already validates this exact graph before checking its ABI,
+        ;; scalar dependencies and artifacts. Do not immediately repeat the graph proof.
+        emitted (executable/validate! graph)]
     (when-not (every? (comp artifact/kernel-artifact? :operation) (:nodes emitted))
       (fail! :emitted-parallel-equation-artifact
              "emitted equation graph requires only KernelArtifact nodes" {}))

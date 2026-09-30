@@ -156,6 +156,27 @@
               #(emitted-equation/validate!
                 (assoc emitted :body (assoc-in body [:equations 0 :operands] [])))))))))
 
+(deftest equation-does-not-repeat-the-executable-graph-check
+  (let [{:keys [algorithm body source]} (scheduled-fixture)
+        emitted (emitted-equation/make algorithm body (emit-graph source))
+        emitted-graph (:graph emitted)
+        checked (atom 0)
+        original graph/validate!]
+    (with-redefs [graph/validate!
+                  (fn [candidate]
+                    (when (identical? emitted-graph candidate) (swap! checked inc))
+                    (original candidate))]
+      (is (identical? emitted (emitted-equation/validate! emitted)))
+      ;; One executable check plus the two independent dataflow-contract projections.
+      ;; There must not be an additional check immediately before executable validation.
+      (is (= 3 @checked))
+      (is (identical? emitted (emitted-equation/validate! emitted)))
+      (is (= 6 @checked) "later public checks remain independent"))
+    (testing "the delegated executable check still rejects malformed graphs"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emitted-equation/validate!
+                    (assoc emitted :graph (assoc emitted-graph :outputs nil))))))))
+
 (deftest emitted-equation-certifies-both-links-of-a-one-to-many-schedule
   (let [{:keys [algorithm body refined witness]} (scheduled-fixture)
         emitted (emit-graph refined)
