@@ -40,6 +40,8 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.value :as value]
             [raster.gpu.link :as link]
             [raster.gpu.descriptor-fixture :as fixture]))
 
@@ -246,36 +248,29 @@
           n-steps 25
           st0 (init-state cfg)
           args (train-args cfg st0 lr)
-          prog (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
-                                       :on-non-resident :nil
-                                       :gemm-precision :f32-scalar)
-          step-kinds (frequencies (mapv :convention (:steps prog)))]
+          prepared (compiled/lower #'gblk-train-step args
+                                   {:compiler :equation-first :target :ze:0 :dtype :float
+                                    :inline? true :schedule {:precision :f32-scalar}
+                                    :donate adapter-syms
+                                    :constants (vec (remove (set adapter-syms) (keys st0)))})]
       (testing "the fused fwd+bwd+SGD train step extracts FULLY RESIDENT"
-        (is (some? prog)
-            "compile-gpu-program returned nil ⇒ a step fell back to the host")
-        (println "  [gemma train-step] resident steps:" (count (:steps prog))
-                 "by kind:" step-kinds))
-      (when prog
-        (let [sess (gpu/make-session :ze:0)]
+        (is (zero? (get-in (compiled/plan prepared) [:attributes :driver-allocations]))
+            "public lowering must not allocate device storage"))
+        (let [program (compiled/instantiate! prepared)]
           (try
-            (let [program
-                  (fixture/instantiate!
-                   sess prog args
-                   (merge (zipmap adapter-syms (repeat :state))
-                          (zipmap '[x input-ln q-norm k-norm post-attn
-                                    pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
-                                  (repeat :constant))))
-                  gpu-state (fn [] (reduce (fn [m s]
-                                             (assoc m s (fixture/download program s)))
-                                           st0 adapter-syms))
-                  gpu-losses (loop [k 0 losses [(host-loss cfg st0)]]
+            (let [gpu-state (fn [outputs]
+                              (reduce (fn [m s]
+                                        (assoc m s (value/->host
+                                                    (get outputs (keyword (str (name s) "'"))))))
+                                      st0 adapter-syms))
+                  trajectory (loop [k 0 losses [(host-loss cfg st0)] state st0]
                                (if (= k n-steps)
-                                 losses
-                                 (do (fixture/run! program args)
-                                     (recur (inc k)
-                                            (conj losses (host-loss cfg (gpu-state)))))))
+                                 {:losses losses :state state}
+                                 (let [state (gpu-state (program {}))]
+                                   (recur (inc k) (conj losses (host-loss cfg state)) state))))
+                  gpu-losses (:losses trajectory)
                   cpu-losses (cpu-train! cfg (clone-adapters st0) lr n-steps)
-                  final-adapters (gpu-state)]
+                  final-adapters (:state trajectory)]
               (println "  [gemma train-step] GPU loss:"
                        (mapv #(format "%.6f" %) (take 4 gpu-losses)) "…"
                        (mapv #(format "%.6f" %) (take-last 3 gpu-losses)))
@@ -297,7 +292,7 @@
                 (doseq [[k g c] (map vector (range) gpu-losses cpu-losses)]
                   (is (< (/ (Math/abs (- g c)) (max 1e-9 (Math/abs c))) 1.0e-3)
                       (format "step %d GPU %.6f vs CPU %.6f" k g c)))))
-            (finally (gpu/close-session! sess))))))))
+            (finally (compiled/close! program)))))))
 
 ;; ═════════════════════════════════════════════════════════════════════════════════
 ;; MIXED-PRECISION BACKWARD (S2a): the SAME resident train step (value+grad + SGD) under
