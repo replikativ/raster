@@ -109,6 +109,22 @@ remain open. Its contract is:
 AD consolidation and external training validation remain separate obligations. None of these
 inference-only checks establishes differentiability, general loop tapes, or higher-order AD.
 
+### Parametric source reload contract
+
+The ASR precision investigation exposed a separate warm-REPL correctness gap: after redefining
+an `All [T]` function, its default Double method changed but a previously materialized Float
+method remained callable through both generic dispatch and compiler resolution. Derived method
+metadata now records its template annotation signature and concrete type-variable bindings.
+Replacing that exact template eagerly rebuilds its already materialized bindings through the
+existing registration-only callback. Explicit concrete overloads have no such provenance and
+remain intact; derived rebuilding does not advance the semantic source epoch again.
+
+This is a direct-template replacement contract, not transactional reload or global dependency
+invalidation. Next, audit stale/orphaned mangled Vars, eager Double provenance and transitive
+inlined callees against the existing definition epoch and source-dependency manifest. Existing
+compiled artifacts or captured dispatch objects are not retroactively rewritten. Keep those
+obligations distinct from the artifact cache's existing epoch invalidation.
+
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable

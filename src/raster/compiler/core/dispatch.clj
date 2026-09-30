@@ -1228,6 +1228,8 @@
                  tag)))))
        templates))))
 
+(declare parametric-register)
+
 (defn register-parametric!
   "Register a parametric method template.
    type-vars: [T] — the type variables
@@ -1245,7 +1247,18 @@
                    :params (vec params)
                    :body body
                    :source-ns source-ns}
-        anns-key (vec annotations)]
+        anns-key (vec annotations)
+        ;; Derived methods belong to a template signature, not merely to a dtype.
+        ;; Keep explicit overloads intact and rebuild only materialized bindings of
+        ;; the template being replaced. The existing registration callback updates
+        ;; the bytecode impl, current typed dispatch object and annotations.
+        materialized (distinct
+                      (keep (fn [method]
+                              (when (= anns-key (get-in method [:warning-meta
+                                                               ::parametric-annotations]))
+                                (get-in method [:warning-meta ::parametric-bindings])))
+                            (some->> (get @dispatch-tables fn-name) deref vals
+                                     (mapcat identity))))]
     ;; Replace existing entry with matching annotations (REPL reload safety),
     ;; or append if no match exists.
     (let [registered
@@ -1258,6 +1271,8 @@
                        (assoc entries idx new-entry)
                        (conj entries new-entry)))))]
       (bump-compiler-definition-revision!)
+      (doseq [bindings materialized]
+        (@parametric-register fn-name new-entry bindings []))
       registered)))
 
 ;; Callback for parametric specialization. Set by core.clj during loading.
