@@ -37,14 +37,10 @@
   (filterv (fn [[slot _]] (= :scalar (:kind slot)))
            (mapv vector (:abi graph) (:arguments graph))))
 
-(defn external-alias-violations
-  "Return graph access/dependency hazards for complete public physical bindings, without driver
-   work. overlaps? must conservatively compare physical values/ranges. Private allocations are
-   not supplied. Dtype, capacity, scalar preconditions and node ABI checks remain separate.
-   Incomplete bindings throw: missing information is not proof of disjointness."
+(defn- external-alias-violations-for-validated-graph
+  "Derive binding hazards for the exact graph checked by the synchronous caller."
   [graph bindings overlaps?]
-  (let [graph (kgraph/validate! graph)
-        ids (set (map :id (concat (:inputs graph) (:outputs graph))))]
+  (let [ids (set (map :id (concat (:inputs graph) (:outputs graph))))]
     (when-not (and (map? bindings) (= ids (set (keys bindings))) (every? some? (vals bindings)))
       (throw (ex-info "graph alias preflight requires exactly every public physical binding"
                       {:reason :kernel-graph-alias-bindings :expected ids
@@ -68,6 +64,14 @@
              :when (not (contains? (set (:dependencies later)) (:id earlier)))]
          {:reason :kernel-graph-alias-dependency :node (:id later) :missing (:id earlier)})))))
 
+(defn external-alias-violations
+  "Return graph access/dependency hazards for complete public physical bindings, without driver
+   work. overlaps? must conservatively compare physical values/ranges. Private allocations are
+   not supplied. Dtype, capacity, scalar preconditions and node ABI checks remain separate.
+   Incomplete bindings throw: missing information is not proof of disjointness."
+  [graph bindings overlaps?]
+  (external-alias-violations-for-validated-graph (kgraph/validate! graph) bindings overlaps?))
+
 (defn validate-external-aliases!
   "Enforce graph access/dependency preflight and return the complete physical bindings."
   [graph bindings overlaps?]
@@ -87,8 +91,10 @@
    predicate compares only real public pointer values. Scalar, extent and alignment checks are
    separate obligations, not inferred from an empty alias result."
   [graph bindings overlaps?]
+  (when-not (kgraph/kernel-graph? graph)
+    (kgraph/validate! graph))
   (let [graph (executable/validate! graph)
-        hazards (external-alias-violations graph bindings overlaps?)
+        hazards (external-alias-violations-for-validated-graph graph bindings overlaps?)
         public (set (keys bindings))
         private (set (map :id (:temporaries graph)))
         ;; Compare graph identities, resolving only public identities to physical values. This
@@ -131,7 +137,11 @@
   This is deliberately partial: computed node arguments, allocation products and artifact
   preconditions still require ordinary binding preflight. No expression is evaluated here."
   [graph]
-  (let [graph (executable/validate! (kgraph/validate! graph))
+  ;; Executables also include single artifacts, but this projection requires a graph boundary.
+  ;; Preserve that narrower domain without repeating validation of a valid graph.
+  (when-not (kgraph/kernel-graph? graph)
+    (kgraph/validate! graph))
+  (let [graph (executable/validate! graph)
         public (scalar-interface graph)
         public-ids (set (map second public))
         bindings (concat public

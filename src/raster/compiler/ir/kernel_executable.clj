@@ -142,7 +142,9 @@
                          :scalars (:scalars graph)
                          :node-scalar-uses (mapv (juxt :id :scalar-uses) (:nodes graph))})))
       (validate-node-artifact-bindings! graph)
-      (let [targets (set (map :target (artifacts graph)))]
+      ;; The node-binding check above validates every artifact. Project only its target here;
+      ;; the public artifacts accessor would immediately revalidate this graph and its nodes.
+      (let [targets (set (map (comp :target :operation) (:nodes graph)))]
         (when-not (= 1 (count targets))
           (throw (ex-info "kernel graph nodes must share one target dialect"
                           {:reason :kernel-graph-executable-targets :targets targets}))))

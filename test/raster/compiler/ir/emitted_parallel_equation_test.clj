@@ -167,11 +167,11 @@
                     (when (identical? emitted-graph candidate) (swap! checked inc))
                     (original candidate))]
       (is (identical? emitted (emitted-equation/validate! emitted)))
-      ;; One executable check plus the two independent dataflow-contract projections.
+      ;; One executable check plus the emitted dataflow-contract projection.
       ;; There must not be an additional check immediately before executable validation.
-      (is (= 3 @checked))
+      (is (= 2 @checked))
       (is (identical? emitted (emitted-equation/validate! emitted)))
-      (is (= 6 @checked) "later public checks remain independent"))
+      (is (= 4 @checked) "later public checks remain independent"))
     (testing "the delegated executable check still rejects malformed graphs"
       (is (thrown? clojure.lang.ExceptionInfo
                    (emitted-equation/validate!
