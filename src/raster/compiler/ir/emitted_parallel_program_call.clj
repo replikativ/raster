@@ -486,13 +486,13 @@
    rename existing aliases but cannot silently introduce a new alias. Graph-owned temporaries are
    intentionally absent from EmittedParallelProgramCall and remain private to KernelGraph."
   [call f]
-  (let [call (validate! call)]
+  ;; buffer-identities independently validates the complete input call before projecting it.
+  (let [source-buffers (buffer-identities call)]
     (when-not (ifn? f)
       (fail! :emitted-program-buffer-mapper
              "emitted program buffer remapping requires a callable projection"
              {:mapper f}))
-    (let [source-buffers (buffer-identities call)
-          target-buffers (mapv f source-buffers)]
+    (let [target-buffers (mapv f source-buffers)]
       (when-let [source (some (fn [[source target]] (when (nil? target) source))
                               (map vector source-buffers target-buffers))]
         (fail! :emitted-program-buffer-remap-missing
@@ -536,7 +536,11 @@
                                 (map (fn [[id value]]
                                        [id (if (typed-scalar? value) value (remap value))]))
                                 outputs))))]
-        (validate! remapped)))))
+        ;; The input was independently validated above and this rewrite retains its exact
+        ;; immutable program. Recheck every remapped binding/step against that program without
+        ;; deriving its unchanged algorithms and kernels a second time in this construction.
+        ;; A later public validation still independently checks the complete program.
+        (validate-call-against-program! remapped (:program call) nil)))))
 
 (defn make
   "Prepare a source-independent, target-neutral call of an emitted parallel program.

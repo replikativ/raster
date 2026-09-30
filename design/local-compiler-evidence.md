@@ -57,18 +57,41 @@ initializer objects, hidden final outputs, constant borrowers and escaped old al
 
 The isolated unchanged finetune-rstr `9e9ba5d` tiny Gemma declarations also compose through this
 public boundary: 60 forward stages followed by 157 VJP/SGD stages, 14 mutable adapter bindings,
-shared frozen weights/norms and a shared input. On Level Zero, two replays match the JVM forward
+shared frozen weights/norms and a shared input. On OpenCL and Level Zero, two replays match the JVM forward
 and independently differentiated pseudo-loss/SGD reference. Maximum errors are 1.20e-6 for
 forward, 2.87e-6 for input cotangent and 2.99e-8 for adapters. The next forward sees updated
 adapters, not their captured initial host arrays. The fixed external output cotangent is supplied
 separately; this is not a fused loss-seed graph. Downloads serve only numerical comparison.
-OpenCL external acceptance is still running; the generated small composition already passes there.
+Both backends produced the same reported errors. All seven CI gates passed and the slice
+squash-merged as #950 (`6533eed1`).
 
 Host-monotonic preparation samples under background load were 70.2 s forward, 287.2 s VJP and
 89.6 s composition. These are an explicit preparation-cost debt, not a speedup or throughput
 measurement. No sibling source/dependency is modified. Full package migration, real-weight or
 longer training, ranged/cross-executable state sharing and asynchronous lifetime proofs remain
 separate gates.
+
+The preparation follow-up instruments a fresh composition of the retained exact Gemma components,
+without recompiling source or allocating device buffers. Total time is 78.35 s; inclusive
+`namespace-instance` time is 50.03 s and final LinkPlan construction is 27.97 s, of which plan
+structure validation is 27.92 s. Mutable ownership normalization, access/initialization checks
+and alias validation together account for less than 0.1 s in this sample. Inclusive nested times
+must not be added. The next narrow deduplication retains independently validated immutable
+programs inside buffer remapping, then rechecks all remapped steps/bindings through the existing
+call validator. A later public validation and later construction remain independent; no proof
+cache, kernel-body change or ownership relaxation is introduced. The input already receives
+independent complete validation through `buffer-identities`; removing the additional entry and
+unchanged-output program checks reduces root-program validation from three to one per remap.
+The focused test checks that count, fresh later validation/construction and rejection of an invalid
+source program or malformed source call before any mapper call. Existing totality, alias/collision
+and loop-buffer tests remain. The affected suites pass 73 tests / 484 assertions, including local
+OpenCL/Level Zero composition replay, and focused review found no blocking proof-boundary issue.
+
+The same retained-component profile after this change reports 45.75 s total: 28.90 s remapping
+and 16.49 s final plan construction, with an exactly equal resulting plan (247 nodes / 2 instances).
+Background load, warm-up and the unchanged final validator's different timing prevent treating
+78.35 → 45.75 s as a controlled speedup. The proven improvement is removal of two redundant root
+program checks, not a kernel/runtime improvement or a general compilation-latency guarantee.
 
 ## Structured AD invocation and external Gemma — 2026-09-30
 
@@ -242,9 +265,9 @@ existing Float SGD primitive: maximum input-gradient error 2.87e-6, maximum erro
 fourteen adapters 2.99e-8. State stays resident between updates; the small validation arrays
 are downloaded to compare each step, so this is not a zero-transfer benchmark. The external
 Double learning-rate port is explicitly rounded at the oracle's existing Float optimizer
-boundary; the compiled numerical declaration itself is unchanged. Sharing donated state across
-independently prepared forward/backward artifacts, upstream package migration and real-weight
-training remain separate obligations.
+boundary; the compiled numerical declaration itself is unchanged. Shared donated state across
+independently prepared forward/backward artifacts is covered by the #950 checkpoint above;
+upstream package migration and real-weight training remain separate obligations.
 
 The existing parametric registration keys templates by annotation signature. In a warm process,
 this broader declaration adds a template rather than deleting the old narrow template. Its
