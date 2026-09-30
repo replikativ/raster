@@ -77,8 +77,7 @@
                              (var raster.compiler.passes.scalar.inline-test/option-loss)
                              :mode :reverse :wrt [0])
                    vg (gradient x y)] vg)]]
-    (let [expanded (binding [inline/*ad-transform-body-fn* rev/transform-body]
-                     (inline/inline-deftm-calls source))
+    (let [expanded (inline/inline-deftm-calls source)
           f (eval (list 'fn '[x y] expanded))]
       (is (= [10.0 7.0 nil] (f 2.0 3.0)))
       (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
@@ -107,10 +106,9 @@
     (is (= [10.0 nil nil] (f 2.0 3.0))))
   (doseq [wrt [[-1] [2] [0 0]]]
     (is (thrown? clojure.lang.ExceptionInfo
-                 (binding [inline/*ad-transform-body-fn* rev/transform-body]
-                   (inline/inline-value+grad-call
+                 (inline/inline-value+grad-call
                     {:var-sym 'raster.compiler.passes.scalar.inline-test/option-loss
-                     :args '[x y] :mode :value+grad :options [:wrt wrt]})))))
+                     :args '[x y] :mode :value+grad :options [:wrt wrt]}))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal :wrt"
                         (#'inline/value+grad-call?
                          '((raster.ad.reverse/value+grad (var example/loss) :wrt runtime-ports)

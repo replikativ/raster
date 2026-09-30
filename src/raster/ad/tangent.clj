@@ -40,8 +40,8 @@
 
 (defn differentiable?
   "Type-level ⊥ test: does `tag` denote a tangent space that carries
-  gradient? (The single source of truth that reverse.clj's
-  differentiable-tag? and the inliner's local copy delegate to.)"
+  gradient? Reverse AD's shared runtime/compiler preparation delegates
+  to this single type-level source of truth."
   [tag]
   (not= :none (:kind (tangent-kind tag))))
 
