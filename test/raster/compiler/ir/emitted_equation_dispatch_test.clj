@@ -3,8 +3,13 @@
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.fixtures.contractions :as contractions]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as program-target]
+            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
@@ -40,6 +45,94 @@
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
+
+(defn- contraction-candidates
+  [reference-compilation]
+  ;; Both emissions refine one retained semantic spine. Re-running the frontend produces fresh
+  ;; SSA identities and cannot establish this correspondence merely by sharing a public ABI.
+  (let [register-emission
+        (program-target/emit-program
+         (:scheduled reference-compilation)
+         (assoc-in (:options reference-compilation)
+                   [:schedule :typed-contraction :strategy] :register-tiled))]
+    (mapv (fn [program]
+            (let [candidate (-> program :equations last :operations first)]
+              (assoc-in candidate [:graph :attributes :strategy]
+                        (get-in candidate [:graph :nodes 0 :operation :attributes :strategy]))))
+          [(:emitted reference-compilation) (:program register-emission)])))
+
+(defn- contraction-selection [alternatives]
+  (dispatch/make
+   {:id "certified-fp32-contraction"
+    :alternatives (mapv :graph alternatives)
+    :default-strategy :sequential-segments
+    :selector {:kind :fixed-strategy :strategy :register-tiled}}))
+
+(deftest generated-contraction-candidates-share-a-certified-dispatch-boundary
+  (register-target!)
+  (let [reference (equation-first/compile #'contractions/fixed-matmul
+                                         {:target target :dtype :float})
+        alternatives (contraction-candidates reference)
+        selection (contraction-selection alternatives)
+        policy {:permitted-modes #{:exact :reassociated}}
+        certified (equation-dispatch/make alternatives selection policy)
+        program (update (:emitted reference) :equations
+                        #(update % (dec (count %)) assoc :operations [certified]))
+        linked (equation-first/lower (assoc reference :emitted program)
+                                    [(float-array 15) (float-array 21)])]
+    (is (= program (emitted-program/validate! program)))
+    (is (= :register-tiled
+           (executable/strategy (-> linked :instances first :call :steps last :graph))))
+    (let [outputs (filter #(= :output (:role %)) (vals (:nodes linked)))]
+      (is (= 1 (count outputs)))
+      (is (nil? (:source (first outputs)))
+          "fresh zero storage may become source-free only after all candidates prove overwrite"))
+    (is (= :sequential-segments
+           (get-in (equation-dispatch/default-equation certified)
+                   [:graph :attributes :strategy])))
+    (is (= {'output 35}
+           (update-vals (equation-dispatch/complete-write-domains certified)
+                        #(launch/resolve-expression (constantly nil) %))))
+    (is (= :equation-dispatch-numerics
+           (reason #(equation-dispatch/make alternatives selection
+                                            {:permitted-modes #{:exact}}))))
+    (is (= :equation-dispatch-default-numerics
+           (reason #(equation-dispatch/make
+                     alternatives (assoc selection :default-strategy :register-tiled) policy))))
+    (let [candidate (second alternatives)
+          artifact (get-in candidate [:graph :nodes 0 :operation])
+          scheduled (assoc-in (get-in artifact [:provenance :scheduled-operation])
+                              [:numerics :mode] :exact)
+          replacement (body-target/emit-artifact
+                       (:kernel-name artifact) scheduled
+                       (get-in artifact [:provenance :target-dialect])
+                       {:attributes (:attributes artifact)})
+          forged (assoc-in candidate [:graph :nodes 0 :operation] replacement)
+          forged-alternatives [(first alternatives) forged]]
+      (is (= forged (emitted-equation/validate! forged)))
+      (is (= :equation-dispatch-numerics
+             (reason #(equation-dispatch/make
+                       forged-alternatives (contraction-selection forged-alternatives)
+                       policy)))
+          "a register schedule cannot self-label as exact to evade numerical permission"))
+    ;; Re-emit a valid artifact with a truncated store body: projection and ABI remain valid,
+    ;; but neither target emission nor a shared write label proves complete initialization.
+    (let [candidate (first alternatives)
+          artifact (get-in candidate [:graph :nodes 0 :operation])
+          scheduled (get-in artifact [:provenance :scheduled-operation])
+          truncated (update-in scheduled [:body :operations] pop)
+          replacement (body-target/emit-artifact
+                       (:kernel-name artifact) truncated
+                       (get-in artifact [:provenance :target-dialect])
+                       {:attributes (:attributes artifact)})
+          partial (assoc-in candidate [:graph :nodes 0 :operation] replacement)
+          partial-alternatives [partial (second alternatives)]]
+      (is (= partial (emitted-equation/validate! partial)))
+      (is (nil? (emitted-equation/contraction-write-domains partial)))
+      (is (= :equation-dispatch-complete-write
+             (reason #(equation-dispatch/make
+                       partial-alternatives (contraction-selection partial-alternatives)
+                       policy)))))))
 
 (deftest independently-certified-equations-require-numerical-permission
   ;; Source generation is hardware-free; no driver or runtime session is opened.

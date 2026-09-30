@@ -508,6 +508,20 @@ segment counts and omitted guards. The focused suite passes 21 tests / 191 asser
 is a prerequisite, not a new dispatch or initialization-elision path; compute coverage once when
 certifying alternatives, and keep numerical/target admission independent of must-write evidence.
 
+The certified equation-dispatch boundary now also accepts one plain FP32 contraction. Portable
+and register-tiled candidates must be emitted from the same retained semantic spine, independently
+prove equal complete-write domains, and preserve the external graph and physical result mapping.
+The register schedule requires explicit reassociation permission; the default remains ordered
+portable. Invocation initialization uses the common proof across all alternatives, never the
+default candidate's coverage alone. A re-emitted artifact with a dropped executable store retains
+a valid projection but is rejected as dispatch coverage evidence. This is an IR composition
+facility, not automatic public candidate generation or an optimized default; per-equation public
+selection remains the next slice. Coverage access reuses its validation report within each query
+rather than immediately rebuilding the first candidate again; cross-query caching is not added.
+The focused dispatch suite passes 7 tests / 35 assertions; the final contraction-only numerical
+forgery and initialization checks pass 1 test / 13 assertions. Existing SWR round-trip validation
+passes after refreshing the warm REPL's stale compiler-record decoder registry.
+
 The shared ScheduledKernelBody graph check now requires structural node membership and exact
 canonical pointer-storage dtypes. Previously the executable boundary caught a dtype mismatch
 after emission; the earlier refinement certificate now rejects it too. The scalar-reduction and

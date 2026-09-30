@@ -49,25 +49,28 @@
       (and (empty? (:operations equation))
            (every? #(= 'scalar (soac/operation-kind %)) (soac/equations algorithm)))
       (and (= 1 (count (:operations equation)))
-           (let [operation (first (:operations equation))]
-             (and (emitted-equation/emitted-equation? operation)
-                  (let [emitted (first (candidates-for operation))
-                        refinement (:refinement emitted)
-                        compound? (seq (get-in equation
-                                               [:attributes :emitted-source-equations]))
-                        source-graph (:source refinement)
-                        retained-operands
-                        (when source-graph
-                          (set (concat (map :id (:inputs source-graph))
-                                       (map :id (:scalars source-graph)))))
-                        expected-operands
-                        (if compound?
-                          (filterv retained-operands (:inputs (soac/facts algorithm)))
-                          (:inputs (soac/facts algorithm)))]
-                    (and (= algorithm (:algorithm emitted))
-                         (or (not compound?) (some? source-graph))
-                         (= (:operands equation) expected-operands)
-                         (= (:results equation) (soac/outputs algorithm))))))))
+           (let [operation (first (:operations equation))
+                 candidates (candidates-for operation)]
+             (and (seq candidates)
+                  (every?
+                   (fn [emitted]
+                     (let [refinement (:refinement emitted)
+                           compound? (seq (get-in equation
+                                                  [:attributes :emitted-source-equations]))
+                           source-graph (:source refinement)
+                           retained-operands
+                           (when source-graph
+                             (set (concat (map :id (:inputs source-graph))
+                                          (map :id (:scalars source-graph)))))
+                           expected-operands
+                           (if compound?
+                             (filterv retained-operands (:inputs (soac/facts algorithm)))
+                             (:inputs (soac/facts algorithm)))]
+                       (and (= algorithm (:algorithm emitted))
+                            (or (not compound?) (some? source-graph))
+                            (= (:operands equation) expected-operands)
+                            (= (:results equation) (soac/outputs algorithm)))))
+                   candidates)))))
 
     (swr/plan? algorithm)
     (and (= 1 (count (:operations equation)))
