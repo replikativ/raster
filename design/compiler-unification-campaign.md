@@ -58,6 +58,12 @@ the remaining external training gates.
    uninterrupted-versus-restored oracle. Reuse existing field/lease/plan contracts. Introduce any
    additional semantic operation only when that workload exposes a concrete missing obligation.
 
+The completed-reduction conversion follow-up removes the warm numerical-region projection gap for
+one explicit Float/Double cast of the completed accumulator. Partial storage stays at the reduction
+dtype. Cold scalar AD can still retain a dynamic projection helper and fail the typedness gate;
+the table's earlier numerical-region decline is superseded by that narrower remaining boundary.
+General mixed-width epilogue arithmetic and public Float-accumulator widening remain separate.
+
 The immediate emphasis returns to unresolved compiler/training workload coverage after the durable
 transfer acceptance; the distributed and scientific work does not replace the emitter agenda.
 

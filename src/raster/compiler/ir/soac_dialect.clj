@@ -2297,13 +2297,16 @@
                       :extent extent :dtype result-dtype})))))
 
       reduce
-      (doseq [[id dtype] (map vector results (:dtypes attributes))]
+      (doseq [[id dtype] (map vector results
+                                    (if-let [transform (:result-transform attributes)]
+                                      [(:result-dtype transform)]
+                                      (:dtypes attributes)))]
         (let [value (get values id)]
           (when (and value
                      (not (and (= :tensor (:kind value)) (= [] (:shape value))
                                (= dtype (:dtype value)))))
             (fail! :typed-soac-reduce-result-type
-                   "reduce results must be scalar tensors with their declared accumulator dtype"
+                   "reduce results must be scalar tensors with their declared completed-result dtype"
                    {:equation equation-id :id id :value value :dtype dtype}))))
 
       segmented-reduce

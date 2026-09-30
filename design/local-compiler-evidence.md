@@ -171,11 +171,25 @@ needed, its input adjoint and projection are separate flat BindCtx bindings so a
 is not hidden under a cast. Untagged argument types remain unguessed.
 The unsupported public scalar-gradient reproduction has two explicit admission boundaries:
 cold emission can retain one nil-safe `project-float` call and fail the typedness gate;
-with a warm specialization it reaches the unhoistable numerical-region scalar gap. The
-regression checks those exact diagnostics, not an arbitrary exception. Recovering a symbol's
+before the completed-conversion follow-up, a warm specialization reached the unhoistable
+numerical-region scalar gap. The regression checks exact diagnostics, not an arbitrary exception. Recovering a symbol's
 type from its existing adjoint binding alone did not remove the cold helper and is not claimed
-as a completed fix. Both the dynamic-cotangent closure and the completed-result storage
-projection remain consolidation obligations.
+as a completed fix. Dynamic-cotangent closure remains a consolidation obligation.
+
+The completed-conversion follow-up reuses the existing reduction result transform, rather than
+adding a scalar AD kernel. A shared predicate permits only one explicit Float/Double conversion
+of the completed accumulator when output storage differs. Accumulation, workgroup scratch,
+first-phase partial output and terminal-phase input retain the reduction dtype; only the terminal
+store takes the converted result dtype. General mixed-width epilogue arithmetic remains outside
+this admitted subset, and the existing dialect grammar retains the single-result transform rule.
+Public Double-to-Float reduction fixtures execute empty, three-element and 2049-element cases
+twice on each local backend, against the JVM. The large case exercises two-phase storage;
+the 16777216/1/1 data distinguishes terminal conversion from premature Float accumulation.
+Both Float-to-Double and Double-to-Float are checked at the SegRed scheduling boundary, but no
+public Float-accumulator widening claim is inferred from that lower-level test. A focused review
+found no blocker. The affected SOAC validation/fusion/emission suites pass 86 tests/551 assertions;
+the public ABI/gradient-boundary/device selection passes 3 tests/40 assertions. These checks
+overlap rather than defining additive coverage; they establish neither performance nor complete cold AD.
 This broadens mixed-type scale admission, not implicit dispatch coercion. A rounding
 counterexample distinguishes this from rounding a Double coefficient to Float before
 multiplication. Public declared-storage compilation and

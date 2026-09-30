@@ -9,6 +9,13 @@
   [coefficient :- Double values :- (Array float)] :- (Array float)
   (par/scale coefficient values))
 
+(deftm double-reduction-float-result
+  [values :- (Array double)] :- Float
+  (let [total (par/reduce acc 0.0 i (alength values)
+                          (+ acc (aget values i)))
+        ^float result (float total)]
+    result))
+
 (deftm mixed-scale-energy
   [coefficient :- Float values :- (Array double)] :- Double
   (par/dot-product (par/scale coefficient values) values))

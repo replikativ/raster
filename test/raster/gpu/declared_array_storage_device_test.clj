@@ -67,6 +67,31 @@
     (run-scale-case :ocl:0)
     (opencl/opencl-skip! "mixed coefficient scale on OpenCL")))
 
+(defn- run-completed-conversion-case [target]
+  (doseq [n [0 3 2049]]
+    (let [x (double-array (take n (cycle [16777216.0 1.0 1.0])))
+          expected (storage/double-reduction-float-result x)
+          artifact (compiled/compile
+                    #'storage/double-reduction-float-result [x]
+                    (merge storage/policy
+                           {:compiler :equation-first :target target :dtype :double}))]
+      (try
+        (dotimes [_ 2]
+          (let [outputs (artifact {})
+                result (value/->host (:result outputs))]
+            (is (= #{:result} (set (keys outputs))))
+            (is (= (class (float-array 0)) (class result)))
+            (is (= [expected] (vec result)))))
+        (finally (compiled/close! artifact))))))
+
+(deftest completed-reduction-conversion-matches-jvm-on-both-backends
+  (if @gp/gpu-available?
+    (run-completed-conversion-case :ze:0)
+    (gp/gpu-skip! "completed reduction conversion on Level Zero"))
+  (if @opencl/opencl-available?
+    (run-completed-conversion-case :ocl:0)
+    (opencl/opencl-skip! "completed reduction conversion on OpenCL")))
+
 (deftest level-zero-mixed-storage-public-compilers-match-jvm
   (if @gp/gpu-available?
     (do (run-case :ze:0) (run-fold-case :ze:0))

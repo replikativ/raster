@@ -17,6 +17,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.fusion-placement :as placement]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region]
             [raster.compiler.passes.scalar.effects :as effects]))
 
 (def ^:private map-equation-rule
@@ -600,8 +601,15 @@
            :when (empty? (:locals consumer))
            :when (= 1 (get uses produced 0))
            :when (not (contains? (set (dialect/outputs program)) produced))
-           :when (= (first (get-in producer [:attributes :dtypes]))
-                    (value-scalar-dtype program (first (:results consumer))))
+           ;; A completed-result transform owns its scalar conversion. Accumulator and
+           ;; intermediate storage stay at the reduction dtype; only the terminal store
+           ;; takes the consumer dtype. Do not grant integral/trapping conversions here.
+           :when (or (= (first (get-in producer [:attributes :dtypes]))
+                        (value-scalar-dtype program (first (:results consumer))))
+                     (and (contains? #{:float :double}
+                                     (first (get-in producer [:attributes :dtypes])))
+                          (scalar-region/completed-floating-conversion?
+                           (scalar-region/from-typed-result-transform transform))))
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
            :when (host-barrier-free? program producer consumer)

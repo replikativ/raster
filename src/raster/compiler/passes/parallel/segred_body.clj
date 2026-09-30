@@ -137,10 +137,15 @@
                 "portable scalar SegRed supports FP32 or FP64 storage and accumulation"
                 {:operation (:id segred) :accumulator-dtype accumulator-dtype}))
     (when-not (and (= accumulator-dtype (dtype/canon (:dtype segred)))
-                   (= accumulator-dtype output-type)
+                   (or (= accumulator-dtype output-type)
+                       (and result-region
+                            (contains? #{:single :cross-block} phase)
+                            (contains? #{:float :double} output-type)
+                            (scalar-region-lower/completed-floating-conversion? result-region)
+                            (= output-type (dtype/canon (:result-dtype result-region)))))
                    (every? #{accumulator-dtype} input-types))
       (decline! :uniform-scalar-storage
-                "portable scalar SegRed requires uniform storage and accumulator dtypes"
+                "portable scalar SegRed requires uniform input/accumulator storage and a certified terminal conversion"
                 {:operation (:id segred) :segred-dtype (:dtype segred)
                  :accumulator-dtype accumulator-dtype :input-dtypes input-types
                  :output-dtype output-type}))
@@ -182,7 +187,7 @@
                 "scalar SegRed reduction must state the exact physical phase it inhabits"
                 {:operation (:id segred) :phase phase
                  :reduction-physical-phase (get-in operator [:attributes :physical-phase])}))
-    {:operator operator :component component :dtype accumulator-dtype
+    {:operator operator :component component :dtype accumulator-dtype :output-dtype output-type
      :workgroup-size workgroup-size :phase phase :output output
      :result-region result-region :schedule schedule}))
 
@@ -498,7 +503,8 @@
    accumulator remain uniform; integral scalar parameters may participate in index expressions."
   [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof]
                      :or {dtype :double array-types {} scalar-types {}}}]
-  (let [{validated-dtype :dtype output :output result-region :result-region}
+  (let [{validated-dtype :dtype output :output result-region :result-region
+         output-dtype :output-dtype}
         (validate-scalar-segred! segred out-sym array-types)
         dtype (or validated-dtype (:dtype segred) dtype)
         index (:name (segop/seg-space-reduced-dim (:space segred)))
@@ -630,8 +636,8 @@
                                        dtype)
                      :operand)
                    arrays)
-              [(body/->KernelParameter output :output dtype [group-count] :global
-                                       (layout/row-major [group-count] dtype) :result)]
+              [(body/->KernelParameter output :output output-dtype [group-count] :global
+                                       (layout/row-major [group-count] output-dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
@@ -643,7 +649,7 @@
         (when result-region
           (scalar-region-lower/lower
            result-region
-           {:accumulator final-value :accumulator-dtype dtype :store-dtype dtype
+           {:accumulator final-value :accumulator-dtype dtype :store-dtype output-dtype
             :parameters (into {} (map (fn [parameter] [(:id parameter) parameter])) parameters)
             :coordinate-lower (fn [_]
                                 (decline! :full-reduction-result-operands
