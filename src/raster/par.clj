@@ -777,8 +777,9 @@
        (broadcast [x y] (+ y (* alpha x)))))
 
 (deftm scale
-  "Scale array x by scalar alpha element-wise."
-  (All [T] [alpha :- T,
+  "Scale array x by scalar alpha element-wise, retaining x's element storage type.
+   Scalar arithmetic follows alpha/x's declared types; broadcast materializes each result at T."
+  (All [T S] [alpha :- S,
             x :- (Array T)] :- (Array T)
        (broadcast [x] (* alpha x))))
 

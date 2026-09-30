@@ -1638,7 +1638,7 @@
   adjointᵢ(cotangent) with the other args as frozen coefficients (bilinear
   gives two different partial adjoints, both spelled with existing kernels).
   Slots without an :adjoint entry are ⊥ (nil grad). Returns a standard
-  grads-fn (BindCtx convention, one flat binding per adjoint expression)."
+  grads-fn (BindCtx convention, flat adjoint and optional projection bindings)."
   [_canonical-op adjoint-map]
   (fn [ctx actual-params _result-sym adjoint-sym gensym-fn]
     (let [args (vec actual-params)
@@ -1646,8 +1646,27 @@
           (reduce
            (fn [[ctx grads] i]
              (if-let [adj-f (get adjoint-map i)]
-               (let [g (gensym-fn (str "dadj_" i) (grad-tag (nth args i nil)))]
-                 [(update ctx :bindings into [g (adj-f args adjoint-sym)])
+               (let [argument (nth args i nil)
+                     ;; A target tangent tag is an obligation, not evidence that the adjoint
+                     ;; expression already has that dtype. Resolve its declared result first,
+                     ;; then materialize the shared projection before stamping the binding.
+                     expression (resolve-emitted-expr (adj-f args adjoint-sym) {})
+                     ;; These adjoints execute ordinary numerical kernels; absent slot
+                     ;; gradients are represented separately by nil, never by their result.
+                     projected (tangent/project-expr (arg-tag argument) expression
+                                                     {:materialized? true})
+                     g (gensym-fn (str "dadj_" i) (grad-tag argument))]
+                 [(update ctx :bindings into
+                          (if (identical? expression projected)
+                            [g expression]
+                            ;; Keep the numerical adjoint and its tangent projection as flat
+                            ;; BindCtx operations. Inlining a kernel may expose a SOAC; wrapping
+                            ;; that SOAC inside a cast would hide its schedule from the frontend.
+                            (let [value (gensym-fn (str "adjoint_value_" i)
+                                                   (:raster.type/tag (meta expression)))]
+                              [value expression
+                               g (tangent/project-expr (arg-tag argument) value
+                                                       {:materialized? true})])))
                   (conj grads g)])
                [ctx (conj grads nil)]))
            [ctx []] (range (count args)))]
@@ -1753,9 +1772,9 @@
               c (list 'raster.dl.loss/mse-grad pred target 1.0 n)))}
 
    'raster.par/dot-product
-   ;; c is a SCALAR cotangent. par/scale's alpha is now (All [T])-typed, so the cotangent
-   ;; flows through at the array's element type — no explicit widening wrapper needed
-   ;; (previously `(double c)` was injected purely to satisfy a Double annotation).
+   ;; dot-product's result/cotangent is Double even for Float operands. scale keeps the
+   ;; coefficient's scalar type independent of its operand/result array storage type; the
+   ;; ordinary broadcast materialization supplies the cotangent's array element boundary.
    {0 (fn [[_a b] c] (list 'raster.par/scale c b))
     1 (fn [[a _b] c] (list 'raster.par/scale c a))}
 

@@ -1,8 +1,23 @@
 (ns raster.compiler.fixtures.mixed-storage
   (:require [raster.core :refer [deftm]]
-            [raster.par :as par]))
+            [raster.par :as par]
+            [raster.ad.reverse :as reverse]))
 
 (def policy {:preserve-declared-array-storage? true})
+
+(deftm mixed-scale
+  [coefficient :- Double values :- (Array float)] :- (Array float)
+  (par/scale coefficient values))
+
+(deftm mixed-scale-energy
+  [coefficient :- Float values :- (Array double)] :- Double
+  (par/dot-product (par/scale coefficient values) values))
+
+(deftm mixed-scale-energy-gradient
+  [coefficient :- Float values :- (Array double)] :- Float
+  (let [gradient ((reverse/value+grad (var mixed-scale-energy) :wrt [0])
+                  coefficient values)]
+    (nth gradient 1)))
 
 (deftm mixed-storage!
   [weights :- (Array float) state :- (Array double) out :- (Array double) n :- Long] :- Void

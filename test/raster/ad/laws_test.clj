@@ -228,6 +228,78 @@
         (recur (clojure.core/inc i) (+ s (* (ra/aget y i) (ra/aget w i))))
         s))))
 
+(deftm laws-float-dot [a :- (Array float) b :- (Array float)] :- Double
+  (par/dot-product a b))
+
+(deftm laws-weighted-float-dot
+  [coefficient :- Double a :- (Array float) b :- (Array float)] :- Double
+  (n/* coefficient (par/dot-product a b)))
+
+(deftm laws-float-coefficient-double-dot
+  [coefficient :- Float a :- (Array double) b :- (Array double)] :- Double
+  (n/* coefficient (par/dot-product a b)))
+
+(deftm laws-float-coefficient-array-scale
+  [coefficient :- Float a :- (Array double) b :- (Array double)] :- Double
+  (par/dot-product (par/scale coefficient a) b))
+
+(deftm laws-float-coefficient-float-scale
+  [coefficient :- Float a :- (Array float) b :- (Array float)] :- Double
+  (par/dot-product (par/scale coefficient a) b))
+
+(deftest derived-scale-adjoint-materializes-the-scalar-tangent-boundary
+  (doseq [[function array] [[#'laws-float-coefficient-array-scale double-array]
+                          [#'laws-float-coefficient-float-scale float-array]]]
+    (let [a (array [1.5 -2.0])
+          b (array [0.5 3.0])
+          [primal dc] ((rev/value+grad function :wrt [0]) (float 2.0) a b)]
+      (is (= -10.5 primal))
+      (is (= Float (class dc)))
+      (is (= (float -5.25) dc)))))
+
+(deftest dot-transpose-retains-float-cotangent-storage
+  (let [a (float-array [1.5 -2.0 0.25])
+        b (float-array [0.5 3.0 -4.0])
+        [primal da db] ((rev/value+grad #'laws-float-dot) a b)]
+    (is (= (par/dot-product a b) primal))
+    (is (= (class a) (class da)))
+    (is (= (class b) (class db)))
+    (is (= (vec b) (vec da)))
+    (is (= (vec a) (vec db))))
+  (let [alpha (+ 1.0 (Math/scalb 1.0 (int -24)))
+        a (float-array [1.5 -2.0 0.25])
+        b (float-array [0.5 3.0 -4.0])
+        [primal dc da db] ((rev/value+grad #'laws-weighted-float-dot) alpha a b)]
+    (is (= (* alpha (par/dot-product a b)) primal))
+    (is (= (par/dot-product a b) dc))
+    (is (= (class a) (class da) (class db)))
+    (is (= (mapv #(float (* alpha (double %))) b) (vec da)))
+    (is (= (mapv #(float (* alpha (double %))) a) (vec db))))
+  (let [alpha (float 2.0)
+        a (double-array [1.5 -2.0])
+        b (double-array [0.5 3.0])
+        [primal dc da db] ((rev/value+grad #'laws-float-coefficient-double-dot) alpha a b)]
+    (is (= (* alpha (par/dot-product a b)) primal))
+    (is (= Float (class dc)))
+    (is (= (float (par/dot-product a b)) dc))
+    (is (= (class a) (class da) (class db)))
+    (is (= [1.0 6.0] (vec da)))
+    (is (= [3.0 -4.0] (vec db)))))
+
+(deftest mixed-scale-remains-differentiable-through-the-shared-transpose
+  (let [alpha 2.0
+        a (float-array [1.5 -2.0])
+        b (float-array [0.5 3.0])
+        c (float-array [0.25 -0.5])
+        gradient (rev/reified-grad #'laws-weighted-float-dot 'a)
+        [primal dc da db dseed] ((rev/value+grad gradient) alpha a b c)]
+    (is (= (par/dot-product (par/scale alpha b) c) primal))
+    (is (= (par/dot-product b c) dc))
+    (is (or (nil? da) (= [0.0 0.0] (vec da))))
+    (is (= (vec (par/scale alpha c)) (vec db)))
+    (is (= (vec (par/scale alpha b)) (vec dseed)))
+    (is (= (class a) (class db) (class dseed)))))
+
 ;; ================================================================
 ;; Corpus — O5 boundary fns (defined here; AD over them must THROW)
 ;; ================================================================

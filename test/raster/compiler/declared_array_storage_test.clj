@@ -27,6 +27,43 @@
                   (when-not (= :scalar (:kind slot)) [(:name slot) (:dtype slot)])))
         (:abi artifact)))
 
+(deftest mixed-scale-retains-independent-scalar-and-storage-dtypes
+  (let [compiled (equation-first/compile
+                  #'storage/mixed-scale (merge policy {:target target :dtype :double}))
+        artifact (first (:kernels compiled))]
+    (is (= 1 (count (:kernels compiled))))
+    (is (= :float (get-in compiled [:options :array-types 'values])))
+    (is (= :double (get-in compiled [:options :scalar-types 'coefficient])))
+    (is (every? #(= :float (:dtype %))
+                (remove #(= :scalar (:kind %)) (:abi artifact))))
+    (is (= :double (:dtype (first (filter #(= 'coefficient (:name %))
+                                        (:abi artifact))))))))
+
+(deftest projected-scalar-reduction-declines-an-unrepresented-device-host-gap
+  ;; Preserve this public reproduction while scalar-value projection joins the numerical
+  ;; equation vertical. A successful JVM adjoint is not yet a whole-program GPU claim.
+  (is (= (float 6.25)
+         (storage/mixed-scale-energy-gradient (float 2.0) (double-array [1.5 -2.0]))))
+  (let [failure (try
+                  (compiled/lower
+                   #'storage/mixed-scale-energy-gradient
+                   [(float 2.0) (double-array [1.5 -2.0])]
+                   (merge policy {:compiler :equation-first :target target :dtype :double}))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error error))]
+    (is (some? failure))
+    (let [data (ex-data failure)
+          region-gap? (and (= :scheduled-equation-region (:reason data))
+                           (seq (:host-gap data)))
+          ;; Cold emission can stop one boundary earlier: an untyped dynamic scalar
+          ;; cotangent retains its nil-safe projection helper. A warm specialization
+          ;; reaches the numerical region gap instead. Neither is GPU support.
+          dynamic-projection? (and (= {'raster.ad.tangent/project-float 1}
+                                       (:undevirtualized data))
+                                   (= {} (:non-exempt-untagged data)))]
+      (is (or region-gap? dynamic-projection?)
+          (str (some-> failure .getMessage) " " data)))))
+
 (deftest one-derivation-separates-storage-from-scalar-computation
   (let [params '[weights state n scale] tags '[floats doubles long double]]
     (is (= (opencl-pass/derive-param-types params tags :double)

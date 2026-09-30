@@ -178,6 +178,21 @@
           result (par/scale 3.0 x)]
       (is (= [3.0 6.0 9.0] (vec result))))))
 
+(deftest scale-separates-scalar-arithmetic-from-array-storage
+  (let [alpha (+ 1.0 (Math/scalb 1.0 (int -24)))
+        x (float-array [1.5 -1.5 0.0])
+        result (par/scale alpha x)]
+    (is (= (class x) (class result)))
+    (is (= (mapv #(float (* alpha (double %))) x) (vec result)))
+    (is (not= (float (* (float alpha) (aget x 0))) (aget ^floats result 0))
+        "do not prematurely round the Double coefficient to match Float storage")
+    (is (= [1.5 -1.5 0.0] (vec x)) "the primal array remains unchanged"))
+  (let [x (double-array [1.5 -2.0])
+        result (par/scale (float 2.0) x)]
+    (is (= (class x) (class result)))
+    (is (= [3.0 -4.0] (vec result))))
+  (is (= [] (vec (par/scale 1.25 (float-array 0))))))
+
 (deftest fill-test
   (testing "raster.par/fill fills array with constant"
     (let [out (double-array 4)
