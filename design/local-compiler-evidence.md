@@ -105,6 +105,16 @@ compilation records a template invalidation and produces `[2,2,2]` on OpenCL, ma
 source, after previously producing `[1,1,1]`. This validates that one transitive path; it is
 not a complete dependency/provenance or all-overload cache-invalidation audit.
 
+The follow-up oracle makes this path reproducible without a mocked epoch: an unchanged
+public map caller invokes a parametric scalar helper, hits its warm compilation template,
+then replaces only the helper. The complete dependency manifest changes while the caller's
+retained-source fingerprint does not; public lowering misses once and hits the replacement
+template on repetition. OpenCL and Level Zero execute the replacement against the JVM
+source twice, while the already instantiated old artifact still executes its original
+semantics. Source restoration and artifact closure are explicit. No new invalidation layer
+or cache is introduced; this closes one concrete transitive test gap, not transactional
+reload, all-overload removal, or arbitrary retained-state invalidation.
+
 ## Declared array storage — 2026-09-30
 
 The opt-in `:preserve-declared-array-storage? true` keeps resolved array element tags as
