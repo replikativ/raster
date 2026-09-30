@@ -1,5 +1,35 @@
 # Local compiler evidence — 2026-09-27
 
+## Current pretrained consumer and native batch layout — 2026-09-30
+
+An isolated snapshot of pretrained-rstr main `98bad4d3517ec05a3c495f019c80d8c553db02af`
+pins Raster 0.2.922. Its Laya CPU-reference test exposed a native oneMKL boundary bug:
+the strided-batch output-span requirement applies even when batch=1. The old exemption
+sent one-head attention output to a rejected FFI call (oneMKL parameter 17), leaving the
+destination unchanged and producing a head mismatch of 0.002937. Independent GEMM
+already supports the same view. Removing the exemption selects that existing fallback;
+there is no new algorithm, numerical policy or GPU specialization.
+
+The corrected local source passes `raster.linalg.blas-test` (17 tests/67 assertions),
+the external decoder composition tests (2/8), and
+`pretrained.laya-gpu-test/resident-head-preserves-cpu-laya-semantics` (1/1). The regression
+checks exact NN/NT results, nonzero offsets and untouched sentinels. A throwing delayed
+optional handle also proves that the invalid descriptor never reaches the extension on
+machines without MKL. Existing valid batch layouts retain their extension path.
+
+The actual external `laya-resident-first-head` fixture (2 tokens, width 64, FFN 256,
+one head) lowers through the public compiled API, instantiates, replays twice, downloads
+its sole semantic output and closes on both local OpenCL and Level Zero. Each replay's
+128 elements match the uncompiled JVM source with maximum absolute error
+2.814456820487976e-6 (fixture tolerance 1e-5). This is small inference correctness evidence,
+not real-weight validation, a timing comparison, full encoder composition or training acceptance.
+
+The validation REPL uses an explicit `:deps` local-root for Raster in `-Sdeps`, not a
+top-level `:override-deps` entry (which does not override this consumer dependency).
+`clojure.java.io/resource` confirms the candidate's source path before acceptance.
+Initial runs accidentally used the released artifact; they established the released
+failure only and are excluded from candidate evidence. No sibling checkout was changed.
+
 ## Declared array storage — 2026-09-30
 
 The opt-in `:preserve-declared-array-storage? true` keeps resolved array element tags as

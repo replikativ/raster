@@ -28,11 +28,15 @@ do not infer a published release from a merge, or device performance from source
 | 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. | Real multi-device/fabric execution, overlap and distributed training collectives still need numerical validation. Co-location validates ownership/scheduling, not network performance. |
 | 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. The whole-domain heat oracle checks host refinement/convergence. The new local continuation gate also executes four generated fine-grid heat steps and restriction per replay on OpenCL and Level Zero, captures addressed coarse/fine bytes, closes the producer, restores and matches uninterrupted device evolution bit-for-bit while conserving mass. CI acceptance for this new gate remains pending. | Production manifest publication/lineage realization and a partial fine-patch evolution with conservative coarse/fine interface exchange, subcycling and reflux remain. Whole-domain refinement and mapped-byte continuation are not an adaptive simulator or production store. |
 
-External source audit rechecked at this checkpoint: pretrained-rstr `f4c2bb4` declares Raster
-0.2.545; finetune-rstr `9e9ba5d` still declares 0.2.287 and its layer forward/backward code names
-the retired binder. Both checkouts contain local work, so these observations are not clean
-external model-validation results. No sibling code or dependency was modified. Existing
-in-repository training evidence must not be substituted for those external gates.
+External source audit refreshed on 2026-09-30: authoritative pretrained-rstr main
+`98bad4d3517ec05a3c495f019c80d8c553db02af` declares Raster 0.2.922 and uses the public
+compiled boundary for Laya/ModernBERT. The older local `f4c2bb4` checkout (0.2.545) and
+`pretrained-rstr-main` checkout (0.2.457) do not describe current upstream. An isolated
+current-main snapshot is used for focused acceptance; no sibling code or dependency was
+modified. The local finetune-rstr `9e9ba5d` checkout still declares 0.2.287 and its layer
+forward/backward code names the retired binder, with local edits that must be preserved.
+Existing in-repository training or external inference evidence must not be substituted for
+the remaining external training gates.
 
 ### Execution order from this checkpoint
 
