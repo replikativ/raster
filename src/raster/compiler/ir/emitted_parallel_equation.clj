@@ -61,7 +61,9 @@
     ;; Each independent emitted-equation validation still reconstructs its graph from scratch.
     (equation-graph/make algorithm body)))
 
-(defn validate!
+(defn- validation-report
+  "Check the complete boundary and retain its source graph only for synchronous projection.
+   Public validators still derive fresh reports; no graph or validation authority is cached."
   [emitted-equation]
   (when-not (emitted-equation? emitted-equation)
     (fail! :emitted-parallel-equation-type
@@ -108,7 +110,16 @@
         (fail! :emitted-parallel-equation-description
                "emitted equation descriptions must be maps"
                {:field field :value value})))
-    emitted-equation))
+    {:boundary emitted-equation :source-graph expected}))
+
+(defn validate!
+  [emitted-equation]
+  (:boundary (validation-report emitted-equation)))
+
+(defn- complete-write-domains-for-validated-boundary
+  [{:keys [algorithm]}]
+  {(get-in algorithm [:output :id])
+   (swr/descriptor-launch-elements (:output algorithm))})
 
 (defn complete-write-domains
   "Exact output domains proved by schedule rederivation, not ABI write permissions.
@@ -118,24 +129,17 @@
    this is not a general must-write analysis for arbitrary KernelBody or future schedules."
   [emitted]
   (when (swr/plan? (:algorithm emitted))
-    (let [{:keys [algorithm]} (validate! emitted)]
-      {(get-in algorithm [:output :id])
-       (swr/descriptor-launch-elements (:output algorithm))})))
+    (complete-write-domains-for-validated-boundary (validate! emitted))))
 
-(defn contraction-write-domains
-  "Candidate-specific coverage for a single plain FP32 contraction leaf.
-
-   This stronger query is for dispatch certification, not a replacement for ordinary SOAC
-   initialization analysis. It reconstructs from the retained algorithm and source graph;
-   compound/refined graphs, other storage representations and other schedule families decline."
-  [emitted]
-  (let [{:keys [algorithm body refinement graph]} (validate! emitted)]
+(defn- contraction-write-domains-for-validated-boundary
+  [boundary source-graph]
+  (let [{:keys [algorithm refinement graph]} boundary]
     (when (and (soac/program-form? algorithm)
                (= 1 (count (soac/equations algorithm)))
                (contains? '#{contract segmented-reduce}
                           (soac/operation-kind (first (soac/equations algorithm))))
                (nil? refinement) (= 1 (count (:nodes graph))))
-      (let [source (expected-graph algorithm body)
+      (let [source source-graph
             node (first (:nodes source))
             certificate (get-in graph [:nodes 0 :operation :provenance :scheduled-operation])]
         (when (and (= 1 (count (:nodes source)))
@@ -144,18 +148,44 @@
                    (scheduled-body/scheduled-kernel-body? certificate))
           (contraction-schedule/complete-write-domain algorithm node source certificate))))))
 
+(defn contraction-write-domains
+  "Candidate-specific coverage for a single plain FP32 contraction leaf.
+
+   This stronger query is for dispatch certification, not a replacement for ordinary SOAC
+   initialization analysis. It reconstructs from the retained algorithm and source graph;
+   compound/refined graphs, other storage representations and other schedule families decline."
+  [emitted]
+  (let [{:keys [boundary source-graph]} (validation-report emitted)]
+    (contraction-write-domains-for-validated-boundary boundary source-graph)))
+
+(defn- physical-results-for-validated-boundary
+  [{:keys [algorithm body]}]
+  (if (swr/plan? algorithm)
+    (let [equation (last (:equations body))]
+      (zipmap (:results equation)
+              (map :destination (get-in equation [:attributes :result-storage]))))
+    (soac/physical-result-map algorithm)))
+
 (defn ^:no-doc validate-with-physical-results
   "Validate an equation and return its exact boundary with the derived storage projection.
    This report is data, not authority to accept a later call without checking its bindings."
   [emitted]
-  (let [{:keys [algorithm body] :as checked} (validate! emitted)]
+  (let [checked (validate! emitted)]
     {:boundary checked
-     :physical-results
+     :physical-results (physical-results-for-validated-boundary checked)}))
+
+(defn ^:no-doc validate-with-result-contracts
+  "Independently check one candidate and derive its storage and complete-write facts together.
+   The returned data cannot authorize a later validation; no checked source graph is retained."
+  [emitted]
+  (let [{:keys [boundary source-graph]} (validation-report emitted)
+        algorithm (:algorithm boundary)]
+    {:boundary boundary
+     :physical-results (physical-results-for-validated-boundary boundary)
+     :complete-write-domains
      (if (swr/plan? algorithm)
-       (let [equation (last (:equations body))]
-         (zipmap (:results equation)
-                 (map :destination (get-in equation [:attributes :result-storage]))))
-       (soac/physical-result-map algorithm))}))
+       (complete-write-domains-for-validated-boundary boundary)
+       (contraction-write-domains-for-validated-boundary boundary source-graph))}))
 
 (defn physical-results
   "Project logical results to physical storage from the retained, validated semantic equation."

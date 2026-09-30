@@ -39,11 +39,6 @@
                {:expected expected :actual actual}))
       actual)))
 
-(defn- write-domains [candidate]
-  (if (swr/plan? (:algorithm candidate))
-    (equation/complete-write-domains candidate)
-    (equation/contraction-write-domains candidate)))
-
 (defn- validation-report
   "Verify every schedule independently and require explicit permission for its numerical mode.
 
@@ -58,14 +53,14 @@
                    (every? equation/emitted-equation? alternatives))
       (fail! :equation-dispatch-alternatives
              "equation dispatch requires certified emitted equations" {}))
-    (doseq [candidate alternatives] (equation/validate! candidate))
-    (when-not (every? #(or (swr/plan? (:algorithm %))
-                          (soac/program-form? (:algorithm %))) alternatives)
-      (fail! :equation-dispatch-algorithm
-             "equation dispatch requires a supported retained typed algorithm" {}))
-    (let [first-candidate (first alternatives)
+    (let [candidate-reports (mapv equation/validate-with-result-contracts alternatives)
+          _ (when-not (every? #(or (swr/plan? (:algorithm %))
+                                  (soac/program-form? (:algorithm %))) alternatives)
+              (fail! :equation-dispatch-algorithm
+                     "equation dispatch requires a supported retained typed algorithm" {}))
+          first-candidate (first alternatives)
           allowed (:permitted-modes numerical-policy)
-          domains (mapv write-domains alternatives)
+          domains (mapv :complete-write-domains candidate-reports)
           _ (when-not (every? seq domains)
               (fail! :equation-dispatch-complete-write
                      "each candidate must independently prove its complete-write domain" {}))
@@ -94,7 +89,7 @@
                               alternatives))
         (fail! :equation-dispatch-graph-boundary
                "dispatch alternatives must retain the same external graph values" {}))
-      (when-not (apply = (map equation/physical-results alternatives))
+      (when-not (apply = (map :physical-results candidate-reports))
         (fail! :equation-dispatch-storage
                "dispatch alternatives must retain the same physical result mapping" {}))
       (when-not (apply = domains)
