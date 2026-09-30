@@ -44,3 +44,23 @@
            (reason-of #(scalar/evaluate-region
                         'raster.compiler.backend.jvm.typed-scalar-test
                         (soac/lambda-form '[] '[1.0]) [] [:half]))))))
+
+(deftest typed-region-consumes-only-canonical-closed-numeric-constants
+  (doseq [[expression dtype expected]
+          [['java.lang.Float/NEGATIVE_INFINITY :float Float/NEGATIVE_INFINITY]
+           ['Double/POSITIVE_INFINITY :double Double/POSITIVE_INFINITY]
+           ['java.lang.Integer/MAX_VALUE :int Integer/MAX_VALUE]
+           ['Long/MAX_VALUE :long Long/MAX_VALUE]]]
+    (is (= [{:type dtype :value expected}]
+           (scalar/evaluate-region
+            'raster.compiler.backend.jvm.typed-scalar-test
+            (soac/lambda-form [] [expression]) [] [dtype]))))
+  (testing "lexical SSA bindings take precedence over literal spellings"
+    (is (= 7.0 (scalar/evaluate-expression
+                'raster.compiler.backend.jvm.typed-scalar-test
+                {'Float/NEGATIVE_INFINITY 7.0} 'Float/NEGATIVE_INFINITY))))
+  (testing "arbitrary fields are not resolved or reflected"
+    (is (= :typed-scalar-unbound
+           (reason-of #(scalar/evaluate-expression
+                        'raster.compiler.backend.jvm.typed-scalar-test
+                        {} 'java.lang.System/out))))))
