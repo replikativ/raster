@@ -38,6 +38,30 @@
     (is (= 'float (tag-of concrete)))
     (is (= unknown (tangent/project-expr nil unknown {:materialized? true})))))
 
+(deftest scalar-projection-follows-carried-types-through-ssa-aliases
+  (let [source (tagged 'source 'double)
+        bindings {'outer 'inner 'inner source}
+        projected (tangent/project-expr 'float 'outer {:binding-map bindings})]
+    (is (= '(float outer) projected))
+    (is (= 'float (tag-of projected)))
+    (is (= 'outer (tangent/project-expr 'double 'outer {:binding-map bindings}))))
+  (is (= 'outer (tangent/project-expr
+                'float 'outer {:binding-map {'outer 'inner 'inner (tagged 'source 'float)}})))
+  (is (= '(float outer)
+         (tangent/project-expr 'float 'outer {:binding-map {'outer 'inner 'inner '(double x)}})))
+  (let [source (tagged 'source 'float)]
+    (is (= source (tangent/project-expr
+                  'float source {:binding-map {'source '(double x)}}))
+        "carried source metadata remains authoritative over alias recovery"))
+  (doseq [bindings [{'outer 'inner 'inner nil}
+                   {'outer 'inner 'inner '(nth grads 0)}
+                   {'outer 'inner 'inner '(if condition x nil)}
+                   {'outer 'inner 'inner 'outer}
+                   {'outer 'unbound}
+                   {'outer '(opaque-result x)}]]
+    (is (= '(raster.ad.tangent/project-float outer)
+           (tangent/project-expr 'float 'outer {:binding-map bindings})))))
+
 (deftest derived-scalar-adjoints-project-before-claiming-their-tangent-tag
   (let [[template _] (tmpl/resolve-template 'raster.par/scale)
         coefficient (tagged 'coefficient 'float)

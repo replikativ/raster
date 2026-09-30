@@ -169,12 +169,14 @@ Concrete kernel adjoints use the existing projection algebra's explicit non-nil/
 contract; unknown dynamic cotangents retain the default nil-safe helper. When a projection is
 needed, its input adjoint and projection are separate flat BindCtx bindings so an inlined SOAC
 is not hidden under a cast. Untagged argument types remain unguessed.
-The unsupported public scalar-gradient reproduction has two explicit admission boundaries:
-cold emission can retain one nil-safe `project-float` call and fail the typedness gate;
-before the completed-conversion follow-up, a warm specialization reached the unhoistable
-numerical-region scalar gap. The regression checks exact diagnostics, not an arbitrary exception. Recovering a symbol's
-type from its existing adjoint binding alone did not remove the cold helper and is not claimed
-as a completed fix. Dynamic-cotangent closure remains a consolidation obligation.
+The public scalar-gradient reproduction exposed an untagged multi-hop SSA alias chain at final
+parameter projection. Looking only at the immediate adjoint binder was insufficient. The shared
+tangent projection now follows existing SSA bindings to carried tags or manifest conversions;
+it does not infer function result types or assume a cotangent is present. Unknown, cyclic,
+conditional and pullback-slot chains retain the nil-safe helper. The focused reproduction now
+compiles with a Float semantic result in the freshly loaded REPL. Its final conversion follows
+a reduction with an intervening array equation, which is still an explicit
+`:emitted-program-host-device-dependency` placement decline rather than completed GPU AD.
 
 The completed-conversion follow-up reuses the existing reduction result transform, rather than
 adding a scalar AD kernel. A shared predicate permits only one explicit Float/Double conversion
@@ -189,7 +191,7 @@ Both Float-to-Double and Double-to-Float are checked at the SegRed scheduling bo
 public Float-accumulator widening claim is inferred from that lower-level test. A focused review
 found no blocker. The affected SOAC validation/fusion/emission suites pass 86 tests/551 assertions;
 the public ABI/gradient-boundary/device selection passes 3 tests/40 assertions. These checks
-overlap rather than defining additive coverage; they establish neither performance nor complete cold AD.
+overlap rather than defining additive coverage; they establish neither performance nor complete scalar AD residency.
 This broadens mixed-type scale admission, not implicit dispatch coercion. A rounding
 counterexample distinguishes this from rounding a Double coefficient to Float before
 multiplication. Public declared-storage compilation and
