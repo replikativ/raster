@@ -580,6 +580,17 @@
         :scalars scalars
         :result-dtype result-dtype}))))
 
+(defn- identity-reduction-result-transform?
+  "An absent transform, or a manifest same-dtype floating cast of the completed accumulator.
+   Discarding any other transform would erase numerical work or a rounding boundary."
+  [producer]
+  (let [transform (get-in producer [:attributes :result-transform])
+        accumulator-dtype (first (get-in producer [:attributes :dtypes]))]
+    (or (nil? transform)
+        (and (= accumulator-dtype (:result-dtype transform))
+             (scalar-region/completed-floating-conversion?
+              (scalar-region/from-typed-result-transform transform))))))
+
 (defn- reduce-result-scalar-candidate
   [program]
   (let [equations (dialect/equations program)
@@ -587,17 +598,17 @@
         uses (value-use-counts program)]
     (first
      (for [producer-index (range (dec (count infos)))
-           :let [consumer-index (inc producer-index)
-                 producer (nth infos producer-index)
-                 consumer (nth infos consumer-index)
-                 produced (first (:results producer))
-                 transform (reduce-result-scalar-transform program producer consumer)]
+           :let [producer (nth infos producer-index)]
            :when (= :reduce (:kind producer))
+           consumer-index (range (inc producer-index) (count infos))
+           :let [consumer (nth infos consumer-index)]
            :when (= :scalar (:kind consumer))
+           :let [produced (first (:results producer))
+                 transform (reduce-result-scalar-transform program producer consumer)]
            :when (= 1 (count (:results producer)) (count (:body-results producer))
                     (count (:results consumer)) (count (:body-results consumer)))
            :when (= 1 (count (get-in producer [:attributes :accumulators])))
-           :when (nil? (get-in producer [:attributes :result-transform]))
+           :when (identity-reduction-result-transform? producer)
            :when (empty? (:locals consumer))
            :when (= 1 (get uses produced 0))
            :when (not (contains? (set (dialect/outputs program)) produced))
@@ -612,6 +623,13 @@
                            (scalar-region/from-typed-result-transform transform))))
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
+           ;; A direct Float/Double conversion cannot trap or observe memory. It can move
+           ;; across pure SSA equations, but never across a physical effect/alias boundary.
+           ;; Nontrivial scalar epilogues retain the existing adjacent-only policy.
+           :when (or (= consumer-index (inc producer-index))
+                     (and (scalar-region/completed-floating-conversion?
+                           (scalar-region/from-typed-result-transform transform))
+                          (reorder-barrier-free? program producer-index consumer-index)))
            :when (host-barrier-free? program producer consumer)
            :when transform]
        {:producer-index producer-index :consumer-index consumer-index

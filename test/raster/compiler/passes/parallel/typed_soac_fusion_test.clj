@@ -718,6 +718,91 @@
     (is (zero? (:vertical stats)))
     (is (= 2 (count (dialect/equations result))))))
 
+(defn- separated-reduction-conversion [intervening terminal]
+  (frontend/form->program
+   (list 'let*
+         ['total '(raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+          (with-meta 'unchanged {:tag 'double}) '(double total)
+          'middle intervening
+          (with-meta 'result {:tag 'float}) terminal]
+         'result)
+   {:dtype :double :array-types {'x :double 'out :double}
+    :scalar-types {'n :long}}))
+
+(deftest terminal-conversion-crosses-only-pure-ssa-equations
+  (let [program (separated-reduction-conversion
+                 '(raster.par/pmap j n double (* (aget x j) 2.0))
+                 '(float unchanged))
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        operation (dialect/operation-parts (first (dialect/equations result)))]
+    (is (= 2 (:vertical stats)))
+    (is (= ['reduce 'map] (mapv dialect/operation-kind (dialect/equations result))))
+    (is (= [:double] (get-in operation [:attributes :dtypes])))
+    (is (= :float (get-in operation [:attributes :result-transform :result-dtype])))
+    (is (= result (dialect/validate! result)))))
+
+(deftest terminal-conversion-does-not-cross-effects-or-generalize-arithmetic
+  (doseq [[intervening terminal]
+          [['(raster.par/map! out j n double (* (aget x j) 2.0)) '(float unchanged)]
+           ['(raster.par/pmap j n double (* (aget x j) 2.0)) '(float (+ unchanged 0.25))]]]
+    (let [program (separated-reduction-conversion intervening terminal)
+          [result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= 1 (:vertical stats)) "only the adjacent identity cast fuses")
+      (is (= 3 (count (dialect/equations result)))))))
+
+(deftest terminal-conversion-retains-existing-nonidentity-transforms
+  (let [program (frontend/form->program
+                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                         ^double scaled (* total 2.0)
+                         middle (raster.par/pmap j n double (* (aget x j) 2.0))
+                         ^float result (float scaled)] result)
+                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 1 (:vertical stats)))
+    (is (= 3 (count (dialect/equations result))))
+    (is (= :double (get-in (dialect/operation-parts (first (dialect/equations result)))
+                          [:attributes :result-transform :result-dtype])))))
+
+(deftest terminal-conversion-retains-intermediate-narrowing
+  (let [program (frontend/form->program
+                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                         ^float narrowed (float total)
+                         middle (raster.par/pmap j n double (* (aget x j) 2.0))
+                         ^double result (double narrowed)] result)
+                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 1 (:vertical stats)))
+    (is (= 3 (count (dialect/equations result))))
+    (is (= :float (get-in (dialect/operation-parts (first (dialect/equations result)))
+                         [:attributes :result-transform :result-dtype])))))
+
+(deftest terminal-conversion-retains-opaque-host-boundaries
+  (let [program (separated-reduction-conversion
+                 '(raster.par/pmap j n double (* (aget x j) 2.0)) '(float unchanged))
+        facts (assoc-in (dialect/facts program) [:attributes :host-binding-ids] #{2})
+        program (dialect/make facts (dialect/equations program) (dialect/outputs program))
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 1 (:vertical stats)))
+    (is (= 3 (count (dialect/equations result))))))
+
+(deftest terminal-conversion-retains-an-intervening-alias-contract
+  (let [program (separated-reduction-conversion
+                 '(raster.par/pmap j n double (aget x j)) '(float unchanged))
+        middle-id (second (nth (dialect/equations program) 2))
+        facts (assoc-in (dialect/facts program) [:equations middle-id :aliases] {'middle 'x})
+        program (dialect/make facts (dialect/equations program) (dialect/outputs program))
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (empty? (get-in facts [:equations middle-id :effects])))
+    (is (= 1 (:vertical stats)))
+    (is (= 3 (count (dialect/equations result))))))
+
+(deftest terminal-conversion-retains-a-shared-reduction-result
+  (let [program (separated-reduction-conversion
+                 '(raster.par/pmap j n double (+ (aget x j) unchanged)) '(float unchanged))
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= 1 (:vertical stats)))
+    (is (= 3 (count (dialect/equations result))))))
+
 (deftest a-map-feeding-a-fold-map-keeps-the-fold-map-intact
   ;; The fold-map reads the map's result as a stable capture, so it is not a vertical fusion
   ;; consumer; reading its references must not re-emit it through the single-lambda builder,

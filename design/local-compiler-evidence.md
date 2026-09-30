@@ -175,8 +175,14 @@ tangent projection now follows existing SSA bindings to carried tags or manifest
 it does not infer function result types or assume a cotangent is present. Unknown, cyclic,
 conditional and pullback-slot chains retain the nil-safe helper. The focused reproduction now
 compiles with a Float semantic result in the freshly loaded REPL. Its final conversion follows
-a reduction with an intervening array equation, which is still an explicit
-`:emitted-program-host-device-dependency` placement decline rather than completed GPU AD.
+a reduction with an intervening pure array equation. The reduction-fusion rule now places a
+direct Float/Double conversion across pure SSA equations, retaining physical effects, aliases
+and opaque host barriers. It may replace only an absent epilogue or a same-dtype manifest
+identity cast; arbitrary arithmetic and intermediate narrowing are not discarded. The public
+scalar-gradient fixture executes empty, three-element and 2049-element cases twice on OpenCL
+and Level Zero with exact JVM parity. The selected fusion suite passes 42 tests/226 assertions;
+the public boundary and dual-backend numerical selection passes 2 tests/27 assertions. This
+closes that reproduction, not arbitrary scalar-device placement or general mixed epilogues.
 
 The completed-conversion follow-up reuses the existing reduction result transform, rather than
 adding a scalar AD kernel. A shared predicate permits only one explicit Float/Double conversion
