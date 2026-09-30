@@ -281,13 +281,15 @@
   [parallel-program equation]
   (body-for-equations parallel-program [equation]))
 
-(defn- typed-host-scalar-equation?
+(defn- typed-host-scalar-equation-for-validated-algorithm?
+  ;; Only called after make validates the enclosing scheduled program with algorithm-boundary?.
+  ;; That check already validates this exact retained algorithm; keep the prefix-specific dtype,
+  ;; scalar-result and capture checks here without deriving its complete SOAC proof twice.
   [values equation algorithm]
   (when-let [[result _] (scalar-result-expression equation)]
     (let [semantic-equation (first (soac/equations algorithm))
           {:keys [attributes captures]} (soac/operation-parts semantic-equation)]
-      (and (= algorithm (soac/validate! algorithm))
-           (= 1 (count (:results equation)))
+      (and (= 1 (count (:results equation)))
            (= (:dtypes attributes) [(get-in values [result :dtype])])
            (empty? (get-in values [result :shape]))
            (every? #(contains? values %) captures)))))
@@ -426,7 +428,8 @@
                                       (:equations scheduled)))
          numerical-equations (vec (drop (count host-prefix) (:equations scheduled)))
          _ (when-not (and (seq numerical-equations)
-                          (every? #(typed-host-scalar-equation? (:values scheduled) % (:algorithm %))
+                          (every? #(typed-host-scalar-equation-for-validated-algorithm?
+                                    (:values scheduled) % (:algorithm %))
                                   host-prefix))
              (fail! :scheduled-equation-prefix
                     "a graph body requires an earlier-only typed host-scalar prefix and numerical equations"

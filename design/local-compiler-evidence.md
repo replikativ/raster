@@ -238,6 +238,29 @@ is typed semantic projection inside one checked boundary, not removal of indepen
 or a new persistent validation cache. External adapter migration and matched kernel baselines
 remain on the existing campaign.
 
+The bounded target-projection cleanup merged as #957 (`41936aa4`) after all seven final-head
+gates passed. An exact-identity census then counted 48,740 SOAC validations over 352 distinct
+program objects in the same recomposition. Some single-equation scalar-prefix programs were
+checked 628 times. This does not make every repetition redundant: separate public graph/program
+validations retain independent proofs.
+
+One immediate duplication is wholly private: scheduled graph construction validates its entire
+body with `algorithm-boundary?`, then host-prefix projection validates those same algorithms
+again. The follow-up removes only that second validation and makes the projector's precondition
+explicit in its private name. Scalar result count, dtype, shape and capture checks remain. The
+existing scalar-gap fixture checks identical graph output, one exact prefix-algorithm validation
+per construction, fresh later construction, malformed semantic inputs and invalid scalar shape.
+No validated context, callback convention, persistent cache or new IR is introduced.
+Focused acceptance passes 88 tests / 594 assertions: 13 / 58 scheduled-graph checks,
+71 / 460 control/equation/dispatch/native-composition checks and 4 / 76 staged vendor,
+mixed-target and checked-prefix exception-order checks. Both local device probes are asserted
+before native composition tests.
+The exact-identity Gemma census after this private cleanup retains the same 247-node / 2-instance
+plan and 352 distinct semantic program objects, while SOAC validator invocations fall from
+48,740 to 24,804 (23,936 redundant invocations removed). Instrumented recomposition reports
+10.74 s under the current background load. The count and identical plan are reproducible
+mechanism evidence; the single timing sample is not a controlled latency-speedup claim.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

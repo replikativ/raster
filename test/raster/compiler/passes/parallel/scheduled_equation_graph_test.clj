@@ -199,6 +199,36 @@
     (is (= (mapv :id numerical) (mapv :id (subvec (:equations body) 1))))
     (is (= 2 (count (:nodes graph))))))
 
+(deftest scheduled-graph-checks-each-retained-host-algorithm-once
+  (let [scheduled (scheduled-scalar-gap)
+        numerical (filterv (comp seq :operations) (:equations scheduled))
+        {:keys [algorithm body graph]} (equation-graph/make-for-equations scheduled numerical)
+        host-equation (first (:equations body))
+        host-algorithm (:algorithm host-equation)
+        result (first (:results host-equation))
+        checks (atom 0)
+        original soac/validate!]
+    (with-redefs [soac/validate!
+                  (fn [candidate]
+                    (when (identical? host-algorithm candidate) (swap! checks inc))
+                    (original candidate))]
+      (is (= graph (equation-graph/make algorithm body)))
+      (is (= 1 @checks) "the checked program supplies the prefix's semantic proof")
+      (is (= graph (equation-graph/make algorithm body)))
+      (is (= 2 @checks) "a later graph construction independently checks the prefix"))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (equation-graph/make
+                  algorithm
+                  (assoc-in body [:equations 0 :algorithm]
+                            (apply list (assoc (vec host-algorithm) 1
+                                               (assoc (soac/facts host-algorithm)
+                                                      :inputs ['missing]))))))
+        "an invalid retained host algorithm still fails during program validation")
+    (is (= :scheduled-equation-prefix
+           (reason-of #(equation-graph/make
+                        algorithm (assoc-in body [:values result :shape] [1]))))
+        "prefix-specific scalar shape checks are not covered by a valid algorithm alone")))
+
 (deftest later-global-extent-becomes-a-bindable-buffer-capacity
   (let [scheduled (scheduled-three-maps)
         scheduled (-> scheduled
