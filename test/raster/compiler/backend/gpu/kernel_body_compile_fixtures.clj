@@ -20,6 +20,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.fixtures.staged-contracts :as staged-public]
+            [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -473,6 +474,10 @@
                 :capabilities capabilities})
     (vec
      (concat
+      (:kernels (equation-first/compile
+                 #'symbolic-storage/regrouped-map {:target device-id :dtype :float}))
+      (:kernels (equation-first/compile
+                 #'symbolic-storage/prefix-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'staged-public/floating-three-stage! {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

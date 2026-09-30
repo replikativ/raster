@@ -115,6 +115,44 @@ semantics. Source restoration and artifact closure are explicit. No new invalida
 or cache is introduced; this closes one concrete transitive test gap, not transactional
 reload, all-overload removal, or arbitrary retained-state invalidation.
 
+## Isolated external resident training migration — 2026-09-30
+
+The committed finetune-rstr `9e9ba5d` snapshot is now exercised through a temporary migration
+of its actual LoRA and QLoRA train-step declarations. Only the isolated copy changes: its
+retired `bind-program!`/`run-program!` wrappers use public `compiled/lower`, `instantiate!`,
+adapter donation and semantic outputs. Frozen batch/weights are constants, all updates run
+resident, and A/B are downloaded only after 30 steps. The wrappers close their artifacts in
+`finally`. Their Double learning-rate port is explicitly materialized as Float at the existing
+Float optimizer boundary, making the uncompiled JVM oracle valid too. No sibling checkout or
+dependency is modified; this is not an upstream migration or real-weight training claim.
+
+- LoRA, rows=2/in=4/rank=2/out=3: loss 0.08468652765 → 0.04792594910 on JVM, OpenCL and
+  Level Zero; final A/B agree exactly.
+- QLoRA, rows=2/in=32/rank=2/out=3 with shared frozen row-major INT8 weights: loss
+  0.05017762880 → 0.04621510704 on all three paths. Maximum adapter errors are
+  2.33e-10 for A and 7.46e-9 for B on each device backend.
+
+These are correctness/state-progress oracles, not throughput measurements. The actual external
+Gemma forward numerical declaration is exercised separately from its retired host wrappers, using
+its unchanged numerical declarations and data constructors: B=1/sequence=2/d=8/heads=2/KV-heads=1/
+head-dim=4/FFN=16/adapter-rank=2. It emits 60 public equation-first stages; both OpenCL and Level
+Zero match the uncompiled JVM output within 1.073e-6 over all 16 output elements on two replays.
+
+The admission gap was a storage/iteration distinction, not missing RMS loop syntax: the same
+producer acquired incompatible extent names through differently grouped head dimensions and
+later array-length reads. Unproved pointwise shape equality now retains the existing indexed
+capture instead of retyping producer storage. No product CSE, checked-scalar hoist, dtype rule,
+model recognizer, or new shape-equality authority is added. Known symbolic capacities retain the
+existing graph precondition; slice-local capacities are checked against the actual linked view.
+An overlong prefix is rejected with `:program-link-graph-range` before allocation or launch.
+For an external input without an explicit shape/view contract, the first pointwise traversal
+establishes only a conservative inferred contract. This does not claim complete symbolic shape
+equivalence or admission of every traversal a larger physical caller buffer could support.
+
+This is not a full package migration. Shared forward/VJP state, actual external training updates,
+real-weight acceptance, and cross-vendor device performance remain open. The local Gemma twin
+does not substitute for those gates.
+
 ## Declared array storage — 2026-09-30
 
 The opt-in `:preserve-declared-array-storage? true` keeps resolved array element tags as
