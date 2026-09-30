@@ -541,6 +541,16 @@ ordered double-product/float-result contraction: the register gate must not eras
 terms just to select a matrix leaf. Canonical typed conversion/specialization remains a follow-up;
 two simultaneously admitted numerical dispatch families need a separate workload oracle.
 
+The mixed attention/projection fixture now shares one JVM-callable source across admission
+and device tests. Its array helpers declare Double methods, so the source inputs are Double;
+the previous Float-input synthetic fixture could compile but could not be evaluated on the
+JVM. The device invocation explicitly binds FP32 copies under `:dtype :float`, while the
+reference invokes the original Double arrays and materializes the Float result. Two resident
+replays on each local backend compare all output elements with a 1e-6 absolute tolerance and
+require exact zeros for the destination with no edges. The initial exploratory local run observed
+maximum error 1.49e-8 on both backends. This validates a composed numerical workload, not two
+admitted candidate families: the conversion-bearing projection remains conservatively ordered.
+
 Focused checks for the public candidate slice: static/dynamic admission, exact empty fallback and
 strict precision 1 test / 11 assertions; OpenCL/CUDA/HIP source/projection checks 1 / 15; real
 Level Zero and OpenCL ragged 65x67x17 replay versus JVM 1 / 4; schedule feasibility 1 / 43. These
