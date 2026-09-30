@@ -12,13 +12,16 @@
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.contraction-body :as contraction-body]
             [raster.compiler.passes.parallel.register-tiled-body :as register-tiled]
-            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
 
 (defn- decline [reason & [data]]
   (merge {:ok false :reason reason} data))
@@ -715,3 +718,60 @@
       (throw (ex-info "unknown typed contraction schedule strategy"
                       {:reason :kernel-graph-contraction-strategy
                        :strategy strategy :fallback :none})))))
+
+(defn complete-write-domain
+  "Prove the dense output domain of an exact generated portable or register-tiled body.
+
+   Output ABI permissions, matching extents and schedule labels are not must-write evidence.
+   Reconstruct from the authoritative typed algorithm and graph widths, not candidate labels.
+   Require exact body, compiler-argument and scalar-binding identity, including stores, masks
+   and launch geometry. Target and numerical admission stay with the original
+   certificate; this query neither discovers hardware nor claims numerical equivalence."
+  [algorithm node graph scheduled]
+  (let [scheduled (scheduled-body/validate-against-node! scheduled node graph)
+        contract-facts (:facts (contraction-context/validate! algorithm (:operation node)))
+        kernel-body (:body scheduled)
+        parameters (:parameters kernel-body)
+        outputs (filterv #(contains? #{:output :inout} (:kind %)) parameters)
+        output (first outputs)
+        scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
+        array-types (into {} (map (juxt :id :dtype))
+                          (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
+        options {:operation-id (get-in scheduled [:source :id])
+                 :array-types array-types :scalar-types scalar-types}
+        expected
+        (case (get-in scheduled [:legality :kind])
+          :ordered-portable-contraction
+          (contraction-body/lower
+           contract-facts (:source scheduled)
+           (assoc options :workgroup-size (first (get-in kernel-body [:launch :workgroup-size]))))
+
+          :register-tiled-contraction
+          (register-tiled/lower contract-facts
+                                (assoc options :tile (get-in scheduled [:legality :tile])))
+
+          nil)
+        expected-arguments (mapv (fn [{:keys [id]}]
+                                   (if (and (= :ordered-portable-contraction
+                                               (get-in scheduled [:legality :kind]))
+                                            (= '_nseg id))
+                                     (get-in expected [:kernel-body :attributes :launch-segment-count])
+                                     id))
+                                 (get-in expected [:kernel-body :parameters]))
+        source-value (get-in (soac/facts algorithm) [:values (:out contract-facts)])
+        plain-output? (and (closure/plain-storage? source-value)
+                           (some #(= (:out contract-facts) (:id %)) (:outputs graph))
+                           (not-any? #(= (:out contract-facts) (:id %)) (:inputs graph)))
+        preconditions-valid?
+        (or (not= :register-tiled-contraction (get-in scheduled [:legality :kind]))
+            (= (:preconditions scheduled)
+               (register-tiled/admission-preconditions (:dims expected) (:tile expected))))]
+    (when (and expected plain-output? preconditions-valid?
+               (= kernel-body (:kernel-body expected))
+               (= (:arguments scheduled) expected-arguments)
+               (= (:scalar-bindings scheduled)
+                  (scheduled-body/derive-scalar-bindings
+                   (:kernel-body expected) expected-arguments scalar-types))
+               (= 1 (count outputs)) (= :output (:kind output))
+               (= (:out contract-facts) (:id output)))
+      {(:out contract-facts) (apply launch/product (map second (:free-axes contract-facts)))})))

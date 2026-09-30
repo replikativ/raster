@@ -7,9 +7,82 @@
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.contract-lower :as lower]
             [raster.compiler.passes.parallel.contract-route :as route]
-            [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
+            [raster.compiler.passes.parallel.contraction-schedule :as schedule]
+            [raster.compiler.passes.parallel.register-tiled-body :as register-tiled]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
+
+(deftest candidate-complete-write-evidence-requires-the-generated-body
+  (doseq [dynamic? [false true]]
+   (let [source (if dynamic?
+                  '(let* [result (raster.par/contract C [[i m] [j n]] [[k depth]]
+                                 (* (aget A (+ (* i depth) k)) (aget B (+ (* k n) j))))]
+                     result)
+                  '(let* [result (raster.par/contract C [[i 65] [j 67]] [[k 3]]
+                                 (* (aget A (+ (* i 3) k)) (aget B (+ (* k 67) j))))]
+                     result))
+        scalar-types (if dynamic? {'m :long 'n :long 'depth :long} {})
+        scalar-values {'m 65 'n 67 'depth 3}
+        {:keys [form]} (pipeline/schedule-parallel-form
+                        source {:dtype :float :target-device :ocl:0
+                                :array-types {'A :float 'B :float 'C :float}
+                                :scalar-types scalar-types})
+        equation (first (:equations form))
+        graph (:graph (equation-graph/make-for-equation form equation))
+        algorithm (:algorithm equation)
+        node (first (:nodes graph))
+        verified (:facts (contraction-context/validate! (:algorithm equation) (:operation node)))
+        portable (schedule/schedule-portable-for-node
+                  node graph verified {} {:scalar-types scalar-types})
+        register (:scheduled (schedule/plan-register-tiled-for-node
+                              node graph verified {} {:precision :mixed-f16-f32}))
+        complete-write #(schedule/complete-write-domain algorithm node graph %)]
+    (is (some? register))
+    (is (= 4355 (launch/resolve-expression
+                 scalar-values (get (complete-write portable) 'C))))
+    (is (= (complete-write portable) (complete-write register)))
+    (let [partial (update-in register [:body :operations] pop)]
+      (is (= (get-in register [:body :parameters]) (get-in partial [:body :parameters])))
+      (is (= 4355 (launch/resolve-expression scalar-values
+                                            (get-in partial [:attributes :out-elems]))))
+      (is (nil? (complete-write partial))))
+    (is (nil? (complete-write (assoc-in portable [:body :launch :group-count] [1]))))
+    (let [arguments (mapv (fn [parameter argument]
+                           (if (= '_nseg (:id parameter))
+                             (launch/minimum argument 1)
+                             argument))
+                         (get-in portable [:body :parameters]) (:arguments portable))
+          scalar-bindings (scheduled-body/derive-scalar-bindings
+                           (:body portable) arguments scalar-types)]
+      (is (nil? (complete-write (assoc portable :arguments arguments
+                                      :scalar-bindings scalar-bindings)))
+          "an unchanged body can still be bound to a truncated segment extent"))
+    (let [non-dense (list* (first algorithm)
+                          (assoc-in (second algorithm) [:values 'C :logical-layout]
+                                    {:strides [67 1]})
+                          (nnext algorithm))]
+      (is (= :typed-soac-result-storage-type
+             (try (schedule/complete-write-domain non-dense node graph portable)
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception
+                    (:reason (ex-data exception)))))))
+    (when dynamic?
+      (is (nil? (complete-write (assoc register :preconditions []))))
+      (let [narrow-body (:kernel-body
+                         (register-tiled/lower verified
+                           {:operation-id (:id (:operation node))
+                            :tile (get-in register [:legality :tile])
+                            :scalar-types {'m :int 'n :int 'depth :int}}))
+            narrow (assoc register :body narrow-body
+                          :scalar-bindings
+                          (scheduled-body/derive-scalar-bindings
+                           narrow-body (:arguments register) scalar-types))]
+        (is (nil? (complete-write narrow))
+            "candidate parameter widths cannot provide their own proof evidence"))))))
 
 (def ^:private matvec
   '(raster.par/contract y [[i m]] [[l k]]
