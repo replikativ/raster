@@ -1025,6 +1025,14 @@
     #(is (ifn? (pipeline/compile-aot #'scalar-helpers/map-cast-helper
                                     :dtype :float :target-device ocl-target)))))
 
+(deftest scalar-helper-admission-preserves-public-softmax-reduction-boundaries
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:outputs (equation-first/lower
+                                compilation [(float-array [1.0 2.0 3.0])])))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation))))))
+
 (deftest ordinary-and-diagnostic-runners-preserve-non-gpu-inline-policy
   (let [seen (atom [])
         diagnostic (var-get (ns-resolve 'raster.compiler.pipeline 'run-passes-diagnostic))]

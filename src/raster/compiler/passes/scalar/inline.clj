@@ -42,6 +42,12 @@
    resident and direct scheduling share this policy; other targets retain their existing policy."
   false)
 
+(def ^:dynamic *preserve-canonical-intrinsics?*
+  "Keep canonical scalar calls symbolic when entering scheduling from an already walked body.
+   This is independent of admitting pure scalar helper tails: the ordinary representation
+   pipeline still expands its existing numeric implementation bodies before SOAC discovery."
+  false)
+
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
    Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
@@ -135,6 +141,11 @@
         n (if-let [i (str/index-of n "_m_")] (subs n 0 i) n)]
     (symbol (namespace impl-sym) n)))
 
+(defn- canonical-callee [callee]
+  ;; Mangled arithmetic names and named intrinsics use the same canonical registry.
+  (or (intrinsics/canonical callee)
+      (intrinsics/canonical (recursion-key callee))))
+
 (defn- needs-arg-lift?
   "Evaluate nonconstant expression arguments once before substitution, even when unused.
    Casts are expressions too: checked conversion may throw, and its operand may
@@ -215,7 +226,14 @@
       (let [effective-wb (if (> (count walked-body) 1)
                            [(apply list 'do walked-body)]
                            walked-body)]
-        (when (inlinable-body? (first effective-wb))
+        ;; Admit bare user scalar tails without also opening array-storage helpers or
+        ;; changing the existing intrinsic implementation expansion of this pipeline.
+        (when (binding [*inline-scalar-bodies?*
+                        (and *inline-scalar-bodies?*
+                             (not-any? types/primitive-array-tags tags)
+                             (let [callee (symbol (str (:ns metadata)) (str (:name metadata)))]
+                               (not (canonical-callee callee))))]
+                (inlinable-body? (first effective-wb)))
           (let [source-ns-sym (symbol (str (.name (.ns v))))
                 source-ns (try (the-ns source-ns-sym) (catch Exception _ nil))
                 param-set (set (map #(if (symbol? %) % (symbol (name %))) params))
@@ -1224,8 +1242,8 @@
                                  ;; A canonical numeric call is already a first-class scalar
                                  ;; operator. The direct GPU helper expansion must not turn it
                                  ;; into an implementation body and lose its algebraic identity.
-                                 (not (and *inline-scalar-bodies?*
-                                           (intrinsics/canonical impl-sym))))
+                                 (not (and *preserve-canonical-intrinsics?*
+                                           (canonical-callee impl-sym))))
                         (try-resolve-deftm impl-sym))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info

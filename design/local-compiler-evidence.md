@@ -74,8 +74,10 @@ A bare pure scalar cast helper exposed entry drift: direct GPU scheduling enable
 existing hygienic scalar-body inliner, while equation-first and resident representation
 passes left the same helper opaque and declined it as lacking a canonical intrinsic.
 The shared ordinary and diagnostic pass runners now enable that same policy when
-`:target-device` selects GPU compilation, including staged AOT entry points. Intrinsics remain
-operators, checked/call-by-value argument handling stays in the existing inliner, and JVM
+`:target-device` selects GPU compilation, including staged AOT entry points. Bare-tail admission
+is limited to scalar, non-intrinsic helpers; array/storage helper and canonical intrinsic
+implementation expansion retain their previous representation-pipeline policy. Direct scheduling
+separately preserves canonical operators. Checked/call-by-value handling stays in the existing inliner, and JVM
 expansion policy is unchanged. No helper-name registry or algorithm-specific rule is added.
 
 The public cast-helper fixture emits one KernelBody map with no fallback and zero driver
@@ -85,6 +87,18 @@ not implement CUDA/HIP `pass-backend`; that preexisting limitation is not a vend
 claim. Exact source-versus-device parity passes two resident replays on each local backend.
 The existing inliner suite passes 19 tests/91 assertions, retaining hygiene, unused checked
 arguments and call-by-value semantics.
+
+The initial CI run caught a policy interaction missed by the small helper fixture: enabling
+bare tails also expanded numeric implementations and array lengths, losing existing softmax/PDE
+SOAC shapes. The fix separates admission from direct-scheduler intrinsic preservation and uses
+the existing canonical registry plus existing generic-name normalization. Public softmax lowering
+is now a regression oracle across all three source families; existing PDE/softmax device cases
+are rerun locally. The failed head is not merged and all seven checks must pass on its replacement.
+The replacement passes the complete source-emission gates locally (195 files per vendor),
+the affected public frontend/PDE/softmax cases (7 tests/61 assertions), and the local coverage
+ratchet (1 test/16 assertions): 253 rows, 240 TypedSOAC, one structured-control, five scalar and
+seven explicit host-only, with 951 KernelBody artifacts and no lowering declines. These counts
+describe this local same-compile report; the committed portable baseline is not silently updated.
 
 An additional local probe redefines only a scalar helper from constant 1 to 2. Fresh public
 compilation records a template invalidation and produces `[2,2,2]` on OpenCL, matching JVM
