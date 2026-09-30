@@ -221,6 +221,51 @@
         covers? #(boolean (coverage/rectangular-effect-covers? % result 60 scalars))
         change-store (fn [f] (walk/postwalk (fn [x] (if (and (seq? x) (= 'effect (first x))) (f x) x)) algorithm))]
     (is (covers? algorithm))
+    (let [address-local
+          (fn [type transform]
+            (walk/postwalk
+             (fn [form]
+               (if (and (seq? form) (= 'effect-region (first form))
+                        (= 3 (count form)) (= 1 (count (nth form 2)))
+                        (= 'effect (first (first (nth form 2)))))
+                 (let [store (first (nth form 2))
+                       address (transform (nth store 3))
+                       local (with-meta 'coverage-address {:tag (symbol (name type))})]
+                   (list 'effect-region
+                         (conj (vec (second form)) (list 'let-value local type address))
+                         [(apply list (assoc (vec store) 3 local))]))
+                 form)) algorithm))]
+      (is (covers? (address-local :long identity))
+          "a retained integral SSA address local preserves exact rectangular coverage")
+      (is (not (covers? (address-local :int identity)))
+          "local dtype narrowing is not erased to manufacture a coverage proof")
+      (is (not (covers? (address-local :long
+                                      #(with-meta (list 'clojure.core/+ % Long/MAX_VALUE)
+                                         {:tag 'long})))))
+      (is (not (covers? (address-local :long (constantly 0))))
+          "an in-bounds local alone does not prove an injective complete write")
+      (let [chained (fn [type transform]
+                      (walk/postwalk
+                       (fn [form]
+                         (if (and (seq? form) (= 'effect-region (first form))
+                                  (some #(= 'coverage-address (second %)) (second form)))
+                           (let [previous (with-meta 'coverage-address
+                                            {:tag (symbol (name type))})
+                                 next-address (with-meta 'coverage-next-address {:tag 'long})
+                                 store (first (nth form 2))]
+                             (list 'effect-region
+                                   (conj (vec (second form))
+                                         (list 'let-value next-address :long
+                                               (with-meta (list 'clojure.core/long previous)
+                                                 {:tag 'long})))
+                                   [(apply list (assoc (vec store) 3 next-address))]))
+                           form))
+                       (address-local type transform)))]
+        (is (covers? (chained :long identity)))
+        (is (not (covers? (chained :int identity))))
+        (is (not (covers? (chained :long
+                                  #(with-meta (list 'clojure.core/+ % Long/MAX_VALUE)
+                                     {:tag 'long})))))))
     (doseq [predicate [false nil true '(clojure.core/> 1 0)]]
       (let [guarded (change-store #(list 'effect-when predicate [] [%]))
             equation (first (soac/equations guarded))]

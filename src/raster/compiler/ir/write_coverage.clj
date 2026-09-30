@@ -226,27 +226,44 @@
                            (not-any? #(contains? scalar-values %)
                                      (drop (count captures) parameters))
                            (= (count destinations) (count (nth equation 2))))
-                  (letfn [(visit [region dimensions]
-                            ;; Referenced address/bound locals are absent from the environment and
-                            ;; decline. Value-only locals do not affect coverage.
+                  (letfn [(visit [region dimensions address-locals]
+                            ;; Expand only retained integral SSA locals, in source order, with
+                            ;; their declared conversion boundary intact. The existing typed range
+                            ;; checker must still prove every operation exact and in bounds before
+                            ;; mixed-radix algebra may erase casts. Numerical/value-only locals
+                            ;; remain irrelevant unless an address actually references them.
                             (when (and (= 1 (count (:body-results region)))
                                        (not-any? (into (set (keys captured))
-                                                       (map first dimensions))
+                                                       (concat (keys address-locals)
+                                                               (map first dimensions)))
                                                  (map :id (:locals region))))
-                              (let [{:keys [region branch loop index lower extent lambda carries destination
+                              (let [address-locals
+                                    (reduce (fn [known {:keys [id dtype init]}]
+                                              (if (contains? #{:int :long} dtype)
+                                                (assoc known id
+                                                       (with-meta
+                                                         (list (symbol "clojure.core" (name dtype))
+                                                               (walk/postwalk-replace known init))
+                                                         {:tag (symbol (name dtype))
+                                                          :raster.type/tag (symbol (name dtype))}))
+                                                known))
+                                            address-locals (:locals region))
+                                    expand #(walk/postwalk-replace address-locals %)
+                                    {:keys [region branch loop index lower extent lambda carries destination
                                             destination-index predicate conflict] :as part}
                                     (soac/effect-parts (first (:body-results region)))]
                                 (cond
                                   branch nil
                                   (and region (contains? part :predicate)) nil
-                                  region (visit region dimensions)
+                                  region (visit region dimensions address-locals)
                                   loop
                                   (when (and (empty? carries) (= 0 lower)
                                              (not (contains? captured index))
+                                             (not (contains? address-locals index))
                                              (not-any? #{index} (map first dimensions)))
-                                    (when-let [n (bound extent)]
+                                    (when-let [n (bound (expand extent))]
                                       (visit (soac/lambda-parts lambda)
-                                             (conj dimensions [index n]))))
+                                             (conj dimensions [index n]) address-locals)))
                                   (and (= target destination) (= :unique conflict)
                                        (contains? #{true 1} predicate))
                                   (let [types (into types
@@ -255,6 +272,7 @@
                                                         (map (fn [[id n]]
                                                                [id {:lower 0 :upper (dec n)}]))
                                                         dimensions)
+                                        destination-index (expand destination-index)
                                         address-range (expression-range destination-index
                                                                         types intervals)
                                         ;; Cast erasure is safe ONLY after exact-width validation.
@@ -267,6 +285,6 @@
                                          (< (:upper address-range) capacity)
                                          (= capacity (reduce *' 1 (map second dimensions)))
                                          (algebra/injective? form)))))))]
-                    (visit region [[outer extent]])))))))))
+                    (visit region [[outer extent]] {})))))))))
     (catch clojure.lang.ExceptionInfo _ false)
     (catch ArithmeticException _ false)))

@@ -165,6 +165,22 @@ a corrupt region cannot hide a missing core-named local. Focused tests execute `
 and `first` as typed Long operands and reject their deliberately omitted captures. This changes
 neither source semantics nor scalar dtype inference, and introduces no separate operation registry.
 
+The next public-training gate reached initialization certification. A fresh RMSNorm-gradient
+buffer is completely written by a rectangular effect map, but its address uses a retained Long
+SSA row-offset local. The existing coverage proof now expands integral SSA locals in source
+order, preserving each declared cast; typed interval checking still precedes mixed-radix
+injection and exact-capacity checks. Narrowing, overflow, guards and non-injective addresses
+remain declines. This extends proof evidence, not ABI write permission or numerical inference.
+The full tiny Gemma/LoRA program then lowers with zero driver allocations and runs through the
+public compiled API on the local Arc. After two SGD steps, GPU/JVM losses were
+2.40469313/2.40469337 and maximum adapter absolute error was 2.98e-8. The existing 25-step
+FP32 trajectory test is migrated from descriptor-fixture invocation to this public API; its
+mixed-precision counterpart still uses the fixture and remains a separate migration item.
+Local validation: the migrated 25-step device/JVM trajectory passes 43 assertions, with both
+losses falling from 2.800152 to 0.256915; the focused coverage test passes 25 assertions and the
+initialization suite passes 21 tests / 129 assertions. These are local Arc results, not CUDA/HIP
+runtime or external full-model training evidence.
+
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable
