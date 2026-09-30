@@ -663,7 +663,10 @@
        :launch (if sequential-effects?
                  (launch/spec {:workgroup-size [1] :group-count [1]})
                  (launch/spec {:workgroup-size [workgroup-size]
-                               :group-count [(launch/ceil-div '_n_bound workgroup-size)]}))
+                               ;; Empty maps still have a valid driver launch. The existing
+                               ;; extent mask suppresses every operation, including effects.
+                               :group-count [(launch/maximum
+                                              1 (launch/ceil-div '_n_bound workgroup-size))]}))
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
        :attributes (cond-> {:kind :portable-segmap :extent bound :no-write-alias true

@@ -29,6 +29,24 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
 
+(deftest portable-map-empty-extent-has-a-masked-valid-launch
+  (let [operation (segop/->SegMap
+                   902 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(clojure.core/aget input i) nil #{'input} #{'output} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)
+        kernel-body (:kernel-body
+                     (segmap-body/lower operation
+                                        {:array-types {'input :float 'output :float}
+                                         :workgroup-size 32}))
+        spec (:launch kernel-body)]
+    (doseq [[extent groups] [[0 1] [1 1] [32 1] [33 2]]]
+      (is (= [groups] (:group-count (klaunch/realize spec
+                                                    (fn [_] extent))))))
+    (is (= :map-active (:id (first (:masks kernel-body)))))
+    (is (= (kernel-body/predicate :lt 'i
+                                 (kernel-body/index-cast '_n_bound :long :exact))
+           (first (:predicates (first (:masks kernel-body))))))))
+
 (deftest map-access-proof-declines-negative-and-indirect-coordinates
   (doseq [expression ['(aget a (- i 1))
                       '(aget a (int (aget b j)))]]
