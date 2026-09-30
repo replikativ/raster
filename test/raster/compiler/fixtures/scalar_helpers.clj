@@ -14,3 +14,17 @@
   (let [output (float-array n)]
     (p/map-void! i n (a/aset output i (cast-tail (a/aget input i))))
     output))
+
+(defn redefine-reload-tail! [factor]
+  (binding [*ns* (the-ns 'raster.compiler.fixtures.scalar-helpers)]
+    (eval (list 'deftm 'reload-tail
+                (list 'All '[T] '[x :- T] ':- 'T
+                      (list 'T (list 'raster.numeric/* 'x (list 'T factor))))))))
+
+(redefine-reload-tail! 1.0)
+
+(deftm map-reload-helper
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (p/map-void! i n (a/aset output i (reload-tail (a/aget input i))))
+    output))
