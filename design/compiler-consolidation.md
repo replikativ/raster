@@ -74,8 +74,11 @@ inventing an incompatible result buffer.
 ### ASR resident-capture acceptance order
 
 Keep this inside item 3, not a replacement campaign or another attention ABI. The allocating
-`gqa-decode-attention-weights!` remains an explicit public resident decline. Its mandatory
-host oracles are separate from BLAS availability. The next implementation must:
+`gqa-decode-attention-weights!` is now an explicit host-only allocating wrapper. Its mandatory
+host oracles are separate from BLAS availability. The caller-owned
+`gqa-decode-attention-weights-resident!` change passes local acceptance with two generated
+KernelBody kernels, without a new attention ABI or emitter. CI and external ASR migration
+remain open. Its contract is:
 
 1. Retain physical score/output/sink storage precision independently of scalar computation
    and normalization scratch precision. Use the shared declared-storage policy, including
@@ -83,18 +86,25 @@ host oracles are separate from BLAS availability. The next implementation must:
 2. Expose caller-owned output and scratch through ordinary public invocation/LinkPlan
    contracts. Reuse the library's numerical stages rather than copying another target kernel.
    Preserve score and exponential materialization, the sum's evaluation order, and the
-   inverse's precision. Reusing a normalized-probability buffer introduces another rounding
+   inverse's precision. Float source reductions/exponentials/reciprocals materialize at Float;
+   Double scratch stores the rounded reciprocal exactly, and its reload restores source T.
+   These source boundaries are explicit rather than dependent on inference context.
+   Reusing a normalized-probability buffer introduces another rounding
    boundary and is not silently equivalent to the existing routine.
 3. Map independent sink positions in parallel and retain ordered, per-head typed sink stores
    inside each work-item. The existing ordered effect-loop dialect can express this; neither
    atomics nor a widened head sum followed by one store preserves Float rounding. A warm-REPL
-   prototype compiled through equation-first and executed on Level Zero preserves the
-   8388608 + three separately materialized thirds counterexample and an untouched sink tail.
-   This prototype is an investigation, not a landed resident attention implementation.
+   public equation-first device test preserves the 8388608 + three separately materialized
+   thirds counterexample and an untouched sink tail on Level Zero and OpenCL.
 4. Validate Float/Double, MHA/GQA, empty history, existing sink contents, untouched tails,
    scratch ownership and repeated resident replay on both local backends against the host
-   oracle. Then migrate the external ASR consumer and measure preparation/execution separately.
-   Keep the debt-ledger decline until the public vertical actually passes those gates.
+   frozen sequential weight-capture oracle. The mandatory host/preflight suite passes 95
+   assertions, both local device tests pass 124 assertions, and the workload ledger pins
+   zero driver allocations during public lowering, seven caller-owned arrays and two outputs.
+   Host wrapper sink/input identity aliases now fail before writes; resident graph preflight
+   rejects writable aliases, while read-only q/k/v sharing remains legal. This is an explicit
+   surface-contract tightening needed by the staged algorithm, not a hidden numerical change.
+   Then migrate the external ASR consumer and measure preparation/execution separately.
 
 AD consolidation and external training validation remain separate obligations. None of these
 inference-only checks establishes differentiability, general loop tapes, or higher-order AD.

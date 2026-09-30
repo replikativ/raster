@@ -205,50 +205,93 @@
 ;; This is the cross-attention alignment signal for DTW word timestamps
 ;; (whisper/moonshine style) — call with a zeroed wsink per decode step, or let
 ;; it accumulate across layers for a layer+head average.
-(deftm gqa-decode-attention-weights! (All [T]
-                                          [q :- (Array T) k :- (Array T) v :- (Array T)
-                                           cache-len :- Long n-q :- Long n-kv :- Long
-                                           head-dim :- Long scale :- Double
-                                           wsink :- (Array T)] :- (Array T)
-                                          (let [out (alloc-like q (* n-q head-dim))
-                                                group (quot n-q n-kv)
-                                                havg (/ 1.0 (double n-q))
-                                                neg-inf (n/neg-inf-val (aget q 0))]
-                                            (dotimes [hq n-q]
-                                              (let [hkv (quot hq group)
-                                                    qb (* hq (int head-dim))
-                                                    sc (alloc-like q cache-len)
-                                                    _ (dotimes [j cache-len]
-                                                        (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
-                                                              dot (loop [d 0 acc 0.0]
-                                                                    (if (< d head-dim)
-                                                                      (recur (inc d)
-                                                                             (+ acc (* (aget q (+ qb d))
-                                                                                       (aget k (+ kb d)))))
-                                                                      acc))]
-                                                          (aset sc j (* dot scale))))
-                                                    mx (loop [j 0 mm neg-inf]
-                                                         (if (< j cache-len) (recur (inc j) (n/max mm (aget sc j))) mm))
-                                                    sum (loop [j 0 s 0.0]
-                                                          (if (< j cache-len)
-                                                            (let [e (m/exp (- (aget sc j) mx))]
-                                                              (aset sc j e) (recur (inc j) (+ s e)))
-                                                            s))
-                                                    inv (/ 1.0 sum)
-                                                    ob (* hq (int head-dim))]
-                                                (dotimes [j cache-len]
-                                                  (aset wsink j (+ (aget wsink j)
-                                                                   (* havg (* (aget sc j) inv)))))
-                                                (dotimes [d head-dim]
-                                                  (aset out (+ ob d)
-                                                        (loop [j 0 a 0.0]
-                                                          (if (< j cache-len)
-                                                            (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
-                                                              (recur (inc j)
-                                                                     (+ a (* (* (aget sc j) inv)
-                                                                             (aget v (+ kvb d))))))
-                                                            a))))))
-                                            out)))
+(deftm gqa-decode-attention-weights-resident!
+  "Caller-owned alignment capture. `sc` has n-q*cache-len elements, `inverse` has n-q
+   doubles, and `out` has n-q*head-dim elements. Sink updates materialize after every head,
+   in head order; this is not a reassociated reduction or atomic accumulation. Writable buffers
+   must not alias any other buffer; read-only q/k/v may share storage. n-q and n-kv are positive,
+   n-q is divisible by n-kv, head-dim is positive and cache-len is nonnegative.
+   Reduction updates, exponential values and the reciprocal materialize at T. Double inverse
+   scratch stores that already-rounded value exactly; reading it restores T before use.
+   Compile with retained declared storage when scalar precision differs from buffer precision."
+  (All [T]
+       [q :- (Array T) k :- (Array T) v :- (Array T)
+        out :- (Array T) sc :- (Array T) inverse :- (Array double) wsink :- (Array T)
+        cache-len :- Long n-q :- Long n-kv :- Long head-dim :- Long scale :- Double] :- Void
+       (let [group (quot n-q n-kv)
+             havg (/ 1.0 (double n-q))
+             neg-inf (n/neg-inf-val (aget q 0))]
+         (raster.par/map-void! hq n-q
+           (let [hkv (quot hq group)
+                 qb (clojure.core/* hq head-dim)
+                 scb (clojure.core/* hq cache-len)
+                 kvstride (clojure.core/* n-kv head-dim)
+                 hkvb (clojure.core/* hkv head-dim)
+                 _ (loop [j 0]
+                     (if (< j cache-len)
+                       (let [kb (clojure.core/+ (clojure.core/* j kvstride) hkvb)
+                             dot (loop [d 0 acc (T 0.0)]
+                                   (if (< d head-dim)
+                                     (recur (inc d)
+                                            (T (+ acc (* (aget q (clojure.core/+ qb d))
+                                                         (aget k (clojure.core/+ kb d))))))
+                                     acc))]
+                         (aset sc (clojure.core/+ scb j) (* dot scale))
+                         (recur (inc j)))
+                       nil))
+                 mx (loop [j 0 mm neg-inf]
+                      (if (< j cache-len)
+                        (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j))))
+                        mm))
+                 sum (loop [j 0 s (T 0.0)]
+                       (if (< j cache-len)
+                         (let [e (T (m/exp (- (aget sc (clojure.core/+ scb j)) mx)))]
+                           (aset sc (clojure.core/+ scb j) e)
+                           (recur (inc j) (T (+ s e))))
+                         s))
+                 inv (T (/ (T 1.0) sum))]
+             (aset inverse hq inv)
+             (loop [d 0]
+               (if (< d head-dim)
+                 (do
+                   (aset out (clojure.core/+ qb d)
+                         (loop [j 0 a (T 0.0)]
+                           (if (< j cache-len)
+                             (let [kvb (clojure.core/+ (clojure.core/* j kvstride) hkvb)]
+                               (recur (inc j)
+                                      (T (+ a (* (* (aget sc (clojure.core/+ scb j)) inv)
+                                                 (aget v (clojure.core/+ kvb d)))))))
+                             a)))
+                   (recur (inc d)))
+                 nil))))
+         (raster.par/map-void! j cache-len
+           (loop [hq 0]
+             (if (< hq n-q)
+               (do
+                 (aset wsink j
+                       (+ (aget wsink j)
+                          (* havg (* (aget sc (clojure.core/+ (clojure.core/* hq cache-len) j))
+                                     (T (aget inverse hq))))))
+                 (recur (inc hq)))
+               nil))))))
+
+(deftm ^{:raster.compiler/host-only true} gqa-decode-attention-weights!
+  "Host-only allocating wrapper for caller-owned alignment capture. Use the resident variant
+   for public GPU compilation and linking. The sink must not alias
+   q/k/v: capture is now staged across heads rather than interleaved with input reads."
+  (All [T]
+       [q :- (Array T) k :- (Array T) v :- (Array T)
+        cache-len :- Long n-q :- Long n-kv :- Long head-dim :- Long scale :- Double
+        wsink :- (Array T)] :- (Array T)
+       (when (or (identical? wsink q) (identical? wsink k) (identical? wsink v))
+         (throw (ex-info "alignment sink must not alias query or cache inputs"
+                         {:reason :attention-alignment-input-alias})))
+       (let [out (alloc-like q (* n-q head-dim))
+             sc (alloc-like q (* n-q cache-len))
+             inverse (double-array n-q)]
+         (gqa-decode-attention-weights-resident!
+          q k v out sc inverse wsink cache-len n-q n-kv head-dim scale)
+         out)))
 
 ;; KV-cache append (decode): write the current token's K (or V) slab of length kvrow = n_kv*head_dim
 ;; into the cache at absolute position `pos` (offset pos*kvrow). par/map-void! over kvrow — the

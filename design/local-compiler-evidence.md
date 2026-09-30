@@ -325,3 +325,42 @@ The follow-up's public Q4_K canary executes both generated and serial schedules 
 and OpenCL at `[1,1024,640]`: all ten validation/warmup/measurement replays per backend match
 the ggml oracle raw float bits after output poisoning. Two measured rounds are a correctness
 check, not a stationary performance series or a schedule-promotion decision.
+
+### Resident alignment capture investigation — 2026-09-30
+
+#920 is merged after all seven final-head CI gates passed. Its source-result cast correction
+retains the operand recurrence precision and ordered association, rather than inferring the
+fold dtype from the destination store.
+
+The caller-owned ASR alignment prototype subsequently exposed three shared boundaries:
+closed numeric constants during typed JVM invocation preparation (#921), empty portable map
+launches (#922), and parametric precision selection in the presence of fixed-precision scratch
+arguments (#923). These are separate compiler PRs, not attention-specific emitter exceptions.
+Their focused checks pass respectively 4 tests/11 assertions, 34 tests/252 assertions and
+4 tests/16 assertions. All three have since squash-merged after their seven final-head gates:
+#921 `649a00c8`, #922 `b0f02e5c`, #923 `499087f4`. #922's first CI run found an old exact-grid
+assertion; its correction checks empty, singleton, full and partial groups (5 tests/42 assertions).
+
+With those corrections loaded in the capped warm REPL, the unlanded resident prototype passes
+2 tests/124 assertions across Level Zero and OpenCL: Float and Double storage, MHA/GQA,
+empty history, replay accumulation, untouched parent tails and per-head Float materialization.
+This is local device correctness evidence, not a performance result or external ASR migration.
+The allocating wrapper now has an explicit host-only boundary and rejects input/sink identity
+aliases before writes. Resident graph preflight checks reject overlapping writable/input and
+writable/writable allocations; read-only q/k/v sharing remains legal. Mandatory host/preflight
+tests pass 7 tests/95 assertions, including exact output and sink comparisons with a frozen old
+weight-capture algorithm. The public workload ledger passes 1 test/18 assertions and records
+two KernelBody steps, retained Float array storage with Double reciprocal scratch, two escaped
+results and zero driver allocations during lowering. The baseline advances only these two
+independently recompiled ASR rows; CI must still ratchet its complete corpus report.
+
+A fresh-REPL check was essential: moving the arithmetic to a map with fixed Double scratch
+exposed contextual widening and one-ULP host differences. Explicit T materialization at the
+exponential, reduction updates, reciprocal and scratch reload restored the unchanged old
+numerical oracle. The casts are source semantics carried through the existing conversion IR,
+not an attention-specific inference or emitter rule. Independent weight/sink comparisons and
+poisoned output/scratch device buffers are part of the new acceptance tests. General implicit
+materialization/inference auditing and specialization invalidation on namespace reload remain
+consolidation work; these explicit boundaries do not prove that every unannotated form is sound.
+The broader AD consolidation, external training and distributed numerical acceptance remain
+on the eight-item campaign; this vertical does not replace them.
