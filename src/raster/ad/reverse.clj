@@ -926,7 +926,10 @@
   Array adjoints are anchored by their typed shadow buffers — no cast."
   [active-params adj-env rev-ctx]
   (let [param-dtype #(-> % meta :raster.type/tag tangent/tangent-kind :dtype)
-        mixed-float? (boolean (some #(= :float (param-dtype %)) active-params))]
+        mixed-float? (boolean (some #(= :float (param-dtype %)) active-params))
+        ;; Contributions refer only to the completed reverse context, not to final
+        ;; parameter binders appended below. Snapshot once for all scalar projections.
+        binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
     (reduce
      (fn [{:keys [rev-ctx param-adj-syms]} p]
        (let [tag (:raster.type/tag (meta p))
@@ -942,7 +945,8 @@
                      expr (if (and (= kind :scalar)
                                    (or (= dtype :float)
                                        (and (= dtype :double) mixed-float?)))
-                            (tangent/project-expr tag raw)
+                            (tangent/project-expr
+                             tag raw {:binding-map binding-map})
                             raw)]
                  (bindings-into rev-ctx [adj-sym expr])))]
          {:rev-ctx rev-ctx

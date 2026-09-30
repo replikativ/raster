@@ -39,23 +39,26 @@
     (is (= :double (:dtype (first (filter #(= 'coefficient (:name %))
                                         (:abi artifact))))))))
 
-(deftest projected-scalar-reduction-retains-its-typed-boundary-or-specific-cold-decline
-  ;; The completed-result conversion now has a numerical schedule, but cold AD emission
-  ;; can still retain a dynamic helper. Neither an arbitrary exception nor warm-only
-  ;; compilation is a claim of complete scalar GPU AD.
+(deftest projected-scalar-reduction-retains-its-typed-boundary
+  ;; Final parameter projection follows existing SSA aliases to the carried source
+  ;; dtype; cold compilation must preserve the same boundary as a warmed compiler.
   (is (= (float 6.25)
          (storage/mixed-scale-energy-gradient (float 2.0) (double-array [1.5 -2.0]))))
-  (let [outcome (try
-                  (compiled/lower
+  (let [compilation (equation-first/compile
+                     #'storage/mixed-scale-energy-gradient
+                     (merge policy {:target target :dtype :double}))
+        output (first (get-in compilation [:semantic :outputs]))]
+    (is (= :float (get-in compilation [:semantic :values output :dtype]))))
+  ;; The source tag is now retained even cold. Scheduling the final conversion past
+  ;; an intervening array equation remains a separate, explicit placement boundary.
+  (let [outcome (try (compiled/lower
                    #'storage/mixed-scale-energy-gradient
                    [(float 2.0) (double-array [1.5 -2.0])]
                    (merge policy {:compiler :equation-first :target target :dtype :double}))
-                  (catch clojure.lang.ExceptionInfo error error))]
+                    (catch clojure.lang.ExceptionInfo error error))]
     (if (instance? clojure.lang.ExceptionInfo outcome)
-      (let [data (ex-data outcome)]
-        (is (= {'raster.ad.tangent/project-float 1} (:undevirtualized data))
-            (str (.getMessage outcome) " " data))
-        (is (= {} (:non-exempt-untagged data))))
+      (do (is (= :emitted-program-host-device-dependency (:reason (ex-data outcome))))
+          (is (= 1 (count (:values (ex-data outcome))))))
       (is (= [:float] (mapv :dtype (filter #(empty? (:shape %)) (:out-tree outcome))))))))
 
 (deftest completed-conversion-has-distinct-partial-and-terminal-storage

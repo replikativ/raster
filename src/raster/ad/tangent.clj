@@ -132,18 +132,27 @@
   never inferred: a symbol's/form's carried :raster.type/tag stamp, the head
   of an explicit float/double cast form, or a numeric literal's own type.
   nil when the expression's type is not statically known."
-  [expr]
-  (cond
-    (or (symbol? expr) (seq? expr))
-    (or (:raster.type/tag (meta expr))
-        (when (and (seq? expr)
-                   (contains? #{'float 'clojure.core/float} (first expr)))
-          'float)
-        (when (and (seq? expr)
-                   (contains? #{'double 'clojure.core/double} (first expr)))
-          'double))
-    (float? expr) 'double  ;; a bare Clojure literal like 0.0 is a double
-    :else nil))
+  ([expr] (expr-manifest-tag expr {}))
+  ([expr binding-map]
+   (letfn [(known-tag [expr seen]
+             (or (cond
+                   (or (symbol? expr) (seq? expr))
+                   (or (:raster.type/tag (meta expr))
+                       (when (and (seq? expr)
+                                  (contains? #{'float 'clojure.core/float} (first expr)))
+                         'float)
+                       (when (and (seq? expr)
+                                  (contains? #{'double 'clojure.core/double} (first expr)))
+                         'double))
+                   (float? expr) 'double  ;; a bare Clojure literal like 0.0 is a double
+                   :else nil)
+                 ;; SSA aliases retain the source value's type even when an intermediate
+                 ;; binder has no tag. Never infer a function's result or the desired target
+                 ;; type; missing, cyclic, and dynamically nil-producing chains stay unknown.
+                 (when (and (symbol? expr) (not (contains? seen expr))
+                            (contains? binding-map expr))
+                   (known-tag (get binding-map expr) (conj seen expr)))))]
+     (known-tag expr #{}))))
 
 (defn project-expr
   "Wrap `cotangent-expr` with the projection onto the tangent space of the
@@ -162,12 +171,15 @@
   `:materialized? true` is a caller obligation that the expression produces a concrete,
   non-nil scalar numeric value (for example an executed kernel adjoint). It permits a primitive scalar
   projection even when its exact dtype has not survived inlining; it does not guess that dtype
-  or weaken the default nil-safe dynamic-cotangent contract."
+  or weaken the default nil-safe dynamic-cotangent contract.
+
+  `:binding-map` supplies existing SSA bindings for following untagged aliases to
+  a carried/manifest source tag. It does not derive types from operator names."
   ([tag cotangent-expr] (project-expr tag cotangent-expr {}))
-  ([tag cotangent-expr {:keys [materialized?]}]
+  ([tag cotangent-expr {:keys [materialized? binding-map]}]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (if (= kind :scalar)
-      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr))]
+      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr binding-map))]
         (cond
           ;; Statically in the primal's tangent space already — Π is the identity.
           (and (= :scalar (:kind ct)) (= dtype (:dtype ct)))

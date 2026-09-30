@@ -1,5 +1,15 @@
 # Compiler unification campaign
 
+Current scalar AD consolidation: final parameter projection follows retained SSA alias bindings
+to carried source types, keeping unknown/dynamically absent cotangents nil-safe. This removes the
+cold projection-helper typedness gap without adding an intrinsic or adjoint registry. Device-result
+placement remains separate: the mixed scalar-energy gradient retains an explicit
+`:emitted-program-host-device-dependency` decline when its terminal conversion is separated from
+the reduction by another array equation. The completed-conversion schedule covers the admitted
+reduction epilogue, not arbitrary scalar consumer placement. Continue with general typed
+device-scalar placement/composition, then external training acceptance; do not treat this narrow
+type-retention fix as completion of the eight-item campaign.
+
 Authorized scope is the eight-item campaign below. The original four-stage emitter sequence and
 subsequent chronological notes remain the detailed history, not a reduction of that scope. Each
 production migration must retain numerical, ABI, ownership and resource contracts; isolated emitter
