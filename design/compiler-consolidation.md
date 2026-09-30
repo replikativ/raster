@@ -141,7 +141,7 @@ producer/checkpoint/fresh-restore/three-step continuation. Coarse and fine chunk
 actual mmap bytes; the producer closes before read mappings open and synchronous restoration
 finishes before leases close. Same-backend final fields agree bit-for-bit; generated fields also
 match the JVM and retain volume-weighted mass. The frontend and new continuation suites pass
-114 tests / 574 assertions locally; full CI remains required. The snapshot's producer string is
+114 tests / 575 assertions locally; full CI remains required. The snapshot's producer string is
 a test-fixture label, not a production compiler-build identity. Production manifest publication,
 partial-patch interface fluxes, actual distributed transport, subcycling and reflux stay open.
 

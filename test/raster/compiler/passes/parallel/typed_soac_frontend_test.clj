@@ -2143,7 +2143,9 @@
     (let [array-backed (frontend/normalize-source
                         (source '(int (aget counts 0)) '(int (aget counts 0))) options)]
       (is (= 2 (count (checks array-backed)))
-          "device effects can change read operands; no dominating immutable value is proven"))))
+          "device effects can change read operands; no dominating immutable value is proven")
+      (is (nil? (frontend/form->program array-backed options))
+          "the second array-backed check cannot move before the intervening device effect"))))
 
 (deftest fixed-rng-inputs-keep-their-ordered-checked-conversions
   (let [options {:dtype :long :array-types {'seeds :long}
