@@ -885,6 +885,26 @@
     (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
     (is (false? (get-in call [:attributes :source-inspected])))))
 
+(deftest call-construction-consumes-only-its-own-exact-plain-equation-projection
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        step (first (filter program-call/emitted-equation-call? (:steps call)))
+        boundary (first (get-in step [:equation :operations]))
+        validations (atom 0)
+        original emitted-equation/validate!]
+    (with-redefs [emitted-equation/validate!
+                  (fn [equation]
+                    (when (identical? boundary equation) (swap! validations inc))
+                    (original equation))]
+      (let [prepared (program-call/make (:program call) (:buffers call) (:scalar-values call)
+                                       (:loop-scratch call) nil)]
+        (is (= 1 @validations) "program validation supplies the constructor's exact projection")
+        (is (identical? (:program call) (:program prepared)))
+        (is (= (:buffers call) (:buffers prepared)))
+        (is (= (:outputs call) (:outputs prepared)))
+        (is (not (contains? prepared :projections)))
+        (is (identical? prepared (program-call/validate! prepared)))
+        (is (= 2 @validations) "later validation remains independent")))))
+
 (deftest buffer-remapping-rechecks-bindings-but-validates-its-unchanged-program-once
   (let [{:keys [call]} (prepared-mixed-call 3)
         validations (atom 0)
@@ -1285,10 +1305,22 @@
          {'steps (scalar 'steps 2) 'n (scalar 'n 64)}
          {loop-output :carry-scratch}
          (fn [equation {:keys [operands]}]
+           (is (nil? (var-get (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                         '*validated-boundary-projections*)))
+               "host evaluator cannot inherit constructor projection facts")
            (swap! evaluations conj [(:id equation) operands])
            {result (scalar result (inc (get-in operands ['steps :value])))}))]
     (is (true? (get-in host-equation [:attributes :host-only])))
     (is (= 1 (count @evaluations)))
     (is (= 3 (get-in call [:outputs result :value])))
     (is (= 2 (count (program-runtime/staging-plan call :execution))))
-    (is (false? (get-in call [:attributes :source-inspected])))))
+    (is (false? (get-in call [:attributes :source-inspected])))
+    (let [rejected-evaluations (atom 0)]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (program-call/make
+                    (assoc emitted :dialect :unsupported)
+                    {initial-id :initial loop-output :loop-output}
+                    {'steps (scalar 'steps 2) 'n (scalar 'n 64)}
+                    {loop-output :carry-scratch}
+                    (fn [& _] (swap! rejected-evaluations inc)))))
+      (is (zero? @rejected-evaluations) "invalid programs fail before host evaluation"))))

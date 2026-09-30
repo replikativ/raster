@@ -173,6 +173,29 @@ assertions, dispatch/persistence/numerical-policy checks add 10 / 72, and select
 mixed-target/exceptional-host-prefix checks add 3 / 12. Full CI and new external model/timing
 acceptance remain separate; earlier Gemma timing samples are not measurements of this slice.
 
+All seven CI gates passed and this program/call slice merged as #955 (`308bec35`).
+
+The constructor follow-up consumes that same fresh report before any host evaluation, then passes
+the identity index explicitly to private numerical-step preparation. It never binds the index
+around the host-evaluator callback. Exact plain boundaries therefore avoid their second derivation
+in construction as well; dispatch boundaries keep their previous independent projection. Runtime
+scalars, preconditions, result views and every generated step still receive their existing checks.
+The mixed fixture proves one plain-boundary check in construction, unchanged buffers and outputs,
+no retained projection field and a fresh later public check. The host-scalar fixture checks that
+the callback has no constructor projection context and that an invalid program fails before any
+callback runs. The affected control/equation/composition/native suites pass 86 tests / 537
+assertions. Dispatch/persistence checks add 10 tests / 72 assertions, and selected public
+mixed-target/exceptional-host-prefix checks add 3 / 12. Both local device availability gates
+remain asserted. No new external Gemma timing or full-package migration is claimed; full CI
+acceptance remains pending for this constructor follow-up.
+
+The first constructor CI run passed the six non-test gates and found four stale count assertions
+in the existing staged CUDA/HIP contraction regression: each constructor now checks its exact
+plain boundary once, not twice. The test retains result-view, independent step-validation and
+forged-binding coverage, and now explicitly checks that later public call validation performs a
+fresh boundary check. This is an assertion update for the intended preparation change, not a
+relaxation of numerical or binding contracts.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

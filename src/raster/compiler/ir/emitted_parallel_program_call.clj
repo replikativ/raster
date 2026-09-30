@@ -198,11 +198,15 @@
     result-views))
 
 (defn- prepare-equation-call
-  [equation values buffers scalars result-views]
+  [equation values buffers scalars result-views projections]
   (let [operation (first (:operations equation))
         emitted (equation-dispatch/boundary-equation operation)
-        ;; physical-results validates this exact boundary once for this preparation scope.
-        result-storage (emitted-equation/physical-results emitted)
+        ;; The enclosing program supplied only exact plain-boundary facts it just checked.
+        ;; Dispatch boundaries still derive their own projection. No constructor context is
+        ;; bound around the host-evaluator callback that precedes this preparation phase.
+        result-storage (if (.containsKey ^java.util.IdentityHashMap projections emitted)
+                         (.get ^java.util.IdentityHashMap projections emitted)
+                         (emitted-equation/physical-results emitted))
         common-graph (:graph emitted)
         result-views (validate-result-views! equation emitted result-storage
                                            (select-keys result-views (:results equation)))
@@ -580,7 +584,8 @@
   ([parallel-program buffers scalar-values loop-scratch evaluate-host]
    (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
   ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
-  (let [parallel-program (emitted-program/validate! parallel-program)
+  (let [{parallel-program :program projections :projections}
+        (emitted-program/validate-with-physical-results! parallel-program)
         validated-equation-calls (java.util.IdentityHashMap.)
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
@@ -639,7 +644,7 @@
 
              :else
              (let [{:keys [call buffers]}
-                   (prepare-equation-call equation values buffers scalars result-views)]
+                   (prepare-equation-call equation values buffers scalars result-views projections)]
                (.put validated-equation-calls call Boolean/TRUE)
                {:buffers buffers :steps (conj steps call)})))
          {:buffers buffers :steps []}
