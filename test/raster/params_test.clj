@@ -1,6 +1,7 @@
 (ns raster.params-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.params :as rp]
+            [raster.ad.reverse :as ad]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.optim :as optim]))
 
@@ -39,6 +40,25 @@
 (deftest lazy-jit-path-runs-with-structured-args
   (let [y (linear-model {:W W :b b} x 3 2)]
     (is (= expected (vec y)))))
+
+(deftest structured-ad-shares-the-forward-invocation-boundary
+  (let [calls (atom [])
+        args [{:W W :b b} x 3 2]
+        gradient (with-redefs [ad/value+grad
+                              (fn [_]
+                                (fn [& flat]
+                                  (swap! calls conj (vec flat))
+                                  [7.0 :dW :db :dx nil nil]))]
+                   (rp/value+grad #'linear-model))]
+    (is (= [7.0 {:W :dW :b :db} :dx nil nil] (apply gradient args)))
+    (is (= [[W b x 3 2]] @calls))
+    (doseq [invalid [(pop args) (conj args :extra)]]
+      (is (thrown? clojure.lang.ArityException (apply gradient invalid)))
+      (is (thrown? clojure.lang.ArityException (apply linear-model invalid))))
+    (doseq [tree [{:W W} {:W W :b W}]]
+      (is (thrown? clojure.lang.ExceptionInfo (gradient tree x 3 2)))
+      (is (thrown? clojure.lang.ExceptionInfo (linear-model tree x 3 2))))
+    (is (= 1 (count @calls)) "invalid calls fail before the flat AD program executes")))
 
 (deftest compile-aot-path-matches-jit-path
   (let [fast (rp/compile-aot #'linear-model)
