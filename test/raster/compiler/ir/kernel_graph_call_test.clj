@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
@@ -31,6 +32,33 @@
     (doseq [n [-1 2147483648]]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"precondition failed"
                             (precondition/check! conditions {'n n}))))))
+
+(deftest graph-preparation-checks-structure-once-per-public-entry
+  (let [graph (emitted-graph)
+        checked (atom 0)
+        original kgraph/validate!
+        bindings (zipmap (map :id (concat (:inputs graph) (:outputs graph)))
+                         (repeatedly #(Object.)))]
+    (with-redefs [kgraph/validate!
+                  (fn [candidate]
+                    (when (identical? graph candidate) (swap! checked inc))
+                    (original candidate))]
+      (is (identical? graph (executable/validate! graph)))
+      (is (= 1 @checked))
+      (is (seq (graph-call/direct-scalar-range-preconditions graph)))
+      (is (= 2 @checked))
+      (is (empty? (graph-call/binding-alias-violations graph bindings identical?)))
+      (is (= 3 @checked))
+      (is (empty? (graph-call/external-alias-violations graph bindings identical?)))
+      (is (= 4 @checked) "public alias checks independently validate"))
+    (testing "invalid bindings and overlap predicates remain errors"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (graph-call/binding-alias-violations graph {} identical?)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (graph-call/binding-alias-violations graph bindings nil)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (graph-call/binding-alias-violations
+                    (get-in graph [:nodes 0 :operation]) {} identical?))))))
 
 (deftest scalar-preconditions-precede-temporary-sizing
   (let [graph (assoc-in (emitted-graph) [:nodes 0 :operation :preconditions]

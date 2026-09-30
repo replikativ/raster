@@ -124,6 +124,26 @@ reuse the existing source-verified REPL. The retained external Gemma profiling a
 its 60-second diagnostic limit under background load and was interrupted; it supplies no timing
 or speedup evidence for this change. Full CI acceptance remains separate.
 
+That slice passed all seven CI gates and merged as #953 (`6fc1c79c`). The graph-call follow-up
+continues the same consolidation: executable validation derives target membership from the
+node artifacts it just validated rather than calling the independently validating public
+artifact accessor; scalar-range projection delegates graph validation once; alias preflight
+uses a private hazard projector after its own executable check. Public alias entry points
+still validate independently, incomplete bindings and invalid overlap predicates still fail,
+and single artifacts remain rejected by the graph-only projections. No proof context or cache
+is added. Each affected public graph entry now checks its exact graph once; emitted-equation
+validation additionally retains its independent dataflow comparison.
+
+The affected graph-call/equation/composition suites pass 55 tests / 315 assertions, including
+native OpenCL and Level Zero composition. The same retained external Gemma components still
+compose to an exactly equal 247-node / 2-instance plan: 651 equation-call checks and 434
+physical-result queries remain. A 46.15-second background-loaded instrumented sample reports
+24.44 seconds in program validation and 20.19 seconds in physical-result derivation (inclusive
+times overlap). It identifies semantic reconstruction as the remaining preparation cost;
+it is not a speedup comparison. The REPL stopped accepting connections before a subsequent
+full external replay could start; that attempt contributes no new numerical evidence. Full
+CI acceptance of this follow-up remains pending.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
