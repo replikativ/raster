@@ -192,11 +192,14 @@
 
 (defn- complete-write?
   [operation id capacity scalars buffers storage]
-  (let [equation (equation-dispatch/boundary-equation operation)]
-    (when (emitted-equation/emitted-equation? equation)
-      (or (when-let [extent (get (emitted-equation/complete-write-domains equation) id)]
-            (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
-          (soac-complete-write? equation id capacity scalars buffers storage)))))
+  (if (equation-dispatch/emitted-equation-dispatch? operation)
+    (when-let [extent (get (equation-dispatch/complete-write-domains operation) id)]
+      (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
+    (let [equation (equation-dispatch/boundary-equation operation)]
+      (when (emitted-equation/emitted-equation? equation)
+        (or (when-let [extent (get (emitted-equation/complete-write-domains equation) id)]
+              (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
+            (soac-complete-write? equation id capacity scalars buffers storage))))))
 
 (defn- write-before-read-inputs
   [parallel-program materialized scalars]

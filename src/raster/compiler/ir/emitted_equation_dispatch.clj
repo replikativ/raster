@@ -1,13 +1,14 @@
 (ns raster.compiler.ir.emitted-equation-dispatch
   "A numerical-policy-checked choice among independently certified equation emissions.
 
-   This first vertical is deliberately limited to SegmentedWeightedReduction. Each candidate
+   SegmentedWeightedReduction and single plain FP32 contractions share this boundary. Each candidate
    retains its own scheduled body and artifact projection; a shared ABI is only a binding
    contract, never a proof that different floating-point schedules are interchangeable."
   (:require [raster.compiler.ir.emitted-parallel-equation :as equation]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
-            [raster.compiler.ir.segmented-weighted-reduction :as swr]))
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.ir.soac-dialect :as soac]))
 
 (defrecord EmittedEquationDispatch [alternatives dispatch numerical-policy])
 
@@ -23,10 +24,27 @@
 
 (defn- numerical-mode
   [candidate]
-  (get-in (last (get-in candidate [:body :equations]))
-          [:operations 0 :numerics :mode]))
+  (if (swr/plan? (:algorithm candidate))
+    (get-in (last (get-in candidate [:body :equations])) [:operations 0 :numerics :mode])
+    (let [certificate (get-in candidate [:graph :nodes 0 :operation :provenance
+                                         :scheduled-operation])
+          expected (case (get-in certificate [:legality :kind])
+                     :ordered-portable-contraction :exact
+                     :register-tiled-contraction :reassociated
+                     nil)
+          actual (get-in certificate [:numerics :mode])]
+      (when-not (and expected (= expected actual))
+        (fail! :equation-dispatch-numerics
+               "contraction schedule did not retain its generated numerical mode"
+               {:expected expected :actual actual}))
+      actual)))
 
-(defn validate!
+(defn- write-domains [candidate]
+  (if (swr/plan? (:algorithm candidate))
+    (equation/complete-write-domains candidate)
+    (equation/contraction-write-domains candidate)))
+
+(defn- validation-report
   "Verify every schedule independently and require explicit permission for its numerical mode.
 
    The reference/default must retain exact evaluation order. A caller may admit reassociation
@@ -41,11 +59,16 @@
       (fail! :equation-dispatch-alternatives
              "equation dispatch requires certified emitted equations" {}))
     (doseq [candidate alternatives] (equation/validate! candidate))
-    (when-not (every? #(swr/plan? (:algorithm %)) alternatives)
+    (when-not (every? #(or (swr/plan? (:algorithm %))
+                          (soac/program-form? (:algorithm %))) alternatives)
       (fail! :equation-dispatch-algorithm
-             "equation dispatch currently supports segmented weighted reductions" {}))
+             "equation dispatch requires a supported retained typed algorithm" {}))
     (let [first-candidate (first alternatives)
           allowed (:permitted-modes numerical-policy)
+          domains (mapv write-domains alternatives)
+          _ (when-not (every? seq domains)
+              (fail! :equation-dispatch-complete-write
+                     "each candidate must independently prove its complete-write domain" {}))
           modes (mapv numerical-mode alternatives)
           selection (dispatch/validate! selection)]
       (when-not (and (map? numerical-policy)
@@ -74,7 +97,7 @@
       (when-not (apply = (map equation/physical-results alternatives))
         (fail! :equation-dispatch-storage
                "dispatch alternatives must retain the same physical result mapping" {}))
-      (when-not (apply = (map equation/complete-write-domains alternatives))
+      (when-not (apply = domains)
         (fail! :equation-dispatch-complete-write
                "every dispatch alternative must prove the same complete-write domain" {}))
       (when-not (every? allowed modes)
@@ -91,8 +114,13 @@
         (when-not (= :exact (nth modes default-index))
           (fail! :equation-dispatch-default-numerics
                  "the safe fallback must retain exact evaluation order"
-                 {:default-strategy (:default-strategy selection)}))))
-    value))
+                 {:default-strategy (:default-strategy selection)})))
+      {:value value :complete-write-domains (first domains)})))
+
+(defn validate!
+  "Validate every candidate, its numerical permission, and the common full-write domain."
+  [value]
+  (:value (validation-report value)))
 
 (defn make
   [alternatives selection numerical-policy]
@@ -102,6 +130,11 @@
   "Return each independently certified equation in its dispatch alternative order."
   [value]
   (:alternatives (validate! value)))
+
+(defn complete-write-domains
+  "Return only coverage proved for every independently certified alternative."
+  [value]
+  (:complete-write-domains (validation-report value)))
 
 (defn default-equation
   "Return the exact fallback equation for boundary inspection, not runtime execution."

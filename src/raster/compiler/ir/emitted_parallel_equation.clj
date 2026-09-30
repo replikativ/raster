@@ -9,6 +9,7 @@
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (defrecord EmittedParallelEquation [algorithm body refinement graph provenance attributes])
@@ -118,6 +119,28 @@
     (let [{:keys [algorithm]} (validate! emitted)]
       {(get-in algorithm [:output :id])
        (swr/descriptor-launch-elements (:output algorithm))})))
+
+(defn contraction-write-domains
+  "Candidate-specific coverage for a single plain FP32 contraction leaf.
+
+   This stronger query is for dispatch certification, not a replacement for ordinary SOAC
+   initialization analysis. It reconstructs from the retained algorithm and source graph;
+   compound/refined graphs, other storage representations and other schedule families decline."
+  [emitted]
+  (let [{:keys [algorithm body refinement graph]} (validate! emitted)]
+    (when (and (soac/program-form? algorithm)
+               (= 1 (count (soac/equations algorithm)))
+               (contains? '#{contract segmented-reduce}
+                          (soac/operation-kind (first (soac/equations algorithm))))
+               (nil? refinement) (= 1 (count (:nodes graph))))
+      (let [source (expected-graph algorithm body)
+            node (first (:nodes source))
+            certificate (get-in graph [:nodes 0 :operation :provenance :scheduled-operation])]
+        (when (and (= 1 (count (:nodes source)))
+                   (= :contraction (get-in node [:operation :phase]))
+                   (= :float (get-in node [:operation :dtype]))
+                   (scheduled-body/scheduled-kernel-body? certificate))
+          (contraction-schedule/complete-write-domain algorithm node source certificate))))))
 
 (defn physical-results
   "Project logical results to physical storage from the retained, validated semantic equation."
