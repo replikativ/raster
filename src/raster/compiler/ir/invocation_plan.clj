@@ -208,9 +208,12 @@
                "public parameter differs from the invocation value table"
                {:parameter parameter :table (get values id)}))
       (av/validate! value))
-    (let [available (reduce (fn [available step]
+    (let [available (binding [util/*shadowing-locals*
+                             (into util/*shadowing-locals*
+                                   (map :symbol (concat parameters steps)))]
+                      (reduce (fn [available step]
                               (validate-step! step values available))
-                            (set (map :id parameters)) steps)
+                              (set (map :id parameters)) steps))
           expected-bindings (mapv :program-value bindings)
           storage-values (mapv :program-value storage-bindings)
           invocation-values (mapv :invocation-value (concat bindings storage-bindings))]
@@ -254,7 +257,9 @@
 
 (defn- referenced-operands
   [expression environment]
-  (let [symbols (sort-by str (util/free-syms expression))]
+  (let [symbols (binding [util/*shadowing-locals*
+                          (into util/*shadowing-locals* (keys environment))]
+                  (sort-by str (util/free-syms expression)))]
     (mapv (fn [symbol]
             (if-let [value (get environment symbol)]
               {:symbol symbol :value value}

@@ -20,6 +20,22 @@
         segred (lower/contract-form->segred matvec :dtype :float :facts verified)]
     (schedule/plan-portable-body verified segred nil)))
 
+(deftest portable-dimensions-retain-core-named-lexical-captures
+  (doseq [dimension '[seq count first]]
+    (let [form (list 'raster.par/contract 'y [['i dimension]] '[[l k]]
+                     '(* (aget A (+ (* i k) l)) (aget x l)))
+          verified (facts/contraction-facts form :dtype :float)
+          ;; The typed producer declares both dimensions in its physical boundary.
+          segred (assoc (lower/contract-form->segred form :dtype :float :facts verified)
+                        :scalars #{dimension 'k})
+          plan (schedule/plan-portable-body verified segred nil
+                                           {:scalar-types {dimension :long 'k :long}})]
+      (is (:ok plan))
+      (is (contains? (set (:scalars plan)) dimension))
+      (is (= :long (some #(when (= dimension (:id %)) (:dtype %))
+                         (get-in plan [:body :parameters]))))
+      (is (= (:body plan) (body/validate! (:body plan)))))))
+
 (deftest outer-product-uses-facts-and-exact-operand-extents
   (let [verified (facts/from-components
                   {:out 'C :free-axes '[[i 4] [j 3]] :contract-axes []

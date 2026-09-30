@@ -49,7 +49,15 @@
   (when-not (facts/facts? contract-facts)
     (throw (ex-info "portable contraction lowering requires verified facts"
                     {:reason :raster/bug :facts contract-facts})))
-  (let [space (:space segred)
+  ;; The verified physical boundary is also the lexical scope for source-symbol
+  ;; discovery. A dimension called `seq` or `count` is a local scalar here, not
+  ;; clojure.core's function of that name. Use the shared scope mechanism rather
+  ;; than weakening index validation or recovering missing types in an emitter.
+  (binding [util/*shadowing-locals*
+            (into util/*shadowing-locals*
+                  (concat (keys array-types) (keys scalar-types)
+                          (:inputs segred) (:outputs segred) (:scalars segred)))]
+   (let [space (:space segred)
         map-only? (empty? (:contract-axes contract-facts))
         segment-dims (if map-only? (segop/seg-space-dims space)
                         (segop/seg-space-segment-dims space))
@@ -344,4 +352,4 @@
        :output output
        :segment-count segment-count
        :launch-segment-count launch-segment-count
-       :workgroup-size workgroup-size})))
+       :workgroup-size workgroup-size}))))
