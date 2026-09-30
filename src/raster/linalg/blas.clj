@@ -558,7 +558,9 @@
                ;; padded matrix span, even when the logical elements of
                ;; interleaved matrix views are disjoint.  Independent GEMMs
                ;; preserve that useful layout without a pack/unpack pass.
-               (when (or (== batch 1) (>= stride-c (* m ldc)))
+               ;; The extension checks this constraint even for batch=1; an unused next-batch
+               ;; stride does not exempt a single interleaved output view.
+               (when (>= stride-c (* m ldc))
                  @sgemm-batch-strided-mh)]
         (.invokeWithArguments mh
                               [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
@@ -592,7 +594,7 @@
           ^MemorySegment sb (.asSlice (MemorySegment/ofArray B) (* (long b-offset) 4))
           ^MemorySegment sc (.asSlice (MemorySegment/ofArray C) (* (long c-offset) 4))]
       (if-let [mh ^java.lang.invoke.MethodHandle
-               (when (or (== batch 1) (>= stride-c (* m ldc)))
+               (when (>= stride-c (* m ldc))
                  @sgemm-batch-strided-mh)]
         (.invokeWithArguments mh
                               [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS

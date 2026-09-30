@@ -247,6 +247,27 @@
       (is (= [17.0 23.0 39.0 53.0, 2.0 4.0 6.0 8.0] (mapv float cnt)))
       (is (= [19.0 22.0 43.0 50.0, 2.0 6.0 4.0 8.0] (mapv float cnn))))))
 
+(deftest single-batch-layout-does-not-bypass-output-span-guard
+  ;; A one-head attention output has stride=n, not m*ldc. oneMKL still rejects that
+  ;; strided-batch descriptor at batch=1. Independent GEMM must write the full matrix.
+  (letfn [(check-layouts []
+            (doseq [[operation b]
+                    [[blas/batched-gemm-nn-layout! (float-array [1 2 3 4 5 6])]
+                     [blas/batched-gemm-nt-layout! (float-array [1 4 2 5 3 6])]]]
+              (let [a (float-array [0.25 0.75 0.5 0.5])
+                    c (float-array 8 (float -99))]
+                (operation a b c 1 2 2 3 (float 1)
+                           0 2 4, 0 (if (= operation blas/batched-gemm-nn-layout!) 3 2) 6,
+                           1 3 3)
+                (is (= [-99.0 3.25 4.25 5.25 2.5 3.5 4.5 -99.0]
+                       (vec c))))))]
+    (check-layouts)
+    ;; This also exercises the guard on CI machines without the optional MKL extension.
+    (with-redefs-fn
+      {(ns-resolve 'raster.linalg.blas 'sgemm-batch-strided-mh)
+       (delay (throw (ex-info "invalid output span reached optional batch FFI" {})))}
+      check-layouts)))
+
 (deftest test-batched-gemm-strided-layouts
   (letfn [(check-layouts []
             ;; A and B are [row,head,dim].  Each head is contiguous within a
