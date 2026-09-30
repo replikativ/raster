@@ -231,6 +231,12 @@
          target-descriptor (validate-target-description!
                             target (or captured-target (hardware/descriptor-for target)))
          resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
+         _ (when (seq (get-in resolved-schedule [:typed-contraction :measured-selectors]))
+             (fail! :equation-first-contraction-selector-unsupported
+                    "equation-first compilation cannot yet consume measured contraction selectors"
+                    {:function (function-symbol resolved-var) :target target
+                     :schedule-path [:typed-contraction :measured-selectors]
+                     :fallback :none}))
          dispatch-reassociated?
          (= :dispatch-reassociated
             (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
