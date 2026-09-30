@@ -701,6 +701,23 @@ as conditional residuals, without an AD-specific rule or effect-based speculatio
    correctness evidence, not a claim of formal completeness; later proof work can build on
    the typed scope and residual contracts.
 
+### Public generated-contraction event canary
+
+`raster.perf.production-canary/equation-gemm!` (CLI `:case :equation-gemm`) exercises
+the public equation-first FP32 path with explicit `:portable`, `:register-tiled`, or
+`:dispatch-register-tiled` schedules. It uses the existing resident Compiled/LinkPlan event
+measurement service, not a second binder or a host-call timer. Compilation, binding, uploads,
+and exact independent pre/post numerical validation stay outside samples. Positive shapes are
+bounded to 16M products, 64 MiB logical buffers and K <= 4096; the dyadic input recipe keeps
+the reference sums exactly representable in FP32 over this bounded domain.
+
+A local 64x64x64 smoke comparison executed both portable and dispatch schedules on OpenCL
+and Level Zero with exact oracle agreement and one launched kernel. Three of four 50 ms
+sample sets were nonstationary; this is execution evidence, **not** a calibrated performance
+baseline or a speedup claim. Ordinary CI checks the canary lifecycle/failure boundary without
+timing assertions. External BLAS/Triton comparisons, representative shape ladders and
+controlled interleaved measurements remain needed before claiming competitive throughput.
+
 Return to the original local-first order now: finish public workload coverage and the
 support/evidence matrix, audit the still-expensive Q4 host preparation with exact proof
 boundaries, then perform matched execution/performance gates before vendor-device claims.

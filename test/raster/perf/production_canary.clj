@@ -443,6 +443,61 @@
          :measurement (measure #(link/run! resident))})
       (finally (compiled/close! c)))))
 
+(defn equation-gemm!
+  "Opt-in public equation-first FP32 contraction canary, timed by device events.
+
+   Compare explicit schedules by separate runs with the same shape/environment. Compilation,
+   binding, transfers and pre/post independent validation are excluded from samples. This is
+   neither an external BLAS baseline nor an automatic schedule promotion. Ordinary CI has no
+   timing threshold. The bounded dyadic input recipe makes the FP32 oracle exact."
+  [{:keys [environment-tag target compiler-revision shape strategy budget-ms]
+    :or {target :ocl:0 shape [64 64 64] strategy :dispatch-register-tiled budget-ms 300.0}}]
+  (let [[m n k :as dimensions] (checked-shape shape)
+        products (*' m n k)
+        bytes (*' 4 (+' (*' m k) (*' k n) (*' m n)))]
+    (when-not (and (contains? #{:portable :register-tiled :dispatch-register-tiled}
+                              strategy)
+                   (<= k 4096) (<= products 16000000) (<= bytes (* 64 1024 1024))
+                   (number? budget-ms) (Double/isFinite (double budget-ms))
+                   (<= 1.0 (double budget-ms) 10000.0))
+      (throw (ex-info "equation GEMM canary requires a bounded FP32 shape, schedule and budget"
+                      {:shape shape :strategy strategy :budget-ms budget-ms})))
+    (let [identity (identity-for :equation-gemm-mnk-resident target :float dimensions
+                                 :device-event environment-tag)
+          args (gemm-arguments dimensions)
+          expected (vec (gemm-reference (first args) (second args) dimensions))
+          started (System/nanoTime)
+          prepared (compiled/lower #'gemm-mnk! (into args (map long dimensions))
+                                   {:compiler :equation-first :target target :dtype :float
+                                    :constants '[A B] :outputs '[C]
+                                    :schedule {:typed-contraction {:strategy strategy}}})
+          compile-ns (- (System/nanoTime) started)
+          started (System/nanoTime)
+          live (compiled/instantiate! prepared {:profile? true})
+          bind-ns (- (System/nanoTime) started)
+          validate! (fn [profile phase]
+                      (when-not (= expected (vec (get-in profile [:result :C])))
+                        (throw (ex-info "equation GEMM differs from the independent dyadic oracle"
+                                        {:shape dimensions :strategy strategy :phase phase}))))]
+      (try
+        (let [before (compiled/profile live)
+              _ (validate! before :before-measurement)
+              measured (compiled/measure live :budget-ms budget-ms :cv-threshold 0.08)
+              after (compiled/profile live)
+              _ (validate! after :after-measurement)]
+          {:identity (assoc identity :numerical-policy :f32)
+           :compiler-revision compiler-revision :validated? true
+           :validation {:oracle :independent-dyadic-fp32-dot :comparison :exact
+                        :before-and-after? true}
+           :compile-ns compile-ns :bind-ns bind-ns
+           :requested-strategy strategy :schedule (:schedule prepared)
+           :scope {:compiler :equation-first :timing-source :device-event
+                   :transfers-included? false :validation-included? false :promotion? false}
+           :kernel-count (count (:profile before))
+           :kernel-names (mapv :kernel-name (:profile before))
+           :execution (compiled/ir live) :measurement measured})
+        (finally (compiled/close! live))))))
+
 (defn composition!
   "Opt-in three-stage public composition canary. Compile, composition and binding are
    reported separately; only the resident replay is measured with device events.
@@ -506,8 +561,8 @@
                (= (.getCanonicalPath (io/file baseline)) (.getCanonicalPath (io/file output))))
       (throw (ex-info "canary output must not overwrite its baseline" {})))
     (let [result ((clojure.core/case case :cpu cpu! :gemm gemm! :rmsnorm rmsnorm!
-                       :heat heat! :composition composition!
-                       (throw (ex-info "canary :case must be :cpu, :gemm, :rmsnorm, :heat or :composition" {}))) opts)
+                       :equation-gemm equation-gemm! :heat heat! :composition composition!
+                       (throw (ex-info "canary :case must be :cpu, :gemm, :equation-gemm, :rmsnorm, :heat or :composition" {}))) opts)
           baseline (when (and baseline (.exists (io/file baseline)))
                      (edn/read-string (slurp baseline)))
           result (assoc result :verdict (verdict baseline result))]
