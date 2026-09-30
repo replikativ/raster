@@ -16,6 +16,50 @@
   (f)
   {:median-ns 100 :stationary? true})
 
+(deftest equation-gemm-canary-validates-outside-event-measurement-and-closes
+  (let [calls (atom [])
+        corrupt? (atom false)
+        corrupt-after? (atom false)
+        args (canary/gemm-arguments [2 3 4])
+        expected (canary/gemm-reference (first args) (second args) [2 3 4])]
+    (with-redefs [hardware/init! (fn [] nil)
+                  hardware/device-signature (constantly {:device :fixture})
+                  compiled/lower (fn [_ _ opts]
+                                   (swap! calls conj [:lower opts]) {:schedule (:schedule opts)})
+                  compiled/instantiate! (fn [_ opts]
+                                          (swap! calls conj [:bind opts]) :fixture)
+                  compiled/profile (fn [_]
+                                     (swap! calls conj :profile)
+                                     {:result {:C (if @corrupt? [Float/NaN] expected)}
+                                      :profile [{:kernel-name "generated"}]})
+                  compiled/measure (fn [_ & _]
+                                     (swap! calls conj :measure)
+                                     (when @corrupt-after? (reset! corrupt? true))
+                                     {:median-ns 100 :stationary? true :timing-source :device-event})
+                  compiled/ir (constantly {})
+                  compiled/close! (fn [_] (swap! calls conj :close))]
+      (let [opts {:environment-tag "fixture" :shape [2 3 4] :strategy :portable}
+            result (canary/equation-gemm! opts)]
+        (is (:validated? result))
+        (is (= [:profile :measure :profile :close] (drop 2 @calls)))
+        (is (= :equation-first (get-in (first @calls) [1 :compiler])))
+        (is (= {:profile? true} (second (second @calls))))
+        (is (= :device-event (get-in result [:identity :timing-source])))
+        (is (= :device-event (get-in result [:measurement :timing-source])))
+        (is (false? (get-in result [:scope :transfers-included?])))
+        (reset! calls [])
+        (reset! corrupt? true)
+        (is (thrown? clojure.lang.ExceptionInfo (canary/equation-gemm! opts)))
+        (is (= [:profile :close] (drop 2 @calls)))
+        (reset! calls [])
+        (reset! corrupt? false)
+        (reset! corrupt-after? true)
+        (is (thrown? clojure.lang.ExceptionInfo (canary/equation-gemm! opts)))
+        (is (= [:profile :measure :profile :close] (drop 2 @calls))))))
+  (doseq [opts [{:shape [4096 4096 4096]} {:shape [1 1 4097]}
+                {:strategy :matrix} {:budget-ms ##NaN}]]
+    (is (thrown? clojure.lang.ExceptionInfo (canary/equation-gemm! opts)))))
+
 (deftest periodic-heat-canary-reference-is-independent-and-shape-checked
   (doseq [shape [[3 5] [8 8]]]
     (let [[_ input nx ny alpha dt inv-dx2 inv-dy2 :as args]
