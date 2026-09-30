@@ -498,6 +498,16 @@ unchanged, and explicit `:portable` selects the same ordered body as `:auto`. Al
 the same ScheduledKernelBody certificate and target emitter, without test-only schedule injection.
 Do not advertise optimized equation-first defaults or a speedup from candidate construction alone.
 
+Before per-equation contraction dispatch can use that candidate, every alternative needs its own
+complete-write evidence. The internal contraction coverage query now rederives the exact generated
+portable/register body from the authoritative TypedSOAC algorithm and graph storage/scalar types.
+It also checks ordered compiler arguments, scalar bindings, output representation, launch and
+register admission guards. Same ABI, output-size labels or candidate-provided widths do not prove
+coverage. Static and Long-dimension regressions reject dropped stores, shortened launches, rebound
+segment counts and omitted guards. The focused suite passes 21 tests / 191 assertions. This query
+is a prerequisite, not a new dispatch or initialization-elision path; compute coverage once when
+certifying alternatives, and keep numerical/target admission independent of must-write evidence.
+
 The shared ScheduledKernelBody graph check now requires structural node membership and exact
 canonical pointer-storage dtypes. Previously the executable boundary caught a dtype mismatch
 after emission; the earlier refinement certificate now rejects it too. The scalar-reduction and
