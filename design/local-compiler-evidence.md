@@ -195,6 +195,48 @@ plain boundary once, not twice. The test retains result-view, independent step-v
 forged-binding coverage, and now explicitly checks that later public call validation performs a
 fresh boundary check. This is an assertion update for the intended preparation change, not a
 relaxation of numerical or binding contracts.
+The repaired staged-contract test passes 1 test / 64 assertions, followed by all seven green
+final-head gates. The constructor slice squash-merged as #956 (`4efdaab6`).
+
+### Fresh external preparation checkpoint
+
+With the constructor follow-up and its CI assertion repair (`1993c9bb`), the same isolated
+committed Gemma source is freshly lowered for the registered OpenCL target: 60 forward stages and
+157 VJP/update stages, with 14 shared mutable adapters. On this shared-load laptop, host preparation
+reports 38.13 s forward, 189.12 s VJP and 14.70 s composition. A separately instrumented
+recomposition of those retained components takes 19.15 s and asserts exact resulting-plan equality
+(247 nodes / 2 instances). These are single warm/noisy samples, not controlled speedup evidence.
+
+The trace retains 651 independent step/binding validations and 434 emitted-boundary validations,
+all through fresh program validation reports. Artifact validation totals 3,906 calls / 0.353 s;
+emitted-boundary validation accounts for 18.00 s inclusive. Nested timings overlap and must not be
+added. This directs subsequent work toward semantic reconstruction, not device kernels or alias
+checks, and does not justify weakening any public validation boundary.
+
+The freshly prepared OpenCL composition also replays twice against independent JVM forward,
+input-gradient and adapter-update oracles. Maximum errors are respectively 1.193e-6, 2.862e-6 and
+2.981e-8. This renews tiny-model correctness acceptance on the constructor head; it is not a
+fresh Level Zero external replay, real-weight training, throughput or a full package migration.
+
+The next bounded cleanup projects plain/dispatch artifact target tags after their executable
+validator has already checked those exact artifacts. Structured loops retain the independent
+artifact check: their graph validator alone does not check arbitrary artifact descriptions,
+especially the older operation-certificate form. Later public program validation remains fresh;
+mixed-target and malformed-source rejection remain required acceptance tests.
+The focused suites pass 73 tests / 526 assertions: 43 / 275 structured-control checks,
+28 / 185 independent equation, dispatch/persistence and public native-composition checks,
+and 2 / 66 staged CUDA/HIP and mixed-target checks. Both local device availability gates
+are asserted, so native composition acceptance does not come from a skipped test path.
+
+A deeper trace with that cleanup preserves the exact same 247-node plan and reports 14.61 s
+recomposition, 651 step validations and 434 emitted-boundary validations. Artifact validation
+falls from 3,906 to 3,472 invocations; that count reduction, not the noisy timing change, is the
+verified result. The trace exposes 48,740 SOAC validator invocations (9.96 s inclusive) and
+11.67 s inclusive expected-graph reconstruction. Multi-arity/self-recursive instrumented entries
+can count nested calls; inclusive times may exceed total wall time. The next consolidation audit
+is typed semantic projection inside one checked boundary, not removal of independent outer proofs
+or a new persistent validation cache. External adapter migration and matched kernel baselines
+remain on the existing campaign.
 
 ## Structured AD invocation and external Gemma — 2026-09-30
 

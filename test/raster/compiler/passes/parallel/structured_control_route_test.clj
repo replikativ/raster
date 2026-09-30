@@ -885,6 +885,36 @@
     (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
     (is (false? (get-in call [:attributes :source-inspected])))))
 
+(deftest program-target-projection-retains-boundary-artifact-validation
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        source-program (:program call)
+        step (first (filter program-call/emitted-equation-call? (:steps call)))
+        boundary (first (get-in step [:equation :operations]))
+        target-artifact (get-in boundary [:graph :nodes 0 :operation])
+        checks (atom 0)
+        original artifact/validate!]
+    (with-redefs [artifact/validate!
+                  (fn [candidate]
+                    (when (identical? candidate target-artifact) (swap! checks inc))
+                    (original candidate))]
+      (emitted-equation/validate! boundary)
+      (let [boundary-checks @checks]
+        (is (pos? boundary-checks) "the boundary validates the actual emitted artifact")
+        (reset! checks 0)
+        (is (identical? source-program (emitted-program/validate! source-program)))
+        (is (= boundary-checks @checks) "target membership adds no second artifact proof")
+        (emitted-program/validate! source-program)
+        (is (= (* 2 boundary-checks) @checks) "later public checks remain independent")))
+    (doseq [[index equation] (map-indexed vector (:equations source-program))
+            :when (or (emitted-loop/emitted-loop? (first (:operations equation)))
+                      (emitted-equation/emitted-equation? (first (:operations equation))))]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emitted-program/validate!
+                    (assoc-in source-program
+                              [:equations index :operations 0 :graph :nodes 0 :operation :source]
+                              nil)))
+          "malformed plain and structured-loop artifacts still fail before invocation"))))
+
 (deftest call-construction-consumes-only-its-own-exact-plain-equation-projection
   (let [{:keys [call]} (prepared-mixed-call 3)
         step (first (filter program-call/emitted-equation-call? (:steps call)))
