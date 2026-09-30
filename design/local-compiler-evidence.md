@@ -93,6 +93,20 @@ Background load, warm-up and the unchanged final validator's different timing pr
 78.35 → 45.75 s as a controlled speedup. The proven improvement is removal of two redundant root
 program checks, not a kernel/runtime improvement or a general compilation-latency guarantee.
 
+The next remapping follow-up reuses only the exact immutable equation boundary's already-checked
+physical-result projection between source and final call validation. One fresh identity context is
+bound separately around those two synchronous phases; mapper callbacks and rename construction
+cannot inherit it. No context is retained in a call or shared with later public validation. Copies,
+metadata changes and changed bodies miss the identity proof; every call/ABI/graph/scalar/result-view
+check still runs. Focused review found no blocker. The affected suites pass 75 tests / 493 assertions,
+including fresh-validation, mapper isolation, copied/changed boundary and native replay checks.
+
+The same actual Gemma composition retains an exactly equal 247-node / 2-instance plan. All 651
+equation-call checks still run, while physical-result queries fall from 651 to 434. An instrumented
+sample reports 29.17 s total, 14.08 s remapping and 14.84 s final plan construction. This is not a
+controlled speedup comparison; independent final plan validation remains intact. The count reduction
+and unchanged plan are the proof, not the sampled timing. Full CI acceptance is pending for this slice.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

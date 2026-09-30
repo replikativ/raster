@@ -158,14 +158,26 @@
     (validate-result-views! equation emitted physical (or (:result-views call) {}))
     call))
 
+(def ^:dynamic ^:private *validated-boundary-projections* nil)
+
+(defn- checked-physical-results [boundary]
+  (if (and *validated-boundary-projections*
+           (.containsKey ^java.util.IdentityHashMap *validated-boundary-projections* boundary))
+    (.get ^java.util.IdentityHashMap *validated-boundary-projections* boundary)
+    (let [physical (emitted-equation/physical-results boundary)]
+      (when *validated-boundary-projections*
+        (.put ^java.util.IdentityHashMap *validated-boundary-projections* boundary physical))
+      physical)))
+
 (defn validate-equation-call!
   [call]
   (when-not (emitted-equation-call? call)
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
   (let [boundary (equation-dispatch/boundary-equation
                   (first (:operations (:equation call))))
-        ;; This public projection independently validates the complete boundary before use.
-        physical (emitted-equation/physical-results boundary)]
+        ;; Independent outside a synchronous rename. Inside it, only the exact already-checked
+        ;; immutable boundary's projection may be reused; every call/binding check still runs.
+        physical (checked-physical-results boundary)]
     (validate-equation-call-against-boundary! call boundary physical)))
 
 (defn- validate-result-views!
@@ -487,7 +499,9 @@
    intentionally absent from EmittedParallelProgramCall and remain private to KernelGraph."
   [call f]
   ;; buffer-identities independently validates the complete input call before projecting it.
-  (let [source-buffers (buffer-identities call)]
+  (let [validated-boundaries (java.util.IdentityHashMap.)
+        source-buffers (binding [*validated-boundary-projections* validated-boundaries]
+                         (buffer-identities call))]
     (when-not (ifn? f)
       (fail! :emitted-program-buffer-mapper
              "emitted program buffer remapping requires a callable projection"
@@ -540,7 +554,10 @@
         ;; immutable program. Recheck every remapped binding/step against that program without
         ;; deriving its unchanged algorithms and kernels a second time in this construction.
         ;; A later public validation still independently checks the complete program.
-        (validate-call-against-program! remapped (:program call) nil)))))
+        ;; Do not convey the validation context to mapper callbacks (or their futures).
+        ;; Its only consumers are the source and final synchronous validation phases.
+        (binding [*validated-boundary-projections* validated-boundaries]
+          (validate-call-against-program! remapped (:program call) nil))))))
 
 (defn make
   "Prepare a source-independent, target-neutral call of an emitted parallel program.

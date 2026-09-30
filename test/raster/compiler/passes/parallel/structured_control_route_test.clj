@@ -918,6 +918,57 @@
                             (catch clojure.lang.ExceptionInfo error error))))))
       (is (zero? @mapped) "a valid program cannot hide an invalid source call"))))
 
+(deftest buffer-renaming-shares-only-an-exact-synchronous-boundary-projection
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        numerical-step (first (filter program-call/emitted-equation-call? (:steps call)))
+        boundary (first (get-in numerical-step [:equation :operations]))
+        projections (atom 0)
+        original emitted-equation/physical-results]
+    (with-redefs [emitted-equation/physical-results
+                  (fn [equation]
+                    (when (identical? boundary equation) (swap! projections inc))
+                    (original equation))]
+      (let [remapped (program-call/map-buffers call #(vector :renamed %))]
+        (is (= 1 @projections) "source and renamed call share only this exact projection")
+        (program-call/validate! remapped)
+        (is (= 2 @projections) "later public validation is independent")
+        (program-call/map-buffers call #(vector :again %))
+        (is (= 3 @projections) "a later rename has a fresh context"))
+      (reset! projections 0)
+      (let [nested? (atom false)]
+        (program-call/map-buffers
+         call (fn [value]
+                (when (compare-and-set! nested? false true)
+                  (program-call/validate! call))
+                [:nested value]))
+        (is (= 2 @projections) "mapper validation cannot borrow the rename's context")))))
+
+(deftest boundary-projection-reuse-does-not-accept-equal-copies-or-changed-bodies
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        step (first (filter program-call/emitted-equation-call? (:steps call)))
+        boundary (first (get-in step [:equation :operations]))
+        copied (with-meta boundary (assoc (meta boundary) :line 1234))
+        changed (assoc boundary :graph (assoc (:graph boundary) :nodes []))
+        project-context (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                    '*validated-boundary-projections*)
+        projections (atom [])
+        original emitted-equation/physical-results]
+    (is (= boundary copied))
+    (is (not (identical? boundary copied)))
+    (with-redefs [emitted-equation/physical-results
+                  (fn [equation]
+                    (swap! projections conj equation)
+                    (original equation))]
+      (with-bindings {project-context (java.util.IdentityHashMap.)}
+        (program-call/validate-equation-call! step)
+        (program-call/validate-equation-call!
+         (assoc-in step [:equation :operations 0] copied))
+        (is (= 2 (count @projections)) "equal copies cannot reuse identity proof")
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (program-call/validate-equation-call!
+                      (assoc-in step [:equation :operations 0] changed))))
+        (is (= 3 (count @projections)) "changed bodies are independently checked")))))
+
 (deftest emitted-program-buffer-remapping-is-total-and-alias-stable
   (let [{:keys [call]} (prepared-mixed-call 3)
         sources (vec (distinct (concat (vals (:buffers call))
