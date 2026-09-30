@@ -177,6 +177,17 @@ public compiled API on the local Arc. After two SGD steps, GPU/JVM losses were
 2.40469313/2.40469337 and maximum adapter absolute error was 2.98e-8. The existing 25-step
 FP32 trajectory test is migrated from descriptor-fixture invocation to this public API; its
 mixed-precision counterpart still uses the fixture and remains a separate migration item.
+An allocation-free public probe at CFG-MP with only `:precision :mixed-f16-f32` lowers and binds
+122 generated kernels, but its 50 contraction leaves retain sequential-segment schedules.
+This is expected under equation-first `:typed-contraction :auto`, which deliberately remains
+ordered portable; a numerical precision permission is not an optimized schedule selection.
+The legacy mixed-precision test must remain until per-equation matrix admission and selection
+reach the same public program boundary. A global explicit matrix request cannot replace that
+work: a training program also contains non-matrix reductions. Non-empty measured contraction
+selectors now fail before frontend lowering on equation-first instead of being silently ignored;
+the descriptor route still owns their existing validated consumption. Empty selector maps and
+the current portable default are unchanged. Next, reuse the existing typed candidate/refinement
+and selector machinery per equation rather than adding a Gemma or AD-specific kernel route.
 Local validation: the migrated 25-step device/JVM trajectory passes 43 assertions, with both
 losses falling from 2.800152 to 0.256915; the focused coverage test passes 25 assertions and the
 initialization suite passes 21 tests / 129 assertions. These are local Arc results, not CUDA/HIP

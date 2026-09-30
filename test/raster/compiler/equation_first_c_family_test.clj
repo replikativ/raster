@@ -247,6 +247,22 @@
            (get-in (ex-data error) [:schedule-decline :reason])))
     (is (= :none (:fallback (ex-data error))))))
 
+(deftest public-contraction-measured-selectors-cannot-be-silently-ignored
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [error (with-redefs [pipeline/get-walked-body
+                             (fn [& _] (throw (AssertionError. "unsupported selector reached lowering")))]
+                  (try
+                    (equation-first/compile
+                     #'contractions/fixed-matmul
+                     {:target target :dtype :float
+                      :schedule {:typed-contraction
+                                 {:measured-selectors {"recorded-contraction" {:kind :fixed-strategy}}}}})
+                    nil
+                    (catch clojure.lang.ExceptionInfo exception exception)))]
+      (is (= :equation-first-contraction-selector-unsupported (:reason (ex-data error))))
+      (is (= [:typed-contraction :measured-selectors] (:schedule-path (ex-data error))))
+      (is (= :none (:fallback (ex-data error)))))))
+
 (deftest public-contraction-selection-preserves-default
   (let [compile-fixed (fn [strategy]
                         (equation-first/compile
