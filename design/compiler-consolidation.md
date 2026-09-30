@@ -190,13 +190,23 @@ constant-data treatment, tangent types, seeds and original parameter/nil-slot or
 by that preparation. Compiled single-parameter `grad` now returns the public API's scalar,
 not the inliner's former one-element vector; multi-parameter gradients remain padded vectors.
 Dynamic option expressions and non-reverse compiled modes decline explicitly. The optionless
-inline transformer remains a separate consolidation obligation; this does not establish general
-loop tapes, conditional residual transposition or complete higher-order array AD.
+inline transformer now consumes the same preparation too: its duplicate activity selection,
+gradient flattening and default scalar-type reconstruction are removed, together with the
+compiler's AD-transform callback and unused AD-only expansion helper. The inliner retains
+overload resolution and metadata-preserving argument substitution, not a second AD algebra.
+This does not establish general loop tapes, conditional residual transposition or complete
+higher-order array AD.
 The final shared-preparation path passes the public 25-step adapter-only Gemma trajectory
 (43 assertions), the inliner/AOT suite (18 tests / 81 assertions), four existing compiled AD
 checks (11 assertions), and the density/observation bridge suite (8 tests / 64 assertions).
-The existing higher-order optionless checks still print late undevirtualized-dispatch warnings;
-numeric agreement there is not evidence that their scalar typing/performance is consolidated.
+The subsequent optionless consolidation passes the inliner/AOT suite (18 tests / 81 assertions),
+the selected first/second/third derivative checks plus public Gemma trajectory (5 tests / 54
+assertions), loop/helper/HVP regressions (4 tests / 38 assertions), Q8 resident LoRA tests
+(3 tests / 18 assertions), and the density/observation bridge suite (8 tests / 64 assertions).
+The selected higher-order run no longer prints the prior late undevirtualized-dispatch warnings;
+that bounded observation is not a claim that all higher-order scalar/array typing or performance
+is consolidated. Runtime and compiled raw-loop failures now describe the same preparation gate,
+rather than recommending compilation as an escape from a shared unsupported construct.
 
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to

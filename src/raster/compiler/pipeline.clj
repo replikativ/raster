@@ -69,9 +69,9 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.macroexpand :as mex]
             [raster.ad.purity :as purity]
-            [raster.ad.reverse :as ad-reverse]
+            ;; Load AD declarations before inspecting template/effect boundaries.
+            [raster.ad.reverse]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ad.flatten :as flatten]
             [raster.compiler.ad.mode-select :as mode-select]
             [raster.compiler.passes.parallel.device :as device]
             [clojure.walk :as walk]
@@ -384,9 +384,7 @@
   (let [;; Normalize multi-body let FIRST — before inlining can drop effects
         normalized (normalize-let-body form)
         result (if (:inline? opts)
-                 (with-bindings {#'flatten/*flatten-dtype* (:dtype opts)
-                                 #'inline/*param-env* (:param-env opts)
-                                 #'inline/*ad-transform-body-fn* ad-reverse/transform-body}
+                 (with-bindings {#'inline/*param-env* (:param-env opts)}
                    (inline/lower-to-ad-primitives normalized))
                  normalized)
         ;; Ensure result is a let* form (dialect requirement)
@@ -410,8 +408,7 @@
   Runs after buffer-fuse so rewritten ops (e.g. transpose-2d!) get inlined too.
   (=> :buffer-fused :expanded)"
   [form opts]
-  (let [expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
-                   (inline/expand-for-backends form 3 (:param-env opts)))]
+  (let [expanded (inline/expand-for-backends form 3 (:param-env opts))]
     (if (= expanded form)
       form
       {:form expanded
@@ -500,8 +497,7 @@
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
-              expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
-                         (inline/expand-for-backends current 3 (:param-env opts)))
+              expanded (inline/expand-for-backends current 3 (:param-env opts))
               ;; GPU aggregate locals must disappear before the fixpoint
               ;; typedness census and TypedSOAC construction. The same shared
               ;; projector already serves AD; keep JVM value identity intact.

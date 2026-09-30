@@ -2881,8 +2881,7 @@
   [body]
   (with-ad-gensym
     (letfn [(lower1 [f]
-              (binding [inline/*ad-transform-body-fn* transform-body]
-                (inline/lower-to-ad-primitives f)))
+              (inline/lower-to-ad-primitives f))
             (relift [f]
               (if (form/binding-form? f)
                 (let [[bindings body-exprs] (extract-let-parts f)]
@@ -4288,9 +4287,8 @@
                    "sanctioned differentiable recurrence — out[i] = acc_i "
                    "is its own tape), a data-dependent/convergence loop via "
                    "a fixed-point solve (adjoint-of-fixed-point rule), or a "
-                   "registered op (e.g. a loss deftm with an AD template), "
-                   "or use the compiled path (compile-aot of a deftm "
-                   "calling value+grad).")
+                   "registered op (e.g. a loss deftm with an AD template). "
+                   "Runtime construction and compiled AD calls share this preparation gate.")
               {:var f-var :reason :flatten-failed}))))
 
 (defn ^clojure.lang.IFn value+grad

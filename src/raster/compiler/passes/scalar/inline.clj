@@ -4,17 +4,14 @@
 	This namespace owns cross-function inlining, pre-AD lowering, and
 	post-AD backend expansion. It does not perform buffer reuse."
   (:require [clojure.string :as str]
-            [raster.ad.tangent :as tangent]
             [raster.ad.templates :as rt]
             [raster.compiler.backend.intrinsics :as intrinsics]
-            [raster.compiler.ad.flatten :as flatten]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
-            [raster.compiler.passes.scalar.cse :as cse]
             [raster.core :as rcore]
             [raster.compiler.core.dispatch :as dispatch]))
 
@@ -384,12 +381,6 @@
 ;; ================================================================
 ;; value+grad / grad inlining
 ;; ================================================================
-
-(def ^:dynamic *ad-transform-body-fn*
-  "The AD transform function (reverse/transform-body).
-  Bound by the pipeline when AD inlining is needed.
-  Breaks the inline↔reverse circular dependency."
-  nil)
 
 (declare inline-deftm-calls inline-invk flatten-nested-lets)
 
@@ -812,73 +803,13 @@
                {:walked-body walked-body :params params :tags tags
                 :var resolved}))))))))
 
-(def ^:dynamic *expand-for-ad-trace* false)
 (def ^:dynamic *param-env* nil)
-
-(defn- expand-for-ad
-  "Fixpoint expansion for AD: inline all non-template deftm calls and
-   value+grad calls until stable. Template-backed calls stay symbolic
-   so the AD transform can use their templates.
-
-   Each iteration:
-   1. Normalize to let* form
-   2. Inline non-template deftm calls in bindings (incl. value+grad)
-   3. Inline non-template .invk calls in body/binding expressions
-   4. Flatten nested lets
-   5. CSE to fold (nth vector-literal N)
-
-   Converges when no more expansions are possible.
-   Set *expand-for-ad-trace* to true for diagnostic output."
-  [form max-iters]
-  (let [cse-let cse/cse-let
-        trace? *expand-for-ad-trace*
-        binding-count (fn [f] (when (form/binding-form? f)
-                                (/ (count (second f)) 2)))]
-    (loop [current form, iter 0]
-      (if (>= iter max-iters)
-        (do (when trace? (println "  [expand-for-ad] max iterations reached"))
-            current)
-        (let [;; Step 1: Normalize to let* and flatten nested lets
-              wrapped (if (form/binding-form? current)
-                        current
-                        (list 'let* [] current))
-              ;; Step 2: Inline deftm calls in bindings
-              ;; With auto-rrules removed, only ops with explicit templates
-              ;; or explicit rrule closures are protected from inlining.
-              ;; User deftm functions (one-step, two-steps) get inlined.
-              after-deftm (inline-deftm-calls wrapped 3 false false)
-              _ (when (and trace? (not= after-deftm wrapped))
-                  (println (str "  [expand-for-ad] iter " iter " step 2 (inline): "
-                                (binding-count wrapped) " → " (binding-count after-deftm) " bindings")))
-              ;; Step 3: Inline .invk calls with simple bodies (no loops/fn)
-              after-invk (inline-invk after-deftm {:preserve-templates? true})
-              ;; Step 4: Flatten nested lets (with ANF-lift renaming)
-              after-flat (flatten-nested-lets after-invk)
-              _ (when (and trace? (not= (binding-count after-flat) (binding-count after-invk)))
-                  (println (str "  [expand-for-ad] iter " iter " step 4 (flatten): "
-                                (binding-count after-invk) " → " (binding-count after-flat) " bindings")))
-              ;; Step 5: CSE (fold nth on vector literals, propagate aliases)
-              expanded (:form (cse-let after-flat))
-              _ (when (and trace? (not= expanded after-flat))
-                  (println (str "  [expand-for-ad] iter " iter " step 5 (CSE): changed")))
-              ;; Convergence: no step changed the form
-              changed? (or (not= after-deftm wrapped)
-                           (not= after-invk after-deftm))]
-          (if changed?
-            (recur expanded (inc iter))
-            (do (when trace?
-                  (println (str "  [expand-for-ad] converged at iter " iter
-                                ", " (binding-count expanded) " bindings")))
-                expanded)))))))
 
 (defn inline-value+grad-call
   "Inline a ((value+grad #'f) args...) call into flat let* bindings.
 
-   Applies reverse-mode AD to f's walked body, flattens the result,
-   and produces bindings for the loss value and gradient symbols.
-
-   transform-body-fn: the AD transform function (reverse/transform-body).
-   Passed as parameter to avoid inline↔reverse circular dependency.
+   Consumes the same prepared typed reverse-gradient program as runtime AD construction.
+   Qualification, alpha-renaming and argument substitution retain its loss/gradient metadata.
 
    Returns {:bindings [[sym1 expr1] [sym2 expr2] ...]
             :result-sym   — symbol bound to the [loss, d_p1, d_p2, ...] vector
@@ -893,61 +824,25 @@
                      (when (every? some? tags) tags)))
         deftm-info (resolve-deftm-for-ad var-sym arg-tags)]
     (when deftm-info
-      (let [{:keys [walked-body params tags]} deftm-info
-            ;; Option-bearing calls consume the public AD constructor's already prepared,
-            ;; typed gradient body. In particular, :wrt activity, constant array reads, seed
-            ;; widths and padded nil slots must not be reimplemented in the compiler inliner.
-            prepared-body (when (seq options)
-                            ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
-                             (:var deftm-info) (:wrt (apply hash-map options))))
-            prepared-form (when prepared-body
-                            (inf/qualify-body-symbols
-                             (first (:walked-body prepared-body))
-                             (:source-ns prepared-body) (set (:params prepared-body))))
-            prepared-elements (when prepared-form (last prepared-form))
-            transform-body (when-not prepared-body
-                             (or *ad-transform-body-fn*
-                                 (throw (ex-info "*ad-transform-body-fn* not bound — pipeline must bind it for AD inlining" {}))))
-            body-form (first walked-body)
-            ;; Fixpoint expansion: inline all non-template deftm calls and
-            ;; value+grad calls until no more expansions are possible.
-            ;; Template-backed ops (matmul, mse-loss, etc.) stay symbolic
-            ;; so the AD transform can use their templates.
-            body-form (when-not prepared-body (expand-for-ad body-form 10))
-            all-params (mapv #(if (symbol? %) % (symbol (name %))) params)
-            ;; Only floating-point arrays/scalars are differentiable. Long/longs
-            ;; are constants for AD — passing them as active forces AD to look
-            ;; for rules on integer ops like (quot d-model n-heads), which
-            ;; don't exist (and shouldn't, since the result is non-diff).
-            ;; Same rule as raster.ad.reverse/build-grad-walked-body —
-            ;; delegates to the tangent protocol's type-level ⊥ test.
-            differentiable-tag? tangent/differentiable?
-            tags-vec (or tags (vec (repeat (count all-params) 'double)))
-            active-params (vec (keep-indexed
-                                (fn [i p]
-                                  (let [tag (nth tags-vec i nil)]
-                                    (when (if prepared-body
-                                            (some? (nth prepared-elements (inc i)))
-                                            (differentiable-tag? tag))
-                                       ;; Stamp :raster.type/tag so AD can read it
-                                       ;; in gen-reverse-let Phase 3 → adj-sym carries
-                                       ;; the tag → closure helpers get typed params
-                                       ;; instead of falling back to Object.
-                                      (with-meta p {:raster.type/tag tag}))))
-                                all-params))
-            ad-form (when-not prepared-body (transform-body body-form active-params))
-            ;; Canonicalize and flatten
-            canonical (when-not prepared-body (flatten/canonicalize-ad-form ad-form))]
-        (when (or prepared-body canonical)
-          (let [flat-result (if prepared-body
-                              {:form prepared-form :result-sym (first prepared-elements)
-                               :param-adj-syms (vec (remove nil? (rest prepared-elements)))}
-                              (flatten/flatten-ad-form canonical))]
+      (let [;; One typed AD preparation owns activity, constant data, seed widths and padded
+            ;; gradient slots for both runtime construction and compilation. The inliner only
+            ;; qualifies, alpha-renames and substitutes this retained program; it does not
+            ;; transform AD again or infer the gradient types from its consumers.
+            prepared-body ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
+                           (:var deftm-info) (:wrt (apply hash-map options)))
+            params (:params prepared-body)
+            prepared-form (inf/qualify-body-symbols
+                           (first (:walked-body prepared-body))
+                           (:source-ns prepared-body) (set params))
+            prepared-elements (last prepared-form)]
+        (when prepared-body
+          (let [flat-result {:form prepared-form :result-sym (first prepared-elements)
+                             :param-adj-syms (vec (rest prepared-elements))}]
             (when flat-result
               (let [{:keys [form result-sym param-adj-syms]} flat-result
-                    ;; form is (let* [...fwd... dy=1.0 ...rev...] primal)
+                    ;; form is the retained flat let* with a padded [primal grads...] tail.
                     ;; Extract bindings
-                    [_ bindings-vec body-expr] form
+                    [_ bindings-vec] form
                     pairs (partition 2 bindings-vec)
                     ;; Substitute actual args for formal params
                     param-names (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil)
@@ -977,31 +872,7 @@
                                              (map first pairs)
                                              renamed-pairs))
                     loss-sym (get final-subst result-sym result-sym)
-                    diff-grad-syms (mapv #(get final-subst % %) param-adj-syms)
-                    ;; Map each ORIGINAL param to a grad sym (or nil for
-                    ;; non-differentiable params filtered out at AD seed time).
-                    ;; Positional consumers see one slot per original param.
-                    diff-set (set active-params)
-                    diff->idx (zipmap active-params (range))
-                    grad-syms (mapv (fn [p]
-                                      (if (contains? diff-set p)
-                                        (nth diff-grad-syms (diff->idx p))
-                                        nil))
-                                    all-params)
-                    ;; Tag gradient syms with expected types from param tags.
-                    ;; Array params (doubles, floats, longs) have array gradients.
-                    ;; This ensures downstream type inference knows the gradient types
-                    ;; even when AD initializes accumulators to scalar 0.0.
-                    ;; Use arg-tags (from param-env) first — these are always correct.
-                    ;; Fall back to deftm var metadata for functions with <5 params.
-                    param-tags (or arg-tags
-                                   (:raster.core/deftm-tags (meta (resolve var-sym)))
-                                   (vec (repeat (count grad-syms) 'double)))
-                    grad-syms (mapv (fn [gs tag]
-                                      (if (and gs tag (not= tag 'double) (not= tag 'long))
-                                        (with-meta gs {:tag tag})
-                                        gs))
-                                    grad-syms param-tags)
+                    grad-syms (mapv #(get final-subst % %) param-adj-syms)
                     ;; Elements: loss + all gradient syms (DCE handles dead ones)
                     elements (if (= mode :value+grad)
                                (vec (cons loss-sym grad-syms))
