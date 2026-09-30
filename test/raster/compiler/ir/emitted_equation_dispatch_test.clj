@@ -1,14 +1,10 @@
 (ns raster.compiler.ir.emitted-equation-dispatch-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.core :refer [deftm]]
-            [raster.arrays]
-            [raster.numeric]
-            [raster.par]
-            [raster.dl.array-ops :as array-ops]
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.fixtures.contractions :as contractions]
+            [raster.compiler.fixtures.attention-projection :as attention-projection]
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-target]
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
@@ -22,25 +18,6 @@
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
-
-(deftm typed-attention-projection
-  [q :- (Array float) k :- (Array float) v :- (Array float)
-   dst :- (Array long) src :- (Array long) weights :- (Array float)
-   rows :- Long edges :- Long width :- Long heads :- Long] :- (Array float)
-  (let [dk (quot width heads)
-        raw (array-ops/indexed-dot q k dst src rows rows edges dk width heads)
-        scaled (array-ops/scale-clamp-exp raw (/ 1.0 (raster.numeric/sqrt dk))
-                                        5.0 (* edges heads))
-        denominator (array-ops/scatter-add scaled dst rows edges heads)
-        weighted (array-ops/scatter-mul-add scaled v dst src rows rows edges dk width heads)
-        normalized (array-ops/segment-div weighted denominator rows width heads 1.0e-6)
-        result (float-array (* rows 7))]
-    (raster.par/contract result [[i rows] [j 7]] [[p width]]
-                         (raster.numeric/*
-                          (raster.arrays/aget normalized (+ (* i width) p))
-                          (raster.arrays/aget weights (+ (* p 7) j)))
-                         :init (float 0.0) :combine raster.numeric/+)
-    result))
 
 (def ^:private artifact-identity
   {:semantic-request-fingerprint "equation-dispatch-request"
@@ -208,7 +185,7 @@
 (deftest reduction-dispatch-preserves-a-conservatively-declined-contraction
   (register-target!)
   (let [compilation (equation-first/compile
-                     #'typed-attention-projection
+                     #'attention-projection/attention-projection
                      {:target target :dtype :float
                       :schedule {:typed-contraction {:strategy :dispatch-register-tiled}
                                  :segmented-weighted-reduction
