@@ -138,7 +138,10 @@
    seq :- Long d :- Long nq :- Long nkv :- Long hd :- Long dff :- Long r :- Long
    eps :- Double theta :- Double lr :- Double] :- (Array float)
   (let [vg ((raster.ad.reverse/value+grad
-             (var raster.dl.gemma-train-resident-test/gblk-loss))
+             (var raster.dl.gemma-train-resident-test/gblk-loss)
+             ;; Frozen model/data ports are not optimizer parameters. Keep the full tuple's
+             ;; existing slot order, but differentiate only the fourteen adapter ports.
+             :wrt [8 9 11 12 14 15 17 18 20 21 23 24 26 27])
             x input-ln q-norm k-norm post-attn pre-ffn post-ffn
             Wq Aq Bq Wk Ak Bk Wv Av Bv Wo Ao Bo Wg Ag Bg Wu Au Bu Wd Ad Bd
             tgt seq d nq nkv hd dff r eps theta)

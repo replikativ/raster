@@ -24,6 +24,7 @@
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
 
 (deftest anf-bindings-carry-existing-result-types-without-reinference
@@ -52,6 +53,74 @@
       (is (= 'gradient (#'inline/known-vg-element elements 'vg index))))
     (doseq [index [-1 2 'n '(long n) '(int 4294967296) '(float 1)]]
       (is (nil? (#'inline/known-vg-element elements 'vg index))))))
+
+(deftm option-loss [x :- Double y :- Double] :- Double
+  (+ (* x x) (* x y)))
+
+(deftm option-one-loss [x :- Double] :- Double (* x x))
+
+(deftm option-one-grad [x :- Double] :- Double
+  ((raster.ad.reverse/grad
+     (var raster.compiler.passes.scalar.inline-test/option-one-loss) :wrt [0]) x))
+
+(deftm option-one-grad-bound [x :- Double] :- Double
+  (let [gradient (raster.ad.reverse/grad
+                  (var raster.compiler.passes.scalar.inline-test/option-one-loss) :wrt [0])]
+    (gradient x)))
+
+(deftest static-ad-options-use-the-public-gradient-body
+  (doseq [source
+          ['(let* [vg ((raster.ad.reverse/value+grad
+                         (var raster.compiler.passes.scalar.inline-test/option-loss)
+                         :wrt [0]) x y)] vg)
+           '(let* [gradient (raster.ad.reverse/value+grad
+                             (var raster.compiler.passes.scalar.inline-test/option-loss)
+                             :mode :reverse :wrt [0])
+                   vg (gradient x y)] vg)]]
+    (let [expanded (binding [inline/*ad-transform-body-fn* rev/transform-body]
+                     (inline/inline-deftm-calls source))
+          f (eval (list 'fn '[x y] expanded))]
+      (is (= [10.0 7.0 nil] (f 2.0 3.0)))
+      (is (= ((rev/value+grad #'option-loss :wrt [0]) 2.0 3.0) (f 2.0 3.0)))))
+  (let [source '(let* [gradient ((raster.ad.reverse/grad
+                                  (var raster.compiler.passes.scalar.inline-test/option-loss)
+                                  :wrt [0]) x y)] gradient)
+        expanded (inline/inline-deftm-calls source)
+        f (eval (list 'fn '[x y] expanded))]
+    (is (= [7.0 nil] (f 2.0 3.0))))
+  (doseq [source ['(let* [g ((raster.ad.reverse/grad
+                             (var raster.compiler.passes.scalar.inline-test/option-one-loss)
+                             :wrt [0]) x)] g)
+                  '(let* [gradient (raster.ad.reverse/grad
+                                    (var raster.compiler.passes.scalar.inline-test/option-one-loss)
+                                    :wrt [0])
+                          g (gradient x)] g)]]
+    (let [expanded (inline/inline-deftm-calls source)
+          f (eval (list 'fn '[x] expanded))]
+      (is (= ((rev/grad #'option-one-loss :wrt [0]) 2.0) (f 2.0)))
+      (is (= 4.0 (f 2.0)))))
+  (let [source '(let* [vg ((raster.ad.reverse/value+grad
+                            (var raster.compiler.passes.scalar.inline-test/option-loss)
+                            :wrt []) x y)] vg)
+        expanded (inline/inline-deftm-calls source)
+        f (eval (list 'fn '[x y] expanded))]
+    (is (= [10.0 nil nil] (f 2.0 3.0))))
+  (doseq [wrt [[-1] [2] [0 0]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (binding [inline/*ad-transform-body-fn* rev/transform-body]
+                   (inline/inline-value+grad-call
+                    {:var-sym 'raster.compiler.passes.scalar.inline-test/option-loss
+                     :args '[x y] :mode :value+grad :options [:wrt wrt]})))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal :wrt"
+                        (#'inline/value+grad-call?
+                         '((raster.ad.reverse/value+grad (var example/loss) :wrt runtime-ports)
+                           x y)))))
+
+(deftest compiled-single-parameter-grad-preserves-the-public-scalar-result
+  (doseq [source [#'option-one-grad #'option-one-grad-bound]]
+    (let [f (pipeline/compile-aot source)]
+      (is (= 4.0 (f 2.0)))
+      (is (= -6.0 (f -3.0))))))
 
 (deftest lifted-arguments-retain-source-types-not-formal-consumer-types
   (doseq [[argument environment] [['(float (aget a 0)) {'a 'doubles}]

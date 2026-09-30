@@ -4272,6 +4272,27 @@
   [f-var]
   (:admissible? (forward-coverage f-var)))
 
+(defn ^:no-doc prepare-value+grad
+  "Prepare the existing typed reverse-gradient program without compiling a runtime wrapper.
+   Both runtime construction and compiler inlining consume this retained program/slot boundary."
+  [f-var wrt]
+  (or (build-grad-walked-body f-var wrt)
+      (throw (ex-info
+              (str "value+grad: cannot assemble a runtime gradient for `"
+                   f-var "` — the body reduces to a loop form the runtime "
+                   "flattener does not support (canonical fixed-trip loops "
+                   "are lifted to SOACs automatically; this one declined "
+                   "the soundness gates, e.g. a data-dependent trip count "
+                   "or a multi-carry body). Express the reduction via "
+                   "`par/reduce`, the recurrence via `par/scan` (the "
+                   "sanctioned differentiable recurrence — out[i] = acc_i "
+                   "is its own tape), a data-dependent/convergence loop via "
+                   "a fixed-point solve (adjoint-of-fixed-point rule), or a "
+                   "registered op (e.g. a loss deftm with an AD template), "
+                   "or use the compiled path (compile-aot of a deftm "
+                   "calling value+grad).")
+              {:var f-var :reason :flatten-failed}))))
+
 (defn ^clojure.lang.IFn value+grad
   "Composable value+gradient operator.
 
@@ -4300,28 +4321,7 @@
   ([f-var & {:keys [mode wrt] :or {mode :reverse}}]
    (case mode
      :reverse
-     (let [bgw (build-grad-walked-body f-var wrt)
-           ;; Fail loud, never return a broken IFn: flatten-for-gradient returns
-           ;; nil when the AD form isn't the flat [primal (fn* [dy] ...)] shape —
-           ;; today that's a body that IS (or tail-lifts to) a raw loop, whose
-           ;; loop-with-let output the runtime assembler can't flatten yet
-           ;; (laws-suite finding 2026-07-04; the compiled/inline path handles it).
-           _ (when (nil? bgw)
-               (throw (ex-info
-                       (str "value+grad: cannot assemble a runtime gradient for `"
-                            f-var "` — the body reduces to a loop form the runtime "
-                            "flattener does not support (canonical fixed-trip loops "
-                            "are lifted to SOACs automatically; this one declined "
-                            "the soundness gates, e.g. a data-dependent trip count "
-                            "or a multi-carry body). Express the reduction via "
-                            "`par/reduce`, the recurrence via `par/scan` (the "
-                            "sanctioned differentiable recurrence — out[i] = acc_i "
-                            "is its own tape), a data-dependent/convergence loop via "
-                            "a fixed-point solve (adjoint-of-fixed-point rule), or a "
-                            "registered op (e.g. a loss deftm with an AD template), "
-                            "or use the compiled path (compile-aot of a deftm "
-                            "calling value+grad).")
-                       {:var f-var :reason :flatten-failed})))
+     (let [bgw (prepare-value+grad f-var wrt)
            {:keys [walked-body params tags source-ns]} bgw
            runtime-fn (make-runtime-value+grad-fn walked-body params)
            ;; Qualify symbols in walked body for inlining from other namespaces

@@ -77,8 +77,8 @@ Keep this inside item 3, not a replacement campaign or another attention ABI. Th
 `gqa-decode-attention-weights!` is now an explicit host-only allocating wrapper. Its mandatory
 host oracles are separate from BLAS availability. The caller-owned
 `gqa-decode-attention-weights-resident!` change passes local acceptance with two generated
-KernelBody kernels, without a new attention ABI or emitter. CI and external ASR migration
-remain open. Its contract is:
+KernelBody kernels, without a new attention ABI or emitter. All seven CI gates passed and
+the slice merged as #924; external ASR migration remains open. Its contract is:
 
 1. Retain physical score/output/sink storage precision independently of scalar computation
    and normalization scratch precision. Use the shared declared-storage policy, including
@@ -141,7 +141,8 @@ producer/checkpoint/fresh-restore/three-step continuation. Coarse and fine chunk
 actual mmap bytes; the producer closes before read mappings open and synchronous restoration
 finishes before leases close. Same-backend final fields agree bit-for-bit; generated fields also
 match the JVM and retain volume-weighted mass. The frontend and new continuation suites pass
-114 tests / 575 assertions locally; full CI remains required. The snapshot's producer string is
+114 tests / 575 assertions locally, followed by all seven green CI gates and merge #926.
+The snapshot's producer string is
 a test-fixture label, not a production compiler-build identity. Production manifest publication,
 partial-patch interface fluxes, actual distributed transport, subcycling and reflux stay open.
 
@@ -180,6 +181,22 @@ Local validation: the migrated 25-step device/JVM trajectory passes 43 assertion
 losses falling from 2.800152 to 0.256915; the focused coverage test passes 25 assertions and the
 initialization suite passes 21 tests / 129 assertions. These are local Arc results, not CUDA/HIP
 runtime or external full-model training evidence.
+
+The adapter-only follow-up uses reverse AD's existing `:wrt` boundary rather than deriving
+activity from model names or compiler donation roles. Static option-bearing direct and
+let-bound `value+grad`/`grad` calls now consume `prepare-value+grad`, the same typed preparation
+used by the runtime constructor, without compiling an unused runtime wrapper. Index validation,
+constant-data treatment, tangent types, seeds and original parameter/nil-slot order stay owned
+by that preparation. Compiled single-parameter `grad` now returns the public API's scalar,
+not the inliner's former one-element vector; multi-parameter gradients remain padded vectors.
+Dynamic option expressions and non-reverse compiled modes decline explicitly. The optionless
+inline transformer remains a separate consolidation obligation; this does not establish general
+loop tapes, conditional residual transposition or complete higher-order array AD.
+The final shared-preparation path passes the public 25-step adapter-only Gemma trajectory
+(43 assertions), the inliner/AOT suite (18 tests / 81 assertions), four existing compiled AD
+checks (11 assertions), and the density/observation bridge suite (8 tests / 64 assertions).
+The existing higher-order optionless checks still print late undevirtualized-dispatch warnings;
+numeric agreement there is not evidence that their scalar typing/performance is consolidated.
 
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
