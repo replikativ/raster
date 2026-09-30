@@ -188,7 +188,13 @@
                               [(:graph operation)]
                               (mapv :graph (candidates-for operation)))
                node (:nodes kernel-graph)]
-           (artifact/validate! (:operation node))))
+           ;; Plain/dispatch candidates have already checked every artifact through their
+           ;; executable validator. Project target membership from those exact objects.
+           ;; Structured-loop graph validation alone is not an artifact validator: keep the
+           ;; independent check for that path, including legacy operation certificates.
+           (if (emitted-loop/emitted-loop? operation)
+             (artifact/validate! (:operation node))
+             (:operation node))))
         mismatches (filterv #(not= expected-target (:target %)) artifacts)]
     (when (seq mismatches)
       (throw (ex-info "emitted program dialect disagrees with a contained kernel target"
