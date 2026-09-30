@@ -24,6 +24,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
+            [raster.compiler.ir.kernel-executable :as kernel-executable]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
@@ -225,6 +226,8 @@
   "Admit register candidates per equation without rescheduling unrelated operations."
   [function-id reference options]
   (let [declines (atom {})
+        measured-selectors (get-in options [:schedule :typed-contraction :measured-selectors] {})
+        consumed (atom #{})
         new-kernels (atom [])
         equations
         (mapv
@@ -246,19 +249,44 @@
                                             :sequential-segments)
                          register (:candidate planned)
                          alternatives [portable register]
-                         selection (kernel-dispatch/make
-                                    {:id (str function-id "/contraction-" (:id equation))
-                                     :alternatives (mapv :graph alternatives)
-                                     :default-strategy :sequential-segments
-                                     :selector {:kind :fixed-strategy :strategy :register-tiled}
-                                     :attributes {:selection :explicit-register-candidate
-                                                  :numerical-mode :reassociated}})
+                         id (str function-id "/contraction-" (:id equation))
+                         interface (mapv #(select-keys % [:kind :dtype :kernel-dtype :role
+                                                         :aliasing :alignment])
+                                         (kernel-executable/abi (:graph portable)))
+                         measured-selector (get measured-selectors id)
+                         _ (when (= :none (:fallback measured-selector))
+                             (fail! :equation-first-contraction-pinning-unsupported
+                                    "public contraction dispatch cannot yet prune pinned alternatives"
+                                    {:dispatch-id id :selector measured-selector}))
+                         selection
+                         (cond->
+                          (kernel-dispatch/make
+                           {:id id
+                            :alternatives (mapv :graph alternatives)
+                            :default-strategy :sequential-segments
+                            :selector {:kind :fixed-strategy :strategy :register-tiled}
+                            :attributes
+                            {:selection (if measured-selector
+                                          :supplied-selector :explicit-register-candidate)
+                             :numerical-mode :reassociated
+                             :tuning {:schedule-path [:typed-contraction :measured-selectors]
+                                      :schedule-key id
+                                      :numerical-mode {:precision :f32
+                                                       :permitted-modes #{:exact :reassociated}}
+                                      :layout {:external-interface interface}}}})
+                           measured-selector (kernel-dispatch/with-selector measured-selector))
                          certified (equation-dispatch/make
                                     alternatives selection
                                     {:permitted-modes #{:exact :reassociated}})]
                      (swap! new-kernels into (map :operation (get-in register [:graph :nodes])))
+                     (when measured-selector (swap! consumed conj id))
                      (assoc equation :operations [certified])))))))
          (get-in reference [:program :equations]))
+        _ (when-let [unconsumed (seq (remove @consumed (keys measured-selectors)))]
+            (fail! :equation-first-contraction-selector-unconsumed
+                   "measured contraction selectors do not name admitted public dispatches"
+                   {:dispatch-ids (vec (sort unconsumed)) :consumed (vec (sort @consumed))
+                    :declines @declines}))
         kernels (into (:kernels reference) @new-kernels)]
     {:program (emitted-program/validate! (assoc (:program reference) :equations equations))
      :kernels kernels
@@ -296,7 +324,9 @@
          target-descriptor (validate-target-description!
                             target (or captured-target (hardware/descriptor-for target)))
          resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
-         _ (when (seq (get-in resolved-schedule [:typed-contraction :measured-selectors]))
+         _ (when (and (seq (get-in resolved-schedule [:typed-contraction :measured-selectors]))
+                      (not= :dispatch-register-tiled
+                            (get-in resolved-schedule [:typed-contraction :strategy])))
              (fail! :equation-first-contraction-selector-unsupported
                     "equation-first compilation cannot yet consume measured contraction selectors"
                     {:function (function-symbol resolved-var) :target target
@@ -313,7 +343,9 @@
            dispatch-reassociated?
            (assoc-in [:segmented-weighted-reduction :strategy] :reference)
            dispatch-contractions?
-           (assoc-in [:typed-contraction :strategy] :portable))
+           (assoc-in [:typed-contraction :strategy] :portable)
+           dispatch-contractions?
+           (assoc-in [:typed-contraction :measured-selectors] {}))
          compiler-options (compiler-options f-var target dtype
                                             (-> options
                                                 (dissoc :target :gemm-precision)

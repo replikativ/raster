@@ -202,7 +202,7 @@
                                           {:typed-contraction {:measured-selectors :invalid}})
                            arc-desc)))
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"require :strategy :auto"
+         clojure.lang.ExceptionInfo #"require an emitting dispatch strategy"
          (sched/feasible?
           (sched/resolve
            (sched/derive-default nil arc-desc)
@@ -210,6 +210,14 @@
             {:strategy :register-tiled
              :measured-selectors {"dispatch-a" {:kind :fixed-selector}}}})
           arc-desc)))
+    (is (true? (sched/feasible?
+                (sched/resolve
+                 (sched/derive-default nil arc-desc)
+                 {:typed-contraction
+                  {:strategy :dispatch-register-tiled
+                   :measured-selectors {"dispatch-a" {:kind :fixed-strategy
+                                                      :strategy :sequential-segments}}}})
+                arc-desc)))
     (is (true? (sched/feasible?
                 (sched/resolve (sched/derive-default nil arc-desc)
                                {:typed-contraction {:matrix-tiles :finite}})
