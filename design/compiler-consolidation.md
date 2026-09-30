@@ -555,6 +555,19 @@ statistics describe the independent emission attempt and may include subsequentl
 artifacts. A real device-throughput claim still requires resident, event-timed benchmark evidence.
 The final retained-statistics assertions pass 2 tests / 22 assertions.
 
+The shared-extent initialization probe is now confirmed in a fresh REPL. Mixed component slicing
+inherited the complete source-binding list, so an extent computed before the protected reduction
+was incorrectly classified as a local host binding still waiting to execute. Component scoping
+now removes only actual prior-prefix definitions from that local-binding list. Current and later
+bindings stay unavailable, and exact TypedSOAC input closure is unchanged. Initializer generation
+introduces the genuine incoming scalar capture when needed; no arbitrary metadata-only input or
+guessed product equality is admitted. The tiny regression proves both prior availability and
+future-definition rejection. The initialization suite passes 22 tests / 137 assertions. The
+original mixed probe compiles to three kernels and lowers to four steps with zero driver
+allocations. Conservative initialization is retained when an opaque incoming extent cannot
+prove the numerical domain product; cross-component product witnesses remain a separate proof
+optimization, not part of this correctness fix.
+
 The shared ScheduledKernelBody graph check now requires structural node membership and exact
 canonical pointer-storage dtypes. Previously the executable boundary caught a dtype mismatch
 after emission; the earlier refinement certificate now rejects it too. The scalar-reduction and
