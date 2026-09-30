@@ -221,6 +221,21 @@
       (is (= 2 (count (:kernels compilation))))
       (is (= :register-tiled
              (executable/strategy (-> linked :instances first :call :steps last :graph))))
+      (let [choice (:dispatch operation)
+            selected (equation-first/compile
+                      #'contractions/fixed-matmul
+                      {:target target :dtype :float
+                       :schedule {:typed-contraction
+                                  {:strategy :dispatch-register-tiled
+                                   :measured-selectors
+                                   {(:id choice) {:kind :fixed-strategy
+                                                  :strategy :sequential-segments}}}}})
+            selected-link (equation-first/lower selected [(float-array 15) (float-array 21)])]
+        (is (= 2 (count (:kernels selected))))
+        (is (= :sequential-segments
+               (-> selected :emitted :equations last :operations first :dispatch :default-strategy)))
+        (is (= :sequential-segments
+               (executable/strategy (-> selected-link :instances first :call :steps last :graph)))))
       (doseq [artifact (:kernels compilation)]
         (is (= artifact
                (scheduled-body/validate-artifact-projection!

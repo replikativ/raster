@@ -15,6 +15,9 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.gpu.indexed-attention-device-test :as indexed-fixture]
+            [raster.gpu.dispatch-benchmark :as benchmark]
+            [raster.gpu.dispatch-tuning :as tuning]
+            [raster.gpu.measurement :as measurement]
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
@@ -169,18 +172,75 @@
       (is (= 1 (get-in strict [:stats :emission :contraction-candidate-declines
                               :register-tiled-numerical-policy])))
       (is (= 1 (count (:kernels strict)))))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"measured typed contraction selectors require"
-         (equation-first/compile
+    (is (= :equation-first-contraction-selector-unconsumed
+           (reason #(equation-first/compile
           #'contractions/fixed-matmul
           (assoc-in options [:schedule :typed-contraction :measured-selectors]
                     {"unsupported-selector" {:kind :fixed-strategy
-                                             :strategy :register-tiled}})))
+                                             :strategy :register-tiled}}))))
         "unconsumed measured selectors remain a loud decline, not ignored evidence")
     (is (= :contraction-equation-dispatch-requires-equation-first
            (reason #(pipeline/compile-gpu-program
                      #'contractions/fixed-matmul target :dtype :float
                      :schedule (:schedule options)))))))
+
+(deftest public-contraction-selectors-use-the-existing-tuning-contract
+  (register-target!)
+  (let [options {:target target :dtype :float
+                 :schedule {:typed-contraction {:strategy :dispatch-register-tiled}}}
+        original (equation-first/compile #'contractions/fixed-matmul options)
+        choice (-> original :emitted :equations last :operations first :dispatch)
+        contract (get-in choice [:attributes :tuning])
+        descriptor (get-in original [:options :target-descriptor])
+        recorded (with-redefs [tuning/cache-put! identity]
+                   (tuning/tune-fixed!
+                    choice descriptor
+                    (fn [candidate]
+                      ;; Synthetic evidence validates the transport contract, not GPU performance.
+                      (let [signature (tuning/executable-signature candidate)
+                            duration (if (= :sequential-segments (:strategy signature)) 10.0 20.0)]
+                        {:measurement (measurement/summarize [duration duration duration])
+                         :validation {:passed? true :oracle-hash "synthetic-contraction-oracle"
+                                      :candidate-hash (:source-hash signature)}}))
+                    :force? true :numerical-mode (:numerical-mode contract) :layout (:layout contract)))
+        override (benchmark/tuning-schedule-override choice recorded descriptor
+                                                    (:numerical-mode contract) (:layout contract))
+        selected-options (assoc-in options [:schedule :typed-contraction :measured-selectors]
+                                   (get-in override [:typed-contraction :measured-selectors]))
+        recompiled (equation-first/compile #'contractions/fixed-matmul selected-options)
+        selected (-> recompiled :emitted :equations last :operations first :dispatch)
+        linked (equation-first/lower recompiled [(float-array 15) (float-array 21)])]
+    (is (= [:typed-contraction :measured-selectors] (:schedule-path contract)))
+    (is (= (:id choice) (:schedule-key contract)))
+    (is (= :sequential-segments (get-in selected [:selector :strategy])))
+    (is (= :supplied-selector (get-in selected [:attributes :selection])))
+    (is (= :sequential-segments (:default-strategy selected)))
+    (is (= 2 (count (:alternatives selected))))
+    (is (= :sequential-segments
+           (executable/strategy (-> linked :instances first :call :steps last :graph))))
+    (is (= :equation-first-contraction-selector-unconsumed
+           (reason #(equation-first/compile
+                     #'contractions/fixed-matmul
+                     (assoc-in selected-options
+                               [:schedule :typed-contraction :measured-selectors "extra-stale-id"]
+                               {:kind :fixed-strategy :strategy :sequential-segments})))))
+    (is (= :equation-first-contraction-selector-unconsumed
+           (reason #(equation-first/compile
+                     #'contractions/fixed-matmul
+                     (assoc-in selected-options [:schedule :precision] :f32-scalar)))))
+    (is (= :equation-first-contraction-pinning-unsupported
+           (reason #(equation-first/compile
+                     #'contractions/fixed-matmul
+                     (assoc-in selected-options
+                               [:schedule :typed-contraction :measured-selectors (:id choice) :fallback]
+                               :none)))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"absent strategy"
+         (equation-first/compile
+          #'contractions/fixed-matmul
+          (assoc-in selected-options
+                    [:schedule :typed-contraction :measured-selectors (:id choice) :strategy]
+                    :unavailable))))))
 
 (deftest reduction-dispatch-preserves-a-conservatively-declined-contraction
   (register-target!)

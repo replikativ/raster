@@ -529,8 +529,22 @@ algorithm/body and captured target description. Other equations remain unchanged
 actual candidate-admission declines have separate counters. Strict precision does not authorize
 the candidate. Binding-time preconditions may choose the exact portable fallback (including empty
 dimensions), using the existing dispatch preflight rather than a new runtime convention. The
-compatibility compiler rejects this equation-only mode; measured selectors are still rejected
-until their public producer/consumption contract is implemented. `:auto` is unchanged.
+compatibility compiler rejects this equation-only mode. `:auto` is unchanged.
+
+The explicit public dispatch now declares the existing generic offline tuning contract and
+accepts exported selector preferences under `[:typed-contraction :measured-selectors dispatch-id]`.
+Every supplied ID must be consumed by an admitted equation; extra/stale IDs and requests for
+numerically declined candidates fail loudly. Generic KernelDispatch validation owns strategy,
+scalar-expression and ABI checks. The exact portable default and both independently certified
+alternatives remain present; `:fallback :none` pins decline until public pruning is implemented.
+Reference frontend scheduling receives no measured-selector request, while the original option
+is retained in compiler/cache identity. Default/`:auto` selector requests still decline early.
+
+This adds no benchmark side effect to compilation, no new cache or binder, and no numeric rule.
+The existing tuning service validates device/artifact/ABI/numerical/layout identities before
+exporting a selector. A bare map supplied directly to the compiler is only a legal preference,
+not portable measurement evidence; reports label it `:supplied-selector`. Synthetic stationary
+durations test tune/export/recompile plumbing without claiming real measured performance.
 
 Mixed reduction/contraction emission revealed that independently re-emitting an unrelated
 contraction may generate different private SSA identities. The reduction join now requires exact

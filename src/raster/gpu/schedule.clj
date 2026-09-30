@@ -280,8 +280,8 @@
               "schedule: measured typed contraction selectors must map dispatch IDs to selector maps"
               {:measured-selectors typed-contraction-selectors})))
     (when (and (seq typed-contraction-selectors)
-               (not= :auto typed-contraction-strategy))
-      (throw (ex-info "schedule: measured typed contraction selectors require :strategy :auto"
+               (not (contains? #{:auto :dispatch-register-tiled} typed-contraction-strategy)))
+      (throw (ex-info "schedule: measured typed contraction selectors require an emitting dispatch strategy"
                       {:strategy typed-contraction-strategy
                        :measured-selectors typed-contraction-selectors})))
     (doseq [[field value] [[:target-fill-multiple target-fill-multiple]
