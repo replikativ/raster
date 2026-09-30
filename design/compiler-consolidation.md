@@ -145,6 +145,19 @@ match the JVM and retain volume-weighted mass. The frontend and new continuation
 a test-fixture label, not a production compiler-build identity. Production manifest publication,
 partial-patch interface fluxes, actual distributed transport, subcycling and reflux stay open.
 
+### Public training boundary follow-up
+
+The full existing tiny Gemma/LoRA forward/reverse-AD/SGD program was probed through
+`compiled/lower` with the equation-first compiler, adapter donation and frozen constants.
+It exposed a contraction whose verified scalar boundary included `seq`, but portable body
+discovery excluded that name as `clojure.core/seq`. Contraction lowering now binds the shared
+lexical-local set from its physical boundary and supplied type environments. The reported leaf
+then retains `[d r seq]`, all with their declared Long widths, without relaxing index validation.
+The focused contraction suite passes 20 tests / 171 assertions. Full public training execution
+remains a distinct acceptance gate, not established by a successful leaf. Direct/synthetic
+contraction callers still have the older default-int policy for unspecified scalar dtypes;
+the production probe supplies explicit types, and tightening that fallback remains separate.
+
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable
