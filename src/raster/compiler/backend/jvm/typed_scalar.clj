@@ -7,6 +7,7 @@
    static class) and coerces every local/result at its declared dtype boundary. It never evals a
    source form and keeps no private operation registry."
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.numeric-constant :as numeric-constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.scalar.effects :as effects]))
@@ -137,8 +138,10 @@
       (symbol? expression)
       (if (contains? environment expression)
         (get environment expression)
-        (fail! :typed-scalar-unbound "typed scalar expression references an unbound SSA value"
-               {:symbol expression :available (set (keys environment))}))
+        (if-let [constant (numeric-constant/value expression)]
+          (:value constant)
+          (fail! :typed-scalar-unbound "typed scalar expression references an unbound SSA value"
+                 {:symbol expression :available (set (keys environment))})))
       (seq? expression)
       (do
         (when-not (= :pure (effects/analyze-effect expression))
