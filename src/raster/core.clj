@@ -1750,7 +1750,9 @@
                                            ;; typed-target-fn: routes through -impl
                                            (fn [& call-args]
                                              (apply @impl-var call-args))
-                                           (meta (ns-resolve source-ns (symbol (name fn-name)))))
+                                           (assoc (meta (ns-resolve source-ns (symbol (name fn-name))))
+                                                  ::dispatch/parametric-annotations annotations
+                                                  ::dispatch/parametric-bindings bindings))
                 ;; Return the compiled -impl var; the caller decides whether to
                 ;; invoke it (runtime dispatch) or just keep the registration
                 ;; (compile-time specialization).

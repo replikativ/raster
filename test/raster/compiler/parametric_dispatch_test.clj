@@ -26,6 +26,41 @@
   (All [T] [a :- (Array T) d :- (Array double) f :- (Array float)] :- T
        (raster.arrays/aget a 0)))
 
+(defn- redefine-parametric-probe! [fn-name value]
+  (binding [*ns* (the-ns 'raster.compiler.parametric-dispatch-test)]
+    (eval (list 'deftm fn-name
+                (list 'All '[T] '[x :- T] ':- 'T (list 'T value))))))
+
+(deftest source-redefinition-refreshes-materialized-dtypes
+  (let [fn-name (gensym "source-reload-probe-")
+        generic (redefine-parametric-probe! fn-name 1.0)
+        first-float (rcore/ensure-dtype-specialization! generic :float)]
+    (is (== 1.0 (@first-float (float 0.0))))
+    (is (== 1.0 (@generic (float 0.0))))
+    (redefine-parametric-probe! fn-name 2.0)
+    ;; Check runtime dispatch BEFORE asking the compiler to resolve the dtype:
+    ;; a resolver-only repair must not mask the stale generic dispatch object.
+    (is (== 2.0 (@generic (float 0.0))))
+    (is (== 2.0 (@generic 0.0)))
+    (let [before (dispatch/compiler-definition-revision)
+          resolved (rcore/ensure-dtype-specialization! generic :float)]
+      (is (== 2.0 (@resolved (float 0.0))))
+      (is (= before (dispatch/compiler-definition-revision))
+          "refreshing a derived dtype must not create another semantic source epoch"))))
+
+(deftest template-redefinition-preserves-explicit-concrete-overloads
+  (let [fn-name (gensym "explicit-reload-probe-")
+        generic (redefine-parametric-probe! fn-name 1.0)]
+    (rcore/ensure-dtype-specialization! generic :float)
+    (binding [*ns* (the-ns 'raster.compiler.parametric-dispatch-test)]
+      (eval (list 'deftm fn-name '[x :- Float] ':- 'Float '(float 9.0))))
+    (is (== 9.0 (@generic (float 0.0))))
+    (redefine-parametric-probe! fn-name 2.0)
+    (is (== 9.0 (@generic (float 0.0)))
+        "the explicit Float method replaced the derived one and is not template-owned")
+    (is (== 2.0 (@generic 0.0)))
+    (is (== 9.0 (@(rcore/ensure-dtype-specialization! generic :float) (float 0.0))))))
+
 (deftest requested-dtype-binds-type-variables-not-fixed-scratch
   (doseq [order [[:float :double] [:double :float]]
           dtype order]
