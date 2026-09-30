@@ -38,8 +38,8 @@
               (contains? @types/soa-registry (symbol (subs h 2)))))))
 
 (def ^:dynamic *inline-scalar-bodies?*
-  "Opt in to bare scalar deftm helper tails at the direct walked-body GPU entry.
-   Other compiler entries retain their existing expansion policy until separately certified."
+  "Opt in to bare pure scalar deftm helper tails at GPU frontend entries. Equation-first,
+   resident and direct scheduling share this policy; other targets retain their existing policy."
   false)
 
 (defn- inlinable-body?

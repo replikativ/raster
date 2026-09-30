@@ -63,6 +63,34 @@ External GPU training migration, real weights and device optimizer acceptance st
 The archived finetune adapter still names retired runtime entry points; this work neither
 restores them nor substitutes a Raster-side model twin for that external gate.
 
+The public equation-first resident Gemma train-step also executes after this consolidation:
+25 on-device SGD updates pass 43 assertions, and CPU/device losses track from 2.800152
+to 0.256915. Device availability is asserted before running the test; a skip is not
+counted as execution. This is the existing small Raster model twin, not external real weights.
+
+## Shared GPU scalar-helper frontend — 2026-09-30
+
+A bare pure scalar cast helper exposed entry drift: direct GPU scheduling enabled the
+existing hygienic scalar-body inliner, while equation-first and resident representation
+passes left the same helper opaque and declined it as lacking a canonical intrinsic.
+The shared ordinary and diagnostic pass runners now enable that same policy when
+`:target-device` selects GPU compilation, including staged AOT entry points. Intrinsics remain
+operators, checked/call-by-value argument handling stays in the existing inliner, and JVM
+expansion policy is unchanged. No helper-name registry or algorithm-specific rule is added.
+
+The public cast-helper fixture emits one KernelBody map with no fallback and zero driver
+allocations through OpenCL/CUDA/HIP equation-first source boundaries. OpenCL descriptor
+compilation is checked both with and without diagnostics. The older descriptor entry does
+not implement CUDA/HIP `pass-backend`; that preexisting limitation is not a vendor runtime
+claim. Exact source-versus-device parity passes two resident replays on each local backend.
+The existing inliner suite passes 19 tests/91 assertions, retaining hygiene, unused checked
+arguments and call-by-value semantics.
+
+An additional local probe redefines only a scalar helper from constant 1 to 2. Fresh public
+compilation records a template invalidation and produces `[2,2,2]` on OpenCL, matching JVM
+source, after previously producing `[1,1,1]`. This validates that one transitive path; it is
+not a complete dependency/provenance or all-overload cache-invalidation audit.
+
 ## Declared array storage — 2026-09-30
 
 The opt-in `:preserve-declared-array-storage? true` keeps resolved array element tags as
