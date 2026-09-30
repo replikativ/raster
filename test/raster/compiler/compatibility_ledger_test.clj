@@ -7,6 +7,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.attention :as attention]
+            [raster.gpu.compiled :as compiled]
             [raster.linalg.contract :as contract]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]
@@ -145,9 +146,27 @@
       (throw (ex-info "ASR alignment admission changed; record its resident ownership evidence"
                       {:workload id}))
       (catch clojure.lang.ExceptionInfo exception
-        (if (= :equation-first-coverage (:reason (ex-data exception)))
-          {:declined {:reason :equation-first-coverage}}
+        (if (= :equation-first-host-only (:reason (ex-data exception)))
+          {:declined {:reason :equation-first-host-only}}
           (throw exception))))
+
+    :asr-resident-alignment-gpu
+    (let [source (raster.core/resolve-deftm-var
+                  #'attention/gqa-decode-attention-weights-resident! {:dtype :float})
+          prepared (compiled/lower
+                    source [(float-array 4) (float-array 6) (float-array 6)
+                            (float-array 4) (float-array 6) (double-array 2)
+                            (float-array [0.25 0.5 0.75]) 3 2 1 2 0.5]
+                    {:compiler :equation-first :target target :dtype :double :inline? true
+                     :preserve-declared-array-storage? true :outputs '[out] :donate '[wsink]})
+          plan (get-in prepared [:lowering :plan])]
+      {:compiler (get-in prepared [:schedule :compiler])
+       :fallback (get-in prepared [:schedule :stats :fallback])
+       :steps (mapv :convention (get-in prepared [:descriptor :steps]))
+       :storage (mapv #(select-keys % [:sym :dtype]) (:in-tree prepared))
+       :lowering {:nodes (count (:nodes plan)) :values (count (:values plan))
+                  :instances (count (:instances plan)) :outputs (count (:outputs plan))
+                  :driver-allocations (get-in plan [:attributes :driver-allocations])}})
 
     :prefix-sum-gpu
     (let [compilation (equation-first/compile
@@ -189,6 +208,7 @@
              :q4k-dp4a-rows-gpu
              :gqa-causal-mha-gpu
              :asr-alignment-weights-gpu
+             :asr-resident-alignment-gpu
              :prefix-sum-gpu
              :heat-rhs-1d-jvm
              :heat-rhs-1d-gpu
@@ -201,6 +221,7 @@
                      (contains? #{:symbolic-dense-contraction-gpu
                                   :q4k-dp4a-rows-gpu
                                   :gqa-causal-mha-gpu
+                                  :asr-resident-alignment-gpu
                                   :prefix-sum-gpu
                                   :heat-rhs-1d-gpu
                                   :heat-loss-rk4-gpu} id) report

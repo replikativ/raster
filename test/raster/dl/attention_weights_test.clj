@@ -3,11 +3,21 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.attention :as attn]
             [raster.dl.attention-reference :as reference]
+            [raster.core :as core]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.gpu.compiled :as compiled]
             [raster.runtime.hardware :as hardware]))
 
 (defn- mass [values n]
   (reduce + 0.0 (take n values)))
+
+(defn- register-target! []
+  (hardware/register-target-device!
+   :ze:asr-alignment-contract
+   {:name "Synthetic ASR boundary target"
+    :capabilities {:total-eus 32 :subgroup-sizes [16] :max-workgroup-size 1024
+                   :shared-local-memory 65536}}))
 
 (deftest gqa-decode-attention-weights-test
   ;; Moved from attention-test, whose namespace-wide BLAS fixture skipped this non-BLAS oracle.
@@ -59,18 +69,14 @@
     (is (< (Math/abs (- 8388609.0 (aget sink 0))) 1e-8))))
 
 (deftest allocating-alignment-is-not-a-resident-gpu-program
-  (hardware/register-target-device!
-   :ze:asr-alignment-contract
-   {:name "Synthetic ASR boundary target"
-    :capabilities {:total-eus 32 :subgroup-sizes [16] :max-workgroup-size 1024
-                   :shared-local-memory 65536}})
+  (register-target!)
   (doseq [dtype [:float :double]
           :let [make-array (if (= dtype :float) float-array double-array)
                 sink (make-array [0.25 0.5 0.75])
                 before (vec sink)
                 args [(make-array 4) (make-array 6) (make-array 6) 3 2 1 2 0.5 sink]]]
     (testing "a scalar-route corpus row is not public resident coverage"
-      (is (= :equation-first-coverage
+      (is (= :equation-first-host-only
              (try
                (compiled/lower #'attn/gqa-decode-attention-weights! args
                                {:compiler :equation-first :target :ze:asr-alignment-contract :dtype dtype
@@ -78,3 +84,56 @@
                nil
                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
     (is (= before (vec sink)) "declining compilation must not execute alignment effects")))
+
+(deftest host-alignment-rejects-input-alias-before-any-sink-store
+  (doseq [make-array [float-array double-array]
+          input [:q :k :v]]
+    (let [q (make-array [1.0 2.0]) k (make-array [1.0 2.0]) v (make-array [3.0 4.0])
+          sink ({:q q :k k :v v} input)
+          before (vec sink)]
+      (is (= :attention-alignment-input-alias
+             (try (attn/gqa-decode-attention-weights! q k v 1 1 1 2 0.5 sink)
+                  nil
+                  (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception))))))
+      (is (= before (vec sink))))))
+
+(deftest staged-host-alignment-matches-the-frozen-weight-capture-oracle
+  (doseq [make-array [float-array double-array]
+          [nq nkv n] [[4 4 5] [4 2 5] [2 1 0] [3 1 1]]]
+    (let [rng (java.util.Random. 11)
+          random-array (fn [n] (make-array (repeatedly n #(.nextGaussian rng))))
+          hd 8 q (random-array (* nq hd)) k (random-array (* n nkv hd))
+          v (random-array (* n nkv hd))
+          sink (make-array (concat (repeat n 0.25) [17.0 19.0]))
+          expected-sink (aclone sink)]
+      (dotimes [_ 2]
+        (let [expected (reference/gqa-decode-with-weights q k v n nq nkv hd 0.5 expected-sink)
+              actual (attn/gqa-decode-attention-weights! q k v n nq nkv hd 0.5 sink)]
+          (is (= (vec expected) (vec actual)) "host output retains each source rounding point")
+          (is (= (vec expected-sink) (vec sink)) "head-ordered sink stores remain exact"))))))
+
+(deftest resident-alignment-retains-alias-preflight-before-private-allocation
+  (register-target!)
+  (let [source (core/resolve-deftm-var #'attn/gqa-decode-attention-weights-resident! {:dtype :float})
+        compilation (equation-first/compile
+                     source {:target :ze:asr-alignment-contract :dtype :double :inline? true
+                             :preserve-declared-array-storage? true})
+        graphs (mapv :graph (mapcat :operations (get-in compilation [:emitted :equations])))
+        bindings (fn [graph]
+                   (into {} (map (fn [buffer] [(:id buffer) (:id buffer)]))
+                         (concat (:inputs graph) (:outputs graph))))
+        violations (fn [graph binding]
+                     ;; Distinct symbols model disjoint allocations; equality models overlap.
+                     (graph-call/binding-alias-violations graph binding =))
+        first-graph (first graphs) second-graph (second graphs)]
+    (is (= 2 (count graphs)))
+    (doseq [graph graphs] (is (empty? (violations graph (bindings graph)))))
+    (is (empty? (violations first-graph (assoc (bindings first-graph) 'k 'q 'v 'q)))
+        "read-only query/cache buffers may share an allocation")
+    (doseq [[graph left right] [[first-graph 'q 'out] [first-graph 'sc 'out]
+                               [first-graph 'sc 'inverse] [second-graph 'sc 'wsink]
+                               [second-graph 'inverse 'wsink]]]
+      (let [binding (assoc (bindings graph) right left)]
+        (is (seq (violations graph binding)) (str "overlap must be rejected: " [left right]))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (graph-call/validate-binding-aliases! graph binding =)))))))

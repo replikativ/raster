@@ -90,7 +90,16 @@
               :kernel-body-declines {}}}
 
   :asr-alignment-weights-gpu
-  {:declined {:reason :equation-first-coverage}}
+  {:declined {:reason :equation-first-host-only}}
+
+  :asr-resident-alignment-gpu
+  {:compiler :equation-first
+   :fallback :none
+   :steps [:kernel-body :kernel-body]
+   :storage [{:sym q :dtype :float} {:sym k :dtype :float} {:sym v :dtype :float}
+             {:sym out :dtype :float} {:sym sc :dtype :float}
+             {:sym inverse :dtype :double} {:sym wsink :dtype :float}]
+   :lowering {:nodes 7 :values 7 :instances 1 :outputs 2 :driver-allocations 0}}
 
   :prefix-sum-gpu
   {:route {:semantic-dialect :typed-parallel
