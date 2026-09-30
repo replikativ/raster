@@ -144,6 +144,35 @@ it is not a speedup comparison. The REPL stopped accepting connections before a 
 full external replay could start; that attempt contributes no new numerical evidence. Full
 CI acceptance of this follow-up remains pending.
 
+The graph-call follow-up passed all seven gates and merged as #954 (`9396876e`). A clean
+2.2 GiB-capped REPL repeated the 55-test / 315-assertion focused suites with both device
+availability gates asserted; graph ordering/runtime/refinement added 21 tests / 119 assertions.
+
+### Exact plain-equation facts across program and call validation
+
+The next slice factors physical-result derivation into the equation validator's returned report.
+The enclosing program validator retains those facts in a fresh exact-object identity index while
+performing all ordinary semantic, host-prefix and target-module checks. Call validation consumes
+that local index rather than reconstructing each plain equation a second time. Every step, ABI,
+scalar, result view and binding is still checked. A later public call starts with a fresh complete
+program validation and never borrows an inherited index. Only successful validation may publish
+its derived projections into a synchronous enclosing rename. No index is stored in the resulting
+call or compilation template; no persistent proof cache, type inference or AD rule is introduced.
+
+Dispatch candidates and structured loops keep their existing validation paths. Plain call
+construction itself still has its earlier validation sequence; the remaining constructor
+duplication must be addressed separately without conveying facts to host-evaluator callbacks.
+This slice changes no kernel arithmetic, schedule, ownership or runtime event behavior.
+
+The mixed structured-loop/plain-equation fixture now checks its exact plain boundary once rather
+than twice during source validation plus remapping, with one fresh check on each later public call.
+Regression cases retain mapper isolation, equal-but-distinct boundaries, changed bodies and failure
+before remapping; a failed call publishes no facts, and a public call replaces rather than trusts
+an inherited projection. Focused control/equation/composition/native suites pass 85 tests / 527
+assertions, dispatch/persistence/numerical-policy checks add 10 / 72, and selected public
+mixed-target/exceptional-host-prefix checks add 3 / 12. Full CI and new external model/timing
+acceptance remain separate; earlier Gemma timing samples are not measurements of this slice.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

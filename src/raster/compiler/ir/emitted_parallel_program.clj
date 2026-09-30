@@ -154,9 +154,8 @@
                                  :ir :emitted-parallel-program})))))
           (recur host-prefix (next remaining)))))))
 
-(defn validate!
-  "Validate a fully emitted equation-first program without depending on a target backend."
-  [parallel-program]
+(defn- validate-program!
+  [parallel-program candidates-fn]
   (when-not (contains? dialect-targets (:dialect parallel-program))
     (throw (ex-info "emitted parallel program requires a supported C-family dialect"
                     {:reason :emitted-parallel-program-dialect
@@ -171,7 +170,7 @@
                          ;; no certificate or cached result escapes to a later invocation.
                          (if (.containsKey candidate-cache operation)
                            (.get candidate-cache operation)
-                           (let [candidates (equation-candidates operation)]
+                           (let [candidates (candidates-fn operation)]
                              (.put candidate-cache operation candidates)
                              candidates)))
         parallel-program
@@ -199,3 +198,25 @@
                        :artifact-targets (mapv :target artifacts)
                        :ir :emitted-parallel-program})))
     parallel-program))
+
+(defn validate!
+  "Validate a fully emitted equation-first program without depending on a target backend."
+  [parallel-program]
+  (validate-program! parallel-program equation-candidates))
+
+(defn ^:no-doc validate-with-physical-results!
+  "Independently validate a program and retain plain equation projections for its caller.
+   The fresh identity index is construction-local and must not be retained in a call or template.
+   Dispatch and structured-loop validation are unchanged and supply no reusable projection here."
+  [parallel-program]
+  (let [projections (java.util.IdentityHashMap.)
+        candidates-for
+        (fn [operation]
+          (if (emitted-equation/emitted-equation? operation)
+            (let [{:keys [boundary physical-results]}
+                  (emitted-equation/validate-with-physical-results operation)]
+              (.put projections boundary physical-results)
+              [boundary])
+            (equation-candidates operation)))
+        checked (validate-program! parallel-program candidates-for)]
+    {:program checked :projections projections}))
