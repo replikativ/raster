@@ -169,6 +169,13 @@ Concrete kernel adjoints use the existing projection algebra's explicit non-nil/
 contract; unknown dynamic cotangents retain the default nil-safe helper. When a projection is
 needed, its input adjoint and projection are separate flat BindCtx bindings so an inlined SOAC
 is not hidden under a cast. Untagged argument types remain unguessed.
+The unsupported public scalar-gradient reproduction has two explicit admission boundaries:
+cold emission can retain one nil-safe `project-float` call and fail the typedness gate;
+with a warm specialization it reaches the unhoistable numerical-region scalar gap. The
+regression checks those exact diagnostics, not an arbitrary exception. Recovering a symbol's
+type from its existing adjoint binding alone did not remove the cold helper and is not claimed
+as a completed fix. Both the dynamic-cotangent closure and the completed-result storage
+projection remain consolidation obligations.
 This broadens mixed-type scale admission, not implicit dispatch coercion. A rounding
 counterexample distinguishes this from rounding a Double coefficient to Float before
 multiplication. Public declared-storage compilation and

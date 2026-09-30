@@ -52,8 +52,17 @@
                   nil
                   (catch clojure.lang.ExceptionInfo error error))]
     (is (some? failure))
-    (is (= :scheduled-equation-region (:reason (ex-data failure))))
-    (is (seq (:host-gap (ex-data failure))))))
+    (let [data (ex-data failure)
+          region-gap? (and (= :scheduled-equation-region (:reason data))
+                           (seq (:host-gap data)))
+          ;; Cold emission can stop one boundary earlier: an untyped dynamic scalar
+          ;; cotangent retains its nil-safe projection helper. A warm specialization
+          ;; reaches the numerical region gap instead. Neither is GPU support.
+          dynamic-projection? (and (= {'raster.ad.tangent/project-float 1}
+                                       (:undevirtualized data))
+                                   (= {} (:non-exempt-untagged data)))]
+      (is (or region-gap? dynamic-projection?)
+          (str (some-> failure .getMessage) " " data)))))
 
 (deftest one-derivation-separates-storage-from-scalar-computation
   (let [params '[weights state n scale] tags '[floats doubles long double]]
