@@ -80,6 +80,17 @@
     (f (float-array [1.25 2.5]) (double-array [3.0 4.0]) out 2)
     (is (= [4.25 6.5] (vec out)))))
 
+(deftest converted-double-fold-retains-parallel-row-ownership
+  (let [eq (equation-first/compile #'storage/mixed-fold-storage!
+                                  (merge policy {:target target :dtype :double}))
+        resident (pipeline/compile-gpu-program #'storage/mixed-fold-storage! target :dtype :double
+                                               :preserve-declared-array-storage? true)]
+    (is (= 1 (count (:kernels eq))))
+    (is (= 1 (count (:steps resident))))
+    (doseq [artifact (concat (:kernels eq) (map :artifact (:steps resident)))]
+      (is (= {'storage :float} (pointer-types artifact)))
+      (is (= :independent (get-in artifact [:provenance :scheduled-operation :body :schedule :association]))))))
+
 (deftest soa-fields-use-the-same-storage-policy
   (with-redefs [types/soa-registry
                 (atom {'Particle {:fields [{:name "x" :element-tag 'float :array-tag 'floats}]}})

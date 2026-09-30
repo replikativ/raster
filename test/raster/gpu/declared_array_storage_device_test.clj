@@ -24,12 +24,29 @@
                    (vec (value/->host (:out (artifact {:weights x :state state}))))))))
         (finally (compiled/close! artifact))))))
 
+(defn- run-fold-case [target]
+  (doseq [compiler [nil :equation-first]]
+    (let [initial (float-array [16777216.0 1.0 1.0 8.0 0.25 0.5 19.0])
+          expected (aclone initial)
+          artifact (compiled/compile
+                    #'storage/mixed-fold-storage! [initial 2 3]
+                    (cond-> (merge storage/policy
+                                   {:target target :dtype :double :donate '[storage]})
+                      compiler (assoc :compiler compiler)))]
+      (try
+        (dotimes [_ 2]
+          (storage/mixed-fold-storage! expected 2 3)
+          (is (= (vec expected)
+                 (vec (value/->host (:storage' (artifact {})))))
+              "Double recurrence precedes each Float store, preserving source order and the tail"))
+        (finally (compiled/close! artifact))))))
+
 (deftest level-zero-mixed-storage-public-compilers-match-jvm
   (if @gp/gpu-available?
-    (run-case :ze:0)
+    (do (run-case :ze:0) (run-fold-case :ze:0))
     (gp/gpu-skip! "mixed array storage on Level Zero")))
 
 (deftest opencl-mixed-storage-public-compilers-match-jvm
   (if @opencl/opencl-available?
-    (run-case :ocl:0)
+    (do (run-case :ocl:0) (run-fold-case :ocl:0))
     (opencl/opencl-skip! "mixed array storage on OpenCL")))

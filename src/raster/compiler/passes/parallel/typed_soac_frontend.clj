@@ -4689,14 +4689,27 @@
         expression
         (util/postwalk-preserving-meta
          (fn [form]
-           (if (dialect/scalar-convert-form? form)
+           (cond
+             (dialect/scalar-convert-form? form)
              (let [{:keys [attributes operand]} (dialect/scalar-convert-parts form)
                    canonical (canonicalize-scalar-folds operand (:source-dtype attributes))]
                (if (= canonical operand)
                  form
                  (let [converted (dialect/scalar-convert attributes canonical)]
                    (with-meta converted (merge (meta converted) (meta form))))))
-             form))
+
+             ;; A source-written cast is also a boundary, before conversion terms are built.
+             ;; Its retained operand facts own the recurrence precision, not the destination
+             ;; storage dtype. Protect this subtree before the generic reduce walk below.
+             (and (seq? form) (= 2 (count form)) (descriptor/cast-op? (first form))
+                  (not (contains? util/*shadowing-locals* (first form))))
+             (let [operand (second form)
+                   source-dtype (retained-expression-dtype operand {} {})]
+               (if source-dtype
+                 (util/remake form (first form) (canonicalize-scalar-folds operand source-dtype))
+                 form))
+
+             :else form))
          expression)
         expression
         (util/postwalk-preserving-meta
@@ -4725,11 +4738,11 @@
     ;; that explicit conversion while canonicalizing the recurrence beneath it; unlike descent
     ;; through `let*`, this introduces no lexical binders that could be detached.
     (if (and (seq? expression) (= 2 (count expression))
-             (descriptor/cast-op? (first expression)))
-      (let [target (some-> (descriptor/cast-result-tag (first expression))
-                           dtype/dtype-for-scalar-tag dtype/canon)
-            operand (second expression)
-            canonical (canonicalize-scalar-folds operand (or target default-dtype))]
+             (descriptor/cast-op? (first expression))
+             (not (contains? util/*shadowing-locals* (first expression))))
+      (let [operand (second expression)
+            source-dtype (retained-expression-dtype operand {} {})
+            canonical (canonicalize-scalar-folds operand (or source-dtype default-dtype))]
         (if (= canonical operand) expression
             (util/remake expression (first expression) canonical)))
       ;; `loop*` is a surface spelling, not part of canonical TypedSOAC. Translate only a complete

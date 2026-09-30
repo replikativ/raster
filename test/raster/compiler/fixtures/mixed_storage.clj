@@ -14,3 +14,19 @@
   (let [scratch (double-array n)]
     (par/map-void! i n (aset scratch i (double (aget weights i))))
     (par/map-void! i n (aset out i (aget scratch (- (- n i) 1))))))
+
+(deftm mixed-fold-storage!
+  "Sequentially replace each Float row element with a Double sum of the current row."
+  [storage :- (Array float) nrows :- Long width :- Long] :- Void
+  (par/map-void! row nrows
+    (let [base (* row width)]
+      (loop [col 0]
+        (if (< col width)
+          (do
+            (aset storage (+ base col)
+                  (float (loop [j 0 acc 0.0]
+                           (if (< j width)
+                             (recur (inc j) (+ acc (double (aget storage (+ base j)))))
+                             acc))))
+            (recur (inc col)))
+          nil)))))
