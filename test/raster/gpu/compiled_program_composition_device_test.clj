@@ -5,6 +5,8 @@
             [raster.dl.gpu-grad-parity :as gp]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
+            [raster.hardware-fixture :as hardware-fixture]
+            [raster.runtime.hardware :as hardware]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
@@ -16,6 +18,111 @@
   [input :- (Array float) result :- (Array float) n :- Long] :- Void
   (par/map-void! i n
                  (arrays/aset result i (* 2.0 (arrays/aget input i)))))
+
+(deftm update-state!
+  [state :- (Array float) gradient :- (Array float) lr :- Double n :- Long] :- Void
+  (par/map-void! i n
+    (arrays/aset state i (- (arrays/aget state i) (* lr (arrays/aget gradient i))))))
+
+(defn- mutable-case [target]
+  (let [state (float-array [2.0 4.0 6.0 8.0])
+        options {:compiler :equation-first :target target :dtype :float}
+        forward (compiled/lower #'twice! [state (float-array 4) 4]
+                                (assoc options :outputs '[result]))
+        update (compiled/lower #'update-state! [state (float-array 4) 0.125 4]
+                               (assoc options :donate '[state]))]
+    {:id :shared-training-state
+     :components [{:id :forward :program forward} {:id :update :program update}]
+     :connections [{:from [:forward :result] :to [:update :gradient]}]
+     :mutable-shares [{:owner [:update :state] :borrowers [[:forward :input]]
+                       :output [:update :state']}]
+     :outputs [{:key :gradient :from [:forward :result]}
+               {:key :weights' :from [:update :state']}]}))
+
+(defn- run-mutable-case [target]
+  (let [prepared (compiled/compose (mutable-case target))
+        artifact (compiled/instantiate! prepared)]
+    (try
+      (is (not-any? #(= [:forward :input] (:key %)) (:in-tree prepared)))
+      (is (= {[:update :state] :weights'} (:donated prepared)))
+      (loop [iteration 0 state [2.0 4.0 6.0 8.0] previous nil]
+        (when (< iteration 3)
+          (let [expected-gradient (mapv #(* 2.0 %) state)
+                expected-state (mapv #(* 0.75 %) state)
+                outputs (artifact (if previous {[:update :state] (:weights' previous)} {}))]
+            (when previous
+              (is (not (value/live? (:weights' previous))))
+              (is (not (value/live? (:gradient previous)))))
+            (is (= expected-gradient (vec (value/->host (:gradient outputs)))))
+            (is (= expected-state (vec (value/->host (:weights' outputs)))))
+            (recur (inc iteration) expected-state outputs))))
+      (let [lease (compiled/invoke-leased artifact {})
+            outputs @lease
+            expected (mapv #(* % 0.75 0.75 0.75 0.75) [2.0 4.0 6.0 8.0])]
+        (try
+          (is (= expected (vec (value/->host (:weights' outputs)))))
+          (is (= :link-output-lease-active
+                 (try (artifact {}) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (is (= expected (vec (value/->host (:weights' outputs))))
+              "lease rejection precedes state mutation")
+          (finally (.close ^java.io.Closeable lease)))
+        (is (not (value/live? (:weights' outputs)))))
+      (finally (compiled/close! artifact)))))
+
+(deftest mutable-composition-preflights-semantic-ownership-without-allocation
+  (hardware-fixture/isolated
+   (fn []
+     (let [target :ze:mutable-preflight]
+       (hardware/register-target-device!
+        target {:name "Synthetic mutable composition target"
+                :capabilities {:subgroup-sizes [16] :total-eus 32
+                               :max-workgroup-size 1024 :shared-local-memory 65536}})
+       (let [request (mutable-case target)
+             state (:default (first (filter #(= :input (:key %))
+                                            (get-in request [:components 0 :program :in-tree]))))
+             prepare-reader (fn [values options]
+                              (compiled/lower #'twice! [values (float-array 4) 4]
+                                              (merge {:compiler :equation-first :target target
+                                                      :dtype :float :outputs '[result]} options)))
+             reason (fn [request]
+                      (try (compiled/compose request) nil
+                           (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+         (with-redefs [link/instantiate! (fn [& _] (throw (AssertionError. "unexpected allocation")))
+                       gpu/alloc! (fn [& _] (throw (AssertionError. "unexpected allocation")))]
+           (is (= :compiled-composition-donation (reason (assoc request :mutable-shares []))))
+           (is (= :compiled-composition-donation
+                  (reason (update request :mutable-shares conj (first (:mutable-shares request))))))
+           (is (= :compiled-composition-mutable-owner
+                  (reason (assoc-in request [:mutable-shares 0 :borrowers] [[:update :state]]))))
+           (is (= :compiled-composition-mutable-owner
+                  (reason (assoc-in request [:mutable-shares 0 :output] [:forward :result]))))
+           (is (= :compiled-composition-mutable-owner
+                  (reason (assoc request :outputs [(first (:outputs request))]))))
+           (is (= :compiled-composition-mutable-owner
+                  (reason (assoc-in request [:components 0 :program]
+                                    (prepare-reader state {:constants '[input]})))))
+           (is (= :link-composition-share-source
+                  (reason (assoc-in request [:components 0 :program]
+                                    (prepare-reader (aclone ^floats state) {})))))
+           (is (= :link-composition-mutable-escape
+                  (reason (-> request
+                              (assoc-in [:components 0 :program]
+                                        (prepare-reader state {:outputs '[result input]}))
+                              (update :outputs conj {:key :old-state :from [:forward :input]})))))
+           (let [prepared (compiled/compose request)]
+             (is (compiled/prepared? prepared))
+             (doseq [[input output] (:donated prepared)]
+               (is (= 1 (count (filter #(= input (:key %)) (:in-tree prepared)))))
+               (is (= 1 (count (filter #(= output (:key %)) (:out-tree prepared)))))))))))))
+
+(deftest mutable-forward-update-composition-replays-current-state
+  (if @opencl/opencl-available?
+    (run-mutable-case :ocl:0)
+    (opencl/opencl-skip! "mutable forward/update composition"))
+  (if @gp/gpu-available?
+    (run-mutable-case :ze:0)
+    (gp/gpu-skip! "mutable forward/update composition on Level Zero")))
 
 (defn- compose-case [target]
   (let [prepare #(compiled/lower #'twice! [(float-array 4) (float-array 4) 4]

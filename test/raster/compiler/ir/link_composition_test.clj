@@ -45,6 +45,71 @@
 (defn- value-node [lowering symbol]
   (get-in lowering [:certificate :values symbol :node]))
 
+(defn- mutable-request []
+  (let [state (float-array 8)
+        reader (resident/lower {:id :reader :target :ze:0 :descriptor (descriptor)
+                                :arguments [(float-array 8) state 8] :outputs '[y w]})
+        writer-kernel (artifact/make
+                       {:kernel-name "composition_update"
+                        :source "__kernel void composition_update(float* x, float* w, long n) {}"
+                        :abi [(kabi/slot 'x :input :float) (kabi/slot 'w :output :float)
+                              (kabi/slot 'n :scalar :long)]
+                        :arguments '[x w n] :launch (:launch kernel)
+                        :effects {:kind :map :reads '[x] :writes '[w]}})
+        writer-descriptor (-> (descriptor)
+                              (assoc :allocs [] :result-sym 'w)
+                              (assoc :steps [{:phase :map :convention :map :artifact writer-kernel
+                                              :argument-specs [{:kind :input :sym 'x}
+                                                               {:kind :output :sym 'w}
+                                                               {:kind :scalar :type :long
+                                                                :value-fn (constantly 8)}]}]))
+        writer (resident/lower {:id :writer :target :ze:0 :descriptor writer-descriptor
+                                :arguments [(float-array 8) state 8] :roles {'w :state}
+                                :outputs '[w]})
+        owner [:writer (value-node writer 'w)]
+        borrower [:reader (value-node reader 'w)]]
+    {:id :mutable-pair :components [{:id :reader :lowering reader} {:id :writer :lowering writer}]
+     :mutable-shares [{:owner owner :borrowers [borrower] :output owner}]
+     :outputs [[:reader (value-node reader 'y)] owner]}))
+
+(deftest mutable-sharing-retains-the-state-owner-and-ordered-effect-evidence
+  (let [request (mutable-request)
+        result (composition/compose request)
+        binding (first (:mutable-shares request))
+        certificate (:certificate result)
+        owner-node (get (:node-mapping certificate) (:owner binding))
+        reader-node (get (:node-mapping certificate) (first (:borrowers binding)))]
+    (is (= owner-node reader-node))
+    (is (= :state (get-in result [:plan :nodes owner-node :role])))
+    (is (= 4 (count (get-in result [:plan :nodes]))))
+    (is (= 2 (count (get-in certificate [:effect-evidence :step-facts]))))
+    (is (= (:mutable-shares request) (:mutable-shares certificate)))
+    (is (identical? result (composition/verify! result)))))
+
+(deftest mutable-sharing-refuses-competing-and-escaped-claims
+  (let [request (mutable-request)
+        {:keys [owner borrowers]} (first (:mutable-shares request))
+        borrower (first borrowers)
+        reader-input [:reader (value-node (get-in request [:components 0 :lowering]) 'x)]
+        reason (fn [request] (try (composition/compose request) nil
+                                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (is (= :link-composition-mutable-roles
+           (reason (assoc-in request [:mutable-shares 0 :borrowers] [borrower borrower]))))
+    (is (= :link-composition-mutable-roles
+           (reason (assoc-in request [:mutable-shares 0 :borrowers] [owner]))))
+    (is (= :link-composition-mutable-output
+           (reason (assoc request :outputs [(first (:outputs request))]))))
+    (is (= :link-composition-mutable-escape
+           (reason (update request :outputs conj borrower))))
+    (is (= :link-composition-mutable-overlap
+           (reason (update request :mutable-shares conj (first (:mutable-shares request))))))
+    (is (= :link-composition-mutable-overlap
+           (reason (assoc request :shares [[borrower reader-input]]))))
+    (is (= :link-composition-mutable-overlap
+           (reason (-> request
+                       (update :components #(vec (reverse %)))
+                       (assoc :connections [{:from owner :to borrower}])))))))
+
 (defn- composite-abstract []
   (av/tensor {:dtype :float :shape ['n]
               :representation {:kind :test-split}}))

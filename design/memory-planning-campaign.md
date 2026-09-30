@@ -48,6 +48,43 @@ particular, physical padding or reuse must not change a source-visible `alength`
 must not invalidate a value unless the language explicitly exposes that transfer of ownership.
 Compatibility can be removed, but never by an undocumented semantic shift.
 
+### Certified independent forward/VJP state
+
+The explicit composition contract is implemented. The concrete acceptance case is a generated
+forward program that reads adapters followed by a generated VJP/SGD program that updates them, with the next
+replay reading the updated adapters. Frozen weights remain ordinary shared constants.
+
+Before: `Compiled/compose` rejects donated components and low-level sharing admits only
+homogeneous inputs or constants. Now: an explicit `:mutable-shares`
+contract identifies one donated state owner and read-only input borrowers:
+
+```clojure
+{:mutable-shares [{:owner [:update :state]
+                  :borrowers [[:forward :input]]
+                  :output [:update :state']}]
+ :outputs [{:key :weights' :from [:update :state']}]}
+```
+
+Ordinary `:shares` and `deftm` semantics remain unchanged; implicit promotion of constants is
+not permitted.
+
+Reuse existing LinkPlan views, ordered effect evidence, composition certificates and the
+LinkedExecutable output lease. Require exact full-view contracts, one owned allocation view,
+one initializer source and one writer. Retain the owner as canonical regardless of request
+order; remove borrower entries from dynamic input refresh so replay cannot upload old adapters.
+The composite donation map must project the owner's final state. Reject escaped pre-update
+aliases, hidden final state, duplicate writers, overlapping/ranged views and competing connection
+claims. These are ownership/version obligations, not new arithmetic or an asynchronous completion
+proof. Every component donation must be covered exactly once by the replacement contract.
+Returned donation handles may be threaded into the next call; omission retains internally
+persistent state under the existing invocation contract. They are not mandatory linear inputs.
+
+The small forward/read → resident SGD/update gate passes on OpenCL and Level Zero, repeated
+with CPU parity and no intervening adapter transfer. Negative preflight tests check no writes,
+handle consumption or allocation on an invalid request; output leases and old-handle invalidation
+retain their existing behavior. Validation against the actual external tiny Gemma forward/VJP
+pair is in progress. Real weights, longer training and performance remain separate gates.
+
 ## Rhythm and other work
 
 Land one invariant or one vertical per PR. Run focused tests in a warm REPL, then let CI run the
