@@ -393,6 +393,20 @@
 
 (declare inline-deftm-calls inline-invk flatten-nested-lets)
 
+(defn- ad-constructor-options
+  [options]
+  (when-not (and (even? (count options))
+                 (every? #{:wrt :mode} (take-nth 2 options)))
+    (throw (ex-info "compiled AD requires static :wrt/:mode keyword options"
+                    {:reason :ad-inline-options :options options})))
+  (let [options-map (apply hash-map options)
+        wrt (:wrt options-map)]
+    (when-not (and (= :reverse (get options-map :mode :reverse))
+                   (or (nil? wrt) (and (vector? wrt) (every? integer? wrt))))
+      (throw (ex-info "compiled AD requires reverse mode and literal :wrt indices"
+                      {:reason :ad-inline-options :options options})))
+    options))
+
 (defn- value+grad-call?
   "Detect ((value+grad <var>) args...) or ((grad <var>) args...) call pattern.
    Returns {:var-sym, :args, :mode (:value+grad or :grad)} or nil."
@@ -400,7 +414,7 @@
   (when (and (seq? init) (seq? (first init)) (>= (count init) 2))
     (let [callee (first init)
           args (vec (rest init))]
-      (when (and (= 2 (count callee))
+      (when (and (<= 2 (count callee))
                  (seq? (second callee)))
         (let [op (first callee)
               var-form (second callee)]
@@ -411,6 +425,7 @@
             (let [var-sym (second var-form)]
               {:var-sym var-sym
                :args args
+               :options (ad-constructor-options (vec (drop 2 callee)))
                :mode (if (= op 'raster.ad.reverse/value+grad)
                        :value+grad :grad)})))))))
 
@@ -871,7 +886,7 @@
             :grad-syms    — [d_p1, d_p2, ...] gradient symbols}
    or nil if the call cannot be inlined."
   [vg-info & {:keys [param-env]}]
-  (let [{:keys [var-sym args mode]} vg-info
+  (let [{:keys [var-sym args mode options]} vg-info
         ;; Infer arg types from param-env to select the right overload
         arg-tags (when (and param-env (every? symbol? args))
                    (let [tags (mapv #(get param-env %) args)]
@@ -879,14 +894,26 @@
         deftm-info (resolve-deftm-for-ad var-sym arg-tags)]
     (when deftm-info
       (let [{:keys [walked-body params tags]} deftm-info
-            transform-body (or *ad-transform-body-fn*
-                               (throw (ex-info "*ad-transform-body-fn* not bound — pipeline must bind it for AD inlining" {})))
+            ;; Option-bearing calls consume the public AD constructor's already prepared,
+            ;; typed gradient body. In particular, :wrt activity, constant array reads, seed
+            ;; widths and padded nil slots must not be reimplemented in the compiler inliner.
+            prepared-body (when (seq options)
+                            ((requiring-resolve 'raster.ad.reverse/prepare-value+grad)
+                             (:var deftm-info) (:wrt (apply hash-map options))))
+            prepared-form (when prepared-body
+                            (inf/qualify-body-symbols
+                             (first (:walked-body prepared-body))
+                             (:source-ns prepared-body) (set (:params prepared-body))))
+            prepared-elements (when prepared-form (last prepared-form))
+            transform-body (when-not prepared-body
+                             (or *ad-transform-body-fn*
+                                 (throw (ex-info "*ad-transform-body-fn* not bound — pipeline must bind it for AD inlining" {}))))
             body-form (first walked-body)
             ;; Fixpoint expansion: inline all non-template deftm calls and
             ;; value+grad calls until no more expansions are possible.
             ;; Template-backed ops (matmul, mse-loss, etc.) stay symbolic
             ;; so the AD transform can use their templates.
-            body-form (expand-for-ad body-form 10)
+            body-form (when-not prepared-body (expand-for-ad body-form 10))
             all-params (mapv #(if (symbol? %) % (symbol (name %))) params)
             ;; Only floating-point arrays/scalars are differentiable. Long/longs
             ;; are constants for AD — passing them as active forces AD to look
@@ -899,18 +926,23 @@
             active-params (vec (keep-indexed
                                 (fn [i p]
                                   (let [tag (nth tags-vec i nil)]
-                                    (when (differentiable-tag? tag)
+                                    (when (if prepared-body
+                                            (some? (nth prepared-elements (inc i)))
+                                            (differentiable-tag? tag))
                                        ;; Stamp :raster.type/tag so AD can read it
                                        ;; in gen-reverse-let Phase 3 → adj-sym carries
                                        ;; the tag → closure helpers get typed params
                                        ;; instead of falling back to Object.
                                       (with-meta p {:raster.type/tag tag}))))
                                 all-params))
-            ad-form (transform-body body-form active-params)
+            ad-form (when-not prepared-body (transform-body body-form active-params))
             ;; Canonicalize and flatten
-            canonical (flatten/canonicalize-ad-form ad-form)]
-        (when canonical
-          (let [flat-result (flatten/flatten-ad-form canonical)]
+            canonical (when-not prepared-body (flatten/canonicalize-ad-form ad-form))]
+        (when (or prepared-body canonical)
+          (let [flat-result (if prepared-body
+                              {:form prepared-form :result-sym (first prepared-elements)
+                               :param-adj-syms (vec (remove nil? (rest prepared-elements)))}
+                              (flatten/flatten-ad-form canonical))]
             (when flat-result
               (let [{:keys [form result-sym param-adj-syms]} flat-result
                     ;; form is (let* [...fwd... dy=1.0 ...rev...] primal)
@@ -978,6 +1010,7 @@
                  :result-sym nil
                  :loss-sym loss-sym
                  :grad-syms grad-syms
+                 :scalar-result? (and (= :grad mode) (= 1 (count grad-syms)))
                  :elements elements}))))))))
 
 (defn- inline-one-pass
@@ -1038,7 +1071,7 @@
              ;; Only rewrite D-as-value when D appears as an argument to non-pointwise ops.
              init init-raw
              ;; Detect (value+grad f) or (grad f) partial application
-             vg-partial (when (and (seq? init) (= 2 (count init)))
+             vg-partial (when (and (seq? init) (<= 2 (count init)))
                           (let [op (first init)]
                             (when (or (= op 'raster.ad.reverse/value+grad)
                                       (= op 'raster.ad.reverse/grad))
@@ -1046,18 +1079,20 @@
                                 (when (or (and (seq? arg) (= 'var (first arg)))
                                           (symbol? arg))
                                   {:var-or-form arg
+                                   :options (ad-constructor-options (vec (drop 2 init)))
                                    :mode (if (= op 'raster.ad.reverse/value+grad)
                                            :value+grad :grad)})))))
              ;; Check for indirect call: (vg-fn args...) where vg-fn was (value+grad f)
              indirect-vg (when (and (not vg-partial) (seq? init) (symbol? (first init)))
                            (when-let [vg-entry (get @vg-fns (first init))]
-                             (let [{:keys [var-or-form mode]} vg-entry
+                             (let [{:keys [var-or-form mode options]} vg-entry
                                    args (vec (rest init))
                                    var-form (if (symbol? var-or-form)
                                               (list 'var var-or-form)
                                               var-or-form)]
                                {:var-sym (second var-form)
                                 :args args
+                                :options options
                                 :mode mode})))
              ;; Rewrite D/partial-d/fn-algebra calls recursively in init
              {:keys [form bindings] :as d-result}
@@ -1084,10 +1119,12 @@
                      (swap! result-pairs conj [bsym bexpr]))
                ;; Track elements for resolve-vg-nth (handles nested nth refs)
                ;; For <=20 elements, also emit vector literal (CSE folds top-level nth)
-                   (do (swap! vg-elements assoc sym (:elements vg-result))
+                   (if (:scalar-result? vg-result)
+                     (swap! result-pairs conj [sym (first (:elements vg-result))])
+                     (do (swap! vg-elements assoc sym (:elements vg-result))
                        (if (<= (count (:elements vg-result)) 20)
                          (swap! result-pairs conj [sym (vec (:elements vg-result))])
-                         nil)) ;; >20: no vector literal, resolve-vg-nth handles all
+                         nil))) ;; >20: no vector literal, resolve-vg-nth handles all
                    (reset! any-inlined? true))
              ;; AD inlining failed, keep as-is
                  (swap! result-pairs conj [sym init]))
