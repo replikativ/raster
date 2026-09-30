@@ -59,6 +59,32 @@
 
 (deftm option-one-loss [x :- Double] :- Double (* x x))
 
+(deftm option-overloaded-loss [x :- Float n :- Long] :- Float
+  (raster.numeric/* x x))
+
+(deftm option-overloaded-loss [x :- Double n :- Long] :- Double
+  (raster.numeric/* x x))
+
+(deftest optionless-ad-retains-concrete-overload-types-and-gradient-slots
+  (doseq [[tag argument] [['float (float 2.0)] ['double 2.0]]]
+    (let [callee 'raster.compiler.passes.scalar.inline-test/option-overloaded-loss
+          resolved (#'inline/resolve-deftm-for-ad callee [tag 'long])
+          result (inline/inline-value+grad-call
+                  {:var-sym callee :args '[x n] :mode :value+grad}
+                  :param-env {'x tag 'n 'long})
+          f (eval (list 'fn '[x n]
+                        (list 'let* (vec (mapcat identity (:bindings result)))
+                              (:elements result))))
+          actual (f argument (long 3))]
+      (is (= ((rev/value+grad (:var resolved)) argument (long 3)) actual))
+      (is (= [4.0 4.0 nil] actual))
+      ;; The primal aliases a typed retained expression; its result reference need not
+      ;; duplicate binder evidence. Gradient binders already carry the tangent tag.
+      (is (= tag (:raster.type/tag
+                  (meta (get (into {} (:bindings result)) (:loss-sym result))))))
+      (is (= tag (:raster.type/tag (meta (first (:grad-syms result))))))
+      (is (nil? (second (:grad-syms result)))))))
+
 (deftm option-one-grad [x :- Double] :- Double
   ((raster.ad.reverse/grad
      (var raster.compiler.passes.scalar.inline-test/option-one-loss) :wrt [0]) x))
