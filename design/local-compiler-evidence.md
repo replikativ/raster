@@ -261,6 +261,39 @@ plan and 352 distinct semantic program objects, while SOAC validator invocations
 10.74 s under the current background load. The count and identical plan are reproducible
 mechanism evidence; the single timing sample is not a controlled latency-speedup claim.
 
+#958 merged as `d7ce1a3d` after all seven final-head gates passed. A refreshed census retains
+24,804 validations over 352 exact programs; the most repeated scalar-prefix programs contain
+only two or three declared values. This is not evidence that their contexts should be truncated.
+
+### Dispatch result-contract certification
+
+The next consolidation keeps one private boundary-validation report containing its freshly
+reconstructed source graph. The public contraction full-write query uses that same graph rather
+than deriving it twice. A dispatch-local result-contract report then derives physical result
+mapping and independently proved complete-write domains from one checked candidate. The source
+graph is not retained in the returned report, call, dispatch or artifact. Public equation validation
+keeps its unchanged return value; independent later public queries and dispatch validations derive
+fresh facts. No numerical policy, kernel, target admission, ABI, lifetime or persistent cache changes.
+
+This removes repeated candidate certification in dispatch, not proof obligations: truncated stores
+still fail full-write admission even when their ABI and ordinary emitted boundary are valid;
+register-tiled candidates cannot self-label as exact; exact-only permission still rejects
+reassociated schedules. Contraction and protected indexed-reduction tests share one proof-count
+helper rather than duplicating fixtures. Existing graph/storage agreement, policy, default and
+artifact round-trip checks remain. The fixed-order external Gemma fixture has no such adaptive
+dispatch; this slice does not claim to reduce its validator count or device runtime.
+
+With the final report-shape assertions, focused acceptance passes 81 tests / 642 assertions:
+71 / 486 equation/dispatch/control/native-composition checks, 4 / 52 actual indexed-dispatch
+replays on both local backends, 4 / 76 public staged vendor/mixed-target/exception-order checks,
+and 2 / 28 ragged generated GEMM and mixed attention/projection device oracles. Availability and
+the actual OpenCL score-reuse capability are asserted; these native results are not skip paths.
+The retained fixed-order Gemma recomposition still asserts exact 247-node / 2-instance plan
+equality (one shared-load sample: 10.78 s). Reports and count regressions establish removed
+proof duplication, not competitive GEMM throughput or a controlled compilation speedup.
+The final two affected report fixtures were rerun serially (2 tests / 48 assertions), checking
+identity, storage/full-write agreement, source-graph non-retention and fresh public validation.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

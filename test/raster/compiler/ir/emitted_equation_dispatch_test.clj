@@ -72,6 +72,39 @@
     :default-strategy :sequential-segments
     :selector {:kind :fixed-strategy :strategy :register-tiled}}))
 
+(defn- check-candidate-proof-reuse! [candidate certified write-domains]
+  (let [expected-graph-var (ns-resolve 'raster.compiler.ir.emitted-parallel-equation
+                                     'expected-graph)
+        original @expected-graph-var
+        reconstructions (atom 0)
+        expected-domain (write-domains candidate)]
+    (let [report (emitted-equation/validate-with-result-contracts candidate)]
+      (is (identical? candidate (:boundary report)))
+      (is (= expected-domain (:complete-write-domains report)))
+      (is (= (emitted-equation/physical-results candidate) (:physical-results report)))
+      (is (not (contains? report :source-graph)) "the temporary reconstructed graph does not escape"))
+    (with-redefs-fn
+      {expected-graph-var (fn [algorithm body]
+                            (when (and (identical? algorithm (:algorithm candidate))
+                                       (identical? body (:body candidate)))
+                              (swap! reconstructions inc))
+                            (original algorithm body))}
+      (fn []
+        (is (= expected-domain (write-domains candidate)))
+        (is (= 1 @reconstructions)
+            "complete-write projection reuses the source graph from its boundary proof")
+        (is (= expected-domain (write-domains candidate)))
+        (is (= 2 @reconstructions) "a later public query reconstructs its own source")
+        (reset! reconstructions 0)
+        (is (identical? certified (equation-dispatch/validate! certified)))
+        (is (= 1 @reconstructions)
+            "dispatch derives storage and full-write facts from one candidate proof")
+        (is (identical? certified (equation-dispatch/validate! certified)))
+        (is (= 2 @reconstructions) "a later public dispatch validation remains independent")))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (write-domains (assoc-in candidate [:graph :nodes 0 :operation :source] nil)))
+        "a previous successful query cannot hide a malformed candidate")))
+
 (deftest generated-contraction-candidates-share-a-certified-dispatch-boundary
   (register-target!)
   (let [reference (equation-first/compile #'contractions/fixed-matmul
@@ -84,6 +117,8 @@
                         #(update % (dec (count %)) assoc :operations [certified]))
         linked (equation-first/lower (assoc reference :emitted program)
                                     [(float-array 15) (float-array 21)])]
+    (check-candidate-proof-reuse! (first alternatives) certified
+                                 emitted-equation/contraction-write-domains)
     (is (= program (emitted-program/validate! program)))
     (is (= :register-tiled
            (executable/strategy (-> linked :instances first :call :steps last :graph))))
@@ -290,6 +325,7 @@
                         (fn [equations]
                           (update equations (dec (count equations)) assoc
                                   :operations [certified])))]
+    (check-candidate-proof-reuse! reference certified emitted-equation/complete-write-domains)
     (is (equation-dispatch/emitted-equation-dispatch? certified))
     (is (= program (emitted-program/validate! program)))
     (let [arguments [(float-array 15) (float-array 15) (float-array 15)
