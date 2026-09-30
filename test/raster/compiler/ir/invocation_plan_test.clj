@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.invocation-plan-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]))
 
@@ -65,6 +66,31 @@
              :program-values {'y (scalar :double)}
              :program-inputs '[y]
              :program-outputs '[y]})))))
+
+(deftest core-named-public-scalars-remain-closed-operands
+  (doseq [dimension '[seq count first]]
+    (let [plan (invocation/from-prefix
+                {:id [:core-local dimension]
+                 :parameters [dimension]
+                 :parameter-values {dimension (scalar :long)}
+                 :bindings [['n (list 'clojure.core/long dimension)]]
+                 :binding-values {'n (scalar :long)}
+                 :program-values {'n (scalar :long)}
+                 :program-inputs '[n] :program-outputs '[n]})
+          step (first (:steps plan))]
+      (is (= [dimension] (mapv :symbol (:operands step))))
+      (is (= {:type :long :value 4}
+             (typed-scalar/evaluate-invocation-step
+              *ns* step {dimension {:type :long :value 4}})))
+      ;; A corrupt closed region must not pass verification just because the missing local
+      ;; shares a name with clojure.core. Its declared public lexical boundary remains known.
+      (is (= :invocation-scalar-free-symbol
+             (reason-of #(invocation/validate!
+                          (assoc plan :steps
+                                 [(assoc step :operands []
+                                         :region (list 'lambda []
+                                                       (list 'region []
+                                                             [(list 'clojure.core/long dimension)])))]))))))))
 
 (deftest scalar-compute-is-a-closed-rank-zero-region
   (is (= :invocation-scalar-operands

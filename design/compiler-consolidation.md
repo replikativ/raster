@@ -158,6 +158,13 @@ remains a distinct acceptance gate, not established by a successful leaf. Direct
 contraction callers still have the older default-int policy for unspecified scalar dtypes;
 the production probe supplies explicit types, and tightening that fallback remains separate.
 
+The same public probe also exposed a missing capture in the typed invocation prefix: `(long seq)`
+was emitted as a closed scalar region with no operands. Invocation operand discovery now uses
+its explicit lexical environment; validation also retains the public/prefix symbol boundary so
+a corrupt region cannot hide a missing core-named local. Focused tests execute `seq`, `count`
+and `first` as typed Long operands and reject their deliberately omitted captures. This changes
+neither source semantics nor scalar dtype inference, and introduces no separate operation registry.
+
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable
