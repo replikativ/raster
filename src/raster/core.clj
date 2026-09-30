@@ -1903,13 +1903,18 @@
 
      :else
      (if-let [dt (::dispatch-table (meta f-var))]
-       (let [all-methods (mapcat val @dt)
+       (let [specialized (when dtype (ensure-dtype-specialization! f-var dtype))
+             all-methods (mapcat val @dt)
              ns-obj (:ns (meta f-var))
              fn-name (:name (meta f-var))
              dtype-tag (case dtype :float 'floats :double 'doubles nil)
              direct (when dtype-tag
                       (first (filter #(some #{dtype-tag} (:tags %)) all-methods)))]
-         (if (and dtype-tag (nil? direct))
+         ;; Bind the template's type variables, not any coincidentally matching fixed array
+         ;; argument. A Float specialization may legitimately also contain Double scratch.
+         (if specialized
+           specialized
+           (if (and dtype-tag (nil? direct))
            ;; dtype requested but no concrete overload: monomorphize the parametric
            ;; template (narrows T for the whole compile pass), else fall back to any
            ;; registered method (legacy non-parametric behavior).
@@ -1926,6 +1931,6 @@
                                              (when ambiguity-hint (str ". " ambiguity-hint))
                                              "\nAvailable: " (mapv :tags all-methods))
                                         {:var f-var :methods (mapv :tags all-methods)})))))]
-             (ns-resolve ns-obj (types/mangle fn-name (:tags method))))))
+             (ns-resolve ns-obj (types/mangle fn-name (:tags method)))))))
        ;; no dispatch table
        (case on-miss :self f-var nil)))))

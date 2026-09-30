@@ -22,6 +22,20 @@
   (All [T] [a :- (Array T) i :- Long] :- T
        (raster.arrays/aget a i)))
 
+(deftm mixed-fixed-storage-probe
+  (All [T] [a :- (Array T) d :- (Array double) f :- (Array float)] :- T
+       (raster.arrays/aget a 0)))
+
+(deftest requested-dtype-binds-type-variables-not-fixed-scratch
+  (doseq [order [[:float :double] [:double :float]]
+          dtype order]
+    (let [expected (rcore/ensure-dtype-specialization! #'mixed-fixed-storage-probe dtype)
+          actual (rcore/resolve-deftm-var #'mixed-fixed-storage-probe {:dtype dtype})
+          input ((if (= dtype :float) float-array double-array) [3.5])]
+      (is (= expected actual)
+          "a fixed array argument must not impersonate the requested type-variable binding")
+      (is (== 3.5 (@actual input (double-array 1) (float-array 1)))))))
+
 (deftest derived-parametric-specialization-preserves-semantic-epoch
   (testing "materializing a dtype from an already-versioned template is cache population"
     (let [before (dispatch/compiler-definition-revision)
