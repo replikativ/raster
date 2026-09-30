@@ -16,7 +16,7 @@
 
 (defrecord LinkCompositionCertificate
            [source-dialect target-dialect plan-id target component-plan-ids
-            connections shares value-mapping node-mapping allocation-mapping instance-mapping
+            connections shares mutable-shares value-mapping node-mapping allocation-mapping instance-mapping
             outputs effect-evidence])
 (defrecord CertifiedLinkComposition [plan certificate components specification])
 
@@ -245,6 +245,60 @@
                       {:reason :link-composition-share-source :nodes references})))
     (first sources)))
 
+(defn- reference-nodes [plans [component value]]
+  (mapv (fn [leaf] [component (:node leaf)])
+        (get-in plans [component :values value :leaves])))
+
+(defn- normalize-mutable-shares!
+  "Explicit single-owner state borrowing, separate from immutable sharing.
+   The final output must name the owner's same physical value, never an earlier borrowed alias."
+  [bindings plans outputs connections shares]
+  (let [claims (atom #{})
+        ordinary (set (mapcat #(reference-nodes plans %)
+                             (concat (mapcat identity shares)
+                                     (mapcat (juxt :from :to) connections))))]
+    (mapv
+     (fn [{:keys [owner borrowers output] :as binding}]
+       (when-not (and (= #{:owner :borrowers :output} (set (keys binding)))
+                      (vector? borrowers) (seq borrowers))
+         (throw (ex-info "mutable sharing requires one owner, borrowers and final output"
+                         {:reason :link-composition-mutable-specification :binding binding})))
+       (let [owner (value-ref! plans owner)
+             borrowers (mapv #(value-ref! plans %) borrowers)
+             output (value-ref! plans output)
+             references (into [owner] borrowers)
+             nodes (set (mapcat #(reference-nodes plans %) references))
+             owner-nodes (reference-nodes plans owner)]
+         (when-not (and (= (count references) (count (distinct references)))
+                        (= :state (value-role (get plans (first owner)) (second owner)))
+                        (every? #(= :input (value-role (get plans (first %)) (second %))) borrowers))
+           (throw (ex-info "mutable sharing requires a unique state owner and read-only input borrowers"
+                           {:reason :link-composition-mutable-roles :binding binding})))
+         (when (seq (set/intersection nodes (set/union ordinary @claims)))
+           (throw (ex-info "mutable state has competing sharing or connection claims"
+                           {:reason :link-composition-mutable-overlap :binding binding})))
+         (when-not (and (= (first owner) (first output))
+                        (= owner-nodes (reference-nodes plans output))
+                        (public-output-value? (get plans (first output)) (second output))
+                        (= 1 (count (filter #{output} outputs))))
+           (throw (ex-info "mutable sharing must export exactly one final owner state"
+                           {:reason :link-composition-mutable-output :binding binding})))
+         (doseq [escaped outputs
+                 :when (and (not= escaped output)
+                            (seq (set/intersection nodes (set (reference-nodes plans escaped)))))]
+           (throw (ex-info "a borrowed or pre-update mutable alias cannot escape composition"
+                           {:reason :link-composition-mutable-escape :output escaped})))
+         (doseq [[component node-id] owner-nodes
+                 :let [node (get-in plans [component :nodes node-id])
+                       view (:view node) allocation (:allocation view)]]
+           (when-not (and (some? (:source node)) (= :owned (:ownership allocation))
+                          (zero? (:byte-offset view)) (= (:byte-length view) (:byte-size allocation)))
+             (throw (ex-info "mutable sharing requires initialized, owned, full allocation views"
+                             {:reason :link-composition-mutable-ownership :owner owner}))))
+         (swap! claims into nodes)
+         {:owner owner :borrowers borrowers :output output}))
+     bindings)))
+
 (defn- leaf-groups [value-groups values]
   (mapcat
    (fn [group]
@@ -304,8 +358,8 @@
 (def ^:dynamic ^:private *verify-components?* true)
 
 (defn- derive-composition
-  [id components {:keys [connections shares outputs attributes]
-                  :or {connections [] shares [] attributes {}} :as specification}]
+  [id components {:keys [connections shares mutable-shares outputs attributes]
+                  :or {connections [] shares [] mutable-shares [] attributes {}} :as specification}]
   (when (nil? id)
     (throw (ex-info "link composition requires a stable plan identity"
                     {:reason :link-composition-id})))
@@ -321,6 +375,8 @@
         shares (normalize-shares! shares component-plans)
         _ (distinct-groups! connections shares)
         outputs (mapv #(value-ref! component-plans %) outputs)
+        mutable-shares (normalize-mutable-shares! mutable-shares component-plans outputs connections shares)
+        all-shares (into shares (map #(into [(:owner %)] (:borrowers %))) mutable-shares)
         _ (when (empty? outputs)
             (throw (ex-info "link composition requires explicit public outputs"
                             {:reason :link-composition-outputs})))
@@ -374,7 +430,7 @@
         connection-pairs (mapv (fn [{:keys [from to]}]
                                  [(namespaced-value-ref from) (namespaced-value-ref to)])
                                connections)
-        share-groups (mapv #(mapv namespaced-value-ref %) shares)
+        share-groups (mapv #(mapv namespaced-value-ref %) all-shares)
         value-groups (concat connection-pairs share-groups)
         _ (doseq [group value-groups]
             (require-equal-contract! :boundary group values0 nodes0)
@@ -490,10 +546,10 @@
         (->LinkCompositionCertificate
          :certified-link-plans :link-plan id target
          (mapv (comp :id :plan :lowering) components)
-         connections shares value-mapping node-mapping allocation-mapping instance-mapping
+         connections shares mutable-shares value-mapping node-mapping allocation-mapping instance-mapping
          output-ids effect-evidence)]
     {:plan plan :certificate certificate :components components
-     :specification (assoc specification :connections connections :shares shares
+     :specification (assoc specification :connections connections :shares shares :mutable-shares mutable-shares
                            :outputs outputs :attributes attributes)}))
 
 (defn verify!
@@ -529,12 +585,13 @@
    `specification` requires ordered `:outputs` and optionally contains:
    - `:connections` — `{:from [producer-id output-value] :to [consumer-id input-value]}`;
    - `:shares` — groups of equal input/constant logical value references;
+   - `:mutable-shares` — explicit {:owner reference :borrowers [reference…] :output reference};
    - `:attributes` — inspectable composite metadata.
 
    Composite values unify atomically across their ordered leaves. Endpoints whose individual
    physical allocations have multiple views remain rejected until ranged composition is explicit."
   [{:keys [id components] :as request}]
-  (let [specification (select-keys request [:connections :shares :outputs :attributes])
+  (let [specification (select-keys request [:connections :shares :mutable-shares :outputs :attributes])
         {:keys [plan certificate components specification]}
         (derive-composition id components specification)]
     (->CertifiedLinkComposition plan certificate components specification)))
@@ -545,7 +602,7 @@
    LinkPlan and all cross-component boundaries are still independently validated. Callers without
    that in-process provenance must use `compose`."
   [{:keys [id components] :as request}]
-  (let [specification (select-keys request [:connections :shares :outputs :attributes])
+  (let [specification (select-keys request [:connections :shares :mutable-shares :outputs :attributes])
         {:keys [plan certificate components specification]}
         (binding [*verify-components?* false]
           (derive-composition id components specification))]

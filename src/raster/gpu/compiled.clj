@@ -850,14 +850,18 @@
     :components [{:id component-id :program prepared} ...]
     :connections [{:from [producer-id output-key] :to [consumer-id input-key]} ...]
     :shares [[[component-id input-or-constant-key] ...] ...]
+    :mutable-shares [{:owner [component-id donated-input-key]
+                      :borrowers [[component-id read-only-input-key] ...]
+                      :output [component-id donated-output-key]} ...]
     :outputs [{:key composite-output-key :from [component-id output-key]} ...]}
 
    Remaining component inputs are exposed under `[component-id input-key]`. Composition happens
    before allocation, so connected intermediates and shared constants have one physical
-   allocation. Donation across independent artifacts is deferred until the ownership/view pass
-   can certify cross-component state threading."
-  [{:keys [id components connections shares outputs attributes]
-    :or {connections [] shares [] attributes {}}}]
+   allocation. Explicit mutable sharing retains one donated state owner, removes borrower input
+   refresh, and exports its final state. Constants cannot be mutable borrowers; ranged views and
+   escaped earlier aliases remain rejected. One linked executable owns replay and output leases."
+  [{:keys [id components connections shares mutable-shares outputs attributes]
+    :or {connections [] shares [] mutable-shares [] attributes {}}}]
   (let [preparation-started (System/nanoTime)
         components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
@@ -874,10 +878,6 @@
                             {:reason :compiled-composition-component-ids
                              :ids (mapv :id components)})))
         donated-components (filterv (comp seq :donated :program) components)
-        _ (when (seq donated-components)
-            (throw (ex-info "cross-component donation requires the composite ownership pass"
-                            {:reason :compiled-composition-donation
-                             :components (mapv :id donated-components)})))
         resolved-connections
         (mapv (fn [{:keys [from to]}]
                 {:from from :to to
@@ -903,6 +903,40 @@
             (throw (ex-info "composite output keys must be unique and ordered"
                             {:reason :compiled-composition-output-keys
                              :keys (mapv :key output-specs)})))
+        resolved-mutable-shares
+        (mapv
+         (fn [{:keys [owner borrowers output] :as binding}]
+           (when-not (and (= #{:owner :borrowers :output} (set (keys binding)))
+                          (vector? borrowers) (seq borrowers))
+             (throw (ex-info "mutable sharing requires owner, borrowers and final output"
+                             {:reason :compiled-composition-mutable-specification :binding binding})))
+           (let [owner-entry (semantic-entry! component-map :input owner)
+                 output-entry (semantic-entry! component-map :output output)
+                 borrower-entries (mapv #(semantic-entry! component-map :input %) borrowers)
+                 selected (filterv #(= output (:from %)) output-specs)]
+             (when-not (and (= :state (:role owner-entry)) (:donate? owner-entry)
+                            (= (first owner) (first output))
+                            (= (get-in component-map [(first owner) :donated (second owner)])
+                               (second output))
+                            (= (:node owner-entry) (:node output-entry))
+                            (every? #(= :input (:role %)) borrower-entries)
+                            (= 1 (count selected)))
+               (throw (ex-info "mutable sharing must retain a donated owner and its final output"
+                               {:reason :compiled-composition-mutable-owner :binding binding})))
+             {:owner owner :owner-entry owner-entry
+              :borrowers (mapv (fn [reference entry] {:reference reference :entry entry})
+                               borrowers borrower-entries)
+              :output output :output-entry output-entry :output-key (:key (first selected))}))
+         mutable-shares)
+        donation-owners (mapv :owner resolved-mutable-shares)
+        component-donations
+        (set (for [{component-id :id program :program} donated-components
+                   key (keys (:donated program))] [component-id key]))
+        _ (when-not (and (= (count donation-owners) (count (distinct donation-owners)))
+                         (= component-donations (set donation-owners)))
+            (throw (ex-info "every component donation requires exactly one mutable owner binding"
+                            {:reason :compiled-composition-donation
+                             :expected component-donations :owners donation-owners})))
         prevalidated? (every? (comp sealed-prepared? :program) components)
         low-level
         ((if prevalidated?
@@ -921,6 +955,13 @@
                                   [(first reference) (:node entry)])
                                 group))
                         resolved-shares)
+          :mutable-shares
+          (mapv (fn [{:keys [owner owner-entry borrowers output output-entry]}]
+                  {:owner [(first owner) (:node owner-entry)]
+                   :borrowers (mapv (fn [{:keys [reference entry]}]
+                                      [(first reference) (:node entry)]) borrowers)
+                   :output [(first output) (:node output-entry)]})
+                resolved-mutable-shares)
           :outputs (mapv (fn [{:keys [from entry]}]
                            [(first from) (:node entry)])
                          output-specs)
@@ -935,13 +976,17 @@
         consumed-inputs (set (map :to resolved-connections))
         discarded-shares (set (mapcat (fn [group] (map :reference (rest group)))
                                       resolved-shares))
+        borrowed-inputs (set (mapcat #(map :reference (:borrowers %)) resolved-mutable-shares))
         in-tree
         (vec
          (for [{component-id :id program :program} components
                entry (:in-tree program)
                :let [reference [component-id (:key entry)]]
                :when (not (contains? consumed-inputs reference))
-               :when (not (contains? discarded-shares reference))]
+               :when (not (contains? discarded-shares reference))
+           ;; Mutable borrowers are read aliases, not dynamic input refresh slots.
+           ;; Their captured host default must never overwrite the owner's updated state.
+               :when (not (contains? borrowed-inputs reference))]
            (assoc entry :key reference :sym [component-id (:sym entry)]
                   :node (mapped-node component-id (:node entry)))))
         out-tree
@@ -962,7 +1007,9 @@
                 :nodes (count (get-in low-level [:plan :nodes]))
                 :instances (count (get-in low-level [:plan :instances]))}]
     (seal-prepared
-     (->Prepared low-level in-tree out-tree {} schedules (:target (:plan low-level))
+     (->Prepared low-level in-tree out-tree
+                 (into {} (map (juxt :owner :output-key)) resolved-mutable-shares)
+                 schedules (:target (:plan low-level))
                  descriptor [] report nil))))
 
 (defn compile

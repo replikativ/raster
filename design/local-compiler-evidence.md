@@ -38,6 +38,38 @@ match the chained uncompiled JVM source with maximum absolute error
 Weights are small synthetic tensors; model-loading, large contexts, performance and real
 checkpoint acceptance remain separate.
 
+## Certified shared forward/update state — 2026-09-30
+
+`compiled/compose` now accepts explicit `:mutable-shares`: one donated owner, read-only
+input borrowers and exactly one selected final owner output. The same source object initializes
+one full owned allocation. Ordinary shares/connections cannot claim those endpoints, constants
+cannot become mutable borrowers, and escaped borrowed/old outputs are rejected. The composition
+certificate retains these obligations and revalidates remapped effect evidence. The composite
+removes borrower refresh slots and retains the owner's donation map; it uses the existing linked
+replay, output invalidation and leases, not a new runtime or cache. Omitted donation handles retain
+the existing internally persistent-state behavior.
+
+The focused low-level, semantic/preflight and native composition suites pass 35 tests / 243
+assertions. Both local backends execute a generated forward/read → SGD/update graph repeatedly
+with exact JVM parity; a live output lease rejects replay before mutation. Invalid requests fail
+before allocation. Missing/duplicate owners, competing immutable/dataflow claims, different
+initializer objects, hidden final outputs, constant borrowers and escaped old aliases are covered.
+
+The isolated unchanged finetune-rstr `9e9ba5d` tiny Gemma declarations also compose through this
+public boundary: 60 forward stages followed by 157 VJP/SGD stages, 14 mutable adapter bindings,
+shared frozen weights/norms and a shared input. On Level Zero, two replays match the JVM forward
+and independently differentiated pseudo-loss/SGD reference. Maximum errors are 1.20e-6 for
+forward, 2.87e-6 for input cotangent and 2.99e-8 for adapters. The next forward sees updated
+adapters, not their captured initial host arrays. The fixed external output cotangent is supplied
+separately; this is not a fused loss-seed graph. Downloads serve only numerical comparison.
+OpenCL external acceptance is still running; the generated small composition already passes there.
+
+Host-monotonic preparation samples under background load were 70.2 s forward, 287.2 s VJP and
+89.6 s composition. These are an explicit preparation-cost debt, not a speedup or throughput
+measurement. No sibling source/dependency is modified. Full package migration, real-weight or
+longer training, ranged/cross-executable state sharing and asynchronous lifetime proofs remain
+separate gates.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
