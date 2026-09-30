@@ -777,6 +777,33 @@
           (is (= :nonterminal-result-transform
                  (:missing-rule (ex-data exception)))))))))
 
+(deftest completed-conversion-separates-terminal-storage-from-reduction-state
+  (doseq [[source target] [[:float :double] [:double :float]]]
+    (let [form (with-meta
+                 '(raster.par/reduce acc 0.0 i 32 (+ acc (clojure.core/aget a i)))
+                 {:raster.type/elem-type source})
+          base (first (lower/lower-reduce (soac/par-form->soac 'result form 91 :dtype source)
+                                          nil :dtype source))
+          transform (kernel-body/->ScalarRegion
+                     '[completed] (list (symbol (name target)) 'completed) [] target)
+          terminal (assoc-in base [:reduction :attributes :result-region] transform)
+          options {:array-types {'a source 'result target}}
+          certificate (segred-body/schedule terminal nil options)
+          parameters (get-in certificate [:body :parameters])]
+      (is (= target (:dtype (first (filter #(= :output (:kind %)) parameters)))))
+      (is (= source (:dtype (first (filter #(= :input (:kind %)) parameters)))))
+      (is (= source (get-in certificate [:numerics :accumulator-dtype])))
+      (is (= target (get-in certificate [:numerics :result-transform :result-dtype])))
+      (is (= source (:dtype (first (get-in certificate [:body :allocations])))))
+      (doseq [candidate [base
+                         (assoc-in terminal [:reduction :attributes :result-region :expression]
+                                   (list (symbol (name target)) '(+ completed 0.25)))]]
+        (try
+          (segred-body/schedule candidate nil options)
+          (is false "mixed output storage requires a direct certified terminal conversion")
+          (catch clojure.lang.ExceptionInfo error
+            (is (= :uniform-scalar-storage (:missing-rule (ex-data error))))))))))
+
 (deftest unproved-affine-loads-decline-the-pointwise-reduction-route
   (let [form '(raster.par/reduce acc 0.0 i n
                                  (+ acc (clojure.core/aget a (+ i offset))))

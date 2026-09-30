@@ -479,6 +479,9 @@
                  #'mixed-storage/mixed-scale
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
       (:kernels (equation-first/compile
+                 #'mixed-storage/double-reduction-float-result
+                 (merge mixed-storage/policy {:target device-id :dtype :double})))
+      (:kernels (equation-first/compile
                  #'symbolic-storage/regrouped-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'symbolic-storage/prefix-map {:target device-id :dtype :float}))

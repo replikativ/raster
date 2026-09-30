@@ -36,6 +36,23 @@
              (:operands transform))
        (:result-dtype transform)))))
 
+(defn completed-floating-conversion?
+  "Whether a region is precisely one explicit floating conversion of its accumulator.
+
+   This narrow mixed-storage subset cannot move arithmetic into the destination precision.
+   General mixed-width result expressions need independently typed intermediate operations."
+  [region]
+  (let [expression (:expression region)]
+    (and (= 1 (count (:parameters region)))
+         (empty? (:operands region))
+         (seq? expression) (= 2 (count expression))
+         (descriptor/cast-op? (first expression))
+         (= (first (:parameters region)) (second expression))
+         (contains? #{:float :double} (:result-dtype region))
+         (= (:result-dtype region)
+            (dtype/dtype-for-scalar-tag
+             (descriptor/cast-result-tag (first expression)))))))
+
 (defn make-region
   "Convert the target-neutral result-transform descriptor into KernelBody region data."
   [transform]

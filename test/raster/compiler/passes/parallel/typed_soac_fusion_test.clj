@@ -694,6 +694,30 @@
         "remapping a full reduction must not invent segmented axes")
     (is (= result (dialect/validate! result)))))
 
+(deftest completed-reduction-conversion-preserves-the-accumulator-precision
+  (let [program (frontend/form->program
+                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                         ^float result (float total)] result)
+                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        operation (dialect/operation-parts (first (dialect/equations result)))
+        transform (get-in operation [:attributes :result-transform])]
+    (is (= 1 (:vertical stats)))
+    (is (= 1 (count (dialect/equations result))))
+    (is (= [:double] (get-in operation [:attributes :dtypes])))
+    (is (= :float (:result-dtype transform)))
+    (is (= :float (get-in (dialect/facts result) [:values 'result :dtype])))
+    (is (= result (dialect/validate! result)))))
+
+(deftest mixed-width-arithmetic-is-not-a-completed-conversion
+  (let [program (frontend/form->program
+                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                         ^float result (float (+ total 0.25))] result)
+                 {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (zero? (:vertical stats)))
+    (is (= 2 (count (dialect/equations result))))))
+
 (deftest a-map-feeding-a-fold-map-keeps-the-fold-map-intact
   ;; The fold-map reads the map's result as a stable capture, so it is not a vertical fusion
   ;; consumer; reading its references must not re-emit it through the single-lambda builder,

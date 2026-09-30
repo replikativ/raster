@@ -30,6 +30,33 @@
                  (dialect/lambda-form '[x-element] [body])))]
     '[y])))
 
+(deftest completed-full-reduction-transform-requires-one-result
+  (let [left '(clojure.core/+ a element)
+        right '(clojure.core/+ b element)
+        attributes {:index 'i :extent 'n :accumulators '[a b]
+                    :identities [0.0 0.0] :dtypes [:double :double]
+                    :algebra [(scan/certify-reassociation
+                               {:acc 'a :init 0.0 :lambda left} :double)
+                              (scan/certify-reassociation
+                               {:acc 'b :init 0.0 :lambda right} :double)]
+                    :result-transform (dialect/make-result-transform
+                                       {:accumulator 'a :expression '(float a)
+                                        :operands [] :scalars [] :result-dtype :float})}
+        facts (dialect/default-program-facts
+               {:values {'x (av/tensor {:dtype :double :shape '[n]}) 'n extent
+                         'left (av/tensor {:dtype :float :shape []})
+                         'right (av/tensor {:dtype :double :shape []})}
+                :inputs '[n x] :equations {0 (dialect/default-equation-facts)}})
+        equation (list '= 0 '[left right]
+                       (list 'reduce attributes '[x] []
+                             (dialect/lambda-form '[a b element] [left right])))]
+    (is (false? (dialect/reduce-attributes? attributes)))
+    (try
+      (dialect/make facts [equation] '[left right])
+      (is false "one transform may not silently validate only the first result of a tuple")
+      (catch clojure.lang.ExceptionInfo error
+        (is (= :typed-soac-syntax (:reason (ex-data error))))))))
+
 (deftest scalar-reduction-coverage-includes-exact-resident-scalar-storage
   (let [equation '(= reduction [sum] (reduce {} [] [] (lambda [] (region [] [0.0]))))
         scalar (av/tensor {:dtype :float :shape []})
