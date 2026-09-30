@@ -7,6 +7,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -883,6 +884,39 @@
     (is (= :suffix-output (get (last bindings) result)))
     (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
     (is (false? (get-in call [:attributes :source-inspected])))))
+
+(deftest buffer-remapping-rechecks-bindings-but-validates-its-unchanged-program-once
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        validations (atom 0)
+        original emitted-program/validate!
+        source-program (:program call)]
+    (with-redefs [emitted-program/validate! (fn [program]
+                                            (when (identical? source-program program)
+                                              (swap! validations inc))
+                                            (original program))]
+      (let [remapped (program-call/map-buffers call #(vector :remapped %))]
+        (is (identical? source-program (:program remapped)))
+        (is (= 1 @validations))
+        (is (identical? remapped (program-call/validate! remapped)))
+        (is (= 2 @validations) "later public validation is independent")
+        (program-call/map-buffers call #(vector :again %))
+        (is (= 3 @validations) "a later construction has no retained validation cache")))
+    (let [mapped (atom 0)
+          invalid (assoc call :program (assoc source-program :dialect :unsupported))]
+      (is (= :emitted-parallel-program-dialect
+             (:reason (ex-data
+                       (try (program-call/map-buffers invalid
+                                                      (fn [value] (swap! mapped inc) value))
+                            (catch clojure.lang.ExceptionInfo error error))))))
+      (is (zero? @mapped) "the complete source program is checked before mapping any buffer"))
+    (let [mapped (atom 0)
+          invalid (assoc call :steps [])]
+      (is (= :emitted-program-call-steps
+             (:reason (ex-data
+                       (try (program-call/map-buffers invalid
+                                                      (fn [value] (swap! mapped inc) value))
+                            (catch clojure.lang.ExceptionInfo error error))))))
+      (is (zero? @mapped) "a valid program cannot hide an invalid source call"))))
 
 (deftest emitted-program-buffer-remapping-is-total-and-alias-stable
   (let [{:keys [call]} (prepared-mixed-call 3)

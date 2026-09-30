@@ -82,8 +82,9 @@ persistent state under the existing invocation contract. They are not mandatory 
 The small forward/read → resident SGD/update gate passes on OpenCL and Level Zero, repeated
 with CPU parity and no intervening adapter transfer. Negative preflight tests check no writes,
 handle consumption or allocation on an invalid request; output leases and old-handle invalidation
-retain their existing behavior. Validation against the actual external tiny Gemma forward/VJP
-pair is in progress. Real weights, longer training and performance remain separate gates.
+retain their existing behavior. The actual external tiny Gemma forward/VJP pair also passes two
+state-progress replays on both backends with all 14 adapters shared. #950 squash-merged after all
+seven CI gates passed. Real weights, longer training and performance remain separate gates.
 
 ## Rhythm and other work
 
