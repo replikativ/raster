@@ -12,6 +12,7 @@
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.fixtures.scalar-helpers :as scalar-helpers]
+            [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
@@ -47,6 +48,17 @@
 (def ^:private hip-target :hip:equation-first-source-test)
 (def ^:private hip-matrix-target :hip:equation-first-matrix-test)
 (def ^:private ocl-target :ocl:equation-first-source-test)
+
+(deftest symbolic-storage-prefixes-are-range-checked-before-allocation
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (is (map? (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 6 4]
+                             {:compiler :equation-first :target target :dtype :float})))
+    (is (= :program-link-graph-range
+           (try
+             (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 6 7]
+                             {:compiler :equation-first :target target :dtype :float})
+             nil
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (use-fixtures
   :once

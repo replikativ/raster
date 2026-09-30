@@ -5592,10 +5592,15 @@
 (declare form->program*)
 
 (defn- preserve-map-storage-inputs
-  "Use existing indexed captures when a pointwise map reads a larger backing buffer.
-   Element operands retain their exact logical shape; no tensor type is weakened."
+  "Use indexed captures when pointwise element-shape equality is not established.
+   Retain source-ordered producer storage shapes; a different symbolic traversal extent is not
+   permission to retype that storage. Existing indexed access/range validation remains mandatory."
   [descriptions values]
-  (let [requirements
+  (let [ineligible-storage
+        (into #{} (keep (fn [[id value]]
+                         (when (or (not= {:kind :plain} (:representation value))
+                                   (some? (:logical-layout value))) id))) values)
+        requirements
         (mapcat (fn [description]
                   (when (= :contract (:kind description))
                     (conj (mapv (juxt :parameter :elements)
@@ -5609,12 +5614,37 @@
                                            (when (and (seq (:shape value))
                                                       (every? integer? (:shape value)))
                                              [id (reduce *' 1 (:shape value))]))) values))]
-    (mapv (fn [{:keys [kind extent inputs] :as description}]
-            (if (and (= :map kind) (integer? extent))
-              (assoc description :storage-inputs
-                     (set (filter #(when-let [capacity (get capacities %)]
-                                     (> capacity extent)) inputs)))
-              description)) descriptions)))
+    (:descriptions
+     (reduce
+      (fn [{:keys [shapes] :as state}
+           {:keys [kind extent inputs locals bodies index results] :as description}]
+        (if-not (= :map kind)
+          (update state :descriptions conj description)
+          (let [expressions (into (mapv :init locals) bodies)
+                pointwise (filter #(pointwise-input? expressions % index) inputs)
+                storage-inputs
+                (into (set (:storage-inputs description))
+                      (filter
+                       (fn [id]
+                         (and (not (contains? ineligible-storage id))
+                              (or (when-let [shape (get shapes id)]
+                                    (and (not= [(list 'unknown-dimension id)] shape)
+                                         (not= [extent] shape)))
+                                  (when-let [capacity (and (integer? extent)
+                                                          (get capacities id))]
+                                    (> capacity extent))))))
+                      pointwise)
+                shapes (reduce (fn [known id]
+                                 (if (or (contains? known id)
+                                         (contains? storage-inputs id))
+                                   known (assoc known id [extent])))
+                               shapes pointwise)]
+            (-> state
+                (assoc :shapes (reduce #(assoc %1 %2 [extent]) shapes results))
+                (update :descriptions conj
+                        (assoc description :storage-inputs storage-inputs))))))
+      {:descriptions [] :shapes (into {} (map (juxt key (comp :shape val))) values)}
+      descriptions))))
 
 (defn form->program
   "Construct and validate TypedSOAC islands directly from a let form.

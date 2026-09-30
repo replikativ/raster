@@ -3,6 +3,8 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
@@ -128,6 +130,30 @@
     (is (= :zero-based-dense-read-spans (:kind certificate)))
     (is (= {'x 'n} (:requirements certificate))
         "the checked graph retains the exact proof target for later address projection")))
+
+(deftest known-symbolic-map-capacity-retains-a-checked-range-boundary
+  (let [source '(let* [result (raster.par/pmap i n float
+                                            (float (+ (aget x i) (float capacity))))]
+                     result)
+        options {:dtype :float :target-device :ocl:0 :array-types {'x :float}
+                 :scalar-types {'n :long 'capacity :long}
+                 :values {'x (av/tensor {:dtype :float :shape '[capacity]})
+                          'capacity (av/tensor {:dtype :long :shape []})}}
+        typed (frontend/form->program source options)
+        scheduled (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))
+        {:keys [graph]} (equation-graph/make-for-equation scheduled (first (:equations scheduled)))
+        node (first (:nodes graph))
+        check #(precondition/check! (:preconditions graph)
+                                    (partial graph-call/resolve-integer
+                                             {'n {:type :long :value 3}
+                                              'capacity {:type :long :value %}}))]
+    (is (= 'capacity (:elements (first (:inputs graph)))))
+    (is (= [{:expression 'capacity :op :>= :value 'n}] (:preconditions graph)))
+    (is (= :certified-index-expression
+           (get-in (map-reads/validate-and-project-addresses (:operation node) node graph)
+                   [:address-projection :kind])))
+    (is (= :kernel-precondition-failed (reason-of #(check 2))))
+    (is (true? (check 4)))))
 
 (deftest address-projection-recomputes-the-proof-and-requires-graph-capacity
   (let [scheduled (scheduled-three-maps)

@@ -2264,6 +2264,60 @@
                 nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
+(deftest symbolic-traversals-retain-producer-storage-through-indexed-captures
+  (let [source '(let* [^long heads-width (* heads width)
+                       ^long batch-heads (* batch heads)
+                       ^long producer-count (* batch heads-width)
+                       ^long consumer-count (* batch-heads width)
+                       a (raster.par/pmap i producer-count float (aget x i))
+                       b (raster.par/pmap j consumer-count float (aget a j))]
+                     b)
+        options {:dtype :float :array-types {'x :float}
+                 :scalar-types {'batch :long 'heads :long 'width :long}}
+        program (frontend/form->program source options)
+        consumer (last (dialect/equations program))
+        parts (dialect/operation-parts consumer)]
+    (is (some? program))
+    (is (= '[producer-count] (get-in (dialect/facts program) [:values 'a :shape])))
+    (is (= 'consumer-count (:extent (:attributes parts))))
+    (is (empty? (:arrays parts)) "unproved shape equality cannot certify an element operand")
+    (is (some #{'a} (:captures parts)))
+    (is (= ['a] (get-in parts [:attributes :attributes :stable-array-captures])))
+    (is (= '[heads-width batch-heads producer-count consumer-count]
+           (mapv #(first (nth % 2))
+                 (filter #(= 'scalar (dialect/operation-kind %))
+                         (dialect/equations program))))
+        "both product computations remain distinct and in source order")))
+
+(deftest repeated-input-traversals-do-not-retype-external-storage
+  (let [source '(let* [a (raster.par/pmap i n float (aget x i))
+                       b (raster.par/pmap j m float (aget x j))]
+                     [a b])
+        program (frontend/form->program source
+                                        {:dtype :float :array-types {'x :float}
+                                         :scalar-types {'n :long 'm :long}})
+        consumer (dialect/operation-parts (last (dialect/equations program)))]
+    (is (= '[n] (get-in (dialect/facts program) [:values 'x :shape])))
+    (is (= 'm (get-in consumer [:attributes :extent])))
+    (is (empty? (:arrays consumer)))
+    (is (= ['x] (get-in consumer [:attributes :attributes :stable-array-captures])))))
+
+(deftest symbolic-storage-promotion-preserves-element-fusion-and-layout-boundaries
+  (let [source '(let* [a (raster.par/pmap i n float (aget x i))
+                       b (raster.par/pmap j n float (aget a j))] b)
+        program (frontend/form->program source
+                                        {:dtype :float :array-types {'x :float}
+                                         :scalar-types {'n :long}})]
+    (is (= ['a] (:arrays (dialect/operation-parts (last (dialect/equations program)))))
+        "identical element shapes remain available to ordinary map fusion"))
+  (let [description {:kind :map :id 0 :sym 'out :results ['out] :extent 'm
+                     :inputs #{'x} :index 'i :locals [] :bodies ['(aget x i)]}
+        preserve #'frontend/preserve-map-storage-inputs]
+    (doseq [value [{:shape ['n] :representation {:kind :plain} :logical-layout {:kind :strided}}
+                  {:shape ['n] :representation {:kind :packed}}]]
+      (is (empty? (:storage-inputs (first (preserve [description] {'x value}))))
+          "unproved flat indexing cannot reinterpret a logical layout or packed storage"))))
+
 (deftest a-recomputed-array-read-is-not-an-alias-across-a-kernel
   ;; `n1 = (aget counts 0)` recomputed after a kernel that writes `counts` is a fresh value; only
   ;; array-free scalars and array lengths alias across kernels.
