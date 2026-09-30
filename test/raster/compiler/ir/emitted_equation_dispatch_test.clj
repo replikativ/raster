@@ -1,5 +1,10 @@
 (ns raster.compiler.ir.emitted-equation-dispatch-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.core :refer [deftm]]
+            [raster.arrays]
+            [raster.numeric]
+            [raster.par]
+            [raster.dl.array-ops :as array-ops]
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.pipeline :as pipeline]
@@ -17,6 +22,25 @@
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
+
+(deftm typed-attention-projection
+  [q :- (Array float) k :- (Array float) v :- (Array float)
+   dst :- (Array long) src :- (Array long) weights :- (Array float)
+   rows :- Long edges :- Long width :- Long heads :- Long] :- (Array float)
+  (let [dk (quot width heads)
+        raw (array-ops/indexed-dot q k dst src rows rows edges dk width heads)
+        scaled (array-ops/scale-clamp-exp raw (/ 1.0 (raster.numeric/sqrt dk))
+                                        5.0 (* edges heads))
+        denominator (array-ops/scatter-add scaled dst rows edges heads)
+        weighted (array-ops/scatter-mul-add scaled v dst src rows rows edges dk width heads)
+        normalized (array-ops/segment-div weighted denominator rows width heads 1.0e-6)
+        result (float-array (* rows 7))]
+    (raster.par/contract result [[i rows] [j 7]] [[p width]]
+                         (raster.numeric/*
+                          (raster.arrays/aget normalized (+ (* i width) p))
+                          (raster.arrays/aget weights (+ (* p 7) j)))
+                         :init (float 0.0) :combine raster.numeric/+)
+    result))
 
 (def ^:private artifact-identity
   {:semantic-request-fingerprint "equation-dispatch-request"
@@ -133,6 +157,78 @@
              (reason #(equation-dispatch/make
                        partial-alternatives (contraction-selection partial-alternatives)
                        policy)))))))
+
+(deftest public-contraction-dispatch-is-opt-in-and-retains-runtime-admission
+  (register-target!)
+  (let [options {:target target :dtype :float
+                 :schedule {:typed-contraction {:strategy :dispatch-register-tiled}}}
+        fixed (equation-first/compile #'contractions/fixed-matmul options)
+        dynamic (equation-first/compile #'contractions/dynamic-matmul options)
+        fixed-link (equation-first/lower fixed [(float-array 15) (float-array 21)])
+        dynamic-link (equation-first/lower dynamic
+                                           [(float-array 15) (float-array 21) 5 7 3])
+        empty-link (equation-first/lower dynamic
+                                         [(float-array 0) (float-array 21) 0 7 3])]
+    (is (= 2 (count (:kernels fixed))))
+    (is (= {:kernel-body 2} (get-in fixed [:stats :emission :emission-routes])))
+    (is (= 1 (get-in fixed [:stats :emission :contraction-dispatches])))
+    (is (= :dispatch-register-tiled
+           (get-in fixed [:options :schedule :typed-contraction :strategy])))
+    (is (= :register-tiled
+           (executable/strategy (-> fixed-link :instances first :call :steps last :graph))))
+    (is (= :register-tiled
+           (executable/strategy (-> dynamic-link :instances first :call :steps last :graph))))
+    (is (= :sequential-segments
+           (executable/strategy (-> empty-link :instances first :call :steps last :graph)))
+        "a failed runtime register precondition selects the exact admitted fallback")
+    (let [default (equation-first/compile #'contractions/fixed-matmul
+                                          {:target target :dtype :float})]
+      (is (not (equation-dispatch/emitted-equation-dispatch?
+                (-> default :emitted :equations last :operations first)))))
+    (let [strict (equation-first/compile
+                  #'contractions/fixed-matmul
+                  (assoc-in options [:schedule :precision] :f32-scalar))]
+      (is (= 0 (get-in strict [:stats :emission :contraction-dispatches])))
+      (is (= 1 (get-in strict [:stats :emission :contraction-candidate-declines
+                              :register-tiled-numerical-policy])))
+      (is (= 1 (count (:kernels strict)))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"measured typed contraction selectors require"
+         (equation-first/compile
+          #'contractions/fixed-matmul
+          (assoc-in options [:schedule :typed-contraction :measured-selectors]
+                    {"unsupported-selector" {:kind :fixed-strategy
+                                             :strategy :register-tiled}})))
+        "unconsumed measured selectors remain a loud decline, not ignored evidence")
+    (is (= :contraction-equation-dispatch-requires-equation-first
+           (reason #(pipeline/compile-gpu-program
+                     #'contractions/fixed-matmul target :dtype :float
+                     :schedule (:schedule options)))))))
+
+(deftest reduction-dispatch-preserves-a-conservatively-declined-contraction
+  (register-target!)
+  (let [compilation (equation-first/compile
+                     #'typed-attention-projection
+                     {:target target :dtype :float
+                      :schedule {:typed-contraction {:strategy :dispatch-register-tiled}
+                                 :segmented-weighted-reduction
+                                 {:strategy :dispatch-reassociated}}})
+        operations (keep (comp first :operations) (get-in compilation [:emitted :equations]))
+        dispatched (filter equation-dispatch/emitted-equation-dispatch? operations)]
+    (is (= 1 (count dispatched)))
+    (is (= 1 (get-in compilation [:stats :emission :reduction-dispatches])))
+    (is (= 0 (get-in compilation [:stats :emission :contraction-dispatches])))
+    (is (= 1 (get-in compilation [:stats :emission :contraction-candidate-declines
+                                 :body-has-unmodeled-terms])))
+    (is (= 3 (count (:kernels compilation))))
+    (is (= {:kernel-body 3} (get-in compilation [:stats :emission :emission-routes])))
+    (is (= 3 (count (set (map :kernel-name (:kernels compilation))))))
+    (is (= #{:indexed-segmented-reduction-reference}
+           (set (map #(get-in % [:dispatch :default-strategy]) dispatched))))
+    (is (= :sequential-segments
+           (->> operations (filter emitted-equation/emitted-equation?) first
+                :graph :nodes first :operation :attributes :strategy))
+        "a double-product/float-result summand stays ordered until conversion is proved")))
 
 (deftest independently-certified-equations-require-numerical-permission
   ;; Source generation is hardware-free; no driver or runtime session is opened.

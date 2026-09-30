@@ -103,7 +103,8 @@
 (def ^:private valid-grf-modes #{:grf128 :grf256})
 (def ^:private valid-segmented-reduction-strategies
   #{:auto :reference :subgroup-score-reuse :dispatch-reassociated})
-(def ^:private valid-typed-contraction-strategies #{:auto :portable :register-tiled :matrix})
+(def ^:private valid-typed-contraction-strategies
+  #{:auto :portable :register-tiled :matrix :dispatch-register-tiled})
 (def ^:private valid-matrix-tile-spaces #{:default :finite})
 
 (defn- valid-matrix-tile-space?

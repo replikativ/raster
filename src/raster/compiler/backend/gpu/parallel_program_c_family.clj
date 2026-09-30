@@ -6,6 +6,7 @@
    scalar equations remain explicit host-only steps. OpenCL, CUDA, and HIP differ only at the
    KernelBody source dialect boundary."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
+            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -19,6 +20,7 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.product-consumer-region :as product-consumer-region]
             [raster.compiler.passes.parallel.product-consumer-route :as product-consumer-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
@@ -54,6 +56,35 @@
                   [(:id operation)
                    (:facts (contraction-context/validate! algorithm operation))])))
         operations))
+
+(defn emit-register-contraction-alternative
+  "Emit a legal register candidate from one already certified plain FP32 equation.
+
+   Unsupported equations return an explicit admission decline. No source analysis, source
+   recognition, or second semantic program is involved; target emission retains the same spine."
+  [reference {:keys [target-descriptor schedule target-dialect] :as opts}]
+  (if-not (emitted-equation/contraction-write-domains reference)
+    {:ok false :reason :not-single-plain-fp32-contraction}
+    (let [algorithm (:algorithm reference)
+          source (equation-graph/make algorithm (:body reference))
+          node (first (:nodes source))
+          facts (:facts (contraction-context/validate! algorithm (:operation node)))
+          planned (contraction-schedule/plan-register-tiled-for-node
+                   node source facts target-descriptor
+                   (assoc opts :precision (:precision schedule)))]
+      (if-not (:ok planned)
+        planned
+        (let [original (get-in reference [:graph :nodes 0 :operation])
+              artifact (body-target/emit-artifact
+                        (str (:kernel-name original) "_register_tiled")
+                        (:scheduled planned) target-dialect)
+              candidate (emitted-equation/make
+                         algorithm (:body reference)
+                         (-> (:graph reference)
+                             (assoc-in [:nodes 0 :operation] artifact)
+                             (assoc-in [:attributes :strategy] :register-tiled))
+                         {:provenance (:provenance reference)})]
+          {:ok true :candidate candidate})))))
 
 (defn- target-program-dialect
   [target-dialect]

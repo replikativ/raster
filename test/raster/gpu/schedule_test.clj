@@ -185,7 +185,7 @@
                                                 :strategy :indexed-segmented-reduction-reference}}}}})
                    [:segmented-weighted-reduction :strategy]))))
   (testing "typed contraction selectors are validated as persistent schedule data"
-    (doseq [strategy [:auto :portable :register-tiled :matrix]]
+    (doseq [strategy [:auto :portable :register-tiled :matrix :dispatch-register-tiled]]
       (is (= strategy
              (get-in (sched/compilation-schedule
                       arc-desc {:schedule {:typed-contraction {:strategy strategy}}})

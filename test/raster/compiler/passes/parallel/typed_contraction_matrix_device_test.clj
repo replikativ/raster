@@ -38,6 +38,27 @@
             (is (= expected (vec (value/->host (:result (live {}))))) (str device)))
           (finally (compiled/close! live)))))))
 
+(deftest certified-contraction-dispatch-replays-on-local-backends
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "certified contraction dispatch on " device))
+      (let [m 65 n 67 k 17
+            left (float-array (map #(/ (- (mod % 17) 8) 4.0) (range (* m k))))
+            right (float-array (map #(/ (- (mod % 13) 6) 8.0) (range (* k n))))
+            arguments [left right m n k]
+            expected (vec (apply contractions/dynamic-matmul arguments))
+            prepared (compiled/lower
+                      #'contractions/dynamic-matmul arguments
+                      {:compiler :equation-first :target device :dtype :float
+                       :schedule {:typed-contraction {:strategy :dispatch-register-tiled}}})
+            live (compiled/instantiate! prepared)]
+        (try
+          (dotimes [_ 2]
+            (is (= expected (vec (value/->host (:result (live {})))))
+                (str device " certified ragged register dispatch")))
+          (finally (compiled/close! live)))))))
+
 (deftest dynamic-register-tiles-replay-with-tail-shapes-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]

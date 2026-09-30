@@ -1924,6 +1924,12 @@
                     "reassociated equation dispatch requires the equation-first compiler"
                     {:reason :reassociated-equation-dispatch-requires-equation-first
                      :device device-id})))
+        _ (when (= :dispatch-register-tiled
+                   (get-in resolved-schedule [:typed-contraction :strategy]))
+            (throw (ex-info
+                    "contraction equation dispatch requires the equation-first compiler"
+                    {:reason :contraction-equation-dispatch-requires-equation-first
+                     :device device-id})))
         gemm-precision (:precision resolved-schedule)
         resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         _ (when (dispatch/host-only? resolved-var)
