@@ -5,6 +5,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
@@ -86,6 +87,34 @@
     (is (not (some #{'n} (:inputs (dialect/facts p)))))
     (is (= 1 (:initialization-fills stats)))
     (is (some #{'n} (:inputs (dialect/facts scheduled))))))
+
+(deftest prior-component-allocation-extents-remain-available-without-numerical-captures
+  (let [options {:dtype :float :array-types {'input :float 'output :float}
+                 :scalar-types {'n :long 'width :long}}
+        p (frontend/form->program
+           (frontend/normalize-source (source '(float-array (* n width)) 4) options) options)
+        [definition writer] (dialect/equations p)
+        extent (first (nth definition 2))
+        projection {:typed-program p :outputs (dialect/outputs p)}
+        scalar-entry {:kind :typed-soac :equation-id (second definition)}
+        writer-entry {:kind :typed-soac :equation-id (second writer)}
+        component {:entries [writer-entry] :prefix [scalar-entry] :suffix []}
+        narrowed (#'route/typed-component-program projection component)
+        [scheduled stats] (initialization/materialize narrowed)]
+    (is (not (some #{extent} (:inputs (dialect/facts narrowed)))))
+    (is (not (some #{extent} (get-in (dialect/facts narrowed) [:attributes :source-bindings]))))
+    (is (some? (get (extent-proof/initial-environment narrowed) extent)))
+    (is (= 1 (:initialization-fills stats)))
+    (is (some #{extent} (:inputs (dialect/facts scheduled))))
+    (is (= scheduled (dialect/validate! scheduled)))
+    ;; The same scalar is unavailable when it has not executed in this component's prefix.
+    ;; Do not turn a future source binding into an incoming value merely because it has a type.
+    (let [future (#'route/typed-component-program
+                  projection (assoc component :prefix [] :suffix [scalar-entry]))]
+      (is (nil? (get (extent-proof/initial-environment future) extent)))
+      (is (= :typed-soac-initialization-contract
+             (try (initialization/materialize future) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
 (deftest total-functional-domains-include-boundaries-and-scan-results
   (doseq [operation ['(raster.par/scan output accumulator (float 0.0) i 8 float

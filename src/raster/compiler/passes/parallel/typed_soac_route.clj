@@ -709,8 +709,20 @@
         first-access-storage (set/difference current-storage prior-storage)
         allocations (filterv #(contains? first-access-storage (:destination %))
                              (get-in source-facts [:attributes :allocations]))
+        prior-definitions
+        (into #{}
+              (mapcat (fn [{:keys [kind equation-id description]}]
+                        (case kind
+                          :typed-soac (nth (get equations-by-id equation-id) 2)
+                          :segmented-weighted-reduction [(:sym description)])))
+              (:prefix component))
+        ;; An allocator extent can be computed in an earlier component and absent from every
+        ;; numerical operand/axis here. Prior source definitions are incoming values, not local
+        ;; host bindings still waiting to execute. Keep current/later definitions unavailable.
         facts (-> source-facts
                   (assoc :inputs inputs :equations equation-facts :effects effects)
+                  (update-in [:attributes :source-bindings]
+                             #(filterv (complement prior-definitions) %))
                   (assoc-in [:attributes :allocations] allocations))]
     (dialect/make facts equations chunk-outputs)))
 
