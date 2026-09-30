@@ -4,6 +4,7 @@
    Level Zero GEMM-specific binding surface to disappear without losing its numerical oracle."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.fixtures.attention-projection :as attention-projection]
@@ -68,22 +69,29 @@
                                       [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
       (if-not @available?
         (skip! (str "mixed attention/projection oracle on " device))
-        (let [prepared (compiled/lower
-                        #'attention-projection/attention-projection device-args
-                        {:compiler :equation-first :target device :dtype :float
-                         :schedule {:typed-contraction {:strategy :dispatch-register-tiled}
-                                    :segmented-weighted-reduction {:strategy :dispatch-reassociated}}})
-              live (compiled/instantiate! prepared)]
-          (try
-            (dotimes [_ 2]
-              (let [actual (vec (value/->host (:result (live {}))))]
-                (is (= (count expected) (count actual)))
-                (is (every? true? (map #(<= (Math/abs (- (double %1) (double %2))) 1.0e-6)
-                                      expected actual))
-                    (str device " Double-source oracle versus explicit FP32 execution"))
-                (is (= (vec (repeat 7 0.0)) (subvec actual 7 14))
-                    "the empty destination row remains initialized through projection")))
-            (finally (compiled/close! live))))))))
+        (let [descriptor (hardware/descriptor-for device)
+              subgroup? (and (= :gpu (:device-type descriptor))
+                             (gpu-target/intel-opencl-subgroup-dialect? descriptor)
+                             (integer? (hardware/preferred-subgroup-size descriptor)))]
+          ;; Always exercise the complete reference graph, including on CI's subgroup-less
+          ;; PoCL device. Add reassociated dispatch only where the current target admits it.
+          (doseq [strategy (cond-> [:reference] subgroup? (conj :dispatch-reassociated))]
+            (let [prepared (compiled/lower
+                            #'attention-projection/attention-projection device-args
+                            {:compiler :equation-first :target device :dtype :float
+                             :schedule {:typed-contraction {:strategy :dispatch-register-tiled}
+                                        :segmented-weighted-reduction {:strategy strategy}}})
+                  live (compiled/instantiate! prepared)]
+              (try
+                (dotimes [_ 2]
+                  (let [actual (vec (value/->host (:result (live {}))))]
+                    (is (= (count expected) (count actual)))
+                    (is (every? true? (map #(<= (Math/abs (- (double %1) (double %2))) 1.0e-6)
+                                          expected actual))
+                        (str device " " strategy " Double-source oracle versus explicit FP32 execution"))
+                    (is (= (vec (repeat 7 0.0)) (subvec actual 7 14))
+                        "the empty destination row remains initialized through projection")))
+                (finally (compiled/close! live))))))))))
 
 (deftest dynamic-register-tiles-replay-with-tail-shapes-on-local-backends
   (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
