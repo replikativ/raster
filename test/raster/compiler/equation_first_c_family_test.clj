@@ -8,8 +8,10 @@
             [raster.compiler.core.hardware :as compiler-hardware]
             [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.fixtures.contractions :as contractions]
+            [raster.compiler.fixtures.scalar-helpers :as scalar-helpers]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
@@ -987,6 +989,66 @@
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
       (is (= expected-outputs (count (:outputs linked))))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
+(deftest public-scalar-cast-helper-uses-the-common-gpu-frontend
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'scalar-helpers/map-cast-helper {:target target :dtype :float})
+          linked (equation-first/lower compilation [(float-array [0.25 -2.5 8.0]) 3])]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:kernels compilation))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
+      (is (= 1 (count (:outputs linked))))
+      (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
+
+(deftest descriptor-and-diagnostic-entries-expand-the-same-scalar-helper
+  ;; The compatibility descriptor entry remains OpenCL/Level Zero-only. Public C-family
+  ;; equation-first emission above is the CUDA/HIP source boundary; do not conflate them.
+  (doseq [target [ocl-target]
+          diagnostic? [false true]]
+    (let [descriptor (pipeline/compile-gpu-program
+                      #'scalar-helpers/map-cast-helper target
+                      :dtype :float :compiler-report? diagnostic? :on-non-resident :throw)]
+      (is (= 1 (count (:steps descriptor))))
+      (is (= [:map-void] (mapv :convention (:steps descriptor))))
+      (is (= diagnostic? (boolean (:compiler-report descriptor)))))))
+
+(deftest staged-aot-and-diagnostics-share-gpu-helper-policy
+  (let [stages (pipeline/show-pipeline #'scalar-helpers/map-cast-helper
+                                      :dtype :float :target-device ocl-target)]
+    (is (= :typed-soac (get-in stages [:soac-fused-stats :route])))
+    (is (= 0 (get-in stages [:backend-applied-stats :fallback])))
+    (is (= 1 (count (:kernels stages)))))
+  ;; Force only construction, not the returned staged GPU invocation or a driver session.
+  (with-redefs-fn {(requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn)
+                  (fn [compile!] (compile!))}
+    #(is (ifn? (pipeline/compile-aot #'scalar-helpers/map-cast-helper
+                                    :dtype :float :target-device ocl-target)))))
+
+(deftest scalar-helper-admission-preserves-public-softmax-reduction-boundaries
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'nn/softmax {:target target :dtype :float})]
+      (is (= :none (get-in compilation [:stats :fallback])))
+      (is (= 1 (count (:outputs (equation-first/lower
+                                compilation [(float-array [1.0 2.0 3.0])])))))
+      (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation))))))
+
+(deftest ordinary-and-diagnostic-runners-preserve-non-gpu-inline-policy
+  (let [seen (atom [])
+        diagnostic (var-get (ns-resolve 'raster.compiler.pipeline 'run-passes-diagnostic))]
+    (with-redefs [pipeline/pass-specs
+                  {:probe {:from :walked :to :walked
+                           :fn (fn [form _]
+                                 (swap! seen conj inline/*inline-scalar-bodies?*)
+                                 {:form form})}}]
+      (doseq [runner [pipeline/run-passes diagnostic]]
+        (binding [inline/*inline-scalar-bodies?* false]
+          (runner 'x [:probe] {})
+          (runner 'x [:probe] {:target-device :cpu:0})
+          (runner 'x [:probe] {:target-device ocl-target}))
+        (binding [inline/*inline-scalar-bodies?* true]
+          (runner 'x [:probe] {}))))
+    (is (= [false false true true false false true true] @seen))))
 
 (deftest public-array-clone-is-a-generated-identity-map
   (doseq [target [cuda-target hip-target]]

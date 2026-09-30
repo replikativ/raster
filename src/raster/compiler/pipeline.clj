@@ -1191,7 +1191,8 @@
   "Reduce a form through a sequence of passes, validating arrow types.
   Passes with :from :* accept any input dialect (flexible).
   Validates output against target dialect when *validate-dialects?* is true.
-  Returns the final transformed form.
+  Returns the final transformed form. GPU :target-device entries share pure scalar-helper
+  expansion; entries without a GPU target retain the caller's existing inline policy.
 
   `start-dialect` (default :walked) lets a caller resume a split pipeline — e.g.
   the resident GPU path runs the representation-neutral front half to :write-read-fused, applies
@@ -1206,7 +1207,10 @@
                     _ (assert (or (= :* from) (= dialect from))
                               (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
                                    ". Check pass ordering."))
-                    result (pass-fn f opts)
+                    result (binding [inline/*inline-scalar-bodies?*
+                                     (or inline/*inline-scalar-bodies?*
+                                         (device/gpu-target? (:target-device opts)))]
+                             (pass-fn f opts))
                     f' (pass-result-form result)]
                 ;; Validate output against target dialect (fails hard)
                 (validate-dialect! to f' pass-key opts)
@@ -1244,7 +1248,8 @@
         ;; GPU sessions enter with a walked deftm body, bypassing the forward pipeline's
         ;; fixpoint/expand stages. Reuse that same shared expansion here so scalar helpers
         ;; and source constants reach TypedSOAC as expressions, not opaque calls/vars.
-        source (binding [inline/*inline-scalar-bodies?* true]
+        source (binding [inline/*inline-scalar-bodies?* true
+                         inline/*preserve-canonical-intrinsics?* true]
                  (-> source
                      (inline/resolve-generic-deftm-calls (:param-env opts))
                      (inline/expand-for-backends 3 (:param-env opts))
@@ -1320,7 +1325,10 @@
                    _ (assert (or (= :* from) (= current-dialect from))
                              (str "Pass :" pass-key " expects :" from " but pipeline is at :"
                                   current-dialect))
-                   result (pass-fn (:form acc) opts)
+                   result (binding [inline/*inline-scalar-bodies?*
+                                    (or inline/*inline-scalar-bodies?*
+                                        (device/gpu-target? (:target-device opts)))]
+                            (pass-fn (:form acc) opts))
                    new-form (pass-result-form result)]
                (validate-dialect! to new-form pass-key opts)
                (-> acc
