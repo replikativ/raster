@@ -2118,6 +2118,35 @@
     (is (= 2 (count (checked-casts array-backed)))
         "array-backed checked extents remain distinct evaluations")))
 
+(deftest repeated-checked-scalar-bindings-reuse-only-dominating-immutable-values
+  (let [options {:dtype :double :scalar-types {'n :long 'm :long}
+                 :array-types {'out-a :double 'out-b :double 'counts :long}}
+        source (fn [first-check second-check]
+                 (list 'let*
+                       ['first-count first-check
+                        'a '(raster.par/map! out-a i first-count double 1.0)
+                        'second-count second-check
+                        'b '(raster.par/map! out-b j second-count double 2.0)] 'b))
+        normalized (frontend/normalize-source (source '(int n) '(int n)) options)
+        pairs (into {} (map vec) (partition 2 (second normalized)))
+        checks #(filter (fn [x] (and (seq? x) (= 'int (first x))))
+                        (tree-seq coll? seq %))]
+    (is (= '(int n) (pairs 'first-count)) "the original checked evaluation is preserved")
+    (is (= 'first-count (pairs 'second-count)))
+    (is (= 1 (count (checks normalized))))
+    (is (some? (frontend/form->program normalized options)))
+    (is (= normalized (frontend/normalize-source normalized options)))
+    (let [changed (frontend/normalize-source (source '(int n) '(int m)) options)]
+      (is (= 2 (count (checks changed))))
+      (is (nil? (frontend/form->program changed options))
+          "a different check after an effect still cannot be hoisted"))
+    (let [array-backed (frontend/normalize-source
+                        (source '(int (aget counts 0)) '(int (aget counts 0))) options)]
+      (is (= 2 (count (checks array-backed)))
+          "device effects can change read operands; no dominating immutable value is proven")
+      (is (nil? (frontend/form->program array-backed options))
+          "the second array-backed check cannot move before the intervening device effect"))))
+
 (deftest fixed-rng-inputs-keep-their-ordered-checked-conversions
   (let [options {:dtype :long :array-types {'seeds :long}
                  :scalar-types {'n :long 'seed :long}}

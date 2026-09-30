@@ -125,6 +125,26 @@ inlined callees against the existing definition epoch and source-dependency mani
 compiled artifacts or captured dispatch objects are not retroactively rewritten. Keep those
 obligations distinct from the artifact cache's existing epoch invalidation.
 
+### Generated numerical continuation acceptance
+
+The resident full-domain refinement workload composes four existing periodic heat steps and
+restriction in one caller-owned LinkPlan, replayed without intermediate host transfers. Inlining
+the same numerical operator exposed repeated checked dimension bindings after device effects.
+Normalization now reuses the existing dominating checked-value evidence for scalar bindings too:
+an identical successful conversion over immutable scalar SSA operands may name the earlier value.
+The first check remains at its source position. A new check after an effect still declines this
+route, and array-backed checks remain separate evaluations. This extends the existing proof; it
+does not make checked casts generally removable, add a PDE opcode or hoist possible exceptions.
+
+Local OpenCL and Level Zero execute uninterrupted six-checkpoint evolution and a three-step
+producer/checkpoint/fresh-restore/three-step continuation. Coarse and fine chunks name hashes of
+actual mmap bytes; the producer closes before read mappings open and synchronous restoration
+finishes before leases close. Same-backend final fields agree bit-for-bit; generated fields also
+match the JVM and retain volume-weighted mass. The frontend and new continuation suites pass
+114 tests / 575 assertions locally; full CI remains required. The snapshot's producer string is
+a test-fixture label, not a production compiler-build identity. Production manifest publication,
+partial-patch interface fluxes, actual distributed transport, subcycling and reflux stay open.
+
 The equation-first public result boundary now includes explicit outputs, donations and taps in
 the certified LinkPlan outputs, not only in runtime wrappers. This joins escape declarations to
 the existing initialization and storage analysis; it does not enable reuse through inspectable

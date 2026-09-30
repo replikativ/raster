@@ -4027,6 +4027,25 @@
                                                (par/par-form? expression)
                                                floating-cast?)
                                    (canonical-scalar expression))
+                     ;; Inlining successive numerical calls can repeat a checked scalar
+                     ;; conversion between their effects. The first successful check over
+                     ;; immutable SSA operands dominates those repeats, just as it does for
+                     ;; checked launch extents below. Preserve the first evaluation; this is
+                     ;; not permission to move a new check before an earlier kernel.
+                     checked-scalar? (and scalar-form
+                                          (ordered-scalar-expression? scalar-form)
+                                          (requires-ordered-evaluation? scalar-form)
+                                          (empty? (par/collect-aget-arrays scalar-form))
+                                          (set/subset? (util/free-syms scalar-form)
+                                                       (set (keys local-scalar-types))))
+                     checked-id (when checked-scalar?
+                                  (get (:checked-extents state) scalar-form))
+                     state (if checked-scalar?
+                             (if checked-id
+                               (assoc-in state [:scalar-aliases symbol] checked-id)
+                               (assoc-in state [:checked-extents scalar-form] symbol))
+                             state)
+                     expression (if checked-id checked-id expression)
                      ;; A recomputed scalar denotes an earlier one only when nothing between
                      ;; them can have changed its value: it reads no array (a kernel in between
                      ;; may write one), or it is an array length, which no kernel changes.
