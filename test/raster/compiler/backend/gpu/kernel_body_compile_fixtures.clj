@@ -19,6 +19,7 @@
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
+            [raster.compiler.fixtures.mixed-storage :as mixed-storage]
             [raster.compiler.fixtures.staged-contracts :as staged-public]
             [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
             [raster.compiler.ir.attention :as attention]
@@ -474,6 +475,9 @@
                 :capabilities capabilities})
     (vec
      (concat
+      (:kernels (equation-first/compile
+                 #'mixed-storage/mixed-scale
+                 (merge mixed-storage/policy {:target device-id :dtype :double})))
       (:kernels (equation-first/compile
                  #'symbolic-storage/regrouped-map {:target device-id :dtype :float}))
       (:kernels (equation-first/compile

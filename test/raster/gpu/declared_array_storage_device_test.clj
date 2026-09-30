@@ -41,6 +41,32 @@
               "Double recurrence precedes each Float store, preserving source order and the tail"))
         (finally (compiled/close! artifact))))))
 
+(defn- run-scale-case [target]
+  (let [alpha (+ 1.0 (Math/scalb 1.0 (int -24)))
+        x (float-array [1.5 -1.5 0.0])
+        expected (mapv #(float (* alpha (double %))) x)
+        artifact (compiled/compile
+                  #'storage/mixed-scale [alpha x]
+                  (merge storage/policy
+                         {:compiler :equation-first :target target :dtype :double}))]
+    (try
+      (is (= expected (vec (storage/mixed-scale alpha x))))
+      (dotimes [_ 2]
+        (let [outputs (artifact {})
+              result (value/->host (:result outputs))]
+          (is (= #{:result} (set (keys outputs))))
+          (is (= (class x) (class result)))
+          (is (= expected (vec result)))))
+      (finally (compiled/close! artifact)))))
+
+(deftest mixed-scale-public-jvm-device-storage-boundary
+  (if @gp/gpu-available?
+    (run-scale-case :ze:0)
+    (gp/gpu-skip! "mixed coefficient scale on Level Zero"))
+  (if @opencl/opencl-available?
+    (run-scale-case :ocl:0)
+    (opencl/opencl-skip! "mixed coefficient scale on OpenCL")))
+
 (deftest level-zero-mixed-storage-public-compilers-match-jvm
   (if @gp/gpu-available?
     (do (run-case :ze:0) (run-fold-case :ze:0))

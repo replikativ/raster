@@ -29,6 +29,31 @@
 
 (defn- tagged [sym tag] (with-meta sym {:raster.type/tag tag}))
 
+(deftest materialized-scalar-projection-does-not-infer-a-missing-expression-dtype
+  (let [unknown '(opaque-result x)
+        dynamic (tangent/project-expr 'float unknown)
+        concrete (tangent/project-expr 'float unknown {:materialized? true})]
+    (is (= '(raster.ad.tangent/project-float (opaque-result x)) dynamic))
+    (is (= '(float (opaque-result x)) concrete))
+    (is (= 'float (tag-of concrete)))
+    (is (= unknown (tangent/project-expr nil unknown {:materialized? true})))))
+
+(deftest derived-scalar-adjoints-project-before-claiming-their-tangent-tag
+  (let [[template _] (tmpl/resolve-template 'raster.par/scale)
+        coefficient (tagged 'coefficient 'float)
+        input (tagged 'input 'doubles)
+        cotangent (tagged 'cotangent 'doubles)
+        [ctx gradients] (tmpl/instantiate-template-ctx
+                         template [coefficient input] nil cotangent (make-test-ctx))
+        scalar-expression (get (into {} (map vec (partition 2 (:bindings ctx))))
+                               (first gradients))]
+    (is (= '[float doubles] (mapv tag-of gradients)))
+    (is (= 'float (first scalar-expression))
+        "a desired Float binder tag must be backed by an actual Double-to-Float projection")
+    (is (= 'float (tag-of scalar-expression)))
+    (is (= 'double (tag-of (second scalar-expression)))
+        "the resolved dot-product result remains authoritative before projection")))
+
 ;; ================================================================
 ;; (i) Π — tangent-tag
 ;; ================================================================

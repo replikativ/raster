@@ -149,9 +149,55 @@ For an external input without an explicit shape/view contract, the first pointwi
 establishes only a conservative inferred contract. This does not claim complete symbolic shape
 equivalence or admission of every traversal a larger physical caller buffer could support.
 
-This is not a full package migration. Shared forward/VJP state, actual external training updates,
-real-weight acceptance, and cross-vendor device performance remain open. The local Gemma twin
-does not substitute for those gates.
+This is not a full package migration. The actual external VJP/update evidence below remains
+separate from shared forward/VJP state, real-weight acceptance, and cross-vendor device
+performance. The local Gemma twin does not substitute for those gates.
+
+### Scalar cotangent and array storage boundary
+
+The unchanged external Gemma VJP/update declaration exposed a JVM transpose failure:
+`dot-product` returns Double, but its existing transpose passed that Double cotangent to a
+Float array through a `scale` signature requiring one shared type. The shared primitive now
+declares independent coefficient and array element types, `All [T S] [S, Array T] → Array T`.
+Existing broadcast materialization retains T after the declared scalar arithmetic; the
+mathematical adjoints and bilinear operation structure are unchanged. The focused review exposed
+a second, pre-existing boundary defect: a derived scalar adjoint's binder received its desired
+tangent tag before the expression was projected, so a Float coefficient gradient could remain
+a runtime Double. Derived adjoints now resolve the expression's declared result through the
+existing emission resolver and apply the shared tangent projection before stamping the binder.
+Concrete kernel adjoints use the existing projection algebra's explicit non-nil/materialized
+contract; unknown dynamic cotangents retain the default nil-safe helper. When a projection is
+needed, its input adjoint and projection are separate flat BindCtx bindings so an inlined SOAC
+is not hidden under a cast. Untagged argument types remain unguessed.
+This broadens mixed-type scale admission, not implicit dispatch coercion. A rounding
+counterexample distinguishes this from rounding a Double coefficient to Float before
+multiplication. Public declared-storage compilation and
+both local device backends preserve that distinction exactly.
+
+The actual external VJP/update program emits 157 equation-first stages. Two updates on each of
+OpenCL and Level Zero match an independent CPU oracle built from the external pseudo-loss,
+`value+grad`, and the
+existing Float SGD primitive: maximum input-gradient error 2.87e-6, maximum error across
+fourteen adapters 2.99e-8. State stays resident between updates; the small validation arrays
+are downloaded to compare each step, so this is not a zero-transfer benchmark. The external
+Double learning-rate port is explicitly rounded at the oracle's existing Float optimizer
+boundary; the compiled numerical declaration itself is unchanged. Sharing donated state across
+independently prepared forward/backward artifacts, upstream package migration and real-weight
+training remain separate obligations.
+
+The existing parametric registration keys templates by annotation signature. In a warm process,
+this broader declaration adds a template rather than deleting the old narrow template. Its
+overlapping arithmetic is unchanged, but this does not establish general all-signature replacement;
+restart for a clean one-template state. The earlier exact-signature reload tests do not certify
+removal of an older signature.
+
+The new public Float scalar energy-gradient reproduction is retained as an explicit decline:
+its reduction and dependent Float projection currently meet an unrepresented device/host gap
+in numerical-region selection (`:scheduled-equation-region`). The JVM scalar gradient is Float
+and correct; that is not GPU scalar-gradient coverage. An earlier independent-seed variant also
+exposed distinct input extents in a reduction; the map storage/capture fix does not establish
+complete reduction storage admission. These are follow-up numerical-boundary obligations, not
+permission to drop a projection or equate unproved shapes.
 
 ## Declared array storage — 2026-09-30
 

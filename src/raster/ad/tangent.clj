@@ -157,8 +157,14 @@
   runtime helpers (project-double/project-float) are emitted ONLY for
   UNTAGGED cotangents (the dynamic/interpreted path, where nil can flow).
   Arrays and unknown primal tags pass through unchanged (array adjoints are
-  anchored by their typed shadow buffers)."
-  [tag cotangent-expr]
+  anchored by their typed shadow buffers).
+
+  `:materialized? true` is a caller obligation that the expression produces a concrete,
+  non-nil scalar numeric value (for example an executed kernel adjoint). It permits a primitive scalar
+  projection even when its exact dtype has not survived inlining; it does not guess that dtype
+  or weaken the default nil-safe dynamic-cotangent contract."
+  ([tag cotangent-expr] (project-expr tag cotangent-expr {}))
+  ([tag cotangent-expr {:keys [materialized?]}]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (if (= kind :scalar)
       (let [ct (tangent-kind (expr-manifest-tag cotangent-expr))]
@@ -167,7 +173,7 @@
           (and (= :scalar (:kind ct)) (= dtype (:dtype ct)))
           cotangent-expr
           ;; Statically scalar of the other dtype — Π is a primitive cast.
-          (= :scalar (:kind ct))
+          (or (= :scalar (:kind ct)) materialized?)
           (let [cast-tag (case dtype :float 'float :double 'double)]
             (with-meta (list cast-tag cotangent-expr)
               {:raster.type/tag cast-tag}))
@@ -176,4 +182,4 @@
           (case dtype
             :float  (list 'raster.ad.tangent/project-float cotangent-expr)
             :double (list 'raster.ad.tangent/project-double cotangent-expr))))
-      cotangent-expr)))
+      cotangent-expr))))
