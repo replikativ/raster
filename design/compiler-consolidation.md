@@ -522,6 +522,39 @@ The focused dispatch suite passes 7 tests / 35 assertions; the final contraction
 forgery and initialization checks pass 1 test / 13 assertions. Existing SWR round-trip validation
 passes after refreshing the warm REPL's stale compiler-record decoder registry.
 
+Equation-first now offers `:typed-contraction {:strategy :dispatch-register-tiled}` as an explicit
+candidate-family opt-in. The frontend and reference schedule stay portable. Each admitted plain
+FP32 equation gets its independently certified register alternative from the same retained
+algorithm/body and captured target description. Other equations remain unchanged; screening and
+actual candidate-admission declines have separate counters. Strict precision does not authorize
+the candidate. Binding-time preconditions may choose the exact portable fallback (including empty
+dimensions), using the existing dispatch preflight rather than a new runtime convention. The
+compatibility compiler rejects this equation-only mode; measured selectors are still rejected
+until their public producer/consumption contract is implemented. `:auto` is unchanged.
+
+Mixed reduction/contraction emission revealed that independently re-emitting an unrelated
+contraction may generate different private SSA identities. The reduction join now requires exact
+enclosing semantic equation equality and retains the reference physical emission; it does not
+equate, select, or certify the discarded unrelated schedule. Kernel enumeration includes only
+retained graphs and certified alternatives. The mixed public oracle deliberately retains an
+ordered double-product/float-result contraction: the register gate must not erase its conversion
+terms just to select a matrix leaf. Canonical typed conversion/specialization remains a follow-up;
+two simultaneously admitted numerical dispatch families need a separate workload oracle.
+
+Focused checks for the public candidate slice: static/dynamic admission, exact empty fallback and
+strict precision 1 test / 11 assertions; OpenCL/CUDA/HIP source/projection checks 1 / 15; real
+Level Zero and OpenCL ragged 65x67x17 replay versus JVM 1 / 4; schedule feasibility 1 / 43. These
+are correctness checks, not calibrated throughput or a claim of competitive GEMM performance.
+An exploratory warm-REPL variant sharing an allocation extent across protected and ordinary
+components reported unavailable initialization extent; reproduce in a clean session before
+classifying it, then address host-prefix sharing as a bounded correctness slice if confirmed.
+The final clean-session dispatch namespace passes 9 tests / 59 assertions. A bounded read-only
+review found no blocker in the semantic-spine join or retained-kernel enumeration. Top-level
+emission-route statistics count retained executable artifacts; nested alternative-emission
+statistics describe the independent emission attempt and may include subsequently discarded
+artifacts. A real device-throughput claim still requires resident, event-timed benchmark evidence.
+The final retained-statistics assertions pass 2 tests / 22 assertions.
+
 The shared ScheduledKernelBody graph check now requires structural node membership and exact
 canonical pointer-storage dtypes. Previously the executable boundary caught a dtype mismatch
 after emission; the earlier refinement certificate now rejects it too. The scalar-reduction and

@@ -17,10 +17,12 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.device :as device]
@@ -125,7 +127,8 @@
   "Join two independently emitted schedules over one retained semantic equation spine.
 
    This runs after TypedSOAC construction: it neither repeats source analysis nor recognizes
-   a model operation from target code. Non-reduction equations must be identical."
+   a model operation from target code. Non-reduction semantic boundaries must be identical;
+   their independently emitted local SSA is discarded in favor of the reference emission."
   [function-id schedule target-descriptor reference subgroup]
   (let [reference-program (emitted-program/validate! (:program reference))
         subgroup-program (emitted-program/validate! (:program subgroup))
@@ -183,9 +186,10 @@
                                 {:permitted-modes #{:exact :reassociated}})]
                  (assoc reference-equation :operations [operation]))
                (do
-                 (when-not (= reference-equation subgroup-equation)
+                 (when-not (= (dissoc reference-equation :operations)
+                              (dissoc subgroup-equation :operations))
                    (fail! :equation-dispatch-other-equation
-                          "reduction scheduling changed an unrelated emitted equation"
+                          "reduction scheduling changed an unrelated semantic equation"
                           {:equation (:id reference-equation)}))
                  reference-equation)))
            ref-equations subgroup-equations)
@@ -196,12 +200,73 @@
               (fail! :equation-dispatch-no-reduction
                      "reassociated reduction dispatch requires a segmented reduction" {}))
           program (emitted-program/validate!
-                   (assoc reference-program :equations equations))]
+                   (assoc reference-program :equations equations))
+          kernels (vec
+                   (mapcat (fn [equation]
+                             (let [operation (first (:operations equation))]
+                               (mapcat #(map :operation (get-in % [:graph :nodes]))
+                                       (cond
+                                         (equation-dispatch/emitted-equation-dispatch? operation)
+                                         (:alternatives operation)
+                                         operation [operation]
+                                         :else []))))
+                           equations))]
       {:program program
-       :kernels (vec (distinct (concat (:kernels reference) (:kernels subgroup))))
+       ;; Enumerate retained alternatives, not discarded independent emissions. Unrelated
+       ;; schedules may generate fresh local SSA/kernel names without changing their semantic
+       ;; boundary; neither those unused artifacts nor their private bindings belong here.
+       :kernels kernels
        :stats (assoc (:stats reference)
+                     :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
                      :reduction-dispatches dispatch-count
                      :alternative-emission (:stats subgroup))})))
+
+(defn- dispatch-contraction-emissions
+  "Admit register candidates per equation without rescheduling unrelated operations."
+  [function-id reference options]
+  (let [declines (atom {})
+        new-kernels (atom [])
+        equations
+        (mapv
+         (fn [equation]
+           (let [operation (first (:operations equation))]
+             (if-not (emitted-equation/emitted-equation? operation)
+               equation
+               (let [planned (program-c-family/emit-register-contraction-alternative
+                              operation options)]
+                 (if-not (:ok planned)
+                   (do
+                     (swap! declines update-in
+                            [(if (= :not-single-plain-fp32-contraction (:reason planned))
+                               :screen :admission)
+                             (:reason planned)]
+                            (fnil inc 0))
+                     equation)
+                   (let [portable (assoc-in operation [:graph :attributes :strategy]
+                                            :sequential-segments)
+                         register (:candidate planned)
+                         alternatives [portable register]
+                         selection (kernel-dispatch/make
+                                    {:id (str function-id "/contraction-" (:id equation))
+                                     :alternatives (mapv :graph alternatives)
+                                     :default-strategy :sequential-segments
+                                     :selector {:kind :fixed-strategy :strategy :register-tiled}
+                                     :attributes {:selection :explicit-register-candidate
+                                                  :numerical-mode :reassociated}})
+                         certified (equation-dispatch/make
+                                    alternatives selection
+                                    {:permitted-modes #{:exact :reassociated}})]
+                     (swap! new-kernels into (map :operation (get-in register [:graph :nodes])))
+                     (assoc equation :operations [certified])))))))
+         (get-in reference [:program :equations]))
+        kernels (into (:kernels reference) @new-kernels)]
+    {:program (emitted-program/validate! (assoc (:program reference) :equations equations))
+     :kernels kernels
+     :stats (assoc (:stats reference)
+                   :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
+                   :contraction-dispatches (count @new-kernels)
+                   :contraction-candidate-declines (get @declines :admission {})
+                   :contraction-screen-declines (get @declines :screen {}))}))
 
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
@@ -240,10 +305,15 @@
          dispatch-reassociated?
          (= :dispatch-reassociated
             (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
+         dispatch-contractions?
+         (= :dispatch-register-tiled
+            (get-in resolved-schedule [:typed-contraction :strategy]))
          reference-schedule
-         (if dispatch-reassociated?
-           (assoc-in resolved-schedule [:segmented-weighted-reduction :strategy] :reference)
-           resolved-schedule)
+         (cond-> resolved-schedule
+           dispatch-reassociated?
+           (assoc-in [:segmented-weighted-reduction :strategy] :reference)
+           dispatch-contractions?
+           (assoc-in [:typed-contraction :strategy] :portable))
          compiler-options (compiler-options f-var target dtype
                                             (-> options
                                                 (dissoc :target :gemm-precision)
@@ -294,6 +364,13 @@
               (function-symbol f-var) resolved-schedule target-descriptor
               reference-emission subgroup-emission))
            reference-emission)
+         emission
+         (if dispatch-contractions?
+           (dispatch-contraction-emissions
+            (function-symbol f-var) emission
+            (assoc compiler-options :target-dialect target-dialect
+                   :schedule resolved-schedule))
+           emission)
          invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
          _ (when-not invocation-plan
              (fail! :equation-first-invocation

@@ -12,6 +12,8 @@
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.abstract-value :as av]
@@ -206,6 +208,23 @@
         (is (= :ordered-k-target-contraction (get-in certificate [:numerics :policy])))
         (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
         (is (= 2 (count (get-in artifact [:launch :workgroup-size]))))))))
+
+(deftest public-contraction-dispatch-emits-both-certified-c-family-alternatives
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile
+                       #'contractions/fixed-matmul
+                       {:target target :dtype :float
+                        :schedule {:typed-contraction {:strategy :dispatch-register-tiled}}})
+          operation (-> compilation :emitted :equations last :operations first)
+          linked (equation-first/lower compilation [(float-array 15) (float-array 21)])]
+      (is (equation-dispatch/emitted-equation-dispatch? operation))
+      (is (= 2 (count (:kernels compilation))))
+      (is (= :register-tiled
+             (executable/strategy (-> linked :instances first :call :steps last :graph))))
+      (doseq [artifact (:kernels compilation)]
+        (is (= artifact
+               (scheduled-body/validate-artifact-projection!
+                (get-in artifact [:provenance :scheduled-operation]) artifact)))))))
 
 (deftest fixed-register-tile-candidate-declines-before-target-emission
   (let [{:keys [node graph facts descriptor options]} (fixed-contraction-site ocl-target)]
