@@ -4494,31 +4494,34 @@
             (:result-storage description)))
     false))
 
+(defn- admitted-description?
+  [physical-outputs description]
+  ;; Ordinary host scalar bindings are opaque control/dataflow boundaries around TypedSOAC
+  ;; islands. Unsupported parallel operations still decline: executing those through a second
+  ;; lowering route inside one program would duplicate semantics.
+  (or (supported-description? physical-outputs description)
+      (and (= :scalar (:kind description))
+           ;; Host control may surround typed islands, but it may not hide a parallel
+           ;; operation that has no equation in this program. Such a leaf must remain
+           ;; on the explicit compatibility/structured-control route until its control
+           ;; scope itself is represented. An ordered scalar before the first
+           ;; parallel equation (for example a checked source cast after an
+           ;; allocation) is a valid host boundary: retaining it at its source
+           ;; position preserves exceptional control transfer. Once device work has
+           ;; occurred, the same scalar remains a decline until the graph represents
+           ;; the required device-to-host sequencing explicitly.
+           (not (contains-parallel-form? (:expr description)))
+           (or (not (requires-ordered-evaluation? (:expr description)))
+               (and (:before-parallel? description)
+                    ;; This value becomes a typed input of the following island. Its
+                    ;; source declaration/metadata must therefore attest the ABI; the
+                    ;; extent use is not permission to guess `long`.
+                    (:scalar-dtype description))))))
+
 (defn- supported-descriptions?
   [descriptions]
   (let [physical-outputs (physical-output-symbols descriptions)]
-    ;; Ordinary host scalar bindings are opaque control/dataflow boundaries around TypedSOAC
-    ;; islands. Unsupported parallel operations still decline: executing those through a second
-    ;; lowering route inside one program would duplicate semantics.
-    (every? #(or (supported-description? physical-outputs %)
-                 (and (= :scalar (:kind %))
-                      ;; Host control may surround typed islands, but it may not hide a parallel
-                      ;; operation that has no equation in this program. Such a leaf must remain
-                      ;; on the explicit compatibility/structured-control route until its control
-                      ;; scope itself is represented.  An ordered scalar before the first
-                      ;; parallel equation (for example a checked source cast after an
-                      ;; allocation) is a valid host boundary: retaining it at its source
-                      ;; position preserves exceptional control transfer.  Once device work has
-                      ;; occurred, the same scalar remains a decline until the graph represents
-                      ;; the required device-to-host sequencing explicitly.
-                      (not (contains-parallel-form? (:expr %)))
-                      (or (not (requires-ordered-evaluation? (:expr %)))
-                          (and (:before-parallel? %)
-                               ;; This value becomes a typed input of the following island.  Its
-                               ;; source declaration/metadata must therefore attest the ABI; the
-                               ;; extent use is not permission to guess `long`.
-                               (:scalar-dtype %)))))
-            descriptions)))
+    (every? #(admitted-description? physical-outputs %) descriptions)))
 
 (defn- copy-allocation-source
   [expression]
@@ -4618,7 +4621,7 @@
           descriptions (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
                                           shape-equalities values)
           physical-outputs (physical-output-symbols descriptions)
-          declined (remove #(supported-description? physical-outputs %) descriptions)
+          declined (remove #(admitted-description? physical-outputs %) descriptions)
           parallel? (some #(not= :scalar (:kind %)) descriptions)]
       (when (and parallel? (seq declined))
         {:reason :typed-soac-source-coverage

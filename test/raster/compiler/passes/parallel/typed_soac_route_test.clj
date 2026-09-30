@@ -678,6 +678,18 @@
 (deftest scalar-only-host-control-does-not-construct-an-empty-typed-program
   (is (nil? (route/attempt '(let* [x 1 y (println x)] y) :float))))
 
+(deftest coverage-diagnostics-share-program-host-boundary-admission
+  (let [source '(let* [mapped (raster.par/pmap i n float
+                                             (* (clojure.core/aget x i) 2.0))
+                       side (println mapped)
+                       result (raster.par/pmap j n float
+                                             (+ (clojure.core/aget mapped j) 1.0))]
+                     result)
+        options {:dtype :float :array-types {'x :float}}]
+    (is (= :typed-soac (:dialect (:program (route/attempt source :float {'x :float})))))
+    (is (nil? (frontend/coverage-decline source options))
+        "admitted host boundaries are not reported as compiler coverage gaps")))
+
 (deftest nested-compatibility-parallel-work-declines-the-whole-typed-route
   (let [source '(let* [mapped (raster.par/pmap i n double
                                                (* (clojure.core/aget x i) 2.0))
