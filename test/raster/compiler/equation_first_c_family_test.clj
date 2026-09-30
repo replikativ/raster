@@ -1187,13 +1187,17 @@
             binds (atom 0)
             executor {:bind! (fn [& _] (swap! binds inc)) :run! identity :release! identity}
             reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
-        (is (= 2 @checks)
-            "constructor checks the program boundary and then its exact equation preparation once")
+        (is (= 1 @checks)
+            "constructor shares the exact program-boundary projection with equation preparation")
+        (with-redefs [emitted-equation/validate!
+                      (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
+          (program-call/validate! forged))
+        (is (= 2 @checks) "later public validation independently rechecks the boundary")
         (reset! checks 0)
         (with-redefs [emitted-equation/validate!
                       (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
           (program-call/make (:program call) (:buffers call) (:scalar-values call) {} nil))
-        (is (= 2 @checks) "empty result views do not cause extra schedule rederivation")
+        (is (= 1 @checks) "empty result views do not cause extra schedule rederivation")
         (reset! checks 0)
         (with-redefs [program-call/validate-equation-call!
                       (fn [step] (swap! checks inc) (checked-step step))]

@@ -189,6 +189,13 @@ mixed-target/exceptional-host-prefix checks add 3 / 12. Both local device availa
 remain asserted. No new external Gemma timing or full-package migration is claimed; full CI
 acceptance remains pending for this constructor follow-up.
 
+The first constructor CI run passed the six non-test gates and found four stale count assertions
+in the existing staged CUDA/HIP contraction regression: each constructor now checks its exact
+plain boundary once, not twice. The test retains result-view, independent step-validation and
+forged-binding coverage, and now explicitly checks that later public call validation performs a
+fresh boundary check. This is an assertion update for the intended preparation change, not a
+relaxation of numerical or binding contracts.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
