@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-ownership :as ownership]
@@ -43,9 +44,12 @@
     (is (= '[sc nrows _n_bound] (mapv :name (:abi kernel))))
     (is (= [:float :long :long] (mapv :dtype (:abi kernel))))
     (is (= [256] (get-in kernel [:launch :workgroup-size])))
-    (is (= [{:value 'rstr_extent_0 :divisor 256}]
-           (mapv #(into {} %) (get-in kernel [:launch :group-count])))
-        "proved source coverage must retain the previously parallel row launch")))
+    (is (= [(launch/maximum 1 (launch/ceil-div 'rstr_extent_0 256))]
+           (get-in kernel [:launch :group-count]))
+        "parallel row mapping retains a masked valid launch for an empty extent")
+    (doseq [[extent groups] [[0 1] [1 1] [256 1] [257 2]]]
+      (is (= [groups] (:group-count
+                       (launch/realize (:launch kernel) (fn [_] extent))))))))
 
 (deftest ownership-proof-declines-cross-row-and-guarded-address-domains
   (let [program (prefill-program)
