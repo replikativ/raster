@@ -185,6 +185,13 @@
   {:arglists '([name [params...] :- RetType & body])}
   [fn-name & args]
   (let [{:keys [params anns ret body]} (parse-defmodel-args args)
+        reserved (set (filter symbol? params))
+        public-args (mapv (fn [index parameter]
+                            (if (symbol? parameter) parameter
+                                (loop [label (symbol (str "arg" index))]
+                                  (if (contains? reserved label)
+                                    (recur (symbol (str label "_"))) label))))
+                          (range) params)
         normalized (pf/normalize-parameter-bindings
                     params anns (if (= 1 (count body)) (first body) (cons 'do body)))
         params (:params normalized)
@@ -226,6 +233,7 @@
                                       (:original-args mm#)
                                       (:treedefs mm#)))
          (alter-meta! (var ~fn-name) assoc
+                      ::public-args '~public-args
                       ::treedefs       (:treedefs mm#)
                       ::flat-var       (var ~flat-name)
                       ::original-args  (:original-args mm#)

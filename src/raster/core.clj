@@ -671,8 +671,7 @@
         ;;   (HVec [...])     — bare HVec annotation
         ;;   (Params <inner>) — back-compat alias; <inner> must be HMap/HVec
         ;; Forward to raster.params/defmodel which owns that machinery. The
-        ;; user namespace must require raster.params for the resolution to
-        ;; succeed (lazy via requiring-resolve at expansion time below).
+        ;; owner is loaded lazily at expansion time; callers need only raster.core.
         tree-head? #{'Params 'HMap 'HVec}
         params-arg? (and (not parametric?)
                          (vector? (first rest-args))
@@ -685,7 +684,9 @@
                                      annotations))))]
     (cond
       params-arg?
-      `(raster.params/defmodel ~fn-name ~@(if docstring (cons docstring rest-args) rest-args))
+      (do
+        (requiring-resolve 'raster.params/defmodel)
+        `(raster.params/defmodel ~fn-name ~@(if docstring (cons docstring rest-args) rest-args)))
       parametric?
       ;; === Parametric deftm: register template + generate concrete double ===
       (do

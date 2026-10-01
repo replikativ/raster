@@ -263,7 +263,7 @@ This is not a general mutable aggregate ownership API or automatic scalar respec
 
 Nominal CSR shape is not a proof of monotonic row pointers, column bounds or consistency between
 nnz and array contents. Those remain numerical input preconditions, not newly claimed compiler
-verification. Nested records, logical HMap public GPU invocation, mixed-record AD reconstruction
+verification. Nested records, mixed-record AD reconstruction
 and writable aggregate donation remain open. Continue the shared declared path projection for
 map/record roots rather than adding a second binder or kernel ABI.
 
@@ -293,10 +293,25 @@ generated flat method through target-neutral TypedSOAC. OpenCL/Level Zero device
 that flat method against the uncompiled structured call, including replay and replacement
 array values. CUDA evidence here is hardware-free source compilation, not native execution.
 
-**Remaining integration:** public `gpu.compiled` does not yet consume the logical HMap wrapper
-directly. Finish its declared path projection alongside mixed scalar/array record projection,
-using InvocationPlan and the existing physical ABI. Do not build another map-specific binder,
-cache, ownership convention or structural overload registry. Dynamic maps inside kernels,
+**Public invocation integration:** equation-first `gpu.compiled` now consumes logical closed
+HMap/HVec wrappers directly. It resolves the existing flat source specialization for numerical
+compilation, while InvocationPlan retains the caller's declared tree paths and canonical leaf
+order. The shared aggregate selector handles record fields and tree paths during materialization
+and replay; no second binder, cache or physical kernel ABI is introduced. Declared numeric scalar
+and primitive-array leaves are supported. Empty trees, nonnumeric leaves and nested record leaves
+remain outside this GPU contract; closed-tree flattening alone does not prove them representable.
+
+Named roots expose semantic keys such as `[:model :buffers 0]`; anonymous destructured parameters
+have stable ordinal labels (`arg0`, etc.), with underscores appended to avoid named-argument
+collisions. Internal source roots remain hygienic gensyms. The prepared descriptor and in-tree
+expose the actual labels, not inferred runtime map keys. Existing explicit HMap syntax is unchanged.
+Whole-root input replacement validates tree shape and identity restrictions before projection,
+and rejects changed captured scalar leaves before uploads/replay. Changing scalar dimensions or
+parameters requires preparing a new invocation. Constant roots cannot be replaced; whole-root
+donation and aggregate writes remain explicit declines. Composition retains qualified leaf inputs
+and strips unqualified root shorthand just as for records.
+
+Dynamic maps inside kernels,
 whole-tree carries and general optional/default semantics remain distinct language capabilities.
 This slice belongs to direct TypedSOAC/compatibility consolidation; the eight-item campaign,
 training/AD consolidation and distributed numerical acceptance remain open.

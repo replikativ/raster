@@ -66,16 +66,42 @@
       (fail! :equation-first-function "equation-first compilation requires a deftm Var"
              {:function f-var}))))
 
+(defn ^:no-doc physical-function
+  "Resolve only the numerical source specialization, preserving the caller's logical boundary."
+  [f-var requested-dtype]
+  (let [source (or (:raster.params/flat-var (meta f-var)) f-var)]
+    (or (rcore/resolve-deftm-var source {:dtype requested-dtype :ambiguity :throw}) source)))
+
 (defn ^:no-doc parameter-representation
   "Declared aggregate representation, shared by compilation and its cache identity."
   [f-var requested-dtype]
-  (let [parameters (pipeline/clean-params (pipeline/get-params f-var requested-dtype))
-        param-env (pipeline/build-param-env f-var requested-dtype)
+  (let [source-var (physical-function f-var requested-dtype)
+        parameters (pipeline/clean-params (pipeline/get-params source-var requested-dtype))
+        param-env (pipeline/build-param-env source-var requested-dtype)
         specs (mapv (fn [sym] {:sym sym :tag (get param-env sym)}) parameters)
-        env (soa-lower/soa-param-env specs {:mixed-products? true})]
+        env (soa-lower/soa-param-env specs {:mixed-products? true})
+        aggregate-projection (soa-lower/parameter-projection
+                              specs env (the-ns (source-namespace-symbol source-var)))
+        physical-by-binding (group-by :binding (:physical-parameters aggregate-projection))
+        metadata (meta f-var)
+        treedefs (:raster.params/treedefs metadata)
+        original (:raster.params/original-args metadata)
+        public (or (:raster.params/public-args metadata) original)
+        tree-projection
+        (when (seq treedefs)
+          (let [labels (zipmap original public)]
+            {:public-parameters public
+             :trees (into {} (map (fn [[root td]] [(get labels root) (:spec td)])) treedefs)
+             :physical-parameters
+             (vec (mapcat (fn [root]
+                            (if-let [td (get treedefs root)]
+                              (mapv (fn [{:keys [sym path]}]
+                                      {:symbol sym :binding (get labels root) :path path
+                                       :tag (get param-env sym)}) (:leaves td))
+                              (or (get physical-by-binding root)
+                                  [{:symbol root :binding root}]))) original))}))]
     {:params specs :soa-env env
-     :projection (soa-lower/parameter-projection specs env
-                                                 (the-ns (source-namespace-symbol f-var)))}))
+     :projection (or tree-projection aggregate-projection)}))
 
 (defn- compiler-options
   [f-var target requested-dtype options]
@@ -328,7 +354,7 @@
      (fail! :equation-first-host-only
             "equation-first GPU compilation was requested for an explicitly host-only deftm"
             {:function (function-symbol f-var) :target target}))
-   (let [resolved-var (or (rcore/resolve-deftm-var f-var {:dtype dtype :ambiguity :throw}) f-var)
+   (let [resolved-var (physical-function f-var dtype)
          _ (when (dispatch/host-only? resolved-var)
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
@@ -358,12 +384,12 @@
            (assoc-in [:typed-contraction :strategy] :portable)
            dispatch-contractions?
            (assoc-in [:typed-contraction :measured-selectors] {}))
-         compiler-options (compiler-options f-var target dtype
+         compiler-options (compiler-options resolved-var target dtype
                                             (-> options
                                                 (dissoc :target :gemm-precision)
                                                 (assoc :schedule reference-schedule
                                                        :target-descriptor target-descriptor)))
-         walked (pipeline/get-walked-body f-var (:dtype compiler-options))
+         walked (pipeline/get-walked-body resolved-var (:dtype compiler-options))
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
          represented-source (pipeline/run-passes
                              source pipeline/gpu-resident-pre-soa-passes compiler-options)
