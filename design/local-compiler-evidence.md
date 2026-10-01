@@ -316,6 +316,26 @@ so its source revision is explicitly unverified even though its version and bina
 This preserves the campaign's correctness/performance distinction; external training migration,
 conservative partial-patch PDE interfaces and real CUDA/HIP execution remain open.
 
+The benchmark guards and raw brackets merged as #960 (`511baa8d`) after all seven gates passed.
+
+### Partial-patch conservative transport — 2026-10-01
+
+The ordinary face-flux/CSR-divergence numerical programs lower through the existing public
+equation-first compiler. A mixed-resolution periodic mesh with twelve coarse cells, sixteen
+fine cells and sixty faces has a genuinely partial refined patch and split interface faces.
+Its independent scatter oracle checks the generated gather path; geometry coverage, timestep
+stability, constant preservation and volume-weighted mass are mandatory host checks.
+Local OpenCL and Level Zero execute four-stage resident programs for three replays without
+intermediate transfers, starting from poisoned scratch/flux arrays. Every replay matches two
+more reference timesteps, and only the donated evolved field escapes. The new fixture passes
+3 tests / 28 assertions; adjacent full-domain refinement and actual mapped-byte continuation
+remain green (combined 9 tests / 78 assertions). These are device executions, not availability skips.
+
+This establishes synchronous conservative interface transport, not general adaptive-mesh
+planning, AMRPlan-to-incidence projection, subcycling/reflux or external time-to-accuracy parity.
+CSR validity and paired incidence signs remain documented caller contracts. No compiler IR,
+emitter, numerical reassociation policy, backend binding or memory/cache convention changed.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
