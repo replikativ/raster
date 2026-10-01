@@ -382,6 +382,26 @@ and periodic 2D geometry; quadratic face enumeration is kept out of the library 
 Patch-field ownership, regridding/remapping, subcycling/reflux, mapped restart across a
 hierarchy change and external accuracy/performance comparison are still open.
 
+All seven final-head gates passed; #963 merged as `3cd16247`.
+
+### Existing sparse-operator admission audit — 2026-10-01
+
+The existing CSR `spmv` gives `[3.0 4.0]` for a two-row JVM oracle, but public equation-first
+lowering declines. Correct-target diagnostic compilation (`:target-device :ocl:0`) locates
+the first array-valued field binding `(.-rowptr A)`. The walked binding already carries
+`ints`; the other index/storage fields retain `ints`/`doubles`, and the dimension retains
+`long`. The scalar-only equation builder lacks a storage projection, not an inferred type.
+The new diagnostic distinguishes this from untyped scalar source without changing admission.
+
+An existing generated-SoA test function also declines in public equation-first compilation,
+while its resident-pipeline test already exercises aggregate scalar replacement. Source
+inspection confirms the public path bypasses the resident parameter-representation pass.
+This motivates sharing that representation producer before widening mixed-record support;
+it is not a reason to add a remap-specific compiler opcode or handwritten sparse kernel.
+The frontend and route suites pass in a clean capped REPL: 188 tests / 1,244 assertions.
+An earlier warm run after recursive namespace reload had stale matrix-record identity errors;
+it is not counted as passing evidence. No new GPU admission or surface semantics is claimed.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
