@@ -50,6 +50,45 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive"
                         (measurement/measure! (constantly 1.0) :budget-ms 0))))
 
+(deftest sampling-options-decline-before-callbacks
+  (let [calls (atom 0)
+        flushes (atom 0)
+        sample #(do (swap! calls inc) 1.0)]
+    (doseq [options [[:cv-threshold -1] [:cv-threshold Double/NaN]
+                     [:cold-warm :unknown] [:timing-source "host"] [:hashes []]
+                     [:compile-ms -1] [:compile-ms Double/POSITIVE_INFINITY]
+                     [:budget-ms Double/POSITIVE_INFINITY]
+                     [:warmup-iterations (inc (bigint Long/MAX_VALUE))]
+                     [:min-samples (inc (bigint Long/MAX_VALUE))]
+                     [:max-samples (inc (bigint Long/MAX_VALUE))]
+                     [:flush-fn 42]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (apply measurement/measure! sample
+                          (concat [:flush-fn #(swap! flushes inc)] options)))))
+    (is (zero? @calls))
+    (is (zero? @flushes))))
+
+(deftest sampling-checks-every-phase-before-continuing
+  (doseq [[phase warmups valid-prefix] [[:warmup 1 0] [:probe 0 0] [:measurement 0 5]]
+          invalid [nil -1 Double/NaN Double/POSITIVE_INFINITY]]
+    (let [calls (atom 0)
+          error (try
+                  (measurement/measure!
+                   #(if (<= (swap! calls inc) valid-prefix) 1000000.0 invalid)
+                   :warmup-iterations warmups :budget-ms 1 :min-samples 1 :max-samples 1)
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= phase (:phase error)))
+      (is (= (inc valid-prefix) @calls)))))
+
+(deftest finite-extreme-budget-remains-callback-bounded
+  (let [calls (atom 0)
+        result (measurement/measure! #(do (swap! calls inc) 1.0)
+                                     :warmup-iterations 0 :budget-ms Double/MAX_VALUE
+                                     :min-samples 1 :max-samples 2)]
+    (is (= 2 (:n result)))
+    (is (= 7 @calls))))
+
 (deftest core-measures-runtime-graphs-with-device-events
   (let [replays (atom 0)
         reads (atom 0)
