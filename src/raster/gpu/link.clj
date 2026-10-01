@@ -887,78 +887,102 @@
        (< (:byte-offset left-view) (bview/byte-end right-view))
        (< (:byte-offset right-view) (bview/byte-end left-view))))
 
-(defn- write-device-array!
+(defn- device-write-facts
   [executable node-id source]
   (let [node (get-in executable [:plan :nodes node-id])
-          _ (when-not node (node-view executable node-id))
-          _ (when-not (value/live? source)
-              (throw (ex-info "cannot write from a consumed or freed DeviceArray"
-                              {:reason :link-device-input-lifetime :node node-id})))
-          _ (when-not (= (:device source) (get-in executable [:plan :target]))
-              (throw (ex-info "DeviceArray target differs from linked executable target"
-                              {:reason :link-device-input-target :node node-id
-                               :source (:device source)
-                               :target (get-in executable [:plan :target])})))
-          source-view (bview/validate-view! (:view source))
-          destination (node-view executable node-id)
-          destination-view (:view destination)
-          _ (when-not (= [(:dtype destination-view) (:shape destination-view)]
-                         [(:dtype source-view) (:shape source-view)])
-              (throw (ex-info "DeviceArray dtype/shape differs from LinkNode"
-                              {:reason :link-device-input-contract :node node-id
-                               :source {:dtype (:dtype source-view) :shape (:shape source-view)}
-                               :destination {:dtype (:dtype destination-view)
-                                             :shape (:shape destination-view)}})))
-          _ (when-not (and (bview/contiguous? source-view)
-                           (bview/contiguous? destination-view))
-              (throw (ex-info "linked DeviceArray writes require contiguous views"
-                              {:reason :link-device-input-layout :node node-id})))
-          session (:session executable)
-          destination-buffer (gpu/buffer session (:key destination))
-          source-buffer (:buffer source)
-          elements (reduce * 1 (:shape destination-view))]
-      (reset! (:output-ready? executable) false)
-      (cond
-        (same-buffer-range? source-buffer source-view destination-buffer destination-view)
-        nil
+        _ (when-not node (node-view executable node-id))
+        _ (when-not (value/live? source)
+            (throw (ex-info "cannot write from a consumed or freed DeviceArray"
+                            {:reason :link-device-input-lifetime :node node-id})))
+        _ (when-not (= (:device source) (get-in executable [:plan :target]))
+            (throw (ex-info "DeviceArray target differs from linked executable target"
+                            {:reason :link-device-input-target :node node-id
+                             :source (:device source)
+                             :target (get-in executable [:plan :target])})))
+        source-view (bview/validate-view! (:view source))
+        destination (node-view executable node-id)
+        destination-view (:view destination)
+        _ (when-not (= [(:dtype destination-view) (:shape destination-view)]
+                       [(:dtype source-view) (:shape source-view)])
+            (throw (ex-info "DeviceArray dtype/shape differs from LinkNode"
+                            {:reason :link-device-input-contract :node node-id
+                             :source {:dtype (:dtype source-view) :shape (:shape source-view)}
+                             :destination {:dtype (:dtype destination-view)
+                                           :shape (:shape destination-view)}})))
+        _ (when-not (and (bview/contiguous? source-view)
+                         (bview/contiguous? destination-view))
+            (throw (ex-info "linked DeviceArray writes require contiguous views"
+                            {:reason :link-device-input-layout :node node-id})))
+        session (:session executable)
+        destination-buffer (gpu/buffer session (:key destination))
+        source-buffer (:buffer source)
+        elements (reduce * 1 (:shape destination-view))]
+    (when (and (not (same-buffer-range? source-buffer source-view destination-buffer destination-view))
+               (overlapping-buffer-range? source-buffer source-view destination-buffer destination-view))
+      (throw (ex-info "linked DeviceArray write has partially overlapping source/destination"
+                      {:reason :link-device-input-overlap :node node-id})))
+    {:session session :destination destination :destination-view destination-view
+     :source-view source-view :source-buffer source-buffer :destination-buffer destination-buffer
+     :elements elements}))
 
-        (overlapping-buffer-range? source-buffer source-view destination-buffer destination-view)
-        (throw (ex-info "linked DeviceArray write has partially overlapping source/destination"
-                        {:reason :link-device-input-overlap :node node-id}))
+(defn- write-device-array!
+  [executable node-id source]
+  (let [{:keys [session destination destination-view source-view source-buffer destination-buffer elements]}
+        (device-write-facts executable node-id source)]
+    (reset! (:output-ready? executable) false)
+    (cond
+      (same-buffer-range? source-buffer source-view destination-buffer destination-view)
+      nil
 
-        (identical? source-buffer destination-buffer)
-        (let [source-resident
-              (gpu/buffer-view session (:key destination)
-                               {:id (:id source-view)
-                                :byte-offset (:byte-offset source-view)
-                                :dtype (:dtype source-view)
-                                :shape (:shape source-view)
-                                :strides (:strides source-view)})]
-          (gpu/copy-range! session source-resident destination {:elements elements}))
+      (identical? source-buffer destination-buffer)
+      (let [source-resident
+            (gpu/buffer-view session (:key destination)
+                             {:id (:id source-view)
+                              :byte-offset (:byte-offset source-view)
+                              :dtype (:dtype source-view)
+                              :shape (:shape source-view)
+                              :strides (:strides source-view)})]
+        (gpu/copy-range! session source-resident destination {:elements elements}))
 
-        :else
-        (let [temporary-key [::device-input (random-uuid)]
-              allocation (:allocation source-view)]
-          (gpu/register-buffer! session temporary-key source-buffer
-                                {:ownership :borrowed
-                                 :allocation-id [::device-input-allocation (random-uuid)]
-                                 :memory-space (:memory-space allocation)
-                                 :coherence (:coherence allocation)
-                                 :alignment (:alignment allocation)})
-          (try
-            (let [source-resident
-                  (gpu/buffer-view session temporary-key
-                                   {:id (:id source-view)
-                                    :byte-offset (:byte-offset source-view)
-                                    :dtype (:dtype source-view)
-                                    :shape (:shape source-view)
-                                    :strides (:strides source-view)})]
-              (gpu/copy-range! session source-resident destination {:elements elements}))
-            (finally
+      :else
+      (let [temporary-key [::device-input (random-uuid)]
+            allocation (:allocation source-view)]
+        (gpu/register-buffer! session temporary-key source-buffer
+                              {:ownership :borrowed
+                               :allocation-id [::device-input-allocation (random-uuid)]
+                               :memory-space (:memory-space allocation)
+                               :coherence (:coherence allocation)
+                               :alignment (:alignment allocation)})
+        (try
+          (let [source-resident
+                (gpu/buffer-view session temporary-key
+                                 {:id (:id source-view)
+                                  :byte-offset (:byte-offset source-view)
+                                  :dtype (:dtype source-view)
+                                  :shape (:shape source-view)
+                                  :strides (:strides source-view)})]
+            (gpu/copy-range! session source-resident destination {:elements elements}))
+          (finally
               ;; Borrowed registrations are detached, never freed.
-              (gpu/free-buffer! session temporary-key)))))
-      (swap! (:pending-inputs executable) disj node-id)
-      executable))
+            (gpu/free-buffer! session temporary-key)))))
+    (swap! (:pending-inputs executable) disj node-id)
+    executable))
+
+(defn validate-write!
+  "Check one input replacement without uploads, copies, registrations or readiness changes.
+   Batch callers preflight all sources before the first mutation. Public write! still validates
+   its own source independently; this is not a retained proof or authorization token."
+  [executable node-id source]
+  (let [executable (ensure-live! executable :validate-write!)]
+    (locking (:lifetime-lock executable)
+      (ensure-live! executable :validate-write!)
+      (ensure-no-output-leases! executable :validate-write!)
+      (if (value/device-array? source)
+        (device-write-facts executable node-id source)
+        (let [node (get-in executable [:plan :nodes node-id])]
+          (when-not node (node-view executable node-id))
+          (link-plan/validate-node-source! node source)))
+      executable)))
 
 (defn write!
   "Initialize or replace one complete contiguous LinkNode from a host value or DeviceArray.

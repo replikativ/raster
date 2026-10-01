@@ -6,6 +6,7 @@
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.link :as link]
             [raster.gpu.value :as value]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]))
@@ -92,6 +93,15 @@
         (is (= :compiled-aggregate-scalar-change
                (reason #(program {:model (assoc changed :offset (float 3))}))))
         (is (= (oracle changed) (vec (value/->host result)))))
+      (let [node (:node (first (filter #(= [:model :buffers 0] (:key %)) (:in-tree prepared))))
+            before (vec (link/download (:executable program) node))
+            invalid (assoc (input 100) :buffers [(float-array (range 100 117)) (float-array 17)])
+            writes (atom 0) original link/write!]
+        (with-redefs [link/write! (fn [& args] (swap! writes inc) (apply original args))]
+          (is (= :link-initializer-dtype (reason #(program {:model invalid})))))
+        (is (zero? @writes))
+        (is (= before (vec (link/download (:executable program) node)))
+            "a later bad leaf must not change an earlier resident input"))
       (let [constant (compiled/instantiate!
                       (compiled/lower #'project-tree! [model (float-array 17) 17]
                                       {:target target :dtype :float :compiler :equation-first

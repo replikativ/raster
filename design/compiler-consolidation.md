@@ -316,6 +316,22 @@ whole-tree carries and general optional/default semantics remain distinct langua
 This slice belongs to direct TypedSOAC/compatibility consolidation; the eight-item campaign,
 training/AD consolidation and distributed numerical acceptance remain open.
 
+### Invocation input batch preflight — 2026-10-01
+
+A reproduced nested-tree invocation exposed a general artifact boundary gap: a wrong second
+buffer dtype was rejected only after uploading the first buffer. The fix belongs to the shared
+LinkNode/DeviceArray input contract, not map or record compilation. `link/validate-write!` checks
+host storage and device liveness, target, layout, shape and range overlap without transfers,
+registrations or readiness mutation. Artifact invocation preflights every dynamic input before
+the first write; profiling and measurement likewise preflight all captured inputs before refresh.
+Public writes still validate independently. No retained proof cache or backend convention is added.
+
+Structural/scalar aggregate checks and donation ownership checks remain separate, preceding batch
+input writes. Native OpenCL and Level Zero oracles verify zero writes on a bad later tree leaf and
+unchanged earlier resident input contents. Host tests also preserve output handles, readiness and
+pending-input state after invalid dtype, length or device-target inputs. This is validation-failure
+atomicity, not rollback of driver failures or a transaction over concurrent caller mutations.
+
 ### Public all-array aggregate invocation — 2026-10-01
 
 The first implementation shares `soa-lower` with equation-first compilation, before TypedSOAC

@@ -215,7 +215,7 @@
   (let [destination-buffer (Object.)
         source-buffer (Object.)
         destination-allocation
-        (bview/allocation {:id :destination :byte-size 16 :memory-space :device
+        (bview/allocation {:id :destination :byte-size 20 :memory-space :device
                            :device :ze:0 :ownership :owned})
         source-allocation
         (bview/allocation {:id :source :byte-size 16 :memory-space :device
@@ -245,6 +245,24 @@
                         (gpu-link/write! executable :destination
                                          (device-array destination-buffer destination-view))))
         (is (empty? @(:pending-inputs executable)))))
+    (testing "device preflight checks compatibility without imports or readiness mutation"
+      (reset! (:output-ready? executable) true)
+      (reset! (:pending-inputs executable) #{:destination})
+      (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
+                    gpu/register-buffer! (fn [& _] (throw (ex-info "preflight imported storage" {})))
+                    gpu/copy-range! (fn [& _] (throw (ex-info "preflight copied storage" {})))]
+        (is (identical? executable
+                        (gpu-link/validate-write! executable :destination
+                                                  (device-array source-buffer source-view))))
+        (is (true? @(:output-ready? executable)))
+        (is (= #{:destination} @(:pending-inputs executable)))
+        (let [overlap (bview/view destination-allocation
+                                  {:dtype :float :shape [4] :byte-offset 4})]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"partially overlapping"
+                                (gpu-link/write! executable :destination
+                                                 (device-array destination-buffer overlap)))))
+        (is (true? @(:output-ready? executable)))
+        (is (= #{:destination} @(:pending-inputs executable)))))
     (testing "a foreign compatible DeviceArray is copied resident-to-resident and detached"
       (reset! (:pending-inputs executable) #{:destination})
       (let [calls (atom [])
@@ -333,9 +351,9 @@
                     {:plan {:instances [{:id instance-id
                                          :descriptor
                                          {:steps [{:convention :contract
-                                                  :artifact {:provenance
-                                                             {:semantic-op :contraction
-                                                              :operation-id :projection}}}
+                                                   :artifact {:provenance
+                                                              {:semantic-op :contraction
+                                                               :operation-id :projection}}}
                                                   {:convention :map
                                                    :artifact
                                                    {:provenance

@@ -1005,3 +1005,11 @@ Existing record, CSR and composition suites remain in the focused acceptance set
 460 assertions pass in the capped warm REPL. This does
 not introduce dynamic map dispatch, record/tree kernel values, aggregate donation, a new AD rule
 or native CUDA/HIP execution; source compilation and device acceptance remain separate evidence.
+
+The input-preflight follow-up reproduces the malformed-later-buffer issue on actual OpenCL:
+one earlier upload succeeded before the bad second dtype declined. Shared LinkNode/DeviceArray
+preflight now makes that count zero. Both local backends verify the earlier resident input is
+unchanged after rejection. Device preflight tests prohibit registrations and copies and retain
+readiness/pending-input state after overlap rejection. The focused link, output-lease,
+composition, tree and record acceptance set passes 52 tests / 373 assertions. This verifies
+validation-failure atomicity, not rollback after an actual driver transfer fails.
