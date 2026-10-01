@@ -239,6 +239,44 @@ the record class name alone.
 Nested aggregates, returning records, aggregate donation and AD over sparse indices must be
 specified and tested independently; none follows from accepting read-only CSR parameters.
 
+### Public all-array aggregate invocation — 2026-10-01
+
+The first implementation shares `soa-lower` with equation-first compilation, before TypedSOAC
+construction. One captured representation environment supplies both the source rewrite and
+ordered physical parameters. The invocation plan retains a checked mapping from declared public
+parameters to physical leaves. Materialization checks the nominal record class, projects only
+its declared fields and delegates each leaf's storage/shape checks to the existing buffer
+materializer. Kernels remain flat typed signatures; KernelABI pointer/scalar rules are unchanged.
+
+The compiled facade accepts the original record in its ordered arguments and in replay input
+maps, e.g. `{:state new-record}`. Semantic leaf keys are `[:state :positions]`, not generated ABI
+names. Capturing a record as `:constant` captures its admitted array leaves. Supplying both a
+record and one of its fields in a replay is rejected. Source-record shorthand is deliberately
+not propagated through composition: composed artifacts keep explicit component/leaf references
+such as `[:component [:state :positions]]`, avoiding collisions between same-named source records.
+The initial facade rejects writes through aggregate fields, donation and whole-record outputs;
+role overrides cannot disguise a write as a read. This does not establish mutable aggregate or
+aggregate-AD semantics. The lower-level compiler still represents array leaves, not record-valued
+outputs or a runtime-owned record.
+
+Declared field order, storage tags and nominal class participate in template identity. Changing
+a relevant declaration changes that identity; unrelated field metadata leaves the projection
+unchanged. A checked synchronous construction reuses already materialized leaf sources for facade
+defaults rather than projecting caller fields again. Flat parameter behavior is preserved.
+
+Native acceptance covers an all-array record containing Float and Int arrays, record replacement,
+captured constants, malformed classes/storage, role/output declines and a generated SoA input with
+an unused Long-array field. The same programs agree with their JVM/independent oracles on OpenCL
+and Level Zero and lower without driver allocations. CUDA source compilation is checked separately,
+not presented as CUDA device execution. Existing resident SoA and invocation/composition tests
+remain required. The optional WASM runtime is absent from the lean local REPL; its full tests stay
+in CI, whose test alias includes Chicory.
+
+Mixed scalar/array records (CSR), nested aggregates, returned records and per-field mutable
+ownership remain next steps. This oracle uses let-bound primitive-array field reads: a direct
+nested core `aget` of a record field exposed an existing JVM Object-array cast gap during the
+probe and is retained as a separate front-end language-coverage follow-up, not claimed fixed.
+
 ### Public training boundary follow-up
 
 The full existing tiny Gemma/LoRA forward/reverse-AD/SGD program was probed through

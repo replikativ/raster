@@ -402,6 +402,26 @@ The frontend and route suites pass in a clean capped REPL: 188 tests / 1,244 ass
 An earlier warm run after recursive namespace reload had stale matrix-record identity errors;
 it is not counted as passing evidence. No new GPU admission or surface semantics is claimed.
 
+All seven final-head gates passed; #964 merged as `9888c474`.
+
+### Public aggregate projection acceptance — 2026-10-01
+
+Equation-first compilation now invokes the existing aggregate representation pass with one
+captured environment. A checked invocation attribute retains the original caller order and
+declared array leaves; facade descriptors retain logical parameter names and replay accepts a
+new logical record. Generated target signatures are still plain pointers/scalars, not records.
+The retained projection also participates in source specialization identity.
+
+Local OpenCL and Level Zero execute an all-array Float/Int record program and a generated SoA
+input, including an unused field. JVM/independent comparisons, record replacement, constants,
+wrong-class/storage and write/donation declines are checked. Lowering allocates zero driver
+buffers. Adjacent invocation, public composition/cache and resident-SoA checks pass together:
+32 tests / 210 assertions. The lean REPL does not include Chicory, so optional WASM execution is
+delegated to the full CI alias rather than reported as a local pass.
+
+This is a flat read-only aggregate facade boundary, not mixed CSR, nested aggregates, mutable
+aggregate ownership, record-valued outputs, arbitrary record AD or vendor device evidence.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

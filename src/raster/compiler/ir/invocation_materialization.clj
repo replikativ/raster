@@ -256,6 +256,42 @@
                {:program-value program-value :invocation-value invocation-value})))
     materialization))
 
+(defn aggregate-field
+  "Read one declared field after checking the logical argument's nominal class."
+  [argument binding class-name field]
+  (when-not (= class-name (some-> argument class .getName))
+    (fail! :invocation-materialization-aggregate-class
+           "aggregate argument differs from its declared class"
+           {:parameter binding :expected class-name :actual (some-> argument class .getName)}))
+  (try
+    (let [f (.getField (class argument) (clojure.lang.Compiler/munge (name field)))]
+      (.get ^java.lang.reflect.Field f argument))
+    (catch java.lang.ReflectiveOperationException error
+      (fail! :invocation-materialization-aggregate-field
+             "aggregate argument has no declared physical field"
+             {:parameter binding :field field :class class-name}))))
+
+(defn- project-parameter-arguments
+  [plan arguments]
+  (let [projection (get-in plan [:attributes :parameter-projection])
+        public (or (:public-parameters projection) (mapv :symbol (:parameters plan)))
+        arguments (vec arguments)]
+    (when-not (= (count public) (count arguments))
+      (fail! :invocation-materialization-arity "public arguments must follow the declared parameter order"
+             {:parameters public :expected (count public) :actual (count arguments)}))
+    (if-not projection arguments
+      (let [values (zipmap public arguments)]
+        (mapv (fn [{:keys [binding field] class-name :class}]
+                (let [argument (get values binding)]
+                  (if-not field argument (aggregate-field argument binding class-name field))))
+              (:physical-parameters projection))))))
+
+(defn parameter-arguments
+  "Project declared aggregate fields at the public invocation boundary.
+   Flat callers retain their original argument order. This evaluates no source expressions."
+  [plan arguments]
+  (project-parameter-arguments (invocation/validate-parameter-projection! plan) arguments))
+
 (defn materialize
   "Specialize `plan` against ordered public `arguments` without allocating device resources.
 
@@ -265,12 +301,7 @@
    aliases are interpreted from structured invocation records."
   [plan arguments evaluate-scalar]
   (let [plan (invocation/validate! plan)
-        arguments (vec arguments)]
-    (when-not (= (count (:parameters plan)) (count arguments))
-      (fail! :invocation-materialization-arity
-             "public arguments must follow the InvocationPlan parameter order"
-             {:parameters (mapv :symbol (:parameters plan))
-              :expected (count (:parameters plan)) :actual (count arguments)}))
+        arguments (project-parameter-arguments plan arguments)]
     (let [parameter-pairs (mapv vector (:parameters plan) arguments)
           scalar-values
           (into {}

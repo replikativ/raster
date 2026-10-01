@@ -9,6 +9,8 @@
    allocation, views, ownership, and transfers remain the job of LinkPlan lowering."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -182,6 +184,45 @@
                  {:step id :source (:source step) :value value}))))
     (conj available id)))
 
+(defn validate-parameter-projection!
+  "Check the logical caller boundary against the invocation's ordered physical parameters."
+  [plan]
+  (when-let [{:keys [public-parameters physical-parameters] :as projection}
+             (get-in plan [:attributes :parameter-projection])]
+    (when-not (and (= #{:public-parameters :physical-parameters} (set (keys projection)))
+                   (distinct-vector? public-parameters) (every? symbol? public-parameters)
+                   (vector? physical-parameters)
+                   (= (mapv :symbol (:parameters plan)) (mapv :symbol physical-parameters))
+                   (= public-parameters (vec (distinct (map :binding physical-parameters)))))
+      (fail! :invocation-parameter-projection "aggregate projection differs from parameter order"
+             {:projection projection :parameters (:parameters plan)}))
+    (doseq [[leaf parameter] (map vector physical-parameters (:parameters plan))]
+      (let [{:keys [symbol binding field tag] class-name :class} leaf
+            array-tag? (types/array-tag? tag)
+            retained-dtype (dtype/dtype-for-scalar-tag
+                            (if array-tag? (types/array-tag->cast tag) tag))]
+        (when-not (and (symbol? symbol) (symbol? binding)
+                       (= (set (keys leaf))
+                          (if field #{:symbol :binding :field :class :tag}
+                              #{:symbol :binding}))
+                       (if field
+                         (and (keyword? field) (string? class-name) (seq class-name) array-tag?)
+                         (= symbol binding))
+                       (or (nil? field)
+                           (and retained-dtype
+                                (= (dtype/canon retained-dtype) (dtype/canon (get-in parameter [:value :dtype])))
+                                (= array-tag? (boolean (seq (get-in parameter [:value :shape])))))))
+          (fail! :invocation-parameter-projection "aggregate leaf differs from its retained storage contract"
+                 {:leaf leaf :parameter parameter}))))
+    (doseq [[binding leaves] (group-by :binding physical-parameters)]
+      (when-not (or (and (= 1 (count leaves)) (nil? (:field (first leaves))))
+                    (and (every? :field leaves)
+                         (= 1 (count (distinct (map :class leaves))))
+                         (= (count leaves) (count (distinct (map :field leaves))))))
+        (fail! :invocation-parameter-projection "aggregate leaves require unique fields and one declared class"
+               {:binding binding :leaves leaves}))))
+  plan)
+
 (defn validate!
   [plan]
   (when-not (invocation-plan? plan)
@@ -208,6 +249,7 @@
                "public parameter differs from the invocation value table"
                {:parameter parameter :table (get values id)}))
       (av/validate! value))
+    (validate-parameter-projection! plan)
     (let [available (binding [util/*shadowing-locals*
                              (into util/*shadowing-locals*
                                    (map :symbol (concat parameters steps)))]

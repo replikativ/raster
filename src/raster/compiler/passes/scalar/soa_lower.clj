@@ -111,6 +111,29 @@
                        fields)))
         soa-env))
 
+(defn parameter-projection
+  "Retain the logical caller order and declared physical leaves of aggregate parameters.
+   Resolve declared classes in the source namespace; no runtime value supplies type facts."
+  [param-specs soa-env source-ns]
+  (when (seq soa-env)
+    (let [physical
+          (vec (mapcat
+                (fn [{:keys [sym tag]}]
+                  (if-let [{:keys [fields]} (get soa-env sym)]
+                    (let [cls (binding [*ns* source-ns] (types/resolve-type-ref->class tag))]
+                      (when-not cls
+                        (throw (ex-info "aggregate parameter requires a resolved declared class"
+                                        {:reason :aggregate-parameter-class :parameter sym :tag tag})))
+                      (mapv (fn [{:keys [name array-tag]}]
+                              {:symbol (field-arr-sym sym name) :binding sym
+                               :field (field-id name) :class (.getName ^Class cls)
+                               :tag array-tag}) fields))
+                    [{:symbol sym :binding sym}])) param-specs))]
+      (when-not (= (count physical) (count (distinct (map :symbol physical))))
+        (throw (ex-info "aggregate physical parameter names collide"
+                        {:reason :aggregate-parameter-collision :physical physical})))
+      {:public-parameters (mapv :sym param-specs) :physical-parameters physical})))
+
 (defn- local-name [head] (let [s (str head)] (subs s (inc (.lastIndexOf s "/")))))
 
 (defn- constructor->scalar-tag
@@ -201,7 +224,8 @@
     ;; (.field x) where x explodes → the field expr
     (and (seq? form) (field-access-head? (first form)))
     (let [ex (explode ctx (second form))
-          fname (subs (str (first form)) 1)]
+          head (str (first form))
+          fname (subs head (if (.startsWith head ".-") 2 1))]
       (if (and ex (contains? ex fname))
         (get ex fname)
         (relist form (map #(lower ctx %) form))))     ; non-value-type field access → recurse
@@ -309,8 +333,9 @@
   "Expand SoA/array-bundle params and scalar-replace value-type access.
    Returns {:body body' :params param-specs' :soa-expansion {soa-sym → info}}.
    No-op when no physical-product params are present."
-  [body param-specs]
-  (let [soa-env (soa-param-env param-specs)]
+  ([body param-specs]
+   (soa-lower body param-specs (soa-param-env param-specs)))
+  ([body param-specs soa-env]
     (if (empty? soa-env)
       {:body body :params param-specs :soa-expansion {}}
       {:body          (lower-body soa-env body)
