@@ -180,6 +180,47 @@
 ;; Semantics preservation: eval before/after merge
 ;; ================================================================
 
+(deftest branch-selected-arrays-remain-live-and-keep-their-size
+  (doseq [choose-a [true false]
+          wrapper [:direct :do :unknown-call :local :loop]
+          escape? [true false]]
+    (let [hoisted #(with-meta % {:raster.buffer/hoistable true})
+          selection (list 'if choose-a 'aa 'bb)
+          selection (case wrapper
+                      :direct selection
+                      :do (list 'do selection)
+                      :unknown-call (list 'if choose-a '(identity aa) '(identity bb))
+                      :local (list 'let* '[q aa] (list 'if choose-a 'q 'bb))
+                      :loop (list 'loop* '[q aa] (list 'if choose-a 'q 'bb)))
+          source (list 'let*
+                       [(hoisted 'a) '(double-array 1)
+                        (hoisted 'b) '(double-array 2)
+                        'wa '(aset a 0 11.0) 'wb '(aset b 0 22.0)
+                        'aa 'a 'bb 'b 'selected selection 'alias 'selected
+                        (hoisted 'c) '(double-array 3) 'wc '(aset c 0 33.0)]
+                       (if escape? 'alias '(aget alias 0)))
+          optimized (:form (mem-merge/merge-memory-blocks source))
+          before (eval source)
+          after (eval optimized)]
+      (if escape?
+        (do (is (= (alength ^doubles before) (alength ^doubles after)))
+            (is (= (vec before) (vec after))))
+        (is (= before after))))))
+
+(deftest branch-protection-does-not-disable-unrelated-reuse
+  (let [hoisted #(with-meta % {:raster.buffer/hoistable true})
+        source (list 'let*
+                     [(hoisted 'a) '(double-array 1) 'wa '(aset a 0 11.0)
+                      'selected '(if true a nil) 'r '(aget selected 0)
+                      (hoisted 'd) '(double-array 1) 'wd '(aset d 0 22.0)
+                      'rd '(aget d 0)
+                      (hoisted 'e) '(double-array 1) 'we '(aset e 0 33.0)
+                      're '(aget e 0)]
+                     '(+ r re))
+        {:keys [form stats]} (mem-merge/merge-memory-blocks source)]
+    (is (= 44.0 (eval source) (eval form)))
+    (is (< (:colors stats) (:blocks stats)))))
+
 (deftest merge-preserves-semantics
   (testing "mem-merge preserves eval semantics for non-overlapping buffers"
     (let [form (list 'let*

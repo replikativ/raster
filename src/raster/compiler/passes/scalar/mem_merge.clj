@@ -334,6 +334,28 @@
                               [sym info]))))
                       pairs))
           alloc-syms-all (set (keys alloc-infos))
+          ;; A selected branch result is a MAY-alias, not the single MUST-alias
+          ;; assumed by the straight-line liveness analysis below. Keep every allocation
+          ;; feeding such a result private, including through intermediate aliases.
+          ;; This intentionally gives up reuse until control-aware alias/escape proofs
+          ;; are available; choosing one arm can otherwise recycle a still-live array.
+          branch-used-bufs
+          (let [dependencies (into {} (map (fn [[s expr]] [s (free-syms expr)]) pairs))
+                branch-uses
+                (apply set/union #{}
+                       (for [expr (concat (map second pairs) body-exprs)
+                             :when (some #(and (seq? %) (= 'if (first %)))
+                                         (tree-seq coll? seq expr))]
+                         ;; Include enclosing let/loop initializers: branch-local names
+                         ;; alone do not expose the allocation feeding their carries.
+                         (free-syms expr)))
+                reachable (loop [seen #{} pending branch-uses]
+                            (if (empty? pending)
+                              seen
+                              (let [seen (set/union seen pending)
+                                    next (apply set/union #{} (map #(get dependencies % #{}) pending))]
+                                (recur seen (set/difference next seen)))))]
+            (set/intersection alloc-syms-all reachable))
           ;; Exclude buffers that are returned (referenced in body expression).
           ;; Returned buffers must keep their exact size — merging with a larger
           ;; buffer would expose extra elements to the caller.
@@ -376,7 +398,7 @@
                        :let [root (resolve-buf arg)]
                        :when root]
                    root)))
-          alloc-syms (set/difference alloc-syms-all returned-bufs opaque-used-bufs)]
+          alloc-syms (set/difference alloc-syms-all returned-bufs opaque-used-bufs branch-used-bufs)]
       (if (< (count alloc-syms) 2)
         {:form let-form :stats {:blocks (count alloc-syms-all) :colors (count alloc-syms-all) :bytes-saved 0}}
         ;; 2. Liveness analysis

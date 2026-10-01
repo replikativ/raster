@@ -1,5 +1,21 @@
 # Local compiler evidence — 2026-09-27
 
+## Consolidation diagnostic — 2026-10-01
+
+The existing public equation-first GEMM canary executed `[32 32 32]`, strict FP32,
+`:portable`, on local `:ocl:0`. Independent dyadic-reference comparisons before and after
+measurement passed; one generated kernel was retained. The explicit revision label was
+`d96a29e1+branch-lifetime-candidate`, with varying background load recorded in the environment
+identity. Preparation was 1.524 s and binding 1.780 s (host monotonic clocks). The device-event
+sample median was 38,229 ns over 91 samples, CV 0.439: **nonstationary**. Transfers and numerical
+validation were outside the timed span. This is an executed correctness/measurement-path
+diagnostic, not a baseline, throughput claim, comparison against BLAS or schedule promotion.
+
+The proof audit separately reproduced a source/JVM branch-alias reuse failure (original 11.0,
+optimized 33.0). The conservative follow-up tests both branches, nested let/loop/do results,
+unknown-call returns, transitive aliases, escaped array sizes and unrelated reuse. GPU memory
+reuse evidence does not supersede this distinct source/JVM analysis.
+
 ## Current pretrained consumer and native batch layout — 2026-09-30
 
 An isolated snapshot of pretrained-rstr main `98bad4d3517ec05a3c495f019c80d8c553db02af`
