@@ -1158,6 +1158,11 @@
                        entries))))) inputs
    (group-by :aggregate-binding (filter :aggregate-binding in-tree))))
 
+(defn- preflight-inputs!
+  [executable input-nodes inputs]
+  (doseq [{:keys [key node default]} input-nodes]
+    (gpu-link/validate-write! executable node (get inputs key default))))
+
 (defn- invoke-compiled-unleased
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
      1. preflight all donations before any mutation;
@@ -1184,6 +1189,9 @@
                               {:key k :inputs (keys inputs)}))))
         ;; 1. An invalid later adapter must not consume an earlier handle or write inputs.
         checked-donations (checked-donations executable in-nodes donated inputs)
+        ;; A malformed later input must not upload an earlier one. Reuse the LinkNode and
+        ;; DeviceArray contracts, including liveness, exact ranges and portable overlap rules.
+        _ (preflight-inputs! executable input-nodes inputs)
         ;; 2. Every dynamic input is refreshed on every invocation, preserving the resident-program
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
@@ -1296,6 +1304,7 @@
 
 (defn- refresh-captured-inputs!
   [^Compiled c]
+  (preflight-inputs! (:executable c) (filterv #(= :input (:role %)) (:in-tree c)) {})
   (doseq [{:keys [node role default]} (:in-tree c) :when (= :input role)]
     (gpu-link/write! (:executable c) node default))
   c)

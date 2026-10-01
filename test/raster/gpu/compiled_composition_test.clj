@@ -56,6 +56,42 @@
     (is (zero? @replays))
     (is (true? @(:output-ready? executable)))))
 
+(deftest invalid-later-input-does-not-write-earlier-input-or-invalidate-output
+  (let [view (bview/view
+              (bview/allocation {:id :input :byte-size 16 :memory-space :device
+                                 :device :ze:0 :ownership :owned})
+              {:dtype :float :shape [4]})
+        buffer {:id :input :dtype :float :n-elements 4 :byte-size 16}
+        old-output (value/wrap-external-view buffer :ze:0 view)
+        foreign-view (assoc-in view [:allocation :device] :cuda:0)
+        foreign (value/wrap-external-view buffer :cuda:0 foreign-view)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :input-preflight :target :ze:0
+                            :nodes {:a (link-plan/node {:id :a :view view :role :input})
+                                    :b (link-plan/node {:id :b :view view :role :input})}}
+                     :session ::session :closed? (atom false) :lifetime-lock (Object.)
+                     :output-leases (atom 0) :pending-inputs (atom #{:a :b})
+                     :output-ready? (atom true) :completed-replays (atom 0)})
+        artifact (compiled/map->Compiled
+                  {:executable executable :target :ze:0 :donated {}
+                   :in-tree [{:key :a :node :a :role :input :default (float-array 4)}
+                             {:key :b :node :b :role :input :default (float-array 4)}]
+                   :out-tree [] :live-outputs (atom [old-output])})
+        writes (atom 0) replays (atom 0)]
+    (with-redefs [gpu-link/write! (fn [& _] (swap! writes inc))
+                  gpu-link/run! (fn [& _] (swap! replays inc))]
+      (doseq [[source expected] [[(int-array 4) :link-initializer-dtype]
+                                 [(float-array 3) :link-initializer-size]
+                                 [foreign :link-device-input-target]]]
+        (is (= expected
+               (try (compiled/invoke-compiled artifact {:b source}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (is (zero? @writes))
+    (is (zero? @replays))
+    (is (value/live? old-output))
+    (is (true? @(:output-ready? executable)))
+    (is (= #{:a :b} @(:pending-inputs executable)))))
+
 (deftest profiling-and-measurement-preflight-leases-before-mutating-inputs-or-outputs
   (let [view (bview/view
               (bview/allocation {:id :output :byte-size 16 :memory-space :device
@@ -64,7 +100,9 @@
         output (value/wrap-external-view
                 {:id :output :dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
         executable (gpu-link/map->LinkedExecutable
-                    {:plan {:id :profile-lease :target :ze:0}
+                    {:plan {:id :profile-lease :target :ze:0
+                            :nodes {:input (link-plan/node {:id :input :dtype :float :shape [4]
+                                                            :device :ze:0 :role :input})}}
                      :session ::session :closed? (atom false) :lifetime-lock (Object.)
                      :output-leases (atom 1) :pending-inputs (atom #{})})
         artifact (compiled/map->Compiled
@@ -247,8 +285,8 @@
     (is (not (link-plan/retained-effect-evidence? nil evidence)))
     (is (not (link-plan/retained-effect-evidence? (:plan forged-plan) evidence)))
     (is (not (link-plan/retained-effect-evidence? (:plan exact)
-                                                 (get-in forged-evidence
-                                                         [:certificate :effect-evidence]))))
+                                                  (get-in forged-evidence
+                                                          [:certificate :effect-evidence]))))
     (with-redefs [link-plan/validate-with-effect-evidence!
                   (fn [_] (throw (ex-info "raw plan validation reached" {})))
                   gpu/make-session
@@ -295,8 +333,8 @@
           calls (atom 0)
           original resident-plan/verify!]
       (with-redefs [resident-plan/verify! (fn [lowering]
-                                           (swap! calls inc)
-                                           (original lowering))]
+                                            (swap! calls inc)
+                                            (original lowering))]
         (is (compiled/prepared?
              (compiled/compose
               (assoc-in request [:components 0 :program] copied))))
