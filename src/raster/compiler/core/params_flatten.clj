@@ -11,6 +11,7 @@
             [clojure.walk :as walk]
             [raster.compiler.core.params :as params]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
 ;; ----------------------------------------------------------------------
@@ -682,7 +683,7 @@
      subsequent leaf accesses resolve through it. If a sub-tree alias is used
      as a value (e.g. passed to a function), assert-no-dangling-tree-refs!
      catches it post-walk."
-  [bindings env walk-fn record-leaf!]
+  [bindings env walk-fn record-leaf! loop-carries?]
   (loop [pairs (partition 2 bindings)
          out []
          e env]
@@ -706,11 +707,10 @@
           ;; (structured view) or (nth flat-source idx) (flat view).
           (and resolved (leaf-spec? (:spec resolved)))
           (let [walked-val (walk-fn bval e)
-                new-e (if (:flat-view resolved)
-                        ;; Flat-view leaf: bsym holds an array reference; no
-                        ;; further structured access is meaningful — don't
-                        ;; track in env.
-                        e
+                new-e (if (or (:flat-view resolved) loop-carries?)
+                        ;; A loop carry can change after initialization; a
+                        ;; flat-view leaf is also not a static tree path.
+                        (dissoc e bsym)
                         (assoc e bsym {:root (:root resolved)
                                        :path (:path resolved)
                                        :spec (:spec resolved)}))]
@@ -724,7 +724,7 @@
 
           :else
           (let [walked-val (walk-fn bval e)]
-            (recur (rest pairs) (conj out bsym walked-val) e))))
+            (recur (rest pairs) (conj out bsym walked-val) (dissoc e bsym)))))
       [out e])))
 
 (defn rewrite-body
@@ -753,6 +753,11 @@
                                        (not (scan-vec-form? form)))
                               (splice-cross-deftm-call form env))]
                 (cond
+                  ;; Binding names and quoted data are not tree accesses. In
+                  ;; particular, a function parameter can shadow a leaf alias.
+                  (and (seq? form) (= 'quote (first form)))
+                  form
+
                   ;; tree/walk! form: expand into per-leaf calls, then walk the result
                   (walk-form? form)
                   (walk (expand-walk-form form env) env)
@@ -791,7 +796,8 @@
                   (bound-form? form)
                   (let [[op bindings & body-forms] form
                         [new-bindings new-env]
-                        (update-let-env bindings env walk record-leaf!)
+                        (update-let-env bindings env walk record-leaf!
+                                        (contains? #{'loop 'loop*} op))
                         walked-body (map #(walk % new-env) body-forms)
                         spliced-body (mapcat (fn [f]
                                                (if (splice-statements? f)
@@ -799,6 +805,26 @@
                                                  [f]))
                                              walked-body)]
                     (apply list op (vec new-bindings) spliced-body))
+
+                  ;; Other binding forms use the shared scope authority rather
+                  ;; than treating their binding vectors as value expressions.
+                  (form/scope-info form)
+                  (let [{:keys [scopes outer rebuild rec? sequential?]} (form/scope-info form)]
+                    (rebuild
+                     (mapv (fn [{:keys [binders inits body aux] :as scope}]
+                             (let [local-env (apply dissoc env binders)
+                                   inits' (if sequential?
+                                            (second
+                                             (reduce (fn [[e out] [binder init]]
+                                                       [(dissoc e binder) (conj out (walk init e))])
+                                                     [env []] (map vector binders inits)))
+                                            (mapv #(walk % (if rec? local-env env)) inits))]
+                               (cond-> (assoc scope
+                                              :inits inits'
+                                              :body (mapv #(walk % local-env) body))
+                                 aux (assoc :aux (mapv #(walk % local-env) aux)))))
+                           scopes)
+                     (mapv #(walk % env) outer)))
 
                 ;; Generic seq: recurse
                   (seq? form)
@@ -1014,6 +1040,97 @@
   (or (params-marker? annotation)
       (hmap-spec? annotation)
       (hvec-spec? annotation)))
+
+(defn normalize-parameter-bindings
+  "Normalize annotated map bindings to symbolic tree roots and static leaf lets.
+  Types and key order still come from the enclosing HMap, never the binding
+  names or runtime values. Supports :keys (including qualified keys), explicit
+  keyword renaming and nested map bindings. Defaults, whole-map aliases and
+  non-keyword map keys are deliberately outside this closed-tree contract."
+  [parameters annotations body]
+  (let [locals (atom #{})
+        bindings (atom [])
+        fail! (fn [binding message data]
+                (throw (ex-info message
+                                (merge {:reason :typed-parameter-destructuring
+                                        :binding binding}
+                                       (select-keys (meta binding) [:line :column])
+                                       data))))]
+    (letfn [(bind! [binding spec source]
+              (cond
+                (symbol? binding)
+                (do
+                  (when (or (namespace binding) (= '& binding) (= ':- binding)
+                            (contains? @locals binding))
+                    (fail! binding "Typed destructuring requires unique unqualified local symbols"
+                           {:local binding}))
+                  (swap! locals conj binding)
+                  (swap! bindings into [binding source]))
+
+                (map? binding)
+                (do
+                  (when-not (hmap-spec? spec)
+                    (fail! binding "Map destructuring requires an enclosing HMap annotation"
+                           {:annotation spec}))
+                  (doseq [[local key] binding]
+                    (if (and (keyword? local) (= "keys" (name local)))
+                      (do
+                        (when-not (and (vector? key) (every? symbol? key)
+                                       (not-any? #{':-} key))
+                          (fail! binding "Use :keys [x y] and annotate the enclosing argument, not individual :keys entries"
+                                 {:directive local :entries key}))
+                        (doseq [entry key]
+                          (let [k (keyword (or (namespace local) (namespace entry))
+                                           (name entry))]
+                            (when-not (contains? (hmap-mandatory spec) k)
+                              (fail! binding "Destructured key is not declared in the HMap"
+                                     {:key k :annotation spec}))
+                            (bind! (with-meta (symbol (name entry)) (meta entry))
+                                   (get (hmap-mandatory spec) k) (list k source)))))
+                      (do
+                        (when-not (and (or (symbol? local) (map? local))
+                                       (keyword? key))
+                          (fail! binding "Closed typed map bindings support :keys, keyword renaming and nested maps; :or/:as/:strs/:syms are not supported"
+                                 {:entry [local key]}))
+                        (when-not (contains? (hmap-mandatory spec) key)
+                          (fail! binding "Destructured key is not declared in the HMap"
+                                 {:key key :annotation spec}))
+                        (bind! local (get (hmap-mandatory spec) key)
+                               (list key source))))))
+
+                :else
+                (fail! binding "Typed parameter bindings must be symbols or annotated maps"
+                       {:annotation spec})))]
+      ;; Seed ordinary parameter names too: a destructured local must not hide
+      ;; a later positional argument, nor may two map parameters share locals.
+      (reset! locals (set (filter symbol? parameters)))
+      (let [roots (mapv (fn [parameter annotation]
+                          (if (symbol? parameter)
+                            parameter
+                            (let [spec (unwrap-params annotation)
+                                  root (gensym "tree_arg__")]
+                              (when-not (hmap-spec? spec)
+                                (fail! parameter "Map parameter destructuring requires an explicit HMap annotation"
+                                       {:annotation annotation}))
+                              (validate-tree-spec! spec)
+                              (bind! parameter spec root)
+                              root)))
+                        parameters annotations)]
+        {:params roots :annotations annotations :binding-locals (vec @locals)
+         :alias-let? (boolean (seq @bindings))
+         :body (if (seq @bindings) (list 'let (vec @bindings) body) body)}))))
+
+(defn elide-destructuring-aliases
+  "Discard only the generated, pure parameter-alias let when the shared scoped
+  free-variable analysis proves none of its locals survive tree rewriting."
+  [prepared-body {:keys [alias-let? binding-locals]}]
+  (if-not (and alias-let? (seq? prepared-body) (= 'let (first prepared-body)))
+    prepared-body
+    (let [body (if (= 3 (count prepared-body))
+                 (nth prepared-body 2) (cons 'do (drop 2 prepared-body)))
+          free (binding [util/*shadowing-locals* (into util/*shadowing-locals* binding-locals)]
+                 (util/free-syms body))]
+      (if (not-any? free (take-nth 2 (second prepared-body))) body prepared-body))))
 
 (defn- collect-symbols
   "Return the set of all symbols that appear anywhere in form."

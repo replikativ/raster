@@ -974,5 +974,13 @@ not an attention-specific inference or emitter rule. Independent weight/sink com
 poisoned output/scratch device buffers are part of the new acceptance tests. General implicit
 materialization/inference auditing and specialization invalidation on namespace reload remain
 consolidation work; these explicit boundaries do not prove that every unannotated form is sound.
+Annotated closed-HMap argument destructuring has a focused local acceptance slice:
+75 tests/204 assertions for shared tree normalization, JVM JIT/AOT execution, reconstructed
+reverse gradients, prior structured-model composition and hardware-free CUDA TypedSOAC source
+compilation. Its generated flat method also passes 2 tests/8 assertions on actual local OpenCL
+and Level Zero, including two replays and changed input-array values against the structured JVM
+oracle. These are not evidence of a logical-map public GPU facade or CUDA native execution;
+those remain explicit obligations in `compiler-consolidation.md` beside mixed record projection.
+
 The broader AD consolidation, external training and distributed numerical acceptance remain
 on the eight-item campaign; this vertical does not replace them.

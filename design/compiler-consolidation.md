@@ -239,6 +239,40 @@ the record class name alone.
 Nested aggregates, returning records, aggregate donation and AD over sparse indices must be
 specified and tested independently; none follows from accepting read-only CSR parameters.
 
+### Annotated map parameter bindings — 2026-10-01
+
+Issue #966's annotations inside `:keys` are not Clojure/Typed Clojure binding syntax.
+The supported surface annotates the enclosing binding:
+
+```clojure
+(deftm squared [{:keys [x]} :- (HMap {:x Double})] :- Double (* x x))
+```
+
+This is source normalization into the existing closed typed-tree path, not a new map
+dispatch system. `:keys`, qualified keyword keys, explicit keyword renaming and nested map
+bindings obtain types from the declared HMap. Canonical leaf order and runtime shape/alias
+checks remain shared with `raster.params`. Missing/extra keys still decline; `:or`, `:as`,
+string/symbol keys and optional/open maps are not admitted by this slice. Inline annotations
+inside `:keys` now fail at macro expansion, not deferred bytecode compilation.
+
+The tree rewriter now respects ordinary local shadowing and changing scalar/array loop carries.
+Other binding forms use the existing `form/scope-info` authority; quoted data stays opaque.
+Only unused generated pure parameter aliases are removed, proved by shared scoped free-variable
+analysis. This avoids making another loop recognizer or type/function registry.
+
+Local evidence covers structured JVM/JIT/AOT calls, reconstructed reverse gradients and the
+generated flat method through target-neutral TypedSOAC. OpenCL/Level Zero device tests compare
+that flat method against the uncompiled structured call, including replay and replacement
+array values. CUDA evidence here is hardware-free source compilation, not native execution.
+
+**Remaining integration:** public `gpu.compiled` does not yet consume the logical HMap wrapper
+directly. Finish its declared path projection alongside mixed scalar/array record projection,
+using InvocationPlan and the existing physical ABI. Do not build another map-specific binder,
+cache, ownership convention or structural overload registry. Dynamic maps inside kernels,
+whole-tree carries and general optional/default semantics remain distinct language capabilities.
+This slice belongs to direct TypedSOAC/compatibility consolidation; the eight-item campaign,
+training/AD consolidation and distributed numerical acceptance remain open.
+
 ### Public all-array aggregate invocation — 2026-10-01
 
 The first implementation shares `soa-lower` with equation-first compilation, before TypedSOAC
