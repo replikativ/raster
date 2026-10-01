@@ -183,7 +183,7 @@
                 (catch UnsupportedOperationException _ false))
       :else false)))
 
-(declare validate-preconditions!)
+(declare validate-checked-preconditions!)
 
 (defn validate!
   "Validate and return a KernelCall. This is driver-independent: a backend subsequently checks
@@ -217,11 +217,10 @@
                       {:kernel-name (:kernel-name artifact)
                        :expected (:shared-memory-bytes spec)
                        :actual (:shared-memory-bytes geometry)})))
-    (validate-preconditions! artifact arguments)
+    (validate-checked-preconditions! artifact arguments)
     (validate-body-launch! artifact geometry)
     (doseq [[slot value] (map vector abi arguments)]
-      (if (= :scalar (:kind slot))
-        (validate-scalar-value! slot value)
+      (when-not (= :scalar (:kind slot))
         (do
           (when (nil? value)
             (throw (ex-info "kernel pointer argument cannot be nil"
@@ -255,12 +254,11 @@
                              :value compiler-value :indexes (vec indexes) :values values})))
           (first values))))))
 
-(defn validate-preconditions!
-  "Validate scalar representations and executable constraints without requiring resident pointers.
-  Used by direct calls and graph preflight before temporary allocation."
+(defn- validate-checked-preconditions!
+  "Check scalars/constraints within one synchronous already-validated artifact/ABI boundary.
+   No proof is retained or accepted from callers. Public entry points validate independently."
   [artifact arguments]
-  (let [artifact (kart/validate! artifact)
-        arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+  (do
     (doseq [[slot compiler-value value] (map vector (:abi artifact) (:arguments artifact) arguments)
             :when (= :scalar (:kind slot))]
       (validate-scalar-value! slot value)
@@ -274,6 +272,14 @@
                         (map vector (:abi artifact) arguments))]
       (precondition/check! (:preconditions artifact) scalars))))
 
+(defn validate-preconditions!
+  "Validate scalar representations and executable constraints without requiring resident pointers.
+  Used by direct calls and graph preflight before temporary allocation."
+  [artifact arguments]
+  (let [artifact (kart/validate! artifact)
+        arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+    (validate-checked-preconditions! artifact arguments)))
+
 (defn realize-launch
   "Realize an artifact's launch from a complete ABI-ordered runtime argument vector.
 
@@ -284,7 +290,7 @@
   [artifact arguments]
   (let [artifact (kart/validate! artifact)
         arguments (kabi/validate-arguments! (:abi artifact) arguments)
-        _ (validate-preconditions! artifact arguments)
+        _ (validate-checked-preconditions! artifact arguments)
         geometry (klaunch/realize (:launch artifact) (argument-resolver artifact arguments))]
     (validate-body-launch! artifact geometry)))
 
@@ -316,7 +322,7 @@
          arguments (kabi/validate-arguments! (:abi artifact) arguments)
          ;; Extent/range checks precede launch realization.  Otherwise a negative bound can first
          ;; fail as an incidental zero-sized grid—or, for a clamped schedule, realize a valid grid.
-         _ (validate-preconditions! artifact arguments)
+         _ (validate-checked-preconditions! artifact arguments)
          resolver (or resolve-value (argument-resolver artifact arguments))
          ;; An override replaces the group vector; check its final geometry below, not the
          ;; unused default grid. Staging callers of realize-launch have no such override.

@@ -42,6 +42,14 @@ shadowing or quoted forms. This is not complete alias analysis and does not just
 the pass or weakening the independent LinkPlan proofs. A suspected separate peephole issue did
 not reproduce and is not claimed as a defect here.
 
+The next covered duplication is synchronous KernelCall admission. Scalar-precondition checks
+now have one private helper for locally checked artifact/argument values; direct call validation,
+launch realization and public scalar preflight retain fresh independent checks at their entry.
+Construction still performs its own preflight and final call validation. Scalar range/literal
+specialization, ordered guards, alias/alignment and geometry checks remain intact. No retained
+proof, cache or new representation is introduced. Count regressions distinguish one checked
+boundary from construction's two, and malformed arguments still fail public validation.
+
 Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/HIP
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.

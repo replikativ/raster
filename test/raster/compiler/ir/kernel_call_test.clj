@@ -27,6 +27,40 @@
 (def ^:private args
   [:resident-x :resident-out {:type :float :value 2.0} {:type :int :value 513}])
 
+(deftest checked-preconditions-do-not-repeat-synchronous-artifact-validation
+  (let [call (kcall/make artifact args)
+        validations (atom 0)
+        scalars (atom 0)
+        validate-artifact kart/validate!
+        validate-scalar kcall/validate-scalar-value!]
+    (with-redefs [kart/validate! (fn [value] (swap! validations inc) (validate-artifact value))
+                  kcall/validate-scalar-value! (fn [slot value]
+                                               (swap! scalars inc)
+                                               (validate-scalar slot value))]
+      (doseq [check [#(kcall/validate! call)
+                     #(kcall/realize-launch artifact args)
+                     #(kcall/validate-preconditions! artifact args)
+                     #(kcall/validate! call)]]
+        (reset! validations 0)
+        (reset! scalars 0)
+        (check)
+        (is (= 1 @validations) "each public entry starts a fresh artifact check")
+        (is (= 2 @scalars) "each physical scalar is still checked once"))
+      (reset! validations 0)
+      (reset! scalars 0)
+      (kcall/make artifact args)
+      (is (= 2 @validations) "construction retains independent final call validation")
+      (is (= 4 @scalars))
+      (doseq [bad [(pop args) (seq args)]
+              check [#(kcall/realize-launch artifact bad)
+                     #(kcall/validate-preconditions! artifact bad)
+                     #(kcall/validate! (assoc call :arguments bad))]]
+        (is (thrown? clojure.lang.ExceptionInfo (check))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kcall/validate-preconditions! (assoc artifact :abi []) args)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kcall/validate! (assoc call :arguments (assoc args 3 {:type :int :value 1.5}))))))))
+
 (deftest scalar-preconditions-cannot-be-bypassed-by-direct-calls-or-launch-overrides
   (let [constrained (assoc artifact :preconditions [{:expression 'n :op :>= :value 64}
                                                    {:expression 'n :op :<= :value 1024}])
