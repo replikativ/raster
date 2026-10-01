@@ -40,6 +40,35 @@
         index (dec (long (Math/ceil (* (double p) n))))]
     (double (nth sorted-samples (max 0 (min (dec n) index))))))
 
+(defn- validate-summary-options!
+  [cv-threshold warmup-iterations budget-ms cold-warm timing-source compile-ms hashes]
+  (when-not (finite-nonnegative? cv-threshold)
+    (throw (ex-info "measurement cv-threshold must be finite and non-negative"
+                    {:cv-threshold cv-threshold})))
+  (when-not (and (integer? warmup-iterations) (<= 0 warmup-iterations Long/MAX_VALUE))
+    (throw (ex-info "measurement warmup-iterations must be a bounded non-negative integer"
+                    {:warmup-iterations warmup-iterations})))
+  (doseq [[field value] [[:budget-ms budget-ms] [:compile-ms compile-ms]]]
+    (when-not (finite-nonnegative? value)
+      (throw (ex-info "measurement metadata must be finite and non-negative"
+                      {:field field :value value}))))
+  (when-not (#{:warm :cold} cold-warm)
+    (throw (ex-info "measurement cold-warm must be :warm or :cold"
+                    {:cold-warm cold-warm})))
+  (when-not (keyword? timing-source)
+    (throw (ex-info "measurement timing-source must be a keyword"
+                    {:timing-source timing-source})))
+  (when-not (map? hashes)
+    (throw (ex-info "measurement hashes must be a map" {:hashes hashes}))))
+
+(defn- checked-sample!
+  [sample-fn phase]
+  (let [sample (sample-fn)]
+    (when-not (finite-nonnegative? sample)
+      (throw (ex-info "device sample must be finite, non-negative nanoseconds"
+                      {:sample sample :phase phase})))
+    (double sample)))
+
 (defn summarize
   "Summarize non-empty duration samples (nanoseconds) as a Measurement.
 
@@ -62,17 +91,8 @@
     (when-let [invalid (first (remove finite-nonnegative? samples))]
       (throw (ex-info "measurement samples must be finite, non-negative nanoseconds"
                       {:sample invalid})))
-    (when-not (finite-nonnegative? cv-threshold)
-      (throw (ex-info "measurement cv-threshold must be finite and non-negative"
-                      {:cv-threshold cv-threshold})))
-    (when-not (#{:warm :cold} cold-warm)
-      (throw (ex-info "measurement cold-warm must be :warm or :cold"
-                      {:cold-warm cold-warm})))
-    (when-not (keyword? timing-source)
-      (throw (ex-info "measurement timing-source must be a keyword"
-                      {:timing-source timing-source})))
-    (when-not (map? hashes)
-      (throw (ex-info "measurement hashes must be a map" {:hashes hashes})))
+    (validate-summary-options! cv-threshold warmup-iterations budget-ms cold-warm
+                               timing-source compile-ms hashes)
     (let [n (count samples)
           sorted (vec (sort samples))
           mean (/ (reduce + 0.0 samples) (double n))
@@ -166,26 +186,31 @@
   (doseq [[field value] [[:warmup-iterations warmup-iterations]
                          [:min-samples min-samples]
                          [:max-samples max-samples]]]
-    (when-not (and (integer? value) (not (neg? (long value))))
+    (when-not (and (integer? value) (<= 0 value Long/MAX_VALUE))
       (throw (ex-info "measurement iteration bounds must be non-negative integers"
                       {:field field :value value}))))
-  (when-not (and (number? budget-ms) (pos? (double budget-ms)))
-    (throw (ex-info "measurement budget-ms must be positive" {:budget-ms budget-ms})))
+  (when-not (and (finite-nonnegative? budget-ms) (pos? (double budget-ms)))
+    (throw (ex-info "measurement budget-ms must be finite and positive" {:budget-ms budget-ms})))
   (when (or (zero? (long min-samples)) (< (long max-samples) (long min-samples)))
     (throw (ex-info "measurement requires 0 < min-samples <= max-samples"
                     {:min-samples min-samples :max-samples max-samples})))
+  (validate-summary-options! cv-threshold warmup-iterations budget-ms cold-warm
+                             timing-source compile-ms hashes)
+  (when-not (and (ifn? sample-fn) (or (nil? flush-fn) (ifn? flush-fn)))
+    (throw (ex-info "measurement sample and optional flush callbacks must be callable" {})))
   (dotimes [_ (long warmup-iterations)]
-    (sample-fn))
-  (let [probe (mapv (fn [_] (double (sample-fn))) (range 5))]
-    (when-let [invalid (first (remove finite-nonnegative? probe))]
-      (throw (ex-info "device sample must be finite, non-negative nanoseconds"
-                      {:sample invalid :phase :probe})))
-    (let [estimate (max 1.0 (/ (reduce + 0.0 probe) (double (count probe))))
-          wanted (long (/ (* (double budget-ms) 1.0e6) estimate))
+    (checked-sample! sample-fn :warmup))
+  (let [probe (mapv (fn [_] (checked-sample! sample-fn :probe)) (range 5))]
+    (let [estimate (max 1.0 (reduce + 0.0 (map #(/ % (double (count probe))) probe)))
+          ;; Bound in floating space before conversion: even a finite budget can overflow
+          ;; when converted to nanoseconds. The explicit callback cap still owns admission.
+          wanted (if (>= (/ (* (double budget-ms) 1.0e6) estimate) (double max-samples))
+                   (long max-samples)
+                   (long (/ (* (double budget-ms) 1.0e6) estimate)))
           n (max (long min-samples) (min (long max-samples) wanted))
           samples (mapv (fn [_]
                           (when flush-fn (flush-fn))
-                          (double (sample-fn)))
+                          (checked-sample! sample-fn :measurement))
                         (range n))]
       (summarize samples
                  :cv-threshold cv-threshold

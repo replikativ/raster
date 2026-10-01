@@ -3,6 +3,33 @@
 Status: agreed landing order, 2026-09-27. This is the near-term completion ledger for
 the compiler north star, not another architecture or a replacement for its longer roadmap.
 
+## Four-step consolidation acceptance campaign — 2026-10-01
+
+The original eight-item campaign remains authoritative. Execute these bounded steps locally
+before treating additional backend coverage as compiler completion:
+
+1. Reconcile the support/evidence ledger and retire only demonstrably redundant paths. Public
+   tree invocation (#969), batch write preflight (#970), and resident conservative CSR transfer
+   (#971) are merged with all seven gates green and published through 0.2.1147. These extend
+   declared representation and workload acceptance; they do not establish general language
+   completeness, aggregate AD or competitive performance.
+2. Close shared correctness seams in normalization, AD and storage/lifetime reasoning. Review
+   the existing source/JVM lifetime pass independently of LinkPlan reuse. A narrower GPU proof
+   cannot justify deleting an analysis covering different execution paths. Every fix needs a
+   counterexample plus unchanged valid-case acceptance; uncertain legality must fail closed.
+3. Establish reproducible resident performance evidence using the existing measurement and
+   production-canary infrastructure, not a second benchmarking framework. Report preparation,
+   allocations, transfers and execution separately. Match timing scopes and numerical policies;
+   varying background load permits diagnostic samples, not schedule promotion.
+4. Improve general schedules only from validated matched measurements. Preserve independent
+   numerical oracles and explicit reassociation policies. Record rejected/inapplicable routes;
+   source compilation and native execution remain separate CUDA/HIP evidence.
+
+Pivotal review gates are shared proof/normalization changes and schedule promotion. Focused
+tests run in the capped reusable REPL; full suites and vendor compiler checks run in CI.
+The outstanding AD, external-model, scientific and distributed milestones stay on the original
+campaign rather than becoming implicit claims of this consolidation checkpoint.
+
 Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/HIP
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.
