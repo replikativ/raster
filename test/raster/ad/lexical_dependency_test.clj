@@ -32,6 +32,24 @@
   (is (false? (#'reverse/init-active? '(loop* [x 7.0 y x] y) {'x true})))
   (is (true? (#'reverse/init-active? '(loop* [local x y local] y) {'x true}))))
 
+(deftest reverse-loop-carry-dependence-respects-lexical-scope
+  (doseq [[expression expected]
+          [['(let* [x 7.0] x) []]
+           ['(quote x) []]
+           ['(let* [local x] local) ['acc]]
+           ['(loop* [local x] local) ['acc]]
+           ['(fn* [local] (+ local x)) ['acc]]]]
+    (is (= expected (#'reverse/loop-var-activity
+                      [['acc expression]] ['acc] ['x])) (str expression)))
+  (is (= ['acc] (#'reverse/loop-var-activity
+                  [['acc 0.0]] ['next-value] ['x]
+                  [['next-value '(let* [local x] local)]])))
+  (is (= ['count 'sum] (#'reverse/loop-var-activity
+                        [['count 'x] ['sum 0.0]]
+                        ['count '(+ sum count)] ['x])))
+  (is (= ['acc] (#'reverse/loop-var-activity
+                  [['acc 0.0]] ['count] ['x] [['count 'x]]))))
+
 (deftest reified-residual-captures-use-the-pullbacks-lexical-boundary
   ;; Isolate capture projection from derivative rules. The forward value `saved` occurs
   ;; only as quoted data or a nested local; `needed` and core-named `count` are genuine reads.

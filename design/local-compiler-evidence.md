@@ -37,8 +37,27 @@ medians were 34,166.7 ns and 31,979.2 ns with CV 0.00428 and 0.00335. The latter
 heuristic only; a short sample on the same physical Arc under varying load is not broad performance
 acceptance. No baseline or automatic schedule is promoted. The composed form defines a checked
 extent after the contraction's writes; existing fusion tests deliberately preserve that boundary.
-The already-supported prebound extent form is the next matched acceptance, not permission to
-hoist an unchecked/trapping operation across effects.
+The prebound-extent form was subsequently tested with the same rotating replay protocol. Both
+ordinary composition and explicit epilogue emit one stage on both backends and pass the exact
+oracle on every replay. OpenCL medians were 40,104 / 40,104 ns (CV 0.376 / 0.200); Level Zero
+medians were 37,083 / 54,479 ns (CV 0.443 / 2.27). All four series are nonstationary. This validates
+the existing legally dominated fusion case, not a speedup or permission to hoist checked extents
+across writes.
+
+The existing cooperative RMSNorm canary `[1 640]` also passes its independent numerical oracle
+on both backends. OpenCL preparation/binding were 1.386 / 0.514 s and device median 3,229 ns
+(342 samples, CV 0.585); Level Zero preparation/binding were 0.592 / 0.0468 s and median 12,812.5 ns
+(391 samples, CV 0.168). Transfers and validation remain outside device-event timing. Both
+series are nonstationary despite passing the deliberately loose advisory roofline cliff bound;
+neither is stable performance acceptance or grounds for schedule promotion.
+
+The next normalization audit found a public AD semantic mismatch: a nested let's unused checked
+array read threw in the primal but vanished from `value+grad`, which returned `[4.0 4.0 nil]`.
+The regression now requires both paths to throw on an empty observation array and compares the
+valid primal/gradient with constant observations. Ordered body-statement, sibling-argument and
+first-exception oracles separately cover the hoister; lexical activity tests cover captured and
+shadowed names. These preserve evaluation semantics without promising differentiation of effects
+or expanding general-loop support.
 
 ## Current pretrained consumer and native batch layout — 2026-09-30
 
