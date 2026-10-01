@@ -2,6 +2,70 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.params-flatten :as pf]))
 
+(deftest annotated-map-bindings-use-declared-tree-leaves
+  (let [spec '(HMap :mandatory {:x Double :nested (HMap {:y Long})})
+        normalized (pf/normalize-parameter-bindings
+                    '[{:keys [x] {renamed :y} :nested}] [spec] '(+ x renamed))
+        prepared (pf/prepare-deftm (:params normalized) (:annotations normalized)
+                                   (:body normalized))
+        root (first (:params normalized))]
+    (is (symbol? root))
+    (is (= ['Long 'Double] (:annotations prepared)))
+    (is (= (list 'let ['x (pf/path->sym root [:x])
+                       'renamed (pf/path->sym root [:nested :y])]
+                 (list '+ (pf/path->sym root [:x])
+                       (pf/path->sym root [:nested :y])))
+           (:body prepared))))
+  (let [spec '(HMap {:coordinates/x Double})
+        normalized (pf/normalize-parameter-bindings
+                    '[{:coordinates/keys [x]}] [spec] 'x)
+        root (first (:params normalized))]
+    (is (= (list 'let ['x (list :coordinates/x root)] 'x)
+           (:body normalized))))
+  (testing "symbolic signatures pass through unchanged"
+    (is (= {:params '[x] :annotations '[Double] :body 'x}
+           (select-keys (pf/normalize-parameter-bindings '[x] '[Double] 'x)
+                        [:params :annotations :body])))))
+
+(deftest unsupported-typed-bindings-decline-before-compilation
+  (doseq [[parameters annotations]
+          [['[{:keys [x :- Double]}] '[(HMap {:x Double})]]
+           ['[{:keys [x]}] '[nil]]
+           ['[{:keys [unknown]}] '[(HMap {:x Double})]]
+           ['[{:keys [x] :or {x 0.0}}] '[(HMap {:x Double})]]
+           ['[{:keys [x] :as p}] '[(HMap {:x Double})]]
+           ['[{:keys [x]} x] '[(HMap {:x Double}) Double]]
+           ['[{:keys [x]} {:keys [x]}] '[(HMap {:x Double}) (HMap {:x Double})]]
+           ['[{[x] :items}] '[(HMap {:items (HVec [Double])})]]]]
+    (try
+      (pf/normalize-parameter-bindings parameters annotations 'x)
+      (is false (str "accepted " parameters))
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :typed-parameter-destructuring (:reason (ex-data e))))))))
+
+(deftest destructured-leaf-aliases-respect-shadowing-and-loop-carries
+  (let [spec '(HMap {:x Long})
+        normalize #(let [n (pf/normalize-parameter-bindings '[{:keys [x]}] [spec] %)]
+                     (pf/prepare-deftm (:params n) (:annotations n) (:body n)))
+        shadow (:body (normalize '(let [x 7] x)))
+        carried (:body (normalize '(loop [x x] (if (< x 3) (recur (inc x)) x))))
+        function (:body (normalize '(fn [x] x)))
+        quoted (:body (normalize '(quote x)))]
+    (is (= '(let [x 7] x) (last shadow)))
+    (is (= '(if (< x 3) (recur (inc x)) x) (last (last carried))))
+    (is (= '(fn [x] x) (last function)))
+    (is (= '(quote x) (last quoted)))))
+
+(deftest alias-elision-only-removes-generated-pure-bindings
+  (let [n (pf/normalize-parameter-bindings '[{:keys []}] '[(HMap {})]
+                                           '(let [x (side-effect)] x))]
+    (is (= '(let [x (side-effect)] x)
+           (pf/elide-destructuring-aliases (:body n) n))))
+  (let [n (pf/normalize-parameter-bindings '[{:keys [x]}] '[(HMap {:x Long})] 'x)
+        prepared (pf/prepare-deftm (:params n) (:annotations n) (:body n))]
+    (is (= (pf/path->sym (first (:params n)) [:x])
+           (pf/elide-destructuring-aliases (:body prepared) n)))))
+
 (deftest hmap-mandatory-shapes
   (testing "(HMap :mandatory {...}) form"
     (is (= '{:a Long :b Double}

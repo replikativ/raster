@@ -182,12 +182,12 @@
     (or (:- m) (:typed.clojure/type m))))
 
 (defn param-type-meta
-  "Extract a metadata-form type annotation from a param symbol:
+  "Extract a metadata-form type annotation from a param symbol or map binding:
   `^{:- T} x` or TypedClojure's `^{:typed.clojure/type T} x`.
   Returns the annotation form or nil. This is the Rich-Hickey-suggested
   metadata syntax, an alternative to the inline `x :- T` token form."
   [param]
-  (when (symbol? param)
+  (when (or (symbol? param) (map? param))
     (meta-type-annotation param)))
 
 (defn strip-type-meta
@@ -195,7 +195,7 @@
   leak into generated binding/hint forms downstream. Leaves :tag and any other
   metadata intact."
   [param]
-  (if (and (symbol? param) (meta param))
+  (if (and (or (symbol? param) (map? param)) (meta param))
     (vary-meta param dissoc :- :typed.clojure/type)
     param))
 

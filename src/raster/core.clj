@@ -615,6 +615,14 @@
     (deftm foo [x :- Long] :- Long (* x x))
     (deftm foo [x :- String] (count x))
 
+  Closed typed maps can use ordinary destructuring with an enclosing type:
+
+    (deftm squared [{:keys [x]} :- (HMap {:x Double})] :- Double (* x x))
+
+  The declared tree is flattened before typed dispatch. Annotations inside
+  :keys are not supported; optional keys/defaults and whole-map aliases are
+  outside this closed-tree contract.
+
   Annotations may equivalently be given as metadata (the Rich-Hickey /
   TypedClojure style). A param type goes on the param symbol; the return
   type goes on the arg vector, before it (mirroring Clojure's ^long [x]):
@@ -668,10 +676,13 @@
         tree-head? #{'Params 'HMap 'HVec}
         params-arg? (and (not parametric?)
                          (vector? (first rest-args))
-                         (some (fn [item]
-                                 (and (sequential? item)
-                                      (tree-head? (first item))))
-                               (first rest-args)))]
+                         (let [{:keys [params annotations]}
+                               (types/parse-typed-params (first rest-args))]
+                           (or (some map? params)
+                               (some (fn [annotation]
+                                       (and (sequential? annotation)
+                                            (tree-head? (first annotation))))
+                                     annotations))))]
     (cond
       params-arg?
       `(raster.params/defmodel ~fn-name ~@(if docstring (cons docstring rest-args) rest-args))

@@ -177,13 +177,18 @@
   positional args. The user-facing var accepts the structured args and
   flattens at call time.
 
+  Annotated map bindings also accept :keys, explicit keyword renaming and
+  nested map bindings, e.g. [{:keys [x]} :- (HMap {:x Double})]. Runtime maps
+  must match the declared closed tree, including its unreferenced leaves.
+
   See ns docstring for examples."
   {:arglists '([name [params...] :- RetType & body])}
   [fn-name & args]
   (let [{:keys [params anns ret body]} (parse-defmodel-args args)
-        prepared (pf/prepare-deftm params anns (if (= 1 (count body))
-                                                 (first body)
-                                                 (cons 'do body)))
+        normalized (pf/normalize-parameter-bindings
+                    params anns (if (= 1 (count body)) (first body) (cons 'do body)))
+        params (:params normalized)
+        prepared (pf/prepare-deftm params anns (:body normalized))
         treedefs    (:treedefs prepared)
         ;; The loss stays POSITIONAL — its leaf params are flattened by
         ;; prepare-deftm. (Containerization happens only at the top-level train
@@ -191,7 +196,7 @@
         ;; the JVM arg limit.)
         flat-params (:params prepared)
         flat-anns   (:annotations prepared)
-        flat-body   (:body prepared)
+        flat-body   (pf/elide-destructuring-aliases (:body prepared) normalized)
         flat-name   (symbol (str fn-name "--flat"))
         flat-param-vec (vec (mapcat (fn [p ann]
                                       (if ann [p :- ann] [p]))
