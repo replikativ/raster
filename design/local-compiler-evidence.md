@@ -993,3 +993,15 @@ GPU invocation; the remaining contracts are recorded in `compiler-consolidation.
 
 The broader AD consolidation, external training and distributed numerical acceptance remain
 on the eight-item campaign; this vertical does not replace them.
+
+### Declared tree public invocation — 2026-10-01
+
+Logical HMap wrappers now enter public equation-first GPU lowering directly. The anonymous-map
+and named nested HMap/HVec oracles execute on both actual local OpenCL and Level Zero, compare
+against uncompiled JVM calls, and check replacement buffers, captured scalar rejection and
+untouched previous results after structural/scalar preflight failure. Nested paths, canonical
+leaf order, declaration-tamper rejection and logical-contract cache identity have host tests.
+Existing record, CSR and composition suites remain in the focused acceptance set: 103 tests /
+460 assertions pass in the capped warm REPL. This does
+not introduce dynamic map dispatch, record/tree kernel values, aggregate donation, a new AD rule
+or native CUDA/HIP execution; source compilation and device acceptance remain separate evidence.

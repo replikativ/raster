@@ -8,6 +8,7 @@
    as LinkValues/BufferViews."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -271,6 +272,24 @@
              "aggregate argument has no declared physical field"
              {:parameter binding :field field :class class-name}))))
 
+(defn validate-aggregate!
+  "Validate a declared tree once, before selecting leaves or mutating resident storage."
+  [argument binding tree-spec]
+  (when tree-spec
+    (params-flatten/assert-tree-shape! tree-spec argument)
+    (params-flatten/assert-no-identity-collisions! tree-spec argument))
+  argument)
+
+(defn aggregate-leaf
+  "Read a declared projection selector, without inferring types from runtime contents."
+  [argument {:keys [binding field path] class-name :class}]
+  (cond field (aggregate-field argument binding class-name field)
+        path (get-in argument path)
+        :else argument))
+
+(defn projection-path [leaf]
+  (or (:path leaf) (when-let [field (:field leaf)] [field])))
+
 (defn- project-parameter-arguments
   [plan arguments]
   (let [projection (get-in plan [:attributes :parameter-projection])
@@ -281,9 +300,10 @@
              {:parameters public :expected (count public) :actual (count arguments)}))
     (if-not projection arguments
       (let [values (zipmap public arguments)]
-        (mapv (fn [{:keys [binding field] class-name :class}]
-                (let [argument (get values binding)]
-                  (if-not field argument (aggregate-field argument binding class-name field))))
+        (doseq [[binding spec] (:trees projection)]
+          (validate-aggregate! (get values binding) binding spec))
+        (mapv (fn [{:keys [binding] :as leaf}]
+                (aggregate-leaf (get values binding) leaf))
               (:physical-parameters projection))))))
 
 (defn parameter-arguments

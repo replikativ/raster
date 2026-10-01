@@ -11,6 +11,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.params-flatten :as params-flatten]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -187,9 +188,12 @@
 (defn validate-parameter-projection!
   "Check the logical caller boundary against the invocation's ordered physical parameters."
   [plan]
-  (when-let [{:keys [public-parameters physical-parameters] :as projection}
+  (when-let [{:keys [public-parameters physical-parameters trees] :as projection}
              (get-in plan [:attributes :parameter-projection])]
-    (when-not (and (= #{:public-parameters :physical-parameters} (set (keys projection)))
+    (when-not (and (= (cond-> #{:public-parameters :physical-parameters} trees (conj :trees))
+                      (set (keys projection)))
+                   (or (nil? trees) (and (map? trees) (seq trees)
+                                        (every? (set public-parameters) (keys trees))))
                    (distinct-vector? public-parameters) (every? symbol? public-parameters)
                    (vector? physical-parameters)
                    (= (mapv :symbol (:parameters plan)) (mapv :symbol physical-parameters))
@@ -197,26 +201,44 @@
       (fail! :invocation-parameter-projection "aggregate projection differs from parameter order"
              {:projection projection :parameters (:parameters plan)}))
     (doseq [[leaf parameter] (map vector physical-parameters (:parameters plan))]
-      (let [{:keys [symbol binding field tag] class-name :class} leaf
+      (let [{:keys [symbol binding field path tag] class-name :class} leaf
+            projected? (or field path)
             array-tag? (types/array-tag? tag)
             retained-dtype (dtype/dtype-for-scalar-tag
                             (if array-tag? (types/array-tag->cast tag) tag))]
         (when-not (and (symbol? symbol) (symbol? binding)
                        (= (set (keys leaf))
-                          (if field #{:symbol :binding :field :class :tag}
-                              #{:symbol :binding}))
-                       (if field
-                         (and (keyword? field) (string? class-name) (seq class-name) retained-dtype)
-                         (= symbol binding))
-                       (or (nil? field)
+                          (cond field #{:symbol :binding :field :class :tag}
+                                path #{:symbol :binding :path :tag}
+                                :else #{:symbol :binding}))
+                       (cond field (and (keyword? field) (string? class-name) (seq class-name) retained-dtype)
+                             path (and (vector? path) (seq path) (contains? trees binding) retained-dtype)
+                             :else (= symbol binding))
+                       (or (not projected?)
                            (and retained-dtype
                                 (= (dtype/canon retained-dtype) (dtype/canon (get-in parameter [:value :dtype])))
                                 (= array-tag? (boolean (seq (get-in parameter [:value :shape])))))))
           (fail! :invocation-parameter-projection "aggregate leaf differs from its retained storage contract"
                  {:leaf leaf :parameter parameter}))))
     (doseq [[binding leaves] (group-by :binding physical-parameters)]
-      (when-not (or (and (= 1 (count leaves)) (nil? (:field (first leaves))))
-                    (and (every? :field leaves)
+      (when-not (or (and (not (contains? trees binding))
+                         (= 1 (count leaves)) (nil? (:field (first leaves)))
+                         (nil? (:path (first leaves))))
+                    (and (contains? trees binding)
+                         (do (params-flatten/validate-tree-spec! (get trees binding)) true)
+                         (= (mapv :path (params-flatten/flatten-spec (get trees binding)))
+                            (mapv :path leaves))
+                         (every? (fn [[declared leaf]]
+                                   (let [declared-tag (types/annotation->tag (:type declared) nil)
+                                         tag (:tag leaf)
+                                         scalar-tag #(if (types/array-tag? %)
+                                                       (types/array-tag->cast %) %)
+                                         declared-dtype (dtype/dtype-for-scalar-tag (scalar-tag declared-tag))]
+                                     (and declared-dtype
+                                          (= declared-dtype (dtype/dtype-for-scalar-tag (scalar-tag tag)))
+                                          (= (types/array-tag? declared-tag) (types/array-tag? tag)))))
+                                 (map vector (params-flatten/flatten-spec (get trees binding)) leaves)))
+                    (and (not (contains? trees binding)) (every? :field leaves)
                          (= 1 (count (distinct (map :class leaves))))
                          (= (count leaves) (count (distinct (map :field leaves))))))
         (fail! :invocation-parameter-projection "aggregate leaves require unique fields and one declared class"

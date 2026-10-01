@@ -179,7 +179,7 @@
 (defn- source-specialization-identity
   [fn-var dtype]
   (let [resolved (or (try
-                       (rcore/resolve-deftm-var fn-var {:dtype dtype :ambiguity :throw})
+                       (equation-first/physical-function fn-var dtype)
                        (catch clojure.lang.ExceptionInfo _ nil))
                      fn-var)
         metadata (meta resolved)
@@ -621,7 +621,8 @@
   [raw-plan compilation args {:keys [donate constants outputs taps roles]}]
   (let [invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
         projection (get-in invocation-plan [:attributes :parameter-projection])
-        aggregate-leaves (group-by :binding (filter :field (:physical-parameters projection)))
+        aggregate-leaves (group-by :binding (filter materialization/projection-path
+                                                   (:physical-parameters projection)))
         _ (when (some aggregate-leaves (concat donate outputs taps))
             (throw (ex-info "aggregate donation and aggregate outputs require per-field ownership support"
                             {:reason :compiled-aggregate-output :aggregates (set (keys aggregate-leaves))})))
@@ -673,9 +674,9 @@
         aggregate-scalars (into {}
                                 (map (fn [[binding leaves]]
                                        [binding (into {}
-                                                      (keep (fn [{:keys [symbol field tag]}]
+                                                      (keep (fn [{:keys [symbol tag] :as leaf}]
                                                               (when-not (types/array-tag? tag)
-                                                                [field (get projected-arguments symbol)])))
+                                                                [leaf (get projected-arguments symbol)])))
                                                       leaves)]))
                                 aggregate-leaves)
         leaves-by-symbol (into {} (map (juxt :symbol identity)) (:physical-parameters projection))
@@ -683,14 +684,16 @@
         in-tree (vec
                  (keep (fn [{:keys [symbol]}]
                          (when-let [node (get public-bindings symbol)]
-                           (let [{:keys [binding field] class-name :class} (get leaves-by-symbol symbol)]
-                             (merge (cond-> {:key (if field [(keyword (name binding)) field]
+                           (let [{:keys [binding] :as leaf} (get leaves-by-symbol symbol)
+                                 path (materialization/projection-path leaf)]
+                             (merge (cond-> {:key (if path (into [(keyword (name binding))] path)
                                                       (keyword (name symbol)))
                                              :sym symbol
                                              :donate? (contains? donate-set symbol)
                                              :default (if projection (get-in raw-plan [:nodes node :source])
                                                           (get argument-map symbol))}
-                                      field (assoc :aggregate-binding binding :aggregate-class class-name :field field
+                                      path (assoc :aggregate-binding binding :aggregate-leaf leaf
+                                                   :aggregate-tree (get-in projection [:trees binding])
                                                    :aggregate-scalars (get aggregate-scalars binding)))
                                     (equation-first-value plan node
                                                           (get effective-roles symbol))))))
@@ -1038,7 +1041,7 @@
                :when (not (contains? borrowed-inputs reference))]
            ;; Composition exposes explicit component/leaf references, not ambiguous
            ;; source-record shorthand shared by several independently prepared components.
-           (assoc (dissoc entry :aggregate-binding :aggregate-class :aggregate-scalars :field)
+           (assoc (dissoc entry :aggregate-binding :aggregate-leaf :aggregate-tree :aggregate-scalars)
                   :key reference :sym [component-id (:sym entry)]
                   :node (mapped-node component-id (:node entry)))))
         out-tree
@@ -1140,17 +1143,18 @@
                  (when (some #(contains? inputs (:key %)) entries)
                    (throw (ex-info "aggregate and individual field inputs cannot both be supplied"
                                    {:reason :compiled-aggregate-input-conflict :parameter binding})))
-                 (doseq [[field expected] (:aggregate-scalars (first entries))]
-                   (let [actual (materialization/aggregate-field (get inputs key) binding
-                                                                 (:aggregate-class (first entries)) field)]
+                 (materialization/validate-aggregate! (get inputs key) binding
+                                                     (:aggregate-tree (first entries)))
+                 (doseq [[leaf expected] (:aggregate-scalars (first entries))]
+                   (let [actual (materialization/aggregate-leaf (get inputs key) leaf)]
                      (when-not (= expected actual)
                        (throw (ex-info "aggregate scalar fields are captured by the prepared specialization; prepare again to change them"
                                        {:reason :compiled-aggregate-scalar-change :parameter binding
-                                        :field field :expected expected :actual actual})))))
+                                        :field (:field leaf) :path (materialization/projection-path leaf)
+                                        :expected expected :actual actual})))))
                  (into (dissoc inputs key)
-                       (map (fn [{:keys [field aggregate-class] field-key :key}]
-                              [field-key (materialization/aggregate-field (get inputs key)
-                                                                          binding aggregate-class field)]))
+                       (map (fn [{:keys [aggregate-leaf] field-key :key}]
+                              [field-key (materialization/aggregate-leaf (get inputs key) aggregate-leaf)]))
                        entries))))) inputs
    (group-by :aggregate-binding (filter :aggregate-binding in-tree))))
 
