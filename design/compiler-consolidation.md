@@ -161,6 +161,29 @@ The snapshot's producer string is
 a test-fixture label, not a production compiler-build identity. Production manifest publication,
 partial-patch interface fluxes, actual distributed transport, subcycling and reflux stay open.
 
+### Conservative partial-interface acceptance — 2026-10-01
+
+The next local numerical slice adds ordinary Double-storage/Int-index typed face-flux and
+CSR-divergence programs in `raster.ode.finite-volume`. Each face flux is materialized once;
+incident cells gather it with opposite signs and their inverse cell volume. The compiler still
+uses the existing maps, scalar loops, arrays and LinkPlan stage/ownership contracts. There is
+no finite-volume or AMR compiler opcode, target kernel, mesh allocator or extra cache.
+
+The fixture replaces only a central coarse patch: twelve coarse cells, sixteen fine cells and
+sixty shared faces on a periodic unit square. It checks complete face coverage, positive volume,
+the explicit convex-combination timestep bound, constant preservation, nontrivial evolution and
+volume-weighted mass. An independent face-scatter oracle checks the production CSR-gather path.
+Four generated stages implement two timesteps per resident replay; three replays on each local
+backend agree with the oracle after every replay. Scratch/flux start poisoned, lowering allocates
+no driver buffers, and only the donated evolved field escapes.
+
+This is a synchronous mixed-resolution numerical acceptance, not a completed AMR hierarchy
+projection or a discretization-accuracy comparison. Caller-supplied CSR bounds and paired signs
+are contracts, not a mesh certificate. Deriving this incidence/geometry from AMRPlan, reconnecting
+coarse/fine fields during regridding, conservative transfer, time interpolation, subcycling/flux
+registers/reflux, restart across a hierarchy change and external AMReX comparison remain open.
+Keep the existing full-domain mapped-byte continuation tests: this fixture does not replace them.
+
 ### Public training boundary follow-up
 
 The full existing tiny Gemma/LoRA forward/reverse-AD/SGD program was probed through
