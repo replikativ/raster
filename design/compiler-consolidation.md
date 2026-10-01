@@ -30,6 +30,18 @@ tests run in the capped reusable REPL; full suites and vendor compiler checks ru
 The outstanding AD, external-model, scientific and distributed milestones stay on the original
 campaign rather than becoming implicit claims of this consolidation checkpoint.
 
+The first proof audit reproduced a source/JVM memory-reuse miscompile: `selected = (if c a b)`
+could leave the first arm's allocation apparently dead, so a later temporary overwrote it
+before the selected read (11.0 became 33.0). Until control-aware may-alias/escape facts are
+available, the source memory pass excludes allocations transitively feeding any conditional
+initializer/body from reuse. It includes whole enclosing let/loop initializers, not just the
+branch-local names. Both selections, nested wrappers, unknown call returns, transitive aliases
+and escaped array sizes have original/optimized JVM comparisons; unrelated straight-line reuse
+remains enabled. The conservative scan may suppress safe optimization for scalar reads,
+shadowing or quoted forms. This is not complete alias analysis and does not justify deleting
+the pass or weakening the independent LinkPlan proofs. A suspected separate peephole issue did
+not reproduce and is not claimed as a defect here.
+
 Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/HIP
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.
