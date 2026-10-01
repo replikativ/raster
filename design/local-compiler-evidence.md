@@ -982,5 +982,14 @@ and Level Zero, including two replays and changed input-array values against the
 oracle. These are not evidence of a logical-map public GPU facade or CUDA native execution;
 those remain explicit obligations in `compiler-consolidation.md` beside mixed record projection.
 
+The mixed primitive record extension passes 41 tests/261 assertions across CSR projection and
+the existing all-array aggregate, SoA, typed-map, composition and invocation/materialization suites. The actual
+existing sparse/spmv source compiles to one generated KernelBody route without fallback and
+executes on local OpenCL and Level Zero. Device oracles include rectangular CSR data, alpha/beta,
+donated y state, new matrix buffers and rejected changes to all three captured scalar fields.
+The success after rejected invocations checks that neither resident state nor buffers were
+silently modified; preparing again correctly runs a changed three-row launch. This is not generic CSR input validation, mixed-record AD or logical HMap
+GPU invocation; the remaining contracts are recorded in `compiler-consolidation.md`.
+
 The broader AD consolidation, external training and distributed numerical acceptance remain
 on the eight-item campaign; this vertical does not replace them.

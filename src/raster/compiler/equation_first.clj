@@ -72,10 +72,10 @@
   (let [parameters (pipeline/clean-params (pipeline/get-params f-var requested-dtype))
         param-env (pipeline/build-param-env f-var requested-dtype)
         specs (mapv (fn [sym] {:sym sym :tag (get param-env sym)}) parameters)
-        env (soa-lower/soa-param-env specs)]
+        env (soa-lower/soa-param-env specs {:mixed-products? true})]
     {:params specs :soa-env env
      :projection (soa-lower/parameter-projection specs env
-                                                  (the-ns (source-namespace-symbol f-var)))}))
+                                                 (the-ns (source-namespace-symbol f-var)))}))
 
 (defn- compiler-options
   [f-var target requested-dtype options]

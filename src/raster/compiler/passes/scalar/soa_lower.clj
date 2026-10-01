@@ -21,6 +21,7 @@
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.passes.scalar.effects :as effects]
             [clojure.walk :as walk]))
 
@@ -37,36 +38,43 @@
   (into {} (map (fn [[element array]] [array element])) types/primitive->array-tag))
 
 (defn- array-bundle-info
-  "Describe a defvalue whose fields are already primitive arrays as physical product leaves.
+  "Describe a defvalue's declared physical product leaves.
 
    This is the container dual of a generated SoA companion: no element-wise transpose is needed,
-   but the logical record parameter must still disappear before functional IR construction."
-  [tag]
+   but the logical record parameter must still disappear before functional IR construction.
+   Numeric scalar fields are admitted only by the equation-first invocation vertical."
+  [tag mixed-products?]
   (let [field-types (get @inference/field-type-registry tag)
         order (or (get @inference/field-order-registry tag) (vec (keys field-types)))
         fields (mapv (fn [field]
-                       (let [array-tag (get field-types field)]
-                         {:name field
-                          :element-tag (get array-tag->element-tag array-tag)
-                          :array-tag array-tag}))
+                       (let [tag (get field-types field)
+                             array-tag (when (types/array-tag? tag) tag)
+                             scalar-tag (when (and mixed-products? (dtype/dtype-for-scalar-tag tag)) tag)]
+                         (cond-> {:name field
+                                  :element-tag (or (get array-tag->element-tag array-tag) scalar-tag)
+                                  :array-tag array-tag}
+                           scalar-tag (assoc :scalar-tag scalar-tag))))
                      order)]
     (when (and (seq fields) (every? :element-tag fields))
       {:scalar-tag tag :soa-tag tag :fields fields :representation :array-bundle})))
 
 (defn soa-param-env
   "From ordered param-specs [{:sym :tag}], find SoA or array-bundle params and build
-  {param-sym → {:scalar-tag :fields [{:name :element-tag :array-tag}]}}."
-  [param-specs]
-  (let [rev @types/soa-reverse-registry
-        reg @types/soa-registry]
-    (into {}
-          (keep (fn [{:keys [sym tag]}]
-                  (if-let [scalar-tag (get rev tag)]
-                    (when-let [info (get reg scalar-tag)]
-                      [sym {:scalar-tag scalar-tag :soa-tag tag :fields (:fields info)}])
-                    (when-let [info (array-bundle-info tag)]
-                      [sym info])))
-                param-specs))))
+  {param-sym → {:scalar-tag :fields [{:name :element-tag :array-tag}]}}.
+  :mixed-products? additionally admits declared numeric scalar fields. The
+  compatibility resident binder does not opt in to that representation."
+  ([param-specs] (soa-param-env param-specs {}))
+  ([param-specs {:keys [mixed-products?]}]
+   (let [rev @types/soa-reverse-registry
+         reg @types/soa-registry]
+     (into {}
+           (keep (fn [{:keys [sym tag]}]
+                   (if-let [scalar-tag (get rev tag)]
+                     (when-let [info (get reg scalar-tag)]
+                       [sym {:scalar-tag scalar-tag :soa-tag tag :fields (:fields info)}])
+                     (when-let [info (array-bundle-info tag mixed-products?)]
+                       [sym info])))
+                 param-specs)))))
 
 (defn collect-soa-env
   "Body-tag-based SoA detection (the shared replacement for the GPU's
@@ -86,12 +94,12 @@
     @acc))
 
 (defn expand-params
-  "Replace each SoA param with its per-field array params (in field order)."
+  "Replace each represented product with ordered primitive array/scalar params."
   [param-specs soa-env]
   (vec (mapcat (fn [{:keys [sym tag] :as p}]
                  (if-let [info (get soa-env sym)]
-                   (mapv (fn [{:keys [name array-tag]}]
-                           {:sym (field-arr-sym sym name) :tag array-tag})
+                   (mapv (fn [{:keys [name array-tag scalar-tag]}]
+                           {:sym (field-arr-sym sym name) :tag (or array-tag scalar-tag)})
                          (:fields info))
                    [p]))
                param-specs)))
@@ -124,10 +132,10 @@
                       (when-not cls
                         (throw (ex-info "aggregate parameter requires a resolved declared class"
                                         {:reason :aggregate-parameter-class :parameter sym :tag tag})))
-                      (mapv (fn [{:keys [name array-tag]}]
+                      (mapv (fn [{:keys [name array-tag scalar-tag]}]
                               {:symbol (field-arr-sym sym name) :binding sym
                                :field (field-id name) :class (.getName ^Class cls)
-                               :tag array-tag}) fields))
+                               :tag (or array-tag scalar-tag)}) fields))
                     [{:symbol sym :binding sym}])) param-specs))]
       (when-not (= (count physical) (count (distinct (map :symbol physical))))
         (throw (ex-info "aggregate physical parameter names collide"
@@ -173,7 +181,7 @@
   (when (symbol? sym)
     (or (get (:soa ctx) (symbol (name sym)))
         (when-let [scalar (when-not (:local-only? ctx)
-                           (get @types/soa-reverse-registry (:tag (meta sym))))]
+                            (get @types/soa-reverse-registry (:tag (meta sym))))]
           {:scalar-tag scalar :fields (:fields (get @types/soa-registry scalar))}))))
 
 (defn- relist
@@ -234,7 +242,7 @@
     (and (seq? form) (= 'let* (first form)))
     (let [[_ binds & body] form
           [ctx' out] (reduce (fn [[c bs] [s e]]
-                             (if-let [ex (explode c e)]
+                               (if-let [ex (explode c e)]
                                  [(assoc-in c [:exploded s] ex) bs]   ; virtual: drop binding
                                  (let [e' (lower c e)]
                                    ;; A later or nested binding can shadow an exploded
@@ -336,11 +344,11 @@
   ([body param-specs]
    (soa-lower body param-specs (soa-param-env param-specs)))
   ([body param-specs soa-env]
-    (if (empty? soa-env)
-      {:body body :params param-specs :soa-expansion {}}
-      {:body          (lower-body soa-env body)
-       :params        (expand-params param-specs soa-env)
-       :soa-expansion soa-env})))
+   (if (empty? soa-env)
+     {:body body :params param-specs :soa-expansion {}}
+     {:body          (lower-body soa-env body)
+      :params        (expand-params param-specs soa-env)
+      :soa-expansion soa-env})))
 
 ;; ─────────────────────────────────────────────────────────────────────────
 ;; Scalar value-type boundary (value-type-in / value-type-out deftms → wasm).
