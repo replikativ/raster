@@ -184,6 +184,15 @@ coarse/fine fields during regridding, conservative transfer, time interpolation,
 registers/reflux, restart across a hierarchy change and external AMReX comparison remain open.
 Keep the existing full-domain mapped-byte continuation tests: this fixture does not replace them.
 
+The follow-up acceptance derives active cells from the existing validated
+`RefinementHierarchy`, excluding covered coarse cells before constructing shared faces.
+Four bounded layouts include moved/narrower and disjoint fine patches; coverage and paired
+incidences are checked independently. Central and disjoint layouts also exercise the same
+generated programs on both local backends. This is a test-only, two-level 2D projection:
+its small pairwise face enumeration is not a production connectivity algorithm, and no new
+public mesh API or compiler IR is introduced. A general hierarchy-to-field/ownership mapping
+and scalable connectivity construction remain open.
+
 ### Public training boundary follow-up
 
 The full existing tiny Gemma/LoRA forward/reverse-AD/SGD program was probed through

@@ -2,20 +2,53 @@
   "A synchronous conservative partial-patch oracle, not subcycled/refluxed AMR."
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
+            [raster.compiler.ir.amr-plan :as amr]
             [raster.ode.finite-volume :as fv]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]
             [raster.gpu.link :as link]))
 
-(defn- mesh []
-  ;; Coordinates use an integer 8x8 finest grid on the unit periodic square.
-  ;; Replace only the central 2x2 coarse patch: 12 coarse cells + 16 fine cells.
-  (let [cells (vec (mapcat (fn [[x y]]
-                            (if (and (<= 2 x 4) (<= 2 y 4))
-                              (for [dx [0 1] dy [0 1]] [(+ x dx) (+ y dy) 1])
-                              [[x y 2]]))
-                          (for [x [0 2 4 6] y [0 2 4 6]] [x y])))
+(defn- hierarchy
+  ([] (hierarchy [{:offsets [2 2] :shape [4 4]}]))
+  ([regions]
+   (amr/hierarchy
+    {:id :heat/partial :base-shape [4 4] :proper-nesting-width 1
+     :levels
+     [(amr/level {:id :coarse :index 0
+                 :patches [(amr/patch {:id :base :level 0 :device :local
+                                      :offsets [0 0] :shape [4 4] :field :base-temperature})]})
+      (amr/level {:id :fine :index 1 :ratio-to-parent [2 2]
+                  :patches (mapv (fn [i region]
+                                   (amr/patch (merge region
+                                                    {:id [:fine i] :level 1 :device :local
+                                                     :field [:fine-temperature i]})))
+                                 (range) regions)})]})))
+
+(defn- active-cells [hierarchy]
+  ;; Deliberately bounded test projection, not a public general AMR mesh builder.
+  (amr/validate-hierarchy! hierarchy)
+  (assert (and (= [4 4] (:base-shape hierarchy))
+               (= 2 (count (:levels hierarchy)))
+               (= [2 2] (:ratio-to-parent (second (:levels hierarchy))))))
+  (let [patches (:patches (second (:levels hierarchy)))
+        covered? (fn [x y]
+                   (some (fn [{[px py] :offsets [sx sy] :shape}]
+                           (and (<= px x) (< x (+ px sx))
+                                (<= py y) (< y (+ py sy)))) patches))]
+    (vec (concat
+          (for [x (range 0 8 2) y (range 0 8 2) :when (not (covered? x y))]
+            [x y 2])
+          (mapcat (fn [{[px py] :offsets [sx sy] :shape}]
+                    (for [x (range px (+ px sx)) y (range py (+ py sy))] [x y 1]))
+                  patches)))))
+
+(defn- mesh
+  ([] (mesh (hierarchy)))
+  ([hierarchy]
+  ;; Integer 8x8 finest grid on the unit periodic square. Pair enumeration is
+  ;; small-oracle-only; it is not a scalable production connectivity algorithm.
+  (let [cells (active-cells hierarchy)
         overlaps (fn [a as b bs] (max 0 (- (min (+ a as) (+ b bs)) (max a b))))
         touches (fn [a as b bs]
                   (or (= (+ a as) b) (= (+ b bs) a)
@@ -40,7 +73,7 @@
      :conductance (double-array (map #(nth % 2) faces))
      :offsets (int-array (reductions + 0 (map count incidences)))
      :indices (int-array (map first flat)) :orientation (double-array (map second flat))
-     :inverse-volume (double-array (map (fn [[_ _ size]] (/ 64.0 (* size size))) cells))}))
+     :inverse-volume (double-array (map (fn [[_ _ size]] (/ 64.0 (* size size))) cells))})))
 
 (defn- initial [cells]
   (double-array (map (fn [[x y size]]
@@ -79,6 +112,37 @@
   (and (= (count expected) (count actual))
        (every? #(< (Math/abs (double %)) 1.0e-11) (map - expected actual))))
 
+(deftest hierarchy-projection-covers-the-domain-without-covered-coarse-cells
+  (doseq [regions [[{:offsets [2 2] :shape [4 4]}]
+                   [{:offsets [2 2] :shape [2 4]}]
+                   [{:offsets [4 2] :shape [2 4]}]
+                   [{:offsets [2 2] :shape [2 2]}
+                    {:offsets [4 4] :shape [2 2]}]]]
+    (let [{:keys [cells faces offsets indices orientation inverse-volume] :as geometry}
+          (mesh (hierarchy regions))
+          tiles (for [[x y size] cells dx (range size) dy (range size)]
+                  [(+ x dx) (+ y dy)])
+          args (arguments geometry)
+          before (mass (first args) inverse-volume)]
+      (is (= (set (for [x (range 8) y (range 8)] [x y])) (set tiles)))
+      (is (= 64 (count tiles)) "no covered coarse cell survives beside its fine replacement")
+      (is (every? true?
+                  (map-indexed (fn [c [_ _ size]]
+                                 (= (* 4 size)
+                                    (reduce + (for [[l r _ length] faces
+                                                    :when (or (= c l) (= c r))] length)))) cells)))
+      (is (= (* 2 (count faces)) (count indices)))
+      (is (every? (fn [f]
+                    (= #{[1.0 (first (faces f))] [-1.0 (second (faces f))]}
+                       (set (for [c (range (count cells))
+                                  p (range (aget offsets c) (aget offsets (inc c)))
+                                  :when (= f (aget indices p))]
+                              [(aget orientation p) c])))) (range (count faces))))
+      (apply pair-step! args)
+      (is (near? (nth (iterate #(reference-step % geometry 0.001)
+                               (vec (initial cells))) 2) (first args)))
+      (is (< (Math/abs (- before (mass (first args) inverse-volume))) 1.0e-12)))))
+
 (deftest partial-interface-is-conservative-and-constant-preserving
   (let [{:keys [cells faces inverse-volume] :as geometry} (mesh)
         args (arguments geometry)
@@ -110,8 +174,8 @@
       (apply pair-step! constant)
       (is (every? #(= 3.25 %) (first constant))))))
 
-(defn- run-device [target]
-  (let [{:keys [inverse-volume] :as geometry} (mesh)
+(defn- run-device [target geometry]
+  (let [{:keys [inverse-volume]} geometry
         args (arguments geometry)
         field (first args)
         expected-states (vec (take 7 (iterate #(reference-step % geometry 0.001) (vec field))))
@@ -131,10 +195,16 @@
           (is (near? (expected-states (* 2 (inc replay))) actual))
           (is (< (Math/abs (- before (mass actual inverse-volume))) 1.0e-12)))))))
 
+(defn- device-geometries []
+  [(mesh) (mesh (hierarchy [{:offsets [2 2] :shape [2 2]}
+                            {:offsets [4 4] :shape [2 2]}]))])
+
 (deftest generated-partial-interface-on-opencl
-  (if @opencl/opencl-fp64-available? (run-device :ocl:0)
+  (if @opencl/opencl-fp64-available?
+      (doseq [geometry (device-geometries)] (run-device :ocl:0 geometry))
       (ze/gpu-skip! "partial-patch-heat-opencl")))
 
 (deftest generated-partial-interface-on-level-zero
-  (if @ze/gpu-available? (run-device :ze:0)
+  (if @ze/gpu-available?
+      (doseq [geometry (device-geometries)] (run-device :ze:0 geometry))
       (ze/gpu-skip! "partial-patch-heat-level-zero")))
