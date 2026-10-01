@@ -21,6 +21,7 @@
   (:refer-clojure :exclude [compile])
   (:require [clojure.set :as set]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.core.types :as types]
             [raster.compiler.equation-artifact-store :as equation-artifact-store]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.build-manifest :as build-manifest]
@@ -666,6 +667,17 @@
                  (assoc-in [:attributes :public-buffer-roles] effective-roles))
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
         argument-map (when-not projection (zipmap (map :symbol parameters) args))
+        projected-arguments (when projection
+                              (zipmap (map :symbol (:physical-parameters projection))
+                                      (materialization/parameter-arguments invocation-plan args)))
+        aggregate-scalars (into {}
+                                (map (fn [[binding leaves]]
+                                       [binding (into {}
+                                                      (keep (fn [{:keys [symbol field tag]}]
+                                                              (when-not (types/array-tag? tag)
+                                                                [field (get projected-arguments symbol)])))
+                                                      leaves)]))
+                                aggregate-leaves)
         leaves-by-symbol (into {} (map (juxt :symbol identity)) (:physical-parameters projection))
         donate-set (set donate)
         in-tree (vec
@@ -673,12 +685,13 @@
                          (when-let [node (get public-bindings symbol)]
                            (let [{:keys [binding field] class-name :class} (get leaves-by-symbol symbol)]
                              (merge (cond-> {:key (if field [(keyword (name binding)) field]
-                                                     (keyword (name symbol)))
+                                                      (keyword (name symbol)))
                                              :sym symbol
                                              :donate? (contains? donate-set symbol)
                                              :default (if projection (get-in raw-plan [:nodes node :source])
                                                           (get argument-map symbol))}
-                                      field (assoc :aggregate-binding binding :aggregate-class class-name :field field))
+                                      field (assoc :aggregate-binding binding :aggregate-class class-name :field field
+                                                   :aggregate-scalars (get aggregate-scalars binding)))
                                     (equation-first-value plan node
                                                           (get effective-roles symbol))))))
                        parameters))
@@ -1025,7 +1038,7 @@
                :when (not (contains? borrowed-inputs reference))]
            ;; Composition exposes explicit component/leaf references, not ambiguous
            ;; source-record shorthand shared by several independently prepared components.
-           (assoc (dissoc entry :aggregate-binding :aggregate-class :field)
+           (assoc (dissoc entry :aggregate-binding :aggregate-class :aggregate-scalars :field)
                   :key reference :sym [component-id (:sym entry)]
                   :node (mapped-node component-id (:node entry)))))
         out-tree
@@ -1120,18 +1133,25 @@
    (fn [inputs binding entries]
      (let [key (keyword (name binding))]
        (if-not (contains? inputs key) inputs
-         (do
-           (when-not (every? #(= :input (:role %)) entries)
-             (throw (ex-info "captured aggregate fields cannot be replaced at invocation"
-                             {:reason :compiled-aggregate-input-role :parameter binding})))
-           (when (some #(contains? inputs (:key %)) entries)
-             (throw (ex-info "aggregate and individual field inputs cannot both be supplied"
-                             {:reason :compiled-aggregate-input-conflict :parameter binding})))
-           (into (dissoc inputs key)
-                 (map (fn [{:keys [field aggregate-class] field-key :key}]
-                        [field-key (materialization/aggregate-field (get inputs key)
-                                                                   binding aggregate-class field)]))
-                 entries))))) inputs
+               (do
+                 (when-not (every? #(= :input (:role %)) entries)
+                   (throw (ex-info "captured aggregate fields cannot be replaced at invocation"
+                                   {:reason :compiled-aggregate-input-role :parameter binding})))
+                 (when (some #(contains? inputs (:key %)) entries)
+                   (throw (ex-info "aggregate and individual field inputs cannot both be supplied"
+                                   {:reason :compiled-aggregate-input-conflict :parameter binding})))
+                 (doseq [[field expected] (:aggregate-scalars (first entries))]
+                   (let [actual (materialization/aggregate-field (get inputs key) binding
+                                                                 (:aggregate-class (first entries)) field)]
+                     (when-not (= expected actual)
+                       (throw (ex-info "aggregate scalar fields are captured by the prepared specialization; prepare again to change them"
+                                       {:reason :compiled-aggregate-scalar-change :parameter binding
+                                        :field field :expected expected :actual actual})))))
+                 (into (dissoc inputs key)
+                       (map (fn [{:keys [field aggregate-class] field-key :key}]
+                              [field-key (materialization/aggregate-field (get inputs key)
+                                                                          binding aggregate-class field)]))
+                       entries))))) inputs
    (group-by :aggregate-binding (filter :aggregate-binding in-tree))))
 
 (defn- invoke-compiled-unleased

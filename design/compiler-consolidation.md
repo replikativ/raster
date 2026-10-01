@@ -239,6 +239,34 @@ the record class name alone.
 Nested aggregates, returning records, aggregate donation and AD over sparse indices must be
 specified and tested independently; none follows from accepting read-only CSR parameters.
 
+### Mixed primitive record invocation — 2026-10-01
+
+The equation-first representation environment now admits numeric scalar fields alongside
+primitive-array fields. The same declared field registry/order supplies body projection,
+physical parameter order and InvocationPlan validation. Scalars are rank-zero numeric values;
+arrays retain their declared storage contracts. Scalar KernelABI slots do not acquire pointer
+`:binding`/`:field` provenance: logical field access happens at invocation materialization.
+The old resident descriptor binder does not opt into the mixed representation.
+
+Raster's existing `raster.linalg.sparse/spmv` is the first acceptance workload, not a rewritten
+flat equivalent or CSR-specific compiler operation. Its original CSRMatrix, x, y, alpha and beta
+arguments lower to one generated KernelBody kernel. Actual OpenCL and Level Zero runs agree
+exactly with the JVM for the nontrivial rectangular CSR fixture, including alpha/beta and replay
+with new matrix buffers. Lowering performs zero driver allocations; y is the donated state.
+
+Prepared replay captures record scalar fields. Replacing the logical record checks its nominal
+class and rejects changed scalar fields **before uploads or kernel replay** with
+`:compiled-aggregate-scalar-change`; callers must prepare again to change them. Tests change
+each CSR scalar field and then verify untouched device state through the next successful call.
+All fields are conservatively captured, including fields not currently used by the emitted leaf.
+This is not a general mutable aggregate ownership API or automatic scalar respecialization.
+
+Nominal CSR shape is not a proof of monotonic row pointers, column bounds or consistency between
+nnz and array contents. Those remain numerical input preconditions, not newly claimed compiler
+verification. Nested records, logical HMap public GPU invocation, mixed-record AD reconstruction
+and writable aggregate donation remain open. Continue the shared declared path projection for
+map/record roots rather than adding a second binder or kernel ABI.
+
 ### Annotated map parameter bindings — 2026-10-01
 
 Issue #966's annotations inside `:keys` are not Clojure/Typed Clojure binding syntax.

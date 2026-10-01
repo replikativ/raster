@@ -206,7 +206,7 @@
                           (if field #{:symbol :binding :field :class :tag}
                               #{:symbol :binding}))
                        (if field
-                         (and (keyword? field) (string? class-name) (seq class-name) array-tag?)
+                         (and (keyword? field) (string? class-name) (seq class-name) retained-dtype)
                          (= symbol binding))
                        (or (nil? field)
                            (and retained-dtype
