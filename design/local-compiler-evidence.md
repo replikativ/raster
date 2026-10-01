@@ -362,6 +362,26 @@ the source/compiler/build and harness hashes and both timing scopes at the two b
 The corrected C++ harness passes both independent CPU oracles and its event-type/containment
 checks. Host-only Raster harness regressions remain green (3 tests / 26 assertions).
 
+All seven final-head gates passed; #962 merged as `e4ac43d1`.
+
+### Hierarchy-derived conservative interfaces — 2026-10-01
+
+The partial-patch oracle now starts from `amr-plan/hierarchy`, retaining its nesting,
+alignment and non-overlap validation. A bounded test projection removes covered coarse
+cells and derives face/CSR arrays for central, narrow, shifted and disjoint fine patches.
+Independent finest-grid coverage and per-cell perimeter checks reject missing or duplicate
+coverage; each face must have precisely its two expected, oppositely signed incidences.
+The unchanged typed numerical programs are checked against face-scatter evolution and
+volume-weighted conservation. Central and disjoint geometries exercise the same public
+compiled path on OpenCL and Level Zero, including three resident replays each.
+The fixture passes 4 tests / 74 assertions with both native capabilities explicitly checked.
+
+This connects the hierarchy geometry to a numerical oracle, not a public scalable AMR
+projection. The test helper is explicitly limited to a 4x4 base, two levels, 2:1 refinement
+and periodic 2D geometry; quadratic face enumeration is kept out of the library API.
+Patch-field ownership, regridding/remapping, subcycling/reflux, mapped restart across a
+hierarchy change and external accuracy/performance comparison are still open.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
