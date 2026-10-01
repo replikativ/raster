@@ -16,6 +16,30 @@ optimized 33.0). The conservative follow-up tests both branches, nested let/loop
 unknown-call returns, transitive aliases, escaped array sizes and unrelated reuse. GPU memory
 reuse evidence does not supersede this distinct source/JVM analysis.
 
+The KernelCall admission consolidation passes 32 tests / 144 assertions across direct and graph
+call validation, plus 27 tests / 154 assertions across dispatch benchmarking and public compiled
+composition. Each public call/precondition/launch entry validates its artifact afresh; its
+locally checked precondition helper no longer repeats that artifact/argument validation or
+scalar representation checks. Construction still checks before geometry realization and again
+at final call admission. Malformed vectors/counts, scalar ranges/specializations, guards and
+pointer/geometry contracts retain their existing failure tests. This is a synchronous duplicate
+check removal, not a retained proof cache or measured preparation speedup.
+The existing native public composition suite adds 9 tests / 88 assertions on actual OpenCL
+and Level Zero, including replay and shared forward/update state. Both availability gates were
+explicitly checked true after the run; passing a conditional suite alone is not execution proof.
+
+A paired changing-activation GEMM/ReLU diagnostic uses the existing public comparison runner,
+strict FP32 `[8 64 64]`, twelve rotating measurement rounds and four warmup rounds. Both candidates
+pass the exact independent reference after every poisoned-output replay on both local backends.
+Ordinary composed source emits two resident stages; explicit epilogue source emits one. The
+OpenCL medians were 35,521 ns and 23,750 ns with CV 0.305 and 0.492 (both nonstationary). Level Zero
+medians were 34,166.7 ns and 31,979.2 ns with CV 0.00428 and 0.00335. The latter satisfy the CV
+heuristic only; a short sample on the same physical Arc under varying load is not broad performance
+acceptance. No baseline or automatic schedule is promoted. The composed form defines a checked
+extent after the contraction's writes; existing fusion tests deliberately preserve that boundary.
+The already-supported prebound extent form is the next matched acceptance, not permission to
+hoist an unchecked/trapping operation across effects.
+
 ## Current pretrained consumer and native batch layout — 2026-09-30
 
 An isolated snapshot of pretrained-rstr main `98bad4d3517ec05a3c495f019c80d8c553db02af`
