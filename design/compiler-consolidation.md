@@ -56,6 +56,10 @@ returned a value. Nested-let projection now uses the existing ordered ANF normal
 all body statements and capturing nontrivial argument terminals before later sibling bindings.
 The old binder-blind loop dependency scans now use shared lexical free-symbol analysis with
 declared parameter/carry/recur-local names retained, including names shadowing core functions.
+The same projection also normalizes newly lifted loop-initializer prefixes before their activity
+and pullback are computed: the quoted-expression API had silently omitted the derivative of a
+nested-let initializer while the equivalent `deftm` path worked. Both APIs now share numerical
+and finite-difference oracles for this shape.
 This closes specific normalization seams, not arbitrary-loop AD or aggregate residual support.
 
 Matched prebound-extent GEMM/ReLU replay confirms the existing general fusion rule emits one

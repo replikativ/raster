@@ -1156,6 +1156,7 @@
 
 (declare gen-reverse-loop-with-let)
 (declare gen-reverse-loop*)
+(declare hoist-nested-lets)
 
 (defn- gen-reverse-loop
   "Generate reverse-mode AD code for a loop* form.
@@ -1531,7 +1532,11 @@
   pullback returns adjoints for those values, which then chain
   backward through the let bindings."
   [let-bindings loop-form active-params]
-  (let [anf-bindings (anf-normalize-bindings let-bindings)
+  (let [;; A loop initializer can introduce a nested let after ad-prepare's
+        ;; outer hoisting. Flatten that newly lifted prefix through the same
+        ;; ordered projection before computing activity and its pullback.
+        normalized-prefix (hoist-nested-lets (list 'let* let-bindings nil))
+        anf-bindings (anf-normalize-bindings (second normalized-prefix))
         ;; PURE forward pass — now handles par/dotimes/if (the capability the old
         ;; hand-rolled copy lacked). This is what lets an array-valued INTERMEDIATE
         ;; produced in the let-prefix (e.g. a broadcast) and consumed by the loop

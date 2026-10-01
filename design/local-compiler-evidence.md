@@ -58,6 +58,13 @@ valid primal/gradient with constant observations. Ordered body-statement, siblin
 first-exception oracles separately cover the hoister; lexical activity tests cover captured and
 shadowed names. These preserve evaluation semantics without promising differentiation of effects
 or expanding general-loop support.
+The quoted `grad-expr` API separately returned gradient 3 instead of 7 for a loop seeded by
+`(let [local x] (* local local))` at x=2; `deftm` gave 7. Newly lifted initializer prefixes now
+pass through that same ordered projection before activity/pullback generation. Surface and
+macroexpanded quoted forms match `deftm`, analytic derivatives and finite differences for both
+zero-trip and three-trip loops. The focused AD suites pass 100 tests / 376 assertions, and
+typed emission passes 9 / 81. Actual Level Zero RMSNorm resident gradients also pass 1 / 5,
+with relative errors 1.17e-7 for x and 8.05e-8 for weights; its availability gate was true.
 
 ## Current pretrained consumer and native batch layout — 2026-09-30
 
