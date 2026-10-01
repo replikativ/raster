@@ -1013,3 +1013,17 @@ unchanged after rejection. Device preflight tests prohibit registrations and cop
 readiness/pending-input state after overlap rejection. The focused link, output-lease,
 composition, tree and record acceptance set passes 52 tests / 373 assertions. This verifies
 validation-failure atomicity, not rollback after an actual driver transfer fails.
+
+### Resident conservative CSR layout transfer — 2026-10-01
+
+The existing partial-patch acceptance suite now passes 7 tests / 206 assertions, including the
+old evolution cases. Sixteen layout-pair host checks compare ordinary CSR spmv with an independent
+finest-tile average, preserve constants and mass, and check positive/volume-balanced weights.
+Central-to-moved and moved-to-disjoint layouts execute three resident evolution/remap replays on
+each local OpenCL/Level Zero backend. Four generated heat stages and one existing CSR stage share
+one explicitly owned field allocation; both evolved and transferred fields match independent
+oracles, with no component host bridge. This is test-only geometry projection and conservative
+cell-average transfer, not regridding control, post-transfer evolution, an AMR accuracy claim or
+competitive performance evidence. The original durable-continuation tests remain required.
+The combined focused run includes those existing full-domain refinement and actual mapped-byte
+continuation oracles: 13 tests / 256 assertions pass with no failures or errors.
