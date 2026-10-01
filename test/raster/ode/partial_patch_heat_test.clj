@@ -4,7 +4,9 @@
             [raster.core :refer [deftm]]
             [raster.compiler.ir.amr-plan :as amr]
             [raster.ode.finite-volume :as fv]
+            [raster.linalg.sparse :as sparse]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]
             [raster.gpu.link :as link]))
@@ -112,6 +114,62 @@
   (and (= (count expected) (count actual))
        (every? #(< (Math/abs (double %)) 1.0e-11) (map - expected actual))))
 
+(defn- remap-matrix [source-cells target-cells]
+  ;; Bounded acceptance fixture only: enumerate geometric overlaps, then use
+  ;; the existing CSR operator. Values are cell averages, not extensive mass.
+  (let [overlap (fn [a as b bs] (max 0 (- (min (+ a as) (+ b bs)) (max a b))))
+        rows (mapv (fn [[tx ty ts]]
+                     (vec (keep-indexed
+                           (fn [i [sx sy ss]]
+                             (let [area (* (overlap tx ts sx ss) (overlap ty ts sy ss))]
+                               (when (pos? area) [i (/ (double area) (* ts ts))])))
+                           source-cells))) target-cells)
+        entries (vec (mapcat identity rows))]
+    (sparse/->CSRMatrix (int-array (reductions + 0 (map count rows)))
+                        (int-array (map first entries)) (double-array (map second entries))
+                        (long (count target-cells)) (long (count source-cells))
+                        (long (count entries)))))
+
+(defn- reference-remap [source-cells target-cells field]
+  ;; Independent finest-tile lookup/average; it does not read the CSR arrays
+  ;; or use the builder's pairwise overlap calculation.
+  (let [tiles (into {} (for [[cell [x y size]] (map-indexed vector source-cells)
+                             dx (range size) dy (range size)]
+                         [[(+ x dx) (+ y dy)] (nth field cell)]))]
+    (mapv (fn [[x y size]]
+            (/ (reduce + (for [dx (range size) dy (range size)]
+                           (get tiles [(+ x dx) (+ y dy)]))) (* size size)))
+          target-cells)))
+
+(defn- remap-geometries []
+  (mapv #(mesh (hierarchy %))
+        [[{:offsets [2 2] :shape [4 4]}]
+         [{:offsets [2 2] :shape [2 4]}]
+         [{:offsets [4 2] :shape [2 4]}]
+         [{:offsets [2 2] :shape [2 2]} {:offsets [4 4] :shape [2 2]}]]))
+
+(deftest csr-remap-preserves-constants-and-volume-weighted-mass
+  (doseq [source (remap-geometries) target (remap-geometries)]
+    (let [A (remap-matrix (:cells source) (:cells target))
+          field (initial (:cells source))
+          actual (sparse/spmv A field (double-array (repeat (count (:cells target)) -317.0)) 1.0 0.0)
+          constant (sparse/spmv A (double-array (repeat (count (:cells source)) 3.25))
+                                (double-array (count (:cells target))) 1.0 0.0)]
+      (is (near? (reference-remap (:cells source) (:cells target) field) actual))
+      (is (every? #(= 3.25 %) constant))
+      (is (< (Math/abs (- (mass field (:inverse-volume source))
+                          (mass actual (:inverse-volume target)))) 1.0e-12))
+      (is (every? pos? (.-values A)))
+      ;; Each source cell's extensive contribution must survive across all
+      ;; target rows, including coarsening, refinement and moved/disjoint patches.
+      (is (every? true?
+                  (for [column (range (count (:cells source)))]
+                    (= (/ 1.0 (aget (:inverse-volume source) column))
+                       (reduce + (for [row (range (count (:cells target)))
+                                       p (range (aget (.-rowptr A) row) (aget (.-rowptr A) (inc row)))
+                                       :when (= column (aget (.-colidx A) p))]
+                                   (/ (aget (.-values A) p) (aget (:inverse-volume target) row)))))))))))
+
 (deftest hierarchy-projection-covers-the-domain-without-covered-coarse-cells
   (doseq [regions [[{:offsets [2 2] :shape [4 4]}]
                    [{:offsets [2 2] :shape [2 4]}]
@@ -208,3 +266,57 @@
   (if @ze/gpu-available?
       (doseq [geometry (device-geometries)] (run-device :ze:0 geometry))
       (ze/gpu-skip! "partial-patch-heat-level-zero")))
+
+(defn- run-resident-remap [target source destination]
+  (let [A (remap-matrix (:cells source) (:cells destination))
+        source-args (arguments source)
+        evolve (compiled/lower #'pair-step! source-args
+                               {:compiler :equation-first :target target :dtype :double :inline? true
+                                :donate '[field]
+                                :constants '[left right conductance offsets indices orientation inverse-volume]})
+        remap (compiled/lower #'sparse/spmv
+                              [A (first source-args)
+                               (double-array (repeat (count (:cells destination)) -317.0)) 1.0 0.0]
+                              {:compiler :equation-first :target target :dtype :double :constants '[A]})
+        prepared (with-redefs [gpu/alloc! (fn [& _] (throw (AssertionError. "composition allocated device storage")))]
+                   (compiled/compose
+                    {:id :heat/resident-remap
+                     :components [{:id :evolve :program evolve} {:id :remap :program remap}]
+                     :mutable-shares [{:owner [:evolve :field] :borrowers [[:remap :x]]
+                                       :output [:evolve :field']}]
+                     :outputs [{:key :source :from [:evolve :field']}
+                               {:key :remapped :from [:remap :result]}]}))
+        plan (compiled/plan prepared)
+        mapping (get-in prepared [:lowering :certificate :node-mapping])
+        field-node (:node (first (:out-tree evolve)))
+        x-node (:node (first (filter #(= :x (:key %)) (:in-tree remap))))
+        expected (vec (take 7 (iterate #(reference-step % source 0.001)
+                                       (vec (initial (:cells source))))))
+        original-mass (mass (first expected) (:inverse-volume source))]
+    (is (every? #(= 0 (get-in (compiled/plan %) [:attributes :driver-allocations])) [evolve remap]))
+    (is (= (mapping [:evolve field-node]) (mapping [:remap x-node])))
+    (is (not-any? #(= [:remap :x] (:key %)) (:in-tree prepared))
+        "the consumer must not refresh its initial host input over producer state")
+    (is (= 5 (reduce + (map #(count (get-in % [:call :steps])) (:instances plan)))))
+    (with-open [executable (link/instantiate! plan)]
+      (dotimes [replay 3]
+        (link/run! executable)
+        (let [source-field (link/download executable (:node (first (:out-tree prepared))))
+              result (link/download executable (:node (second (:out-tree prepared))))
+              expected-field (expected (* 2 (inc replay)))]
+          (is (near? expected-field source-field))
+          (is (near? (reference-remap (:cells source) (:cells destination) expected-field) result))
+          (is (< (Math/abs (- original-mass (mass result (:inverse-volume destination)))) 1.0e-12)))))))
+
+(defn- run-remap-layouts [target]
+  (let [[central _ moved disjoint] (remap-geometries)]
+    (run-resident-remap target central moved)
+    (run-resident-remap target moved disjoint)))
+
+(deftest resident-conservative-remap-on-opencl
+  (if @opencl/opencl-fp64-available? (run-remap-layouts :ocl:0)
+      (opencl/opencl-skip! "resident-conservative-remap-opencl")))
+
+(deftest resident-conservative-remap-on-level-zero
+  (if @ze/gpu-available? (run-remap-layouts :ze:0)
+      (ze/gpu-skip! "resident-conservative-remap-level-zero")))

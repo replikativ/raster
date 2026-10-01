@@ -193,6 +193,28 @@ its small pairwise face enumeration is not a production connectivity algorithm, 
 public mesh API or compiler IR is introduced. A general hierarchy-to-field/ownership mapping
 and scalable connectivity construction remain open.
 
+### Conservative layout remapping acceptance — 2026-10-01
+
+The bounded partial-patch fixture now projects overlaps between its existing active-cell
+layouts into ordinary CSRMatrix data and calls the existing `sparse/spmv` through public
+equation-first compilation. No remap/AMR semantic opcode, target kernel or production mesh
+builder is added. Sixteen source/target layout pairs check positive weights, constant preservation,
+volume-weighted mass and every source column's extensive contribution. A separate finest-tile
+lookup/average oracle does not consult the CSR entries or their overlap builder.
+
+Resident acceptance composes four generated heat stages with the generated CSR stage. The
+evolving field is an explicit donated owner with a read-only remap borrower, initialized from
+the same host object; the borrower cannot refresh that old initializer on replay. Central-to-moved
+and moved-to-disjoint layouts run three replays on actual OpenCL and Level Zero, matching
+independent face-scatter evolution and tile-remap oracles and retaining mass at every checkpoint.
+Component lowering reports zero driver allocations, and composition is tested with allocation
+forbidden. The shared field resolves to one physical node; no host bridge is introduced.
+
+This is conservative transfer of a cell-average field to another layout, not a completed adaptive
+simulator. The overlap enumeration is small/test-only. Production connectivity, migration and
+lineage publication, subsequent evolution on the changed hierarchy, subcycling/reflux and
+discretization/error-estimator or external simulator comparisons remain separate acceptance work.
+
 ### Aggregate invocation projection audit — 2026-10-01
 
 Before inventing a conservative-remap primitive, probe the existing CSR `spmv`. Its JVM
