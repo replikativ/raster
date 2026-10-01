@@ -118,8 +118,29 @@ double-accumulation CPU oracle (maximum absolute error at most `1e-4`). This is 
 a comparison with Raster's mixed-FP16/XMX schedules. Both retain inputs and output on
 the device through four warmups and twelve measured replays. Compilation, binding,
 uploads, downloads and validation are excluded from the device-event samples and
-reported separately where applicable. The measured value is the whole queue/event
-span, not the sum of kernel durations; Raster also prints the latter for diagnosis.
+reported separately where applicable. The measured values have different envelopes:
+CLBlast reports a queue-marker span, while Raster reports first kernel start to last kernel end.
+CLBlast's marker span may include CPU submission gaps before/between kernels; Raster excludes
+the gap before its first kernel. Labels alone do not make these directly comparable, even if
+both series pass the CV heuristic. Historical brackets are diagnostic, not matched-envelopes
+kernel-speedup proofs. Raster also prints summed kernel durations for diagnosis.
+
+The CLBlast harness additionally reports `:completion-kernel-samples-ns`, the start/end
+duration of its returned event. In the pinned 1.7.0 source, direct GEMM returns its sole kernel
+event, but indirect GEMM may run preprocessing and returns the GEMM or final postprocessing
+event. Therefore this field is always labeled `:last-kernel-only`: never substitute it for the
+whole operation or choose its scope by guessing from dimensions. Profiling must preserve the
+complete kernel envelope before making a kernel-competitiveness claim. Host-synchronized
+end-to-end replay can instead compare dispatch cost, under a separate common host-clock protocol.
+
+The [pinned event-envelope diagnostic](../results/clblast-pinned-event-envelope-20261001.edn)
+builds CLBlast's 1.7.0 tag (`ca2fc3cb09d4917cc72d4ca661d30296865a4afc`) with GNU 15.2.0,
+Release flags and one build job. Its library SHA-256 is identical to the previously retained
+library image. This supplies a verified-source build matching those bytes, not recovered
+provenance for the earlier build. Both bounded shapes pass the independent CPU oracle, and
+the returned events are checked as positive NDRange durations contained in their marker spans.
+This record compares neither envelope against Raster and does not observe all library kernels.
+It closes a provenance gap and documents timing scope; it is not a competitive ranking.
 
 For the CLBlast source at commit `87f18d7f0718ea416dfab66c303d11deeff94f3f`,
 build outside CI (replace the paths with local directories):
@@ -178,9 +199,9 @@ An additional [bracketed diagnostic run](../results/strict-f32-symbolic-tile-bra
 places CLBlast before and after Raster at `[256,256,256]`: Raster's generated tile has a 104 µs
 median, while CLBlast has 173 µs before and 159 µs after. At `[8,256,256]` the medians are
 90 µs and 142 µs respectively. The raw series show substantial transients, especially at the
-small shape, so these numbers establish that the generated schedule is competitive on this Arc
-under the stated protocol, not that it is a stable winner or the right selector for other shapes,
-devices, precisions or activation epilogues. A randomized stationary comparison and explicit
+small shape. These observations suggest a useful generated schedule, but the timing-envelope
+audit above means they do not establish a matched kernel-performance ranking or a stable winner
+for other shapes, devices, precisions or activation epilogues. A randomized stationary comparison and explicit
 correctness-guarded selection remain necessary before promoting a measured policy.
 
 The [September 27 recheck](../results/strict-f32-local-recheck-20260927.edn) does not reproduce

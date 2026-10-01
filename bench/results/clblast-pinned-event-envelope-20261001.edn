@@ -1,0 +1,19 @@
+{:kind :clblast-pinned-event-envelope-diagnostic :version 1 :date "2026-10-01"
+ :raster-base-revision "78cbef90"
+ :provenance {:source-revision "ca2fc3cb09d4917cc72d4ca661d30296865a4afc" :tag "1.7.0"
+  :compiler "GNU 15.2.0" :build-type :release :cxx-flags "-O3 -DNDEBUG" :build-jobs 1
+  :tuners false :samples false :clients false :tests false
+  :harness-cxx-flags "-std=c++14 -O2"
+  :library-sha256 "56f9d9290d91163196089da81eb57da5a72bb943f072f7c51486d4aea3e4a179"
+  :harness-sha256 "7679ffd95c43c7136e7c339e651be26fcb9fc54d9070cdcace2f3058fc19a3e9"
+  :byte-identical-to-previous-library? true :original-build-provenance-recovered? false}
+ :scope {:diagnostic-only? true :background-load :shared-varying :promotion? false
+  :compared-to-raster? false :complete-kernel-envelope-observed? false
+  :queue-envelope-includes-host-submission-gaps? true
+  :returned-event-command-type :ndrange-kernel :returned-event-contained-in-markers? true
+  :completion-event-scope :last-kernel-only :selection-policy :clblast-default-database
+  :transfers-and-oracle-outside-samples? true}
+ :runs [
+  {:baseline :clblast-sgemm :precision :strict-f32 :shape [8 256 256] :device "Intel(R) Arc(TM) Graphics" :driver "26.05.37020.3" :clblast-version [1 7 0] :event-clock :queue-markers :event-envelope :queue-marker-span :host-submission-gaps-included? true :completion-event-scope :last-kernel-only :warmups 4 :samples-ns [210156 172500 174688 187396 172032 184271 171198 150469 131875 164219 66458 129218 ] :completion-kernel-samples-ns [131354 131354 130833 156666 101875 102708 100000 100000 57291 46979 60625 62083 ] :max-absolute-error 0}
+  {:baseline :clblast-sgemm :precision :strict-f32 :shape [256 256 256] :device "Intel(R) Arc(TM) Graphics" :driver "26.05.37020.3" :clblast-version [1 7 0] :event-clock :queue-markers :event-envelope :queue-marker-span :host-submission-gaps-included? true :completion-event-scope :last-kernel-only :warmups 4 :samples-ns [82188 114740 99791 158177 126927 75677 93854 90052 88229 82812 83906 87343 ] :completion-kernel-samples-ns [74791 66041 65520 65833 66458 69895 61979 61041 61562 61145 62291 61562 ] :max-absolute-error 0}
+ ]}

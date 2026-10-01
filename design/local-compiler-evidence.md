@@ -336,6 +336,32 @@ planning, AMRPlan-to-incidence projection, subcycling/reflux or external time-to
 CSR validity and paired incidence signs remain documented caller contracts. No compiler IR,
 emitter, numerical reassociation policy, backend binding or memory/cache convention changed.
 
+All seven final-head gates passed; #961 merged as `78cbef90`.
+
+### GEMM timing-envelope audit — 2026-10-01
+
+Source inspection found a benchmark-envelope mismatch: OpenCL Raster profiles the earliest
+kernel START through latest kernel END, while the CLBlast harness profiles before/after queue
+markers. The marker span may include host submission gaps before the first kernel and between
+commands. Shared device clocks and stationary samples alone do not make these the same measure.
+The harnesses now name their envelopes explicitly. Historical brackets stay diagnostic; they
+do not establish matched-envelope kernel speedups.
+
+The CLBlast harness also records its returned NDRange event START/END, verifies its command
+type and containment in the queue span, and labels it last-kernel-only. In inspected CLBlast
+1.7.0 source, the direct routine enqueues one kernel; the indirect routine may enqueue
+preprocessing and return only the GEMM or final postprocessing kernel event. That diagnostic
+must never silently replace whole-operation timing or be inferred from a matrix shape.
+No compiler, generated kernel, selection, event-runtime or ownership contract changed.
+
+A separate single-job build of tag `1.7.0` at `ca2fc3cb` completes successfully. Its
+library image is byte-identical to the older retained library (SHA-256 `56f9d929…`). This
+establishes a verified-source build matching those bytes, not the original checkout's provenance.
+The [pinned diagnostic](../bench/results/clblast-pinned-event-envelope-20261001.edn) retains
+the source/compiler/build and harness hashes and both timing scopes at the two bounded shapes.
+The corrected C++ harness passes both independent CPU oracles and its event-type/containment
+checks. Host-only Raster harness regressions remain green (3 tests / 26 assertions).
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening
