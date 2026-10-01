@@ -50,6 +50,25 @@ specialization, ordered guards, alias/alignment and geometry checks remain intac
 proof, cache or new representation is introduced. Count regressions distinguish one checked
 boundary from construction's two, and malformed arguments still fail public validation.
 
+The AD normalization audit reproduced a public semantic failure: an unused checked array read
+inside a nested let initializer throws in the primal, but `value+grad` previously erased it and
+returned a value. Nested-let projection now uses the existing ordered ANF normalizer, retaining
+all body statements and capturing nontrivial argument terminals before later sibling bindings.
+The old binder-blind loop dependency scans now use shared lexical free-symbol analysis with
+declared parameter/carry/recur-local names retained, including names shadowing core functions.
+The same projection also normalizes newly lifted loop-initializer prefixes before their activity
+and pullback are computed: the quoted-expression API had silently omitted the derivative of a
+nested-let initializer while the equivalent `deftm` path worked. Both APIs now share numerical
+and finite-difference oracles for this shape.
+This closes specific normalization seams, not arbitrary-loop AD or aggregate residual support.
+
+Matched prebound-extent GEMM/ReLU replay confirms the existing general fusion rule emits one
+stage, just like the explicit epilogue, on OpenCL and Level Zero. Numerical oracles pass on every
+replay. Its timing and the cooperative RMSNorm canary remain nonstationary under background load.
+Step 4 therefore retains current schedule defaults: no noisy measurement licenses promotion or
+weakening the checked-extent ordering rule. See `local-compiler-evidence.md` for timing scope and
+the remaining acceptance gaps.
+
 Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/HIP
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.

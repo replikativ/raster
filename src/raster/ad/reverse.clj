@@ -1116,14 +1116,14 @@
   [bindings recur-args active-params & [recur-bindings]]
   (let [loop-syms (mapv first bindings)
         active-set (atom (set active-params))
-        ;; Collect free symbols in an expression
-        free-syms (fn free-syms [expr]
-                    (cond
-                      (symbol? expr) #{expr}
-                      (seq? expr) (reduce into #{} (map free-syms (rest expr)))
-                      :else #{}))
+        lexical-names (into (into (set active-params) loop-syms)
+                            (map first recur-bindings))
+        dependencies (fn [expression]
+                       (binding [util/*shadowing-locals*
+                                 (into util/*shadowing-locals* lexical-names)]
+                         (util/free-syms expression)))
         ;; Build a dependency map for recur-bindings: {sym -> #{dep-syms}}
-        rb-deps (into {} (map (fn [[sym expr]] [sym (free-syms expr)])
+        rb-deps (into {} (map (fn [[sym expr]] [sym (dependencies expr)])
                               (or recur-bindings [])))
         ;; Expand a set of symbols through recur-binding dependencies
         expand-through-rb (fn [syms]
@@ -1145,8 +1145,8 @@
       (doseq [[sym init] bindings
               :let [idx (.indexOf loop-syms sym)
                     update-expr (nth recur-args idx)
-                    init-syms (free-syms init)
-                    update-syms (expand-through-rb (free-syms update-expr))
+                    init-syms (dependencies init)
+                    update-syms (expand-through-rb (dependencies update-expr))
                     all-dep-syms (into init-syms update-syms)]]
         (when (and (not (contains? @active-set sym))
                    (some @active-set all-dep-syms))
@@ -1156,6 +1156,7 @@
 
 (declare gen-reverse-loop-with-let)
 (declare gen-reverse-loop*)
+(declare hoist-nested-lets)
 
 (defn- gen-reverse-loop
   "Generate reverse-mode AD code for a loop* form.
@@ -1174,11 +1175,10 @@
   ;; Only lift inits that reference active params — (long 0) etc. stay in place.
   (let [raw-bindings (vec (partition 2 (second loop-form)))
         active-set (set active-params)
-        references-active? (fn refs? [expr]
-                             (cond
-                               (symbol? expr) (contains? active-set expr)
-                               (seq? expr) (some refs? (rest expr))
-                               :else false))
+        references-active? (fn [expr]
+                             (binding [util/*shadowing-locals*
+                                       (into util/*shadowing-locals* active-params)]
+                               (some active-set (util/free-syms expr))))
         active-nontrivial (filterv (fn [[_ init]]
                                      (and (seq? init) (references-active? init)))
                                    raw-bindings)]
@@ -1532,7 +1532,11 @@
   pullback returns adjoints for those values, which then chain
   backward through the let bindings."
   [let-bindings loop-form active-params]
-  (let [anf-bindings (anf-normalize-bindings let-bindings)
+  (let [;; A loop initializer can introduce a nested let after ad-prepare's
+        ;; outer hoisting. Flatten that newly lifted prefix through the same
+        ;; ordered projection before computing activity and its pullback.
+        normalized-prefix (hoist-nested-lets (list 'let* let-bindings nil))
+        anf-bindings (anf-normalize-bindings (second normalized-prefix))
         ;; PURE forward pass — now handles par/dotimes/if (the capability the old
         ;; hand-rolled copy lacked). This is what lets an array-valued INTERMEDIATE
         ;; produced in the let-prefix (e.g. a broadcast) and consumed by the loop
@@ -3759,6 +3763,18 @@
 ;; par/ftm/letfn*/reify*/catch bodies — closing the sibling-conflation hole the
 ;; old version silently passed through.
 
+(defn- hoisted-let-value
+  "Project a hygienic let into ordered ANF bindings and its final value.
+   Every body statement remains evaluated, including unused checked reads."
+  [expression]
+  (let [[_ bindings & body] (util/alpha-convert expression)
+        [extras value] (anf/anf-normalize-expr (cons 'do body) ad-gensym)
+        trivial? (anf/trivial-expr? value)
+        result (if trivial? value (with-meta (ad-gensym "argument") (meta value)))]
+    {:bindings (cond-> (into (vec bindings) extras)
+                 (not trivial?) (into [result value]))
+     :value result}))
+
 (defn- hoist-nested-lets
   "Hoist let expressions out of call arguments into a wrapping let*.
   Transforms: (f (let [a e1] a) (let [b e2] b)) → (let* [a e1 b e2] (f a b))
@@ -3785,8 +3801,8 @@
                         ;; unrolled fold iterations, which reuse the same local
                         ;; names) collide and the reverse AD conflates them —
                         ;; wrong gradients.
-                        (let [[_ inner-binds & inner-body] (util/alpha-convert he)]
-                          (-> acc (into (vec inner-binds)) (conj sym (last inner-body))))
+                        (let [{:keys [bindings value]} (hoisted-let-value he)]
+                          (-> acc (into bindings) (conj sym value)))
                         (conj acc sym he))))
                   []
                   (partition 2 bindings))
@@ -3839,7 +3855,10 @@
     (let [f (first form)
           args (rest form)
           hoisted-args (map hoist-nested-lets args)
-          ;; Collect let bindings from args and replace with their body
+          has-let? (some #(and (seq? %) (contains? #{'let 'let*} (first %))) hoisted-args)
+          ;; Once one argument's bindings move before the call, all earlier arguments
+          ;; must be evaluated there too. Otherwise a later let initializer can run
+          ;; before an earlier checked read or effectful argument.
           collected (reduce
                      (fn [{:keys [bindings clean-args]} arg]
                        (if (and (seq? arg) (contains? #{'let 'let*} (first arg)))
@@ -3851,11 +3870,18 @@
                          ;; unrolled fold iterations) would otherwise collide in
                          ;; the outer let* and the reverse AD would conflate them
                          ;; (later binding shadows the earlier → wrong gradients).
-                         (let [[_ inner-bindings & inner-body] (util/alpha-convert arg)]
-                           {:bindings (into bindings (vec inner-bindings))
-                            :clean-args (conj clean-args (last inner-body))})
-                         {:bindings bindings
-                          :clean-args (conj clean-args arg)}))
+                         (let [projection (hoisted-let-value arg)]
+                           {:bindings (into bindings (:bindings projection))
+                            :clean-args (conj clean-args (:value projection))})
+                         (if has-let?
+                           (let [[extras normalized] (anf/anf-normalize-expr arg ad-gensym)
+                                 value (if (anf/trivial-expr? normalized) normalized
+                                           (with-meta (ad-gensym "argument") (meta arg)))]
+                             {:bindings (cond-> (into bindings extras)
+                                          (not (anf/trivial-expr? normalized))
+                                          (into [value normalized]))
+                              :clean-args (conj clean-args value)})
+                           {:bindings bindings :clean-args (conj clean-args arg)})))
                      {:bindings [] :clean-args []}
                      hoisted-args)]
       (if (seq (:bindings collected))
