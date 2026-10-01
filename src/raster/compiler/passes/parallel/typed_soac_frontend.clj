@@ -40,6 +40,7 @@
 (def source-decline-reasons
   "Structured analysis failures that mean source lies outside the closed TypedSOAC subset."
   #{:unsupported-scalar-binding
+    :unsupported-buffer-projection
     :source-value-conflict
     :scan-dtype-unsupported
     :scan-not-associative
@@ -5236,6 +5237,13 @@
         parameters (capture-symbols (count captures))
         {:keys [dtype expression]} (scalar-result description scalar-dtypes scalar-types)]
     (when-not dtype
+      (let [tag (or (types/sym-type-tag sym)
+                    (:raster.type/tag (meta expr)) (:tag (meta expr)))]
+        (when (types/array-tag? tag)
+          (fail! :unsupported-buffer-projection
+                 "array-valued binding requires a physical storage projection, not a scalar equation"
+                 {:binding id :symbol sym :expression expr :retained-tag tag
+                  :source (select-keys (meta expr) [:file :line :column])})))
       (fail! :unsupported-scalar-binding
              "typed scalar equations require a retained result dtype"
              {:binding id :symbol sym :expression expr}))

@@ -193,6 +193,52 @@ its small pairwise face enumeration is not a production connectivity algorithm, 
 public mesh API or compiler IR is introduced. A general hierarchy-to-field/ownership mapping
 and scalable connectivity construction remain open.
 
+### Aggregate invocation projection audit — 2026-10-01
+
+Before inventing a conservative-remap primitive, probe the existing CSR `spmv`. Its JVM
+result is correct, but public equation-first compilation declines before scheduling.
+The walked binders already retain `m: long`, `rp: ints`, `ci: ints`, and `vs: doubles`.
+This is **not missing type inference**: an array-valued field binding reaches the scalar
+equation builder without its physical storage projection. The frontend now distinguishes
+that failure as `:unsupported-buffer-projection`, retaining the tag, expression and source
+coordinates; genuinely untyped scalar bindings keep their original diagnostic.
+
+There are two representation boundaries to consolidate. `soa-lower` already projects
+registered SoA companions and all-array records in the resident pipeline, but equation-first
+compilation does not invoke that parameter-rewriting step. CSR additionally mixes arrays
+with scalar dimensions, outside the all-array admission. Physical KernelABI scalar slots
+currently reject logical pointer bindings/fields; removing that invariant alone would not
+make public invocation materialize a record correctly.
+
+Keep this work inside campaign item 3, as a prerequisite for reusing existing sparse library
+operators in item 8; it does not replace training, memory, emitter or benchmark acceptance.
+The implementation order is:
+
+1. Factor one checked parameter-representation projection from the existing aggregate pass.
+   Derive ordered leaves exclusively from declared field types/order, preserving each leaf's
+   scalar or array kind and storage type. Do not add a CSR, solver or backend registry.
+2. Apply that representation before TypedSOAC construction in the public path. Retain the
+   logical caller parameter and field path separately from physical leaf symbols; share the
+   producer with the existing resident path instead of copying its source rewrite.
+3. Carry the checked logical-to-physical parameter mapping into invocation materialization.
+   Public calls still supply the declared record, not hidden extra dimensions or field buffers.
+   Array leaves retain source identity and per-leaf ownership/alias proofs; scalar leaves use
+   existing scalar type checks. Do not evaluate arbitrary field expressions in the linker.
+4. Keep kernel signatures flat. Decide explicitly whether logical scalar provenance belongs
+   only to invocation projection or also to KernelABI; do not conflate a scalar dimension with
+   a resident pointer. Any shared ABI change needs coordination with the vendor backend work.
+5. Validate generated SoA, all-array containers and mixed CSR records through public lowering
+   and native JVM/device parity, plus malformed fields, wrong scalar types, aliases and warm
+   specialization/dependency invalidation. Then reuse CSR for conservative hierarchy remapping.
+
+Record projection does not prove CSR row-pointer monotonicity, indirect-index bounds or
+consistency of scalar dimensions with storage capacities. Preserve those as explicit library
+input contracts unless checked independently; never infer a complete write or safe read from
+the record class name alone.
+
+Nested aggregates, returning records, aggregate donation and AD over sparse indices must be
+specified and tested independently; none follows from accepting read-only CSR parameters.
+
 ### Public training boundary follow-up
 
 The full existing tiny Gemma/LoRA forward/reverse-AD/SGD program was probed through

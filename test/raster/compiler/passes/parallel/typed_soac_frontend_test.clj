@@ -19,6 +19,21 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest retained-array-binding-declines-as-storage-not-missing-scalar-type
+  (doseq [tag ['ints 'doubles]]
+    (let [binder (with-meta 'field {:raster.type/tag tag})
+          expression (with-meta '(.-values container) {:line 12 :column 5})
+          error (try
+                  (#'frontend/scalar-equation {:id 0 :sym binder :expr expression} {} {})
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? error))
+      (is (frontend/source-decline? error))
+      (is (= :unsupported-buffer-projection (:reason (ex-data error))))
+      (is (= tag (:retained-tag (ex-data error))))
+      (is (= expression (:expression (ex-data error))))
+      (is (= {:line 12 :column 5} (:source (ex-data error)))))))
+
 (deftest generated-row-major-coordinates-carry-their-domain-type
   (let [matched (patterns/match-nested-dotimes-row-major-map
                  '(dotimes [i rows]
