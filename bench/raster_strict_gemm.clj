@@ -3,6 +3,7 @@
   (:require [raster.perf.production-canary :as canary]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
+            [raster.gpu.measurement :as measurement]
             [raster.runtime.hardware :as hardware]))
 
 (defn- dimension [text]
@@ -15,16 +16,33 @@
   (let [^floats actual (float-array actual)]
     (when-not (= (alength expected) (alength actual))
       (throw (ex-info "GEMM output length differs from oracle" {})))
+    (when-not (every? #(Float/isFinite (float %)) actual)
+      (throw (ex-info "GEMM produced a nonfinite output" {})))
     (let [error (reduce max 0.0
                         (map (fn [want got]
                                (Math/abs (- (double want) (double got))))
                              expected actual))]
-      (when (> error 1.0e-4)
+      (when-not (and (Double/isFinite error) (<= error 1.0e-4))
         (throw (ex-info "GEMM differs from independent CPU oracle"
                         {:max-absolute-error error})))
       error)))
 
+(defn- profile-duration-ns [profile field]
+  (let [ms (get profile field)]
+    (when-not (and (number? ms) (Double/isFinite (double ms)) (pos? ms)
+                   (< (double ms) (/ Long/MAX_VALUE 1.0e6)))
+      (throw (ex-info "GEMM profile requires a finite positive device duration"
+                      {:field field :value ms})))
+    (let [ns (long (* 1.0e6 ms))]
+      (when-not (pos? ns)
+        (throw (ex-info "GEMM profile duration is below one nanosecond"
+                        {:field field :value ms})))
+      ns)))
+
 (defn benchmark! [shape]
+  (when-not (and (vector? shape) (= 3 (count shape))
+                 (every? #(and (integer? %) (<= 1 % 4096)) shape))
+    (throw (ex-info "GEMM shape must contain three dimensions in 1..4096" {:shape shape})))
   (let [[m n k] shape]
     (when (> (*' m n k) 64000000)
       (throw (ex-info "reference work exceeds 64M products" {:shape shape})))
@@ -48,15 +66,15 @@
               pre-error (check-output! expected (link/download resident (:node output)))
               profiles (vec (repeatedly 12 #(link/profile! resident)))
               post-error (check-output! expected (link/download resident (:node output)))
-              samples (mapv #(long (* 1.0e6 (:device-wall-ms %))) profiles)]
-          (when-not (every? pos? samples)
-            (throw (ex-info "device-event span is missing or nonpositive"
-                            {:samples-ns samples})))
+              samples (mapv #(profile-duration-ns % :device-wall-ms) profiles)]
           {:baseline :raster-generated-contract
            :precision :strict-f32 :shape shape
            :device (hardware/device-signature :ocl:0)
            :clock :device-event-span :warmups 4 :samples-ns samples
-           :kernel-total-ns (mapv #(long (* 1.0e6 (:kernel-total-ms %))) profiles)
+           :measurement (into {} (measurement/summarize samples
+                                   :timing-source :device-event
+                                   :warmup-iterations 4))
+           :kernel-total-ns (mapv #(profile-duration-ns % :kernel-total-ms) profiles)
            :kernel-names (mapv :kernel-name (:profile (first profiles)))
            :compile-ns compile-ns :bind-ns bind-ns
            :schedule-precision (get-in prepared [:schedule :precision])

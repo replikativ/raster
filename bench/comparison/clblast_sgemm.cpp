@@ -118,6 +118,8 @@ int main(int argc, char** argv) {
           double sum = 0.0;
           for (size_t inner = 0; inner < k; ++inner)
             sum += double(a[row * k + inner]) * double(b[inner * n + column]);
+          if (!std::isfinite(c[row * n + column]))
+            throw std::runtime_error("SGEMM produced a nonfinite output");
           max_error = std::max(max_error, std::abs(double(c[row * n + column]) - double(float(sum))));
         }
       }
