@@ -294,6 +294,28 @@ proof duplication, not competitive GEMM throughput or a controlled compilation s
 The final two affected report fixtures were rerun serially (2 tests / 48 assertions), checking
 identity, storage/full-write agreement, source-graph non-retention and fresh public validation.
 
+All seven final-head gates passed; #959 squash-merged as `9a98c2c1`.
+
+### Matched GEMM evidence and benchmark guards — 2026-10-01
+
+The next local acceptance slice reuses the existing strict-FP32 public GEMM canary and
+CLBlast comparison rather than adding another compiler or benchmark path. Both oracles
+now explicitly reject nonfinite output: a NaN must not escape a maximum-error comparison.
+The Raster harness validates shape/work bounds before device initialization, validates
+finite positive event durations before integer conversion, and uses the existing measurement
+summary rather than introducing a second stationarity rule. Its opt-in host-only checks
+pass 3 tests / 26 assertions; the corrected C++ harness builds and executes locally.
+
+The [raw bracket record](../bench/results/strict-f32-local-brackets-20261001.edn) retains
+all chronological samples, exact generated source/ABI fingerprints, separate preparation/binding
+times and binary provenance. Both `[8,256,256]` and `[256,256,256]` match the CPU oracle
+exactly. Five of six bracket series fail the 5% CV diagnostic; this does not establish
+a stable ranking, regression or schedule-promotion decision. The generated register-tiled
+source/ABI match the September 27 record. The CLBlast library source checkout was removed,
+so its source revision is explicitly unverified even though its version and binary hash remain.
+This preserves the campaign's correctness/performance distinction; external training migration,
+conservative partial-patch PDE interfaces and real CUDA/HIP execution remain open.
+
 ## Structured AD invocation and external Gemma — 2026-09-30
 
 Structured `raster.params/value+grad` now uses the same generated fixed-arity flattening

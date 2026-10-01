@@ -141,6 +141,19 @@ claim about tuned vendor-library peak performance. Record the exact device, driv
 source revision and thermal/load context before comparing medians. Repeat with
 interleaved runs if the device is shared or nonstationary; do not promote a schedule
 from one pair of measurements. Neither benchmark is part of the ordinary test suite.
+The Raster result includes the existing `measurement/summarize` CV diagnostic, not a
+new stationarity or schedule-admission rule. Nonfinite oracle outputs and missing,
+nonfinite, overflowing or sub-nanosecond event durations fail explicitly. The host-only
+harness checks can run in an existing bench REPL without initializing a device:
+
+```clojure
+(require 'raster-strict-gemm-test)
+(clojure.test/run-tests 'raster-strict-gemm-test)
+```
+
+For a source/test-only REPL, load `bench/raster_strict_gemm.clj` and then
+`bench/raster_strict_gemm_test.clj` instead. These opt-in checks stay outside ordinary
+compiler CI and do not require an external CLBlast installation.
 The first [raw Arc comparison](../results/strict-f32-clblast-raster-20260925.edn) contains
 `[8,256,256]` and `[256,256,256]` with separate-process, non-interleaved device samples.
 Both paths matched the CPU oracle. At the larger shape, Raster's default portable segmented
@@ -176,6 +189,20 @@ while CLBlast is about 151 µs and its square bracket moves from 180 to 74 µs. 
 exact for the dyadic oracle. This leaves performance unresolved, not certified by the older
 favorable samples. The next comparison must freeze revisions and source fingerprints, control
 device load, and alternate runs; no tuning choice was changed from these nonstationary records.
+
+The [October 1 bracketed recheck](../results/strict-f32-local-brackets-20261001.edn)
+retains CLBlast → Raster → CLBlast execution order at both shapes on main `9a98c2c1`.
+All outputs match the independent CPU oracle exactly. Raster's generated register-tiled
+source and ABI hashes match the earlier recheck; no kernel or selection policy changed.
+Its medians are 95 µs for `[8,256,256]` and 207 µs for `[256,256,256]`. Five of six
+bracket series fail the existing 5% CV heuristic, and the CLBlast brackets drift markedly.
+This is neither a regression attribution nor a competitive ranking. The retained library's
+source revision could not be recovered after its temporary source directory disappeared:
+the record distinguishes fetched 1.7.0 headers from that existing library and records its
+binary hash rather than asserting a verified library source commit.
+The initial Raster preparation took 27.6 s and binding 1.39 s; warm preparations took
+25 ms and 427 ms, with bindings of 337 ms and 298 ms. These are coarse diagnostic
+host timings, not kernel durations or a controlled compilation-speedup result.
 
 ### Public dynamic GEMM/activation probe
 
