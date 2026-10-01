@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static void check(cl_int status, const char* operation) {
@@ -97,16 +98,28 @@ int main(int argc, char** argv) {
       if (active_queue != queue) throw std::runtime_error("CLBlast changed the measured queue");
       check(clEnqueueMarkerWithWaitList(queue, 0, nullptr, &after), "after marker");
       check(clWaitForEvents(1, &after), "wait for GEMM");
-      cl_ulong start = 0, end = 0;
+      cl_ulong start = 0, end = 0, kernel_start = 0, kernel_end = 0;
       check(clGetEventProfilingInfo(before, CL_PROFILING_COMMAND_END, sizeof(start), &start, nullptr),
             "before timestamp");
       check(clGetEventProfilingInfo(after, CL_PROFILING_COMMAND_END, sizeof(end), &end, nullptr),
             "after timestamp");
+      // CLBlast's returned event belongs to the final kernel. Indirect GEMM may
+      // enqueue preprocessing kernels too, so this is NOT the complete operation.
+      cl_command_type command_type = 0;
+      check(clGetEventInfo(gemm_event, CL_EVENT_COMMAND_TYPE, sizeof(command_type),
+                           &command_type, nullptr), "completion event type");
+      if (command_type != CL_COMMAND_NDRANGE_KERNEL)
+        throw std::runtime_error("CLBlast completion event is not an NDRange kernel");
+      check(clGetEventProfilingInfo(gemm_event, CL_PROFILING_COMMAND_START,
+                                   sizeof(kernel_start), &kernel_start, nullptr), "kernel start");
+      check(clGetEventProfilingInfo(gemm_event, CL_PROFILING_COMMAND_END,
+                                   sizeof(kernel_end), &kernel_end, nullptr), "kernel end");
       clReleaseEvent(before);
       clReleaseEvent(gemm_event);
       clReleaseEvent(after);
-      if (end < start) throw std::runtime_error("OpenCL event clock went backwards");
-      return end - start;
+      if (!(start <= kernel_start && kernel_start < kernel_end && kernel_end <= end))
+        throw std::runtime_error("OpenCL kernel event is missing, nonpositive or outside queue markers");
+      return std::make_pair(end - start, kernel_end - kernel_start);
     };
 
     auto validate = [&]() {
@@ -129,7 +142,7 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < 4; ++i) gemm();
     const auto pre_error = validate();
-    std::vector<cl_ulong> samples;
+    std::vector<std::pair<cl_ulong, cl_ulong>> samples;
     for (int i = 0; i < 12; ++i) samples.push_back(gemm());
     const auto post_error = validate();
     std::cout << std::setprecision(12)
@@ -139,8 +152,12 @@ int main(int argc, char** argv) {
               << " :driver " << std::quoted(device_string(device, CL_DRIVER_VERSION))
               << " :clblast-version [" << CLBLAST_VERSION_MAJOR << " "
               << CLBLAST_VERSION_MINOR << " " << CLBLAST_VERSION_PATCH << "]"
-              << " :event-clock :queue-markers :warmups 4 :samples-ns [";
-    for (auto sample : samples) std::cout << sample << " ";
+              << " :event-clock :queue-markers :event-envelope :queue-marker-span"
+              << " :host-submission-gaps-included? true"
+              << " :completion-event-scope :last-kernel-only :warmups 4 :samples-ns [";
+    for (auto sample : samples) std::cout << sample.first << " ";
+    std::cout << "] :completion-kernel-samples-ns [";
+    for (auto sample : samples) std::cout << sample.second << " ";
     std::cout << "] :max-absolute-error " << std::max(pre_error, post_error) << "}\n";
 
     clReleaseMemObject(c_buffer);

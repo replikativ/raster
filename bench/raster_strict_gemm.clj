@@ -71,6 +71,7 @@
            :precision :strict-f32 :shape shape
            :device (hardware/device-signature :ocl:0)
            :clock :device-event-span :warmups 4 :samples-ns samples
+           :event-envelope :first-kernel-start-to-last-kernel-end
            :measurement (into {} (measurement/summarize samples
                                    :timing-source :device-event
                                    :warmup-iterations 4))
