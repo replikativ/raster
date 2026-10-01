@@ -29,6 +29,7 @@
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.core :as rcore]))
@@ -64,6 +65,17 @@
       (symbol (str (ns-name ns)) (str name))
       (fail! :equation-first-function "equation-first compilation requires a deftm Var"
              {:function f-var}))))
+
+(defn ^:no-doc parameter-representation
+  "Declared aggregate representation, shared by compilation and its cache identity."
+  [f-var requested-dtype]
+  (let [parameters (pipeline/clean-params (pipeline/get-params f-var requested-dtype))
+        param-env (pipeline/build-param-env f-var requested-dtype)
+        specs (mapv (fn [sym] {:sym sym :tag (get param-env sym)}) parameters)
+        env (soa-lower/soa-param-env specs)]
+    {:params specs :soa-env env
+     :projection (soa-lower/parameter-projection specs env
+                                                  (the-ns (source-namespace-symbol f-var)))}))
 
 (defn- compiler-options
   [f-var target requested-dtype options]
@@ -355,8 +367,22 @@
          source (if (= 1 (count walked)) (first walked) (list* 'do walked))
          represented-source (pipeline/run-passes
                              source pipeline/gpu-resident-pre-soa-passes compiler-options)
+         representation (parameter-representation f-var (:dtype compiler-options))
+         param-specs (:params representation)
+         represented (soa-lower/soa-lower represented-source param-specs (:soa-env representation))
+         projection (:projection representation)
+         physical-parameters (mapv :sym (:params represented))
+         physical-types (when projection
+                          (opencl-pass/derive-param-types physical-parameters
+                                                         (mapv :tag (:params represented))
+                                                         (:dtype compiler-options) compiler-options))
+         compiler-options (cond-> compiler-options
+                            projection (assoc :active-params physical-parameters
+                                              :public-parameters physical-parameters
+                                              :array-types (:array-types physical-types)
+                                              :scalar-types (:scalar-types physical-types)))
          semantic-candidate (pipeline/run-passes
-                             represented-source pipeline/gpu-semantic-post-soa-passes
+                             (:body represented) pipeline/gpu-semantic-post-soa-passes
                              compiler-options :write-read-fused)
          semantic (case (:dialect semantic-candidate)
                     :typed-parallel (if (get-in semantic-candidate [:attributes :invocation-plan])
@@ -371,6 +397,9 @@
                     "deftm is outside the direct TypedSOAC/structured-control vertical"
                     {:function (function-symbol f-var)
                      :dialect (:dialect semantic) :fallback :none}))
+         semantic (cond-> semantic
+                    projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
+                                         projection))
          scheduled (structured-route/schedule-program semantic compiler-options)
          backend (device/select-runtime-backend target true nil)
          target-dialect (target-source-dialect target backend target-descriptor)

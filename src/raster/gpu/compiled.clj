@@ -27,6 +27,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
@@ -193,6 +194,9 @@
                 :tags (:raster.core/deftm-tags metadata)
                 :source-body-fingerprint
                 (when source-body (semantic-fingerprint/fingerprint source-body))
+                :parameter-projection
+                (when (:raster.core/deftm-params metadata)
+                  (:projection (equation-first/parameter-representation fn-var dtype)))
                 :source-dependency-fingerprint (:fingerprint dependency-evidence)}
         persistence-blockers
         (cond-> #{}
@@ -614,9 +618,30 @@
 (defn- project-equation-first-boundary
   "Choose public roles and escaped outputs on the normalized candidate, before its sole proof."
   [raw-plan compilation args {:keys [donate constants outputs taps roles]}]
-  (let [attributes (:attributes raw-plan)
+  (let [invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        projection (get-in invocation-plan [:attributes :parameter-projection])
+        aggregate-leaves (group-by :binding (filter :field (:physical-parameters projection)))
+        _ (when (some aggregate-leaves (concat donate outputs taps))
+            (throw (ex-info "aggregate donation and aggregate outputs require per-field ownership support"
+                            {:reason :compiled-aggregate-output :aggregates (set (keys aggregate-leaves))})))
+        expand (fn [symbol] (if-let [leaves (get aggregate-leaves symbol)]
+                             (filterv #(contains? (get-in raw-plan [:attributes :public-buffer-bindings]) %)
+                                      (mapv :symbol leaves)) [symbol]))
+        constants (vec (mapcat expand constants))
+        roles (into {} (mapcat (fn [[symbol role]] (map #(vector % role) (expand symbol))) roles))
+        attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)
         public-defaults (:public-buffer-roles attributes)
+        _ (doseq [[binding leaves] aggregate-leaves
+                  leaf leaves
+                  :let [role (or (get roles (:symbol leaf))
+                                 (when (some #{(:symbol leaf)} constants) :constant)
+                                 (get public-defaults (:symbol leaf)))]]
+            (when (or (contains? #{:state :output} (get public-defaults (:symbol leaf)))
+                      (and role (not (contains? #{:input :constant} role))))
+              (throw (ex-info "the initial aggregate vertical admits read-only fields only"
+                              {:reason :compiled-aggregate-write :parameter binding :field (:field leaf)
+                               :role role}))))
         public-symbols (set (keys public-bindings))
         requested-symbols (set (concat donate constants (keys roles)))
         unknown (set/difference requested-symbols public-symbols)
@@ -640,17 +665,22 @@
                  (assoc-in [:instances 0 :roles] compiler-roles)
                  (assoc-in [:attributes :public-buffer-roles] effective-roles))
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
-        argument-map (zipmap (map :symbol parameters) args)
+        argument-map (when-not projection (zipmap (map :symbol parameters) args))
+        leaves-by-symbol (into {} (map (juxt :symbol identity)) (:physical-parameters projection))
         donate-set (set donate)
         in-tree (vec
                  (keep (fn [{:keys [symbol]}]
                          (when-let [node (get public-bindings symbol)]
-                           (merge {:key (keyword (name symbol))
-                                   :sym symbol
-                                   :donate? (contains? donate-set symbol)
-                                   :default (get argument-map symbol)}
-                                  (equation-first-value plan node
-                                                        (get effective-roles symbol)))))
+                           (let [{:keys [binding field] class-name :class} (get leaves-by-symbol symbol)]
+                             (merge (cond-> {:key (if field [(keyword (name binding)) field]
+                                                     (keyword (name symbol)))
+                                             :sym symbol
+                                             :donate? (contains? donate-set symbol)
+                                             :default (if projection (get-in raw-plan [:nodes node :source])
+                                                          (get argument-map symbol))}
+                                      field (assoc :aggregate-binding binding :aggregate-class class-name :field field))
+                                    (equation-first-value plan node
+                                                          (get effective-roles symbol))))))
                        parameters))
         resolve-node (fn [value]
                        (or (get public-bindings value)
@@ -744,6 +774,13 @@
         attributes (:attributes plan)
         public-bindings (:public-buffer-bindings attributes)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
+        parameter-projection (get-in compilation [:semantic :attributes :invocation-plan :attributes :parameter-projection])
+        logical-binding (into {} (map (juxt :symbol :binding)) (:physical-parameters parameter-projection))
+        public-parameters (or (:public-parameters parameter-projection) (mapv :symbol parameters))
+        public-arrays (vec (distinct (for [{:keys [symbol]} parameters
+                                          :when (contains? public-bindings symbol)]
+                                      (get logical-binding symbol symbol))))
+        public-array-set (set public-arrays)
         certification-started (System/nanoTime)
         lowering (invocation-link/certify-final-projection result)
         invocation-certification-ns (- (System/nanoTime) certification-started)
@@ -753,11 +790,10 @@
                        :phase (keyword (str "kernel-" index))
                        :kernel-name (:kernel-name kernel)})
                     (range) (:kernels compilation))
-        descriptor {:all-params (mapv :symbol parameters)
-                    :array-params (mapv :symbol (filter #(contains? public-bindings (:symbol %))
-                                                       parameters))
-                    :scalar-params (mapv :symbol (remove #(contains? public-bindings (:symbol %))
-                                                        parameters))
+        descriptor {:all-params public-parameters
+                    :array-params public-arrays
+                    :scalar-params (filterv #(not (contains? public-array-set %)) public-parameters)
+                    :parameter-projection parameter-projection
                     :steps steps :result-sym nil :equation-first? true}
         schedule (assoc (get-in compilation [:options :schedule])
                         :compiler :equation-first :stats (:stats compilation))
@@ -987,7 +1023,10 @@
            ;; Mutable borrowers are read aliases, not dynamic input refresh slots.
            ;; Their captured host default must never overwrite the owner's updated state.
                :when (not (contains? borrowed-inputs reference))]
-           (assoc entry :key reference :sym [component-id (:sym entry)]
+           ;; Composition exposes explicit component/leaf references, not ambiguous
+           ;; source-record shorthand shared by several independently prepared components.
+           (assoc (dissoc entry :aggregate-binding :aggregate-class :field)
+                  :key reference :sym [component-id (:sym entry)]
                   :node (mapped-node component-id (:node entry)))))
         out-tree
         (mapv (fn [{:keys [key from entry]}]
@@ -1075,6 +1114,26 @@
        checked))
    [] donated))
 
+(defn- project-aggregate-inputs
+  [in-tree inputs]
+  (reduce-kv
+   (fn [inputs binding entries]
+     (let [key (keyword (name binding))]
+       (if-not (contains? inputs key) inputs
+         (do
+           (when-not (every? #(= :input (:role %)) entries)
+             (throw (ex-info "captured aggregate fields cannot be replaced at invocation"
+                             {:reason :compiled-aggregate-input-role :parameter binding})))
+           (when (some #(contains? inputs (:key %)) entries)
+             (throw (ex-info "aggregate and individual field inputs cannot both be supplied"
+                             {:reason :compiled-aggregate-input-conflict :parameter binding})))
+           (into (dissoc inputs key)
+                 (map (fn [{:keys [field aggregate-class] field-key :key}]
+                        [field-key (materialization/aggregate-field (get inputs key)
+                                                                   binding aggregate-class field)]))
+                 entries))))) inputs
+   (group-by :aggregate-binding (filter :aggregate-binding in-tree))))
+
 (defn- invoke-compiled-unleased
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
      1. preflight all donations before any mutation;
@@ -1086,6 +1145,7 @@
    donated inputs invalidated — never a mutation."
   [^Compiled c inputs]
   (let [{:keys [executable in-tree out-tree donated target]} c
+        inputs (project-aggregate-inputs in-tree inputs)
         in-nodes     (into {} (map (juxt :key identity)) in-tree)
         input-nodes  (filterv #(= :input (:role %)) in-tree)
         input-keys   (set (map :key input-nodes))
