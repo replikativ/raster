@@ -38,6 +38,7 @@
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
+            [raster.gpu.schedule :as gpu-schedule]
             [raster.gpu.value :as v]))
 
 (declare invoke-compiled)
@@ -537,6 +538,7 @@
                 :or {target :ze:0 dtype :float on-non-resident :nil}}]
   (let [preparation-started (System/nanoTime)
         template-report (atom nil)
+        schedule (if schedule (gpu-schedule/normalize-override schedule) schedule)
         compile-arguments
         (cond-> [:dtype dtype :on-non-resident on-non-resident]
           gemm-precision (conj :gemm-precision gemm-precision)
@@ -759,6 +761,9 @@
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident])
         compilation-options (assoc compilation-options :target target :dtype dtype)
+        compilation-options (cond-> compilation-options
+                              (contains? compilation-options :schedule)
+                              (update :schedule gpu-schedule/normalize-override))
         template-key
         (fn [revision]
           (template-cache-key

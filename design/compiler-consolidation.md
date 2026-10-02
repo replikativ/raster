@@ -666,8 +666,13 @@ callers may still resolve a descriptor when none is supplied. The equation-first
 cache fingerprints that same capture and passes it into compilation; each subsequent preparation
 captures current facts, so changed calibration creates a new specialization. Unknown/non-data
 descriptors fail rather than collapsing into a shared nil cache identity. This snapshot is not an
-admission lease against later runtime device changes. Cache canonicalization of equivalent policy spellings
-remains a follow-up. Quantized Q4_K already has a public compiled
+admission lease against later runtime device changes. Both public preparation paths now use
+the shared schedule-override normalizer before template identity: the existing nested
+`:gemm-precision` alias shares its template with `:precision`, while distinct precision policies
+and default-versus-pinned provenance remain distinct. Conflicts fail before lookup, unknown
+keys are retained for validation, and invalid top-level sugar is not hidden by normalization.
+This is spelling canonicalization, not equivalence inferred from coincidentally identical kernels.
+Quantized Q4_K already has a public compiled
 artifact oracle. Reuse these workload tests instead of adding another acceptance framework.
 
 ### Remaining reduction boundary, in landing order

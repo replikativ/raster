@@ -35,6 +35,46 @@
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
 
+(deftest equation-first-cache-normalizes-only-equivalent-schedule-spellings
+  (let [args [(float-array 4) 4]
+        base {:compiler :equation-first :target target :dtype :float}
+        count-compiles (atom 0)
+        original equation-first/compile]
+    ;; Settle generated specializations before measuring template acquisitions.
+    (compiled/lower #'artifact-map args base)
+    (compiled/clear-compilation-cache!)
+    (try
+      (with-redefs [equation-first/compile
+                    (fn [& xs] (swap! count-compiles inc) (apply original xs))]
+        (let [old (compiled/lower #'artifact-map args
+                                  (assoc base :schedule {:gemm-precision :f32-scalar}))
+              canonical (compiled/lower #'artifact-map args
+                                        (assoc base :schedule {:precision :f32-scalar}))]
+          (is (= 1 @count-compiles))
+          (is (= (:schedule old) (:schedule canonical)))
+          (is (true? (get-in (compiled/preparation-report canonical) [:template :cache-hit?])))
+          (is (= (get-in (compiled/preparation-report old) [:template :semantic-fingerprint])
+                 (get-in (compiled/preparation-report canonical) [:template :semantic-fingerprint])))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (compiled/lower #'artifact-map args
+                                       (assoc base :schedule {:gemm-precision :mixed-f16-f32
+                                                              :precision :f32-scalar}))))
+          (is (= 1 @count-compiles) "conflicting sugar fails before acquiring a template")
+          (compiled/lower #'artifact-map args (assoc base :schedule {:precision :mixed-f16-f32}))
+          (is (= 2 @count-compiles) "distinct precision policies remain distinct")
+          (let [with-meta (compiled/lower #'artifact-map args
+                                          (assoc base :schedule {:precision :mixed-f16-f32
+                                                                 :meta {:ignored true}}))]
+            (is (= 2 @count-compiles))
+            (is (true? (get-in (compiled/preparation-report with-meta) [:template :cache-hit?]))))
+          (compiled/lower #'artifact-map args base)
+          (is (= 3 @count-compiles) "default and explicitly pinned policy provenance remain distinct")
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (compiled/lower #'artifact-map args
+                                       (assoc base :gemm-precision :unknown
+                                              :schedule {:precision :f32-scalar}))))))
+      (finally (compiled/clear-compilation-cache!)))))
+
 (def ^:private identity
   {:semantic-request-fingerprint "semantic-request"
    :compiler-build-fingerprint "compiler-build"
