@@ -35,7 +35,14 @@
    Provider events are opaque, provider-owned completions. Promotion establishes the requested
    durable tier; localization establishes a local realization that can subsequently be opened as a
    scoped lease. Event methods deliberately mirror Raster GPU events without sharing native handles
-   or pretending storage and device queues are the same resource."
+   or pretending storage and device queues are the same resource. Content-addressed realizations
+   are immutable. A :durable-receipt placement promises those named bytes in the declared tier.
+   Await establishes completion and returns a ContentPlacement for localization/promotion.
+
+   -release-storage-event! is safe drain, not best-effort cancellation: whether await was never
+   called, succeeded or failed, release must settle work and end provider borrows before returning.
+   If draining fails, ownership remains internal to the provider and no result may be consumed.
+   Providers unable to guarantee this must not advertise publication capabilities."
   (-provider-descriptor [provider])
   (-submit-promotion! [provider content target-tier opts])
   (-submit-localization! [provider content opts])
@@ -54,6 +61,18 @@
 (defn- fail!
   [message reason data]
   (throw (ex-info message (assoc data :reason reason))))
+
+(defn- release-after-error! [error release!]
+  (try (release!)
+       (catch Throwable cleanup
+         (when-not (identical? error cleanup) (.addSuppressed ^Throwable error cleanup))))
+  (throw error))
+
+(defn- with-release* [body release!]
+  (let [result (try (body)
+                    (catch Throwable error (release-after-error! error release!)))]
+    (release!)
+    result))
 
 (defn- keyword-set?
   [value]
@@ -353,6 +372,7 @@
   (when-not (storage-event? event)
     (fail! "ContentProvider returned a non-StorageEvent"
            :numerical-content-event-type {:actual (type event)}))
+  (storage-event event)
   (when-not (= (:id description) (:provider-id event))
     (fail! "storage event belongs to a different content provider"
            :numerical-content-event-provider-mismatch
@@ -362,6 +382,15 @@
            :numerical-content-event-operation-mismatch
            {:expected operation :actual (:operation event)}))
   event)
+
+(defn- accept-provider-event! [provider description operation event]
+  (try
+    (validate-provider-event! description operation event)
+    (catch Throwable error
+      (if (storage-event? event)
+        ;; The originating provider owns a rejected handoff even if its provider-id is wrong.
+        (release-after-error! error #(-release-storage-event! provider event))
+        (throw error)))))
 
 (defn submit-promotion!
   "Submit promotion of immutable content to a declared durable tier."
@@ -381,8 +410,8 @@
                 :numerical-content-promotion-durability
                 {:provider (:id description) :tier target-tier
                  :capabilities (:capabilities tier)})))
-     (validate-provider-event!
-      description :promote (-submit-promotion! provider content target-tier opts)))))
+     (accept-provider-event!
+      provider description :promote (-submit-promotion! provider content target-tier opts)))))
 
 (defn submit-localization!
   "Submit localization of immutable content into a provider tier that can later be opened."
@@ -398,20 +427,12 @@
      (require-capability! description :localize)
      (when-let [tier-id (:tier opts)]
        (tier-by-id description tier-id))
-     (validate-provider-event!
-      description :localize (-submit-localization! provider content opts)))))
+     (accept-provider-event!
+      provider description :localize (-submit-localization! provider content opts)))))
 
 (defn- checked-event
   [provider event]
-  (let [description (provider-descriptor provider)]
-    (when-not (storage-event? event)
-      (fail! "storage event operation requires a StorageEvent"
-             :numerical-content-event-type {:actual (type event)}))
-    (when-not (= (:id description) (:provider-id event))
-      (fail! "storage event belongs to a different content provider"
-             :numerical-content-event-provider-mismatch
-             {:expected (:id description) :actual (:provider-id event)}))
-    event))
+  (validate-provider-event! (provider-descriptor provider) (:operation event) event))
 
 (defn storage-event-complete?
   [provider event]
@@ -426,6 +447,8 @@
   (-storage-event-measurement provider (checked-event provider event)))
 
 (defn release-storage-event!
+  "Settle provider work and release its event, with or without any preceding await.
+   A failure forbids consuming the result; opaque resource ownership remains with the provider."
   [provider event]
   (-release-storage-event! provider (checked-event provider event))
   nil)
@@ -463,20 +486,87 @@
          (lease-segment lease)
          lease
          (catch Throwable error
-           (try (.close ^AutoCloseable lease)
-                (catch Throwable cleanup
-                  (when-not (identical? error cleanup) (.addSuppressed error cleanup))))
-           (throw error)))))))
+           (release-after-error! error #(.close ^AutoCloseable lease))))))))
 
 (defn with-local-content
-  "Open localized content, call `f` with its lease, and release the provider resource exactly once."
+  "Open localized content, call `f` and release its lease once, preserving primary failures."
   ([provider content f] (with-local-content provider content {} f))
   ([provider content opts f]
    (when-not (ifn? f)
      (fail! "with-local-content requires a callback"
             :numerical-content-callback {:callback f}))
    (let [lease (open-local-content! provider content opts)]
-     (try
-       (f lease)
-       (finally
-         (.close ^AutoCloseable lease))))))
+     (with-release* #(f lease) #(.close ^AutoCloseable lease)))))
+
+(defn- checked-placement! [description content tier placement]
+  (when-not (content-placement? placement)
+    (fail! "storage completion must return a ContentPlacement"
+           :numerical-content-completion-placement {:actual (type placement)}))
+  (content-placement placement)
+  (when-not (= [(:id description) tier content]
+               [(:provider-id placement) (:tier-id placement) (:content placement)])
+    (fail! "storage completion differs from its requested placement"
+           :numerical-content-completion-mismatch
+           {:expected {:provider-id (:id description) :tier-id tier :content content}
+            :actual placement}))
+  placement)
+
+(defn- await-placement! [provider description content tier event]
+  (with-release*
+    #(checked-placement! description content tier (await-storage-event! provider event))
+    ;; This scope owns the exact accepted handoff. Descriptor drift must not prevent safe drain.
+    #(-release-storage-event! provider event)))
+
+(defn finalize-state-availability!
+  "Verify/promote a certified state's blobs before invoking publish-manifest! with its manifest.
+
+   Preflights all capabilities/digest algorithms before submitting work. Localizes through the
+   first declared scoped-segment tier and serially verifies exact stored extents and SHA-256 under
+   a source lease. The lease closes before content-addressed promotion. Every completion must name
+   the requested provider, tier and content, and every event drains before the next stage. Runtime
+   placements are returned in manifest field/chunk order, never embedded into the compiler state.
+
+   This finalizes availability according to trusted immutable-content/durable-receipt provider
+   contracts, not producer authentication, codec semantics or a storage transaction. The callback
+   owns metadata atomicity, parent existence and retries. Failure can leave orphaned promoted blobs;
+   callback failure or lost acknowledgment cannot roll metadata back. No store/cache is introduced."
+  [provider certified-state target-tier publish-manifest!]
+  (numerical-state/verify! certified-state)
+  (when-not (ifn? publish-manifest!)
+    (fail! "state availability finalization requires a metadata publication callback"
+           :numerical-content-publication-callback {}))
+  (let [description (provider-descriptor provider)
+        _ (doseq [capability [:localize :scoped-segment :promote]]
+            (require-capability! description capability))
+        local-tier (or (some #(when (contains? (:capabilities %) :scoped-segment) (:id %))
+                            (:tiers description))
+                       (fail! "state availability requires an openable localization tier"
+                              :numerical-content-localization-tier {}))
+        target (tier-by-id description target-tier)
+        _ (when-not (contains? (:capabilities target) :durable-receipt)
+            (fail! "publication target does not promise a durable receipt"
+                   :numerical-content-promotion-durability {:tier target-tier}))
+        chunks (vec (for [field (get-in certified-state [:manifest :fields])
+                          chunk (:chunks field)]
+                      {:field-id (:id field) :chunk chunk}))
+        _ (doseq [{:keys [chunk]} chunks]
+            (when-not (= :sha-256 (get-in chunk [:content :algorithm]))
+              (fail! "state publication has an unsupported content digest algorithm"
+                     :numerical-content-chunk-algorithm
+                     {:chunk (:id chunk) :algorithm (get-in chunk [:content :algorithm])})))
+        placements
+        (mapv (fn [{:keys [field-id chunk]}]
+                (let [address (:content chunk)]
+                  (await-placement! provider description address local-tier
+                                    (submit-localization! provider address {:tier local-tier}))
+                  (with-local-content provider address {:tier local-tier}
+                    (fn [lease]
+                      (checked-placement! description address local-tier (:placement lease))
+                      (verify-chunk-lease! chunk lease)))
+                  {:field-id field-id :chunk-id (:id chunk)
+                   :placement (await-placement!
+                               provider description address target-tier
+                               (submit-promotion! provider address target-tier))}))
+              chunks)]
+    {:certified-state certified-state :placements placements
+     :publication (publish-manifest! (:manifest certified-state))}))

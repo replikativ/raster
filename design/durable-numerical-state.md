@@ -270,6 +270,32 @@ without changing the manifest or weakening mmap/LMDB lifetime rules. A nonblocki
 does not release the lease: cancellation stops admission of new work, then `release-event!` waits at
 the current transfer boundary and consumes the event and lease together.
 
+Storage providers have the analogous safe-drain obligation: event release settles provider work
+and ends internal borrows before returning, whether await was never called, succeeded or failed. If it cannot drain,
+ownership remains internal to the provider and no result is consumed. Rejected event handoffs are
+released through their originating provider even when the returned provider ID or operation is
+malformed. Submission and consumption share field validation. Scoped callbacks and rejected lease
+handoffs retain the primary failure, suppress cleanup failures and release once. This tightens the
+provider ownership contract; it does not implement a provider, cancellation rollback or a storage
+transaction. Publication must not begin its next stage after unsuccessful release.
+
+`finalize-state-availability!` is the production availability finalizer over these contracts. It
+reverifies the certified manifest, callback, provider capabilities, openable localization tier,
+durable target tier and every digest algorithm before submitting anything. In manifest field/chunk
+order it localizes and checks the exact placement, verifies a scoped source's stored extent/SHA-256,
+closes that lease, then promotes by content address and checks the durable placement. Each event
+drains before the next stage. There is at most one operation or lease outstanding; repeated content
+addresses are deliberately not cached/deduplicated by a second runtime registry. Only after every
+chunk succeeds does the caller's metadata publisher receive the original pure manifest. Returned
+runtime placements remain separate from the certified compiler state.
+
+This finalizer trusts the provider's immutable-content and durable-receipt promises. It cannot
+authenticate caller-declared program provenance, attest numerical codec semantics or turn a bad
+provider into a correct one. Partial failure may leave orphaned blobs. Parent existence, atomic
+metadata publication, compare-and-swap, retries and lost-acknowledgment recovery belong to the
+metadata plane (for example Datahike), not this synchronous content finalizer. Receipt-to-manifest
+producer binding and device representation evidence remain separate acceptance gates.
+
 In-place mmap editing is for ephemeral working copies. Mutating an object already published under a
 content address violates snapshot immutability. Same-sized Boring edits may dirty only touched
 pages, which is valuable while constructing the next chunk; the result must then be sealed under a

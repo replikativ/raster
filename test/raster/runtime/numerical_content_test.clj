@@ -198,6 +198,68 @@
       (is (= [cleanup] (vec (.getSuppressed ^Throwable failure))))
       (is (= 1 @releases)))))
 
+(deftest rejected-storage-event-handoffs-release-through-the-originating-provider
+  (doseq [operation [:promote :localize]
+          bad-field [:provider-id :operation :queue :id]
+          cleanup-fails? [false true]]
+    (let [description (:description (fake-provider :owner))
+          event (assoc (content/storage-event
+                        {:provider-id :owner :id :rejected :operation operation})
+                       bad-field (if (#{:queue :id} bad-field) nil :wrong))
+          releases (atom [])
+          cleanup (ex-info "event cleanup failed" {})
+          provider (reify content/ContentProvider
+                     (-provider-descriptor [_] description)
+                     (-submit-promotion! [_ _ _ _] event)
+                     (-submit-localization! [_ _ _] event)
+                     (-release-storage-event! [_ returned]
+                       (swap! releases conj returned)
+                       (when cleanup-fails? (throw cleanup))))
+          failure (try (case operation
+                         :promote (content/submit-promotion! provider (address 1) :durable)
+                         :localize (content/submit-localization! provider (address 1)))
+                       nil (catch Throwable error error))]
+      (is (= (case bad-field
+               :provider-id :numerical-content-event-provider-mismatch
+               :operation :numerical-content-event-operation-mismatch
+               :queue :numerical-content-event-queue
+               :id :numerical-content-event-id)
+             (:reason (ex-data failure))))
+      (is (= 1 (count @releases)))
+      (is (identical? event (first @releases)))
+      (is (= (if cleanup-fails? [cleanup] []) (vec (.getSuppressed ^Throwable failure)))))))
+
+(deftest scoped-content-preserves-primary-errors-and-releases-once
+  (doseq [[body-fails? cleanup-fails? same-error?]
+          [[true true false] [true false false] [false true false] [false false false]
+           [true true true]]]
+    (let [releases (atom 0)
+          primary (ex-info "body failed" {})
+          cleanup (if same-error? primary (ex-info "lease cleanup failed" {}))
+          lease (assoc (chunk-lease (byte-array 16) (address 1) releases)
+                       :release-fn #(do (swap! releases inc) (when cleanup-fails? (throw cleanup))))
+          description (content/provider-description
+                       {:id :local-test :capabilities #{:scoped-segment}
+                        :tiers [(content/storage-tier {:id :file :kind :file :locality :node
+                                                       :durability :cached})]})
+          provider (reify content/ContentProvider
+                     (-provider-descriptor [_] description)
+                     (-open-local-content! [_ _ _] lease))
+          result (try (content/with-local-content provider (address 1)
+                        (fn [actual]
+                          (is (identical? lease actual))
+                          (if body-fails? (throw primary) :success)))
+                      (catch Throwable error error))]
+      (is (if body-fails? (identical? primary result)
+              (if cleanup-fails? (identical? cleanup result) (= :success result))))
+      (when body-fails?
+        (is (= (if (and cleanup-fails? (not same-error?)) [cleanup] [])
+               (vec (.getSuppressed ^Throwable result)))))
+      (is (= 1 @releases))
+      (is (content/lease-closed? lease))
+      (.close ^AutoCloseable lease)
+      (is (= 1 @releases)))))
+
 (deftest content-address-streams-across-staging-blocks
   (let [bytes (byte-array (map unchecked-byte (range 131073)))
         expected (.formatHex (HexFormat/of)

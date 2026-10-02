@@ -1449,3 +1449,22 @@ semantics. Runtime tests pass 13 tests / 218 assertions, including both orders, 
 patterns, staging boundaries, digest failures, overflow, partial overlap and closed destinations.
 Pivotal review found no blocker. Full CI remains required; publication and independent semantic
 restore matching are not established by this codec alone.
+
+### Ordered numerical-state availability finalization — 2026-10-03
+
+The content runtime now verifies/localizes/promotes each certified manifest chunk in bounded
+sequence and invokes an external metadata callback only after matching durable placements. It
+reuses the manifest/content/provider contracts rather than adding a store or compiler cache.
+Rejected provider-event handoffs drain through the originating provider; accepted-event field
+validation is shared with consumption. Source leases close before promotion, and callback or
+validation errors retain their identity with cleanup errors suppressed. The provider's safe-drain
+obligation explicitly includes never-awaited handoffs. Combined publication/content/state tests
+pass 33 tests / 618 assertions in the existing REPL. Pivotal review required accepted-event cleanup
+to bypass fresh descriptor validation: an unavailable or changed descriptor must not prevent the
+originating provider's raw safe drain. Counterexamples cover pre-await failure and post-await drift,
+including primary/suppressed cleanup errors. The final review found no remaining blocker; full CI
+remains a landing gate. Multi-field/repeated-content tests preserve order and keep opaque runtime
+receipt metadata out of the certified compiler state.
+This finalizes provider-declared availability, not producer authentication, codec verification,
+parent existence or transactional metadata publication. Orphan blobs and acknowledgment loss are
+explicit failure cases; receipt-to-manifest integration remains on the eight-item campaign.
