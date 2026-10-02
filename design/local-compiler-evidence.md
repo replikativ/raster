@@ -1004,6 +1004,33 @@ and OpenCL at `[1,1024,640]`: all ten validation/warmup/measurement replays per 
 the ggml oracle raw float bits after output poisoning. Two measured rounds are a correctness
 check, not a stationary performance series or a schedule-promotion decision.
 
+### Double arithmetic before Float materialization — 2026-10-02
+
+Extending the public Q8_K→Q4_K composition oracle to changed-input replays exposed a
+one-ULP scale error on both local backends. For the exact Float input `0.49460068345069885`,
+Double division by 127 followed by nearest-even Float conversion should produce
+`0.003894493682309985`; native execution produced `0.0038944934494793415`, exactly the
+result of multiplication by a rounded Float reciprocal. Packed words and integer sums still
+matched, and the existing toleranced projection oracle did not expose the scale discrepancy.
+
+A one-element public kernel reproduces this independently of quantization. The retained
+KernelBody source contains Double division and `convert_float_rte`, without fast-math flags.
+An OpenCL diagnostic with native optimization temporarily disabled gives the expected result;
+a separate resident Double intermediate also gives the expected result on both backends.
+These observations isolate the native optimization boundary rather than justify relaxing the
+oracle. Production build flags remain unchanged.
+
+The OpenCL emitter now materializes nonliteral Double values in volatile private storage before
+nearest-even Float narrowing. The guarded helper is shared by concatenated kernels; its demand
+also declares FP64 when only scalar intermediates, rather than buffer storage, use Double.
+Literal-only conversions keep their existing emission, and CUDA/HIP keep `__double2float_rn`.
+The strengthened chain retains one binding across three inputs, including a zero row, poisons
+all connected activation leaves and the output before each replay, and checks packed words,
+scales and sums exactly against the independent CPU quantizer. Both actual local backends pass
+40 assertions; the final projection retains its existing `1e-3` tolerance. Private volatile
+materialization may cost instructions: this is correctness evidence, not measured throughput
+or proof of all native arithmetic optimizations.
+
 ### Resident alignment capture investigation — 2026-09-30
 
 #920 is merged after all seven final-head CI gates passed. Its source-result cast correction

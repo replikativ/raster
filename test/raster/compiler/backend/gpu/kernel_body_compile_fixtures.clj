@@ -792,6 +792,11 @@
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)
                            {:target-dialect dialect}))
+           (write-source! directory suffix "double-division-narrowing"
+                          (body-emit/emit-scalar-kernel
+                           "double_division_narrowing"
+                           (body-fixtures/double-division-narrowing-body)
+                           {:target-dialect dialect}))
            (write-source! directory suffix "scalar-while"
                           (body-emit/emit-scalar-kernel
                            "scalar_while" (body-fixtures/scalar-while-body)

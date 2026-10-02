@@ -577,8 +577,11 @@
       ;; OpenCL conversion suffixes state the requested rounding of IEEE narrowing.
       (and narrowing-fp? (= :ieee overflow))
       (if (c-dialect/opencl? *scalar-dialect*)
-        (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
-             "(" argument-source ")")
+        (if (and (= [:double :float :nearest-even] [source-type result-type rounding])
+                 (not (record-kind? "Literal" argument)))
+          (str "rstr_narrow_f64_f32_rte(" argument-source ")")
+          (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
+               "(" argument-source ")"))
         (case [source-type result-type rounding]
           [:float :half :nearest-even] (str "__float2half_rn(" argument-source ")")
           [:double :float :nearest-even] (str "__double2float_rn(" argument-source ")")
@@ -1665,7 +1668,11 @@
         storage-declarations (concat parameters (:allocations kernel-body))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
         uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
-        uses-double? (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
+        uses-double? (or (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
+                         (some #{:double} (vals value-types))
+                         ;; Expression-valued operands need no named ValueSpec. This exact
+                         ;; emitted helper demand also covers their narrowing boundary.
+                         (str/includes? operation-source "rstr_narrow_f64_f32_rte("))
         collective (first (filter #(record-kind? "Collective" %) operations))
         uses-subgroups? (or collective
                             (some #(and (record-kind? "IndexBinding" %)

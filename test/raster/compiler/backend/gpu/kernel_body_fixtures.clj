@@ -22,6 +22,26 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn double-division-narrowing-body
+  "Float-only storage with an expression-valued Double division before explicit narrowing."
+  []
+  (body/make
+   {:id :double-division-narrowing
+    :parameters [(body/->KernelParameter 'input :scalar :float [] nil nil :input)
+                 (body/->KernelParameter 'out :output :float [1] :global
+                                         (layout/row-major [1] :float) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'narrowed :float)
+                  (body/cast-expression
+                   (body/scalar-expression
+                    :div :double [(body/cast-expression 'input :double :exact :exact)
+                                (body/literal 127.0 :double)])
+                   :float :nearest-even :ieee))
+                 (body/->ScalarStore 'out [0] 'narrowed nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn scalar-while-body
   "One lane-local, loop-carried condition shared by verifier and all C-family gates."
   []

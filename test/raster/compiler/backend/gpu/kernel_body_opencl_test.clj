@@ -662,6 +662,35 @@
               {:keys [exit err]} (compile-c-family-source target source)]
           (is (zero? exit) err))))))
 
+(deftest double-division-narrowing-retains-its-source-precision
+  (let [kernel (fixtures/double-division-narrowing-body)]
+    (doseq [target [:opencl-portable :opencl-intel]]
+      (let [source (opencl/emit-scalar-kernel "narrowing" kernel {:target-dialect target})
+            second-source (opencl/emit-scalar-kernel "narrowing_second" kernel
+                                                    {:target-dialect target})]
+        (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp64 : enable"))
+        (is (str/includes? source "volatile double materialized = value;"))
+        (is (= 2 (count (re-seq #"rstr_narrow_f64_f32_rte\(" source))))
+        (is (str/includes? source " / 127.0"))
+        (when (command-available? "clang")
+          (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-"
+                                           :in (str source second-source))]
+            (is (zero? exit) err)))))
+    (doseq [target [:cuda :hip]]
+      (let [source (opencl/emit-scalar-kernel "narrowing" kernel {:target-dialect target})]
+        (is (str/includes? source "__double2float_rn("))
+        (is (not (str/includes? source "rstr_narrow_f64_f32_rte")))))
+    (let [literal-kernel (assoc kernel :operations
+                                [(body/->ScalarCompute
+                                  (body/value 'narrowed :float)
+                                  (body/cast-expression (body/literal 0.0 :double)
+                                                        :float :nearest-even :ieee))
+                                 (body/->ScalarStore 'out [0] 'narrowed nil)])
+          source (opencl/emit-scalar-kernel "literal_narrowing" literal-kernel)]
+      (is (str/includes? source "convert_float_rte(0.0)"))
+      (is (not (str/includes? source "rstr_narrow_f64_f32_rte"))))))
+
 (deftest checked-integral-narrowing-reaches-capable-c-family-targets
   (testing "portable OpenCL declines because it has no standard terminating trap"
     (try
