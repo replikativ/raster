@@ -407,6 +407,21 @@
       (.putAll ^java.util.IdentityHashMap *validated-boundary-projections* local-projections))
     checked))
 
+(defn ^:no-doc validate-with-retained-program!
+  "Internal exact-owner static-proof path. Recheck every concrete call binding and step;
+   reuse only the unchanged emitted program's sealed validation and physical projections.
+   The fresh projection scope and evidence are not installed on the returned call."
+  [call retained-validation]
+  (when-not (emitted-program-call? call)
+    (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
+           {:actual (type call)}))
+  (let [{:keys [program projections]}
+        (emitted-program/checked-retained-validation! (:program call) retained-validation)
+        local-projections (doto (java.util.IdentityHashMap.) (.putAll projections))]
+    (binding [*validated-boundary-projections* local-projections]
+      ;; No constructor exemptions: even steps originating from `make` are checked afresh.
+      (validate-call-against-program! call program nil))))
+
 (defn execution-order
   "Project straight-line selected graph order without allocating device storage.
 

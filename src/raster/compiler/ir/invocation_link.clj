@@ -376,7 +376,8 @@
    scalar equations. The returned plan is allocation-free; runtime contact starts only in
    raster.gpu.link/instantiate!.
    The six-argument arity accepts internal exact-owner static evidence, not a runtime proof;
-   materialization, call bindings and final LinkPlan validation are still checked independently."
+   materialization, call bindings and final LinkPlan memory/effect obligations remain fresh.
+   Only unchanged static program validation can be shared with final construction."
   ([materialized parallel-program target evaluate-host]
    (:plan (lower materialized parallel-program target evaluate-host
                  (fn [plan] {:plan plan}))))
@@ -507,7 +508,7 @@
                    :semantic-outputs resident-outputs
                    :host-outputs (into {} (filter (comp typed-scalar? val)) (:outputs call))
                    :driver-allocations 0}}
-     project))))
+     project retained-validation))))
 
 (defn- derive-certificate
   [plan effect-evidence]

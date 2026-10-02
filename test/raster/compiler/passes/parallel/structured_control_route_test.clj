@@ -1000,6 +1000,51 @@
       (is (not (emitted-program/retained-validation?
                 (assoc source-program :dialect :unsupported) another))))))
 
+(deftest retained-program-check-revalidates-the-complete-call-boundary
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        evidence (emitted-program/validate-with-physical-results! (:program call))
+        numerical-index (first (keep-indexed
+                                #(when (program-call/emitted-equation-call? %2) %1)
+                                (:steps call)))
+        numerical (get-in call [:steps numerical-index])
+        scalar-id (first (keys (:scalar-values numerical)))
+        buffer-id (first (keys (:buffers numerical)))
+        reject-reason (fn [check candidate]
+                        (try (check candidate) nil
+                             (catch clojure.lang.ExceptionInfo error
+                               [(.getMessage error) (ex-data error)])))
+        retained #(program-call/validate-with-retained-program! % evidence)]
+    (is (identical? call (retained call)))
+    (doseq [[label invalid]
+            [[:steps (assoc call :steps [])]
+             [:scalars (assoc-in call [:steps numerical-index :scalar-values scalar-id]
+                                 {:type :float :value 1.0})]
+             [:buffers (update-in call [:steps numerical-index :buffers] dissoc buffer-id)]
+             [:loop-scratch (assoc-in call [:steps 0 :scratch] nil)]
+             [:outputs (assoc call :outputs {})]
+             [:graph (assoc-in call [:steps numerical-index :graph :nodes] [])]
+             [:result-views (assoc-in call [:steps numerical-index :result-views]
+                                     {::unknown ::missing})]
+             [:step-buffers (assoc-in call [:steps numerical-index :buffers] {})]]]
+      (testing (name label)
+        (let [independent (reject-reason program-call/validate! invalid)]
+          (is (some? independent) "the baseline independently rejects this tampering")
+          (is (= independent (reject-reason retained invalid))
+              "static reuse never exempts a concrete call obligation"))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (program-call/validate-with-retained-program!
+                  call (with-meta evidence (assoc (meta evidence) :copied true)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (retained (assoc call :program (with-meta (:program call) {:copied true})))))
+    (is (not (contains? call :projections)))
+    (let [checks (atom 0) original emitted-program/validate-with-physical-results!]
+      (with-redefs [emitted-program/validate-with-physical-results!
+                    (fn [program] (swap! checks inc) (original program))]
+        (is (identical? call (retained call)))
+        (is (zero? @checks))
+        (is (identical? call (program-call/validate! call)))
+        (is (= 1 @checks) "a later public check has no inherited retained scope")))))
+
 (deftest buffer-renaming-shares-only-an-exact-synchronous-boundary-projection
   (let [{:keys [call]} (prepared-mixed-call 3)
         numerical-step (first (filter program-call/emitted-equation-call? (:steps call)))
