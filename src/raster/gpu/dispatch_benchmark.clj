@@ -265,7 +265,12 @@
    explicitly. Returns the DispatchTuning together with a schedule override ready to pass as
    `:schedule` to compile-gpu-program. Compilation remains pure; this function is explicitly an
    offline action. `:pin-fixed? true` is accepted only for a fixed measured selector and requests
-   fallback-free recompilation with every losing alternative pruned."
+   fallback-free recompilation with every losing alternative pruned.
+
+   Linked tuning holds the executable lifetime lock and rejects live output leases. It always
+   invalidates output readiness and value continuity (including a tuning-cache hit), without
+   crediting candidate kernels as full plan replays. Callback failures poison the executable;
+   close and reinstantiate it. Output leases cannot escape a tuning callback."
   [executable descriptor runtime-values case-fn
    & {:keys [instance step numerical-mode layout improvement-threshold force? measurement
              pin-fixed?]
@@ -275,14 +280,16 @@
         contract (get-in dispatch [:attributes :tuning])
         numerical-mode (or numerical-mode (:numerical-mode contract))
         layout (or layout (:layout contract))
-        result (tune-dispatch!
-                (:session executable) dispatch descriptor runtime-values
-                (linked-case-fn executable instance step case-fn)
-                :numerical-mode numerical-mode
-                :layout layout
-                :improvement-threshold improvement-threshold
-                :force? force?
-                :measurement measurement)]
+        result (link/with-exclusive-mutation!
+                executable :tune-linked-dispatch!
+                #(tune-dispatch!
+                  (:session executable) dispatch descriptor runtime-values
+                  (linked-case-fn executable instance step case-fn)
+                  :numerical-mode numerical-mode
+                  :layout layout
+                  :improvement-threshold improvement-threshold
+                  :force? force?
+                  :measurement measurement))]
     {:tuning result
      :selector (:selector result)
      :schedule-override (tuning-schedule-override dispatch result descriptor

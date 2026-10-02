@@ -287,6 +287,9 @@
                               :bindings {'x :x 'out :out}}]}
           :session (atom {})
           :node-views {:x x-view :out out-view}
+          :lifetime-lock (Object.) :output-leases (atom 0)
+          :output-ready? (atom true) :completed-replays (atom 0)
+          :execution-state (atom {:value-epoch 0})
           :closed? (atom false)})
         measured-selector {:kind :runtime-scalar-ranges
                            :argument 'width :below :reference
@@ -326,6 +329,9 @@
            (:schedule-override result)))
     (is (= :compiled (:instance-id result)))
     (is (= measured-selector (:selector result)))
+    (is (= {:value-epoch 2} @(:execution-state executable)))
+    (is (false? @(:output-ready? executable)))
+    (is (zero? @(:completed-replays executable)))
     (is (= :reduce (:phase result)))
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"exceeds its resident node view"
