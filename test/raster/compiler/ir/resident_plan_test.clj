@@ -115,6 +115,36 @@
            (reason-of #(resident/bind-template template
                                                [(float-array 7) second-w 8]))))))
 
+(deftest scalar-specialization-witnesses-preserve-floating-bits
+  (let [descriptor (pipeline/compile-gpu-program #'production-map :ze:0
+                                                 :dtype :float :on-non-resident :throw)
+        args [(float-array 8) (float-array 8) (float 0.0) 8]
+        lowering (resident/lower {:id :scalar-bits :target :ze:0
+                                  :descriptor descriptor :arguments args})
+        template (resident/source-free-template lowering)]
+    (is (= :resident-plan-template-scalars
+           (reason-of #(resident/bind-template template (assoc args 2 (float -0.0))))))
+    (is (= :resident-plan-certificate
+           (reason-of #(resident/verify!
+                        (assoc-in lowering [:certificate :scalars 'scale] (float -0.0))))))
+    (is (identical? lowering (resident/verify! lowering)))
+    (doseq [bits [0x7fc00001 0x7fc00002]
+            :let [nan (Float/intBitsToFloat bits)
+                  nan-args (assoc args 2 nan)
+                  nan-lowering (resident/lower {:id [:scalar-nan bits] :target :ze:0
+                                                :descriptor descriptor :arguments nan-args})
+                  nan-template (resident/source-free-template nan-lowering)
+                  same-nan (Float/intBitsToFloat bits)
+                  other-nan (Float/intBitsToFloat (bit-xor bits 3))]]
+      (is (resident/certified-plan? (resident/bind-template nan-template
+                                                           (assoc args 2 same-nan))))
+      (is (identical? nan-lowering (resident/verify! nan-lowering)))
+      (is (= :resident-plan-template-scalars
+             (reason-of #(resident/bind-template nan-template (assoc args 2 other-nan)))))
+      (is (= :resident-plan-certificate
+             (reason-of #(resident/verify!
+                          (assoc-in nan-lowering [:certificate :scalars 'scale] other-nan))))))))
+
 (deftest external-ownership-is-not-mistaken-for-host-initialization
   (let [lowering (resident/lower
                   {:id :external :target :ze:0 :descriptor (descriptor)

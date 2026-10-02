@@ -507,8 +507,11 @@
                             (if (contains? arrays parameter)
                               [:array (.getName (.getComponentType (class value)))
                                (java.lang.reflect.Array/getLength value)]
-                              value)))
+                              [:scalar (semantic-fingerprint/fingerprint value)])))
                         (:all-params descriptor))]
+    ;; Ordinary equality identifies signed zeros and cannot reliably identify equal NaN bits.
+    ;; Canonical scalar fingerprints select the cache entry; bind-template independently checks
+    ;; those bits rather than trusting the digest. Primitive-array contents remain absent.
     (cond-> [::compiled qualified target dtype signature (:schedule descriptor)]
       preserve-declared-array-storage?
       (conj {:preserve-declared-array-storage? true}))))

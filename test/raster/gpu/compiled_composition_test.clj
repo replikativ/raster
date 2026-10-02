@@ -444,6 +444,26 @@
     (finally
       (compiled/clear-compilation-cache!))))
 
+(deftest resident-plan-key-preserves-scalar-bits
+  (let [descriptor (assoc (descriptor) :all-params '[x w scale n]
+                           :scalar-params '[scale n])
+        x (float-array 8) w (float-array 8)
+        key-for (fn [scale]
+                  (#'compiled/compilation-id #'component :ze:0 :float descriptor
+                                             [x w scale 8] false))
+        nan-a (Float/intBitsToFloat 0x7fc00001)
+        same-nan-a (Float/intBitsToFloat 0x7fc00001)
+        nan-b (Float/intBitsToFloat 0x7fc00002)]
+    (is (not= (key-for (float 0.0)) (key-for (float -0.0))))
+    (is (= (key-for nan-a) (key-for same-nan-a)))
+    (is (not= (key-for nan-a) (key-for nan-b)))
+    (is (not= (key-for (float 0.0)) (key-for (double 0.0))))
+    (is (not= (key-for 0.0) (key-for -0.0)))
+    (is (= (key-for (Double/longBitsToDouble 0x7ff8000000000001))
+           (key-for (Double/longBitsToDouble 0x7ff8000000000001))))
+    (is (not= (key-for (Double/longBitsToDouble 0x7ff8000000000001))
+              (key-for (Double/longBitsToDouble 0x7ff8000000000002))))))
+
 (deftest structural-compilation-cache-is-single-flight
   (compiled/clear-compilation-cache!)
   (try
