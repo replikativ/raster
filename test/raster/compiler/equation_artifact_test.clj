@@ -187,12 +187,18 @@
                   :source {:source-dependency-fingerprint "source-dependencies"}
                   :target {:descriptor-fingerprint "target-descriptor"}}}
             compiles (atom 0)
-            report (atom nil)]
+            report (atom nil)
+            expected-identity {:semantic-request-fingerprint "semantic-request"
+                               :compiler-build-fingerprint "compiler-build"
+                               :source-dependency-fingerprint "source-dependencies"
+                               :target-descriptor-fingerprint "target-descriptor"}]
         (compiled/clear-compilation-cache!)
         (try
-          (binding [compiled/*equation-artifact-store* cache]
+          (binding [compiled/*equation-artifact-store* cache
+                    compiled/*compilation-template-observer* #(reset! report %)]
             (#'compiled/cached-compilation-template
              key :equation-first #(do (swap! compiles inc) @compilation)))
+          (is (= expected-identity (:persistent-artifact-identity @report)))
           (compiled/clear-compilation-cache!)
           (binding [compiled/*equation-artifact-store* cache
                     compiled/*compilation-template-observer* #(reset! report %)]
@@ -201,5 +207,26 @@
                     key :equation-first #(throw (ex-info "must not compile" {}))))))
           (is (= 1 @compiles))
           (is (= :hit (get-in @report [:persistent-artifact :status])))
+          (is (= expected-identity (:persistent-artifact-identity @report)))
+          (binding [compiled/*equation-artifact-store* cache
+                    compiled/*compilation-template-observer* #(reset! report %)]
+            (#'compiled/cached-compilation-template
+             key :equation-first #(throw (ex-info "must reuse process entry" {}))))
+          (is (true? (:cache-hit? @report)))
+          (is (= :process-cache-hit (get-in @report [:persistent-artifact :reason])))
+          (is (= expected-identity (:persistent-artifact-identity @report)))
+          (let [development-key (-> key
+                                    (assoc :semantic-fingerprint "development-request"
+                                           :persistent-cache-eligible? false
+                                           :persistence-blockers #{:compiler-build-fingerprint})
+                                    (assoc-in [:semantic-request :compiler-build-fingerprint] nil))]
+            (binding [compiled/*equation-artifact-store* cache
+                      compiled/*compilation-template-observer* #(reset! report %)]
+              (#'compiled/cached-compilation-template development-key :equation-first
+               (fn [] @compilation)))
+            (is (false? (:persistent-cache-eligible? @report)))
+            (is (= #{:compiler-build-fingerprint} (:persistence-blockers @report)))
+            (is (nil? (get-in @report [:persistent-artifact-identity :compiler-build-fingerprint])))
+            (is (= :ineligible (get-in @report [:persistent-artifact :status]))))
           (finally
             (compiled/clear-compilation-cache!)))))))
