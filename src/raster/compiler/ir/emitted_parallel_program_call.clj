@@ -571,22 +571,12 @@
         (binding [*validated-boundary-projections* validated-boundaries]
           (validate-call-against-program! remapped (:program call) nil))))))
 
-(defn make
-  "Prepare a source-independent, target-neutral call of an emitted parallel program.
-
-   `buffers` may include preallocated intermediate and output storage in addition to inputs.
-   `scalar-values` contains typed runtime scalars. `loop-scratch` maps loop output IDs to alternate
-   carry buffers. `evaluate-host` is called only for effect-free scalar equations that do not
-   depend on device results.
-   Optional `result-views` maps logical results to their prefix-producing physical destinations.
-   This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
-   validates concrete views, and runtime preparation requires checked view resolution."
-  ([parallel-program buffers scalar-values loop-scratch evaluate-host]
-   (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
-  ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
+(defn- stage-inputs
+  "Fresh checked inputs and host results for this construction only. The evaluator is neither
+   returned nor retained. This private value is not an externally reusable validation proof."
+  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
   (let [{parallel-program :program projections :projections}
         (emitted-program/validate-with-physical-results! parallel-program)
-        validated-equation-calls (java.util.IdentityHashMap.)
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
                                              (filter #(emitted-equation/emitted-equation?
@@ -627,7 +617,16 @@
               (fail! :emitted-program-loop-scratch
                      "loop scratch binding cannot be nil" {:value id})))
         {:keys [scalars host-steps]}
-        (evaluate-host-equations parallel-program buffers scalar-values evaluate-host)
+        (evaluate-host-equations parallel-program buffers scalar-values evaluate-host)]
+    {:program parallel-program :projections projections :buffers buffers :scalars scalars
+     :loop-scratch loop-scratch :host-steps host-steps :result-views result-views}))
+
+(defn- construct-staged-call
+  "Construct only from inputs just staged by this namespace. Host evaluation remains outside
+   structural construction; every checked host step is installed unchanged into the call."
+  [{parallel-program :program :keys [projections buffers scalars loop-scratch host-steps result-views]}]
+  (let [values (:values parallel-program)
+        validated-equation-calls (java.util.IdentityHashMap.)
         planned
         (reduce
          (fn [{:keys [buffers steps]} equation]
@@ -663,4 +662,20 @@
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) final-buffers scalars loop-scratch outputs
       {:execution :stage-once-host-repetition :source-inspected false})
-     parallel-program validated-equation-calls))))
+     parallel-program validated-equation-calls)))
+
+(defn make
+  "Prepare a source-independent, target-neutral call of an emitted parallel program.
+
+   `buffers` may include preallocated intermediate and output storage in addition to inputs.
+   `scalar-values` contains typed runtime scalars. `loop-scratch` maps loop output IDs to alternate
+   carry buffers. `evaluate-host` is called only for effect-free scalar equations that do not
+   depend on device results.
+   Optional `result-views` maps logical results to their prefix-producing physical destinations.
+   This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
+   validates concrete views, and runtime preparation requires checked view resolution."
+  ([parallel-program buffers scalar-values loop-scratch evaluate-host]
+   (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
+  ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
+   (construct-staged-call
+    (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host result-views))))
