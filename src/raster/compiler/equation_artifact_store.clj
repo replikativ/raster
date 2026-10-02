@@ -80,7 +80,8 @@
             (Files/setLastModifiedTime (.toPath file)
                                        (FileTime/fromMillis (System/currentTimeMillis)))
             (catch Exception _ nil))
-          {:status :hit :value compilation :bytes (.length file)})
+          (merge {:status :hit :value compilation :bytes (.length file)}
+                 (select-keys envelope [:compilation-fingerprint :payload-fingerprint])))
         (catch Exception error
           {:status :miss :reason :invalid-entry
            :error-class (.getName (class error))
@@ -95,7 +96,8 @@
                     {:reason :equation-artifact-store-key-identity})))
   (let [directory (.toPath ^java.io.File (:root store))
         target (.toPath (entry-file store semantic-request-fingerprint))
-        bytes (artifact/encode (artifact/seal identity compilation))]
+        envelope (artifact/seal identity compilation)
+        bytes (artifact/encode envelope)]
     (when (< (:max-bytes store) (alength ^bytes bytes))
       (throw (ex-info "equation artifact exceeds the complete store byte budget"
                       {:reason :equation-artifact-store-entry-too-large
@@ -120,4 +122,5 @@
         (finally
           (Files/deleteIfExists temporary))))
     (trim! store (.toFile target))
-    {:status :stored :bytes (alength ^bytes bytes) :file (.getName (.toFile target))}))
+    (merge {:status :stored :bytes (alength ^bytes bytes) :file (.getName (.toFile target))}
+           (select-keys envelope [:compilation-fingerprint :payload-fingerprint]))))

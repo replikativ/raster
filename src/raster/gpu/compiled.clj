@@ -376,6 +376,16 @@
            {:compiler compiler :cache-hit? hit? :success? true
             :miss-reason miss-reason
             :semantic-fingerprint (:semantic-fingerprint key)
+            ;; Reuse the artifact owner's build/source/target identity even on process hits.
+            ;; This is template evidence, not a bound invocation or checkpoint producer proof.
+            :persistent-artifact-identity
+            (when (and (= :equation-first compiler) (:persistent-cache-eligible? key))
+              (persistent-artifact-identity key))
+            ;; The template owner retains the original store/load result across process hits.
+            ;; These hashes identify that exact artifact, including its generated value names.
+            :retained-artifact
+            (select-keys @(:persistent-report entry)
+                         [:compilation-fingerprint :payload-fingerprint])
             :persistent-cache-eligible? (:persistent-cache-eligible? key)
             :persistence-blockers (:persistence-blockers key)
             :source-dependency-blockers (:source-dependency-blockers key)
