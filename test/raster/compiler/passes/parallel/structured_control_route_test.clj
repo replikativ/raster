@@ -1354,3 +1354,36 @@
                     {loop-output :carry-scratch}
                     (fn [& _] (swap! rejected-evaluations inc)))))
       (is (zero? @rejected-evaluations) "invalid programs fail before host evaluation"))))
+
+(deftest staged-host-result-conflicts-use-exact-scalar-bits
+  (let [value (av/tensor {:dtype :double :shape []})
+        algorithm (soac/make
+                   (soac/default-program-facts
+                    {:values {'input value 'answer value} :inputs '[input]
+                     :equations {'host (soac/default-equation-facts)}})
+                   [(list '= 'host '[answer]
+                          (list 'scalar {:dtypes [:double]} '[input]
+                                (soac/lambda-form '[x] '[x])))]
+                   '[answer])
+        equation (program/->ProgramEquation
+                  [:host] [:test :host] nil '[input] '[answer] algorithm [] #{}
+                  {:source :test} {:host-only true})
+        emitted (program/make {:dialect :opencl-parallel
+                               :values {'input value 'answer value}
+                               :inputs '[input] :equations [equation] :outputs '[answer]})
+        typed (fn [x] {:type :double :value x})
+        prepare (fn [supplied evaluated]
+                  (program-call/make emitted {} {'input (typed evaluated)
+                                                  'answer (typed supplied)} {}
+                                     (fn [_ _] {'answer (typed evaluated)})))
+        reason (fn [supplied evaluated]
+                 (try (prepare supplied evaluated) nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (is (= :emitted-program-host-result-conflict (reason 0.0 -0.0)))
+    (is (= :emitted-program-host-result-conflict (reason -0.0 0.0)))
+    (is (program-call/emitted-program-call? (prepare -0.0 -0.0)))
+    (let [nan-a (Double/longBitsToDouble 0x7ff8000000000001)
+          nan-a' (Double/longBitsToDouble 0x7ff8000000000001)
+          nan-b (Double/longBitsToDouble 0x7ff8000000000002)]
+      (is (program-call/emitted-program-call? (prepare nan-a nan-a')))
+      (is (= :emitted-program-host-result-conflict (reason nan-a nan-b))))))

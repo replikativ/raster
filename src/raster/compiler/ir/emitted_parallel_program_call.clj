@@ -309,7 +309,7 @@
                    (assoc :scalars
                           (reduce-kv (fn [environment id value]
                                        (when-let [supplied (get environment id)]
-                                         (when-not (= supplied value)
+                                         (when-not (semantic-fingerprint/equivalent? supplied value)
                                            (fail! :emitted-program-host-result-conflict
                                                   "supplied and evaluated host scalars disagree"
                                                   {:equation (:id equation) :value id})))
