@@ -108,6 +108,14 @@ payloads. The existing canonical comparison now checks that conflict boundary wi
 host execution order or scalar validation. The structured-control/program-call suite passes
 44 tests / 280 assertions; this remains a correctness change, not template reuse.
 
+The first structural prerequisite now separates private `stage-inputs` from
+`construct-staged-call`. Public `make` composes them synchronously with unchanged arities and
+validation order. The evaluator is not retained; physical-result projections and construction
+identity maps stay invocation-local. Two dependent host equations run once, in order, on each
+preparation; invalid inputs and host exceptions cannot enter structural construction. The
+combined structured-control and actual local composition acceptance passes 54 tests / 378
+assertions. No template lookup or retained public staging authority is introduced by this split.
+
 Then resume matched performance evidence, external training acceptance and the distributed/PDE
 milestones. This optimization does not complete the wider campaign or authorize schedule promotion.
 

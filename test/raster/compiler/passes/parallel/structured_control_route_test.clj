@@ -1355,19 +1355,21 @@
                     (fn [& _] (swap! rejected-evaluations inc)))))
       (is (zero? @rejected-evaluations) "invalid programs fail before host evaluation"))))
 
+(defn- host-identity-equation [id input output value]
+  (let [algorithm (soac/make
+                   (soac/default-program-facts
+                    {:values {input value output value} :inputs [input]
+                     :equations {id (soac/default-equation-facts)}})
+                   [(list '= id [output]
+                          (list 'scalar {:dtypes [(:dtype value)]} [input]
+                                (soac/lambda-form '[x] '[x])))]
+                   [output])]
+    (program/->ProgramEquation [id] [:test id] nil [input] [output] algorithm [] #{}
+                              {:source :test} {:host-only true})))
+
 (deftest staged-host-result-conflicts-use-exact-scalar-bits
   (let [value (av/tensor {:dtype :double :shape []})
-        algorithm (soac/make
-                   (soac/default-program-facts
-                    {:values {'input value 'answer value} :inputs '[input]
-                     :equations {'host (soac/default-equation-facts)}})
-                   [(list '= 'host '[answer]
-                          (list 'scalar {:dtypes [:double]} '[input]
-                                (soac/lambda-form '[x] '[x])))]
-                   '[answer])
-        equation (program/->ProgramEquation
-                  [:host] [:test :host] nil '[input] '[answer] algorithm [] #{}
-                  {:source :test} {:host-only true})
+        equation (host-identity-equation 'host 'input 'answer value)
         emitted (program/make {:dialect :opencl-parallel
                                :values {'input value 'answer value}
                                :inputs '[input] :equations [equation] :outputs '[answer]})
@@ -1387,3 +1389,39 @@
           nan-b (Double/longBitsToDouble 0x7ff8000000000002)]
       (is (program-call/emitted-program-call? (prepare nan-a nan-a')))
       (is (= :emitted-program-host-result-conflict (reason nan-a nan-b))))))
+
+(deftest fresh-host-staging-precedes-structural-construction
+  (let [value (av/tensor {:dtype :double :shape []})
+        emitted (program/make
+                 {:dialect :opencl-parallel :values {'input value 'middle value 'answer value}
+                  :inputs '[input] :outputs '[answer]
+                  :equations [(host-identity-equation 'first 'input 'middle value)
+                              (host-identity-equation 'second 'middle 'answer value)]})
+        evaluations (atom [])
+        constructions (atom 0)
+        original @#'program-call/construct-staged-call
+        evaluate (fn [equation {:keys [operands]}]
+                   (swap! evaluations conj (:id equation))
+                   {(first (:results equation)) (get operands (first (:operands equation)))})
+        inputs {'input {:type :double :value 2.0}}
+        failure (ex-info "fresh host evaluation failed" {:reason ::staging-probe})]
+    (with-redefs-fn
+      {#'program-call/construct-staged-call
+       (fn [staged]
+         (swap! constructions inc)
+         (is (not (contains? staged :evaluate-host)) "the evaluator is not retained in staged inputs")
+         (original staged))}
+      (fn []
+        (dotimes [_ 2]
+          (is (= {:type :double :value 2.0}
+                 (get-in (program-call/make emitted {} inputs {} evaluate) [:outputs 'answer]))))
+        (is (= [['first] ['second] ['first] ['second]] @evaluations))
+        (is (= 2 @constructions))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (program-call/make emitted {} (assoc inputs 'unknown {:type :double :value 1.0})
+                                        {} evaluate)))
+        (is (= 4 (count @evaluations)) "invalid inputs reject before any host callback")
+        (is (identical? failure
+                        (try (program-call/make emitted {} inputs {} (fn [& _] (throw failure)))
+                             nil (catch clojure.lang.ExceptionInfo error error))))
+        (is (= 2 @constructions) "staging failure cannot enter structural construction")))))
