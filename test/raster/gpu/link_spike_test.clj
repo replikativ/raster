@@ -230,6 +230,7 @@
                      :session ::session
                      :node-views {:destination resident}
                      :pending-inputs (atom #{:destination})
+                     :tainted-inputs (atom #{})
                      :closed? (atom false)
                      :lifetime-lock (Object.) :output-leases (atom 0)
                      :output-ready? (atom false)})
@@ -279,7 +280,85 @@
           (gpu-link/write! executable :destination (device-array source-buffer source-view)))
         (is (= [:register :copy :detach] (mapv first @calls)))
         (is (= {:elements 4} (-> @calls second last)))
-        (is (empty? @(:pending-inputs executable)))))))
+        (is (empty? @(:pending-inputs executable)))))
+    (testing "a failed device copy does not preserve old initialized readiness"
+      (reset! (:pending-inputs executable) #{})
+      (let [failure (ex-info "simulated partially completed device copy" {})
+            detached (atom false)]
+        (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
+                      gpu/register-buffer! (fn [& _] nil)
+                      gpu/buffer-view (fn [& _] (gpu/->ResidentBufferView ::session :import source-view))
+                      gpu/copy-range! (fn [& _] (throw failure))
+                      gpu/free-buffer! (fn [& _] (reset! detached true))]
+          (is (identical? failure
+                          (try (gpu-link/write! executable :destination
+                                                (device-array source-buffer source-view))
+                               (catch Throwable error error)))))
+        (is (true? @detached))
+        (is (= #{:destination} @(:pending-inputs executable)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not been initialized"
+                              (gpu-link/run! executable)))))
+    (testing "a no-copy self-write cannot revive a failed destination"
+      (with-redefs [gpu/buffer (fn [& _] destination-buffer)]
+        (doseq [write [gpu-link/validate-write! gpu-link/write!]]
+          (is (= :link-device-input-tainted
+                 (try (write executable :destination
+                             (device-array destination-buffer destination-view))
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+      (is (= #{:destination} @(:pending-inputs executable))))
+    (testing "copy failure stays primary when detaching the borrowed buffer also fails"
+      (let [failure (ex-info "copy failed" {})
+            cleanup (ex-info "detach failed" {})]
+        (with-redefs [gpu/buffer (fn [& _] destination-buffer)
+                      gpu/register-buffer! (fn [& _] nil)
+                      gpu/buffer-view (fn [& _] (gpu/->ResidentBufferView ::session :import source-view))
+                      gpu/copy-range! (fn [& _] (throw failure))
+                      gpu/free-buffer! (fn [& _] (throw cleanup))]
+          (is (identical? failure
+                          (try (gpu-link/write! executable :destination
+                                                (device-array source-buffer source-view))
+                               (catch Throwable error error))))
+          (is (= [cleanup] (vec (.getSuppressed failure)))))))))
+
+(deftest failed-host-replacement-requires-overlapping-views-to-be-reinitialized
+  (let [allocation (bview/allocation {:id :failed-transfer :byte-size 32 :memory-space :device
+                                     :device :ze:0 :ownership :owned})
+        views {:x (bview/view allocation {:dtype :float :shape [4]})
+               :alias (bview/view allocation {:dtype :float :shape [4]})
+               :partial (bview/view allocation {:dtype :float :shape [4] :byte-offset 4})
+               :untouched (bview/view allocation {:dtype :float :shape [3] :byte-offset 20})}
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :failed-transfer :target :ze:0 :outputs []
+                            :nodes (into {} (map (fn [[id view]]
+                                                  [id (link-plan/map->LinkNode
+                                                       {:id id :view view :role :input})]) views))}
+                     :session ::session :node-views (into {} (map (fn [[id view]]
+                                                                   [id (gpu/->ResidentBufferView
+                                                                        ::session id view)]) views))
+                     :pending-inputs (atom #{}) :tainted-inputs (atom #{})
+                     :closed? (atom false) :lifetime-lock (Object.)
+                     :output-leases (atom 0) :output-ready? (atom true) :completed-replays (atom 0)})
+        failure (ex-info "simulated partially completed upload" {})
+        replayed (atom false)]
+    (with-redefs [gpu/upload-range! (fn [& _] (throw (AssertionError. "preflight must not copy")))]
+      (is (thrown? clojure.lang.ExceptionInfo (gpu-link/upload! executable :x (double-array 4))))
+      (is (empty? @(:pending-inputs executable)))
+      (is (true? @(:output-ready? executable))))
+    (with-redefs [gpu/upload-range! (fn [& _] (throw failure))]
+      (is (identical? failure (try (gpu-link/upload! executable :x (float-array 4))
+                                   (catch Throwable error error)))))
+    (is (= #{:x :alias :partial} @(:pending-inputs executable)))
+    (is (false? @(:output-ready? executable)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not been initialized" (gpu-link/run! executable)))
+    (with-redefs [gpu/upload-range! (fn [& _] nil)
+                  raster.gpu.parallel-program/run-prepared! (fn [& _] (reset! replayed true))]
+      (gpu-link/upload! executable :x (float-array 4))
+      (is (= #{:alias :partial} @(:pending-inputs executable)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not been initialized" (gpu-link/run! executable)))
+      (doseq [id [:alias :partial]] (gpu-link/upload! executable id (float-array 4)))
+      (is (empty? @(:pending-inputs executable)))
+      (gpu-link/run! executable)
+      (is (true? @replayed)))))
 
 (deftest owned-runtime-allocation-preserves-the-certified-identity
   (let [session (atom {:device-id :ze:0 :session-id :session

@@ -1297,15 +1297,46 @@
   (doseq [{:keys [key node default]} input-nodes]
     (gpu-link/validate-write! executable node (get inputs key default))))
 
+(defn- retiring-value-root?
+  [previous value]
+  (and (v/device-array? value)
+       (or (some #(identical? % value) previous)
+           (when-let [base (:base value)] (retiring-value-root? previous base)))))
+
+(defn- write-invocation-inputs!
+  "Retire public output aliases before mutation, but retain private borrowed reads when a caller
+   feeds a previous output back as an input. The executable lifetime lock and completed preflight
+   justify this local handoff; no independent owner or asynchronous lifetime is extended."
+  [c input-nodes inputs previous donations]
+  (let [borrowed (atom [])
+        retiring (into (vec previous) donations)]
+    (try
+      (let [sources (mapv (fn [{:keys [key node default]}]
+                            (let [source (get inputs key default)]
+                              [node (if (retiring-value-root? retiring source)
+                                      (let [read (v/wrap-external-view
+                                                  (:buffer source) (:device source) (:view source))]
+                                        (swap! borrowed conj read)
+                                        read)
+                                      source)])) input-nodes)]
+        ;; Transfers are not transactional: consume donations at the mutation boundary, so
+        ;; even a partially failed write cannot leave a live donated alias to corrupted bytes.
+        (doseq [value donations] (v/consume! value))
+        (invalidate-live-outputs! c)
+        (doseq [[node source] sources]
+          (gpu-link/write! (:executable c) node source)))
+      (finally (doseq [read @borrowed] (v/free! read))))))
+
 (defn- invoke-compiled-unleased
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
      1. preflight all donations before any mutation;
-     2. write each dynamic input (host upload, exact-view no-op, or device-to-device copy);
-     3. consume exact resident donated values (donation-invalidation, §1.3);
+     2. consume donations and retire previous output wrappers after complete preflight;
+     3. write dynamic inputs (host upload, exact-view no-op, or device-to-device copy);
      4. replay the linked graph with no output download;
      5. project out-tree nodes as external DeviceArrays over stable LinkPlan views.
    Mutation of resident :state is invisible: the caller sees fresh output values and the old
-   donated inputs invalidated — never a mutation."
+   donated inputs invalidated — never a mutation. Backend failures after preflight consume
+   donations too: partially completed device writes cannot be rolled back."
   [^Compiled c inputs]
   (let [{:keys [executable in-tree out-tree donated target]} c
         inputs (project-aggregate-inputs in-tree inputs)
@@ -1326,21 +1357,14 @@
         ;; A malformed later input must not upload an earlier one. Reuse the LinkNode and
         ;; DeviceArray contracts, including liveness, exact ranges and portable overlap rules.
         _ (preflight-inputs! executable input-nodes inputs)
+        previous (when-let [outputs (:live-outputs c)] @outputs)
         ;; 2. Every dynamic input is refreshed on every invocation, preserving the resident-program
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
-        _ (doseq [{:keys [key node default]} input-nodes]
-            (gpu-link/write! executable node (get inputs key default)))
-        ;; 3. Only after every provided donated view and dynamic write has passed may its old
-        ;;    wrapper be invalidated. The buffers remain resident and owned by the executable.
-        _ (doseq [val checked-donations] (v/consume! val))]
-    ;; 4. invalidate the PREVIOUS batch of outputs — they alias resident buffers this replay
-    ;;    overwrites, so a retained old wrapper would observe a silent mutation (§2.3). ::external
-    ;;    free! only marks the wrapper dead; it never frees the session-owned buffer.
-    (invalidate-live-outputs! c)
-    ;; 5. replay, no download.
+        _ (write-invocation-inputs! c input-nodes inputs previous checked-donations)]
+    ;; 4. replay, no download.
     (gpu-link/run! executable)
-    ;; 6. project outputs as resident device values; record them for next-call invalidation.
+    ;; 5. project outputs as resident device values; record them for next-call invalidation.
     (let [out (into {} (map (fn [{:keys [key] :as node}]
                               [key (project-node executable node target)]))
                     out-tree)]
@@ -1438,9 +1462,10 @@
 
 (defn- refresh-captured-inputs!
   [^Compiled c]
-  (preflight-inputs! (:executable c) (filterv #(= :input (:role %)) (:in-tree c)) {})
-  (doseq [{:keys [node role default]} (:in-tree c) :when (= :input role)]
-    (gpu-link/write! (:executable c) node default))
+  (let [input-nodes (filterv #(= :input (:role %)) (:in-tree c))
+        previous (when-let [outputs (:live-outputs c)] @outputs)]
+    (preflight-inputs! (:executable c) input-nodes {})
+    (write-invocation-inputs! c input-nodes {} previous []))
   c)
 
 (defn profile
@@ -1451,7 +1476,6 @@
    (:executable c) :profile
    (fn []
      (refresh-captured-inputs! c)
-     (invalidate-live-outputs! c)
      (let [profile-result (gpu-link/profile! (:executable c))
            result (into {} (map (fn [{:keys [key node]}]
                                   [key (gpu-link/download (:executable c) node)]))
@@ -1469,7 +1493,6 @@
    (:executable c) :measure
    (fn []
      (refresh-captured-inputs! c)
-     (invalidate-live-outputs! c)
      (apply gpu-link/measure! (:executable c) (mapcat identity opts)))))
 
 (defn cache-key

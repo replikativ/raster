@@ -13,7 +13,7 @@
     {:plan {:id :resident-result :outputs [:out]
             :nodes {:out {:view {:allocation {:ownership ownership}}}}}
      :session (atom {}) :owns-session? owns-session? :graph-key :graph
-     :pending-inputs (atom #{}) :closed? (atom false)
+     :pending-inputs (atom #{}) :tainted-inputs (atom #{}) :closed? (atom false)
      :lifetime-lock (Object.) :completed-replays (atom 0)
      :output-leases (atom 0) :output-ready? (atom false)})))
 

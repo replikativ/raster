@@ -29,7 +29,7 @@
 
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
-            instantiation-report pending-inputs profile? closed? lifetime-lock completed-replays
+            instantiation-report pending-inputs tainted-inputs profile? closed? lifetime-lock completed-replays
             output-leases output-ready?]
   java.io.Closeable
   (close [this] (close! this))
@@ -372,6 +372,7 @@
                                                                                  :ownership])))
                                                      node-id)))
                                            (:nodes plan)))
+                               (atom #{})
                                (boolean profile?)
                                (atom false)
                                (Object.)
@@ -857,8 +858,23 @@
       (run! executable)
       (output-lease! executable))))
 
+(defn- failed-write!
+  "A failed backend transfer can have changed any byte in its destination. Keep every overlapping
+   view unready until explicitly reinitialized; never credit the old initialized contents."
+  [executable node-id error]
+  (let [target (get-in executable [:plan :nodes node-id :view])
+        affected (into #{node-id}
+                       (keep (fn [[id node]]
+                               (when (bview/overlaps? target (:view node)) id)))
+                       (get-in executable [:plan :nodes]))]
+    (swap! (:pending-inputs executable) into affected)
+    (swap! (:tainted-inputs executable) into affected)
+    (throw error)))
+
 (defn upload!
-  "Upload an exact contiguous host value into one live LinkNode view. Returns the executable."
+  "Upload an exact contiguous host value into one live LinkNode view. Returns the executable.
+   A runtime transfer failure leaves the destination and overlapping views requiring explicit
+   reinitialization. Pure validation errors leave readiness unchanged."
   [executable node-id source]
   (let [executable (ensure-live! executable :upload!)
         node (get-in executable [:plan :nodes node-id])]
@@ -870,9 +886,12 @@
       ;; Reject dtype/length mistakes before the backend copy sees them.
       (link-plan/validate-node-source! node source)
       (reset! (:output-ready? executable) false)
-      (gpu/upload-range! (:session executable) (node-view executable node-id) source
-                         {:elements (reduce * 1 (get-in node [:view :shape]))})
+      (try
+        (gpu/upload-range! (:session executable) (node-view executable node-id) source
+                           {:elements (reduce * 1 (get-in node [:view :shape]))})
+        (catch Throwable error (failed-write! executable node-id error)))
       (swap! (:pending-inputs executable) disj node-id)
+      (swap! (:tainted-inputs executable) disj node-id)
       executable)))
 
 (defn- same-buffer-range?
@@ -917,6 +936,16 @@
         destination-buffer (gpu/buffer session (:key destination))
         source-buffer (:buffer source)
         elements (reduce * 1 (:shape destination-view))]
+    ;; A self-write is not a repair. Nor may a disjoint copy read another tainted view of this
+    ;; allocation. Check before mutation so preflight preserves the old output boundary.
+    (when (some #(let [resident (node-view executable %)
+                      view (:view resident)]
+                        (and (identical? source-buffer (gpu/buffer session (:key resident)))
+                             (< (:byte-offset source-view) (+ (:byte-offset view) (:byte-length view)))
+                             (< (:byte-offset view) (+ (:byte-offset source-view) (:byte-length source-view)))))
+                     @(:tainted-inputs executable))
+      (throw (ex-info "DeviceArray reads tainted storage; reinitialize it with a real write"
+                      {:reason :link-device-input-tainted :node node-id})))
     (when (and (not (same-buffer-range? source-buffer source-view destination-buffer destination-view))
                (overlapping-buffer-range? source-buffer source-view destination-buffer destination-view))
       (throw (ex-info "linked DeviceArray write has partially overlapping source/destination"
@@ -926,9 +955,9 @@
      :elements elements}))
 
 (defn- write-device-array!
-  [executable node-id source]
+  [executable node-id facts]
   (let [{:keys [session destination destination-view source-view source-buffer destination-buffer elements]}
-        (device-write-facts executable node-id source)]
+        facts]
     (reset! (:output-ready? executable) false)
     (cond
       (same-buffer-range? source-buffer source-view destination-buffer destination-view)
@@ -953,7 +982,8 @@
                                :memory-space (:memory-space allocation)
                                :coherence (:coherence allocation)
                                :alignment (:alignment allocation)})
-        (try
+        (let [primary (volatile! nil)]
+         (try
           (let [source-resident
                 (gpu/buffer-view session temporary-key
                                  {:id (:id source-view)
@@ -962,10 +992,17 @@
                                   :shape (:shape source-view)
                                   :strides (:strides source-view)})]
             (gpu/copy-range! session source-resident destination {:elements elements}))
+          (catch Throwable error (vreset! primary error) (throw error))
           (finally
               ;; Borrowed registrations are detached, never freed.
-            (gpu/free-buffer! session temporary-key)))))
+            (try (gpu/free-buffer! session temporary-key)
+                 (catch Throwable cleanup-error
+                   (if-let [error @primary]
+                     (when-not (identical? error cleanup-error)
+                       (.addSuppressed ^Throwable error cleanup-error))
+                     (throw cleanup-error)))))))))
     (swap! (:pending-inputs executable) disj node-id)
+    (swap! (:tainted-inputs executable) disj node-id)
     executable))
 
 (defn validate-write!
@@ -990,14 +1027,21 @@
    Host values use upload!. A compatible DeviceArray already naming the exact destination range
    is accepted without a copy; every other compatible resident value uses a backend device copy,
    never device→host→device. Partially overlapping ranges fail explicitly because backend
-   overlap semantics are not a portable memory contract. Returns the executable."
+   overlap semantics are not a portable memory contract. Runtime transfer failures require explicit
+   reinitialization of the destination and overlapping views; compatibility failures do not.
+   Returns the executable."
   [executable node-id source]
   (let [executable (ensure-live! executable :write!)]
     (locking (:lifetime-lock executable)
       (ensure-live! executable :write!)
       (ensure-no-output-leases! executable :write!)
       (if (value/device-array? source)
-        (write-device-array! executable node-id source)
+        (let [facts (device-write-facts executable node-id source)]
+          ;; Pure compatibility failures must preserve readiness. A subsequent runtime copy or
+          ;; registration failure cannot promise that the destination still has its old bytes.
+          (try
+            (write-device-array! executable node-id facts)
+            (catch Throwable error (failed-write! executable node-id error))))
         (upload! executable node-id source)))))
 
 (defn- descriptor-source-map

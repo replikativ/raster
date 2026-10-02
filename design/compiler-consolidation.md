@@ -1362,3 +1362,21 @@ native restart, state, storage lease and AMR checks pass 40 tests / 454 assertio
 snapshot bytes cannot bypass target cell-order/phase/program-policy checks. Compiler-derived
 producer evidence, codecs, publication, explicit migrations and external training/distributed
 acceptance remain separate; no surface numerical semantics changed.
+
+### Failure-safe synchronous input replacement — 2026-10-02
+
+Linked writes distinguish cold pending inputs from storage tainted by failed backend transfers.
+Failure invalidates all overlapping nodes; a no-copy self-write or a copy reading tainted storage
+cannot claim recovery. Successful full writes repair the explicitly written node. Borrowed D2D
+cleanup preserves the primary error and attaches cleanup failures as suppressed exceptions.
+
+Compiled invocation, profile and measure share one preflight/retirement/write boundary. Strict
+object-ancestry private borrowed reads preserve recurrent previous-output inputs under the existing
+lifetime lock; public wrappers are retired before mutation. Donations commit after full preflight
+but before transfers, including when backend execution subsequently fails. This intentional failure
+contract avoids live aliases to partially mutated storage; pure validation failures retain handles.
+
+The affected native link, composition and lease suite passes 42 tests / 303 assertions, with no
+remaining pivotal-review blocker. The full seven CI gates remain the merge requirement. This
+prerequisite does not implement completed byte receipts, general failed-kernel rollback, cross-owner
+mutation tracking, asynchronous input lineage or the remaining external/distributed acceptance.
