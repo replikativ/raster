@@ -69,6 +69,48 @@ Step 4 therefore retains current schedule defaults: no noisy measurement license
 weakening the checked-extent ordering rule. See `local-compiler-evidence.md` for timing scope and
 the remaining acceptance gaps.
 
+### Equation-first preparation reuse: next structural boundary
+
+The measured warm Q4 preparation still spends about two seconds constructing its LinkPlan even
+when structural compiler-template resolution is a hit. Extend the existing resident-plan
+template service rather than introducing another compiler cache or bypassing public proofs.
+The exact-scalar specialization prerequisite is PR #978; it is not equation-first plan reuse.
+
+The implementation order is:
+
+1. Separate fresh invocation materialization and host-equation evaluation from reusable call
+   construction. Materialization runs on every preparation, retaining lifted reads, checked
+   conversions, aggregate projection, generated initializers and exceptions. Every host equation
+   runs exactly once per preparation, including cache hits; no evaluator closure is retained.
+2. Define a source-free binding witness over the complete staged scalar environment, resolved
+   storage dtype/shape/range, initialization contract and storage alias partition. Canonical bits
+   distinguish signed zero and NaN payloads. Compile epoch, target facts and numerical/schedule
+   policy remain part of the enclosing compiler-template identity. Array contents are excluded;
+   scalar values derived from those contents are evaluated freshly before selecting an entry.
+3. Generalize the existing single-flight resident-template cache for the two existing certified
+   lowering kinds. Strip all caller and generated/clone initializer sources. Rebind those sources
+   from the current materialization, check the complete witness independently of its digest,
+   and reconstruct public defaults/input-output projections from current arguments.
+4. Retain fresh final projection/effect certification for roles, donations, outputs and taps.
+   A cached proof must be sealed to the exact immutable structure it proves. Public revalidation
+   must still reject tampered calls/plans/certificates; a boolean cache-hit flag grants no authority.
+
+First acceptance includes changed arrays and lifted scalars, failed reads on hits, host evaluation
+counts, raw floating bits, changed dtype/extents/ranges, shared versus distinct storage, initializer
+freshness, changed roles/outputs, compiler redefinition and certificate tampering. Reuse numerical
+Q4 composition and existing tree/record oracles; compare fresh and cached preparation. Bypass
+template reuse for an unsupported staging form without narrowing accepted compiler source forms.
+The measured Q4 host prefixes must be covered before claiming this fixes that preparation cliff.
+
+The prerequisite audit also reproduced an equation-first host-result consistency defect:
+ordinary equality admitted supplied +0.0 versus evaluated -0.0, but rejected equal Double NaN
+payloads. The existing canonical comparison now checks that conflict boundary without changing
+host execution order or scalar validation. The structured-control/program-call suite passes
+44 tests / 280 assertions; this remains a correctness change, not template reuse.
+
+Then resume matched performance evidence, external training acceptance and the distributed/PDE
+milestones. This optimization does not complete the wider campaign or authorize schedule promotion.
+
 Finish the general compiler work on OpenCL and Level Zero first. Continue CUDA/HIP
 hardware-free compile gates; native vendor runtimes and hardware acceptance follow the
 local milestone. FPGA spatial scheduling and distributed optimization are later tracks.
