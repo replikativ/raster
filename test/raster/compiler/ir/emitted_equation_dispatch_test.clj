@@ -10,6 +10,7 @@
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -196,6 +197,12 @@
     (is (= :sequential-segments
            (executable/strategy (-> empty-link :instances first :call :steps last :graph)))
         "a failed runtime register precondition selects the exact admitted fallback")
+    (with-redefs [dispatch/admit-alternative
+                  (fn [& _] (throw (AssertionError. "public validation reselected dispatch")))]
+      (doseq [plan [fixed-link dynamic-link empty-link]
+              :let [call (-> plan :instances first :call)]]
+        (is (identical? call (program-call/validate! call))
+            "source-ordered binding validation checks the retained admitted alternative, not selection")))
     (let [default (equation-first/compile #'contractions/fixed-matmul
                                           {:target target :dtype :float})]
       (is (not (equation-dispatch/emitted-equation-dispatch?

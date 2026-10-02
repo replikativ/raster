@@ -22,7 +22,7 @@
 (defrecord EvaluatedHostEquation [equation operands results])
 (defrecord EmittedEquationCall [equation graph buffers scalar-values outputs])
 (defrecord EmittedParallelProgramCall
-           [program steps buffers scalar-values loop-scratch outputs attributes])
+           [program steps entry-buffers buffers scalar-values loop-scratch outputs attributes])
 
 (defn- record-kind?
   [record-class value]
@@ -197,7 +197,7 @@
                  {:equation (:id equation) :result result :destination destination}))))
     result-views))
 
-(defn- prepare-equation-call
+(defn- prepare-equation-bindings
   [equation values buffers scalars result-views projections]
   (let [operation (first (:operations equation))
         emitted (equation-dispatch/boundary-equation operation)
@@ -249,19 +249,29 @@
                   (require-buffer buffers argument :equation-interface)))
               (:abi common-graph) (:arguments common-graph))
         runtime-arguments (executable/typed-runtime-arguments common-graph runtime-arguments)
-        bindings (executable/graph-bindings common-graph runtime-arguments)
+        bindings (executable/graph-bindings common-graph runtime-arguments)]
+    {:bindings (assoc bindings :outputs (select-keys buffers (:results equation)))
+     :buffers buffers :boundary emitted :common-graph common-graph
+     :runtime-arguments runtime-arguments :result-storage result-storage
+     :result-views result-views}))
+
+(defn- prepare-equation-call
+  [equation values buffers scalars result-views projections]
+  (let [{:keys [bindings buffers boundary common-graph runtime-arguments result-storage result-views]}
+        (prepare-equation-bindings equation values buffers scalars result-views projections)
+        operation (first (:operations equation))
         graph (if (equation-dispatch/emitted-equation-dispatch? operation)
                 (:executable
                  (dispatch/admit-alternative
                   (:dispatch operation) runtime-arguments
                   #(preflight-violations % (:scalar-values bindings))))
                 common-graph)
-        outputs (select-keys buffers (:results equation))]
+        outputs (:outputs bindings)]
     {:call (validate-equation-call-against-boundary!
             (assoc (->EmittedEquationCall equation graph (:buffers bindings)
                                          (:scalar-values bindings) outputs)
                    :result-views result-views)
-            emitted result-storage)
+            boundary result-storage)
      :buffers buffers}))
 
 (defn- evaluate-host-equations
@@ -329,8 +339,9 @@
   (when-not (identical? (:program call) parallel-program)
     (fail! :emitted-program-call-program-identity
            "validated program is not the program contained in its call" {}))
-  (let [{:keys [steps buffers scalar-values loop-scratch outputs attributes]} call]
-    (doseq [[field value] [[:buffers buffers] [:scalar-values scalar-values]
+  (let [{:keys [steps entry-buffers buffers scalar-values loop-scratch outputs attributes]} call
+        current-buffers (volatile! entry-buffers)]
+    (doseq [[field value] [[:entry-buffers entry-buffers] [:buffers buffers] [:scalar-values scalar-values]
                            [:loop-scratch loop-scratch] [:outputs outputs]
                            [:attributes attributes]]]
       (when-not (map? value)
@@ -353,10 +364,11 @@
                      "evaluated host step changed equation identity" {:equation (:id equation)})))
 
         (emitted-equation-call? step)
-        (do (when-not (and validated-equation-calls
-                           (.containsKey ^java.util.IdentityHashMap
-                                         validated-equation-calls step))
-              (validate-equation-call! step))
+        (let [constructed? (and validated-equation-calls
+                                (.containsKey ^java.util.IdentityHashMap
+                                              validated-equation-calls step))]
+          (when-not constructed?
+            (validate-equation-call! step))
             (doseq [[result physical] (:result-views step)]
               (when-not (and (= (get buffers physical) (get (:buffers step) physical))
                              (= (get buffers result) (get (:outputs step) result))
@@ -367,16 +379,39 @@
                        {:equation (:id equation) :result result :physical physical})))
             (when-not (= equation (:equation step))
               (fail! :emitted-program-call-step-equation
-                     "emitted graph step changed equation identity" {:equation (:id equation)})))
+                     "emitted graph step changed equation identity" {:equation (:id equation)}))
+          (if constructed?
+            ;; The synchronous constructor retained this exact step's checked post-environment.
+            ;; Public and retained-static validators never receive this construction map.
+            (vreset! current-buffers
+                     (.get ^java.util.IdentityHashMap validated-equation-calls step))
+            (let [{expected :bindings next-buffers :buffers}
+                  (prepare-equation-bindings equation (:values parallel-program) @current-buffers
+                                             scalar-values (:result-views step)
+                                             (or *validated-boundary-projections*
+                                                 (java.util.IdentityHashMap.)))]
+              ;; A certified dispatch may select any admitted graph alternative, but its logical
+              ;; runtime arguments must still come from the same source-ordered environment.
+              (doseq [field [:buffers :scalar-values :outputs]]
+                (let [same? (if (= field :scalar-values)
+                              (semantic-fingerprint/equivalent? (get expected field) (get step field))
+                              (= (get expected field) (get step field)))]
+                  (when-not same?
+                    (fail! :emitted-program-call-step-bindings
+                           "emitted equation bindings differ from its entry environment"
+                           {:equation (:id equation) :field field
+                            :expected (get expected field) :actual (get step field)}))))
+              (vreset! current-buffers next-buffers))))
 
         (loop-call/structured-loop-call? step)
-        (let [step (loop-call/validate! step)
-              emitted (emitted-loop/validate! (first (:operations equation)))]
+        (let [emitted (emitted-loop/validate! (first (:operations equation)))]
           (when-not (and (= (:schedule emitted) (:schedule step))
                          (= (:graph emitted) (:graph step)))
             (fail! :emitted-program-call-loop
                    "structured loop call differs from its emitted equation"
-                   {:equation (:id equation)})))
+                   {:equation (:id equation)}))
+          (loop-call/validate-in-context! step @current-buffers scalar-values loop-scratch)
+          (vswap! current-buffers merge (:outputs step)))
 
         :else
         (fail! :emitted-program-call-step "emitted program call has an unknown step"
@@ -385,6 +420,21 @@
       (fail! :emitted-program-call-outputs
              "emitted program call outputs differ from the program boundary"
              {:expected (:outputs parallel-program) :actual (keys outputs)}))
+    (when-not (= @current-buffers buffers)
+      (fail! :emitted-program-call-final-bindings
+             "emitted program final buffers differ from its source-ordered execution"
+             {:expected @current-buffers :actual buffers}))
+    (doseq [[id actual] outputs]
+      (let [expected (if (contains? scalar-values id)
+                       (get scalar-values id)
+                       (get @current-buffers id ::missing))
+            same? (if (typed-scalar? expected)
+                    (semantic-fingerprint/equivalent? expected actual)
+                    (= expected actual))]
+        (when-not same?
+          (fail! :emitted-program-call-output-bindings
+                 "exported result differs from its source-ordered value"
+                 {:value id :expected expected :actual actual}))))
     call))
 
 (defn validate!
@@ -510,7 +560,8 @@
                       (:outputs step)))
 
             :else []))]
-    (vec (distinct (concat (:buffers call)
+    (vec (distinct (concat (:entry-buffers call)
+                           (:buffers call)
                            (:loop-scratch call)
                            (output-bindings (:outputs call))
                            (mapcat step-bindings (:steps call)))))))
@@ -572,6 +623,7 @@
             remapped
             (-> call
                 (update :steps #(mapv remap-step %))
+                (update :entry-buffers #(remap-buffer-map remap %))
                 (update :buffers #(remap-buffer-map remap %))
                 (update :loop-scratch #(remap-buffer-map remap %))
                 (update :outputs
@@ -664,7 +716,7 @@
              :else
              (let [{:keys [call buffers]}
                    (prepare-equation-call equation values buffers scalars result-views projections)]
-               (.put validated-equation-calls call Boolean/TRUE)
+               (.put validated-equation-calls call buffers)
                {:buffers buffers :steps (conj steps call)})))
          {:buffers buffers :steps []}
          (:equations parallel-program))
@@ -680,7 +732,7 @@
               (:outputs parallel-program))]
     (validate-call-against-program!
      (->EmittedParallelProgramCall
-      parallel-program (:steps planned) final-buffers scalars loop-scratch outputs
+      parallel-program (:steps planned) buffers final-buffers scalars loop-scratch outputs
       {:execution :stage-once-host-repetition :source-inspected false})
      parallel-program validated-equation-calls)))
 

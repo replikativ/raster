@@ -1260,3 +1260,39 @@ This preserves the current validation algebra; it does not strengthen every pree
 structured-loop carry-plan or top-level staging-metadata invariant. Whole source-free plan
 binding, persisted compiler-build/dependency evidence, external training migration and matched
 performance acceptance remain separate campaign obligations. No source semantics changed.
+
+### Source-ordered emitted-call binding consistency — 2026-10-02
+
+The next audit reproduced an independent correctness gap: public call validation accepted a loop
+with resolved trip count two while its retained outer `steps` scalar was still three. The loop
+graph alone cannot prove repetition, because that scalar may not be consumed by any kernel.
+Reconstruction from final buffer bindings was also insufficient: a zero-trip loop aliases its
+result to the initial carry and loses the originally requested destination in that final map.
+
+`EmittedParallelProgramCall` now carries explicit `entry-buffers` execution data alongside final
+bindings. Validation threads the buffer environment in source order, reconstructs each loop's
+canonical binding using the existing `make`, and checks its trip count, invariants, scalar ports,
+scratch/rotation and outputs. Numerical steps share one logical ABI/result-binding projection
+with construction. Validation checks the retained certified dispatch alternative without selecting
+again. Final bindings and exported values must agree with that source-ordered environment.
+Scalar comparisons preserve floating bits; buffer tokens retain ordinary equality rather than
+being serialized or compared by numerical contents. Storage enumeration and renaming include
+entry bindings, including unused zero-trip destinations.
+
+The constructor's synchronous exact-step identity map retains checked post-environments, avoiding
+reconstruction of its newly made numerical steps. Independent and retained-static public-call
+checks receive no such exemptions. Host callbacks are not rerun. No additional proof cache,
+operator registry or source-pattern matcher is introduced. This is an internal call-IR schema
+change, not a change to surface Clojure semantics or the supported public compilation API; raw
+calls without entry bindings now fail validation instead of being treated as certified execution.
+
+Acceptance includes zero/one/odd/even trips; two consecutive loops including a zero-trip first
+loop; distinct multiple carries; numerical consumption of aliased loop outputs; binding/export
+tampering; entry-map renaming; no dispatch reselection; and signed-zero/NaN invariant bits.
+The affected control, dispatch, LinkPlan and native composition suites pass 120 tests / 889
+assertions; the six focused cache-owner/final-proof checks pass 55 assertions. The persistent
+REPL required refreshing the artifact namespace's imported record class after an IR reload;
+the artifact round-trip and the complete affected rerun then passed. No source workaround was
+introduced for that stale-session failure.
+This closes the contextual binding gap, not comprehensive host-step operand/evaluation proofs,
+general dynamic-loop AD, distributed readiness, or all remaining campaign requirements.

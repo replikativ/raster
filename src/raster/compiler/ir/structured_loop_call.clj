@@ -7,6 +7,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.ir.soac-dialect :as soac]))
@@ -219,6 +220,29 @@
                             {:id iteration :type (:kernel-dtype iteration-slot)})}
               scratch output-bindings {:execution :host-repetition})]
     (validate! call)))
+
+(defn validate-in-context!
+  "Validate a loop call against its containing program's outer runtime bindings.
+
+   A resolved trip count and carry rotation cannot be verified from the iteration ABI alone:
+   the trip-count scalar may not be consumed by any kernel. Reconstruct their canonical binding
+   through `make`, then compare execution fields. Buffer tokens use ordinary identity-aware
+   equality, not content hashing; typed scalar comparisons retain floating bits. Attributes are
+   diagnostic and are not execution authority. No host evaluation or driver contact occurs."
+  [call buffers scalars scratch]
+  (let [call (validate! call)
+        canonical (make (:schedule call) (:graph call) buffers scalars scratch)]
+    (doseq [field [:trip-count :buffers :scalars :scratch :outputs]]
+      (let [expected (get canonical field)
+            actual (get call field)
+            same? (if (= field :scalars)
+                    (semantic-fingerprint/equivalent? expected actual)
+                    (= expected actual))]
+        (when-not same?
+          (fail! :structured-loop-call-bindings
+                 "structured loop execution differs from its outer program bindings"
+                 {:field field :expected expected :actual actual}))))
+    call))
 
 (defn iteration-binding
   "Return the ordinary KernelGraph buffer/scalar bindings for iteration `index`."

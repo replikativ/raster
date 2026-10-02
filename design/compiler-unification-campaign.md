@@ -63,6 +63,11 @@ the remaining external training gates.
    local native backends available. Warm Q4 preparation is about 11.7 ms in one diagnostic,
    not a controlled performance baseline. Continue auditing structured-call invariant completeness
    separately; this deduplication does not certify arbitrary forged carry-plan/staging metadata.
+   The subsequent source-ordered call audit now retains entry buffer bindings and checks loop
+   trip counts, carry rotations, numerical argument projection, final bindings and exports against
+   each step's actual entry environment. It does not reselect dispatch alternatives or rerun host
+   callbacks. Its affected suites pass 120 tests / 889 assertions, with six cache-owner checks
+   passing another 55 assertions. Comprehensive host-step evaluation evidence remains separate.
 2. Select the next compiler migration from a reproduced public workload, using the compatibility
    ledger to distinguish stale entry-point accounting from an actual semantic/emission gap. Preserve
    the corresponding JVM path and independent numerical tests while retiring the migrated fallback.
