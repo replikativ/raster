@@ -1394,3 +1394,8 @@ Affected link/composition/lease/measurement/ordered-program tests pass 64 tests 
 including native replay, recurrent outputs, all measurement phases, callback failures, unavailable
 device timing and idempotent poisoned cleanup. Full CI and pivotal review remain required before
 merge. Actual resident-byte producer evidence and the broader eight-item campaign remain open.
+Pivotal review found no blocker in this scope. Before producer evidence is admitted, the linked
+autotuning bridge must stop launching candidate kernels directly through the session outside
+the lifetime lock, leases and epoch/poison boundary. Raw-session mutation remains out of contract;
+Raster's own linked tuning must use a tracked exclusive mutation scope rather than inherit that
+exemption. No continuity claim is made for tuned instances yet.

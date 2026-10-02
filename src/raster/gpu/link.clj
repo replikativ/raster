@@ -1230,7 +1230,7 @@
                     {:reason :link-pending-inputs :nodes @(:pending-inputs executable)}))))
 
 (defn- require-profiling! [executable]
-  (when (false? (:profile? executable))
+  (when-not (true? (:profile? executable))
     (throw (ex-info "linked executable was not instantiated with profiling enabled"
                     {:reason :link-profiling-disabled}))))
 

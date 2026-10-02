@@ -444,6 +444,7 @@
                                                      :operation-id :scores
                                                      :debug-only :excluded}}}]}}]}
                      :session :session :graph-key :graph
+                     :profile? true
                      :pending-inputs (atom #{}) :closed? (atom false)
                      :lifetime-lock (Object.) :output-leases (atom 0)
                      :output-ready? (atom false) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})]

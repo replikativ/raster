@@ -116,6 +116,7 @@
   (let [executable
         (link/map->LinkedExecutable
          {:plan {:nodes {:cache {:role :state}}}
+          :profile? true
           :pending-inputs (atom #{}) :closed? (atom false)
           :lifetime-lock (Object.) :output-leases (atom 0)
           :output-ready? (atom false)})]
@@ -128,6 +129,7 @@
         executable
         (link/map->LinkedExecutable
          {:plan {:nodes {}}
+          :profile? true
           :session :session
           :prepared-program :prepared
           :pending-inputs (atom #{})
