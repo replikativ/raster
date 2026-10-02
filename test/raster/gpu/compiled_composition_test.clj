@@ -34,7 +34,7 @@
                                   :b (gpu/->ResidentBufferView ::session :b view-b)}
                      :closed? (atom false) :lifetime-lock (Object.)
                      :output-leases (atom 0) :pending-inputs (atom #{})
-                     :output-ready? (atom true) :completed-replays (atom 0)})
+                     :output-ready? (atom true) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})
         artifact (compiled/map->Compiled
                   {:executable executable :target :ze:0
                    :in-tree [{:key :A :node :a :role :state :dtype :float :shape [4]}
@@ -71,7 +71,7 @@
                                     :b (link-plan/node {:id :b :view view :role :input})}}
                      :session ::session :closed? (atom false) :lifetime-lock (Object.)
                      :output-leases (atom 0) :pending-inputs (atom #{:a :b})
-                     :output-ready? (atom true) :completed-replays (atom 0)})
+                     :output-ready? (atom true) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})
         artifact (compiled/map->Compiled
                   {:executable executable :target :ze:0 :donated {}
                    :in-tree [{:key :a :node :a :role :input :default (float-array 4)}
@@ -106,7 +106,7 @@
                      :node-views {:a (gpu/->ResidentBufferView ::session :a view)}
                      :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)
                      :pending-inputs (atom #{}) :tainted-inputs (atom #{})
-                     :output-ready? (atom true) :completed-replays (atom 0)})
+                     :output-ready? (atom true) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})
         artifact (compiled/map->Compiled
                   {:executable executable :target :ze:0 :donated {}
                    :in-tree [{:key :a :node :a :role :input :default (float-array 4)}]
@@ -169,7 +169,7 @@
                      :session ::session :node-views {:a (gpu/->ResidentBufferView ::session :a view)}
                      :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)
                      :pending-inputs (atom #{}) :tainted-inputs (atom #{})
-                     :output-ready? (atom true) :completed-replays (atom 0)})
+                     :output-ready? (atom true) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})
         artifact (compiled/map->Compiled
                   {:executable executable :target :ze:0 :donated (if donate? {:a :result} {})
                    :in-tree [{:key :a :node :a :role :input :dtype :float :shape [4]}]

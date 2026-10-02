@@ -30,7 +30,7 @@
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases prepared-program allocation-keys node-views
             instantiation-report pending-inputs tainted-inputs profile? closed? lifetime-lock completed-replays
-            output-leases output-ready?]
+            output-leases output-ready? execution-state]
   java.io.Closeable
   (close [this] (close! this))
   clojure.lang.IFn
@@ -378,7 +378,8 @@
                                (Object.)
                                (atom 0)
                                (atom 0)
-                               (atom false))))
+                               (atom false)
+                               (atom {:value-epoch 0}))))
        (catch Throwable error
          (if owns-session?
            (try (gpu/close-session! session) (catch Throwable _))
@@ -411,6 +412,11 @@
   (when @(:closed? executable)
     (throw (ex-info "linked executable is closed"
                     {:operation operation :plan (get-in executable [:plan :id])})))
+  (when-let [failure (some-> (:execution-state executable) deref :failure)]
+    (throw (ex-info "linked execution previously failed; close and reinstantiate it"
+                    {:reason :link-execution-poisoned :operation operation
+                     :plan (get-in executable [:plan :id])}
+                    failure)))
   executable)
 
 (defn- ensure-no-output-leases! [executable operation]
@@ -432,6 +438,34 @@
       (ensure-live! executable operation)
       (ensure-no-output-leases! executable operation)
       (f))))
+
+(defn- begin-mutation! [executable]
+  ;; This is an owner-local invalidation epoch, not portable state identity or an execution count.
+  ;; All production instances have this state; incomplete hand-built records fail before mutation.
+  (when-not (:execution-state executable)
+    (throw (ex-info "linked executable lacks execution state"
+                    {:reason :link-execution-state-missing})))
+  (swap! (:execution-state executable) update :value-epoch inc)
+  (reset! (:output-ready? executable) false))
+
+(defn- poison-execution! [executable error]
+  ;; Reentrant restoration may already have poisoned this owner. Preserve the first backend
+  ;; failure rather than replacing it with an outer already-poisoned wrapper.
+  (swap! (:execution-state executable)
+         #(if (:failure %) % (assoc % :failure error)))
+  (reset! (:output-ready? executable) false)
+  (throw error))
+
+(defn- execute-once! [executable operation execute!]
+  (ensure-live! executable operation)
+  (ensure-no-output-leases! executable operation)
+  (begin-mutation! executable)
+  (try
+    (let [result (execute!)]
+      (swap! (:completed-replays executable) inc)
+      (reset! (:output-ready? executable) true)
+      result)
+    (catch Throwable error (poison-execution! executable error))))
 
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
@@ -828,7 +862,8 @@
 
 (defn run!
   "Replay synchronously and return resident output views. No host copies. Live output leases
-   prevent replay until released."
+   prevent replay until released. Failed replay poisons the executable; close and reinstantiate
+   rather than reusing potentially partially mutated state."
   [executable]
   (let [executable (ensure-live! executable :run!)]
     (locking (:lifetime-lock executable)
@@ -838,12 +873,10 @@
         (throw (ex-info "linked executable has owned inputs or state that have not been initialized"
                         {:reason :link-pending-inputs :plan (get-in executable [:plan :id])
                          :nodes @(:pending-inputs executable)})))
-      (reset! (:output-ready? executable) false)
-      (if-let [recorded (:graph-key executable)]
-        (gpu/replay! (:session executable) recorded)
-        (parallel-program/run-prepared! (:prepared-program executable)))
-      (swap! (:completed-replays executable) inc)
-      (reset! (:output-ready? executable) true)
+      (execute-once! executable :run!
+                     #(if-let [recorded (:graph-key executable)]
+                        (gpu/replay! (:session executable) recorded)
+                        (parallel-program/run-prepared! (:prepared-program executable))))
       (outputs executable))))
 
 (defn run-and-lease!
@@ -885,7 +918,7 @@
         (node-view executable node-id))
       ;; Reject dtype/length mistakes before the backend copy sees them.
       (link-plan/validate-node-source! node source)
-      (reset! (:output-ready? executable) false)
+      (begin-mutation! executable)
       (try
         (gpu/upload-range! (:session executable) (node-view executable node-id) source
                            {:elements (reduce * 1 (get-in node [:view :shape]))})
@@ -958,7 +991,7 @@
   [executable node-id facts]
   (let [{:keys [session destination destination-view source-view source-buffer destination-buffer elements]}
         facts]
-    (reset! (:output-ready? executable) false)
+    (begin-mutation! executable)
     (cond
       (same-buffer-range? source-buffer source-view destination-buffer destination-view)
       nil
@@ -1149,21 +1182,9 @@
             (update :record-time-prologue #(mapv annotate %))
             (update :per-replay #(mapv annotate %)))))))
 
-(defn profile!
-  "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready.
-
-   Descriptor-backed events retain their stable LinkPlan instance and step identities plus the
-   compiler artifact's bounded provenance. Runtime phase keys still identify the exact replay,
-   but callers need not decode generated kernel names or execution UUIDs to attribute costs."
+(defn- profile-replay!
   [executable]
-  (let [executable (ensure-live! executable :profile!)]
-    (with-unleased-execution! executable :profile!
-      (fn []
-        (when (seq @(:pending-inputs executable))
-          (throw (ex-info "linked executable has inputs or state that have not been initialized"
-                          {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
-        (reset! (:output-ready? executable) false)
-        (let [result (if-not (:graph-key executable)
+  (let [result (if-not (:graph-key executable)
                        (parallel-program/profile-prepared!
                         (:prepared-program executable)
                         #(gpu/profile-bound-kernel-graph! (:session executable) %))
@@ -1204,13 +1225,33 @@
                                                   event)
                                           mixed-sources (assoc :source (nth mixed-sources index)))))
                                     (range (count events)) events)))))]
-          (swap! (:completed-replays executable) inc)
-          (reset! (:output-ready? executable) true)
-          result)))))
+    result))
+
+(defn- require-ready-inputs! [executable]
+  (when (seq @(:pending-inputs executable))
+    (throw (ex-info "linked executable has inputs or state that have not been initialized"
+                    {:reason :link-pending-inputs :nodes @(:pending-inputs executable)}))))
+
+(defn- require-profiling! [executable]
+  (when-not (true? (:profile? executable))
+    (throw (ex-info "linked executable was not instantiated with profiling enabled"
+                    {:reason :link-profiling-disabled}))))
+
+(defn profile!
+  "Profile one synchronous replay with stable source attribution and completion bookkeeping.
+   A failed execution poisons the executable; close and reinstantiate rather than replaying
+   potentially partially mutated state. Pure readiness/profiling/lease declines do not mutate it."
+  [executable]
+  (with-unleased-execution! executable :profile!
+    #(do (require-ready-inputs! executable)
+         (require-profiling! executable)
+         (execute-once! executable :profile! (fn [] (profile-replay! executable))))))
 
 (defn measure!
-  "Measure a profiled LinkedExecutable with device events. Stateful plans require the explicit
-   `:before-sample!` restore hook so repeated samples cannot silently measure mutated state."
+  "Measure a profiled LinkedExecutable with device events. Every warmup, probe and measured
+   replay advances the same completion/owner-local value epoch as run! and profile!.
+   Stateful plans require :before-sample! restoration. Failed replay or restoration poisons
+   the executable. Caller callbacks run outside the measured device interval."
   [executable & {:keys [before-sample!] :as opts}]
   (let [executable (ensure-live! executable :measure!)
         state-nodes (into #{} (keep (fn [[node-id node]]
@@ -1218,31 +1259,47 @@
                           (get-in executable [:plan :nodes]))]
     (with-unleased-execution! executable :measure!
       (fn []
-        (when (seq @(:pending-inputs executable))
-          (throw (ex-info "linked executable has inputs or state that have not been initialized"
-                          {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
+        (require-ready-inputs! executable)
+        (require-profiling! executable)
+        (doseq [[option callback] [[:before-sample! before-sample!] [:flush-fn (:flush-fn opts)]]]
+          (when-not (or (nil? callback) (ifn? callback))
+            (throw (ex-info "measurement callbacks must be callable" {:option option}))))
         (when (and (seq state-nodes) (nil? before-sample!))
           (throw (ex-info "stateful linked executables require :before-sample! restoration"
                           {:reason :link-stateful-measurement :state-nodes state-nodes})))
-        (reset! (:output-ready? executable) false)
-        (if (nil? (:graph-key executable))
-          (let [timing-scope (volatile! nil)
+        (let [timing-scope (volatile! nil)
                 sample! (fn []
-                          (when before-sample! (before-sample!))
-                          (let [profile (parallel-program/profile-prepared!
-                                         (:prepared-program executable)
-                                         #(gpu/profile-bound-kernel-graph!
-                                           (:session executable) %))]
-                            (vreset! timing-scope (:timing-scope profile))
-                            (* 1.0e6 (double (:device-wall-ms profile)))))
+                          (execute-once!
+                           executable :measure!
+                           (fn []
+                             (when before-sample! (before-sample!))
+                             ;; A restore hook must not leave a lease or uninitialized inputs.
+                             (ensure-live! executable :measure!)
+                             (ensure-no-output-leases! executable :measure!)
+                             (require-ready-inputs! executable)
+                             (let [profile (profile-replay! executable)
+                                   wall-ms (:device-wall-ms profile)]
+                               (when-not (and (number? wall-ms)
+                                              (Double/isFinite (double wall-ms))
+                                              (not (neg? (double wall-ms))))
+                                 (throw (ex-info "device profiler returned no finite wall duration"
+                                                 {:reason :link-measurement-device-duration
+                                                  :wall-ms wall-ms})))
+                               (vreset! timing-scope (:timing-scope profile))
+                               (* 1.0e6 (double wall-ms))))))
+                flush (when-let [flush! (:flush-fn opts)]
+                        (fn []
+                          (ensure-live! executable :measure!)
+                          (ensure-no-output-leases! executable :measure!)
+                          (begin-mutation! executable)
+                          (try (flush!)
+                               (catch Throwable error (poison-execution! executable error)))))
                 measurement-options (-> opts
                                         (dissoc :before-sample!)
-                                        (assoc :timing-source :device-event))]
-            (assoc (apply measurement/measure! sample!
-                          (mapcat identity measurement-options))
-                   :timing-scope @timing-scope))
-          (apply gpu/measure-recorded-graph! (:session executable) (:graph-key executable)
-                 (mapcat identity opts)))))))
+                                        (assoc :timing-source :device-event)
+                                        (cond-> flush (assoc :flush-fn flush)))
+                result (apply measurement/measure! sample! (mapcat identity measurement-options))]
+          (cond-> result @timing-scope (assoc :timing-scope @timing-scope)))))))
 
 (defn download
   "Download one complete contiguous LinkNode view. Debug/host-boundary helper, not invocation."
