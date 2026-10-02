@@ -8,6 +8,7 @@
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.ode.finite-volume :as fv]
             [raster.ode.amr-geometry :as geometry]
+            [raster.ode.amr-transfer :as transfer]
             [raster.linalg.sparse :as sparse]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -164,21 +165,8 @@
   (and (= (count expected) (count actual))
        (every? #(< (Math/abs (double %)) 1.0e-11) (map - expected actual))))
 
-(defn- remap-matrix [source-cells target-cells]
-  ;; Bounded acceptance fixture only: enumerate geometric overlaps, then use
-  ;; the existing CSR operator. Values are cell averages, not extensive mass.
-  (let [overlap (fn [a as b bs] (max 0 (- (min (+ a as) (+ b bs)) (max a b))))
-        rows (mapv (fn [[tx ty ts]]
-                     (vec (keep-indexed
-                           (fn [i [sx sy ss]]
-                             (let [area (* (overlap tx ts sx ss) (overlap ty ts sy ss))]
-                               (when (pos? area) [i (/ (double area) (* ts ts))])))
-                           source-cells))) target-cells)
-        entries (vec (mapcat identity rows))]
-    (sparse/->CSRMatrix (int-array (reductions + 0 (map count rows)))
-                        (int-array (map first entries)) (double-array (map second entries))
-                        (long (count target-cells)) (long (count source-cells))
-                        (long (count entries)))))
+(defn- remap-matrix [source target]
+  (transfer/matrix (:projection source) (:projection target)))
 
 (defn- reference-remap [source-cells target-cells field]
   ;; Independent finest-tile lookup/average; it does not read the CSR arrays
@@ -200,7 +188,7 @@
 
 (deftest csr-remap-preserves-constants-and-volume-weighted-mass
   (doseq [source (remap-geometries) target (remap-geometries)]
-    (let [A (remap-matrix (:cells source) (:cells target))
+    (let [A (remap-matrix source target)
           field (initial (:cells source))
           actual (sparse/spmv A field (double-array (repeat (count (:cells target)) -317.0)) 1.0 0.0)
           constant (sparse/spmv A (double-array (repeat (count (:cells source)) 3.25))
@@ -318,7 +306,7 @@
       (ze/gpu-skip! "partial-patch-heat-level-zero")))
 
 (defn- run-resident-remap [target source destination]
-  (let [A (remap-matrix (:cells source) (:cells destination))
+  (let [A (remap-matrix source destination)
         source-args (arguments source)
         evolve (compiled/lower #'pair-step! source-args
                                {:compiler :equation-first :target target :dtype :double :inline? true
@@ -372,7 +360,7 @@
       (ze/gpu-skip! "resident-conservative-remap-level-zero")))
 
 (defn- prepare-post-remap-evolution [target source destination target-pairs]
-  (let [A (remap-matrix (:cells source) (:cells destination))
+  (let [A (remap-matrix source destination)
         source-args (arguments source)
         ;; Poison the target field too: its contents must come from the resident remap,
         ;; not the target program's captured host initializer or its previous replay.
