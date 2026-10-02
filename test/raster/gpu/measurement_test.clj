@@ -132,7 +132,7 @@
           :prepared-program :prepared
           :pending-inputs (atom #{})
           :lifetime-lock (Object.) :output-leases (atom 0)
-          :output-ready? (atom false) :completed-replays (atom 0)
+          :output-ready? (atom false) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)
           :closed? (atom false)})]
     (with-redefs [parallel-program/profile-prepared!
                   (fn [prepared profile-handle!]
@@ -174,6 +174,76 @@
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
     (is (true? @(:output-ready? executable)))
     (is (= 1 @(:completed-replays executable)))))
+
+(defn- tracked-executable [recorded?]
+  (link/map->LinkedExecutable
+   {:plan {:nodes {}} :session :session :profile? true
+    :graph-key (when recorded? :graph)
+    :prepared-program (when-not recorded? :prepared)
+    :pending-inputs (atom #{}) :closed? (atom false)
+    :lifetime-lock (Object.) :output-leases (atom 0)
+    :output-ready? (atom true) :completed-replays (atom 0)
+    :execution-state (atom {:value-epoch 0})}))
+
+(deftest every-measurement-replay-advances-the-same-owner-state
+  (doseq [recorded? [false true]]
+    (let [executable (tracked-executable recorded?)
+          profiles (atom 0) restores (atom 0) flushes (atom 0)
+          profile (fn [& _] (swap! profiles inc)
+                    {:profile [] :device-wall-ms 0.002})]
+      (with-redefs [gpu/profile-recorded-graph! profile
+                    parallel-program/profile-prepared! profile]
+        (let [result (link/measure! executable :warmup-iterations 1
+                                    :min-samples 3 :max-samples 3
+                                    :before-sample! #(swap! restores inc)
+                                    :flush-fn #(swap! flushes inc))]
+          (is (= 3 (count (:samples-ns result))))
+          (is (= :device-event (:timing-source result)))
+          (is (= 9 @profiles @restores @(:completed-replays executable)))
+          (is (= 3 @flushes))
+          (is (= 12 (:value-epoch @(:execution-state executable))))
+          (is (true? @(:output-ready? executable))))))))
+
+(deftest invalid-measurement-options-and-preflight-do-not-change-values
+  (let [executable (tracked-executable true)]
+    (doseq [opts [{:budget-ms -1} {:min-samples 0}
+                  {:before-sample! 4} {:flush-fn 4}]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (apply link/measure! executable (mapcat identity opts)))))
+    (reset! (:pending-inputs executable) #{:input})
+    (is (thrown? clojure.lang.ExceptionInfo (link/profile! executable)))
+    (reset! (:pending-inputs executable) #{})
+    (is (= :link-profiling-disabled
+           (try (link/profile! (assoc executable :profile? false))
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= {:value-epoch 0} @(:execution-state executable)))
+    (is (zero? @(:completed-replays executable)))
+    (is (true? @(:output-ready? executable)))))
+
+(deftest measurement-failures-poison-without-crediting-an-incomplete-replay
+  (doseq [failure-kind [:restore :profile :duration :flush]]
+    (let [executable (tracked-executable true)
+          failure (ex-info "injected measurement failure" {:kind failure-kind})
+          profile (fn [& _]
+                    (when (= :profile failure-kind) (throw failure))
+                    {:profile [] :device-wall-ms (when-not (= :duration failure-kind) 0.002)})]
+      (with-redefs [gpu/profile-recorded-graph! profile]
+        (let [error (try (link/measure! executable :warmup-iterations 0
+                                       :min-samples 1 :max-samples 1
+                                       :before-sample! #(when (= :restore failure-kind) (throw failure))
+                                       :flush-fn #(when (= :flush failure-kind) (throw failure)))
+                         (catch Throwable error error))]
+          (if (= :duration failure-kind)
+            (is (= :link-measurement-device-duration (:reason (ex-data error))))
+            (is (identical? failure error)))
+          (is (identical? error (:failure @(:execution-state executable))))
+          (is (= (if (= :flush failure-kind) 5 0) @(:completed-replays executable)))
+          (is (= (if (= :flush failure-kind) 6 1)
+                 (:value-epoch @(:execution-state executable))))
+          (is (false? @(:output-ready? executable)))
+          (is (= :link-execution-poisoned
+                 (try (link/run! executable)
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))
 
 (deftest bound-graph-profile-preserves-device-span-and-kernel-breakdown
   (let [calls (atom []) session (atom {:device-id :probe})]

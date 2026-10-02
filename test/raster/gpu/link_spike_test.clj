@@ -233,7 +233,7 @@
                      :tainted-inputs (atom #{})
                      :closed? (atom false)
                      :lifetime-lock (Object.) :output-leases (atom 0)
-                     :output-ready? (atom false)})
+                     :output-ready? (atom false) :execution-state (atom {:value-epoch 0})})
         device-array (fn [buffer view]
                        (value/map->DeviceArray
                         {:buffer buffer :device :ze:0 :dtype :float :shape [4] :view view
@@ -337,17 +337,19 @@
                                                                         ::session id view)]) views))
                      :pending-inputs (atom #{}) :tainted-inputs (atom #{})
                      :closed? (atom false) :lifetime-lock (Object.)
-                     :output-leases (atom 0) :output-ready? (atom true) :completed-replays (atom 0)})
+                     :output-leases (atom 0) :output-ready? (atom true) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})
         failure (ex-info "simulated partially completed upload" {})
         replayed (atom false)]
     (with-redefs [gpu/upload-range! (fn [& _] (throw (AssertionError. "preflight must not copy")))]
       (is (thrown? clojure.lang.ExceptionInfo (gpu-link/upload! executable :x (double-array 4))))
       (is (empty? @(:pending-inputs executable)))
+      (is (= {:value-epoch 0} @(:execution-state executable)))
       (is (true? @(:output-ready? executable))))
     (with-redefs [gpu/upload-range! (fn [& _] (throw failure))]
       (is (identical? failure (try (gpu-link/upload! executable :x (float-array 4))
                                    (catch Throwable error error)))))
     (is (= #{:x :alias :partial} @(:pending-inputs executable)))
+    (is (= {:value-epoch 1} @(:execution-state executable)))
     (is (false? @(:output-ready? executable)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not been initialized" (gpu-link/run! executable)))
     (with-redefs [gpu/upload-range! (fn [& _] nil)
@@ -358,6 +360,7 @@
       (doseq [id [:alias :partial]] (gpu-link/upload! executable id (float-array 4)))
       (is (empty? @(:pending-inputs executable)))
       (gpu-link/run! executable)
+      (is (= {:value-epoch 5} @(:execution-state executable)))
       (is (true? @replayed)))))
 
 (deftest owned-runtime-allocation-preserves-the-certified-identity
@@ -443,7 +446,7 @@
                      :session :session :graph-key :graph
                      :pending-inputs (atom #{}) :closed? (atom false)
                      :lifetime-lock (Object.) :output-leases (atom 0)
-                     :output-ready? (atom false) :completed-replays (atom 0)})]
+                     :output-ready? (atom false) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)})]
     (with-redefs [gpu/profile-recorded-graph! (fn [session graph]
                                                 (is (= [:session :graph] [session graph]))
                                                 measured)]

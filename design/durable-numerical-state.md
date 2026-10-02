@@ -144,6 +144,17 @@ ownership. Donations commit at that same mutation boundary: backend failure cons
 whereas pure preflight errors preserve handles. This readiness contract is a prerequisite for
 future completed-input receipts, not byte attestation or rollback of partially executed kernels.
 
+Synchronous replay, profiling and measurement share one completion boundary. Each warmup, probe
+and measured replay counts as a completed replay only after success. An owner-local value epoch
+also advances before uploads, device writes, restoration/replay and measurement flush callbacks;
+it invalidates continuity, but is neither a portable state identity nor byte evidence. Pure option,
+readiness, profiling and lease declines do not change it. A failed replay, profiling operation,
+restore callback or flush poisons the executable: the original error is retained, subsequent use
+rejects with `:link-execution-poisoned`, and callers must close and reinstantiate. Closing remains
+allowed and idempotent. Unlike a repairable failed input transfer, an arbitrary partially executed
+program has no proven restoration boundary. This is an intentional failure-contract tightening,
+not automatic rollback, cross-owner mutation detection or completed producer attestation.
+
 The bound structure is implemented, not full producer certification. Its result has scope
 `:exact-bound-program` and explicitly `:attests-input-bytes? false`; it supplies no numerical-state
 `:program-fingerprint`. Affected artifact/cache/composition tests pass 28 tests / 189 assertions:

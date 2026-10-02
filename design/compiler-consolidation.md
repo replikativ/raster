@@ -1380,3 +1380,17 @@ The affected native link, composition and lease suite passes 42 tests / 303 asse
 remaining pivotal-review blocker. The full seven CI gates remain the merge requirement. This
 prerequisite does not implement completed byte receipts, general failed-kernel rollback, cross-owner
 mutation tracking, asynchronous input lineage or the remaining external/distributed acceptance.
+
+### Unified synchronous replay state — 2026-10-03
+
+Run, profile and measurement now use one completion/failure boundary; measurement warmups and
+probes no longer execute outside replay accounting. Owner-local epochs invalidate continuity on
+input replacement, replay/restoration and flush. Failed execution or measurement callbacks poison
+the executable while preserving the original cause and allowing close; pure preflight declines
+remain nonmutating. Failed transfers retain the narrower explicit reinitialization contract.
+These epochs are diagnostic invalidation, not portable producer fingerprints or byte receipts.
+
+Affected link/composition/lease/measurement/ordered-program tests pass 64 tests / 488 assertions,
+including native replay, recurrent outputs, all measurement phases, callback failures, unavailable
+device timing and idempotent poisoned cleanup. Full CI and pivotal review remain required before
+merge. Actual resident-byte producer evidence and the broader eight-item campaign remain open.

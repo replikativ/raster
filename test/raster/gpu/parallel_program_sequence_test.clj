@@ -134,7 +134,7 @@
                      :prepared-program prepared
                      :pending-inputs (atom #{})
                      :output-ready? (atom true)
-                     :completed-replays (atom 0)
+                     :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)
                      :output-leases (atom 0)
                      :closed? (atom false)
                      :lifetime-lock (Object.)})]
@@ -142,6 +142,11 @@
            (try (link/run! executable)
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
     (is (= [[:run :a]] @events))
+    (is (= :link-execution-poisoned
+           (try (link/run! executable)
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= [[:run :a]] @events))
+    (is (= 1 (:value-epoch @(:execution-state executable))))
     (is (false? @(:output-ready? executable)))
     (is (zero? @(:completed-replays executable)))))
 
@@ -166,7 +171,7 @@
         executable (link/map->LinkedExecutable
                     {:plan {:id :mixed} :session :session :graph-key :composite
                      :prepared-program prepared :pending-inputs (atom #{})
-                     :output-ready? (atom false) :completed-replays (atom 0)
+                     :output-ready? (atom false) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)
                      :output-leases (atom 0) :closed? (atom false)
                      :lifetime-lock (Object.)})]
     (with-redefs [gpu/replay! (fn [_ key] (swap! runs conj [:replay key]))

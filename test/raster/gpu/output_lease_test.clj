@@ -14,7 +14,7 @@
             :nodes {:out {:view {:allocation {:ownership ownership}}}}}
      :session (atom {}) :owns-session? owns-session? :graph-key :graph
      :pending-inputs (atom #{}) :tainted-inputs (atom #{}) :closed? (atom false)
-     :lifetime-lock (Object.) :completed-replays (atom 0)
+     :lifetime-lock (Object.) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)
      :output-leases (atom 0) :output-ready? (atom false)})))
 
 (defn- reason [f]
@@ -80,18 +80,29 @@
       (is (zero? @replays)))))
 
 (deftest failed-replay-cannot-create-an-output-lease
-  (let [executable (executable)]
-    (with-redefs [gpu/replay! (fn [& _] (throw (ex-info "failed" {})))]
-      (is (thrown? clojure.lang.ExceptionInfo (link/run! executable)))
+  (let [executable (executable)
+        failure (ex-info "failed" {})
+        replays (atom 0)
+        closes (atom 0)]
+    (with-redefs [gpu/replay! (fn [& _] (swap! replays inc) (throw failure))
+                  gpu/close-session! (fn [& _] (swap! closes inc))]
+      (is (identical? failure (try (link/run! executable)
+                                  (catch Throwable error error))))
       (is (zero? @(:completed-replays executable)))
-      (is (= :link-output-lease-before-replay
-             (reason #(link/output-lease! executable))))
-      (reset! (:completed-replays executable) 1)
-      (reset! (:output-ready? executable) true)
-      (is (thrown? clojure.lang.ExceptionInfo (link/run! executable)))
       (is (false? @(:output-ready? executable)))
-      (is (= :link-output-lease-before-replay
-             (reason #(link/output-lease! executable)))))))
+      (is (= 1 (:value-epoch @(:execution-state executable))))
+      (doseq [operation [#(link/run! executable)
+                         #(link/upload! executable :out (double-array 1))
+                         #(link/profile! executable)
+                         #(link/measure! executable)
+                         #(link/output-lease! executable)]]
+        (let [error (try (operation) (catch Throwable error error))]
+          (is (= :link-execution-poisoned (:reason (ex-data error))))
+          (is (identical? failure (.getCause ^Throwable error)))))
+      (is (= 1 @replays))
+      (link/close! executable)
+      (link/close! executable)
+      (is (= 1 @closes)))))
 
 (deftest lease-acquisition-waits-for-complete-synchronous-replay
   (let [executable (executable)
