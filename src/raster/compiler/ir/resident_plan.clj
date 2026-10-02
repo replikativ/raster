@@ -9,6 +9,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.link-plan :as link-plan]))
 
 (defrecord ResidentPlanCertificate
@@ -221,7 +222,8 @@
     (when-not (certificate? certificate)
       (throw (ex-info "resident-plan lowering requires a ResidentPlanCertificate"
                       {:reason :resident-plan-certificate-type :actual (type certificate)})))
-    (when-not (= expected certificate)
+    (when-not (and (= (dissoc expected :scalars) (dissoc certificate :scalars))
+                   (semantic-fingerprint/equivalent? (:scalars expected) (:scalars certificate)))
       (throw (ex-info "resident-program to LinkPlan certificate does not match its target"
                       {:reason :resident-plan-certificate
                        :expected expected :actual certificate})))
@@ -268,7 +270,7 @@
         argument-map (descriptor-environment! descriptor arguments)
         scalar-values (select-keys argument-map (:scalar-params descriptor))
         expected-scalars (:scalars (:certificate template))
-        _ (when-not (= expected-scalars scalar-values)
+        _ (when-not (semantic-fingerprint/equivalent? expected-scalars scalar-values)
             (throw (ex-info "resident plan template scalar specialization changed"
                             {:reason :resident-plan-template-scalars
                              :expected expected-scalars :actual scalar-values})))

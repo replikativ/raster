@@ -1120,3 +1120,27 @@ cell-average transfer, not regridding control, post-transfer evolution, an AMR a
 competitive performance evidence. The original durable-continuation tests remain required.
 The combined focused run includes those existing full-domain refinement and actual mapped-byte
 continuation oracles: 13 tests / 256 assertions pass with no failures or errors.
+
+### Exact scalar specialization and warm preparation — 2026-10-02
+
+The existing descriptor resident-plan cache admitted a changed signed-zero scalar: ordinary
+Clojure equality accepted both a tampered scalar certificate and rebinding a +0.0 template with
+-0.0. Cache selection now uses the existing canonical scalar fingerprints; template binding and
+certificate verification independently compare full canonical bytes. This preserves scalar
+types, signed zero and NaN payloads without putting primitive-array contents in cache keys.
+Other certificate fields retain their previous independent checks. This is a correctness
+prerequisite for equation-first binding reuse, not that reuse's implementation.
+The affected host and native composition suites pass 39 tests / 267 assertions, including
+Float/Double signed-zero and NaN cache keys, Float certificate tampering and template rebinding.
+
+An instrumented public Q4 projection preparation ([1,1024,640]) found a warm compiler-template
+hit resolving in about 12 microseconds, while LinkPlan construction still took about 2.08 seconds.
+Scoped instrumentation attributes most construction time to repeated structural proof work;
+inclusive timings overlap and must not be summed. These observations come from a shared-load,
+power-save laptop and are bottleneck evidence, not controlled performance comparisons. The next
+cache extension must retain fresh invocation materialization and execute host equations once
+per preparation, while reusing only source-free certified structure.
+
+The partial-patch heat evolution acceptance was also rechecked on both available local OpenCL
+and Level Zero: 2 tests / 36 assertions pass. This does not add subcycling, reflux, production
+regridding control or an external AMR accuracy comparison.
