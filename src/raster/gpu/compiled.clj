@@ -43,8 +43,7 @@
             [raster.gpu.schedule :as gpu-schedule]
             [raster.gpu.value :as v]
             [raster.runtime.numerical-content :as numerical-content])
-  (:import [java.lang.foreign MemorySegment]
-           [java.nio ByteOrder]))
+  (:import [java.lang.foreign MemorySegment]))
 
 (declare invoke-compiled)
 
@@ -1379,7 +1378,7 @@
    Mutation of resident :state is invisible: the caller sees fresh output values and the old
    donated inputs invalidated — never a mutation. Backend failures after preflight consume
    donations too: partially completed device writes cannot be rolled back."
-  [^Compiled c inputs before-replay!]
+  [^Compiled c inputs before-mutation! before-replay!]
   (let [{:keys [executable in-tree out-tree donated target]} c
         inputs (project-aggregate-inputs in-tree inputs)
         in-nodes     (into {} (map (juxt :key identity)) in-tree)
@@ -1403,6 +1402,7 @@
         ;; 2. Every dynamic input is refreshed on every invocation, preserving the resident-program
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
+        _ (when before-mutation! (before-mutation!))
         _ (write-invocation-inputs! c input-nodes inputs previous checked-donations)]
     (when before-replay! (before-replay!))
     ;; 4. replay, no download on the ordinary invocation path.
@@ -1416,7 +1416,7 @@
       out)))
 
 (defn- invoke-compiled-unleased [c inputs]
-  (invoke-compiled-unleased* c inputs nil))
+  (invoke-compiled-unleased* c inputs nil nil))
 
 (defn invoke-compiled
   "Invoke a resident artifact under its linked lifetime guard. A live output lease rejects the
@@ -1467,6 +1467,11 @@
 ;; Inspection (§2.1) + lifecycle
 ;; ================================================================
 
+(defn- require-no-evidence-events! [executable]
+  (when (seq (:events @(:session executable)))
+    (throw (ex-info "resident byte evidence requires no async events"
+                    {:reason :compiled-evidence-unready}))))
+
 (defn- completed-frontier! [c]
   (let [executable (:executable c)
         plan (:plan executable)
@@ -1480,6 +1485,7 @@
             (fail :compiled-evidence-ownership))
         _ (when-not (link-plan/retained-effect-evidence? plan evidence)
             (fail :compiled-evidence-initialization))
+        _ (require-no-evidence-events! executable)
         _ (when (seq (:record-time-prologue (gpu-link/execution-order executable)))
             (fail :compiled-evidence-record-time-prologue))
         roots (set/union (:requires initialization) (:initializers initialization))
@@ -1495,8 +1501,8 @@
     {:roots roots :outputs outputs :state state}))
 
 (defn- require-evidence-ready! [executable]
-  (when (or (seq @(:pending-inputs executable)) (seq @(:tainted-inputs executable))
-            (seq (:events @(:session executable))))
+  (require-no-evidence-events! executable)
+  (when (or (seq @(:pending-inputs executable)) (seq @(:tainted-inputs executable)))
     (throw (ex-info "resident byte evidence requires initialized storage and no async events"
                     {:reason :compiled-evidence-unready}))))
 
@@ -1516,8 +1522,7 @@
                                                         :elements (quot n element-bytes)})
                                   n)))]
                  [node (assoc (select-keys view [:dtype :shape :strides :byte-length])
-                              :byte-order (if (= (ByteOrder/nativeOrder) ByteOrder/LITTLE_ENDIAN)
-                                            :little-endian :big-endian)
+                              :representation :device-native
                               :content content)])))
         nodes))
 
@@ -1543,7 +1548,9 @@
    record-time prologue or async events. Adjacent witnessed mutable state can name the previous
    same-owner receipt; ordinary replay/measurement/tuning/failed evidence breaks continuity.
    This does not publish durable blobs, prove mathematical equivalence, or track raw-session
-   mutation outside the LinkedExecutable ownership contract. Ordinary invocation is unchanged."
+   mutation outside the LinkedExecutable ownership contract. Bytes retain opaque device-native
+   representation; no host/device endianness agreement or canonical numerical codec is inferred.
+   Ordinary invocation is unchanged."
   [c inputs]
   (let [program (execution-identity c)
         _ (when-not (compiled? c)
@@ -1557,6 +1564,7 @@
              schedules (bound-schedule-evidence! executable)
              owner-state @(:execution-state executable)
              previous (:completed-evidence owner-state)
+             mutated? (volatile! false)
              before (volatile! nil)
              held (volatile! nil)]
          (try
@@ -1564,7 +1572,8 @@
                  (gpu-link/execute-and-lease!
                   executable :invoke-with-evidence
                   #(invoke-compiled-unleased*
-                    c inputs (fn [] (vreset! before (snapshot-resident-bytes executable roots)))))
+                    c inputs (fn [] (vreset! mutated? true))
+                    (fn [] (vreset! before (snapshot-resident-bytes executable roots)))))
                  _ (vreset! held lease)
                  after (snapshot-resident-bytes executable outputs)
                  post-state (snapshot-resident-bytes executable state)
@@ -1586,8 +1595,9 @@
              (swap! (:execution-state executable) assoc :completed-evidence receipt)
              receipt)
            (catch Throwable error
-             (swap! (:execution-state executable) dissoc :completed-evidence)
-             (invalidate-live-outputs! c)
+             (when @mutated?
+               (swap! (:execution-state executable) dissoc :completed-evidence)
+               (invalidate-live-outputs! c))
              (when-let [lease @held]
                (try (.close ^java.io.Closeable lease)
                     (catch Throwable cleanup

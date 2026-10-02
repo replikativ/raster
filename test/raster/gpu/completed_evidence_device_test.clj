@@ -53,6 +53,8 @@
               (is (compiled/completed-evidence? receipt))
               (is (true? (:attests-resident-bytes? data)))
               (is (= (address x) (get-in data [:inputs (input-node c) :content])))
+              (is (= :device-native (get-in data [:inputs (input-node c) :representation])))
+              (is (not (contains? (get-in data [:inputs (input-node c)]) :byte-order)))
               (is (= (address expected) (:content (first (vals (:outputs data))))))
               (is (= (vec expected) (vec (value/->host output))))
               (is (nil? (:parent data)))
@@ -61,7 +63,75 @@
               (is (= :compiled-completed-evidence-owner (reason #(deref (assoc receipt :data {})))))))
           (with-open [receipt (compiled/invoke-with-evidence c {(input-key c) defaults})]
             (is (not= (address x) (get-in @receipt [:inputs (input-node c) :content]))))
+          (let [owner-state @(:execution-state (:executable c))
+                epoch (:value-epoch owner-state)
+                writes (atom 0)]
+            (with-redefs [link/execution-order (constantly {:record-time-prologue [:unsupported]})
+                          gpu/upload-range! (fn [& _] (swap! writes inc))]
+              (is (= :compiled-evidence-record-time-prologue
+                     (reason #(compiled/invoke-with-evidence c {(input-key c) x})))))
+            (swap! (:session (:executable c)) assoc :events {:in-flight :opaque-test-event})
+            (try
+              (with-redefs [gpu/upload-range! (fn [& _] (swap! writes inc))]
+                (is (= :compiled-evidence-unready
+                       (reason #(compiled/invoke-with-evidence c {(input-key c) x})))))
+              (finally (swap! (:session (:executable c)) assoc :events {})))
+            (is (zero? @writes))
+            (is (= epoch (:value-epoch @(:execution-state (:executable c)))))
+            (is (identical? (:completed-evidence owner-state)
+                            (:completed-evidence @(:execution-state (:executable c)))))
+            (is (some? (reason #(compiled/invoke-with-evidence c {(input-key c) (float-array 3)}))))
+            (is (= epoch (:value-epoch @(:execution-state (:executable c)))))
+            (is (identical? (:completed-evidence owner-state)
+                            (:completed-evidence @(:execution-state (:executable c))))))
+          (let [foreign (compiled/instantiate! prepared)]
+            (try
+              (let [source (first (vals (compiled/invoke-compiled foreign {(input-key foreign) x})))]
+                (with-open [receipt (compiled/invoke-with-evidence c {(input-key c) source})]
+                  (is (= (address expected) (get-in @receipt [:inputs (input-node c) :content])))
+                  (compiled/invoke-compiled foreign {(input-key foreign) (float-array 4)})
+                  (is (= [12.0 16.0 20.0 24.0]
+                         (vec (value/->host (first (vals (compiled/completed-output-values receipt)))))))))
+              (finally (compiled/close! foreign))))
+          (let [failure (ex-info "input upload failed" {})]
+            (with-redefs [gpu/upload-range! (fn [& _] (throw failure))]
+              (is (identical? failure (try (compiled/invoke-with-evidence c {(input-key c) x})
+                                          (catch Throwable error error)))))
+            (is (nil? (:completed-evidence @(:execution-state (:executable c)))))
+            (is (seq @(:tainted-inputs (:executable c))))
+            (with-open [fresh (compiled/invoke-with-evidence c {(input-key c) x})]
+              (is (= (address x) (get-in @fresh [:inputs (input-node c) :content])))
+              (is (empty? @(:tainted-inputs (:executable c))))))
+          (let [bits (float-array [(Float/intBitsToFloat 0x7fc00011) (float 0.0) (float -0.0) 1.0])
+                first-input (with-open [receipt (compiled/invoke-with-evidence c {(input-key c) bits})]
+                              (let [actual (get-in @receipt [:inputs (input-node c) :content])]
+                                (is (= (address bits) actual)) actual))]
+            (aset bits 0 (Float/intBitsToFloat 0x7fc00013))
+            (with-open [receipt (compiled/invoke-with-evidence c {(input-key c) bits})]
+              (is (= (address bits) (get-in @receipt [:inputs (input-node c) :content])))
+              (is (not= first-input (get-in @receipt [:inputs (input-node c) :content])))))
           (finally (compiled/close! c)))))))
+
+(defn- run-ownership-and-range-case! [target]
+  (with-redefs [build/current-identity (constantly (test-build))]
+    (let [n 40000 x (float-array n) expected (float-array n)]
+      (aset x (dec n) (float 3.0))
+      (aset expected (dec n) (float 6.0))
+      (let [prepared (compiled/lower #'witnessed-scale [x n]
+                                    {:target target :compiler :equation-first :dtype :float})
+            c (compiled/instantiate! prepared)]
+        (try
+          (with-open [receipt (compiled/invoke-with-evidence c {})]
+            (is (= (address x) (get-in @receipt [:inputs (input-node c) :content])))
+            (is (= (address expected) (:content (first (vals (:outputs @receipt)))))))
+          (finally (compiled/close! c)))
+        (let [session (gpu/make-session target)
+              attached (compiled/instantiate! prepared {:session session})]
+          (try
+            (is (= :compiled-evidence-ownership
+                   (reason #(compiled/invoke-with-evidence attached {}))))
+            (is (zero? @(:completed-replays (:executable attached))))
+            (finally (compiled/close! attached) (gpu/close-session! session))))))))
 
 (defn- run-state-case! [target]
   (with-redefs [build/current-identity (constantly (test-build))]
@@ -100,10 +170,10 @@
 
 (deftest completed-resident-bytes-and-state-chain-match-real-opencl
   (if @opencl/opencl-available?
-    (do (run-input-case! :ocl:0) (run-state-case! :ocl:0))
+    (do (run-input-case! :ocl:0) (run-state-case! :ocl:0) (run-ownership-and-range-case! :ocl:0))
     (opencl/opencl-skip! "completed resident byte producer evidence")))
 
 (deftest completed-resident-bytes-and-state-chain-match-real-level-zero
   (if @ze/gpu-available?
-    (do (run-input-case! :ze:0) (run-state-case! :ze:0))
+    (do (run-input-case! :ze:0) (run-state-case! :ze:0) (run-ownership-and-range-case! :ze:0))
     (ze/gpu-skip! "completed resident byte producer evidence")))
