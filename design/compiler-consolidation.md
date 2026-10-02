@@ -1416,3 +1416,12 @@ Focused lease/dispatch-benchmark/measurement/program-tuning tests pass 42 tests 
 capped REPL. Review and full CI remain prerequisites; completed byte evidence remains next.
 The caught-inner-replay regression verifies first-failure identity, removal of the temporary scope
 marker, and idempotent poisoned close. The parent replay fix is shared, not a tuning-only exception.
+
+### Retained instantiated artifact owner — 2026-10-03
+
+`Compiled` now retains the original `Prepared` and reuses its exact-object seal mechanism for
+explicit structural inspection. There is no new cache, eager identity hash or byte-attestation
+claim; copied owners still fail closed. The contract is recorded once in
+[durable-numerical-state.md](durable-numerical-state.md). Artifact/composition/lease tests pass
+41 tests / 323 assertions in the existing REPL; pivotal review found no blocker. Actual resident
+byte snapshots, completed producer receipts and publication remain on the original campaign.

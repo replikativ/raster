@@ -8,6 +8,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.link :as gpu-link]
             [raster.runtime.hardware :as hardware])
   (:import [java.nio.file Files Path]
            [java.util Comparator]))
@@ -296,6 +297,26 @@
                 (is (string? (:fingerprint a)))
                 (is (= a b) "host array identity and contents are deliberately not attested")
                 (is (false? (:attests-input-bytes? a)))
+                (with-redefs [gpu-link/instantiate-certified! (fn [& _] ::bound-executable)
+                              gpu-link/instantiate! (fn [& _] ::independently-bound-executable)]
+                  (let [c (compiled/instantiate! p)]
+                    (is (identical? p (:prepared c)))
+                    (is (= ::bound-executable (:executable c)))
+                    (is (= a (compiled/execution-identity c)))
+                    (with-redefs [build-manifest/current-identity (constantly nil)]
+                      (is (= a (compiled/execution-identity c))
+                          "inspection retains the bound artifact rather than current build/cache state"))
+                    (doseq [changed [(assoc c :executable ::foreign-executable)
+                                     (assoc c :in-tree [])
+                                     (assoc c :prepared q)]]
+                      (is (= :compiled-execution-identity-owner
+                             (reason-of #(compiled/execution-identity changed)))))
+                    (is (= :compiled-execution-identity-owner
+                           (reason-of #(compiled/execution-identity
+                                        (compiled/instantiate! (assoc p :target (:target p))))))))
+                  (with-redefs [compiled/execution-identity
+                                (fn [& _] (throw (ex-info "unexpected hot-path identity hashing" {})))]
+                    (is (compiled/compiled? (compiled/instantiate! p)))))
                 (is (= [input] (mapv :key (:data-slots a))))
                 (is (not= (:fingerprint a)
                           (:fingerprint (compiled/execution-identity
