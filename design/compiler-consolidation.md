@@ -152,6 +152,16 @@ diagnostic observations, not a controlled speedup. Cold proof derivation is incl
 equation lowering, outside its materialization/construction subphase timers. Complete source-free
 plan binding and matched performance evidence remain outstanding.
 
+Storage realization now consumes that same sealed physical-result index for exact plain-equation
+boundary identities. Missing entries, dispatch boundaries and structured loops retain independent
+projection validation. Concrete shape, prefix view, backing range and initialization realization
+are unchanged. Independent versus retained lowering agrees on values, outputs and aliases;
+focused tests pass 3 / 23 assertions and affected suites pass 75 / 522. Review found no blocker.
+After this additional static deduplication, a warm public Q4 diagnostic records 0.435 s total,
+including 0.431 s LinkPlan construction. Fresh final validation remains the dominant measured
+cost. These shared-load observations still do not establish a controlled execution speedup or
+complete whole-plan binding reuse.
+
 Then resume matched performance evidence, external training acceptance and the distributed/PDE
 milestones. This optimization does not complete the wider campaign or authorize schedule promotion.
 

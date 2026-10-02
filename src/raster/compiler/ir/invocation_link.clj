@@ -329,7 +329,7 @@
      state (control/carried algorithm))))
 
 (defn- lower-equation-storage
-  [state invocation-id equation program-values scalars]
+  [state invocation-id equation program-values scalars physical-projections]
   (cond
     (true? (get-in equation [:attributes :host-only])) state
 
@@ -338,8 +338,12 @@
 
     :else
     (let [emitted (equation-dispatch/boundary-equation (first (:operations equation)))
-          ;; The public projection validates this exact boundary before storage is derived.
-          physical (emitted-equation/physical-results emitted)]
+          ;; Retained projections were validated for this exact immutable boundary. Missing
+          ;; entries (including dispatch boundaries) retain the independent public path.
+          physical (if (and physical-projections
+                            (.containsKey ^java.util.Map physical-projections emitted))
+                     (.get ^java.util.Map physical-projections emitted)
+                     (emitted-equation/physical-results emitted))]
       (reduce
        (fn [state result]
          (let [physical-id (get physical result)
@@ -406,7 +410,8 @@
                                          materialized (:values parallel-program)
                                          overwrite-inputs required-buffers)
         realized (reduce #(lower-equation-storage %1 invocation-id %2
-                                                  (:values parallel-program) shape-scalars)
+                                                  (:values parallel-program) shape-scalars
+                                                  (:projections retained-validation))
                          initial (:equations parallel-program))
         call-scalars (select-keys shape-scalars (keys (:values parallel-program)))
         ;; Shape-only invocation scalars are part of the physical program contract even when no
