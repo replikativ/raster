@@ -59,6 +59,8 @@
             descriptor   ;; raw descriptor or inspectable composite descriptor
             args         ;; captured specialization arguments (empty for a composite)
             preparation-report ;; compact host-side lowering/cache/certification timings
+            prepared     ;; original compiler-owned Prepared, retained for explicit evidence
+            provenance-seal
             live-outputs] ;; atom holding the DeviceArrays projected by the LAST invocation. They
                           ;; alias resident buffers the next replay overwrites, so they are
                           ;; invalidated (marked dead) at the start of the next invoke and at close!
@@ -75,23 +77,23 @@
 (defn compiled? [x] (instance? Compiled x))
 (defn prepared? [x] (instance? Prepared x))
 
-(def ^:private prepared-seal-token (Object.))
+(def ^:private artifact-seal-token (Object.))
 
-(defn- seal-prepared
-  "Bind in-process provenance to one exact immutable Prepared object. A copied or associated
+(defn- seal-artifact
+  "Bind in-process provenance to one exact immutable artifact object. A copied or associated
    record may retain the closure but cannot satisfy its identity check. This is an optimization
    witness, never a replacement for the public, re-derivable lowering certificate."
-  [prepared]
+  [artifact]
   (let [owner (volatile! nil)
-        sealed (assoc prepared :provenance-seal
+        sealed (assoc artifact :provenance-seal
                       (fn [candidate]
-                        (when (identical? candidate @owner) prepared-seal-token)))]
+                        (when (identical? candidate @owner) artifact-seal-token)))]
     (vreset! owner sealed)
     sealed))
 
-(defn- sealed-prepared? [prepared]
-  (let [seal (:provenance-seal prepared)]
-    (and (fn? seal) (identical? prepared-seal-token (seal prepared)))))
+(defn- sealed-artifact? [artifact]
+  (let [seal (:provenance-seal artifact)]
+    (and (fn? seal) (identical? artifact-seal-token (seal artifact)))))
 
 ;; Compilation templates are immutable and argument-independent.  LinkPlan lowering below still
 ;; runs for every invocation, so shapes, weights, roles, views, and ownership never enter this
@@ -661,7 +663,7 @@
                 :link-plan-lowering-ns lowering-ns
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
-    (seal-prepared
+    (seal-artifact
      (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args report nil))))
 
 (defn- equation-first-value
@@ -895,7 +897,7 @@
                 :equation-lower-phases-ns @equation-lower-phases
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
-    (seal-prepared
+    (seal-artifact
      (->Prepared lowering in-tree out-tree donated schedule target descriptor args report nil))))
 
 (defn lower
@@ -923,13 +925,14 @@
    (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args
                  preparation-report]} prepared
          evidence (get-in lowering [:certificate :effect-evidence])
-         executable (if (and (sealed-prepared? prepared)
+         executable (if (and (sealed-artifact? prepared)
                              (link-plan/retained-effect-evidence? (:plan lowering) evidence))
                       (gpu-link/instantiate-certified! lowering opts)
                       (gpu-link/instantiate! (:plan lowering) opts))]
-     (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
+     (seal-artifact
+      (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
                  preparation-report
-                 (atom nil)))))
+                 prepared nil (atom nil))))))
 
 (defn preparation-report
   "Return compact host-side template-cache and LinkPlan preparation facts for a Prepared or
@@ -979,18 +982,22 @@
                     {:reason :compiled-execution-identity-vertical :kind (:kind report)}))))
 
 (defn execution-identity
-  "Identify one exact retained, specialized Prepared program without claiming input-byte lineage.
+  "Identify one exact retained, specialized Prepared or Compiled without input-byte lineage.
 
    Requires complete packaged build/source/target evidence and retained artifact hashes. Includes
    certified calls, storage contracts, composition, roles, donation, outputs and schedule, but never
    host initializer arrays. Generated IDs belong to the exact retained artifact; this is not an
    alpha-equivalence or target-neutral mathematical identity. Caller defaults can be replaced at
    invocation, so the returned identity deliberately does not attest the bytes used in execution."
-  [prepared]
-  (when-not (and (prepared? prepared) (sealed-prepared? prepared))
-    (throw (ex-info "execution-identity requires the original compiler-owned Prepared artifact"
+  [artifact]
+  (when-not (and (or (prepared? artifact) (compiled? artifact)) (sealed-artifact? artifact))
+    (throw (ex-info "execution-identity requires an original compiler-owned artifact"
                     {:reason :compiled-execution-identity-owner})))
-  (let [artifact (exact-artifact-evidence (:lowering prepared) (:preparation-report prepared))
+  (let [prepared (if (compiled? artifact) (:prepared artifact) artifact)
+        _ (when-not (and (prepared? prepared) (sealed-artifact? prepared))
+            (throw (ex-info "compiled evidence requires its original compiler-owned Prepared"
+                            {:reason :compiled-execution-identity-owner})))
+        artifact (exact-artifact-evidence (:lowering prepared) (:preparation-report prepared))
         plan (:plan (:lowering prepared))
         boundary #(mapv (fn [entry] (dissoc entry :default)) %)
         projection {:kind :raster.compiled/exact-bound-program-v1
@@ -1123,7 +1130,7 @@
             (throw (ex-info "every component donation requires exactly one mutable owner binding"
                             {:reason :compiled-composition-donation
                              :expected component-donations :owners donation-owners})))
-        prevalidated? (every? (comp sealed-prepared? :program) components)
+        prevalidated? (every? (comp sealed-artifact? :program) components)
         low-level
         ((if prevalidated?
            link-composition/compose-prevalidated
@@ -1195,7 +1202,7 @@
                                   components)
                 :nodes (count (get-in low-level [:plan :nodes]))
                 :instances (count (get-in low-level [:plan :instances]))}]
-    (seal-prepared
+    (seal-artifact
      (->Prepared low-level in-tree out-tree
                  (into {} (map (juxt :owner :output-key)) resolved-mutable-shares)
                  schedules (:target (:plan low-level))
