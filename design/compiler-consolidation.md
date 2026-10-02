@@ -1412,5 +1412,7 @@ retains the original cause and poisons the owner. A callback may replay for rest
 cannot export an intermediate output lease. Even a tuning-cache hit conservatively invalidates
 readiness: callers replay the plan before exposing a result. This closes Raster-owned tuning's
 raw-session bypass, not arbitrary direct session mutation or producer-byte certification.
-Focused lease/dispatch-benchmark/measurement/program-tuning tests pass 40 tests / 295 assertions in the retained
+Focused lease/dispatch-benchmark/measurement/program-tuning tests pass 42 tests / 308 assertions in the retained
 capped REPL. Review and full CI remain prerequisites; completed byte evidence remains next.
+The caught-inner-replay regression verifies first-failure identity, removal of the temporary scope
+marker, and idempotent poisoned close. The parent replay fix is shared, not a tuning-only exception.

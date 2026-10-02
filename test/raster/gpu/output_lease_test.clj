@@ -142,6 +142,25 @@
     (is (= 1 (:value-epoch @(:execution-state executable))))
     (is (= :link-execution-poisoned (reason #(link/run! executable))))))
 
+(deftest caught-nested-replay-failure-retains-the-first-poison
+  (let [executable (executable)
+        failure (ex-info "inner replay failed" {})
+        closes (atom 0)]
+    (with-redefs [gpu/replay! (fn [& _] (throw failure))
+                  gpu/close-session! (fn [& _] (swap! closes inc))]
+      (let [error (try (link/with-exclusive-mutation!
+                       executable :tune #(try (link/run! executable) (catch Throwable _)))
+                      (catch Throwable error error))]
+        (is (= :link-execution-poisoned (:reason (ex-data error))))
+        (is (identical? failure (.getCause ^Throwable error)))
+        (is (identical? failure (:failure @(:execution-state executable))))
+        (is (nil? (:exclusive-mutation? @(:execution-state executable))))
+        (let [later (try (link/run! executable) (catch Throwable error error))]
+          (is (identical? failure (.getCause ^Throwable later))))
+        (link/close! executable)
+        (link/close! executable)
+        (is (= 1 @closes))))))
+
 (deftest lease-acquisition-waits-for-complete-synchronous-replay
   (let [executable (executable)
         entered (promise)
