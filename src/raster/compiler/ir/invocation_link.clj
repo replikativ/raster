@@ -370,13 +370,20 @@
 
    `evaluate-host` is passed unchanged to EmittedParallelProgramCall for closed, effect-free host
    scalar equations. The returned plan is allocation-free; runtime contact starts only in
-   raster.gpu.link/instantiate!."
+   raster.gpu.link/instantiate!.
+   The six-argument arity accepts internal exact-owner static evidence, not a runtime proof;
+   materialization, call bindings and final LinkPlan validation are still checked independently."
   ([materialized parallel-program target evaluate-host]
    (:plan (lower materialized parallel-program target evaluate-host
                  (fn [plan] {:plan plan}))))
   ([materialized parallel-program target evaluate-host project]
+   (lower materialized parallel-program target evaluate-host project nil))
+  ([materialized parallel-program target evaluate-host project retained-validation]
   (let [materialized (materialization/validate! materialized)
-        parallel-program (emitted-program/validate! parallel-program)
+        parallel-program (if retained-validation
+                           (:program (emitted-program/checked-retained-validation!
+                                      parallel-program retained-validation))
+                           (emitted-program/validate! parallel-program))
         _ (when-let [providers (seq (get-in parallel-program
                                            [:attributes :native-initialization-providers]))]
             (fail! :invocation-link-native-initialization
@@ -407,7 +414,8 @@
         ;; element-equivalent to flattened result storage at the LinkPlan boundary.
         call (program-call/make parallel-program (:buffers realized) call-scalars
                                 (:loop-scratch realized) evaluate-host
-                                (into {} (keep :result-view) (vals (:storage realized))))
+                                (into {} (keep :result-view) (vals (:storage realized)))
+                                retained-validation)
         resident-outputs (into [] (remove (comp typed-scalar? val)) (:outputs call))
         output-tokens (set (map val resident-outputs))
         storage (:storage realized)

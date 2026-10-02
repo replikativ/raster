@@ -27,6 +27,7 @@
             [raster.compiler.build-manifest :as build-manifest]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-composition :as link-composition]
@@ -121,6 +122,10 @@
 
 (def ^:dynamic *compilation-template-observer*
   "Internal per-request observer. It receives only cache/timing facts, never source or artifacts."
+  nil)
+
+(def ^:dynamic ^:private *compilation-template-owner*
+  "Per-request slot for the exact stable process-cache owner; never part of public reports."
   nil)
 
 (def ^:dynamic *equation-artifact-store*
@@ -337,10 +342,20 @@
 (defn- cached-compilation-template
   [key compiler thunk]
   (let [persistent-report (atom nil)
+        value (delay (resolve-compilation-template key compiler thunk persistent-report))
         candidate
         {:compiler compiler
-         :value (delay
-                  (resolve-compilation-template key compiler thunk persistent-report))
+         :value value
+         ;; Process-local evidence belongs to this existing template owner, not to the serialized
+         ;; compilation. Resolve/load/store the ordinary artifact before deriving this evidence.
+         :emitted-validation
+         (when (= :equation-first compiler)
+           (delay
+             (let [compilation @value
+                   validator @#'emitted-program/validate-with-physical-results!]
+               (when (equation-first/equation-first-compilation? compilation)
+                 {:validation (validator (:emitted compilation))
+                  :validator-identity (weak-identity validator)}))))
          :persistent-report persistent-report}
         [before after]
         (swap-vals! compilation-template-cache
@@ -354,6 +369,8 @@
       (swap! compilation-template-stats update-in [:misses-by-reason miss-reason] (fnil inc 0)))
     (try
       (let [value @(:value entry)]
+        (when *compilation-template-owner*
+          (reset! *compilation-template-owner* {:key key :entry entry}))
         (when *compilation-template-observer*
           (*compilation-template-observer*
            {:compiler compiler :cache-hit? hit? :success? true
@@ -399,14 +416,17 @@
    This makes a single preparation request converge the cache while preserving the invariant that
    every returned template was produced during a stable compiler-definition interval."
   [key-for-revision compiler thunk]
-  (let [request-observer *compilation-template-observer*]
+  (let [request-observer *compilation-template-observer*
+        request-owner *compilation-template-owner*]
     (loop [attempt 1]
       (let [revision-before (dispatch/compiler-definition-revision)
             report (atom nil)
+            owner (atom nil)
             key (key-for-revision revision-before)
             outcome (try
                       {:value
-                       (binding [*compilation-template-observer* #(reset! report %)]
+                       (binding [*compilation-template-observer* #(reset! report %)
+                                 *compilation-template-owner* owner]
                          (cached-compilation-template key compiler thunk))}
                       (catch Throwable error {:error error}))
             _ (when-let [error (:error outcome)]
@@ -420,6 +440,7 @@
                 (swap! compilation-template-cache dissoc key))]
         (if (= revision-before revision-after)
           (do
+            (when request-owner (reset! request-owner @owner))
             (when request-observer
               (request-observer
                (assoc @report
@@ -442,6 +463,30 @@
                         :compiler-revision-before revision-before
                         :compiler-revision-after revision-after)))
               (throw error))))))))
+
+(defn- owned-emitted-validation
+  "Reuse only facts belonging to the exact stable compilation owner and current pipeline.
+   Stale guards fall back to independent validation; a failed proof is never cached negatively."
+  [{:keys [key entry]} compilation]
+  (let [current-owner? (fn []
+                         (and (identical? entry (get @compilation-template-cache key))
+                              (= (get-in key [:guards :compiler-revision])
+                                 (dispatch/compiler-definition-revision))
+                              (= (get-in key [:guards :pipeline-identity])
+                                 (weak-identity @#'equation-first/compile))
+                              (identical? compilation @(:value entry))))]
+    (when (and (:emitted-validation entry) (current-owner?))
+      (try
+        (let [{:keys [validation validator-identity]} @(:emitted-validation entry)]
+          (when (and (current-owner?)
+                     (= validator-identity
+                        (weak-identity @#'emitted-program/validate-with-physical-results!))
+                     (emitted-program/retained-validation? (:emitted compilation) validation))
+            validation))
+        (catch Throwable error
+          (swap! compilation-template-cache
+                 #(if (identical? entry (get % key)) (dissoc % key) %))
+          (throw error))))))
 
 ;; ================================================================
 ;; Role derivation (§4.2) and tree construction
@@ -757,6 +802,7 @@
                 :as opts}]
   (let [preparation-started (System/nanoTime)
         template-report (atom nil)
+        template-owner (atom nil)
         target-descriptor (equation-first/validate-target-description!
                            target (hardware/descriptor-for target))
         target-identity (target-specialization-identity target target-descriptor)
@@ -776,11 +822,13 @@
            target-identity
            compilation-options
            (weak-identity @#'equation-first/compile)))
-        compilation (binding [*compilation-template-observer* #(reset! template-report %)]
+        compilation (binding [*compilation-template-observer* #(reset! template-report %)
+                              *compilation-template-owner* template-owner]
                       (stable-compilation-template
                        template-key :equation-first
                        #(equation-first/compile fn-var compilation-options target-descriptor)))
         lowering-started (System/nanoTime)
+        retained-validation (owned-emitted-validation @template-owner compilation)
         equation-lower-phases (atom nil)
         projection-ns (atom 0)
         result (binding [equation-first/*lower-observer*
@@ -791,7 +839,8 @@
                     (let [started (System/nanoTime)
                           projected (project-equation-first-boundary plan compilation args opts)]
                       (reset! projection-ns (- (System/nanoTime) started))
-                      projected))))
+                      projected))
+                  retained-validation))
         equation-lower-ns (- (System/nanoTime) lowering-started @projection-ns)
         plan (:plan result)
         {:keys [in-tree out-tree]} (:projection result)

@@ -133,6 +133,25 @@ identity; object identity alone is not semantic reload invalidation.
 The focused structured-control and local device-composition suites pass 55 tests / 392 assertions,
 including mutation rejection through the projection map and its entry views.
 
+The existing compilation-template entry now owns a delayed, process-local static proof, derived
+only after ordinary artifact resolution/load/store. Reuse requires the exact live cache entry,
+compilation and emitted-program identities, plus current compiler epoch, pipeline root and
+validator root. Guards are checked again after forcing the delay. Drift uses independent
+validation; failed proof derivation evicts only its own entry and permits retry. This is not a
+transactional reload guarantee. No second cache or serialized proof field is introduced.
+
+Only repeated static emitted-program analysis is skipped. Invocation materialization, scalar and
+buffer validation, result views, host equations, final LinkPlan validation and public verification
+remain fresh. The focused owner/failure/drift suite passes 4 tests / 42 assertions; affected
+composition/control/local-device suites pass 75 tests / 522 assertions. Review found no blocker.
+
+One public Q4 preparation run on the shared-load, power-save laptop records cold total 8.78 s
+(7.38 s compiler-template resolution) and warm total 0.891 s (25 microseconds template resolution,
+0.875 s LinkPlan construction). Earlier warm construction was about 1.69 s, but these are unmatched
+diagnostic observations, not a controlled speedup. Cold proof derivation is included in aggregate
+equation lowering, outside its materialization/construction subphase timers. Complete source-free
+plan binding and matched performance evidence remain outstanding.
+
 Then resume matched performance evidence, external training acceptance and the distributed/PDE
 milestones. This optimization does not complete the wider campaign or authorize schedule promotion.
 

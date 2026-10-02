@@ -1436,6 +1436,7 @@
                    (swap! evaluations conj (:id equation))
                    {(first (:results equation)) (get operands (first (:operands equation)))})
         inputs {'input {:type :double :value 2.0}}
+        evidence (emitted-program/validate-with-physical-results! emitted)
         failure (ex-info "fresh host evaluation failed" {:reason ::staging-probe})]
     (with-redefs-fn
       {#'program-call/construct-staged-call
@@ -1444,15 +1445,27 @@
          (is (not (contains? staged :evaluate-host)) "the evaluator is not retained in staged inputs")
          (original staged))}
       (fn []
-        (dotimes [_ 2]
+        (doseq [retained [nil evidence]]
           (is (= {:type :double :value 2.0}
-                 (get-in (program-call/make emitted {} inputs {} evaluate) [:outputs 'answer]))))
+                 (get-in (program-call/make emitted {} inputs {} evaluate {} retained)
+                         [:outputs 'answer]))))
         (is (= [['first] ['second] ['first] ['second]] @evaluations))
         (is (= 2 @constructions))
-        (is (thrown? clojure.lang.ExceptionInfo
-                     (program-call/make emitted {} (assoc inputs 'unknown {:type :double :value 1.0})
-                                        {} evaluate)))
+        (doseq [retained [nil evidence]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (program-call/make emitted {} (assoc inputs 'unknown {:type :double :value 1.0})
+                                          {} evaluate {} retained)))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (program-call/make emitted {} {'input {:type :long :value 2}}
+                                          {} evaluate {} retained)))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (program-call/make emitted {} inputs {} evaluate {'unknown 'missing} retained))))
         (is (= 4 (count @evaluations)) "invalid inputs reject before any host callback")
+        (is (= :emitted-parallel-program-retained-validation
+               (try (program-call/make emitted {} inputs {} evaluate {}
+                                        (with-meta evidence (assoc (meta evidence) :copy true)))
+                    nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (is (= 4 (count @evaluations)) "copied evidence rejects before host evaluation")
         (is (identical? failure
                         (try (program-call/make emitted {} inputs {} (fn [& _] (throw failure)))
                              nil (catch clojure.lang.ExceptionInfo error error))))

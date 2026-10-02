@@ -486,10 +486,14 @@
 
    Returns a validated, allocation-free LinkPlan. Public buffers retain their stable host source
    identity until instantiation; scalar prefix and host-only equations execute through the same
-   typed JVM reference backend."
+   typed JVM reference backend.
+   The four-argument arity is an internal capability path: retained-validation must be exact-owner
+   static evidence. Invocation materialization and final LinkPlan validation remain fresh."
   ([compilation arguments]
    (:plan (lower compilation arguments (fn [plan] {:plan plan}))))
   ([compilation arguments project]
+   (lower compilation arguments project nil))
+  ([compilation arguments project retained-validation]
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
@@ -515,7 +519,8 @@
                 (let [started (System/nanoTime)
                       projected (project plan)]
                   (vswap! projection-ns + (- (System/nanoTime) started))
-                  projected)))]
+                  projected))
+              retained-validation)]
     (when *lower-observer*
       (*lower-observer* {:materialization-ns materialization-ns
                          :link-plan-construction-ns
