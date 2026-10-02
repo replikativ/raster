@@ -449,7 +449,10 @@
   (reset! (:output-ready? executable) false))
 
 (defn- poison-execution! [executable error]
-  (swap! (:execution-state executable) assoc :failure error)
+  ;; Reentrant restoration may already have poisoned this owner. Preserve the first backend
+  ;; failure rather than replacing it with an outer already-poisoned wrapper.
+  (swap! (:execution-state executable)
+         #(if (:failure %) % (assoc % :failure error)))
   (reset! (:output-ready? executable) false)
   (throw error))
 

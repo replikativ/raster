@@ -247,6 +247,27 @@
                  (try (link/run! executable)
                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))
 
+(deftest caught-nested-restore-failure-cannot-replace-the-original-poison
+  (let [executable (assoc (tracked-executable true) :owns-session? true)
+        failure (ex-info "nested restore replay failed" {})
+        closes (atom 0)]
+    (with-redefs [gpu/replay! (fn [& _] (throw failure))
+                  gpu/close-session! (fn [& _] (swap! closes inc))]
+      (let [error (try (link/measure! executable :warmup-iterations 0
+                                     :before-sample! #(try (link/run! executable)
+                                                          (catch Throwable _)))
+                       (catch Throwable error error))]
+        (is (= :link-execution-poisoned (:reason (ex-data error))))
+        (is (identical? failure (.getCause ^Throwable error)))
+        (is (identical? failure (:failure @(:execution-state executable))))
+        (is (false? @(:output-ready? executable)))
+        (is (zero? @(:completed-replays executable)))
+        (let [later (try (link/run! executable) (catch Throwable error error))]
+          (is (identical? failure (.getCause ^Throwable later))))
+        (link/close! executable)
+        (link/close! executable)
+        (is (= 1 @closes))))))
+
 (deftest bound-graph-profile-preserves-device-span-and-kernel-breakdown
   (let [calls (atom []) session (atom {:device-id :probe})]
     (with-redefs-fn
