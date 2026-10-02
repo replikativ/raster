@@ -1331,3 +1331,25 @@ validation time. Spatial order at tangentially displaced coarse/fine centres, ti
 device-side patch packing, general conservative remap construction, subcycling/reflux, manifest
 publication and real distributed execution remain separate acceptance obligations. Shared face
 fluxes and paired incidences establish the conservative structure, not those broader claims.
+
+### Production cell-average layout transfer — 2026-10-02
+
+`raster.ode.amr-transfer/matrix` replaces the fixture-only all-pairs remap builder. It normalizes
+source/target cell rectangles to exact rational coordinates, sweeps x events and queries disjoint
+active y intervals to visit actual overlaps once. Touching-only cells are excluded; packed row and
+column order remain those of the supplied layouts. Both layouts' total area, non-overlap and
+per-cell coverage are checked exactly, as are target row-weight sums. Different finest lattices
+are supported on the same physical domain. The existing FP64 CSR operator performs execution.
+
+Nonzero budgets reject impossible coverage before event preparation and stop streamed overlap
+discovery before storing excess entries. Int capacity includes the extra target row-offset entry;
+positive coefficient representability is checked before fresh primitive-array materialization.
+Independent small all-pairs rational and finest-tile oracles remain. The affected transfer and
+native evolution/remap/restart suite passes 16 tests / 375 assertions; both local backends are
+available. Review found no remaining blocker after budget/capacity hardening.
+
+Geometric overlap conservation is exact before FP64 rounding; constant preservation and mass
+balance in execution are tolerance claims, not bitwise conservation or high-order reconstruction.
+This adds no compiler operation, ownership transfer, manifest compatibility certificate or
+publication protocol. Device patch packing, adaptive/subcycled/refluxed evolution, semantic
+restore compatibility and external training/distributed acceptance remain on the campaign.

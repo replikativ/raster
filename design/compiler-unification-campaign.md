@@ -43,8 +43,11 @@ Item 8 now also has a production 2D hierarchy projection in `raster.ode.amr-geom
 anisotropic, multilevel active rows retain patch provenance and match geometric sides into faces
 and CSR incidence. Native evolution/remap/restart fixtures consume it, retaining independent
 geometry and numerical oracles (28 tests / 1303 assertions). Fresh array materialization trusts
-constructor output and adds no certification or ownership authority. Device patch packing,
-scalable hierarchy validation, production remap/publication, subcycling/reflux and general-rank
+constructor output and adds no certification or ownership authority. Production cell-average
+remap now uses exact normalized geometry, an overlap sweep and the existing FP64 CSR operator;
+different finest lattices are covered by independent rational-overlap oracles. The affected
+transfer/native evolution/remap/restart suite passes 16 tests / 375 assertions. Device patch packing,
+scalable hierarchy validation, semantic restore compatibility/publication, subcycling/reflux and general-rank
 numerical providers remain open; the campaign is not complete.
 
 External source audit refreshed on 2026-09-30: authoritative pretrained-rstr main
