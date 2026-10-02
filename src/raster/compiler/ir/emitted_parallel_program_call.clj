@@ -204,8 +204,8 @@
         ;; The enclosing program supplied only exact plain-boundary facts it just checked.
         ;; Dispatch boundaries still derive their own projection. No constructor context is
         ;; bound around the host-evaluator callback that precedes this preparation phase.
-        result-storage (if (.containsKey ^java.util.IdentityHashMap projections emitted)
-                         (.get ^java.util.IdentityHashMap projections emitted)
+        result-storage (if (.containsKey ^java.util.Map projections emitted)
+                         (.get ^java.util.Map projections emitted)
                          (emitted-equation/physical-results emitted))
         common-graph (:graph emitted)
         result-views (validate-result-views! equation emitted result-storage
@@ -395,13 +395,16 @@
            {:actual (type call)}))
   (let [{:keys [program projections]}
         (emitted-program/validate-with-physical-results! (:program call))
-        checked (binding [*validated-boundary-projections* projections]
+        ;; A public validation's synchronous projection scope is mutable and invocation-local;
+        ;; the validator's sealed static evidence itself remains read-only.
+        local-projections (doto (java.util.IdentityHashMap.) (.putAll projections))
+        checked (binding [*validated-boundary-projections* local-projections]
                   (validate-call-against-program! call program nil))]
     ;; Every public validation starts with a fresh complete program check and projection index.
     ;; A synchronous enclosing rename may retain only facts from this successful check; mapper
     ;; callbacks never inherit that rename context and no index is stored in the returned call.
     (when *validated-boundary-projections*
-      (.putAll ^java.util.IdentityHashMap *validated-boundary-projections* projections))
+      (.putAll ^java.util.IdentityHashMap *validated-boundary-projections* local-projections))
     checked))
 
 (defn execution-order

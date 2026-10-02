@@ -116,6 +116,23 @@ preparation; invalid inputs and host exceptions cannot enter structural construc
 combined structured-control and actual local composition acceptance passes 54 tests / 378
 assertions. No template lookup or retained public staging authority is introduced by this split.
 
+A warm public Q4 preparation profile after this split resolves the compiler template in about
+10 microseconds, but LinkPlan construction still takes about 1.69 seconds. Fresh staging includes
+about 434 ms of program validation; structural call construction takes only about 2.2 ms. These
+shared-load observations rule out caching constructed calls as the principal fix. Target static
+proof reuse and complete source-free plan binding instead; inclusive profiling is not a speedup.
+
+The next prerequisite makes emitted-program physical-result evidence read-only and seals it to
+the exact in-process program/evidence objects. Copied/modified values and replacement metadata
+callbacks fail the owner check. Public program/call validators still independently validate;
+their mutable synchronous projection scopes are fresh copies, not the sealed index. No global
+cache or persistent artifact field is added, and no validation is skipped by this prerequisite.
+The seal is an internal structural-tamper contract, not security isolation against JVM reflection
+or private-Var mutation. Cache integration must additionally check compiler epoch and pipeline
+identity; object identity alone is not semantic reload invalidation.
+The focused structured-control and local device-composition suites pass 55 tests / 392 assertions,
+including mutation rejection through the projection map and its entry views.
+
 Then resume matched performance evidence, external training acceptance and the distributed/PDE
 milestones. This optimization does not complete the wider campaign or authorize schedule promotion.
 
