@@ -170,6 +170,14 @@ shape, role, scalar bit and wiring changes distinguish identities; cold/process-
 paths agree for the same artifact; nested composition works; incomplete builds and modified owners
 reject. Different host arrays and contents intentionally do not change this structural identity.
 Actual data attestation, full producer publication and independent restore matching remain open.
+
+An instantiated `Compiled` retains its original compiler-owned `Prepared` by reference and shares
+the existing exact-object seal. `execution-identity` can inspect either original owner; copying or
+associating fields, replacing the executable/boundary or substituting another Prepared declines.
+An independently validated copied Prepared may still execute, but does not acquire exact retained
+artifact provenance through instantiation. Inspection uses retained build/artifact evidence rather
+than the current compiler cache or build state. No identity hashing is added to instantiation or
+ordinary invocation. This remains structural evidence with `:attests-input-bytes? false`.
 A conservative exact execution/build identity must not be presented as target-neutral mathematical
 program equivalence.
 
