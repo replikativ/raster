@@ -1425,3 +1425,16 @@ claim; copied owners still fail closed. The contract is recorded once in
 [durable-numerical-state.md](durable-numerical-state.md). Artifact/composition/lease tests pass
 41 tests / 323 assertions in the existing REPL; pivotal review found no blocker. Actual resident
 byte snapshots, completed producer receipts and publication remain on the original campaign.
+
+### Offline resident-byte producer evidence — 2026-10-03
+
+The next explicit boundary snapshots actual post-transfer inputs and post-replay outputs under
+the existing ownership lock and output lease. It reuses bounded SHA-256 content hashing and the
+retained artifact identity; no second cache or ordinary-invocation readback is introduced. Mutable
+state chains only across uninterrupted same-owner epochs with matching actual bytes. Admission
+and fault tests cover refreshed defaults, device copies, NaN payloads, bounded ranges, externally
+owned sessions, asynchronous events, prologues and failed transfer/readback cleanup. Pivotal review
+required removing an unsupported host-byte-order label; raw receipts now explicitly retain opaque
+device-native representation. Focused content/artifact/composition/lease/native tests pass 51 tests
+/ 541 assertions in the retained capped REPL; full CI remains a landing prerequisite. Publication
+and cross-device codec/restore matching remain open.

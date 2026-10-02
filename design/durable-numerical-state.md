@@ -130,8 +130,8 @@ Reject missing/extra slots and opaque runtime handles. Reuse content addresses a
 parameter bytes are not folded into the template cache key.
 In particular, a caller-supplied content-address map is not an authenticated binding receipt. The
 runtime must join an exact node/view, verified source bytes or inherited device lineage, and a
-completed upload/D2D operation before claiming those bytes produced the result. Until that boundary
-exists, externally initialized programs cannot claim full producer attestation.
+completed upload/D2D operation before claiming those bytes produced the result. Structural
+inspection alone cannot claim full producer attestation for externally initialized programs.
 
 The synchronous linked-write boundary must also fail closed after a partially completed transfer:
 the destination and all overlapping views require explicit reinitialization. A no-copy self-write
@@ -169,7 +169,8 @@ The bound structure is implemented, not full producer certification. Its result 
 shape, role, scalar bit and wiring changes distinguish identities; cold/process-hit/persistent-load
 paths agree for the same artifact; nested composition works; incomplete builds and modified owners
 reject. Different host arrays and contents intentionally do not change this structural identity.
-Actual data attestation, full producer publication and independent restore matching remain open.
+Completed resident-byte inspection is described below; full producer publication and independent
+restore matching remain open.
 
 An instantiated `Compiled` retains its original compiler-owned `Prepared` by reference and shares
 the existing exact-object seal. `execution-identity` can inspect either original owner; copying or
@@ -180,6 +181,36 @@ than the current compiler cache or build state. No identity hashing is added to 
 ordinary invocation. This remains structural evidence with `:attests-input-bytes? false`.
 A conservative exact execution/build identity must not be presented as target-neutral mathematical
 program equivalence.
+
+### Offline completed resident-byte evidence
+
+`compiled/invoke-with-evidence` executes an original sealed `Compiled` under the existing linked
+lifetime lock. It hashes actual dense initialization-root bytes after all invocation writes and
+declared outputs plus mutated roots after successful synchronous replay. This covers refreshed
+host inputs and completed device copies, not mutable Prepared defaults or caller-supplied hashes.
+The content reader shares the existing SHA-256 implementation with a fixed 64-KiB staging bound;
+ordinary invocation adds no hashing or readback. Inspection is explicitly offline: downloading
+large weights remains expensive despite bounded working memory.
+
+The returned exact-owner `CompletedEvidence` pins output values until close. Dereferencing it
+returns historical metadata even after close; accessing its device outputs requires the live
+lease. Metadata records the retained program fingerprint, bound schedule descriptions, typed
+view extents, raw content addresses and optional parent fingerprint. Raw bytes are labeled
+`:device-native`, without an inferred byte order or canonical numerical codec. These receipts
+are not cross-device restore manifests, compiler-binary attestations or mathematical proofs.
+
+Admission requires an owned session and owned storage, retained initialization evidence, dense
+views, no record-time prologue and no registered asynchronous events. A mutable-state receipt
+names the previous same-owner receipt only when the owner epoch is uninterrupted and its
+actual pre-state equals the previous actual post-state. Stateless receipts have no parent.
+Unwitnessed replay, transfer, profiling, measurement or tuning breaks continuity. Pure input
+preflight declines preserve the previous head; failures after mutation clear it. A readback
+failure produces no receipt and releases the output lease, without pretending the successfully
+completed replay never occurred. Only the latest head is retained, not an ancestor object chain.
+
+This establishes a conservative completed-byte boundary inside linked ownership. Durable blob
+publication, verified codec matching, scalable selective inspection and tracking mutation through
+arbitrary raw-session access remain separate obligations on the original campaign.
 
 ## Konserve, mmap, LMDB and S3
 
