@@ -408,6 +408,9 @@ The combined public composition, native replay, linker and scientific suites pas
 assertions, including the existing no-upload generated-intermediate assertions; both local device
 availability gates were explicitly true. Pivotal review found no blocker in the conservative
 initializer proof, with the existing sealed-Prepared prevalidated boundary retained.
+The existing hardware-free public C-family composition test additionally checks certified
+write-only initializer removal (1 test / 10 assertions), so this positive optimization boundary
+is protected even when native device execution is skipped.
 
 ### Aggregate invocation projection audit — 2026-10-01
 

@@ -1080,7 +1080,27 @@
       (is (= {:hits 1 :misses 1 :misses-by-reason {:compulsory 1}
               :compilations 1 :failures 0
               :entries 1 :entries-by-compiler {:equation-first 1}}
-             (dissoc (compiled/compilation-cache-stats) :compile-nanos))))
+             (dissoc (compiled/compilation-cache-stats) :compile-nanos)))
+      (let [producer (compiled/lower #'c-family-effect-map!
+                                     [(float-array 8) (float-array (repeat 8 -317.0)) (long-array 8) 8]
+                                     {:compiler :equation-first :target cuda-target :dtype :float
+                                      :outputs '[left]})
+            consumer (prepare)
+            source-node (get-in producer [:out-tree 0 :node])
+            composite (compiled/compose
+                       {:id :write-only-initializer-elimination
+                        :components [{:id :producer :program producer} {:id :consumer :program consumer}]
+                        :connections [{:from [:producer :left] :to [:consumer :input]}]
+                        :outputs [{:key :result :from [:consumer :result]}]})
+            mapped (get-in composite [:lowering :certificate :node-mapping [:producer source-node]])]
+        (is (some? (get-in (compiled/plan producer) [:nodes source-node :source]))
+            "the standalone producer has a captured caller output initializer")
+        (is (contains? (get-in producer [:lowering :certificate :effect-evidence :initialization :complete-writes])
+                       source-node))
+        (is (not (contains? (get-in producer [:lowering :certificate :effect-evidence :initialization :reads])
+                            source-node)))
+        (is (nil? (get-in (compiled/plan composite) [:nodes mapped :source]))
+            "certified write-only connected outputs need no upload even without device execution")))
     (finally
       (compiled/clear-compilation-cache!))))
 
