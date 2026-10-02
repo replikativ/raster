@@ -3,13 +3,20 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
             [raster.compiler.ir.amr-plan :as amr]
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.numerical-state :as state]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.ode.finite-volume :as fv]
             [raster.linalg.sparse :as sparse]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]
-            [raster.gpu.link :as link]))
+            [raster.gpu.link :as link]
+            [raster.runtime.numerical-content :as content]
+            [raster.test-support.numerical-checkpoint :as checkpoint])
+  (:import [java.nio ByteBuffer ByteOrder]
+           [java.nio.file Files]))
 
 (defn- hierarchy
   ([] (hierarchy [{:offsets [2 2] :shape [4 4]}]))
@@ -333,7 +340,7 @@
   (if @ze/gpu-available? (run-remap-layouts :ze:0)
       (ze/gpu-skip! "resident-conservative-remap-level-zero")))
 
-(defn- run-post-remap-evolution [target source destination]
+(defn- prepare-post-remap-evolution [target source destination target-pairs]
   (let [A (remap-matrix (:cells source) (:cells destination))
         source-args (arguments source)
         ;; Poison the target field too: its contents must come from the resident remap,
@@ -348,27 +355,38 @@
                               [A (first source-args)
                                (double-array (repeat (count (:cells destination)) -317.0)) 1.0 0.0]
                               {:compiler :equation-first :target target :dtype :double :constants '[A]})
-        evolve-target (compiled/lower #'pair-step-into!
-                                      (into [(double-array (repeat (count (:cells destination)) Double/NaN))]
-                                            destination-args)
-                                      (assoc (dissoc options :donate) :outputs '[out]))
+        targets (mapv (fn [i]
+                        {:id (if (zero? i) :destination [:destination i])
+                         :program (compiled/lower #'pair-step-into!
+                                                  (into [(double-array (repeat (count (:cells destination)) Double/NaN))]
+                                                        destination-args)
+                                                  (assoc (dissoc options :donate) :outputs '[out]))})
+                      (range target-pairs))
+        components (into [{:id :source :program evolve-source} {:id :remap :program remap}] targets)
         prepared (with-redefs [gpu/alloc! (fn [& _] (throw (AssertionError. "composition allocated device storage")))]
                    (compiled/compose
                     {:id :heat/post-remap-evolution
-                     :components [{:id :source :program evolve-source}
-                                  {:id :remap :program remap}
-                                  {:id :destination :program evolve-target}]
+                     :components components
                      :mutable-shares [{:owner [:source :field] :borrowers [[:remap :x]]
                                        :output [:source :field']}]
-                     :connections [{:from [:remap :result] :to [:destination :field]}]
+                     :connections (into [{:from [:remap :result] :to [:destination :field]}]
+                                        (map (fn [[a b]] {:from [(:id a) :out] :to [(:id b) :field]})
+                                             (partition 2 1 targets)))
+                     :shares (when (> target-pairs 1)
+                               (mapv (fn [key] (mapv #(vector (:id %) key) targets))
+                                     [:left :right :conductance :offsets :indices :orientation :inverse-volume]))
                      :outputs [{:key :source :from [:source :field']}
-                               {:key :destination :from [:destination :out]}]}))
+                               {:key :destination :from [(:id (peek targets)) :out]}]}))]
+    {:prepared prepared :components components}))
+
+(defn- run-post-remap-evolution [target source destination]
+  (let [{:keys [prepared components]} (prepare-post-remap-evolution target source destination 1)
         plan (compiled/plan prepared)
         original (vec (initial (:cells source)))
         original-mass (mass original (:inverse-volume source))
         source-states (vec (take 7 (iterate #(reference-step % source 0.001) original)))]
-    (is (every? #(= 0 (get-in (compiled/plan %) [:attributes :driver-allocations]))
-                [evolve-source remap evolve-target]))
+    (is (every? #(= 0 (get-in (compiled/plan (:program %)) [:attributes :driver-allocations]))
+                components))
     (is (= 9 (reduce + (map #(count (get-in % [:call :steps])) (:instances plan)))))
     (is (not-any? #(contains? #{[:remap :x] [:destination :field]} (:key %)) (:in-tree prepared))
         "both resident consumers lose their host refresh slots")
@@ -398,3 +416,118 @@
 (deftest resident-post-remap-evolution-on-level-zero
   (if @ze/gpu-available? (run-post-remap-layouts :ze:0)
       (ze/gpu-skip! "resident-post-remap-evolution-level-zero")))
+
+(defn- layout-snapshot [captured geometry parents phase]
+  (let [shape [(count (:cells geometry))]
+        layout (fingerprint/fingerprint (:cells geometry))]
+    (state/certify
+     (state/manifest
+      {:id [:heat/partial-layout layout phase (:content captured)]
+       :parents parents :logical-coordinate {:phase phase}
+       :fields [(state/field
+                 {:id :temperature :value (av/tensor {:dtype :double :shape shape}) :chunk-shape shape
+                  :coordinate-space {:hierarchy :heat/partial :layout-fingerprint layout
+                                     :active-cells (:cells geometry) :centering :cell}
+                  :chunks [(state/chunk {:id [:temperature 0] :offsets [0] :shape shape
+                                         :logical-byte-length (:bytes captured)
+                                         :stored-byte-length (:bytes captured)
+                                         :content (:content captured)
+                                         :storage {:format :raw-array :byte-order :little-endian}})]})]
+       :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
+                            :compatibility-id "partial-layout-face-flux-f64-test-v1"}
+       ;; Explicit fixture provenance, not a production compiler-build identity or publication.
+       :provenance {:program-fingerprint "partial-layout-evolution-test-v1"}}))))
+
+(defn- host-capture [field]
+  (let [bytes (doto (ByteBuffer/allocate (* Double/BYTES (count field)))
+                (.order ByteOrder/LITTLE_ENDIAN))]
+    (doseq [value field] (.putDouble bytes (double value)))
+    (.flip bytes)
+    {:content (checkpoint/payload-address bytes) :bytes (.remaining bytes)}))
+
+(deftest regridded-state-lineage-retains-the-cell-order-not-just-extent
+  (let [[_ _ source destination] (remap-geometries)
+        field (initial (:cells source))
+        remapped (reference-remap (:cells source) (:cells destination) field)
+        parent (layout-snapshot (host-capture field) source [] :source)
+        child (layout-snapshot (host-capture remapped) destination
+                               [(get-in parent [:manifest :id])] :after-remap)
+        parent-space (get-in parent [:manifest :fields 0 :coordinate-space])
+        child-space (get-in child [:manifest :fields 0 :coordinate-space])]
+    (is (= (count (:cells source)) (count (:cells destination))))
+    (is (not= parent-space child-space))
+    (is (= [(get-in parent [:manifest :id])] (get-in child [:manifest :parents])))
+    (is (identical? parent (state/verify! parent)))
+    (is (identical? child (state/verify! child)))
+    (is (= :numerical-state-certificate
+           (try (state/verify! (assoc-in child [:manifest :fields 0 :coordinate-space] parent-space)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(defn- output-node [prepared key]
+  (:node (first (filter #(= key (:key %)) (:out-tree prepared)))))
+
+(defn- run-regridded-continuation [target]
+  (let [[_ _ source destination] (remap-geometries)
+        uninterrupted (:prepared (prepare-post-remap-evolution target source destination 3))
+        midpoint (:prepared (prepare-post-remap-evolution target source destination 1))
+        source-field (nth (iterate #(reference-step % source 0.001)
+                                  (vec (initial (:cells source)))) 2)
+        transferred (reference-remap (:cells source) (:cells destination) source-field)
+        expected (nth (iterate #(reference-step % destination 0.001) transferred) 6)
+        paths (checkpoint/temp-files [:source :destination])]
+    (try
+      (let [baseline (with-open [executable (link/instantiate! (compiled/plan uninterrupted))]
+                       (link/run! executable)
+                       (vec (link/download executable (output-node uninterrupted :destination))))
+            captured (with-open [executable (link/instantiate! (compiled/plan midpoint))]
+                       (link/run! executable)
+                       (into {} (for [[key geometry] [[:source source] [:destination destination]]]
+                                  [key (checkpoint/capture-f64!
+                                        (:session executable)
+                                        (link/node-view executable (output-node midpoint key))
+                                        (paths key) (count (:cells geometry)))])))
+            parent (layout-snapshot (:source captured) source [] :source-step-2)
+            child (layout-snapshot (:destination captured) destination
+                                   [(get-in parent [:manifest :id])] :target-step-2)
+            parent-chunk (get-in parent [:manifest :fields 0 :chunks 0])
+            child-chunk (get-in child [:manifest :fields 0 :chunks 0])
+            fresh-args (assoc (arguments destination) 0
+                              (double-array (repeat (count (:cells destination)) -997.0)))
+            fresh (compiled/lower #'pair-step! fresh-args
+                                  {:compiler :equation-first :target target :dtype :double :inline? true
+                                   :donate '[field]
+                                   :constants '[left right conductance offsets indices orientation inverse-volume]})
+            node (output-node fresh :field')]
+        (is (= 17 (reduce + (map #(count (get-in % [:call :steps]))
+                                 (:instances (compiled/plan uninterrupted))))))
+        (is (near? expected baseline))
+        (is (identical? parent (state/verify! parent)))
+        (is (identical? child (state/verify! child)))
+        (is (= (:cells destination) (get-in child [:manifest :fields 0 :coordinate-space :active-cells])))
+        ;; Both producer sessions and writable mappings are gone before either read lease opens.
+        (with-open [parent-lease (checkpoint/open-chunk-lease (paths :source) parent-chunk)
+                    child-lease (checkpoint/open-chunk-lease (paths :destination) child-chunk)]
+          (let [restored (assoc-in (compiled/plan fresh) [:nodes node :source]
+                                   (content/lease-segment child-lease))]
+            (with-open [executable (link/instantiate! restored)]
+              ;; Initialization is synchronous; no mapping is retained across replay.
+              (.close parent-lease)
+              (.close child-lease)
+              (is (and (content/lease-closed? parent-lease) (content/lease-closed? child-lease)))
+              (dotimes [_ 2] (link/run! executable))
+              (let [actual (vec (link/download executable node))
+                    raw-bits #(mapv (fn [value] (Double/doubleToRawLongBits (double value))) %)]
+                (is (= (raw-bits baseline) (raw-bits actual))
+                    "same-backend restart after changing layout matches uninterrupted resident evolution bit-for-bit")
+                (is (near? expected actual))
+                (is (< (Math/abs (- (mass (initial (:cells source)) (:inverse-volume source))
+                                    (mass actual (:inverse-volume destination)))) 1.0e-12)))))))
+      (finally (doseq [path (vals paths)] (Files/deleteIfExists path))))))
+
+(deftest opencl-regridded-state-resumes-from-addressed-bytes
+  (if @opencl/opencl-fp64-available? (run-regridded-continuation :ocl:0)
+      (opencl/opencl-skip! "regridded-state-mapped-byte-continuation-opencl")))
+
+(deftest level-zero-regridded-state-resumes-from-addressed-bytes
+  (if @ze/gpu-available? (run-regridded-continuation :ze:0)
+      (ze/gpu-skip! "regridded-state-mapped-byte-continuation-level-zero")))
