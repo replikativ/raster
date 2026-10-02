@@ -57,6 +57,12 @@ the remaining external training gates.
    tails. Scalar reductions retain their exact one-element resident representation. Invalid
    shape diagnostics propagate; unsupported proofs may decline. Public validations remain
    independent; redundant proofs may be shared only inside an exact synchronous construction scope.
+   Exact-owner static program evidence now reaches final synchronous construction, after the
+   projection callback. Concrete call and memory/effect checks remain fresh; public verification
+   stays independent. The October 2 affected suites pass 103 tests / 696 assertions, with both
+   local native backends available. Warm Q4 preparation is about 11.7 ms in one diagnostic,
+   not a controlled performance baseline. Continue auditing structured-call invariant completeness
+   separately; this deduplication does not certify arbitrary forged carry-plan/staging metadata.
 2. Select the next compiler migration from a reproduced public workload, using the compatibility
    ledger to distinguish stale entry-point accounting from an actual semantic/emission gap. Preserve
    the corresponding JVM path and independent numerical tests while retiring the migrated fallback.

@@ -1228,3 +1228,35 @@ boundaries, then perform matched execution/performance gates before vendor-devic
   claims with executable tests before starting another subsystem.
 - Changes in accepted source forms are documented; no silent changes to numeric association,
   array length, mutation, ownership or exception policies.
+
+### Final-construction static proof reuse — 2026-10-02
+
+A warm public Q4 preparation probe separates final validation from storage realization:
+`program-call/validate!` accounts for about 436 ms, while allocation/alias validation,
+bound access facts and initialization analysis together take less than 1 ms. Nine SOAC
+physical-result lookups total about 0.11 ms; caching those lookups would not address this cliff.
+Inclusive instrumentation overlaps and must not be summed.
+
+Final synchronous construction now accepts the same exact-owner emitted-program proof already
+used for staging/storage. A private identity scope is built only after the role/output projection
+callback returns. It names the exact program, not a fingerprint or structurally equal copy.
+Other programs validate independently. The internal call validator copies sealed physical
+projections into a fresh local scope and rechecks all existing concrete step/binding obligations,
+with no constructor exemptions. Final role, range, alias and ordered-initialization/effect checks
+remain fresh. No additional cache or retained call/plan field is introduced. One-argument public
+validation always rederives the complete program, including inside a retained construction scope.
+
+Focused owner/callback/mixed-program/tampering checks pass 3 tests / 53 assertions. Affected
+control, LinkPlan, composition/cache and native composition suites pass 103 / 696; both local
+OpenCL and Level Zero availability gates were true. Review found no blocker. A subsequent warm
+public Q4 diagnostic reports 11.69 ms total, 8.73 ms LinkPlan construction and a 17 microsecond
+compiler-template hit. These unmatched shared-load, power-save observations establish removal
+of repeated static derivation, not a controlled end-to-end model or kernel speedup.
+The public generated/serial Q4 canary at `[1,256,64]` also completes on each local backend,
+checking raw float-bit ggml agreement before and after two measured resident replays. Those
+minimal diagnostic samples do not establish stationarity or select a tuning winner.
+
+This preserves the current validation algebra; it does not strengthen every preexisting
+structured-loop carry-plan or top-level staging-metadata invariant. Whole source-free plan
+binding, persisted compiler-build/dependency evidence, external training migration and matched
+performance acceptance remain separate campaign obligations. No source semantics changed.

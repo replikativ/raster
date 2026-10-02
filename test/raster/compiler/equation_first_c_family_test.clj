@@ -69,8 +69,8 @@
               compilation @(:value entry)
               owner {:key key :entry entry}
               epoch (dispatch/compiler-definition-revision)]
-          (is (= 2 cold-checks) "cold preparation derives owner proof plus fresh final proof")
-          (is (= 1 warm-checks) "warm preparation keeps its independent final proof")
+          (is (= 1 cold-checks) "cold preparation derives the owner static program proof once")
+          (is (= 0 warm-checks) "warm construction reuses only that exact static program proof")
           (is (emitted-program/retained-validation?
                 (:emitted compilation) (#'compiled/owned-emitted-validation owner compilation)))
           (is (not (contains? compilation :emitted-validation))
@@ -91,6 +91,60 @@
             (is (nil? (#'compiled/owned-emitted-validation owner compilation))))
           (is (nil? (#'compiled/owned-emitted-validation owner (assoc compilation :stats {})))))))
     (finally (compiled/clear-compilation-cache!))))
+
+(deftest final-plan-static-proof-is-scoped-after-projection-and-by-program-identity
+  (let [source (ns-resolve 'raster.compiler.equation-first-c-family-test 'c-family-elementwise)
+        prepared (compiled/lower source [(float-array 8) 8]
+                                 {:compiler :equation-first :target cuda-target :dtype :float})
+        plan (get-in prepared [:lowering :plan])
+        instance (first (:instances plan))
+        call (:call instance)
+        evidence (emitted-program/validate-with-physical-results! (:program call))
+        original emitted-program/validate-with-physical-results!
+        checks (atom 0)
+        scope (ns-resolve 'raster.compiler.ir.link-plan '*retained-program-validations*)
+        input-node (get-in prepared [:in-tree 0 :node])
+        output-node (first (:outputs plan))
+        reason (fn [check value]
+                 (try (check value) nil
+                      (catch clojure.lang.ExceptionInfo error
+                        [(.getMessage error) (ex-data error)])))]
+    (with-redefs [emitted-program/validate-with-physical-results!
+                  (fn [program] (swap! checks inc) (original program))]
+      (let [result (link-plan/make-with-final-projection
+                    plan (fn [candidate]
+                           (is (nil? @scope) "projection callback cannot inherit static authority")
+                           (program-call/validate! call)
+                           {:plan candidate :projection :checked}) evidence)]
+        (is (= 1 @checks) "only the independent callback validation rederives the program")
+        (is (= :checked (:projection result)))
+        (is (= (:nodes plan) (get-in result [:plan :nodes])))
+        (is (not (contains? (:plan result) :retained-validation)))
+        (link-plan/validate! (:plan result))
+        (is (= 2 @checks) "later public plan validation independently checks the program"))
+      (reset! checks 0)
+      (let [other (assoc instance :id ::other
+                         :call (assoc call :program (with-meta (:program call) {:other true})))
+            mixed (assoc plan :instances [instance other])]
+        (link-plan/validate-with-effect-evidence! mixed evidence)
+        (is (= 1 @checks) "a structurally equal but different program validates independently")))
+    (doseq [[label invalid]
+            [[:roles (assoc-in plan [:instances 0 :roles (first (keys (:outputs call)))] :constant)]
+             [:range (assoc-in plan [:nodes output-node :view :shape] [1])]
+             [:aliases (assoc plan :aliases #{#{::missing output-node}})]
+             [:initialization (-> plan
+                                  (assoc-in [:nodes input-node :source] nil)
+                                  (assoc-in [:nodes input-node :role] :internal))]]]
+      (testing (name label)
+        (let [independent (reason link-plan/validate! invalid)]
+          (is (some? independent))
+          (is (= independent
+                 (reason #(link-plan/validate-with-effect-evidence! % evidence) invalid))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (link-plan/validate-with-effect-evidence!
+                  plan (with-meta evidence (assoc (meta evidence) :copied true)))))
+    (is (nil? @scope) "failed validation restores its construction scope")
+    (is (link-plan/link-plan? (link-plan/validate! plan)))))
 
 (deftest storage-projection-reuses-only-owned-static-evidence
   (compiled/clear-compilation-cache!)
@@ -979,19 +1033,24 @@
         opts {:compiler :equation-first :target cuda-target :dtype :float}
         original link-plan/validate-with-effect-evidence!
         validate-call! program-call/validate!
+        validate-retained-call! program-call/validate-with-retained-program!
         validate-boundary! emitted-equation/validate!
         lower-storage @#'invocation-link/lower-equation-storage
         checks (atom 0)
         call-checks (atom 0)
         boundary-checks (atom 0)
         prepared (with-redefs [link-plan/validate-with-effect-evidence!
-                               (fn [plan]
+                               (fn [& arguments]
                                  (swap! checks inc)
-                                 (original plan))
+                                 (apply original arguments))
                                program-call/validate!
                                (fn [call]
                                  (swap! call-checks inc)
                                  (validate-call! call))
+                               program-call/validate-with-retained-program!
+                               (fn [call evidence]
+                                 (swap! call-checks inc)
+                                 (validate-retained-call! call evidence))
                                invocation-link/lower-equation-storage
                                (fn [& arguments]
                                  (with-redefs [emitted-equation/validate!

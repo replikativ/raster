@@ -11,6 +11,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -38,6 +39,7 @@
            [source-dialect target-dialect plan-id target step-facts initialization])
 
 (def ^:dynamic ^:private *validated-program-instances* nil)
+(def ^:dynamic ^:private *retained-program-validations* nil)
 
 (def ^:private effect-evidence-seal-token (Object.))
 
@@ -354,7 +356,12 @@
                     {:reason :program-link-instance-type
                      :instance instance :actual (type instance)})))
   (let [{:keys [id call roles attributes]} instance
-        call (program-call/validate! call)
+        validation (when *retained-program-validations*
+                     (.get ^java.util.IdentityHashMap *retained-program-validations*
+                           (:program call)))
+        call (if validation
+               (program-call/validate-with-retained-program! call validation)
+               (program-call/validate! call))
         buffer-values (set (keys (:buffers call)))]
     (when (nil? id)
       (throw (ex-info "a program link instance requires a stable identity"
@@ -1242,17 +1249,26 @@
 
 (defn ^:no-doc validate-with-effect-evidence!
   "Validate a LinkPlan and retain the exact ordered effect facts derived from its executable ABIs.
-   The evidence is immutable compiler data: it allocates no storage and contacts no driver."
-  [plan]
-  (binding [*validated-program-instances* (java.util.IdentityHashMap.)]
-    (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
-          step-facts (vec (instance-access-facts plan))
-          initialization (analyze-effects! plan step-facts)]
-      {:plan plan
-       :effect-evidence
-       (seal-effect-evidence
-        plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
-                                   step-facts initialization))})))
+   The evidence is immutable compiler data: it allocates no storage and contacts no driver.
+   The second arity is an internal exact-owner static-program capability. Public one-argument
+   validation always independently checks complete programs, even inside a retained scope."
+  ([plan] (validate-with-effect-evidence! plan nil))
+  ([plan retained-validation]
+   (let [validations (java.util.IdentityHashMap.)]
+     (when retained-validation
+       (let [program (:program retained-validation)]
+         (emitted-program/checked-retained-validation! program retained-validation)
+         (.put validations program retained-validation)))
+     (binding [*validated-program-instances* (java.util.IdentityHashMap.)
+               *retained-program-validations* validations]
+       (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
+             step-facts (vec (instance-access-facts plan))
+             initialization (analyze-effects! plan step-facts)]
+         {:plan plan
+          :effect-evidence
+          (seal-effect-evidence
+           plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
+                                     step-facts initialization))})))))
 
 (defn ^:no-doc validate-with-certified-effect-facts!
   "Validate plan structure and derive a new effect witness from already certified step facts.
@@ -1393,11 +1409,13 @@
 
    The projection is synchronous and its candidate must not escape: only the validated final plan
    and projection metadata are returned. This is for callers whose public roles or escaped outputs
-   are known only after storage identities have been normalized."
-  [request project]
-  (let [{:keys [plan projection]} (project (normalize-plan request))
-        {:keys [plan effect-evidence]} (validate-with-effect-evidence! plan)]
-    {:plan plan :effect-evidence effect-evidence :projection projection}))
+   are known only after storage identities have been normalized. Internal static evidence is scoped
+   only to final validation, never to the projection callback or its returned metadata."
+  ([request project] (make-with-final-projection request project nil))
+  ([request project retained-validation]
+   (let [{:keys [plan projection]} (project (normalize-plan request))
+         {:keys [plan effect-evidence]} (validate-with-effect-evidence! plan retained-validation)]
+     {:plan plan :effect-evidence effect-evidence :projection projection})))
 
 (defn ^:no-doc make-with-certified-effect-facts
   "Construct a LinkPlan by composing step facts from immediately verified component evidence."
