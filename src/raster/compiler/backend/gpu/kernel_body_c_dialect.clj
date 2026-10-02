@@ -170,6 +170,17 @@
   (if (opencl? dialect)
     (str (when uses-half? "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n")
          (when uses-double? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+         ;; Materialize the source precision before narrowing. Intel's native optimizer can
+         ;; otherwise replace double division followed by convert_float_rte with multiplication
+         ;; by a rounded float reciprocal, even without fast-math options. A volatile private
+         ;; value prevents that contraction without disabling optimization for the whole kernel.
+         (when uses-double?
+           (str "#ifndef RSTR_NARROW_F64_F32_RTE\n"
+                "#define RSTR_NARROW_F64_F32_RTE\n"
+                "inline float rstr_narrow_f64_f32_rte(double value) {\n"
+                "  volatile double materialized = value;\n"
+                "  return convert_float_rte(materialized);\n"
+                "}\n#endif\n"))
          (when uses-subgroups?
            (str "#if defined(cl_khr_subgroups)\n"
                 "#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n"

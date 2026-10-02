@@ -12,8 +12,10 @@
             [raster.dl.attention-reference :as attention-reference]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.par :as par]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.link :as link]
             [raster.gpu.core :as gpu]
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.device-probe :as opencl]
@@ -351,6 +353,29 @@
           (is (< (maxerr yref (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
+(deftest public-double-division-narrows-only-after-double-arithmetic
+  (doseq [target [:ze:0 :ocl:0]]
+    (if-not (case target :ze:0 @gp/gpu-available? :ocl:0 @opencl/opencl-available?)
+      (case target
+        :ze:0 (gp/gpu-skip! "public Double division before Float narrowing")
+        :ocl:0 (opencl/opencl-skip! "public Double division before Float narrowing"))
+      (let [input (float-array [0.0 -0.0 0.49460068 -0.49460068 1.0e-30 Float/MAX_VALUE])
+            output (float-array (alength input))
+            prepared (compiled/lower
+                      #'checked-casts/double-divide-to-float!
+                      [input output (long (alength input))]
+                      {:compiler :equation-first :target target :dtype :float
+                       :outputs '[output] :roles '{output :output}})
+            live (compiled/instantiate! prepared)]
+        (try
+          (doseq [values [input (float-array (reverse input))]]
+            (link/upload! (:executable live) (:node (first (:out-tree live)))
+                          (float-array (repeat (alength input) Float/NaN)))
+            (let [expected (mapv #(Float/floatToRawIntBits (float (/ (double %) 127.0))) values)
+                  actual (value/->host (:output (live {:input values})))]
+              (is (= expected (mapv #(Float/floatToRawIntBits %) actual)))))
+          (finally (compiled/close! live)))))))
+
 (deftest public-q8k-quantization-and-q4k-projection-compose-resident
   (doseq [target [:ze:0 :ocl:0]]
     (if-not (case target
@@ -368,15 +393,6 @@
             xs (float-array (* nrows (quot padded-in 256)))
             bsums (int-array (* nrows (quot padded-in 32)))
             y (float-array (* nrows out))
-            expected (float-array (* nrows out))
-            _ (dotimes [row nrows]
-                (let [padded (float-array padded-in)
-                      row-output (float-array out)]
-                  (System/arraycopy x (* row width) padded 0 width)
-                  (let [{:keys [xq xs bsums]} (q/quantize-act-q8k padded padded-in q/q4-K)]
-                    (qk/qmatmul-q4k-composable!
-                     xq xs bsums wq da db aq bq row-output padded-in out 0 out))
-                  (System/arraycopy row-output 0 expected (* row out) out)))
             opts {:compiler :equation-first :target target :dtype :float}
             quant (compiled/lower
                    #'qk/quant-act-q8k-cooperative-padded-rows-gpu!
@@ -412,10 +428,53 @@
           (is (= producer consumer) (str key " has one resident allocation"))
           (is (nil? (get-in plan [:nodes producer :source]))
               (str key " is not re-uploaded between programs")))
-        (let [artifact (compiled/instantiate! prepared)]
+        (let [artifact (compiled/instantiate! prepared)
+              resident (:executable artifact)
+              quant-nodes (into {}
+                                (for [entry (:out-tree quant)]
+                                  [(:key entry) (get mapping [:quant (:node entry)])]))
+              output-node (:node (first (:out-tree artifact)))]
           (try
-            (let [result (artifact {[:quant :x] x})]
-              (is (< (maxerr expected (value/->host (:y result))) 1e-3)))
+            ;; A single successful call cannot establish that connected resident leaves are
+            ;; refreshed. Reuse the same binding with changed input, including a zero row
+            ;; whose packed bytes and sums must overwrite the preceding replay's values.
+            (doseq [input [x (gen (* nrows width) 212)
+                           (let [input (gen (* nrows width) 213)]
+                             (java.util.Arrays/fill input 0 width (float 0.0))
+                             input)]]
+              (let [expected-xp (int-array (alength xp))
+                    expected-xs (float-array (alength xs))
+                    expected-bsums (int-array (alength bsums))
+                    expected-y (float-array (alength y))]
+                (dotimes [row nrows]
+                  (let [padded (float-array padded-in)
+                        row-output (float-array out)]
+                    (System/arraycopy input (* row width) padded 0 width)
+                    (let [{:keys [xq xs bsums]} (q/quantize-act-q8k padded padded-in q/q4-K)
+                          packed (pack-i8 xq)]
+                      (System/arraycopy packed 0 expected-xp (* row (quot padded-in 4))
+                                        (alength packed))
+                      (System/arraycopy xs 0 expected-xs (* row (quot padded-in 256))
+                                        (alength xs))
+                      (System/arraycopy bsums 0 expected-bsums (* row (quot padded-in 32))
+                                        (alength bsums))
+                      (qk/qmatmul-q4k-composable!
+                       xq xs bsums wq da db aq bq row-output padded-in out 0 out))
+                    (System/arraycopy row-output 0 expected-y (* row out) out)))
+                (doseq [[key poison] [[:xp (int-array (repeat (alength xp) 0x55555555))]
+                                      [:xs (float-array (repeat (alength xs) Float/NaN))]
+                                      [:bsums (int-array (repeat (alength bsums) Integer/MIN_VALUE))]]]
+                  (link/upload! resident (get quant-nodes key) poison))
+                (link/upload! resident output-node
+                              (float-array (repeat (alength y) Float/NaN)))
+                (let [result (artifact {[:quant :x] input})]
+                  (is (= (vec expected-xp)
+                         (vec (link/download resident (:xp quant-nodes)))))
+                  (is (= (vec expected-xs)
+                         (vec (link/download resident (:xs quant-nodes)))))
+                  (is (= (vec expected-bsums)
+                         (vec (link/download resident (:bsums quant-nodes)))))
+                  (is (< (maxerr expected-y (value/->host (:y result))) 1e-3)))))
             (finally (compiled/close! artifact))))))))
 
 (deftest q4k-public-abi-product-runs-as-one-cooperative-compiled-kernel

@@ -4,6 +4,12 @@
             [raster.core :refer [deftm]]
             [raster.par]))
 
+(deftm double-divide-to-float!
+  "Retain Double arithmetic until the explicit Float materialization boundary."
+  [input :- (Array float) output :- (Array float) n :- Long] :- (Array float)
+  (raster.par/map! output index n float
+                   (float (/ (double (raster.arrays/aget input index)) 127.0))))
+
 (deftm narrow-rows!
   [input :- (Array long) output :- (Array int) n :- Long] :- (Array int)
   (raster.par/map! output index n int
