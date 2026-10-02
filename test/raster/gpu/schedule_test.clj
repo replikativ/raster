@@ -16,6 +16,16 @@
    :machine-lanes 8192 :subgroup-size 16 :grf-bytes-per-lane 256
    :max-workgroup-size 1024})
 
+(deftest override-normalization-preserves-policy-and-invalid-inputs
+  (is (nil? (sched/normalize-override nil)))
+  (is (= {:precision :f32-scalar :unknown :retained}
+         (sched/normalize-override {:gemm-precision :f32-scalar
+                                   :meta {:ignored true} :unknown :retained})))
+  (is (= {:gemm-precision nil} (sched/normalize-override {:gemm-precision nil})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (sched/normalize-override {:gemm-precision :mixed-f16-f32
+                                          :precision :f32-scalar}))))
+
 (deftest compilation-policy-has-one-precedence-and-feasibility-boundary
   (is (= :mixed-f16-f32 (:precision (sched/compilation-schedule arc-desc {}))))
   (is (= :f32-scalar

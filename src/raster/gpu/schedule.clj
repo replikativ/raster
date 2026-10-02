@@ -115,6 +115,22 @@
            (= (count matrix-tiles) (count (distinct matrix-tiles)))
            (every? (set (hw/gemm-tile-candidates desc)) matrix-tiles))))
 
+(defn normalize-override
+  "Canonicalize existing schedule sugar without deriving machine defaults or changing pins.
+   Shared by resolution and compilation-template identity. Conflicts still fail; user metadata
+   remains ignored, exactly as in schedule resolution. This does not equate default and pinned
+   policies or erase unknown keys before validation."
+  [override]
+  (when-not (nil? override)
+    (let [gp (:gemm-precision override)]
+      (when (and gp (:precision override) (not= gp (:precision override)))
+        (throw (ex-info (str "schedule/resolve: conflicting :gemm-precision " gp
+                             " and :precision " (:precision override)
+                             " — pass one (prefer :precision; :gemm-precision is deprecated sugar)")
+                        {:gemm-precision gp :precision (:precision override)})))
+      (cond-> (dissoc override :meta)
+        gp (-> (dissoc :gemm-precision) (assoc :precision gp))))))
+
 (defn resolve
   "Stage 2: deep-merge a user `override` schedule onto the derived default, recording the pinned
    top-level keys in :meta :overrides. `:gemm-precision` is deprecated sugar for `:precision`.
@@ -124,14 +140,7 @@
   [derived override]
   (if (nil? override)
     derived
-    (let [gp (:gemm-precision override)
-          _ (when (and gp (:precision override) (not= gp (:precision override)))
-              (throw (ex-info (str "schedule/resolve: conflicting :gemm-precision " gp
-                                   " and :precision " (:precision override)
-                                   " — pass one (prefer :precision; :gemm-precision is deprecated sugar)")
-                              {:gemm-precision gp :precision (:precision override)})))
-          override  (cond-> (dissoc override :meta)   ;; user :meta never clobbers machine-params
-                      gp (-> (dissoc :gemm-precision) (assoc :precision gp)))
+    (let [override (normalize-override override)
           pinned    (set (keys override))
           merged    (deep-merge derived override)]
       (update-in merged [:meta :overrides] (fnil into #{}) pinned))))

@@ -341,6 +341,27 @@
         (is (= 2 @calls)
             "copying one sealed component makes the whole public composition verify independently")))))
 
+(deftest descriptor-cache-uses-the-shared-schedule-alias-normalization
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [calls (atom []) args [(float-array 16) (float-array 16) 16]
+          base {:target :ze:0 :constants '[w]}]
+      (with-redefs [pipeline/compile-gpu-program
+                    (fn [& arguments] (swap! calls conj arguments) (descriptor))]
+        (doseq [schedule [{:gemm-precision :f32-scalar} {:precision :f32-scalar}]]
+          (compiled/lower #'component args (assoc base :schedule schedule)))
+        (is (= 1 (count @calls)))
+        (is (= {:precision :f32-scalar}
+               (:schedule (apply hash-map (drop 2 (first @calls))))))
+        (compiled/lower #'component args (assoc base :schedule {:precision :mixed-f16-f32}))
+        (is (= 2 (count @calls)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (compiled/lower #'component args
+                                     (assoc base :schedule {:gemm-precision :mixed-f16-f32
+                                                            :precision :f32-scalar}))))
+        (is (= 2 (count @calls)))))
+    (finally (compiled/clear-compilation-cache!))))
+
 (deftest repeated-lowerings-share-only-the-immutable-compilation-template
   (compiled/clear-compilation-cache!)
   (try
