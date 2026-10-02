@@ -14,6 +14,7 @@
   (:refer-clojure :exclude [chunk])
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.validate :refer [fail! exact-keys! non-blank-string? unique-by!]]))
 
 (def schema-version 1)
@@ -286,6 +287,9 @@
     (when-not (map? attributes)
       (fail! "numerical state attributes must be a map"
              :numerical-state-attributes {:attributes attributes})))
+  ;; The durable IR must be serializable pure data even inside extension metadata, not a
+  ;; hidden reference to an arena, callback, mutable host array or driver object.
+  (semantic-fingerprint/canonical-bytes candidate)
   candidate)
 
 (defn- derive-certificate
@@ -322,7 +326,72 @@
     (when-not (certificate? certificate)
       (fail! "numerical state certificate has the wrong type"
              :numerical-state-certificate-type {:actual (type certificate)}))
-    (when-not (= expected certificate)
+    (when-not (semantic-fingerprint/equivalent? expected certificate)
       (fail! "numerical state certificate does not match its manifest"
              :numerical-state-certificate {:expected expected :actual certificate}))
+    certified))
+
+(defn restore-contract
+  "Validate a caller's expected semantic state boundary, independently of checkpoint bytes.
+
+   Fields name target AbstractValues and coordinate spaces. The complete field set, logical
+   coordinate, numerical contract and producer provenance must agree; this conservative policy
+   introduces no implicit migration or numerical-equivalence claims. Chunk partition, content,
+   storage tier, placement and ownership are not restore semantics. The caller must derive this
+   expectation from the intended continuation, not blindly copy the incoming manifest."
+  [{:keys [fields logical-coordinate numerical-contract provenance] :as contract}]
+  (when-not (map? contract)
+    (fail! "restore contract must be a map" :numerical-state-restore-contract {}))
+  (exact-keys! "restore contract" :numerical-state-restore-contract-fields contract
+               #{:fields :logical-coordinate :numerical-contract :provenance})
+  (when-not (and (vector? fields) (seq fields) (every? map? fields))
+    (fail! "restore contract requires a complete non-empty target field vector"
+           :numerical-state-restore-fields {}))
+  (unique-by! "restore fields" :numerical-state-restore-field-identities :id fields)
+  (doseq [{:keys [id value coordinate-space]} fields]
+    (when (nil? id)
+      (fail! "restore field requires an identity" :numerical-state-field-id {}))
+    (abstract-value/validate! value)
+    (when-not (and (= :tensor (:kind value)) (dtype/known? (:dtype value)))
+      (fail! "restore field requires a tensor with a compiler-known dtype"
+             :numerical-state-restore-field-value {:field id}))
+    (concrete-shape! id value)
+    (when-not (map? coordinate-space)
+      (fail! "restore field requires an explicit coordinate space"
+             :numerical-state-field-coordinate-space {:field id})))
+  (when-not (map? logical-coordinate)
+    (fail! "restore requires an explicit expected logical coordinate"
+           :numerical-state-logical-coordinate {}))
+  (validate-numerical-contract! numerical-contract)
+  (validate-provenance! provenance)
+  (let [contract (assoc contract :fields (mapv #(select-keys % [:id :value :coordinate-space]) fields))]
+    (semantic-fingerprint/canonical-bytes contract)
+    contract))
+
+(defn- restore-field-contracts [fields]
+  (into {}
+        (map (fn [{:keys [id value coordinate-space]}]
+               [id {:storage (abstract-value/storage-contract value)
+                    :shape (mapv bigint (:shape value)) :coordinate-space coordinate-space}])) fields))
+
+(defn verify-restore!
+  "Verify the snapshot and require its semantics to match an independently supplied target.
+
+   Valid bytes with a valid coverage certificate may still have the wrong cell order, physical
+   coordinates, timestep, numeric policy or producing program. This check must precede opening
+   leases/uploading bytes. Byte/digest verification and decoding the stored format/byte order
+   into the requested logical storage remain separate runtime obligations.
+   Returns the certified state unchanged; no authority token or migration is produced."
+  [certified expected]
+  (verify! certified)
+  (let [expected (restore-contract expected)
+        manifest (:manifest certified)
+        actual (assoc (select-keys manifest [:logical-coordinate :numerical-contract :provenance])
+                      :fields (restore-field-contracts (:fields manifest)))
+        expected (update expected :fields restore-field-contracts)]
+    (doseq [facet [:fields :logical-coordinate :numerical-contract :provenance]]
+      (when-not (semantic-fingerprint/equivalent? (get expected facet) (get actual facet))
+        (fail! "numerical snapshot does not match the intended restore boundary"
+               :numerical-state-restore-incompatible
+               {:facet facet :expected (get expected facet) :actual (get actual facet)})))
     certified))

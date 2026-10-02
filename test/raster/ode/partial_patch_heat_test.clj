@@ -436,26 +436,34 @@
   (if @ze/gpu-available? (run-post-remap-layouts :ze:0)
       (ze/gpu-skip! "resident-post-remap-evolution-level-zero")))
 
-(defn- layout-snapshot [captured geometry parents phase]
+(defn- layout-restore-contract [geometry phase]
   (let [shape [(count (:cells geometry))]
         layout (fingerprint/fingerprint (:cells geometry))]
+    (state/restore-contract
+     {:logical-coordinate {:phase phase}
+      :fields [{:id :temperature :value (av/tensor {:dtype :double :shape shape})
+                :coordinate-space {:hierarchy :heat/partial :layout-fingerprint layout
+                                   :active-cells (:cells geometry) :centering :cell}}]
+      :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
+                           :compatibility-id "partial-layout-face-flux-f64-test-v1"}
+      ;; Explicit fixture provenance, not a production compiler-build identity or publication.
+      :provenance {:program-fingerprint "partial-layout-evolution-test-v1"}})))
+
+(defn- layout-snapshot [captured geometry parents phase]
+  (let [shape [(count (:cells geometry))]
+        layout (fingerprint/fingerprint (:cells geometry))
+        contract (layout-restore-contract geometry phase)]
     (state/certify
      (state/manifest
-      {:id [:heat/partial-layout layout phase (:content captured)]
-       :parents parents :logical-coordinate {:phase phase}
+      (assoc contract
+       :id [:heat/partial-layout layout phase (:content captured)] :parents parents
        :fields [(state/field
-                 {:id :temperature :value (av/tensor {:dtype :double :shape shape}) :chunk-shape shape
-                  :coordinate-space {:hierarchy :heat/partial :layout-fingerprint layout
-                                     :active-cells (:cells geometry) :centering :cell}
+                 (assoc (first (:fields contract)) :chunk-shape shape
                   :chunks [(state/chunk {:id [:temperature 0] :offsets [0] :shape shape
                                          :logical-byte-length (:bytes captured)
                                          :stored-byte-length (:bytes captured)
                                          :content (:content captured)
-                                         :storage {:format :raw-array :byte-order :little-endian}})]})]
-       :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
-                            :compatibility-id "partial-layout-face-flux-f64-test-v1"}
-       ;; Explicit fixture provenance, not a production compiler-build identity or publication.
-       :provenance {:program-fingerprint "partial-layout-evolution-test-v1"}}))))
+                                         :storage {:format :raw-array :byte-order :little-endian}})]))])))))
 
 (defn- host-capture [field]
   (let [bytes (doto (ByteBuffer/allocate (* Double/BYTES (count field)))
@@ -478,6 +486,11 @@
     (is (= [(get-in parent [:manifest :id])] (get-in child [:manifest :parents])))
     (is (identical? parent (state/verify! parent)))
     (is (identical? child (state/verify! child)))
+    (is (identical? child (state/verify-restore! child (layout-restore-contract destination :after-remap))))
+    (let [error (try (state/verify-restore! child (layout-restore-contract source :after-remap)) nil
+                     (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+      (is (= :numerical-state-restore-incompatible (:reason error)))
+      (is (= :fields (:facet error)) "same extent and valid bytes do not prove cell-order compatibility"))
     (is (= :numerical-state-certificate
            (try (state/verify! (assoc-in child [:manifest :fields 0 :coordinate-space] parent-space)) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
@@ -523,6 +536,12 @@
         (is (identical? parent (state/verify! parent)))
         (is (identical? child (state/verify! child)))
         (is (= (:cells destination) (get-in child [:manifest :fields 0 :coordinate-space :active-cells])))
+        ;; Target geometry and phase come from the intended continuation, not the incoming bytes.
+        (state/verify-restore! parent (layout-restore-contract source :source-step-2))
+        (state/verify-restore! child (layout-restore-contract destination :target-step-2))
+        (is (= :numerical-state-restore-incompatible
+               (try (state/verify-restore! child (layout-restore-contract source :target-step-2)) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
         ;; Both producer sessions and writable mappings are gone before either read lease opens.
         (with-open [parent-lease (checkpoint/open-chunk-lease (paths :source) parent-chunk)
                     child-lease (checkpoint/open-chunk-lease (paths :destination) child-chunk)]

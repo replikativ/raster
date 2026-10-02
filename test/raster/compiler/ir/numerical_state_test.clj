@@ -173,3 +173,86 @@
                            :logical-coordinate {:step 48 :branch :higher-viscosity})))]
     (is (= reused (get-in certified [:certificate :fields 0 :chunks 0 :content])))
     (is (= (content 20) (get-in certified [:certificate :fields 0 :chunks 1 :content])))))
+
+(defn- expected-restore [fields]
+  (state/restore-contract
+   {:fields fields :logical-coordinate {:step 40 :time-seconds 10.0 :stage :accepted}
+    :numerical-contract {:mode :ieee-mixed-precision :determinism :reproducible-order
+                         :compatibility-id "shallow-water-v3:f32-storage:f32-accumulate"}
+    :provenance {:program-fingerprint "sha256:compiler-and-solver-fingerprint"
+                 :parameters {:cfl 0.45}}}))
+
+(deftest restore-compares-the-target-not-only-the-snapshots-own-certificate
+  (let [target (expected-restore [(temperature-field)])
+        changes [[[:fields 0 :coordinate-space :axes 0 :origin] 1.0 :fields]
+                 [[:logical-coordinate :step] 41 :logical-coordinate]
+                 [[:numerical-contract :compatibility-id] "different-solver" :numerical-contract]
+                 [[:numerical-contract :determinism] :nondeterministic :numerical-contract]
+                 [[:provenance :program-fingerprint] "different-program" :provenance]
+                 [[:provenance :parameters :cfl] 0.9 :provenance]]]
+    (doseq [[path value facet] changes]
+      (let [incoming (state/certify (assoc-in (checkpoint) path value))
+            error (thrown-data #(state/verify-restore! incoming target))]
+        (is (identical? incoming (state/verify! incoming)) "incoming certificate is valid on its own")
+        (is (= :numerical-state-restore-incompatible (:reason error)))
+        (is (= facet (:facet error)))))
+    (let [incoming (state/certify (checkpoint))]
+      (is (identical? incoming (state/verify-restore! incoming target)))
+      (doseq [changed [(assoc-in target [:fields 0 :id] :velocity)
+                       (assoc-in target [:fields 0 :value :shape] [4 5])
+                       (assoc-in target [:fields 0 :value :dtype] :double)
+                       (assoc-in target [:fields 0 :value :logical-layout] {:order :column-major})
+                       (assoc-in target [:fields 0 :value :representation] {:kind :quantized :scheme :q8})]]
+        (is (= :numerical-state-restore-incompatible
+               (:reason (thrown-data #(state/verify-restore! incoming changed)))))))))
+
+(deftest restore-storage-placement-partition-and-field-order-are-not-semantics
+  (let [temperature (temperature-field)
+        velocity (assoc temperature :id :velocity)
+        one-chunk (assoc temperature :chunk-shape [5 4]
+                         :chunks [(chunk :t-all [0 0] [5 4] 80 96 99)])
+        incoming (state/certify (assoc (checkpoint [one-chunk velocity])
+                                      :id :other-checkpoint :parents [] :attributes {:host :another-node}))
+        target (expected-restore
+                [(update velocity :value assoc :ownership :borrowed :memory-space :device
+                         :placement {:device :other-gpu} :sharding {:kind :replicated})
+                 (update temperature :value assoc :shape [(int 5) (int 4)])])]
+    (is (identical? incoming (state/verify-restore! incoming target)))
+    (is (= :numerical-state-restore-incompatible
+           (:reason (thrown-data #(state/verify-restore! incoming (expected-restore [temperature]))))))))
+
+(deftest restore-contract-is-explicit-and-rechecks-the-certificate
+  (let [target (expected-restore [(temperature-field)])
+        incoming (state/certify (checkpoint))]
+    (is (= :numerical-state-certificate
+           (:reason (thrown-data #(state/verify-restore!
+                                  (assoc-in incoming [:manifest :logical-coordinate :step] 41) target)))))
+    (doseq [invalid [(dissoc target :logical-coordinate) (assoc target :fields [])
+                     (update target :fields #(conj % (first %)))
+                     (assoc target :allow-any-producer true)]]
+      (is (thrown? clojure.lang.ExceptionInfo (state/restore-contract invalid))))
+    (let [negative-zero (state/certify (assoc-in (checkpoint) [:provenance :parameters :offset] -0.0))
+          positive-target (assoc-in target [:provenance :parameters :offset] 0.0)]
+      (is (= :numerical-state-restore-incompatible
+             (:reason (thrown-data #(state/verify-restore! negative-zero positive-target))))))))
+
+(deftest numerical-certificates-retain-scalar-bits-and-require-pure-metadata
+  (let [negative-zero (state/certify (assoc-in (checkpoint) [:provenance :parameters :offset] -0.0))]
+    (is (= :numerical-state-certificate
+           (:reason (thrown-data #(state/verify!
+                                  (assoc-in negative-zero [:manifest :provenance :parameters :offset] 0.0)))))))
+  (let [nan #(Double/longBitsToDouble (long %))
+        bits 0x7ff8000000000001
+        certified (state/certify (assoc-in (checkpoint) [:provenance :parameters :offset] (nan bits)))
+        independently-copied (assoc-in certified [:certificate :provenance :parameters :offset] (nan bits))]
+    (is (identical? independently-copied (state/verify! independently-copied)))
+    (is (= :numerical-state-certificate
+           (:reason (thrown-data #(state/verify!
+                                  (assoc-in certified [:certificate :provenance :parameters :offset]
+                                            (nan (inc bits)))))))))
+  (is (= :semantic-fingerprint-unsupported
+         (:reason (thrown-data #(state/certify (assoc-in (checkpoint) [:attributes :runtime] (atom 1)))))))
+  (is (= :semantic-fingerprint-unsupported
+         (:reason (thrown-data #(state/restore-contract
+                                (assoc-in (expected-restore [(temperature-field)])
+                                          [:provenance :callback] (fn [] nil))))))))

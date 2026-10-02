@@ -47,8 +47,14 @@ constructor output and adds no certification or ownership authority. Production 
 remap now uses exact normalized geometry, an overlap sweep and the existing FP64 CSR operator;
 different finest lattices are covered by independent rational-overlap oracles. The affected
 transfer/native evolution/remap/restart suite passes 16 tests / 375 assertions. Device patch packing,
-scalable hierarchy validation, semantic restore compatibility/publication, subcycling/reflux and general-rank
+scalable hierarchy validation, compiler-derived provenance/publication, subcycling/reflux and general-rank
 numerical providers remain open; the campaign is not complete.
+
+The strict semantic restore boundary now checks the independently supplied target field/layout,
+logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
+verification also rejects opaque metadata and signed-zero drift. Affected state/native restart,
+lease and AMR checks pass 39 tests / 450 assertions. This matches declared contracts, not omitted
+application semantics or mathematical equivalence; production producer evidence remains open.
 
 External source audit refreshed on 2026-09-30: authoritative pretrained-rstr main
 `98bad4d3517ec05a3c495f019c80d8c553db02af` declares Raster 0.2.922 and uses the public
