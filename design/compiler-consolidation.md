@@ -1457,8 +1457,11 @@ The next typed-manifest seam now has generated probe machinery: two asymmetric f
 per canonical dtype, verified KernelBody stores, common OpenCL/CUDA/HIP artifact emission with
 compilation requirements retained, and independent explicit byte-pattern classification. All six
 types have real local OpenCL and Level Zero byte readbacks and resource cleanup checks. Focused
-oracles: 5 tests / 200 assertions, zero failures/errors; no native skip on this machine. The new
+oracles: 6 tests / 207 assertions, zero failures/errors; no native skip on this machine. The new
 native namespace is selected by the existing OpenCL CI gate; all six sources join CUDA/HIP fixtures.
+Optional Level Zero FP16/FP64 tests query the exact live device's core module flags; absent
+capabilities are reported, while query and compilation failures remain failures. Strict classifier
+admission rejects nonintegral/out-of-range observations before signed-byte normalization.
 
 This is not a new cache, dtype registry, handwritten kernel or producer certificate. Pure probe
 observations grant no authority. Next: seal measured facts to the exact live execution owner and

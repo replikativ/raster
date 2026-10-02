@@ -177,6 +177,9 @@
 (def ^:private h-zeDeviceGetProperties
   (delay (make-handle "zeDeviceGetProperties" (fd I32 PTR PTR))))
 
+(def ^:private h-zeDeviceGetModuleProperties
+  (delay (make-handle "zeDeviceGetModuleProperties" (fd I32 PTR PTR))))
+
 (def ^:private h-zeContextCreate
   (delay (make-handle "zeContextCreate" (fd I32 PTR PTR PTR))))
 
@@ -385,6 +388,27 @@
 (defn- ensure-init! []
   (when-not (:initialized? @state)
     (init!)))
+
+(defn module-capabilities
+  "Query module capabilities of the exact selected live device, not a catalogue guess.
+   Optional FP16/FP64 support comes from ze_device_module_properties_t flags. Query failure
+   propagates; it must not masquerade as an absent optional capability."
+  []
+  (ensure-init!)
+  (with-open [arena (Arena/ofConfined)]
+    ;; Level Zero core ABI: stype@0, pNext@8, spirvVersionSupported@16, flags@20,
+    ;; fp16flags@24, fp32flags@28, fp64flags@32. Follow this runtime's 64-bit ABI.
+    (let [props (.allocate arena 128)
+          _ (.set props I32 0 (int 0x5)) ; ZE_STRUCTURE_TYPE_DEVICE_MODULE_PROPERTIES
+          _ (ze-call! "zeDeviceGetModuleProperties" @h-zeDeviceGetModuleProperties
+                      [(:device @state) props])
+          flags (.get props I32 20)]
+      {:spirv-version (.get props I32 16)
+       :fp16? (not (zero? (bit-and flags 1)))
+       :fp64? (not (zero? (bit-and flags 2)))
+       :fp16-flags (.get props I32 24)
+       :fp32-flags (.get props I32 28)
+       :fp64-flags (.get props I32 32)})))
 
 (defn async-cmd-list
   "The shared ASYNCHRONOUS immediate command list, created lazily. Unlike the default

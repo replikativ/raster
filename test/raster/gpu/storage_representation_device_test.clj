@@ -42,6 +42,12 @@
 
 (deftest typed-storage-probes-on-level-zero
   (if @ze/gpu-available?
-    (doseq [dt (keys dtype/dtype-info)]
-      (testing (str dt) (check-storage! :ze:0 dt)))
+    (let [caps ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities))]
+      (doseq [dt (keys dtype/dtype-info)]
+        (testing (str dt)
+          (if (case dt :half (:fp16? caps) :double (:fp64? caps) true)
+            (check-storage! :ze:0 dt)
+            (do
+              (println "[LEVEL ZERO CAPABILITY SKIP] storage representation" dt caps)
+              (is true "explicit optional module capability absent"))))))
     (ze/gpu-skip! "typed storage representation probes")))

@@ -29,6 +29,12 @@
   (is (thrown? clojure.lang.ExceptionInfo (probe/expected-bytes :bogus :big-endian)))
   (is (thrown? clojure.lang.ExceptionInfo (probe/expected-bytes :int :native))))
 
+(deftest observations-cannot-truncate-or-wrap-nonbytes
+  (doseq [not-byte [376 -136 120.9 120.0 nil "120" 18446744073709551736N]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (probe/classify-bytes :int
+                   (assoc (probe/expected-bytes :int :little-endian) 0 not-byte))))))
+
 (deftest finite-literals-preserve-the-independent-bit-oracles
   (let [values (fn [dt] (mapv #(get-in % [:value :value])
                              (:operations (probe/kernel-body dt))))]

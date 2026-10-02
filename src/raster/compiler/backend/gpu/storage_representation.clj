@@ -40,6 +40,9 @@
    Reject wrong extents, permutations, corrupted bytes and unsupported representations."
   [element-dtype observed]
   (let [dt (dtype/canon element-dtype)
+        _ (when-not (every? #(and (integer? %) (<= -128 % 255)) observed)
+            (throw (ex-info "storage observation must contain exact signed or unsigned bytes"
+                            {:reason :storage-probe-byte-values :observed observed})))
         observed (mapv #(bit-and 255 (long %)) observed)
         candidates (filterv #(= observed (expected-bytes dt %))
                             [:little-endian :big-endian])]
