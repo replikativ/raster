@@ -1402,3 +1402,15 @@ exemption. No continuity claim is made for tuned instances yet.
 The tuning review also exposed reentrant poisoning: a restore callback can catch an inner
 failed replay. Poison is now first-failure-wins, retaining that original backend cause through
 the outer already-poisoned wrapper. A focused nested-restore regression includes safe close.
+
+### Linked autotuning mutation boundary — 2026-10-03
+
+The linked bridge now enters one existing-lock exclusive mutation scope for candidate callbacks
+and launches. Live output leases reject before tuning begins. Scope entry and successful exit
+invalidate continuity; no candidate receives full-plan completion credit. Callback failure
+retains the original cause and poisons the owner. A callback may replay for restoration but
+cannot export an intermediate output lease. Even a tuning-cache hit conservatively invalidates
+readiness: callers replay the plan before exposing a result. This closes Raster-owned tuning's
+raw-session bypass, not arbitrary direct session mutation or producer-byte certification.
+Focused lease/dispatch-benchmark/measurement/program-tuning tests pass 40 tests / 295 assertions in the retained
+capped REPL. Review and full CI remain prerequisites; completed byte evidence remains next.

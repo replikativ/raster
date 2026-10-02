@@ -467,6 +467,34 @@
       result)
     (catch Throwable error (poison-execution! executable error))))
 
+(defn with-exclusive-mutation!
+  "Run an explicitly mutating offline action under the executable lifetime lock.
+
+   This does not credit a complete plan replay. Even a cached/no-op action conservatively
+   invalidates output readiness and value continuity. The callback may restore or run the plan,
+   but cannot acquire an output lease within this scope. Any callback failure poisons the owner;
+   callers must perform pure selection/argument preflight before entering this boundary."
+  [executable operation mutate!]
+  (when-not (ifn? mutate!)
+    (throw (ex-info "exclusive mutation requires a callable action" {:operation operation})))
+  (with-unleased-execution!
+   executable operation
+   (fn []
+     (when (some-> executable :execution-state deref :exclusive-mutation?)
+       (throw (ex-info "exclusive mutation scopes cannot be nested"
+                       {:reason :link-mutation-scope-active :operation operation})))
+     (begin-mutation! executable)
+     (swap! (:execution-state executable) assoc :exclusive-mutation? true)
+     (try
+       (let [result (mutate!)]
+         (ensure-live! executable operation)
+         ;; A callback may have completed a full replay before launching more candidates.
+         ;; Its intermediate output-ready/epoch cannot describe the final candidate state.
+         (begin-mutation! executable)
+         result)
+       (catch Throwable error (poison-execution! executable error))
+       (finally (swap! (:execution-state executable) dissoc :exclusive-mutation?))))))
+
 (defn node-view
   "Return a stable ResidentBufferView for one public or internal LinkNode."
   [executable node-id]
@@ -795,6 +823,9 @@
           value-ids)))
 
 (defn- require-owned-output-boundary! [executable]
+  (when (some-> executable :execution-state deref :exclusive-mutation?)
+    (throw (ex-info "output leases cannot escape an exclusive mutation scope"
+                    {:reason :link-mutation-scope-active})))
   (when-not (and (:owns-session? executable)
                  (seq (get-in executable [:plan :outputs]))
                  (every? #(= :owned (get-in executable [:plan :nodes % :view

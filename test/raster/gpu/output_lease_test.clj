@@ -104,6 +104,44 @@
       (link/close! executable)
       (is (= 1 @closes)))))
 
+(deftest exclusive-offline-mutation-invalidates-without-publishing-a-plan-result
+  (let [executable (executable)
+        calls (atom 0)]
+    (with-redefs [gpu/replay! (fn [& _] nil)
+                  link/outputs (fn [_] {:out :resident-view})
+                  link/output-values (fn [_] {:out :resident-view})]
+      (link/run! executable)
+      (with-open [lease (link/output-lease! executable)]
+        (is (= :link-output-lease-active
+               (reason #(link/with-exclusive-mutation! executable :tune
+                                                      (fn [] (swap! calls inc))))))
+        (is (= 1 (:value-epoch @(:execution-state executable))))
+        (is (true? @(:output-ready? executable))))
+      (is (= :selected
+             (link/with-exclusive-mutation!
+              executable :tune
+              #(do (swap! calls inc)
+                   (link/run! executable)
+                   (is (= :link-mutation-scope-active
+                          (reason (fn [] (link/output-lease! executable)))))
+                   :selected))))
+      (is (= 1 @calls))
+      (is (= 4 (:value-epoch @(:execution-state executable))))
+      (is (= 2 @(:completed-replays executable)))
+      (is (false? @(:output-ready? executable)))
+      (is (= :link-output-lease-before-replay (reason #(link/output-lease! executable)))))))
+
+(deftest failed-exclusive-mutation-poisons-with-the-original-cause
+  (let [executable (executable)
+        failure (ex-info "candidate validation failed after writes" {})]
+    (is (identical? failure
+                    (try (link/with-exclusive-mutation! executable :tune #(throw failure))
+                         (catch Throwable error error))))
+    (is (false? @(:output-ready? executable)))
+    (is (nil? (:exclusive-mutation? @(:execution-state executable))))
+    (is (= 1 (:value-epoch @(:execution-state executable))))
+    (is (= :link-execution-poisoned (reason #(link/run! executable))))))
+
 (deftest lease-acquisition-waits-for-complete-synchronous-replay
   (let [executable (executable)
         entered (promise)

@@ -155,6 +155,14 @@ allowed and idempotent. Unlike a repairable failed input transfer, an arbitrary 
 program has no proven restoration boundary. This is an intentional failure-contract tightening,
 not automatic rollback, cross-owner mutation detection or completed producer attestation.
 
+Offline linked-dispatch tuning also owns an exclusive mutation scope. Selection precedes the
+scope; candidate construction, restoration, validation and timing remain under the existing
+lifetime lock and cannot bypass output leases. Entry and successful exit invalidate value
+continuity and output readiness, even when the tuning cache avoids launches. Candidate kernels
+do not count as complete plan replays. Callback failure poisons the executable, and an output
+lease cannot escape a callback that temporarily ran the full plan. This conservative contract
+does not infer which candidates wrote which bytes or attach content evidence to tuning results.
+
 The bound structure is implemented, not full producer certification. Its result has scope
 `:exact-bound-program` and explicitly `:attests-input-bytes? false`; it supplies no numerical-state
 `:program-fingerprint`. Affected artifact/cache/composition tests pass 28 tests / 189 assertions:
