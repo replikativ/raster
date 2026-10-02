@@ -39,6 +39,14 @@ do not infer a published release from a merge, or device performance from source
 | 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. | Real multi-device/fabric execution, overlap and distributed training collectives still need numerical validation. Co-location validates ownership/scheduling, not network performance. |
 | 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. The whole-domain heat oracle checks host refinement/convergence. The local continuation gate executes four generated fine-grid heat steps and restriction per replay on OpenCL and Level Zero, restores addressed coarse/fine bytes and matches uninterrupted evolution bit-for-bit while conserving mass (#926). Partial-patch evolution checks shared conservative coarse/fine face fluxes. #971 adds resident conservative CSR field transfer across changed layouts. Source evolution → transfer → target evolution executes nine generated stages and three replays on both local backends. Changed-layout mapped-byte restoration now matches an uninterrupted 17-stage resident chain bit-for-bit; both match independent numerical oracles and preserve mass. The affected partial-patch, whole-domain continuation and manifest suites pass 21 tests / 351 assertions on October 2. | Production connectivity/field mapping, semantic restore compatibility, manifest publication/lineage realization, temporal interpolation/subcycling and flux-register/reflux acceptance remain. Test-only two-level geometry, transfer, post-transfer evolution and restart do not establish an adaptive simulator, external AMR accuracy or a production store. |
 
+Item 8 now also has a production 2D hierarchy projection in `raster.ode.amr-geometry`: rectangular,
+anisotropic, multilevel active rows retain patch provenance and match geometric sides into faces
+and CSR incidence. Native evolution/remap/restart fixtures consume it, retaining independent
+geometry and numerical oracles (28 tests / 1303 assertions). Fresh array materialization trusts
+constructor output and adds no certification or ownership authority. Device patch packing,
+scalable hierarchy validation, production remap/publication, subcycling/reflux and general-rank
+numerical providers remain open; the campaign is not complete.
+
 External source audit refreshed on 2026-09-30: authoritative pretrained-rstr main
 `98bad4d3517ec05a3c495f019c80d8c553db02af` declares Raster 0.2.922 and uses the public
 compiled boundary for Laya/ModernBERT. The older local `f4c2bb4` checkout (0.2.545) and
