@@ -104,6 +104,18 @@
   (fv/diffusive-face-fluxes! flux scratch left right conductance faces)
   (fv/divergence-step! field scratch flux offsets indices orientation inverse-volume cells dt))
 
+(deftm pair-step-into!
+  [out :- (Array double), field :- (Array double), scratch :- (Array double), flux :- (Array double),
+   left :- (Array int), right :- (Array int), conductance :- (Array double),
+   offsets :- (Array int), indices :- (Array int), orientation :- (Array double),
+   inverse-volume :- (Array double), cells :- Long, faces :- Long, dt :- Double] :- Void
+  ;; Same two steps with a read-only input and a distinct owned output. This is the ordinary
+  ;; functional dataflow boundary, not an ownership transfer into a second mutable owner.
+  (fv/diffusive-face-fluxes! flux field left right conductance faces)
+  (fv/divergence-step! scratch field flux offsets indices orientation inverse-volume cells dt)
+  (fv/diffusive-face-fluxes! flux scratch left right conductance faces)
+  (fv/divergence-step! out scratch flux offsets indices orientation inverse-volume cells dt))
+
 (defn- arguments [{:keys [cells faces left right conductance offsets indices orientation inverse-volume]}]
   [(initial cells) (double-array (repeat (count cells) Double/NaN))
    (double-array (repeat (count faces) Double/NaN))
@@ -320,3 +332,69 @@
 (deftest resident-conservative-remap-on-level-zero
   (if @ze/gpu-available? (run-remap-layouts :ze:0)
       (ze/gpu-skip! "resident-conservative-remap-level-zero")))
+
+(defn- run-post-remap-evolution [target source destination]
+  (let [A (remap-matrix (:cells source) (:cells destination))
+        source-args (arguments source)
+        ;; Poison the target field too: its contents must come from the resident remap,
+        ;; not the target program's captured host initializer or its previous replay.
+        destination-args (assoc (arguments destination) 0
+                                (double-array (repeat (count (:cells destination)) Double/NaN)))
+        options {:compiler :equation-first :target target :dtype :double :inline? true
+                 :donate '[field]
+                 :constants '[left right conductance offsets indices orientation inverse-volume]}
+        evolve-source (compiled/lower #'pair-step! source-args options)
+        remap (compiled/lower #'sparse/spmv
+                              [A (first source-args)
+                               (double-array (repeat (count (:cells destination)) -317.0)) 1.0 0.0]
+                              {:compiler :equation-first :target target :dtype :double :constants '[A]})
+        evolve-target (compiled/lower #'pair-step-into!
+                                      (into [(double-array (repeat (count (:cells destination)) Double/NaN))]
+                                            destination-args)
+                                      (assoc (dissoc options :donate) :outputs '[out]))
+        prepared (with-redefs [gpu/alloc! (fn [& _] (throw (AssertionError. "composition allocated device storage")))]
+                   (compiled/compose
+                    {:id :heat/post-remap-evolution
+                     :components [{:id :source :program evolve-source}
+                                  {:id :remap :program remap}
+                                  {:id :destination :program evolve-target}]
+                     :mutable-shares [{:owner [:source :field] :borrowers [[:remap :x]]
+                                       :output [:source :field']}]
+                     :connections [{:from [:remap :result] :to [:destination :field]}]
+                     :outputs [{:key :source :from [:source :field']}
+                               {:key :destination :from [:destination :out]}]}))
+        plan (compiled/plan prepared)
+        original (vec (initial (:cells source)))
+        original-mass (mass original (:inverse-volume source))
+        source-states (vec (take 7 (iterate #(reference-step % source 0.001) original)))]
+    (is (every? #(= 0 (get-in (compiled/plan %) [:attributes :driver-allocations]))
+                [evolve-source remap evolve-target]))
+    (is (= 9 (reduce + (map #(count (get-in % [:call :steps])) (:instances plan)))))
+    (is (not-any? #(contains? #{[:remap :x] [:destination :field]} (:key %)) (:in-tree prepared))
+        "both resident consumers lose their host refresh slots")
+    (with-open [executable (link/instantiate! plan)]
+      (dotimes [replay 3]
+        (link/run! executable)
+        (let [actual-source (link/download executable (:node (first (:out-tree prepared))))
+              actual-target (link/download executable (:node (second (:out-tree prepared))))
+              expected-source (source-states (* 2 (inc replay)))
+              remapped (reference-remap (:cells source) (:cells destination) expected-source)
+              expected-target (nth (iterate #(reference-step % destination 0.001) remapped) 2)]
+          (is (near? expected-source actual-source))
+          (is (near? expected-target actual-target))
+          (is (not (near? remapped actual-target)) "the remapped field actually evolves")
+          (is (< (Math/abs (- original-mass (mass actual-target (:inverse-volume destination))))
+                 1.0e-12)))))))
+
+(defn- run-post-remap-layouts [target]
+  (let [[central _ moved disjoint] (remap-geometries)]
+    (run-post-remap-evolution target central moved)
+    (run-post-remap-evolution target moved disjoint)))
+
+(deftest resident-post-remap-evolution-on-opencl
+  (if @opencl/opencl-fp64-available? (run-post-remap-layouts :ocl:0)
+      (opencl/opencl-skip! "resident-post-remap-evolution-opencl")))
+
+(deftest resident-post-remap-evolution-on-level-zero
+  (if @ze/gpu-available? (run-post-remap-layouts :ze:0)
+      (ze/gpu-skip! "resident-post-remap-evolution-level-zero")))

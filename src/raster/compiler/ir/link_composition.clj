@@ -457,6 +457,19 @@
                       (get-in nodes0 [canonical :view :allocation :id])]))
               node-replacements)
         connected-sources (set (map first connection-leaf-pairs))
+        initializer-free-producers
+        (into #{}
+              (mapcat (fn [{component-id :id lowering :lowering}]
+                        (let [{:keys [complete-writes reads]}
+                              (get-in lowering [:certificate :effect-evidence :initialization])]
+                          ;; Conservative sufficient proof: a certified complete overwrite and
+                          ;; no reads anywhere in this component. Read-before-write or missing
+                          ;; coverage evidence retains the original producer initializer.
+                          (when (and (set? complete-writes) (set? reads))
+                            (keep #(when-not (contains? reads %)
+                                     (get node-mapping0 [component-id %]))
+                                  complete-writes)))))
+              components)
         shared-source-by-node
         (into {}
               (mapcat (fn [group]
@@ -474,7 +487,12 @@
                               node (cond-> (assoc-in node [:view :allocation :id] allocation-id')
                                      (contains? connected-sources node-id)
                                      (assoc :role :internal)
-                                     (contains? connected-sources node-id)
+                                     ;; Only the consumer's source disappears with its replaced
+                                     ;; node. A producer may read its own initialized output before
+                                     ;; writing it (for example beta*y); a connection does not prove
+                                     ;; that its initializer is dead or that the write is complete.
+                                     (and (contains? connected-sources node-id)
+                                          (contains? initializer-free-producers node-id))
                                      (assoc :source nil)
                                      (contains? shared-source-by-node node-id)
                                      (assoc :source (get shared-source-by-node node-id)))]
