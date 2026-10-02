@@ -108,13 +108,15 @@ retained artifact hashes. Successful recompilation/storage after a corrupt load 
 the replacement artifact. Ineligible builds expose no persistent artifact identity map. This
 records exact artifact identity, not a durable numerical receipt.
 
-The production projection must join that complete artifact identity with the bound invocation:
+`compiled/execution-identity` now joins that complete artifact identity with the bound invocation:
 ordered retained program calls (including host-derived scalars and selected graphs), public shape/
 storage contracts, roles, donation and schedule. For composition, use the existing
 `CertifiedLinkComposition` components and normalized specification, not its nested timing reports.
-Reverify the corresponding retained owner before producing evidence; no second build/source cache
-or function registry is needed. Initially require documented stable component IDs rather than
-claiming equivalence under arbitrary graph renaming.
+It requires the original compiler-owned Prepared, independently reverifies the existing lowering
+owners, and records source-free plan and default-free boundary contracts. No second build/source
+cache or function registry is needed. Component IDs remain significant rather than claiming
+equivalence under arbitrary graph renaming. This explicit inspection operation is not run on each
+replay and introduces no identity cache.
 Generated SSA names are anchored to that exact retained compilation artifact. Independently
 recompiled artifacts may conservatively differ even for identical source; future typed-IR
 alpha-normalization must be scope/definition/use aware, not a blanket symbol replacement.
@@ -131,11 +133,15 @@ runtime must join an exact node/view, verified source bytes or inherited device 
 completed upload/D2D operation before claiming those bytes produced the result. Until that boundary
 exists, externally initialized programs cannot claim full producer attestation.
 
-These projections are the next implementation gate, not implemented producer certification.
-Acceptance must distinguish scalar/shape/graph/wiring/data changes, preserve scalar bits, agree on
-cold/warm preparation, reject incomplete builds and tampered owners, and reject a changed producer
-against an independent restore target before leasing. A conservative exact execution/build identity
-also must not be presented as target-neutral mathematical program equivalence.
+The bound structure is implemented, not full producer certification. Its result has scope
+`:exact-bound-program` and explicitly `:attests-input-bytes? false`; it supplies no numerical-state
+`:program-fingerprint`. Affected artifact/cache/composition tests pass 28 tests / 189 assertions:
+shape, role, scalar bit and wiring changes distinguish identities; cold/process-hit/persistent-load
+paths agree for the same artifact; nested composition works; incomplete builds and modified owners
+reject. Different host arrays and contents intentionally do not change this structural identity.
+Actual data attestation, full producer publication and independent restore matching remain open.
+A conservative exact execution/build identity must not be presented as target-neutral mathematical
+program equivalence.
 
 ## Konserve, mmap, LMDB and S3
 

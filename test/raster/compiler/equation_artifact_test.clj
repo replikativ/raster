@@ -1,6 +1,7 @@
 (ns raster.compiler.equation-artifact-test
   (:require [boring.core :as boring]
             [clojure.test :refer [deftest is testing use-fixtures]]
+            [raster.compiler.build-manifest :as build-manifest]
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
@@ -34,6 +35,12 @@
     (raster.par/map! output index n float
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
+
+(deftm artifact-scale
+  [input :- (Array float) factor :- Float n :- Long] :- (Array float)
+  (let [output (float-array n)]
+    (raster.par/map! output index n float
+                     (raster.numeric/* factor (raster.arrays/aget input index)))))
 
 (deftest equation-first-cache-normalizes-only-equivalent-schedule-spellings
   (let [args [(float-array 4) 4]
@@ -252,3 +259,78 @@
             (is (= {} (:retained-artifact @report))))
           (finally
             (compiled/clear-compilation-cache!)))))))
+
+(deftest exact-bound-program-evidence-does-not-attest-input-bytes
+  ;; Synthetic packaged-build evidence exercises the identity boundary, not release provenance.
+  (let [build (build-manifest/manifest-identity
+               {:schema-version build-manifest/schema-version :library 'raster/raster
+                :version "identity-test-only" :revision "synthetic-identity-test"
+                :runtime {:java-version (System/getProperty "java.version")
+                          :clojure-version (clojure-version)}
+                :source-namespaces '[raster.arrays raster.numeric raster.par]
+                :dependencies {}})
+        options {:compiler :equation-first :target target :dtype :float}]
+    (compiled/clear-compilation-cache!)
+    (try
+      (with-temporary-directory
+        (fn [directory]
+          (binding [compiled/*equation-artifact-store*
+                    (store/make-store {:root (.toFile directory) :max-entries 4
+                                       :max-bytes (* 4 1024 1024)})]
+            (with-redefs [build-manifest/current-identity (constantly build)]
+              (let [p (compiled/lower #'artifact-map [(float-array [1 2 3 4]) 4] options)
+                    q (compiled/lower #'artifact-map [(float-array [9 8 7 6]) 4] options)
+                    a (compiled/execution-identity p)
+                    b (compiled/execution-identity q)
+                    input (:key (first (:in-tree p)))
+                    output (:key (first (:out-tree p)))
+                    composition (fn [connections]
+                                  (compiled/compose
+                                   {:id :identity/twice
+                                    :components [{:id :a :program p} {:id :b :program q}]
+                                    :connections connections
+                                    :outputs [{:key :result :from [:b output]}]}))
+                    connected (composition [{:from [:a output] :to [:b input]}])
+                    separate (composition [])]
+                (is (= :exact-bound-program (:scope a)))
+                (is (string? (:fingerprint a)))
+                (is (= a b) "host array identity and contents are deliberately not attested")
+                (is (false? (:attests-input-bytes? a)))
+                (is (= [input] (mapv :key (:data-slots a))))
+                (is (not= (:fingerprint a)
+                          (:fingerprint (compiled/execution-identity
+                                         (compiled/lower #'artifact-map [(float-array 8) 8] options)))))
+                (is (not= (:fingerprint a)
+                          (:fingerprint (compiled/execution-identity
+                                         (compiled/lower #'artifact-map [(float-array 4) 4]
+                                                         (assoc options :constants '[input]))))))
+                (let [scale-identity (fn [factor]
+                                       (:fingerprint
+                                        (compiled/execution-identity
+                                         (compiled/lower #'artifact-scale [(float-array 4) factor 4]
+                                                         options))))
+                      nan (fn [bits] (Float/intBitsToFloat (int bits)))]
+                  (is (not= (scale-identity (float 2.0)) (scale-identity (float 3.0))))
+                  (is (not= (scale-identity (float 0.0)) (scale-identity (float -0.0))))
+                  (is (= (scale-identity (nan 0x7fc00012)) (scale-identity (nan 0x7fc00012))))
+                  (is (not= (scale-identity (nan 0x7fc00012)) (scale-identity (nan 0x7fc00013)))))
+                (is (= :compiled-execution-identity-owner
+                       (reason-of #(compiled/execution-identity (assoc p :target :changed)))))
+                (is (= 1 (count (:data-slots (compiled/execution-identity connected)))))
+                (is (= 2 (count (:data-slots (compiled/execution-identity separate)))))
+                (is (not= (:fingerprint (compiled/execution-identity connected))
+                          (:fingerprint (compiled/execution-identity separate))))
+                (let [nested (compiled/compose
+                              {:id :identity/nested
+                               :components [{:id :inner :program connected}]
+                               :outputs [{:key :result :from [:inner :result]}]})]
+                  (is (= 1 (count (:data-slots (compiled/execution-identity nested))))))
+                (compiled/clear-compilation-cache!)
+                (is (= a (compiled/execution-identity
+                          (compiled/lower #'artifact-map [(float-array 4) 4] options)))
+                    "persistent loads retain the exact compilation's generated IDs"))))))
+      (with-redefs [build-manifest/current-identity (constantly nil)]
+        (is (= :compiled-execution-identity-incomplete
+               (reason-of #(compiled/execution-identity
+                            (compiled/lower #'artifact-map [(float-array 4) 4] options))))))
+      (finally (compiled/clear-compilation-cache!)))))

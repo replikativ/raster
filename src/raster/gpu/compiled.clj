@@ -940,6 +940,73 @@
                     {:reason :compiled-preparation-report-type :actual (type artifact)})))
   (:preparation-report artifact))
 
+(defn- exact-artifact-evidence
+  [lowering report]
+  (case (:kind report)
+    :equation-first
+    (let [{:keys [persistent-cache-eligible? persistence-blockers source-dependency-blockers
+                 persistent-artifact-identity retained-artifact]} (:template report)]
+      (when-not (and persistent-cache-eligible?
+                     (empty? persistence-blockers) (empty? source-dependency-blockers)
+                     (= 4 (count persistent-artifact-identity))
+                     (every? #(and (string? %) (not-empty %)) (vals persistent-artifact-identity))
+                     (= #{:compilation-fingerprint :payload-fingerprint}
+                        (set (keys retained-artifact)))
+                     (every? #(and (string? %) (not-empty %)) (vals retained-artifact)))
+        (throw (ex-info "exact program evidence requires a complete retained compiler artifact"
+                        {:reason :compiled-execution-identity-incomplete
+                         :persistence-blockers persistence-blockers
+                         :source-dependency-blockers source-dependency-blockers
+                         :retained-artifact? (boolean (seq retained-artifact))})))
+      (invocation-link/verify! lowering)
+      {:identity persistent-artifact-identity :artifact retained-artifact})
+
+    :composition
+    (let [components (:components lowering)
+          reports (:components report)]
+      (link-composition/verify! lowering)
+      (when-not (= (mapv :id components) (mapv :id reports))
+        (throw (ex-info "composition reports must follow their exact certified components"
+                        {:reason :compiled-execution-identity-components})))
+      {:components (mapv (fn [component component-report]
+                           {:id (:id component)
+                            :artifact (exact-artifact-evidence
+                                       (:lowering component) (:report component-report))})
+                         components reports)
+       :specification (:specification lowering)})
+
+    (throw (ex-info "exact program evidence requires the equation-first vertical"
+                    {:reason :compiled-execution-identity-vertical :kind (:kind report)}))))
+
+(defn execution-identity
+  "Identify one exact retained, specialized Prepared program without claiming input-byte lineage.
+
+   Requires complete packaged build/source/target evidence and retained artifact hashes. Includes
+   certified calls, storage contracts, composition, roles, donation, outputs and schedule, but never
+   host initializer arrays. Generated IDs belong to the exact retained artifact; this is not an
+   alpha-equivalence or target-neutral mathematical identity. Caller defaults can be replaced at
+   invocation, so the returned identity deliberately does not attest the bytes used in execution."
+  [prepared]
+  (when-not (and (prepared? prepared) (sealed-prepared? prepared))
+    (throw (ex-info "execution-identity requires the original compiler-owned Prepared artifact"
+                    {:reason :compiled-execution-identity-owner})))
+  (let [artifact (exact-artifact-evidence (:lowering prepared) (:preparation-report prepared))
+        plan (:plan (:lowering prepared))
+        boundary #(mapv (fn [entry] (dissoc entry :default)) %)
+        projection {:kind :raster.compiled/exact-bound-program-v1
+                    :artifact artifact
+                    :plan (update plan :nodes
+                                  (fn [nodes]
+                                    (into {} (map (fn [[id node]] [id (dissoc node :source)]) nodes))))
+                    :inputs (boundary (:in-tree prepared))
+                    :outputs (boundary (:out-tree prepared))
+                    :donated (:donated prepared) :schedule (:schedule prepared)
+                    :target (:target prepared)}]
+    {:scope :exact-bound-program
+     :fingerprint (semantic-fingerprint/fingerprint projection)
+     :data-slots (mapv #(select-keys % [:key :node :dtype :shape :role]) (:in-tree prepared))
+     :attests-input-bytes? false}))
+
 (defn instantiation-report
   "Return the compact host-side construction report for an instantiated Compiled artifact."
   [compiled]
