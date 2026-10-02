@@ -1450,6 +1450,22 @@ patterns, staging boundaries, digest failures, overflow, partial overlap and clo
 Pivotal review found no blocker. Full CI remains required; publication and independent semantic
 restore matching are not established by this codec alone.
 
+### Generated storage representation probes — 2026-10-03
+
+The resident producer path hashes device-native bytes and deliberately supplies no byte order.
+The next typed-manifest seam now has generated probe machinery: two asymmetric finite sentinels
+per canonical dtype, verified KernelBody stores, common OpenCL/CUDA/HIP artifact emission with
+compilation requirements retained, and independent explicit byte-pattern classification. All six
+types have real local OpenCL and Level Zero byte readbacks and resource cleanup checks. Focused
+oracles: 5 tests / 200 assertions, zero failures/errors; no native skip on this machine. The new
+native namespace is selected by the existing OpenCL CI gate; all six sources join CUDA/HIP fixtures.
+
+This is not a new cache, dtype registry, handwritten kernel or producer certificate. Pure probe
+observations grant no authority. Next: seal measured facts to the exact live execution owner and
+probe artifact, then project completed bytes into typed manifests. Device-side canonical packing
+and general bitcast semantics remain a separate compiler vertical; do not infer them from finite
+sentinels or host endianness. Existing ordinary invoke and compilation paths stay unchanged.
+
 ### Ordered numerical-state availability finalization — 2026-10-03
 
 The content runtime now verifies/localizes/promotes each certified manifest chunk in bounded

@@ -13,6 +13,7 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.staged-contraction-fixtures :as staged-fixtures]
+            [raster.compiler.backend.gpu.storage-representation :as storage-probe]
             [raster.compiler.backend.gpu.layout-transform :as layout-transform]
             [raster.compiler.backend.gpu.paged-kv-append :as paged-append-emit]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
@@ -894,6 +895,10 @@
                (:source (matrix-target/emit-matrix-kernel
                          "mma_verified_contract"
                          (verified-direct-matrix-body :mma) :cuda)))])
+           (map (fn [dt]
+                  (write-artifact! directory suffix (str "storage-probe-" (name dt))
+                                   (storage-probe/emit-artifact dt dialect)))
+                [:byte :int :long :half :float :double])
            (map-indexed
             (fn [index artifact]
               (write-artifact! directory suffix (str "equation-first-" index) artifact))
