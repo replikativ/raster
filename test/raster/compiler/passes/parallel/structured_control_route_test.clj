@@ -1045,6 +1045,124 @@
         (is (identical? call (program-call/validate! call)))
         (is (= 1 @checks) "a later public check has no inherited retained scope")))))
 
+(deftest program-entry-context-closes-structured-execution-and-final-bindings
+  (doseq [trip-count [0 1 2 3 4]]
+    (let [{:keys [call]} (prepared-mixed-call trip-count)
+          evidence (emitted-program/validate-with-physical-results! (:program call))
+          altered (assoc-in call [:steps 0 :trip-count] (inc trip-count))]
+      (is (map? (:entry-buffers call)))
+      (is (identical? call (program-call/validate! call)))
+      (is (identical? call (program-call/validate-with-retained-program! call evidence)))
+      (doseq [check [program-call/validate!
+                    #(program-call/validate-with-retained-program! % evidence)]]
+        (is (= :structured-loop-call-bindings (reason-of #(check altered)))
+            "resolved repetition must agree with the retained outer scalar, even at zero"))
+      (when (zero? trip-count)
+        (is (not= (:entry-buffers call) (:buffers call))
+            "zero-trip result aliasing does not erase the originally requested destination"))))
+  (let [{:keys [call result]} (prepared-mixed-call 3)
+        step (second (:steps call))
+        input-id (first (keep (fn [[slot argument]]
+                               (when (= :input (:kind slot)) argument))
+                             (map vector (get-in step [:graph :abi])
+                                  (get-in step [:graph :arguments]))))
+        initial (get-in call [:steps 0 :buffers :carries 0 :initial])
+        evidence (emitted-program/validate-with-physical-results! (:program call))]
+    (is (some? input-id))
+    (doseq [[label invalid]
+            [[:invariants (assoc-in call [:steps 0 :buffers :invariants ::unknown] :initial)]
+             [:scratch (assoc-in call [:steps 0 :scratch] {})]
+             [:rotation (assoc-in call [:steps 0 :buffers :carries 0 :alternate] initial)]
+             [:carry-output (assoc-in call [:steps 0 :outputs] {})]
+             [:iteration-scalar (assoc-in call [:steps 0 :scalars :iteration]
+                                         {:id ::unknown :type :long})]
+             [:entry-context (assoc call :entry-buffers {})]
+             [:numerical-input (assoc-in call [:steps 1 :buffers input-id] initial)]
+             [:final-buffers (assoc-in call [:buffers ::unknown] :initial)]
+             [:export (assoc-in call [:outputs result] initial)]]]
+      (testing (name label)
+        (is (some? (reason-of #(program-call/validate! invalid))))
+        (is (= (reason-of #(program-call/validate! invalid))
+               (reason-of #(program-call/validate-with-retained-program! invalid evidence))))))
+    (let [mapped (program-call/map-buffers call #(vector :renamed %))]
+      (is (= (into {} (map (fn [[id value]] [id [:renamed value]])) (:entry-buffers call))
+             (:entry-buffers mapped)))
+      (is (identical? mapped (program-call/validate! mapped))))))
+
+(deftest chained-loops-use-each-source-ordered-entry-environment
+  (let [{first-loop :loop :as first-decomposition} (loop-decomposition)
+        tensor (get (control/outer-values first-loop) 'u-final)
+        second-loop (control/make
+                     (assoc (control/facts first-loop) :id 'second-loop)
+                     '[iteration steps2]
+                     (control/invariants first-loop)
+                     [{:initial 'u-final :parameter 'u-in :result 'u-next :output 'u-last}]
+                     (control/body first-loop)
+                     {'steps2 (av/tensor {:dtype :long :shape []})
+                      'n (av/tensor {:dtype :int :shape []}) 'u-final tensor 'u-last tensor})
+        first-program (route/program-envelope first-decomposition)
+        second-program (route/program-envelope
+                        {:loop second-loop :loop-binding 'second-loop :source nil})
+        typed (program/make
+               {:dialect :typed-parallel
+                :values (merge (:values first-program) (:values second-program))
+                :inputs '[steps n u steps2]
+                :equations (vec (concat (:equations first-program) (:equations second-program)))
+                :outputs '[u-last]})
+        options {:target-device :ocl:0 :dtype :float}
+        scheduled (route/schedule-program typed options)
+        emitted (:program (program-opencl/emit-program scheduled options))]
+    (doseq [[first-trips second-trips] [[0 0] [0 3] [1 0] [2 3] [3 4]]]
+      (let [call (program-call/make
+                  emitted {'u :initial 'u-final :middle 'u-last :last}
+                  {'steps {:type :long :value first-trips}
+                   'steps2 {:type :long :value second-trips}
+                   'n {:type :int :value 64}}
+                  (cond-> {} (> first-trips 1) (assoc 'u-final :first-scratch)
+                    (> second-trips 1) (assoc 'u-last :second-scratch)) nil)
+            first-result (if (zero? first-trips) :initial :middle)
+            final-result (if (zero? second-trips) first-result :last)]
+        (is (= first-result (get-in call [:steps 1 :buffers :carries 0 :initial])))
+        (is (= final-result (get-in call [:outputs 'u-last])))
+        (is (identical? call (program-call/validate! call)))
+        (is (identical? call (program-call/validate-with-retained-program!
+                             call (emitted-program/validate-with-physical-results! emitted))))))))
+
+(deftest contextual-loop-validation-keeps-multiple-carry-rotations-distinct
+  (let [{single-loop :loop} (loop-decomposition)
+        body (control/body single-loop)
+        facts (soac/facts body)
+        extra (walk/postwalk-replace {'advance 'advance-v 'u-in 'v-in 'u-next 'v-next}
+                                    (first (soac/equations body)))
+        body (soac/make
+              (-> facts
+                  (update :values assoc 'v-in (get-in facts [:values 'u-in])
+                          'v-next (get-in facts [:values 'u-next]))
+                  (update :inputs conj 'v-in)
+                  (assoc-in [:equations 'advance-v] (get-in facts [:equations 'advance])))
+              (conj (vec (soac/equations body)) extra) '[u-next v-next])
+        tensor (get (control/outer-values single-loop) 'u)
+        loop (control/make
+              (control/facts single-loop) (control/loop-index single-loop)
+              (control/invariants single-loop)
+              (conj (control/carried single-loop)
+                    {:initial 'v :parameter 'v-in :result 'v-next :output 'v-final})
+              body (assoc (control/outer-values single-loop) 'v tensor 'v-final tensor))
+        typed (route/program-envelope {:loop loop :loop-binding 'time-loop :source nil})
+        options {:target-device :ocl:0 :dtype :float}
+        emitted (:program (program-opencl/emit-program (route/schedule-program typed options) options))]
+    (doseq [trips [0 1 2 3]]
+      (let [call (program-call/make
+                  emitted {'u :initial-u 'v :initial-v 'u-final :output-u 'v-final :output-v}
+                  {'steps {:type :long :value trips} 'n {:type :int :value 64}}
+                  (if (> trips 1) {'u-final :scratch-u 'v-final :scratch-v} {}) nil)]
+        (is (identical? call (program-call/validate! call)))
+        (is (= (if (zero? trips) {'u-final :initial-u 'v-final :initial-v}
+                   {'u-final :output-u 'v-final :output-v}) (:outputs call)))
+        (is (= :structured-loop-call-bindings
+               (reason-of #(program-call/validate!
+                            (assoc-in call [:steps 0 :buffers :carries 1 :initial] :initial-u)))))))))
+
 (deftest buffer-renaming-shares-only-an-exact-synchronous-boundary-projection
   (let [{:keys [call]} (prepared-mixed-call 3)
         numerical-step (first (filter program-call/emitted-equation-call? (:steps call)))

@@ -9,7 +9,8 @@
             [raster.gpu.structured-loop :as runtime]))
 
 (defn- scheduled-call
-  [trip-count]
+  ([trip-count] (scheduled-call trip-count (float 0.5)))
+  ([trip-count alpha]
   (let [extent (av/tensor {:dtype :int :shape []})
         trip-index (av/tensor {:dtype :long :shape []})
         scalar (av/tensor {:dtype :float :shape []})
@@ -45,8 +46,22 @@
      {'u0 :initial 'u-final :output}
      {'steps {:type :long :value trip-count}
       'n {:type :int :value 64}
-      'alpha {:type :float :value 0.5}}
-     (if (> trip-count 1) {'u-final :scratch} {}))))
+      'alpha {:type :float :value alpha}}
+     (if (> trip-count 1) {'u-final :scratch} {})))))
+
+(deftest contextual-loop-scalars-retain-floating-bit-semantics
+  (doseq [[alpha different]
+          [[(Float/intBitsToFloat (unchecked-int 0x80000000)) (float 0.0)]
+           [(Float/intBitsToFloat 0x7fc00001) (Float/intBitsToFloat 0x7fc00002)]]]
+    (let [call (scheduled-call 3 alpha)
+          buffers {'u0 :initial 'u-final :output}
+          scalars {'steps {:type :long :value 3}
+                   'n {:type :int :value 64}
+                   'alpha {:type :float :value alpha}}
+          check #(loop-call/validate-in-context! % buffers scalars {'u-final :scratch})]
+      (is (identical? call (check call)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (check (assoc-in call [:scalars :invariants 'alpha-in :value] different)))))))
 
 (deftest host-repetition-uses-one-ordinary-graph-call-per-iteration
   (let [events (atom [])
