@@ -133,6 +133,17 @@ runtime must join an exact node/view, verified source bytes or inherited device 
 completed upload/D2D operation before claiming those bytes produced the result. Until that boundary
 exists, externally initialized programs cannot claim full producer attestation.
 
+The synchronous linked-write boundary must also fail closed after a partially completed transfer:
+the destination and all overlapping views require explicit reinitialization. A no-copy self-write
+or a device copy reading a tainted resident range cannot repair those bytes. Successful complete
+writes clear the repaired node only; disjoint views remain usable. Invocation, profiling and
+measurement retire previous output wrappers after complete preflight but before backend writes.
+Inputs rooted by object identity in those retired outputs retain private borrowed reads only
+inside the existing executable lifetime lock, without extending independent or asynchronous
+ownership. Donations commit at that same mutation boundary: backend failure consumes them too,
+whereas pure preflight errors preserve handles. This readiness contract is a prerequisite for
+future completed-input receipts, not byte attestation or rollback of partially executed kernels.
+
 The bound structure is implemented, not full producer certification. Its result has scope
 `:exact-bound-program` and explicitly `:attests-input-bytes? false`; it supplies no numerical-state
 `:program-fingerprint`. Affected artifact/cache/composition tests pass 28 tests / 189 assertions:

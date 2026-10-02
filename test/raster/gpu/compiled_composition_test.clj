@@ -92,6 +92,99 @@
     (is (true? @(:output-ready? executable)))
     (is (= #{:a :b} @(:pending-inputs executable)))))
 
+(deftest failed-input-transfer-retires-previous-output-aliases
+  (let [view (bview/view
+              (bview/allocation {:id :input :byte-size 16 :memory-space :device
+                                 :device :ze:0 :ownership :owned})
+              {:dtype :float :shape [4]})
+        old-output (value/wrap-external-view
+                    {:dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :failed-input :target :ze:0
+                            :nodes {:a (link-plan/node {:id :a :view view :role :input})}}
+                     :session ::session
+                     :node-views {:a (gpu/->ResidentBufferView ::session :a view)}
+                     :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)
+                     :pending-inputs (atom #{}) :tainted-inputs (atom #{})
+                     :output-ready? (atom true) :completed-replays (atom 0)})
+        artifact (compiled/map->Compiled
+                  {:executable executable :target :ze:0 :donated {}
+                   :in-tree [{:key :a :node :a :role :input :default (float-array 4)}]
+                   :out-tree [] :live-outputs (atom [old-output])})
+        failure (ex-info "partial upload" {})]
+    (with-redefs [gpu/upload-range! (fn [& _]
+                                    (is (not (value/live? old-output)))
+                                    (throw failure))]
+      (is (identical? failure
+                      (try (compiled/invoke-compiled artifact {:a (float-array 4)})
+                           (catch Throwable error error)))))
+    (is (not (value/live? old-output)))
+    (is (nil? @(:live-outputs artifact)))
+    (is (= #{:a} @(:pending-inputs executable)))
+    (is (= #{:a} @(:tainted-inputs executable)))
+    (doseq [operation [compiled/profile compiled/measure]]
+      (let [output (value/wrap-external-view
+                    {:dtype :float :n-elements 4 :byte-size 16} :ze:0 view)]
+        (reset! (:live-outputs artifact) [output])
+        (with-redefs [gpu/upload-range! (fn [& _]
+                                        (is (not (value/live? output)))
+                                        (throw failure))]
+          (is (identical? failure (try (operation artifact)
+                                       (catch Throwable error error)))))
+        (is (not (value/live? output)))
+        (is (nil? @(:live-outputs artifact)))))
+    (let [output (value/wrap-external-view
+                  {:dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
+          executable (-> executable
+                         (assoc-in [:plan :nodes :state]
+                                   (link-plan/node {:id :state :view view :role :state}))
+                         (assoc-in [:node-views :state] (gpu/->ResidentBufferView ::session :state view)))
+          artifact (-> artifact
+                       (assoc :executable executable :donated {:state :state-out})
+                       (update :in-tree conj {:key :state :node :state :role :state
+                                             :dtype :float :shape [4]}))]
+      (reset! (:live-outputs artifact) [output])
+      (with-redefs [gpu/buffer (fn [& _] (:buffer output))
+                    gpu/upload-range! (fn [& _]
+                                        (is (not (value/live? output)))
+                                        (throw failure))]
+        (is (identical? failure
+                        (try (compiled/invoke-compiled artifact
+                                                       {:state output :a (float-array 4)})
+                             (catch Throwable error error)))))
+      (is (not (value/live? output))))))
+
+(deftest previous-output-can-feed-the-next-invocation-without-reviving-its-wrapper
+  (doseq [[alias? donate?] [[false false] [true false] [false true]]]
+   (let [view (bview/view
+              (bview/allocation {:id :recurrent :byte-size 16 :memory-space :device
+                                 :device :ze:0 :ownership :owned})
+              {:dtype :float :shape [4]})
+        buffer {:dtype :float :n-elements 4 :byte-size 16}
+        output (value/wrap-external-view buffer :ze:0 view)
+        source (if alias? (value/alias-of output) output)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:id :recurrent :target :ze:0
+                            :nodes {:a (link-plan/node {:id :a :view view :role :input})}}
+                     :session ::session :node-views {:a (gpu/->ResidentBufferView ::session :a view)}
+                     :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)
+                     :pending-inputs (atom #{}) :tainted-inputs (atom #{})
+                     :output-ready? (atom true) :completed-replays (atom 0)})
+        artifact (compiled/map->Compiled
+                  {:executable executable :target :ze:0 :donated (if donate? {:a :result} {})
+                   :in-tree [{:key :a :node :a :role :input :dtype :float :shape [4]}]
+                   :out-tree [] :live-outputs (atom [output])})
+        replayed (atom false)]
+    (with-redefs [gpu/buffer (fn [& _] buffer)
+                  gpu/copy-range! (fn [& _] (throw (AssertionError. "self-write must not copy")))
+                  gpu-link/run! (fn [& _]
+                                  (is (not (value/live? output)))
+                                  (reset! replayed true))]
+      (is (= {} (compiled/invoke-compiled artifact {:a source}))))
+    (is @replayed)
+    (is (not (value/live? output)))
+    (is (not (value/live? source))))))
+
 (deftest profiling-and-measurement-preflight-leases-before-mutating-inputs-or-outputs
   (let [view (bview/view
               (bview/allocation {:id :output :byte-size 16 :memory-space :device
