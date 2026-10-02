@@ -356,7 +356,9 @@
   nil)
 
 (defn open-local-content!
-  "Open already-localized content as a scoped MemorySegment lease."
+  "Open already-localized content as a scoped MemorySegment lease.
+   A returned provider lease is released if validation rejects the handoff. Cleanup failures are
+   suppressed onto the original validation error rather than replacing its diagnostic."
   ([provider content] (open-local-content! provider content {}))
   ([provider content opts]
    (let [description (provider-descriptor provider)]
@@ -371,21 +373,25 @@
        (when-not (local-content-lease? lease)
          (fail! "ContentProvider returned a non-LocalContentLease"
                 :numerical-content-lease-type {:actual (type lease)}))
-       (when-not (= content (:content lease))
-         (.close ^AutoCloseable lease)
-         (fail! "ContentProvider opened a lease for different content"
-                :numerical-content-open-mismatch
-                {:expected content :actual (:content lease)}))
-       (let [placement (:placement lease)]
-         (when-not (= (:id description) (:provider-id placement))
-           (.close ^AutoCloseable lease)
-           (fail! "local content placement belongs to a different provider"
-                  :numerical-content-placement-provider-mismatch
-                  {:expected (:id description) :actual (:provider-id placement)}))
-         (tier-by-id description (:tier-id placement)))
-       ;; Access once so a malformed or already-closed lease fails before ownership is returned.
-       (lease-segment lease)
-       lease))))
+       (try
+         (when-not (= content (:content lease))
+           (fail! "ContentProvider opened a lease for different content"
+                  :numerical-content-open-mismatch
+                  {:expected content :actual (:content lease)}))
+         (let [placement (:placement lease)]
+           (when-not (= (:id description) (:provider-id placement))
+             (fail! "local content placement belongs to a different provider"
+                    :numerical-content-placement-provider-mismatch
+                    {:expected (:id description) :actual (:provider-id placement)}))
+           (tier-by-id description (:tier-id placement)))
+         ;; Access once so a malformed or already-closed lease fails before ownership is returned.
+         (lease-segment lease)
+         lease
+         (catch Throwable error
+           (try (.close ^AutoCloseable lease)
+                (catch Throwable cleanup
+                  (when-not (identical? error cleanup) (.addSuppressed error cleanup))))
+           (throw error)))))))
 
 (defn with-local-content
   "Open localized content, call `f` with its lease, and release the provider resource exactly once."

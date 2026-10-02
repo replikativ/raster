@@ -157,6 +157,46 @@
     :segment (MemorySegment/ofArray bytes) :byte-offset 4 :byte-length 8
     :release-fn #(swap! release-count inc)}))
 
+(deftest rejected-provider-leases-release-on-every-failed-handoff
+  (let [expected (address 1)
+        description (content/provider-description
+                     {:id :local-test
+                      :tiers [(content/storage-tier {:id :file :kind :file :locality :node
+                                                     :durability :cached})]
+                      :capabilities #{:scoped-segment}})]
+    (doseq [[alter-lease reason] [[#(assoc-in % [:placement :tier-id] :unknown)
+                                  :numerical-content-provider-tier]
+                                 [#(assoc-in % [:placement :provider-id] :foreign)
+                                  :numerical-content-placement-provider-mismatch]
+                                 [#(assoc % :content (address 2)) :numerical-content-open-mismatch]
+                                 [#(assoc % :byte-length 100) nil]]]
+      (let [releases (atom 0)
+            lease (alter-lease (chunk-lease (byte-array 16) expected releases))
+            provider (reify content/ContentProvider
+                       (-provider-descriptor [_] description)
+                       (-open-local-content! [_ _ _] lease))
+            failure (try (content/open-local-content! provider expected) nil
+                         (catch Throwable error error))]
+        (is (some? failure))
+        (when reason (is (= reason (:reason (ex-data failure)))))
+        (is (= 1 @releases))
+        (is (content/lease-closed? lease))
+        (.close ^AutoCloseable lease)
+        (is (= 1 @releases))))
+    (let [releases (atom 0)
+          cleanup (ex-info "provider cleanup failed" {})
+          lease (-> (chunk-lease (byte-array 16) expected releases)
+                    (assoc-in [:placement :provider-id] :foreign)
+                    (assoc :release-fn #(do (swap! releases inc) (throw cleanup))))
+          provider (reify content/ContentProvider
+                     (-provider-descriptor [_] description)
+                     (-open-local-content! [_ _ _] lease))
+          failure (try (content/open-local-content! provider expected) nil
+                       (catch Throwable error error))]
+      (is (= :numerical-content-placement-provider-mismatch (:reason (ex-data failure))))
+      (is (= [cleanup] (vec (.getSuppressed ^Throwable failure))))
+      (is (= 1 @releases)))))
+
 (deftest content-address-streams-across-staging-blocks
   (let [bytes (byte-array (map unchecked-byte (range 131073)))
         expected (.formatHex (HexFormat/of)
