@@ -6,6 +6,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.core.hardware :as compiler-hardware]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.equation-artifact :as equation-artifact]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -48,6 +49,113 @@
 (def ^:private hip-target :hip:equation-first-source-test)
 (def ^:private hip-matrix-target :hip:equation-first-matrix-test)
 (def ^:private ocl-target :ocl:equation-first-source-test)
+
+(deftest equation-template-owns-static-proof-with-fresh-final-validation
+  (compiled/clear-compilation-cache!)
+  (try
+    ;; Resolve the existing fixture at test execution, after its deftm has been defined.
+    (let [source (ns-resolve 'raster.compiler.equation-first-c-family-test 'c-family-elementwise)
+          checks (atom 0)
+          original emitted-program/validate-with-physical-results!
+          prepare (fn [] (compiled/lower source [(float-array 8) 8]
+                                         {:compiler :equation-first :target cuda-target :dtype :float}))]
+      (with-redefs [emitted-program/validate-with-physical-results!
+                    (fn [program] (swap! checks inc) (original program))]
+        (let [first-prepared (prepare)
+              cold-checks @checks
+              second-prepared (prepare)
+              warm-checks (- @checks cold-checks)
+              [key entry] (first @(var-get #'compiled/compilation-template-cache))
+              compilation @(:value entry)
+              owner {:key key :entry entry}
+              epoch (dispatch/compiler-definition-revision)]
+          (is (= 2 cold-checks) "cold preparation derives owner proof plus fresh final proof")
+          (is (= 1 warm-checks) "warm preparation keeps its independent final proof")
+          (is (emitted-program/retained-validation?
+                (:emitted compilation) (#'compiled/owned-emitted-validation owner compilation)))
+          (is (not (contains? compilation :emitted-validation))
+              "process-local proof is not added to the ordinary persisted compilation value")
+          (is (= [false true] (mapv #(get-in (compiled/preparation-report %) [:template :cache-hit?])
+                                   [first-prepared second-prepared])))
+          (is (not (identical? (get-in first-prepared [:lowering :plan :nodes
+                                                     (get-in first-prepared [:in-tree 0 :node]) :source])
+                               (get-in second-prepared [:lowering :plan :nodes
+                                                      (get-in second-prepared [:in-tree 0 :node]) :source]))))
+          (invocation-link/verify! (:lowering second-prepared))
+          (is (= (+ cold-checks warm-checks 1) @checks) "public verification remains independent")
+          (with-redefs [dispatch/compiler-definition-revision (constantly (inc epoch))]
+            (is (nil? (#'compiled/owned-emitted-validation owner compilation))))
+          (with-redefs [equation-first/compile (fn [& _] nil)]
+            (is (nil? (#'compiled/owned-emitted-validation owner compilation))))
+          (with-redefs [emitted-program/validate-with-physical-results! original]
+            (is (nil? (#'compiled/owned-emitted-validation owner compilation))))
+          (is (nil? (#'compiled/owned-emitted-validation owner (assoc compilation :stats {})))))))
+    (finally (compiled/clear-compilation-cache!))))
+
+(deftest static-proof-failure-evicts-the-owner-and-allows-retry
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [source (ns-resolve 'raster.compiler.equation-first-c-family-test 'c-family-elementwise)
+          prepare #(compiled/lower source [(float-array 8) 8]
+                                   {:compiler :equation-first :target cuda-target :dtype :float})
+          original emitted-program/validate-with-physical-results!
+          fail? (atom true)
+          failure (ex-info "static validation failed" {:reason ::static-proof-probe})]
+      (with-redefs [emitted-program/validate-with-physical-results!
+                    (fn [program]
+                      (if (compare-and-set! fail? true false) (throw failure) (original program)))]
+        (is (identical? failure (try (prepare) nil (catch clojure.lang.ExceptionInfo error error))))
+        (is (zero? (:entries (compiled/compilation-cache-stats))))
+        (is (compiled/prepared? (prepare)))
+        (is (= 1 (:entries (compiled/compilation-cache-stats))))))
+    (finally (compiled/clear-compilation-cache!))))
+
+(deftest delayed-static-proof-rechecks-owner-guards-after-resolution
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [source (ns-resolve 'raster.compiler.equation-first-c-family-test 'c-family-elementwise)
+          _ (compiled/lower source [(float-array 8) 8]
+                            {:compiler :equation-first :target cuda-target :dtype :float})
+          cache (var-get #'compiled/compilation-template-cache)
+          [key original-entry] (first @cache)
+          compilation @(:value original-entry)
+          validated @(:emitted-validation original-entry)
+          epoch (dispatch/compiler-definition-revision)
+          pipeline-root @#'equation-first/compile
+          validator-root @#'emitted-program/validate-with-physical-results!]
+      (doseq [change [:epoch :pipeline :validator :owner]]
+        (let [revision (atom epoch)
+              resolutions (atom 0)
+              entry (assoc original-entry :emitted-validation
+                           (delay
+                             (swap! resolutions inc)
+                             (case change
+                               :epoch (swap! revision inc)
+                               :pipeline (alter-var-root #'equation-first/compile
+                                                         (constantly (fn [& args] (apply pipeline-root args))))
+                               :validator (alter-var-root #'emitted-program/validate-with-physical-results!
+                                                          (constantly (fn [program] (validator-root program))))
+                               :owner (swap! cache assoc key (assoc original-entry :replacement true)))
+                             validated))]
+          (swap! cache assoc key entry)
+          (with-redefs [dispatch/compiler-definition-revision #(deref revision)
+                        equation-first/compile pipeline-root
+                        emitted-program/validate-with-physical-results! validator-root]
+            (is (nil? (#'compiled/owned-emitted-validation {:key key :entry entry} compilation))
+                (str change " drift during resolution cannot authorize reuse"))
+            (is (= 1 @resolutions)))
+          (swap! cache assoc key original-entry)))
+      (let [replacement (assoc original-entry :replacement true)
+            failure (ex-info "failed after replacement" {:reason ::owner-replaced})
+            entry (assoc original-entry :emitted-validation
+                         (delay (swap! cache assoc key replacement) (throw failure)))]
+        (swap! cache assoc key entry)
+        (is (identical? failure
+                        (try (#'compiled/owned-emitted-validation {:key key :entry entry} compilation)
+                             nil (catch clojure.lang.ExceptionInfo error error))))
+        (is (identical? replacement (get @cache key))
+            "failed proof must not evict a concurrent replacement owner")))
+    (finally (compiled/clear-compilation-cache!))))
 
 (deftest symbolic-storage-prefixes-are-range-checked-before-allocation
   (doseq [target [ocl-target cuda-target hip-target]]

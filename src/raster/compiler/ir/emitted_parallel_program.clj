@@ -237,6 +237,16 @@
     (and (.isInstance ^Class validation-seal-class seal)
          (identical? validation-evidence-seal-token (seal parallel-program evidence)))))
 
+(defn ^:no-doc checked-retained-validation!
+  "Consume only an exact independently validated program/evidence pair. This does not validate
+   current invocation bindings, and does not replace the independent public validators."
+  [parallel-program evidence]
+  (when-not (retained-validation? parallel-program evidence)
+    (throw (ex-info "retained emitted-program validation does not belong to this exact program"
+                    {:reason :emitted-parallel-program-retained-validation
+                     :ir :emitted-parallel-program})))
+  evidence)
+
 (defn ^:no-doc validate-with-physical-results!
   "Independently validate a program and retain read-only plain equation projections.
    Evidence is sealed to this exact immutable program and evidence object; retained-validation?

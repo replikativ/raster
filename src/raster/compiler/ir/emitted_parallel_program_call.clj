@@ -577,9 +577,11 @@
 (defn- stage-inputs
   "Fresh checked inputs and host results for this construction only. The evaluator is neither
    returned nor retained. This private value is not an externally reusable validation proof."
-  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
+  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation]
   (let [{parallel-program :program projections :projections}
-        (emitted-program/validate-with-physical-results! parallel-program)
+        (if retained-validation
+          (emitted-program/checked-retained-validation! parallel-program retained-validation)
+          (emitted-program/validate-with-physical-results! parallel-program))
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
                                              (filter #(emitted-equation/emitted-equation?
@@ -676,9 +678,14 @@
    depend on device results.
    Optional `result-views` maps logical results to their prefix-producing physical destinations.
    This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
-   validates concrete views, and runtime preparation requires checked view resolution."
+   validates concrete views, and runtime preparation requires checked view resolution.
+   The seven-argument arity is an internal static-evidence capability path. It skips only repeated
+   emitted-program analysis; scalar/buffer/result-view checks and host staging remain fresh."
   ([parallel-program buffers scalar-values loop-scratch evaluate-host]
    (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
   ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
+   (make parallel-program buffers scalar-values loop-scratch evaluate-host result-views nil))
+  ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation]
    (construct-staged-call
-    (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host result-views))))
+    (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host result-views
+                  retained-validation))))
