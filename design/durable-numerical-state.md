@@ -212,6 +212,17 @@ This establishes a conservative completed-byte boundary inside linked ownership.
 publication, verified codec matching, scalable selective inspection and tracking mutation through
 arbitrary raw-session access remain separate obligations on the original campaign.
 
+`numerical-content/decode-raw-array-chunk!` is the corresponding production byte-codec boundary
+for declared `:raw-array` chunks. It receives the independently checked target element dtype and
+an explicit destination byte order, rejects encoded/ambiguous storage contracts, validates exact
+shape-derived byte counts and non-overlapping writable destination storage, then verifies the
+leased SHA-256 before any write. Endian conversion reverses element bytes with bounded staging;
+NaN payloads, signed zeros, half bits and integral values are not numerically converted. The
+caller retains the immutable source lease and owns the destination. Later copy/close failures
+are not transactional rollback. This decoder proves neither target field/coordinate compatibility
+nor GPU byte order; callers must still check the independent restore contract and establish the
+device storage representation before upload. A device-native receipt alone is not its codec input.
+
 ## Konserve, mmap, LMDB and S3
 
 The practical first composition is a Konserve tiered store with a local file frontend and an

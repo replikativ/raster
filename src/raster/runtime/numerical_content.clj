@@ -8,7 +8,8 @@
 
    This namespace owns no store implementation. In particular, remote object storage is localized
    before `open-local-content!`; a remote object is never represented as a fictitious mmap."
-  (:require [raster.compiler.ir.execution-plan :as execution]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.numerical-state :as numerical-state])
   (:import [java.lang AutoCloseable]
            [java.lang.foreign MemorySegment]
@@ -258,6 +259,63 @@
                :numerical-content-chunk-digest
                {:chunk (:id chunk) :expected expected :actual actual}))))
   lease)
+
+(defn decode-raw-array-chunk!
+  "Verify a leased :raw-array chunk and copy its exact element bits into destination.
+
+   element-dtype comes from the independently checked target field, not inferred payload bytes.
+   destination-byte-order is explicit; this does not attest a GPU's representation or perform an
+   upload. Floating NaNs, signed zeros and half payloads are never converted through host numbers.
+   All format/extent/alias checks and SHA-256 verification precede writes. Endian conversion uses
+   bounded 64-KiB staging. The caller owns the non-overlapping destination and retains the source
+   lease, which must remain immutable throughout verification and copying. A concurrent close or
+   write failure is not transactional rollback, and yields no successful decode result."
+  [chunk lease element-dtype ^MemorySegment destination destination-byte-order]
+  (numerical-state/chunk chunk)
+  (let [width (dtype/bytes-of element-dtype)
+        bytes (reduce *' width (:shape chunk))
+        source (lease-segment lease)]
+    (when-not (= {:format :raw-array :byte-order (get-in chunk [:storage :byte-order])}
+                 (:storage chunk))
+      (fail! "raw-array decoding requires an unencoded raw-array storage contract"
+             :numerical-content-codec-format {:storage (:storage chunk)}))
+    (when-not (contains? numerical-state/byte-orders destination-byte-order)
+      (fail! "raw-array decoding requires explicit destination byte order"
+             :numerical-content-codec-byte-order {:byte-order destination-byte-order}))
+    (when-not (and (<= bytes Long/MAX_VALUE)
+                   (= bytes (:logical-byte-length chunk) (:stored-byte-length chunk)))
+      (fail! "raw-array byte extent disagrees with shape and element dtype"
+             :numerical-content-codec-extent
+             {:shape (:shape chunk) :dtype element-dtype :expected bytes
+              :logical (:logical-byte-length chunk) :stored (:stored-byte-length chunk)}))
+    (when-not (and (instance? MemorySegment destination)
+                   (= bytes (.byteSize destination))
+                   (not (.isReadOnly destination))
+                   (.isAlive (.scope destination))
+                   (.isAccessibleBy destination (Thread/currentThread)))
+      (fail! "raw-array destination must be a live writable exact-extent segment"
+             :numerical-content-codec-destination {:expected bytes}))
+    (when (.isPresent (.asOverlappingSlice source destination))
+      (fail! "raw-array decoding cannot mutate its leased immutable source"
+             :numerical-content-codec-alias {}))
+    (verify-chunk-lease! chunk lease)
+    (if (or (= 1 width) (= destination-byte-order (get-in chunk [:storage :byte-order])))
+      (MemorySegment/copy source 0 destination 0 (long bytes))
+      (let [scratch (byte-array 65536)
+            staging (MemorySegment/ofArray scratch)]
+        (loop [offset 0]
+          (when (< offset bytes)
+            (let [n (long (min 65536 (- bytes offset)))]
+              (MemorySegment/copy source offset staging 0 n)
+              (doseq [base (range 0 n width)
+                      lane (range (quot width 2))]
+                (let [left (+ base lane) right (+ base (- width 1 lane))
+                      value (aget scratch left)]
+                  (aset-byte scratch left (aget scratch right))
+                  (aset-byte scratch right value)))
+              (MemorySegment/copy staging 0 destination offset n)
+              (recur (+ offset n)))))))
+    destination))
 
 (defn provider-descriptor
   [provider]

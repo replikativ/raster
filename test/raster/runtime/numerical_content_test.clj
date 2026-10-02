@@ -1,11 +1,12 @@
 (ns raster.runtime.numerical-content-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.buffer-view :as buffer-view]
             [raster.compiler.ir.numerical-state :as numerical-state]
             [raster.gpu.core :as gpu]
             [raster.runtime.numerical-content :as content])
   (:import [java.lang AutoCloseable]
-           [java.lang.foreign MemorySegment ValueLayout]
+           [java.lang.foreign Arena MemorySegment ValueLayout]
            [java.security MessageDigest]
            [java.util HexFormat]))
 
@@ -269,6 +270,97 @@
                              nil
                              (catch clojure.lang.ExceptionInfo error (ex-data error))))))))
     (is (= 3 @releases))))
+
+(defn- codec-fixture [bytes element-dtype order]
+  (let [segment (MemorySegment/ofArray bytes)
+        address (content/content-address-of segment)
+        chunk (numerical-state/chunk
+               {:id :codec :offsets [0] :shape [(quot (alength bytes) (dtype/bytes-of element-dtype))]
+                :logical-byte-length (alength bytes) :stored-byte-length (alength bytes)
+                :content address :storage {:format :raw-array :byte-order order}})
+        lease (content/local-content-lease
+               {:content address
+                :placement (content/content-placement
+                            {:provider-id :codec-test :tier-id :memory :content address})
+                :segment segment :byte-length (alength bytes) :release-fn (fn [])})]
+    {:chunk chunk :lease lease :source segment}))
+
+(deftest raw-array-codec-preserves-all-element-bits-in-both-orders
+  ;; Arbitrary bits include payload NaNs, sign bits and half patterns; never host FP decoding.
+  (doseq [element-dtype [:byte :half :int :long :float :double :f32]
+          source-order [:little-endian :big-endian]
+          target-order [:little-endian :big-endian]]
+    (let [width (dtype/bytes-of element-dtype)
+          ;; Little-endian quiet-NaN payload, negative zero and all-one payload per width.
+          words ({1 [0 -128 -1]
+                  2 [1 126 0 -128 -1 -1]
+                  4 [1 0 -64 127 0 0 0 -128 -1 -1 -1 -1]
+                  8 [1 0 0 0 0 0 -8 127 0 0 0 0 0 0 0 -128 -1 -1 -1 -1 -1 -1 -1 -1]}
+                 width)
+          bytes (byte-array (if (= :little-endian source-order)
+                              words (mapcat reverse (partition width words))))
+          {:keys [chunk lease source]} (codec-fixture bytes element-dtype source-order)
+          target (byte-array (alength bytes))
+          expected (if (= source-order target-order)
+                     (vec bytes)
+                     (vec (mapcat reverse (partition width bytes))))]
+      (with-open [lease lease]
+        (let [destination (MemorySegment/ofArray target)]
+          (is (identical? destination
+                          (content/decode-raw-array-chunk! chunk lease element-dtype destination target-order))))
+        (is (= expected (vec target)))
+        (is (= (vec bytes) (vec (.toArray source ValueLayout/JAVA_BYTE))))
+        (is (false? (content/lease-closed? lease)))))))
+
+(deftest raw-array-codec-bounds-staging-and-validates-before-any-write
+  (let [bytes (byte-array (map unchecked-byte (range 131080)))
+        {:keys [chunk lease source]} (codec-fixture bytes :double :little-endian)
+        target (byte-array (alength bytes))
+        destination (MemorySegment/ofArray target)
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (with-open [lease lease]
+      (is (identical? destination
+                      (content/decode-raw-array-chunk! chunk lease :double destination :big-endian)))
+      (is (= (vec (mapcat reverse (partition 8 bytes))) (vec target)))
+      (java.util.Arrays/fill target (byte 99))
+      (let [unchanged (vec target)]
+        (doseq [[bad-chunk bad-lease dt dst order expected]
+                [[(assoc-in chunk [:storage :format] :compressed) lease :double destination :big-endian
+                  :numerical-content-codec-format]
+                 [(assoc-in chunk [:storage :compression] :none) lease :double destination :big-endian
+                  :numerical-content-codec-format]
+                 [chunk lease :double destination :native :numerical-content-codec-byte-order]
+                 [chunk lease :float destination :big-endian :numerical-content-codec-extent]
+                 [chunk lease :double (.asSlice destination 0 8) :big-endian :numerical-content-codec-destination]
+                 [chunk lease :double (.asReadOnly destination) :big-endian :numerical-content-codec-destination]
+                 [chunk lease :double source :big-endian :numerical-content-codec-alias]
+                 [(assoc chunk :shape [Long/MAX_VALUE]) lease :double destination :big-endian
+                  :numerical-content-codec-extent]
+                 [chunk lease :unknown destination :big-endian :unknown-dtype]
+                 [chunk lease :double nil :big-endian :numerical-content-codec-destination]]]
+          (is (= expected (reason #(content/decode-raw-array-chunk! bad-chunk bad-lease dt dst order))))
+          (is (= unchanged (vec target))))
+        (aset-byte bytes 2 (byte 77))
+        (is (= :numerical-content-chunk-digest
+               (reason #(content/decode-raw-array-chunk! chunk lease :double destination :big-endian))))
+        (is (= unchanged (vec target)))))))
+
+(deftest raw-array-codec-rejects-partial-alias-and-closed-destinations
+  (let [bytes (byte-array (range 16))
+        base (MemorySegment/ofArray bytes)
+        address (content/content-address-of (.asSlice base 4 8))
+        chunk (raw-chunk address 8)
+        reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (with-open [lease (chunk-lease bytes address (atom 0))]
+      (is (= :numerical-content-codec-alias
+             (reason #(content/decode-raw-array-chunk! chunk lease :byte (.asSlice base 8 8) :little-endian))))
+      (is (= (vec (range 16)) (vec bytes)))
+      (let [arena (Arena/ofConfined)
+            destination (.allocate arena 8)]
+        (.close arena)
+        (is (= :numerical-content-codec-destination
+               (reason #(content/decode-raw-array-chunk! chunk lease :byte destination :little-endian))))
+        (is (false? (content/lease-closed? lease)))))))
 
 (defn- fake-transfer-session
   []

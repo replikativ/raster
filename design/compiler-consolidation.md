@@ -1438,3 +1438,14 @@ required removing an unsupported host-byte-order label; raw receipts now explici
 device-native representation. Focused content/artifact/composition/lease/native tests pass 51 tests
 / 541 assertions in the retained capped REPL; full CI remains a landing prerequisite. Publication
 and cross-device codec/restore matching remain open.
+
+### Verified raw-array byte codec — 2026-10-03
+
+Production content runtime now decodes verified `:raw-array` chunks into caller-owned segments,
+with explicit target dtype/byte order, exact shape-derived extents and source/destination alias
+protection. It uses the existing dtype table and content verifier, not another representation
+registry. Bounded endian reversal preserves raw element bits and does not infer GPU storage
+semantics. Runtime tests pass 13 tests / 218 assertions, including both orders, NaN/signed-zero/half
+patterns, staging boundaries, digest failures, overflow, partial overlap and closed destinations.
+Pivotal review found no blocker. Full CI remains required; publication and independent semantic
+restore matching are not established by this codec alone.
