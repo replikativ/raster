@@ -210,10 +210,38 @@
   [parallel-program]
   (validate-program! parallel-program equation-candidates))
 
+(def ^:private validation-evidence-seal-token (Object.))
+
+(defn- validation-seal [program-ref owner]
+  (fn [candidate-program candidate-evidence]
+    (when (and (some? candidate-program)
+               (identical? (.get ^java.lang.ref.WeakReference program-ref) candidate-program)
+               (identical? @owner candidate-evidence))
+      validation-evidence-seal-token)))
+
+(def ^:private validation-seal-class (class (validation-seal nil nil)))
+
+(defn- seal-validation-evidence [parallel-program evidence]
+  (let [program-ref (java.lang.ref.WeakReference. parallel-program)
+        owner (volatile! nil)
+        sealed (with-meta evidence
+                 {::validation-seal (validation-seal program-ref owner)})]
+    (vreset! owner sealed)
+    sealed))
+
+(defn ^:no-doc retained-validation?
+  "True only for the exact in-process program/evidence objects independently validated here.
+   A copied or modified program/evidence does not inherit validation authority."
+  [parallel-program evidence]
+  (let [seal (::validation-seal (meta evidence))]
+    (and (.isInstance ^Class validation-seal-class seal)
+         (identical? validation-evidence-seal-token (seal parallel-program evidence)))))
+
 (defn ^:no-doc validate-with-physical-results!
-  "Independently validate a program and retain plain equation projections for its caller.
-   The fresh identity index is construction-local and must not be retained in a call or template.
-   Dispatch and structured-loop validation are unchanged and supply no reusable projection here."
+  "Independently validate a program and retain read-only plain equation projections.
+   Evidence is sealed to this exact immutable program and evidence object; retained-validation?
+   checks ownership before internal reuse. Public validators still independently check programs.
+   Dispatch and structured-loop validation are unchanged and supply no projection here."
   [parallel-program]
   (let [projections (java.util.IdentityHashMap.)
         candidates-for
@@ -225,4 +253,5 @@
               [boundary])
             (equation-candidates operation)))
         checked (validate-program! parallel-program candidates-for)]
-    {:program checked :projections projections}))
+    (seal-validation-evidence
+     checked {:program checked :projections (java.util.Collections/unmodifiableMap projections)})))

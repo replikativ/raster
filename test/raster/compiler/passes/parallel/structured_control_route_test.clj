@@ -968,6 +968,38 @@
                             (catch clojure.lang.ExceptionInfo error error))))))
       (is (zero? @mapped) "a valid program cannot hide an invalid source call"))))
 
+(deftest retained-program-validation-is-exact-and-read-only
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        source-program (:program call)
+        evidence (emitted-program/validate-with-physical-results! source-program)
+        projections (:projections evidence)
+        numerical-step (first (filter program-call/emitted-equation-call? (:steps call)))
+        boundary (first (get-in numerical-step [:equation :operations]))]
+    (is (emitted-program/retained-validation? source-program evidence))
+    (is (not (emitted-program/retained-validation?
+              (with-meta source-program {:copied true}) evidence)))
+    (is (not (emitted-program/retained-validation?
+              source-program (with-meta evidence (assoc (meta evidence) :copied true)))))
+    (is (not (emitted-program/retained-validation?
+              source-program (assoc evidence :projections (java.util.IdentityHashMap.)))))
+    (let [seal-key :raster.compiler.ir.emitted-parallel-program/validation-seal
+          token ((get (meta evidence) seal-key) source-program evidence)]
+      (is (not (emitted-program/retained-validation?
+                source-program (with-meta evidence {seal-key (fn [& _] token)})))
+          "arbitrary metadata callbacks cannot replace the validator's owner check"))
+    (is (.containsKey ^java.util.Map projections boundary))
+    (is (= (emitted-equation/physical-results boundary) (.get ^java.util.Map projections boundary)))
+    (is (thrown? UnsupportedOperationException (.put ^java.util.Map projections boundary {})))
+    (is (thrown? UnsupportedOperationException (.clear ^java.util.Map projections)))
+    (is (thrown? UnsupportedOperationException
+                 (.setValue ^java.util.Map$Entry (first (.entrySet ^java.util.Map projections)) {})))
+    (is (identical? call (program-call/validate! call)) "public call verification remains independent")
+    (let [another (emitted-program/validate-with-physical-results! source-program)]
+      (is (emitted-program/retained-validation? source-program another))
+      (is (not (identical? evidence another)))
+      (is (not (emitted-program/retained-validation?
+                (assoc source-program :dialect :unsupported) another))))))
+
 (deftest buffer-renaming-shares-only-an-exact-synchronous-boundary-projection
   (let [{:keys [call]} (prepared-mixed-call 3)
         numerical-step (first (filter program-call/emitted-equation-call? (:steps call)))
