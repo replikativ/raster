@@ -22,6 +22,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.equation-artifact-store :as equation-artifact-store]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.build-manifest :as build-manifest]
@@ -40,7 +41,10 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.schedule :as gpu-schedule]
-            [raster.gpu.value :as v]))
+            [raster.gpu.value :as v]
+            [raster.runtime.numerical-content :as numerical-content])
+  (:import [java.lang.foreign MemorySegment]
+           [java.nio ByteOrder]))
 
 (declare invoke-compiled)
 
@@ -94,6 +98,37 @@
 (defn- sealed-artifact? [artifact]
   (let [seal (:provenance-seal artifact)]
     (and (fn? seal) (identical? artifact-seal-token (seal artifact)))))
+
+(defrecord CompletedEvidence [data lease executable epoch values released? provenance-seal]
+  java.io.Closeable
+  (close [this]
+    (when-not (sealed-artifact? this)
+      (throw (ex-info "completed evidence requires its original owner"
+                      {:reason :compiled-completed-evidence-owner})))
+    (locking (:lifetime-lock executable)
+      (when (compare-and-set! released? false true)
+        (try (doseq [value (vals values)] (v/free! value))
+             (finally (.close ^java.io.Closeable lease))))))
+  clojure.lang.IDeref
+  (deref [this]
+    (when-not (sealed-artifact? this)
+      (throw (ex-info "completed evidence requires its original owner"
+                      {:reason :compiled-completed-evidence-owner})))
+    data))
+
+(defn completed-evidence? [value]
+  (and (instance? CompletedEvidence value) (sealed-artifact? value)))
+
+(defn completed-output-values
+  "Return pinned DeviceArray outputs from original completed evidence, until it is closed.
+   Dereferencing evidence itself returns historical portable metadata, including after close."
+  [evidence]
+  (when-not (completed-evidence? evidence)
+    (throw (ex-info "completed output access requires original evidence"
+                    {:reason :compiled-completed-evidence-owner})))
+  (locking (:lifetime-lock (:executable evidence))
+    @(:lease evidence)
+    (:values evidence)))
 
 ;; Compilation templates are immutable and argument-independent.  LinkPlan lowering below still
 ;; runs for every invocation, so shapes, weights, roles, views, and ownership never enter this
@@ -1334,7 +1369,7 @@
           (gpu-link/write! (:executable c) node source)))
       (finally (doseq [read @borrowed] (v/free! read))))))
 
-(defn- invoke-compiled-unleased
+(defn- invoke-compiled-unleased*
   "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
      1. preflight all donations before any mutation;
      2. consume donations and retire previous output wrappers after complete preflight;
@@ -1344,7 +1379,7 @@
    Mutation of resident :state is invisible: the caller sees fresh output values and the old
    donated inputs invalidated — never a mutation. Backend failures after preflight consume
    donations too: partially completed device writes cannot be rolled back."
-  [^Compiled c inputs]
+  [^Compiled c inputs before-replay!]
   (let [{:keys [executable in-tree out-tree donated target]} c
         inputs (project-aggregate-inputs in-tree inputs)
         in-nodes     (into {} (map (juxt :key identity)) in-tree)
@@ -1369,7 +1404,8 @@
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
         _ (write-invocation-inputs! c input-nodes inputs previous checked-donations)]
-    ;; 4. replay, no download.
+    (when before-replay! (before-replay!))
+    ;; 4. replay, no download on the ordinary invocation path.
     (gpu-link/run! executable)
     ;; 5. project outputs as resident device values; record them for next-call invalidation.
     (let [out (into {} (map (fn [{:keys [key] :as node}]
@@ -1378,6 +1414,9 @@
       (when-let [live-outputs (:live-outputs c)]
         (reset! live-outputs (vec (vals out))))
       out)))
+
+(defn- invoke-compiled-unleased [c inputs]
+  (invoke-compiled-unleased* c inputs nil))
 
 (defn invoke-compiled
   "Invoke a resident artifact under its linked lifetime guard. A live output lease rejects the
@@ -1427,6 +1466,133 @@
 ;; ================================================================
 ;; Inspection (§2.1) + lifecycle
 ;; ================================================================
+
+(defn- completed-frontier! [c]
+  (let [executable (:executable c)
+        plan (:plan executable)
+        evidence (get-in c [:lowering :certificate :effect-evidence])
+        initialization (:initialization evidence)
+        fail (fn [reason] (throw (ex-info "compiled execution cannot attest resident byte history"
+                                         {:reason reason})))
+        _ (when-not (and (:owns-session? executable)
+                         (every? #(= :owned (get-in % [:view :allocation :ownership]))
+                                 (vals (:nodes plan))))
+            (fail :compiled-evidence-ownership))
+        _ (when-not (link-plan/retained-effect-evidence? plan evidence)
+            (fail :compiled-evidence-initialization))
+        _ (when (seq (:record-time-prologue (gpu-link/execution-order executable)))
+            (fail :compiled-evidence-record-time-prologue))
+        roots (set/union (:requires initialization) (:initializers initialization))
+        outputs (set (:outputs plan))
+        written (mapv #(get-in plan [:nodes % :view]) (:writes initialization))
+        state (into #{} (filter (fn [node]
+                                 (some #(bview/overlaps? (get-in plan [:nodes node :view]) %)
+                                       written))) roots)]
+    (doseq [node (set/union roots outputs)]
+      (let [view (get-in plan [:nodes node :view])]
+        (when-not (and view (= (:strides view) (bview/dense-strides (:shape view))))
+          (fail :compiled-evidence-noncontiguous))))
+    {:roots roots :outputs outputs :state state}))
+
+(defn- require-evidence-ready! [executable]
+  (when (or (seq @(:pending-inputs executable)) (seq @(:tainted-inputs executable))
+            (seq (:events @(:session executable))))
+    (throw (ex-info "resident byte evidence requires initialized storage and no async events"
+                    {:reason :compiled-evidence-unready}))))
+
+(defn- snapshot-resident-bytes [executable nodes]
+  (require-evidence-ready! executable)
+  (into {}
+        (map (fn [node]
+               (let [view (get-in executable [:plan :nodes node :view])
+                     resident (gpu-link/node-view executable node)
+                     element-bytes (dtype/bytes-of (:dtype view))
+                     content (numerical-content/content-address-from-reader
+                              (:byte-length view)
+                              (fn [offset ^MemorySegment destination]
+                                (let [n (.byteSize destination)]
+                                  (gpu/download-range! (:session executable) resident destination
+                                                       {:src-element (quot offset element-bytes)
+                                                        :elements (quot n element-bytes)})
+                                  n)))]
+                 [node (assoc (select-keys view [:dtype :shape :strides :byte-length])
+                              :byte-order (if (= (ByteOrder/nativeOrder) ByteOrder/LITTLE_ENDIAN)
+                                            :little-endian :big-endian)
+                              :content content)])))
+        nodes))
+
+(defn- bound-schedule-evidence! [executable]
+  (mapv (fn [index {:keys [instance executable]}]
+          (when-not (and (map? executable) (seq (:entry-points executable))
+                         (every? string? (:entry-points executable)))
+            (throw (ex-info "bound schedule lacks retained executable evidence"
+                            {:reason :compiled-evidence-bound-schedule :index index})))
+          {:index index :instance instance
+           :executable (select-keys executable [:kind :strategy :precision :entry-points :selection])})
+        (range) (gpu-link/execution-info executable)))
+
+(defn invoke-with-evidence
+  "Execute an original compiler-owned Compiled and attest actual resident bytes offline.
+
+   SHA-256 input snapshots follow all invocation writes, never Prepared defaults or caller hashes.
+   Outputs and mutated initialization roots are read after synchronous completion. The returned
+   Closeable pins outputs for publication; completed-output-values exposes them while live.
+   Deref returns historical portable evidence. Close invalidates its projected DeviceArrays.
+
+   Requires complete retained program identity, wholly owned session/storage, dense views, no
+   record-time prologue or async events. Adjacent witnessed mutable state can name the previous
+   same-owner receipt; ordinary replay/measurement/tuning/failed evidence breaks continuity.
+   This does not publish durable blobs, prove mathematical equivalence, or track raw-session
+   mutation outside the LinkedExecutable ownership contract. Ordinary invocation is unchanged."
+  [c inputs]
+  (let [program (execution-identity c)
+        _ (when-not (compiled? c)
+            (throw (ex-info "resident evidence requires an instantiated artifact"
+                            {:reason :compiled-evidence-unbound})))
+        executable (:executable c)]
+    (gpu-link/with-unleased-execution!
+     executable :invoke-with-evidence
+     (fn []
+       (let [{:keys [roots outputs state]} (completed-frontier! c)
+             schedules (bound-schedule-evidence! executable)
+             owner-state @(:execution-state executable)
+             previous (:completed-evidence owner-state)
+             before (volatile! nil)
+             held (volatile! nil)]
+         (try
+           (let [{:keys [result lease]}
+                 (gpu-link/execute-and-lease!
+                  executable :invoke-with-evidence
+                  #(invoke-compiled-unleased*
+                    c inputs (fn [] (vreset! before (snapshot-resident-bytes executable roots)))))
+                 _ (vreset! held lease)
+                 after (snapshot-resident-bytes executable outputs)
+                 post-state (snapshot-resident-bytes executable state)
+                 parent (when (and (seq state) (completed-evidence? previous)
+                                   (identical? executable (:executable previous))
+                                   (= (:epoch previous) (:value-epoch owner-state))
+                                   (= (:fingerprint program) (get-in previous [:data :program-fingerprint]))
+                                   (= (select-keys @before state) (get-in previous [:data :post-state])))
+                          (get-in previous [:data :fingerprint]))
+                 data {:kind :raster.compiled/completed-resident-bytes-v1
+                       :scope :completed-linked-replay :program-fingerprint (:fingerprint program)
+                       :bound-schedules schedules :inputs @before :outputs after :post-state post-state
+                       :parent parent :attests-resident-bytes? true}
+                 data (assoc data :fingerprint (semantic-fingerprint/fingerprint data))
+                 receipt (seal-artifact
+                          (->CompletedEvidence data lease executable
+                                               (:value-epoch @(:execution-state executable))
+                                               result (atom false) nil))]
+             (swap! (:execution-state executable) assoc :completed-evidence receipt)
+             receipt)
+           (catch Throwable error
+             (swap! (:execution-state executable) dissoc :completed-evidence)
+             (invalidate-live-outputs! c)
+             (when-let [lease @held]
+               (try (.close ^java.io.Closeable lease)
+                    (catch Throwable cleanup
+                      (when-not (identical? error cleanup) (.addSuppressed error cleanup)))))
+             (throw error))))))))
 
 (defn explain
   "Print the artifact's shape: in-tree / out-tree / donation plan / target / schedule and the

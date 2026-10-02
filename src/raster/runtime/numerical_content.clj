@@ -188,27 +188,44 @@
   (.asSlice ^MemorySegment (:segment lease) (long (:byte-offset lease))
             (long (:byte-length lease))))
 
-(defn content-address-of
-  "Hash immutable stored bytes without materializing the whole segment on the Java heap.
-
-   This is the address of the stored payload, not of its decoded numerical values. A fixed-size
-   staging array also works for mapped chunks larger than ByteBuffer's int-indexed limit."
-  [^MemorySegment segment]
-  (when-not (instance? MemorySegment segment)
-    (fail! "content hashing requires a MemorySegment"
-           :numerical-content-hash-segment {:actual (type segment)}))
+(defn content-address-from-reader
+  "Hash exactly byte-length stored bytes through one bounded 64-KiB staging segment.
+   read! receives [byte-offset destination-segment], synchronously fills that entire segment,
+   and returns its byte count. The caller owns source lifetime, synchronization and immutability;
+   this hashes supplied bytes, not authority/provenance or decoded numerical values."
+  [byte-length read!]
+  (when-not (and (integer? byte-length) (<= 0 byte-length Long/MAX_VALUE) (ifn? read!))
+    (fail! "stream content hashing requires a bounded byte extent and callable reader"
+           :numerical-content-hash-reader {:byte-length byte-length}))
   (let [digest (MessageDigest/getInstance "SHA-256")
         scratch (byte-array 65536)
         scratch-segment (MemorySegment/ofArray scratch)
-        total (.byteSize segment)]
+        total (long byte-length)]
     (loop [offset 0]
       (when (< offset total)
-        (let [n (int (min (long (alength scratch)) (- total offset)))]
-          (MemorySegment/copy segment offset scratch-segment 0 n)
+        (let [n (int (min (long (alength scratch)) (- total offset)))
+              actual (read! offset (.asSlice scratch-segment 0 n))]
+          (when-not (= n actual)
+            (fail! "stream content reader did not complete the requested range"
+                   :numerical-content-hash-short-read {:offset offset :expected n :actual actual}))
           (.update digest scratch 0 n)
           (recur (+ offset n)))))
     (numerical-state/content-address :sha-256
                                      (.formatHex (HexFormat/of) (.digest digest)))))
+
+(defn content-address-of
+  "Hash stored segment bytes without materializing the whole segment on the Java heap.
+   The fixed staging bound also supports mapped chunks beyond ByteBuffer's int-indexed limit."
+  [^MemorySegment segment]
+  (when-not (instance? MemorySegment segment)
+    (fail! "content hashing requires a MemorySegment"
+           :numerical-content-hash-segment {:actual (type segment)}))
+  (content-address-from-reader
+   (.byteSize segment)
+   (fn [offset ^MemorySegment destination]
+     (let [n (.byteSize destination)]
+       (MemorySegment/copy segment offset destination 0 n)
+       n))))
 
 (defn verify-chunk-lease!
   "Verify a localized chunk's exact stored extent and SHA-256 before restore or device upload.
