@@ -92,6 +92,31 @@
           (is (nil? (#'compiled/owned-emitted-validation owner (assoc compilation :stats {})))))))
     (finally (compiled/clear-compilation-cache!))))
 
+(deftest storage-projection-reuses-only-owned-static-evidence
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [source (ns-resolve 'raster.compiler.equation-first-c-family-test 'c-family-elementwise)
+          args [(float-array 8) 8]
+          _ (compiled/lower source args
+                            {:compiler :equation-first :target cuda-target :dtype :float})
+          [key entry] (first @(var-get #'compiled/compilation-template-cache))
+          compilation @(:value entry)
+          evidence (#'compiled/owned-emitted-validation {:key key :entry entry} compilation)
+          original emitted-equation/physical-results
+          projections (atom 0)]
+      (with-redefs [emitted-equation/physical-results
+                    (fn [boundary] (swap! projections inc) (original boundary))]
+        (let [fresh (equation-first/lower compilation args)
+              independent-count @projections
+              retained (:plan (equation-first/lower compilation args (fn [plan] {:plan plan})
+                                                    evidence))]
+          (is (= 1 independent-count) "ordinary lowering independently derives storage projection")
+          (is (= independent-count @projections) "owned projection avoids only static re-derivation")
+          (is (= (:values fresh) (:values retained)))
+          (is (= (:outputs fresh) (:outputs retained)))
+          (is (= (:aliases fresh) (:aliases retained))))))
+    (finally (compiled/clear-compilation-cache!))))
+
 (deftest static-proof-failure-evicts-the-owner-and-allows-retry
   (compiled/clear-compilation-cache!)
   (try
@@ -980,8 +1005,8 @@
     (is (= 1 @checks) "the projected public boundary is proved once, not twice")
     (is (= 1 @call-checks)
         "only the projected instance is checked; its pre-projection candidate does not escape")
-    (is (= 1 @boundary-checks)
-        "storage projection checks its boundary once, independent of template warmth")
+    (is (= 0 @boundary-checks)
+        "storage projection consumes the exact owner proof; final call validation remains fresh")
     (is (link-plan/retained-effect-evidence? plan evidence))
     (is (false? (link-plan/retained-effect-evidence?
                  (assoc plan :outputs []) evidence)))
