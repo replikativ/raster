@@ -171,7 +171,11 @@
                        (make-array java.nio.file.OpenOption 0))
           (is (= {:status :miss :reason :invalid-entry}
                  (select-keys (store/load-artifact cache "second-request" second-id)
-                              [:status :reason]))))))))
+                              [:status :reason])))
+          (is (not (contains? (store/load-artifact cache "second-request" second-id)
+                             :compilation-fingerprint)))
+          (is (not (contains? (store/load-artifact cache "second-request" second-id)
+                             :payload-fingerprint))))))))
 
 (deftest equation-template-cache-reuses-a-persistent-artifact-after-process-clear
   (with-temporary-directory
@@ -188,6 +192,7 @@
                   :target {:descriptor-fingerprint "target-descriptor"}}}
             compiles (atom 0)
             report (atom nil)
+            retained-artifact (atom nil)
             expected-identity {:semantic-request-fingerprint "semantic-request"
                                :compiler-build-fingerprint "compiler-build"
                                :source-dependency-fingerprint "source-dependencies"
@@ -199,6 +204,10 @@
             (#'compiled/cached-compilation-template
              key :equation-first #(do (swap! compiles inc) @compilation)))
           (is (= expected-identity (:persistent-artifact-identity @report)))
+          (reset! retained-artifact (:retained-artifact @report))
+          (is (= #{:compilation-fingerprint :payload-fingerprint}
+                 (set (keys @retained-artifact))))
+          (is (every? string? (vals @retained-artifact)))
           (compiled/clear-compilation-cache!)
           (binding [compiled/*equation-artifact-store* cache
                     compiled/*compilation-template-observer* #(reset! report %)]
@@ -208,6 +217,7 @@
           (is (= 1 @compiles))
           (is (= :hit (get-in @report [:persistent-artifact :status])))
           (is (= expected-identity (:persistent-artifact-identity @report)))
+          (is (= @retained-artifact (:retained-artifact @report)))
           (binding [compiled/*equation-artifact-store* cache
                     compiled/*compilation-template-observer* #(reset! report %)]
             (#'compiled/cached-compilation-template
@@ -215,6 +225,7 @@
           (is (true? (:cache-hit? @report)))
           (is (= :process-cache-hit (get-in @report [:persistent-artifact :reason])))
           (is (= expected-identity (:persistent-artifact-identity @report)))
+          (is (= @retained-artifact (:retained-artifact @report)))
           (let [development-key (-> key
                                     (assoc :semantic-fingerprint "development-request"
                                            :persistent-cache-eligible? false
@@ -226,7 +237,18 @@
                (fn [] @compilation)))
             (is (false? (:persistent-cache-eligible? @report)))
             (is (= #{:compiler-build-fingerprint} (:persistence-blockers @report)))
-            (is (nil? (get-in @report [:persistent-artifact-identity :compiler-build-fingerprint])))
-            (is (= :ineligible (get-in @report [:persistent-artifact :status]))))
+            (is (nil? (:persistent-artifact-identity @report)))
+            (is (= :ineligible (get-in @report [:persistent-artifact :status])))
+            (is (= {} (:retained-artifact @report))))
+          (with-redefs [store/store-artifact!
+                        (fn [& _] (throw (ex-info "simulated unavailable artifact store" {})))]
+            (binding [compiled/*equation-artifact-store* cache
+                      compiled/*compilation-template-observer* #(reset! report %)]
+              (#'compiled/cached-compilation-template
+               (assoc key :semantic-fingerprint "failed-store-request") :equation-first
+               (fn [] @compilation)))
+            (is (true? (:persistent-cache-eligible? @report)))
+            (is (= :write-failed (get-in @report [:persistent-artifact :status])))
+            (is (= {} (:retained-artifact @report))))
           (finally
             (compiled/clear-compilation-cache!)))))))

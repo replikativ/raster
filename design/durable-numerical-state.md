@@ -102,6 +102,11 @@ lookup excludes concrete shapes, scalar arguments, array contents, roles and com
 Successful equation-first preparation reports now retain the existing four-part persistent artifact
 identity on cold compilation, persistent loads and process hits. Ineligible source checkouts retain
 their blockers and missing build evidence; reporting a fingerprint does not make them complete.
+The same owner also retains the already sealed/opened compilation and payload fingerprints.
+Store/load/process-hit paths agree; corrupt loads, ineligible builds and failed writes provide no
+retained artifact hashes. Successful recompilation/storage after a corrupt load supplies hashes of
+the replacement artifact. Ineligible builds expose no persistent artifact identity map. This
+records exact artifact identity, not a durable numerical receipt.
 
 The production projection must join that complete artifact identity with the bound invocation:
 ordered retained program calls (including host-derived scalars and selected graphs), public shape/
@@ -110,6 +115,9 @@ storage contracts, roles, donation and schedule. For composition, use the existi
 Reverify the corresponding retained owner before producing evidence; no second build/source cache
 or function registry is needed. Initially require documented stable component IDs rather than
 claiming equivalence under arbitrary graph renaming.
+Generated SSA names are anchored to that exact retained compilation artifact. Independently
+recompiled artifacts may conservatively differ even for identical source; future typed-IR
+alpha-normalization must be scope/definition/use aware, not a blanket symbol replacement.
 
 Publication must additionally name addressed evidence for the actual final external inputs.
 Prepared defaults are not sufficient: invocation can replace them. Constants, weights and external
@@ -118,6 +126,10 @@ evidence. Derive required slots from the final semantic input boundary so connec
 duplicate immutable shares and removed mutable borrowers do not become spurious dependencies.
 Reject missing/extra slots and opaque runtime handles. Reuse content addresses and manifests;
 parameter bytes are not folded into the template cache key.
+In particular, a caller-supplied content-address map is not an authenticated binding receipt. The
+runtime must join an exact node/view, verified source bytes or inherited device lineage, and a
+completed upload/D2D operation before claiming those bytes produced the result. Until that boundary
+exists, externally initialized programs cannot claim full producer attestation.
 
 These projections are the next implementation gate, not implemented producer certification.
 Acceptance must distinguish scalar/shape/graph/wiring/data changes, preserve scalar bits, agree on
