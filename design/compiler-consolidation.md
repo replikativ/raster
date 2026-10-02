@@ -412,6 +412,31 @@ The existing hardware-free public C-family composition test additionally checks 
 write-only initializer removal (1 test / 10 assertions), so this positive optimization boundary
 is protected even when native device execution is skipped.
 
+### Changed-layout mapped-byte continuation — 2026-10-02
+
+The partial-patch fixture now compares an uninterrupted resident source-evolve → transfer →
+six-target-step chain (17 generated stages) with a nine-stage midpoint captured after two target
+steps, then restored into a fresh target-layout executable for the remaining four steps. Actual
+source and destination mapped bytes are content-addressed; producer sessions and writable maps
+close before read leases open. Parent/child manifests retain the distinct active-cell order,
+layout fingerprint and actual chunk content identity, including equal-length changed layouts.
+Read leases are verified and closed after synchronous initialization, before restored replay.
+
+Both OpenCL and Level Zero match uninterrupted final fields bit-for-bit, independent face-scatter
+and finest-tile-transfer oracles within tolerance, and volume-weighted mass. Reusable preparation
+shares target geometry constants across the uninterrupted chain rather than uploading duplicate
+copies. The affected partial-patch, whole-domain continuation and manifest suites pass 21 tests /
+351 assertions; both native availability gates were explicitly true. The existing whole-domain
+checkpoint oracle is preserved, not replaced.
+
+The mandatory host test rejects coordinate-space tampering of a certified state despite unchanged
+field length. This proves certificate integrity, not automatic rejection of an independently valid
+but wrong-layout checkpoint during runtime binding. The fixture supplies the matching geometry;
+production hierarchy-to-field reconstruction, semantic restore compatibility and lineage/store
+publication remain open, as do subcycling/reflux and external accuracy comparisons. Provenance is
+explicitly a fixture label, not a production compiler-build identity. Pivotal review found no
+lifetime, resource-cleanup or numerical-oracle blocker. No new compiler operation or runtime API.
+
 ### Aggregate invocation projection audit — 2026-10-01
 
 Before inventing a conservative-remap primitive, probe the existing CSR `spmv`. Its JVM
