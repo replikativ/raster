@@ -364,7 +364,12 @@
            :numerical-state-logical-coordinate {}))
   (validate-numerical-contract! numerical-contract)
   (validate-provenance! provenance)
-  (let [contract (assoc contract :fields (mapv #(select-keys % [:id :value :coordinate-space]) fields))]
+  (let [contract (assoc contract :fields
+                        (mapv (fn [{:keys [id value coordinate-space]}]
+                                {:id id :coordinate-space coordinate-space
+                                 :value (abstract-value/tensor
+                                         (assoc (abstract-value/storage-contract value)
+                                                :shape (:shape value)))}) fields))]
     (semantic-fingerprint/canonical-bytes contract)
     contract))
 

@@ -256,3 +256,16 @@
          (:reason (thrown-data #(state/restore-contract
                                 (assoc-in (expected-restore [(temperature-field)])
                                           [:provenance :callback] (fn [] nil))))))))
+
+(deftest restore-contract-projects-only-logical-target-value-facets
+  (let [target (update (temperature-field) :value assoc
+                       :placement {:runtime-device (Object.)} :attributes {:allocator (fn [] nil)})
+        contract (expected-restore [target])
+        value (get-in contract [:fields 0 :value])
+        incoming (state/certify (checkpoint))]
+    (is (nil? (:placement value)))
+    (is (= {} (:attributes value)))
+    (is (identical? incoming (state/verify-restore! incoming contract)))
+    (is (= :semantic-fingerprint-unsupported
+           (:reason (thrown-data #(expected-restore
+                                  [(assoc-in target [:value :representation :runtime] (Object.))])))))))

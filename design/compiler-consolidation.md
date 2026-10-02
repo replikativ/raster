@@ -1358,7 +1358,7 @@ restore compatibility and external training/distributed acceptance remain on the
 
 The strict declared-target gate and bit-preserving numerical certificate policy are documented
 once in [durable-numerical-state.md](durable-numerical-state.md#restore-compatibility). Affected
-native restart, state, storage lease and AMR checks pass 39 tests / 450 assertions. Correct
+native restart, state, storage lease and AMR checks pass 40 tests / 454 assertions. Correct
 snapshot bytes cannot bypass target cell-order/phase/program-policy checks. Compiler-derived
 producer evidence, codecs, publication, explicit migrations and external training/distributed
 acceptance remain separate; no surface numerical semantics changed.

@@ -80,6 +80,8 @@ storage placement, memory ownership and device placement do not imply or prevent
 compatibility. The expectation must come from the intended continuation, not blindly from the
 incoming manifest. Omitted application semantics are not inferred; different program/numerical
 contracts require an explicit future migration rather than an implicit relaxed comparison.
+Target AbstractValues are projected onto shared logical storage facets and shape: runtime device
+handles and allocator attributes are discarded, not serialized into the restore expectation.
 
 Manifest and restore metadata must be supported pure canonical data, including extension maps.
 Certificates use the shared bit-preserving comparison: signed-zero changes reject, same-payload
@@ -90,7 +92,7 @@ No complete persistence codec or mathematical program-equivalence proof is claim
 
 The same-extent/different-cell-order PDE checkpoint is independently valid but rejects against
 the wrong target layout before leasing. The correct target resumes from actual mapped bytes on
-OpenCL and Level Zero. Affected state, restart, lease and AMR suites pass 39 tests / 450 assertions.
+OpenCL and Level Zero. Affected state, restart, lease and AMR suites pass 40 tests / 454 assertions.
 The fixture's producer fingerprint remains an explicit fixture label, not compiler-build evidence.
 
 ## Konserve, mmap, LMDB and S3

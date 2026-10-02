@@ -53,7 +53,7 @@ numerical providers remain open; the campaign is not complete.
 The strict semantic restore boundary now checks the independently supplied target field/layout,
 logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
 verification also rejects opaque metadata and signed-zero drift. Affected state/native restart,
-lease and AMR checks pass 39 tests / 450 assertions. This matches declared contracts, not omitted
+lease and AMR checks pass 40 tests / 454 assertions. This matches declared contracts, not omitted
 application semantics or mathematical equivalence; production producer evidence remains open.
 
 External source audit refreshed on 2026-09-30: authoritative pretrained-rstr main
