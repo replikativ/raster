@@ -7,6 +7,7 @@
             [raster.compiler.ir.numerical-state :as state]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.ode.finite-volume :as fv]
+            [raster.ode.amr-geometry :as geometry]
             [raster.linalg.sparse :as sparse]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -20,9 +21,10 @@
 
 (defn- hierarchy
   ([] (hierarchy [{:offsets [2 2] :shape [4 4]}]))
-  ([regions]
+  ([regions] (hierarchy regions 1))
+  ([regions nesting]
    (amr/hierarchy
-    {:id :heat/partial :base-shape [4 4] :proper-nesting-width 1
+    {:id :heat/partial :base-shape [4 4] :proper-nesting-width nesting
      :levels
      [(amr/level {:id :coarse :index 0
                  :patches [(amr/patch {:id :base :level 0 :device :local
@@ -52,8 +54,8 @@
                     (for [x (range px (+ px sx)) y (range py (+ py sy))] [x y 1]))
                   patches)))))
 
-(defn- mesh
-  ([] (mesh (hierarchy)))
+(defn- reference-mesh
+  ([] (reference-mesh (hierarchy)))
   ([hierarchy]
   ;; Integer 8x8 finest grid on the unit periodic square. Pair enumeration is
   ;; small-oracle-only; it is not a scalable production connectivity algorithm.
@@ -83,6 +85,35 @@
      :offsets (int-array (reductions + 0 (map count incidences)))
      :indices (int-array (map first flat)) :orientation (double-array (map second flat))
      :inverse-volume (double-array (map (fn [[_ _ size]] (/ 64.0 (* size size))) cells))})))
+
+(defn- mesh
+  ([] (mesh (hierarchy)))
+  ([hierarchy]
+   (let [projection (geometry/project-hierarchy
+                     hierarchy {:domain-lengths [1.0 1.0] :diffusivity 0.1})
+         arrays (geometry/materialize-connectivity projection)]
+     (merge arrays
+            {:projection projection
+             ;; The old scalar-width form survives only in this square-cell oracle adapter.
+             :cells (mapv (fn [{[x y] :offsets [nx ny] :shape}]
+                            (assert (= nx ny)) [x y nx]) (:cells projection))
+             :faces (mapv (fn [{:keys [left right conductance start end]}]
+                            [left right conductance (- end start)]) (:faces projection))}))))
+
+(deftest production-projection-agrees-with-independent-small-mesh
+  (doseq [regions [[{:offsets [2 2] :shape [4 4]}]
+                  [{:offsets [0 0] :shape [8 8]}]
+                  [{:offsets [2 2] :shape [2 2]} {:offsets [4 4] :shape [2 2]}]]]
+    (let [h (hierarchy regions (if (= [8 8] (:shape (first regions))) 0 1))
+          actual (mesh h) reference (reference-mesh h)
+          by-pair (fn [faces]
+                    (reduce (fn [pairs [l r c _]]
+                              (update pairs (vec (sort [l r])) (fnil + 0.0) c)) {} faces))
+          a (by-pair (:faces actual)) r (by-pair (:faces reference))]
+      (is (= (:cells reference) (:cells actual)))
+      (is (= (set (keys r)) (set (keys a))))
+      (is (every? #(< (Math/abs (- (r %) (a %))) 1.0e-14) (keys r)))
+      (is (= (vec (:inverse-volume reference)) (vec (:inverse-volume actual)))))))
 
 (defn- initial [cells]
   (double-array (map (fn [[x y size]]

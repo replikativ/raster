@@ -1296,3 +1296,38 @@ the artifact round-trip and the complete affected rerun then passed. No source w
 introduced for that stale-session failure.
 This closes the contextual binding gap, not comprehensive host-step operand/evaluation proofs,
 general dynamic-loop AD, distributed readiness, or all remaining campaign requirements.
+
+### Hierarchy-derived conservative connectivity — 2026-10-02
+
+The partial-patch acceptance previously built its own small 4x4/dyadic mesh. The next production
+seam is `raster.ode.amr-geometry/project-hierarchy`: a pure host-side projection of the existing
+validated hierarchy into immutable packed active cells, patch/field/device/local-row provenance,
+exact finest-lattice rectangles, geometric faces and CSR incidences. It supports 2D rectangular
+domains, anisotropic integer refinement, multiple levels/patches, periodic and homogeneous
+no-flux boundaries, positive physical lengths and uniform non-negative diffusivity. Other ranks
+and boundary/material contracts decline explicitly rather than changing the AMR provider ABI.
+
+Covered parent rows are indexed under the declared patch-row budget, not tested against every
+fine patch. Faces are matched by axis, plane and interval through opposing-side merges. Unlike
+the old cell-pair aggregation, distinct periodic faces and self-neighbours retain both signed
+incidences. Patch-row mappings explicitly describe packing; they do not transfer ownership or
+force host copies. `materialize-connectivity` converts trusted constructor output into fresh
+caller-owned arrays for the unchanged finite-volume kernels; it is not independent certification
+of an arbitrary caller-supplied map. No compiler opcode, provider registry or handwritten kernel
+is added. The dyadic whole-patch multilevel provider remains separate and unchanged.
+
+The native evolution/remap/restart fixtures now use this production projection while retaining
+their old bounded all-pairs mesh as an independent geometry oracle. Hardware-free acceptance
+covers nonsquare domains, three levels, [2 3] refinement, complete/disjoint refinement, tiny
+periodic dimensions, exact tile/side coverage, opposite incidences, patch-order permutations,
+nonconstant packing, fresh arrays, no-flux conservation and constant preservation. Six tests
+pass 966 assertions, including the final rank/physical-capacity checks. Both native availability
+gates are true. The combined geometry, native partial-patch evolution/remap/restart and hierarchy
+run passes 28 tests / 1303 assertions; the subsequent focused rerun adds those two capacity checks.
+
+This advances the hierarchy-to-field/connectivity seam, not a complete adaptive simulator.
+Existing hierarchy validation still compares patch pairs: the row budget is not a bound on total
+validation time. Spatial order at tangentially displaced coarse/fine centres, timestep stability,
+device-side patch packing, general conservative remap construction, subcycling/reflux, manifest
+publication and real distributed execution remain separate acceptance obligations. Shared face
+fluxes and paired incidences establish the conservative structure, not those broader claims.
