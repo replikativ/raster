@@ -204,6 +204,36 @@
     (is (= (numerical-state/content-address :sha-256 expected)
            (content/content-address-of (MemorySegment/ofArray bytes))))))
 
+(deftest bounded-reader-hashes-one-byte-stream-not-a-tree-of-chunk-digests
+  (let [bytes (byte-array (map unchecked-byte (range 131073)))
+        source (MemorySegment/ofArray bytes)
+        requests (atom [])
+        actual (content/content-address-from-reader
+                (alength bytes)
+                (fn [offset ^MemorySegment destination]
+                  (let [n (.byteSize destination)]
+                    (swap! requests conj [offset n])
+                    (MemorySegment/copy source offset destination 0 n)
+                    n)))]
+    (is (= (content/content-address-of source) actual))
+    (is (= [[0 65536] [65536 65536] [131072 1]] @requests))
+    (is (= (content/content-address-of (MemorySegment/ofArray (byte-array 0)))
+           (content/content-address-from-reader 0 #(throw (AssertionError. "empty read")))))))
+
+(deftest reader-contract-failures-do-not-produce-content-evidence
+  (let [reads (atom 0)
+        read! (fn [& _] (swap! reads inc) 0)
+        reason (fn [f] (try (f) (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (doseq [n [-1 0.5 (inc (bigint Long/MAX_VALUE))]]
+      (is (= :numerical-content-hash-reader
+             (reason #(content/content-address-from-reader n read!)))))
+    (is (zero? @reads))
+    (is (= :numerical-content-hash-reader
+           (reason #(content/content-address-from-reader 1 nil))))
+    (is (= :numerical-content-hash-short-read
+           (reason #(content/content-address-from-reader 8 read!))))
+    (is (= 1 @reads))))
+
 (deftest localized-chunks-are-verified-over-the-leased-byte-range
   (let [bytes (byte-array (map byte (range 16)))
         expected-address (content/content-address-of
