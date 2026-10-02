@@ -374,8 +374,40 @@ forbidden. The shared field resolves to one physical node; no host bridge is int
 
 This is conservative transfer of a cell-average field to another layout, not a completed adaptive
 simulator. The overlap enumeration is small/test-only. Production connectivity, migration and
-lineage publication, subsequent evolution on the changed hierarchy, subcycling/reflux and
+lineage publication, subcycling/reflux and
 discretization/error-estimator or external simulator comparisons remain separate acceptance work.
+
+### Resident post-transfer evolution — 2026-10-02
+
+The next acceptance composes source evolution, conservative CSR transfer, then two steps of
+evolution on the target layout: nine generated stages with no inter-program host bridge.
+The original field remains a donated mutable owner with a read-only remap borrower. Target
+evolution reads the remapped field and writes a distinct owned result; this is ordinary functional
+dataflow, not transfer into another mutable owner. The linker still rejects connections to state
+consumers and donations without explicit mutable-owner bindings; those separate limitations are
+not silently bypassed or generalized by this fixture.
+
+This workload reproduced a general composition decline: connecting a producer output discarded
+its source initializer, even when the producer reads that output (CSR `spmv` retains `beta*y`).
+Composition now preserves producer initialization unless existing certified effect evidence proves
+a complete overwrite with no reads anywhere in that component. Missing or read/write evidence
+retains the initializer; existing write-only generated intermediates still avoid uploads. The
+replaced consumer node's source disappears. Fresh initialization/effect proofs remain mandatory;
+a zero numerical coefficient is not an initializer-elimination proof.
+A hardware-free read/write producer regression checks source identity, disappearance of the
+consumer source, independent verification, and rejection if the initializer is removed.
+
+Central-to-moved and moved-to-disjoint layouts run three resident replays on each local backend.
+Independent face-scatter evolution and finest-tile transfer oracles agree at every replay; target
+evolution is nontrivial and retains volume-weighted mass. Target input/output and scratch begin
+poisoned, while `spmv`'s old output is finite because `0*NaN` is not zero. The link-composition and
+full partial-patch suites pass 19 tests / 324 assertions. Production connectivity/field mapping,
+durable restart across layout changes, lineage publication, subcycling/reflux and external accuracy
+acceptance remain outstanding. No AMR compiler opcode or new runtime/cache is introduced.
+The combined public composition, native replay, linker and scientific suites pass 48 tests / 535
+assertions, including the existing no-upload generated-intermediate assertions; both local device
+availability gates were explicitly true. Pivotal review found no blocker in the conservative
+initializer proof, with the existing sealed-Prepared prevalidated boundary retained.
 
 ### Aggregate invocation projection audit — 2026-10-01
 

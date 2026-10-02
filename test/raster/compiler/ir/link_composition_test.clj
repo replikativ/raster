@@ -227,6 +227,44 @@
     (is (= [(get (:node-mapping certificate) [:second [:second 'y]])]
            (:outputs plan)))))
 
+(deftest connecting-an-initialized-producer-retains-its-read-before-write-source
+  (let [state (float-array (repeat 8 3.25))
+        consumer-source (float-array (repeat 8 -317.0))
+        update-kernel (artifact/make
+                       {:kernel-name "composition_accumulate"
+                        :source "__kernel void composition_accumulate(float* x, float* w, long n) {}"
+                        :abi [(kabi/slot 'x :input :float) (kabi/slot 'w :inout :float)
+                              (kabi/slot 'n :scalar :long)]
+                        :arguments '[x w n] :launch (:launch kernel)
+                        :effects {:kind :map :reads '[x w] :writes '[w]}})
+        producer (resident/lower
+                  {:id :producer :target :ze:0 :arguments [(float-array 8) state 8]
+                   :roles {'w :state} :outputs '[w]
+                   :descriptor (assoc (descriptor) :allocs [] :result-sym 'w
+                                      :steps [{:phase :accumulate :convention :map :artifact update-kernel
+                                               :argument-specs [{:kind :input :sym 'x}
+                                                                {:kind :output :sym 'w}
+                                                                {:kind :scalar :type :long
+                                                                 :value-fn (constantly 8)}]}])})
+        consumer (lowered :consumer consumer-source (float-array 8))
+        producer-value (value-node producer 'w)
+        consumer-value (value-node consumer 'x)
+        result (composition/compose
+                {:id :initialized-dataflow
+                 :components [{:id :producer :lowering producer} {:id :consumer :lowering consumer}]
+                 :connections [{:from [:producer producer-value] :to [:consumer consumer-value]}]
+                 :outputs [[:consumer (value-node consumer 'y)]]})
+        mapping (get-in result [:certificate :node-mapping])
+        connected-node (mapping [:producer producer-value])]
+    (is (= connected-node (mapping [:consumer consumer-value])))
+    (is (= :internal (get-in result [:plan :nodes connected-node :role])))
+    (is (identical? state (get-in result [:plan :nodes connected-node :source])))
+    (is (not-any? #(identical? consumer-source (:source %)) (vals (get-in result [:plan :nodes]))))
+    (is (identical? result (composition/verify! result)))
+    (is (= :link-read-before-write
+           (try (link/validate! (assoc-in (:plan result) [:nodes connected-node :source] nil)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
 (deftest construction-derives-once-and-explicit-verification-rederives
   (let [derive-var (ns-resolve 'raster.compiler.ir.link-composition
                                'derive-composition)
