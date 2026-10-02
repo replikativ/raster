@@ -1,6 +1,7 @@
 # Durable numerical state
 
-Status: initial compiler contract and runtime direction, 2026-08-31.
+Status: compiler/runtime contracts and strict semantic restore gates, 2026-10-02. Production
+publication, compiler-derived provenance and distributed durability acceptance remain open.
 
 Raster needs durable state for model parameters and optimizer state, KV continuations, PDE fields,
 multilevel meshes, sampled agents, compiler measurements, and reproducible branches of a running
@@ -40,7 +41,7 @@ Three identities must remain distinct:
 `NumericalStateManifest` is the storage-neutral compiler/runtime boundary. Version 1 contains
 complete, regular, rectangular chunks for dense `AbstractValue` tensors. It certifies dtype-derived
 logical byte counts, clipped edge cells, canonical grid order, content addresses, explicit byte
-order, numerical compatibility, producer provenance and lineage. It does not contain paths,
+order, and binds declared numerical compatibility, producer provenance and lineage. It does not contain paths,
 buckets, object keys, mmap segments, buffers, queues, devices or store handles.
 
 Publication is immutable and ordered:
@@ -64,6 +65,35 @@ and must retain it through any asynchronous transfer. Provider adapters and publ
 call this verifier (or supply a separately certified equivalent); merely opening a lease is not a
 digest check. The mapped PDE restart oracle now uses this shared boundary and injects corruption
 and truncation faults.
+
+## Restore compatibility
+
+A valid manifest/certificate and correct chunk bytes can still describe the wrong target.
+`numerical-state/restore-contract` declares the intended continuation's complete field set,
+AbstractValues, coordinate spaces, logical step/stage, numerical policy and producer provenance.
+`verify-restore!` independently verifies the incoming certificate and compares that expectation
+before opening leases or uploading bytes. It returns no new authority or migration token.
+
+Field IDs, canonical raw-storage facets, concrete shapes, coordinate spaces and the complete
+logical/numerical/provenance contracts must agree. Field order, chunk partition, content identity,
+storage placement, memory ownership and device placement do not imply or prevent semantic
+compatibility. The expectation must come from the intended continuation, not blindly from the
+incoming manifest. Omitted application semantics are not inferred; different program/numerical
+contracts require an explicit future migration rather than an implicit relaxed comparison.
+Target AbstractValues are projected onto shared logical storage facets and shape: runtime device
+handles and allocator attributes are discarded, not serialized into the restore expectation.
+
+Manifest and restore metadata must be supported pure canonical data, including extension maps.
+Certificates use the shared bit-preserving comparison: signed-zero changes reject, same-payload
+NaNs survive independent copies, and different payloads reject. This tightens previously permissive
+metadata validation; it changes no surface numerical operation. Byte verification, stored-format
+decoding, byte-order conversion and asynchronous lease retention remain separate obligations.
+No complete persistence codec or mathematical program-equivalence proof is claimed.
+
+The same-extent/different-cell-order PDE checkpoint is independently valid but rejects against
+the wrong target layout before leasing. The correct target resumes from actual mapped bytes on
+OpenCL and Level Zero. Affected state, restart, lease and AMR suites pass 40 tests / 454 assertions.
+The fixture's producer fingerprint remains an explicit fixture label, not compiler-build evidence.
 
 ## Konserve, mmap, LMDB and S3
 

@@ -1353,3 +1353,12 @@ balance in execution are tolerance claims, not bitwise conservation or high-orde
 This adds no compiler operation, ownership transfer, manifest compatibility certificate or
 publication protocol. Device patch packing, adaptive/subcycled/refluxed evolution, semantic
 restore compatibility and external training/distributed acceptance remain on the campaign.
+
+### Semantic restore boundary — 2026-10-02
+
+The strict declared-target gate and bit-preserving numerical certificate policy are documented
+once in [durable-numerical-state.md](durable-numerical-state.md#restore-compatibility). Affected
+native restart, state, storage lease and AMR checks pass 40 tests / 454 assertions. Correct
+snapshot bytes cannot bypass target cell-order/phase/program-policy checks. Compiler-derived
+producer evidence, codecs, publication, explicit migrations and external training/distributed
+acceptance remain separate; no surface numerical semantics changed.
