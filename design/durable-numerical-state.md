@@ -270,6 +270,15 @@ without changing the manifest or weakening mmap/LMDB lifetime rules. A nonblocki
 does not release the lease: cancellation stops admission of new work, then `release-event!` waits at
 the current transfer boundary and consumes the event and lease together.
 
+Storage providers have the analogous safe-drain obligation: event release settles provider work
+and ends internal borrows before returning, including after exceptional await. If it cannot drain,
+ownership remains internal to the provider and no result is consumed. Rejected event handoffs are
+released through their originating provider even when the returned provider ID or operation is
+malformed. Submission and consumption share field validation. Scoped callbacks and rejected lease
+handoffs retain the primary failure, suppress cleanup failures and release once. This tightens the
+provider ownership contract; it does not implement a provider, cancellation rollback or a storage
+transaction. Publication must not begin its next stage after unsuccessful release.
+
 In-place mmap editing is for ephemeral working copies. Mutating an object already published under a
 content address violates snapshot immutability. Same-sized Boring edits may dirty only touched
 pages, which is valuable while constructing the next chunk; the result must then be sealed under a

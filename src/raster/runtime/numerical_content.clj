@@ -35,7 +35,13 @@
    Provider events are opaque, provider-owned completions. Promotion establishes the requested
    durable tier; localization establishes a local realization that can subsequently be opened as a
    scoped lease. Event methods deliberately mirror Raster GPU events without sharing native handles
-   or pretending storage and device queues are the same resource."
+   or pretending storage and device queues are the same resource. Content-addressed realizations
+   are immutable. A :durable-receipt placement promises those named bytes in the declared tier.
+
+   -release-storage-event! is safe drain, not best-effort cancellation: after successful or
+   exceptional await it must settle work and end provider-retained borrows before returning.
+   If draining fails, ownership remains internal to the provider and no result may be consumed.
+   Providers unable to guarantee this must not advertise publication capabilities."
   (-provider-descriptor [provider])
   (-submit-promotion! [provider content target-tier opts])
   (-submit-localization! [provider content opts])
@@ -54,6 +60,18 @@
 (defn- fail!
   [message reason data]
   (throw (ex-info message (assoc data :reason reason))))
+
+(defn- release-after-error! [error release!]
+  (try (release!)
+       (catch Throwable cleanup
+         (when-not (identical? error cleanup) (.addSuppressed ^Throwable error cleanup))))
+  (throw error))
+
+(defn- with-release* [body release!]
+  (let [result (try (body)
+                    (catch Throwable error (release-after-error! error release!)))]
+    (release!)
+    result))
 
 (defn- keyword-set?
   [value]
@@ -353,6 +371,7 @@
   (when-not (storage-event? event)
     (fail! "ContentProvider returned a non-StorageEvent"
            :numerical-content-event-type {:actual (type event)}))
+  (storage-event event)
   (when-not (= (:id description) (:provider-id event))
     (fail! "storage event belongs to a different content provider"
            :numerical-content-event-provider-mismatch
@@ -362,6 +381,15 @@
            :numerical-content-event-operation-mismatch
            {:expected operation :actual (:operation event)}))
   event)
+
+(defn- accept-provider-event! [provider description operation event]
+  (try
+    (validate-provider-event! description operation event)
+    (catch Throwable error
+      (if (storage-event? event)
+        ;; The originating provider owns a rejected handoff even if its provider-id is wrong.
+        (release-after-error! error #(-release-storage-event! provider event))
+        (throw error)))))
 
 (defn submit-promotion!
   "Submit promotion of immutable content to a declared durable tier."
@@ -381,8 +409,8 @@
                 :numerical-content-promotion-durability
                 {:provider (:id description) :tier target-tier
                  :capabilities (:capabilities tier)})))
-     (validate-provider-event!
-      description :promote (-submit-promotion! provider content target-tier opts)))))
+     (accept-provider-event!
+      provider description :promote (-submit-promotion! provider content target-tier opts)))))
 
 (defn submit-localization!
   "Submit localization of immutable content into a provider tier that can later be opened."
@@ -398,20 +426,12 @@
      (require-capability! description :localize)
      (when-let [tier-id (:tier opts)]
        (tier-by-id description tier-id))
-     (validate-provider-event!
-      description :localize (-submit-localization! provider content opts)))))
+     (accept-provider-event!
+      provider description :localize (-submit-localization! provider content opts)))))
 
 (defn- checked-event
   [provider event]
-  (let [description (provider-descriptor provider)]
-    (when-not (storage-event? event)
-      (fail! "storage event operation requires a StorageEvent"
-             :numerical-content-event-type {:actual (type event)}))
-    (when-not (= (:id description) (:provider-id event))
-      (fail! "storage event belongs to a different content provider"
-             :numerical-content-event-provider-mismatch
-             {:expected (:id description) :actual (:provider-id event)}))
-    event))
+  (validate-provider-event! (provider-descriptor provider) (:operation event) event))
 
 (defn storage-event-complete?
   [provider event]
@@ -426,6 +446,8 @@
   (-storage-event-measurement provider (checked-event provider event)))
 
 (defn release-storage-event!
+  "Settle provider work and release its event, including after exceptional await.
+   A failure forbids consuming the result; opaque resource ownership remains with the provider."
   [provider event]
   (-release-storage-event! provider (checked-event provider event))
   nil)
@@ -463,20 +485,14 @@
          (lease-segment lease)
          lease
          (catch Throwable error
-           (try (.close ^AutoCloseable lease)
-                (catch Throwable cleanup
-                  (when-not (identical? error cleanup) (.addSuppressed error cleanup))))
-           (throw error)))))))
+           (release-after-error! error #(.close ^AutoCloseable lease))))))))
 
 (defn with-local-content
-  "Open localized content, call `f` with its lease, and release the provider resource exactly once."
+  "Open localized content, call `f` and release its lease once, preserving primary failures."
   ([provider content f] (with-local-content provider content {} f))
   ([provider content opts f]
    (when-not (ifn? f)
      (fail! "with-local-content requires a callback"
             :numerical-content-callback {:callback f}))
    (let [lease (open-local-content! provider content opts)]
-     (try
-       (f lease)
-       (finally
-         (.close ^AutoCloseable lease))))))
+     (with-release* #(f lease) #(.close ^AutoCloseable lease)))))
