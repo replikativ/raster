@@ -4,7 +4,18 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.ocl-runtime]
+            [raster.gpu.ze-runtime]))
+
+(deftest backend-local-scan-runners-are-retired
+  (doseq [[namespace names]
+          [['raster.gpu.ocl-runtime '[invoke-registered-scan-exclusive-kernel]]
+           ['raster.gpu.ze-runtime '[invoke-registered-scan-exclusive-kernel
+                                     invoke-full-gpu-scan!]]]
+          name names]
+    (is (nil? (ns-resolve namespace name))
+        "scans execute the retained typed graph, not a second backend-owned algorithm")))
 
 (defn- scan-artifact
   []

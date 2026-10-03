@@ -150,6 +150,15 @@
                              "k" (list a obuf n))]
                        out))))))
 
+(deftest backend-local-scans-are-not-production-invocation-markers
+  (let [heads (var-get (requiring-resolve 'raster.compiler.pipeline/gpu-invoke-heads))]
+    (doseq [head '[raster.gpu.ocl-runtime/invoke-registered-scan-exclusive-kernel
+                   raster.gpu.ze-runtime/invoke-registered-scan-exclusive-kernel]]
+      (is (not (contains? heads head)))
+      (is (= :no-kernel-steps
+             (why (list 'let* ['out (list head "block" "propagate" '[input] 'output 'n)]
+                        'out)))))))
+
 (deftest ordered-reduction-residency-is-decided-by-result-role
   (let [abi [(kabi/slot 'a :input :float :role :operand)
              (kabi/slot 'out :output :float :role :result)
