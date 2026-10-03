@@ -14,13 +14,58 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
-            [raster.compiler.passes.parallel.contract-lower :as contract-lower]))
+            [raster.compiler.passes.parallel.contract-lower :as contract-lower]
+            [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]))
+
+(deftest mixed-matrix-stage-planning-does-not-enter-target-emission
+  (let [spec {:id :pure-mixed-plan :a 'a :b 'b :c 'c
+              :m :m :n :n :k :k :vector-width 4 :requested-splits 8
+              :tile (hardware/derive-gemm-tile {})}
+        forbidden (fn [& _] (throw (ex-info "planning entered target emission" {})))]
+    (with-redefs [gemm/emit-scheduled-stage-graph forbidden
+                  kernel-body-target/emit-artifact forbidden]
+      (doseq [variant [:nn :nt :tn :tt], split-k? [false true]]
+        (let [candidate (assoc spec :variant variant :split-k? split-k?)
+              planned (:graph (mixed-schedule/plan candidate))]
+          (is (= planned (graph/validate! planned)))
+          ;; Split combination allocates fresh scalar SSA names on each plan.
+          (let [other (:graph (mixed-schedule/plan
+                              (assoc candidate :target-dialect :not-an-emitter)))]
+            (is (graph/dataflow-equivalent? planned other))
+            (is (= (filterv #(or (matrix-stage/matrix-stage? %)
+                                 (layout-stage/layout-stage? %))
+                            (mapv :operation (:nodes planned)))
+                   (filterv #(or (matrix-stage/matrix-stage? %)
+                                 (layout-stage/layout-stage? %))
+                            (mapv :operation (:nodes other))))))
+          (is (not-any? (comp artifact/kernel-artifact? :operation) (:nodes planned)))
+          (is (= (if split-k? :split-k :full)
+                 (some #(when (matrix-stage/matrix-stage? (:operation %))
+                          (get-in % [:operation :reduction :kind])) (:nodes planned))))))
+      (doseq [variant [:nn :nt], fusion [:fuse-lhs-cast? :fuse-tile-inputs?]]
+        (let [planned (:graph (mixed-schedule/plan
+                              (assoc spec :variant variant fusion true)))
+              matrix (some #(when (matrix-stage/matrix-stage? (:operation %))
+                              (:operation %)) (:nodes planned))]
+          (is (some? matrix))
+          (is (= (if (= fusion :fuse-tile-inputs?) 1 (if (= variant :nt) 3 2))
+                 (count (:nodes planned))))))
+      (doseq [variant [:nn :nt], row [false true], col [false true]]
+        (let [planned (:graph (mixed-schedule/plan-batched
+                              (assoc spec :variant variant :batch :batch
+                                     :batching {:row row :col col})))
+              matrix (get-in planned [:nodes 0 :operation])]
+          (is (= 1 (count (:nodes planned))))
+          (is (matrix-stage/matrix-stage? matrix))
+          (is (= [:batch :m :n] (:result-shape matrix)))
+          (is (= {:extent :batch :lhs row :rhs col} (:batching matrix))))))))
 
 (deftest opencl-backend-aliases-share-mixed-matrix-admission
   (let [desc {:device-type :gpu :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
