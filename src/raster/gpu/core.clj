@@ -499,8 +499,10 @@
       (release-session-layer! sess [[:events #(release-event! sess (:event %))]])
       (let [{:keys [device-id arena-id buffers allocations prepared graphs kernel-graphs]} @sess]
         (release-session-layer! sess [[:graphs #(destroy-recorded-graph-entry! device-id %)]])
-        (release-session-layer! sess [[:prepared #(destroy-prepared-entry! device-id %)]
-                                     [:kernel-graphs #(destroy-kernel-graph-entry! device-id %)]])
+        (release-session-layer! sess [[:prepared #(destroy-prepared-entry! device-id %)]])
+        ;; Composite program debt may borrow graph bindings. Do not descend after a failed
+        ;; parent release, or retry its retry-safe child again within this same close attempt.
+        (release-session-layer! sess [[:kernel-graphs #(destroy-kernel-graph-entry! device-id %)]])
         (free-session-buffers! buffers allocations device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
@@ -675,6 +677,31 @@
     {:buffer-keys (into #{} (mapcat :buffer-keys) footprints)
      :allocation-ids (into #{} (mapcat :allocation-ids) footprints)
      :resident-buffers (into [] (mapcat :resident-buffers) footprints)}))
+
+(defn ^:no-doc retain-program-cleanup!
+  "Adopt unresolved composite-program cleanup into the existing prepared session layer.
+   The owner releases bindings only, never session root allocations. Capture resolved roots
+   before returning so aliases cannot bypass the ordinary prepared-buffer retention guard.
+   This is runtime ownership, not a new executable, portable evidence or compiler cache."
+  [sess owner buffer-keys]
+  (locking sess
+    (assert-session-open! sess)
+    (when-not (instance? raster.gpu.resource_cleanup.Cleanup owner)
+      (throw (ex-info "Program cleanup adoption requires a cleanup owner"
+                      {:reason :invalid-cleanup-owner})))
+    (when (seq (cleanup/pending owner))
+      (let [keys (vec buffer-keys)
+            missing (remove #(contains? (:buffers @sess) %) keys)]
+        (when (seq missing)
+          (throw (ex-info "Program cleanup lost a dependent buffer registration"
+                          {:reason :program-cleanup-missing-root :keys (vec missing)})))
+        (when-not (some #(identical? owner (::cleanup/owner %)) (vals (:prepared @sess)))
+          (swap! sess assoc-in [:prepared [::failed-construction (random-uuid)]]
+                 {::cleanup/owner owner :failed-construction? true
+                  :generation (random-uuid)
+                  :resident-footprint
+                  (registered-buffer-footprint sess (mapv #(get-in @sess [:buffers %]) keys))})))))
+  nil)
 
 (defn- pending-resident-events
   [events kind footprint]

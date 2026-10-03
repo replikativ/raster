@@ -64,13 +64,135 @@
       (is (identical? primary
                      (try (program/prepare-sequence-with!
                            [{:id :a :call :a} {:id :b :call :b} {:id :c :call :c}]
-                           {:adopt-cleanup! (fn [owner] (reset! adopted owner))})
+                           {:bind! identity :run! identity :release! identity
+                            :adopt-cleanup! (fn [owner] (reset! adopted owner))})
                           (catch Throwable e e)))))
     (is (= [:b :a] @released))
     (is (= [secondary] (vec (.getSuppressed primary))))
     (is (= [[:instance :b]] (cleanup/pending @adopted)))
     (is (identical? secondary (try (cleanup/release! @adopted) (catch Throwable e e))))
     (is (= [:b :a] @released))))
+
+(deftest session-adoption-pins-original-and-late-alias-roots
+  (let [root {:dtype :float :n-elements 1} failure (ex-info "unknown destroy" {})
+        attempts (atom 0)
+        owner (cleanup/owner [{:id :program
+                               :release #(do (swap! attempts inc) (throw failure))}])
+        sess (atom {:device-id :ocl:0 :buffers {:x root} :prepared {}
+                    :allocations {:x {:id :root :ownership :owned}}
+                    :kernel-graphs {} :graphs {} :events {}})]
+    (is (identical? failure (try (cleanup/release! owner) (catch Throwable e e))))
+    (gpu/retain-program-cleanup! sess owner [:x])
+    (gpu/retain-program-cleanup! sess owner [:x])
+    (is (= 1 (count (:prepared @sess))))
+    ;; A distinct registration ID does not make the same native root independent.
+    (swap! sess assoc-in [:buffers :late-alias] root)
+    (swap! sess assoc-in [:allocations :late-alias] {:id :other-id :ownership :owned})
+    (doseq [key [:x :late-alias]]
+      (is (= :prepared-buffer-retained
+             (try (gpu/free-buffer! sess key)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (dotimes [_ 2]
+      (is (identical? failure (try (gpu/close-session! sess) (catch Throwable e e)))))
+    (is (= 1 @attempts))
+    (is (= #{:x :late-alias} (set (keys (:buffers @sess)))))))
+
+(deftest retry-safe-adopted-program-releases-before-session-roots
+  (let [root {:dtype :float :n-elements 1} releases (atom []) attempts (atom 0)
+        failure (ex-info "not destroyed" {:cleanup-retry-safe? true})
+        owner (cleanup/owner [{:id :program
+                               :release #(do (swap! releases conj :program)
+                                             (when (= 1 (swap! attempts inc)) (throw failure)))}])
+        sess (atom {:device-id :ocl:0 :buffers {:x root} :prepared {}
+                    :allocations {:x {:id :root :ownership :owned}}
+                    :kernel-graphs {} :graphs {} :events {}})]
+    (is (identical? failure (try (cleanup/release! owner) (catch Throwable e e))))
+    (gpu/retain-program-cleanup! sess owner [:x])
+    (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve)
+                    (fn [_ name]
+                      (case name
+                        "free-buffer!" (fn [_] (swap! releases conj :root))
+                        "close-kernel-arena!" (fn [_] (swap! releases conj :arena))))}
+      #(gpu/close-session! sess))
+    (is (= [:program :program :root :arena] @releases))
+    (is (empty? (:prepared @sess)))
+    (is (empty? (:buffers @sess)))
+    (gpu/close-session! sess)
+    (is (= [:program :program :root :arena] @releases))))
+
+(deftest failed-prepared-parent-prevents-second-graph-retry-in-one-close
+  (let [attempts (atom 0) failure (ex-info "not destroyed" {:cleanup-retry-safe? true})
+        child (cleanup/owner [{:id :kernel :release #(when (<= (swap! attempts inc) 2)
+                                                      (throw failure))}])
+        sess (atom {:device-id :ocl:0 :session-id :session :buffers {} :allocations {}
+                    :prepared {} :graphs {} :events {}
+                    :kernel-graphs {:g {:generation :generation ::cleanup/owner child}}})
+        handle (gpu/->KernelGraphHandle :g :session :generation)
+        parent (cleanup/owner [{:id :program :release #(gpu/release-kernel-graph! sess handle)}])]
+    (is (identical? failure (try (cleanup/release! parent) (catch Throwable e e))))
+    (gpu/retain-program-cleanup! sess parent [])
+    (is (identical? failure (try (gpu/close-session! sess) (catch Throwable e e))))
+    (is (= 2 @attempts) "a prepared-layer failure must not descend to graphs in the same close")
+    (is (contains? (:kernel-graphs @sess) :g))
+    (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve)
+                    (fn [& _] (fn [& _]))}
+      #(gpu/close-session! sess))
+    (is (= 3 @attempts))
+    (is (empty? (:kernel-graphs @sess)))
+    (is (empty? (:prepared @sess)))))
+
+(deftest direct-graph-sequence-preflights-before-binding
+  (let [contacts (atom 0)]
+    (is (= :parallel-program-executor
+           (try (program/prepare-sequence-with!
+                 [{:id :graph :kind :graph :call {}}]
+                 {:bind! (fn [& _] (swap! contacts inc)) :run! identity})
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (zero? @contacts))))
+
+(deftest direct-graph-handle-is-owned-before-constructing-its-wrapper
+  (let [own (ns-resolve 'raster.gpu.parallel-program 'own-prepared) original @own
+        primary (ex-info "wrapper failed" {}) secondary (ex-info "destroy uncertain" {})
+        released (atom []) adopted (atom nil)]
+    (with-redefs-fn
+      {own (fn [value & owners]
+             (if (program/prepared-kernel-graph? value) (throw primary)
+                 (apply original value owners)))}
+      #(is (identical? primary
+                      (try (program/prepare-sequence-with!
+                            [{:id :graph :kind :graph :call {}}]
+                            {:bind! (fn [& _] :returned-handle) :run! identity
+                             :release! (fn [handle] (swap! released conj handle) (throw secondary))
+                             :adopt-cleanup! (fn [owner] (reset! adopted owner))})
+                           (catch Throwable e e)))))
+    (is (= [:returned-handle] @released))
+    (is (= [secondary] (vec (.getSuppressed primary))))
+    (is (= [:graph] (cleanup/pending @adopted)))
+    (is (identical? secondary (try (cleanup/release! @adopted) (catch Throwable e e))))
+    (is (= [:returned-handle] @released))))
+
+(deftest owned-link-validation-failure-retains-the-session-after-failed-close
+  ;; Validation is stubbed explicitly to isolate ownership immediately after session creation.
+  ;; Both admission declines precede allocation or kernel acquisition.
+  (doseq [kind [:target :external]]
+    (let [sess (atom {:device-id (if (= :target kind) :ze:0 :ocl:0)})
+          secondary (ex-info "session close uncertain" {}) closes (atom 0)
+          plan {:target :ocl:0 :instances [] :nodes {}}]
+      (with-redefs [link-plan/validate-with-effect-evidence! (fn [plan] {:plan plan})
+                    gpu/make-session (fn [_] sess)
+                    gpu/close-session! (fn [actual] (is (identical? sess actual))
+                                         (swap! closes inc) (throw secondary))]
+        (let [error (try (link/instantiate! plan
+                                          (if (= :external kind) {:external-buffers {:extra ::buffer}} {}))
+                         (catch Throwable e e))
+              owner (::cleanup/unresolved (ex-data error))
+              primary (.getCause error)]
+          (is (= (if (= :target kind) :link-session-target :link-external-bindings)
+                 (:reason (ex-data primary))))
+          (is (= [secondary] (vec (.getSuppressed primary))))
+          (is (= [:session] (cleanup/pending owner)))
+          (is (identical? secondary (try (cleanup/release! owner) (catch Throwable e e))))
+          (is (= 1 @closes)))))))
 
 (deftest repeated-parallel-close-preserves-failures-without-repeating-success
   (let [calls (atom []) primary (ex-info "b uncertain" {}) secondary (ex-info "a uncertain" {})

@@ -26,7 +26,8 @@
                                (fn [call _] (stub-program (:id call) events))]
                    (program/prepare-sequence-with!
                     [{:id :first :call {:id :a}}
-                     {:id :second :call {:id :b}}] {}))]
+                     {:id :second :call {:id :b}}]
+                    {:bind! identity :run! identity :release! identity}))]
     (try
       (is (= [{:instance :first :step 0 :handle :a}
               {:instance :second :step 0 :handle :b}]
@@ -68,7 +69,8 @@
       (is (= :second-binding
              (try
                (program/prepare-sequence-with!
-                [{:id :first :call {:id :a}} {:id :second :call {:id :b}}] {})
+                [{:id :first :call {:id :a}} {:id :second :call {:id :b}}]
+                {:bind! identity :run! identity :release! identity})
                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
       (is (= [[:release :a]] @events)))))
 
