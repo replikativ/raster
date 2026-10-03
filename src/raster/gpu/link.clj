@@ -23,6 +23,7 @@
             [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.resident-value :as resident-value]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.value :as value]))
 
 (declare close! run!)
@@ -38,6 +39,29 @@
 
 (defn linked-executable? [x]
   (and x (= "raster.gpu.link.LinkedExecutable" (.getName (class x)))))
+
+(defn- own-linked-executable
+  [executable]
+  (let [{:keys [session owns-session? graph-key phases prepared-program allocation-keys]} executable
+        recording (if graph-key #{:recording} #{})
+        phase-ids (set (map #(vector :phase %) phases))
+        program (if prepared-program #{:program} #{})
+        resources
+        (if owns-session?
+          [{:id :session :release #(gpu/close-session! session)}]
+          (vec (concat
+                (when graph-key
+                  [{:id :recording :release #(gpu/release-recorded-graph! session graph-key)}])
+                (map (fn [phase]
+                       {:id [:phase phase] :after recording
+                        :release #(gpu/release-prepared! session phase)}) (reverse phases))
+                (when prepared-program
+                  [{:id :program :after recording
+                    :release #(parallel-program/release-prepared! prepared-program)}])
+                (map (fn [key]
+                       {:id [:allocation key] :after (into (into recording phase-ids) program)
+                        :release #(gpu/free-buffer! session key)}) (reverse allocation-keys)))))]
+    (assoc executable ::cleanup/owner (cleanup/owner resources) ::active-uses (volatile! 0))))
 
 (defn instantiation-report
   "Return compact host-monotonic phase timings for construction of a linked executable. Binding
@@ -357,7 +381,8 @@
                                                               {:profile? profile?})
                                   (gpu/record-graph! session @phases gkey {:profile? profile?})))
                  (vreset! recorded-key gkey)))
-           (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
+           (own-linked-executable
+            (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
                                @allocation-keys node-views
                                {:timing-source :host-monotonic
                                 :validation-source (if retained-evidence
@@ -384,7 +409,7 @@
                                (atom 0)
                                (atom 0)
                                (atom false)
-                               (atom {:value-epoch 0}))))
+                               (atom {:value-epoch 0})))))
        (catch Throwable error
          (if owns-session?
            (try (gpu/close-session! session) (catch Throwable _))
@@ -417,6 +442,10 @@
   (when @(:closed? executable)
     (throw (ex-info "linked executable is closed"
                     {:operation operation :plan (get-in executable [:plan :id])})))
+  (if-let [owner (::cleanup/owner executable)]
+    (cleanup/assert-live! owner)
+    (throw (ex-info "Linked executable has lost its cleanup owner"
+                    {:reason :missing-cleanup-owner :operation operation})))
   (when-let [failure (some-> (:execution-state executable) deref :failure)]
     (throw (ex-info "linked execution previously failed; close and reinstantiate it"
                     {:reason :link-execution-poisoned :operation operation
@@ -432,6 +461,15 @@
                      :leases @(:output-leases executable)
                      :plan (get-in executable [:plan :id])}))))
 
+(defn- start-use! [executable]
+  (when-not (::active-uses executable)
+    (throw (ex-info "Linked executable lacks use-scope state"
+                    {:reason :link-use-state-missing})))
+  (vswap! (::active-uses executable) inc))
+
+(defn- finish-use! [executable]
+  (vswap! (::active-uses executable) dec))
+
 (defn with-unleased-execution!
   "Run a composite Link/Compiled mutation under the same lifetime guard as replay and leases.
    Check before invoking `f`, so input donation or output-wrapper invalidation cannot occur when
@@ -442,7 +480,9 @@
     (locking (:lifetime-lock executable)
       (ensure-live! executable operation)
       (ensure-no-output-leases! executable operation)
-      (f))))
+      (start-use! executable)
+      (try (f)
+           (finally (finish-use! executable))))))
 
 (defn- begin-mutation! [executable]
   ;; This is an owner-local invalidation epoch, not portable state identity or an execution count.
@@ -464,13 +504,15 @@
 (defn- execute-once! [executable operation execute!]
   (ensure-live! executable operation)
   (ensure-no-output-leases! executable operation)
-  (begin-mutation! executable)
+  (start-use! executable)
   (try
+    (begin-mutation! executable)
     (let [result (execute!)]
       (swap! (:completed-replays executable) inc)
       (reset! (:output-ready? executable) true)
       result)
-    (catch Throwable error (poison-execution! executable error))))
+    (catch Throwable error (poison-execution! executable error))
+    (finally (finish-use! executable))))
 
 (defn with-exclusive-mutation!
   "Run an explicitly mutating offline action under the executable lifetime lock.
@@ -954,14 +996,17 @@
         (node-view executable node-id))
       ;; Reject dtype/length mistakes before the backend copy sees them.
       (link-plan/validate-node-source! node source)
-      (begin-mutation! executable)
-      (try
-        (gpu/upload-range! (:session executable) (node-view executable node-id) source
-                           {:elements (reduce * 1 (get-in node [:view :shape]))})
-        (catch Throwable error (failed-write! executable node-id error)))
-      (swap! (:pending-inputs executable) disj node-id)
-      (swap! (:tainted-inputs executable) disj node-id)
-      executable)))
+      (with-unleased-execution!
+       executable :upload!
+       (fn []
+         (begin-mutation! executable)
+         (try
+           (gpu/upload-range! (:session executable) (node-view executable node-id) source
+                              {:elements (reduce * 1 (get-in node [:view :shape]))})
+           (catch Throwable error (failed-write! executable node-id error)))
+         (swap! (:pending-inputs executable) disj node-id)
+         (swap! (:tainted-inputs executable) disj node-id)
+         executable)))))
 
 (defn- same-buffer-range?
   [left-buffer left-view right-buffer right-view]
@@ -1108,9 +1153,11 @@
         (let [facts (device-write-facts executable node-id source)]
           ;; Pure compatibility failures must preserve readiness. A subsequent runtime copy or
           ;; registration failure cannot promise that the destination still has its old bytes.
-          (try
-            (write-device-array! executable node-id facts)
-            (catch Throwable error (failed-write! executable node-id error))))
+          (with-unleased-execution!
+           executable :write!
+           #(try
+              (write-device-array! executable node-id facts)
+              (catch Throwable error (failed-write! executable node-id error)))))
         (upload! executable node-id source)))))
 
 (defn- descriptor-source-map
@@ -1356,6 +1403,25 @@
                          {:elements n})
     out))
 
+(defn assert-closeable!
+  "Check close admission without changing ownership. Composition callers must hold the
+   executable lifetime lock through their dependent invalidation and close operations."
+  [executable]
+  (when-not (linked-executable? executable)
+    (throw (ex-info "Close admission requires a LinkedExecutable" {:actual (type executable)})))
+  (locking (:lifetime-lock executable)
+    (when-not (::cleanup/owner executable)
+      (throw (ex-info "Linked executable has lost its cleanup owner"
+                      {:reason :missing-cleanup-owner})))
+    (ensure-no-output-leases! executable :close!)
+    (when-not (::active-uses executable)
+      (throw (ex-info "Linked executable lacks use-scope state"
+                      {:reason :link-use-state-missing})))
+    (when (pos? @(::active-uses executable))
+      (throw (ex-info "Cannot close a linked executable from its active use callback"
+                      {:reason :link-execution-in-use}))))
+  executable)
+
 (defn close!
   "Release a LinkedExecutable. Idempotent. An owned session is closed wholesale; an attached
    executable releases only its recording, phases, and allocation registrations. A live output
@@ -1364,13 +1430,9 @@
   (when-not (linked-executable? executable)
     (throw (ex-info "close! requires a LinkedExecutable" {:actual (type executable)})))
   (locking (:lifetime-lock executable)
-    (ensure-no-output-leases! executable :close!)
-    (when (compare-and-set! (:closed? executable) false true)
-      (if (:owns-session? executable)
-        (gpu/close-session! (:session executable))
-        (cleanup-attached! (:session executable) (:graph-key executable)
-                           (:phases executable) (:prepared-program executable)
-                           (:allocation-keys executable)))))
+    (assert-closeable! executable)
+    (when-not @(:closed? executable) (reset! (:closed? executable) true))
+    (cleanup/release! (::cleanup/owner executable)))
   nil)
 
 (defn- prepare-private-reuse!

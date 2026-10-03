@@ -11,6 +11,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.dispatch-tuning :as tuning]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.tuning-cache :as cache])
@@ -281,7 +282,7 @@
         out-view (gpu/->ResidentBufferView :test-session :resident-out
                                            {:byte-length 4 :dtype :float})
         executable
-        (link/map->LinkedExecutable
+        (raster.gpu.test-lifecycle/linked-executable
          {:plan {:instances [{:id :compiled
                               :descriptor program-descriptor
                               :bindings {'x :x 'out :out}}]}

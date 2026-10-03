@@ -10,6 +10,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.value :as value]))
@@ -27,7 +28,7 @@
         view-b (view :b)
         a (value/wrap-external-view buffer-a :ze:0 view-a)
         b (value/wrap-external-view foreign-b :ze:0 view-b)
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :two-adapters :target :ze:0}
                      :session ::session
                      :node-views {:a (gpu/->ResidentBufferView ::session :a view-a)
@@ -65,7 +66,7 @@
         old-output (value/wrap-external-view buffer :ze:0 view)
         foreign-view (assoc-in view [:allocation :device] :cuda:0)
         foreign (value/wrap-external-view buffer :cuda:0 foreign-view)
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :input-preflight :target :ze:0
                             :nodes {:a (link-plan/node {:id :a :view view :role :input})
                                     :b (link-plan/node {:id :b :view view :role :input})}}
@@ -99,7 +100,7 @@
               {:dtype :float :shape [4]})
         old-output (value/wrap-external-view
                     {:dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :failed-input :target :ze:0
                             :nodes {:a (link-plan/node {:id :a :view view :role :input})}}
                      :session ::session
@@ -163,7 +164,7 @@
         buffer {:dtype :float :n-elements 4 :byte-size 16}
         output (value/wrap-external-view buffer :ze:0 view)
         source (if alias? (value/alias-of output) output)
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :recurrent :target :ze:0
                             :nodes {:a (link-plan/node {:id :a :view view :role :input})}}
                      :session ::session :node-views {:a (gpu/->ResidentBufferView ::session :a view)}
@@ -192,12 +193,13 @@
               {:dtype :float :shape [4]})
         output (value/wrap-external-view
                 {:id :output :dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :profile-lease :target :ze:0
                             :nodes {:input (link-plan/node {:id :input :dtype :float :shape [4]
                                                             :device :ze:0 :role :input})}}
                      :session ::session :closed? (atom false) :lifetime-lock (Object.)
-                     :output-leases (atom 1) :pending-inputs (atom #{})})
+                     :output-leases (atom 1) :pending-inputs (atom #{})
+                     :execution-state (atom {:value-epoch 0})})
         artifact (compiled/map->Compiled
                   {:executable executable
                    :in-tree [{:node :input :role :input :default (float-array 4)}]
@@ -246,19 +248,22 @@
 (deftest execution-info-observes-linked-binding-and-rejects-unavailable-evidence
   (let [info {:strategy :chosen :entry-points ["chosen_kernel"]}
         session (atom {:prepared {:phase {:execution-info info}}})
-        live (gpu-link/map->LinkedExecutable
+        live (raster.gpu.test-lifecycle/linked-executable
               {:session session :phases [:phase] :closed? (atom false)})
         compiled (compiled/map->Compiled {:executable live})]
     (is (= [{:phase :phase :executable info}] (compiled/execution-info compiled)))
     (is (= :compiled-execution-info-unbound
            (try (compiled/execution-info (compiled/map->Prepared {}))
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (let [prepared (parallel-program/map->PreparedParallelProgram
+    (let [prepared ((ns-resolve 'raster.gpu.parallel-program 'own-prepared)
+                   (parallel-program/map->PreparedParallelProgram
                     {:binding-order [:fixed-phase]
                      :handles {:fixed-phase :bound-handle}
-                     :closed? (atom false)})
+                     :closed? (atom false)}))
           fixed-info (assoc info :selection :fixed :admission [])
-          artifact (assoc compiled :executable (assoc live :prepared-program prepared))]
+          artifact (assoc compiled :executable
+                          (raster.gpu.test-lifecycle/linked-executable
+                           (assoc live :prepared-program prepared)))]
       (with-redefs [gpu/kernel-graph-execution-info
                     (fn [actual-session handle]
                       (is (identical? session actual-session))
@@ -275,7 +280,7 @@
 
 (deftest compiled-artifact-projects-the-link-instantiation-report
   (let [report {:timing-source :host-monotonic :total-ns 42}
-        live (gpu-link/map->LinkedExecutable {:instantiation-report report})
+        live (raster.gpu.test-lifecycle/linked-executable {:instantiation-report report})
         artifact (compiled/map->Compiled {:executable live})]
     (is (= report (compiled/instantiation-report artifact)))
     (is (= :compiled-instantiation-report-type

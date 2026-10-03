@@ -7,6 +7,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.program-tuning :as program-tuning]))
 
@@ -118,7 +119,7 @@
 (deftest program-runner-checks-budget-before-tuning-and-merges-results
   (let [manifest (program-tuning/manifest descriptor)
         plan (program-tuning/tuning-plan manifest)
-        executable (link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:instances [{:id :program :descriptor descriptor}]}
                      :closed? (atom false)})
         calls (atom [])

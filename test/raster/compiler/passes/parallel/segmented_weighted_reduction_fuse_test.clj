@@ -20,6 +20,7 @@
             [raster.dl.array-ops :as array-ops]
             [raster.dl.gsdm :as gsdm]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.hardware-fixture :as hardware-fixture]
             [raster.numeric]
@@ -510,7 +511,7 @@
                                  {:byte-length (* 4 (get capacities key)) :dtype :float})]))
                     node-id)
         executable
-        (link/map->LinkedExecutable
+        (raster.gpu.test-lifecycle/linked-executable
          {:plan {:instances [{:id :probe :descriptor descriptor :bindings node-id}]}
           :session (atom {}) :node-views views :closed? (atom false)})
         projected (link/dispatch-arguments executable args)

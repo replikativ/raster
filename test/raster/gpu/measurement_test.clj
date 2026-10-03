@@ -1,6 +1,7 @@
 (ns raster.gpu.measurement-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as parallel-program]))
@@ -114,7 +115,7 @@
 
 (deftest stateful-linked-measurement-requires-restore
   (let [executable
-        (link/map->LinkedExecutable
+        (raster.gpu.test-lifecycle/linked-executable
          {:plan {:nodes {:cache {:role :state}}}
           :profile? true
           :pending-inputs (atom #{}) :closed? (atom false)
@@ -127,7 +128,7 @@
   (let [profiles (atom 0)
         restores (atom 0)
         executable
-        (link/map->LinkedExecutable
+        (raster.gpu.test-lifecycle/linked-executable
          {:plan {:nodes {}}
           :profile? true
           :session :session
@@ -163,7 +164,7 @@
 
 (deftest profiling-and-measurement-respect-output-leases
   (let [executable
-        (link/map->LinkedExecutable
+        (raster.gpu.test-lifecycle/linked-executable
          {:plan {:nodes {}} :session :session :prepared-program :prepared
           :pending-inputs (atom #{}) :closed? (atom false)
           :lifetime-lock (Object.) :output-leases (atom 1)
@@ -178,7 +179,7 @@
     (is (= 1 @(:completed-replays executable)))))
 
 (defn- tracked-executable [recorded?]
-  (link/map->LinkedExecutable
+  (raster.gpu.test-lifecycle/linked-executable
    {:plan {:nodes {}} :session :session :profile? true
     :graph-key (when recorded? :graph)
     :prepared-program (when-not recorded? :prepared)
@@ -248,7 +249,8 @@
                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))))
 
 (deftest caught-nested-restore-failure-cannot-replace-the-original-poison
-  (let [executable (assoc (tracked-executable true) :owns-session? true)
+  (let [executable (raster.gpu.test-lifecycle/linked-executable
+                    (assoc (tracked-executable true) :owns-session? true))
         failure (ex-info "nested restore replay failed" {})
         closes (atom 0)]
     (with-redefs [gpu/replay! (fn [& _] (throw failure))
