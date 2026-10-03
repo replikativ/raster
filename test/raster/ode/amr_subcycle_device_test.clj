@@ -182,10 +182,16 @@
     (run-cycle! :ocl:0)
     (opencl/opencl-skip! "FP64 subcycled diffusion and reflux" :fp64)))
 
-(deftest subcycled-diffusion-cycle-on-level-zero
+(defn- on-level-zero-fp64! [label run!]
   (if @ze/gpu-available?
-    (run-cycle! :ze:0)
-    (ze/gpu-skip! "FP64 subcycled diffusion and reflux")))
+    (let [caps ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities))]
+      (if (:fp64? caps)
+        (run! :ze:0)
+        (ze/gpu-capability-skip! label :fp64? caps)))
+    (ze/gpu-skip! label)))
+
+(deftest subcycled-diffusion-cycle-on-level-zero
+  (on-level-zero-fp64! "FP64 subcycled diffusion and reflux" run-cycle!))
 
 (deftest synchronized-subcycle-restart-on-opencl
   (if @opencl/opencl-fp64-available?
@@ -193,6 +199,4 @@
     (opencl/opencl-skip! "FP64 synchronized subcycle restart" :fp64)))
 
 (deftest synchronized-subcycle-restart-on-level-zero
-  (if @ze/gpu-available?
-    (run-synchronized-restart! :ze:0)
-    (ze/gpu-skip! "FP64 synchronized subcycle restart")))
+  (on-level-zero-fp64! "FP64 synchronized subcycle restart" run-synchronized-restart!))
