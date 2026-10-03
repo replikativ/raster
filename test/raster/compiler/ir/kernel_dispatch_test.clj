@@ -14,6 +14,7 @@
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.ze-runtime :as ze]))
 
 (def ^:private abi
@@ -853,7 +854,9 @@
         (fn [_ function-name]
           (case function-name
             "register-kernel!" (fn [_ _])
-            "make-buffer" (fn [elements dtype] {:elements elements :dtype dtype})
+            "make-buffer" (fn [elements dtype opts]
+                            (lifecycle/native-buffer #(hash-map :elements elements :dtype dtype)
+                                                     #(swap! freed conj %) opts))
             "bind-kernel-call" (fn [call & _] {:kernel-call call ::cleanup/owner (cleanup/owner [])})
             "record-graph!" (fn [prepareds & _]
                               (let [recording {:prepareds (vec prepareds)}]
@@ -907,10 +910,12 @@
         resolver
         (fn [_ name]
           (case name
-            "slice-buffer" (fn [buffer byte-offset byte-length dt]
-                             (let [slice {:slice true :buffer buffer :byte-offset byte-offset
-                                          :byte-size byte-length :n-elements (quot byte-length 4)
-                                          :dtype dt}]
+            "slice-buffer" (fn [buffer byte-offset byte-length dt opts]
+                             (let [slice (lifecycle/native-buffer
+                                          #(hash-map :slice true :buffer buffer :byte-offset byte-offset
+                                                     :byte-size byte-length :n-elements (quot byte-length 4)
+                                                     :dtype dt)
+                                          #(swap! freed conj %) opts)]
                                (swap! slices conj slice)
                                slice))
             "register-kernel!" (fn [& _])

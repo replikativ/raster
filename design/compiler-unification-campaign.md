@@ -2057,3 +2057,9 @@ The next native lifetime consolidation is kernel-arena teardown: both backend ar
 swallow native release errors, and Level Zero scans arbitrary MemorySegment metadata rather than
 declared owned resources. Replace these with retained outcome owners before claiming complete
 native lifetime coverage; do not infer destructor authority from a value's representation.
+
+The first #1013 full CI run exposed four remaining legacy fixture failures in dispatch, GEMM
+Link topology and recorded-root ordering. Their mock constructors now use the shared canonical
+acquisition/retention fixture, and the owned staging root carries its exact owner in the session.
+All 45 tests / 256 assertions in those three namespaces pass in the existing REPL. No production
+ownership check was weakened; the rerun must still pass all seven exact-head CI gates.

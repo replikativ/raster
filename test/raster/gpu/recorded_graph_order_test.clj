@@ -6,7 +6,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.measurement :as measurement]
-            [raster.gpu.test-lifecycle]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.link :as link]))
 
 (defn- owned-phase [entry]
@@ -66,7 +66,9 @@
         (is (nil? (get-in @sess [:buffers :data])))))))
 
 (deftest prepared-root-footprints-allow-disjoint-staging-and-pin-owned-aliases
-  (let [root (Object.) staging (Object.) freed (atom [])
+  (let [freed (atom [])
+        root (lifecycle/native-buffer #(hash-map :id :root) #(swap! freed conj %) {})
+        staging (lifecycle/native-buffer #(hash-map :id :staging) #(swap! freed conj %) {})
         sess (atom {:device-id :ocl:0 :closed? false :graphs {} :prepared {}
                     :kernels {:phase [(artifact/make
                                       {:kernel-name "root_probe"
@@ -77,6 +79,7 @@
                                        :launch (launch/spec {:workgroup-size [1] :group-count [1]})
                                        :effects {:kind :in-place}})]}
                     :buffers {:data root :staging staging}
+                    :buffer-owners {:data (::cleanup/owner root) :staging (::cleanup/owner staging)}
                     :allocations {:data {:id :root :ownership :owned}
                                   :staging {:id :staging :ownership :owned}}})]
     (with-redefs-fn
