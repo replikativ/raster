@@ -42,7 +42,8 @@
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.resident-value :as resident-value]
-            [raster.gpu.resource-cleanup :as cleanup]))
+            [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.runtime-root :as root]))
 
 ;; ================================================================
 ;; Library loading
@@ -187,6 +188,9 @@
 (def ^:private h-zeContextCreate
   (delay (make-handle "zeContextCreate" (fd I32 PTR PTR PTR))))
 
+(def ^:private h-zeContextDestroy
+  (delay (make-handle "zeContextDestroy" (fd I32 PTR))))
+
 (def ^:private h-zeCommandListCreateImmediate
   (delay (make-handle "zeCommandListCreateImmediate" (fd I32 PTR PTR PTR PTR))))
 
@@ -256,16 +260,7 @@
 (def ^:private h-zeEventHostReset
   (delay (make-handle "zeEventHostReset" (fd I32 PTR))))
 
-;; --- Regular (replayable) command list + queue: enqueue-all-sync-once (command graph) ---
-(def ^:private ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC 0x0f)
-(def ^:private h-zeCommandQueueCreate
-  (delay (make-handle "zeCommandQueueCreate" (fd I32 PTR PTR PTR PTR))))
-(def ^:private h-zeCommandListCreate
-  (delay (make-handle "zeCommandListCreate" (fd I32 PTR PTR PTR PTR))))
-(def ^:private h-zeCommandListClose
-  (delay (make-handle "zeCommandListClose" (fd I32 PTR))))
-(def ^:private h-zeCommandQueueExecuteCommandLists
-  (delay (make-handle "zeCommandQueueExecuteCommandLists" (fd I32 PTR I32 PTR PTR))))
+;; --- Checked native destruction ---
 (def ^:private h-zeCommandListDestroy
   (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
 (def ^:private h-zeCommandQueueDestroy
@@ -308,78 +303,99 @@
 ;; Initialization
 ;; ================================================================
 
+(declare close-module-cache-entries!)
+
+(defn- runtime-root-plan []
+  [{:id :async-list
+    :release #(ze-call! "zeCommandListDestroy(async)" @h-zeCommandListDestroy [%])}
+   {:id :sync-list
+    :release #(ze-call! "zeCommandListDestroy(sync)" @h-zeCommandListDestroy [%])}
+   {:id :modules :after #{:async-list :sync-list} :release close-module-cache-entries!}
+   {:id :context :after #{:async-list :sync-list :modules}
+    :release #(ze-call! "zeContextDestroy" @h-zeContextDestroy [%])}
+   {:id :arena :after #{:context} :release #(.close ^Arena %)}])
+
+(defn- checked-native-handle [operation handle]
+  (when (or (nil? handle) (.equals MemorySegment/NULL handle))
+    (throw (ex-info "Level Zero creation returned no native handle"
+                    {:reason :invalid-native-root-handle :operation operation})))
+  handle)
+
 (defn init!
   "Initialize Level Zero runtime. Idempotent.
   Finds first GPU device, creates context and immediate command list."
   []
-  (when-not (:initialized? @state)
-    (let [arena (Arena/ofShared)]
+  (root/initialize! state (runtime-root-plan)
+                    (fn [entry]
+                      (let [arena (root/acquire! entry :arena #(Arena/ofShared))
+                            modules (root/acquire! entry :modules #(atom {}))]
       ;; zeInit
-      (ze-call! "zeInit" @h-zeInit [(int ZE_INIT_FLAG_GPU_ONLY)])
+                        (ze-call! "zeInit" @h-zeInit [(int ZE_INIT_FLAG_GPU_ONLY)])
 
       ;; zeDriverGet — get count, then first driver
-      (let [count-seg (int-seg arena 0)]
-        (ze-call! "zeDriverGet(count)" @h-zeDriverGet [count-seg MemorySegment/NULL])
-        (let [n-drivers (read-int count-seg)]
-          (when (zero? n-drivers)
-            (throw (ex-info "No Level Zero drivers found" {})))
+                        (let [count-seg (int-seg arena 0)]
+                          (ze-call! "zeDriverGet(count)" @h-zeDriverGet [count-seg MemorySegment/NULL])
+                          (let [n-drivers (read-int count-seg)]
+                            (when (zero? n-drivers)
+                              (throw (ex-info "No Level Zero drivers found" {})))
 
-          (let [drivers-seg (.allocate arena (MemoryLayout/sequenceLayout n-drivers PTR))
-                _ (.set count-seg I32 0 (int n-drivers))
-                _ (ze-call! "zeDriverGet(handles)" @h-zeDriverGet [count-seg drivers-seg])
-                driver (.get drivers-seg PTR 0)
+                            (let [drivers-seg (.allocate arena (MemoryLayout/sequenceLayout n-drivers PTR))
+                                  _ (.set count-seg I32 0 (int n-drivers))
+                                  _ (ze-call! "zeDriverGet(handles)" @h-zeDriverGet [count-seg drivers-seg])
+                                  driver (.get drivers-seg PTR 0)
 
                 ;; zeDeviceGet — get first GPU device
-                dev-count-seg (int-seg arena 0)
-                _ (ze-call! "zeDeviceGet(count)" @h-zeDeviceGet
-                            [driver dev-count-seg MemorySegment/NULL])
-                n-devices (read-int dev-count-seg)]
-            (when (zero? n-devices)
-              (throw (ex-info "No Level Zero devices found" {})))
+                                  dev-count-seg (int-seg arena 0)
+                                  _ (ze-call! "zeDeviceGet(count)" @h-zeDeviceGet
+                                              [driver dev-count-seg MemorySegment/NULL])
+                                  n-devices (read-int dev-count-seg)]
+                              (when (zero? n-devices)
+                                (throw (ex-info "No Level Zero devices found" {})))
 
-            (let [devices-seg (.allocate arena (MemoryLayout/sequenceLayout n-devices PTR))
-                  _ (.set dev-count-seg I32 0 (int n-devices))
-                  _ (ze-call! "zeDeviceGet(handles)" @h-zeDeviceGet
-                              [driver dev-count-seg devices-seg])
-                  device (.get devices-seg PTR 0)
+                              (let [devices-seg (.allocate arena (MemoryLayout/sequenceLayout n-devices PTR))
+                                    _ (.set dev-count-seg I32 0 (int n-devices))
+                                    _ (ze-call! "zeDeviceGet(handles)" @h-zeDeviceGet
+                                                [driver dev-count-seg devices-seg])
+                                    device (.get devices-seg PTR 0)
 
                   ;; zeContextCreate
-                  ctx-desc (.allocate arena 24)
-                  _ (.set ctx-desc I32 0 (int ZE_STRUCTURE_TYPE_CONTEXT_DESC))
-                  ctx-out (ptr-seg arena)
-                  _ (ze-call! "zeContextCreate" @h-zeContextCreate
-                              [driver ctx-desc ctx-out])
-                  context (read-ptr ctx-out)
+                                    ctx-desc (.allocate arena 24)
+                                    _ (.set ctx-desc I32 0 (int ZE_STRUCTURE_TYPE_CONTEXT_DESC))
+                                    ctx-out (ptr-seg arena)
+                                    context (root/acquire! entry :context
+                                                           #(do
+                                                              (ze-call! "zeContextCreate" @h-zeContextCreate [driver ctx-desc ctx-out])
+                                                              (checked-native-handle "zeContextCreate" (read-ptr ctx-out))))
 
                   ;; zeCommandListCreateImmediate (synchronous mode)
-                  cq-desc (.allocate arena 40)
-                  _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-                  _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS))
-                  cmd-out (ptr-seg arena)
-                  _ (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
-                              [context device cq-desc cmd-out])
-                  cmd-list (read-ptr cmd-out)]
+                                    cq-desc (.allocate arena 40)
+                                    _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+                                    _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS))
+                                    cmd-out (ptr-seg arena)
+                                    cmd-list (root/acquire! entry :sync-list
+                                                            #(do
+                                                               (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
+                                                                         [context device cq-desc cmd-out])
+                                                               (checked-native-handle "zeCommandListCreateImmediate(sync)" (read-ptr cmd-out))))]
 
               ;; Query device ID for ocloc compilation
-              (let [dev-props (.allocate arena 512)
-                    _ (.set dev-props I32 0 (int ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES))
-                    _ (ze-call! "zeDeviceGetProperties" @h-zeDeviceGetProperties
-                                [device dev-props])
+                                (let [dev-props (.allocate arena 512)
+                                      _ (.set dev-props I32 0 (int ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES))
+                                      _ (ze-call! "zeDeviceGetProperties" @h-zeDeviceGetProperties
+                                                  [device dev-props])
                     ;; ze_device_properties_t: stype@0, pNext@8, type@16, vendorId@20, deviceId@24
-                    device-id-val (.get dev-props I32 24)]
-                (clojure.core/reset! state
-                                     {:initialized? true
-                                      :driver driver
-                                      :device device
-                                      :context context
-                                      :cmd-list cmd-list
-                                      :arena arena
-                                      :device-id-hex (format "0x%04x" device-id-val)
-                                      :modules (atom {})}))))))
-      nil)))
+                                      device-id-val (.get dev-props I32 24)]
+                                  {:driver driver
+                                   :device device
+                                   :context context
+                                   :cmd-list cmd-list
+                                   :arena arena
+                                   :device-id-hex (format "0x%04x" device-id-val)
+                                   :modules modules})))))))))
 
 (defn- ensure-init! []
-  (when-not (:initialized? @state)
+  (if (:initialized? @state)
+    (root/assert-live! state)
     (init!)))
 
 (defn module-capabilities
@@ -444,17 +460,17 @@
   token's ~200 dependent GEMVs, sync once)."
   ^MemorySegment []
   (ensure-init!)
-  (or (:cmd-list-async @state)
-      (let [{:keys [arena context device]} @state
-            cq-desc (.allocate ^Arena arena 40)
-            _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-            _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS))
-            cmd-out (ptr-seg arena)
-            _ (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
-                        [context device cq-desc cmd-out])
-            lst (read-ptr cmd-out)]
-        (clojure.core/swap! state assoc :cmd-list-async lst)
-        lst)))
+  (root/acquire-child! state :async-list
+                       (fn [_]
+                         (let [{:keys [arena context device]} @state
+                               cq-desc (.allocate ^Arena arena 40)
+                               _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+                               _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS))
+                               cmd-out (ptr-seg arena)]
+                           #(do
+                              (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
+                                        [context device cq-desc cmd-out])
+                              (checked-native-handle "zeCommandListCreateImmediate(async)" (read-ptr cmd-out)))))))
 
 (defn synchronize-async!
   "Block until all commands appended to the async command list have completed."
@@ -1813,17 +1829,18 @@
         (throw (ex-info "Fresh kernel has no cleanup owner" {:reason :missing-cleanup-owner})))))
   nil)
 
-(defn- close-module-cache!
+(defn- close-module-cache-entries!
   "Release independent cache entries only after a pure all-borrowers preflight."
-  []
-  (locking state
-    (let [modules (:modules @state)]
-      (cleanup/with-registry-use modules
-        (when (some #(when-let [borrowers (:borrowers %)] (seq @borrowers)) (vals @modules))
-          (throw (ex-info "Module cache still has kernel borrowers"
-                          {:reason :module-in-use})))
-        (cleanup/release-entries! modules (vec @modules)
-                                  #(cleanup/release! (::cleanup/owner %)))))))
+  [modules]
+  (cleanup/with-registry-use modules
+    (when (some #(when-let [borrowers (:borrowers %)] (seq @borrowers)) (vals @modules))
+      (throw (ex-info "Module cache still has kernel borrowers"
+                      {:reason :module-in-use})))
+    (cleanup/release-entries! modules (vec @modules)
+                              #(cleanup/release! (::cleanup/owner %)))))
+
+(defn- close-module-cache! []
+  (locking state (close-module-cache-entries! (:modules @state))))
 
 ;; ================================================================
 ;; Kernel registry (pipeline integration)
@@ -1950,6 +1967,8 @@
   ([kernel-name kernel-info]
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
+   (cleanup/assert-registry-mutable! state)
+   (cleanup/assert-registry-mutable! (:modules @state))
    (cleanup/assert-registry-mutable! kernel-registry)
    (let [_ (when (some #(contains? kernel-info %) [:arena-id :module :entry-name :kernel-handle ::cleanup/owner ::registration
                                                    ::registration-payload-identity])
@@ -3294,29 +3313,16 @@
 ;; ================================================================
 
 (defn shutdown!
-  "Release cached modules only when registrations and dedicated kernel borrowers are closed.
-   Root-context/buffer ownership is not yet represented here; callers must close sessions first."
+  "Clean failed initialization; live teardown declines until child resource leases are complete."
   []
+  (cleanup/assert-registry-mutable! state)
+  (cleanup/assert-registry-mutable! (:modules @state))
   (cleanup/with-registry-use kernel-registry
-    (locking state
-      (when (:initialized? @state)
-    ;; Never infer ownership from MemorySegment-shaped metadata or drop failed registrations.
-    ;; Registration retirement takes the registry lock before state; shutdown never reverses it.
-        (when (seq @kernel-registry)
-          (throw (ex-info "Close kernel arenas before Level Zero shutdown"
-                          {:reason :registrations-in-use})))
-        (close-module-cache!)
-        (clojure.core/reset! kernel-dispatch-registry {})
-        (when-let [^Arena arena (:arena @state)]
-          (.close arena))
-        (clojure.core/reset! state {:initialized? false :driver nil :device nil
-                                    :context nil :cmd-list nil :arena nil
-                                    :modules (atom {})}))))
+    (root/shutdown-construction! state))
   nil)
 
 (defn reset!
-  "Shutdown then reinitialize. Requires closed kernel arenas and dedicated kernels.
-   This does not yet certify recovery of live buffers, command lists or corrupted contexts."
+  "Clean failed initialization then reinitialize. Live reset awaits resource leases."
   []
   (shutdown!)
   (init!)

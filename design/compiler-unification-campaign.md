@@ -2179,11 +2179,10 @@ These are the runtime prerequisites of the existing training/distributed campaig
 planner or a substitute completion target. The module-cache slice does not enable eviction or
 claim safe global reset while outstanding kernel/buffer/event borrowers remain.
 
-### Module-cache ownership continuation (2026-10-03, implementation in review)
+### Module-cache ownership continuation (2026-10-03, merged)
 
-PR #1015 passed all seven exact-head gates and merged as `35a3a1af`. The next slice
-is being implemented on `runtime/module-cache-owners`; it is not yet released or
-approved for merge. It replaces raw ZE module-cache handles with exact owning
+PR #1015 passed all seven exact-head gates and merged as `35a3a1af`. PR #1016 also
+passed all seven exact-head gates and merged as `6b872966`. It replaces raw ZE module-cache handles with exact owning
 cache references and gives each fresh kernel a `kernel -> module-borrow` cleanup
 dependency. A copied/stale handle is not authority. Payload hashing and native
 compilation consume the same snapshot; reservation/publication rollback uses the
@@ -2209,6 +2208,34 @@ benchmark prefix/recording rollback. A fresh JVM confirmed 27 registration/bound
 tests (250 assertions), 38 ownership/benchmark fault tests (355 assertions), and
 seven actual-device boundary tests (84 assertions) against the final exact-reference
 representation. The pivotal reviewer approved the code subject to device/CI gates;
-the local device gate is now met. Full exact-head CI gates remain required. This slice does not certify
+the local device and exact-head CI gates are met. This slice does not certify
 root context, command-list, buffer or reset lifetime safety; those are the following
 steps, and the full eight-item compiler campaign remains open.
+
+### Root-construction ownership (2026-10-03, local implementation under review)
+
+The shared runtime-root boundary reserves a cleanup DAG and exact generation before
+OpenCL context/queue or Level Zero context/list acquisition. Native status, NULL,
+readback, publication and destruction failures retain exact unresolved authority;
+independent siblings may close, while their context and host Arena remain pinned.
+Lazy ZE async-list acquisition uses the same root's pre-reserved slot, serialized
+with initialization. Invalid construction callbacks fail before publication.
+
+This slice deliberately changes live `shutdown!`/`reset!` to fail with
+`:runtime-root-leases-incomplete`, without destroying or dropping resources.
+Only failed, never-live initialization can be cleaned by this boundary. Compiler-only
+development reload remains available; native runtime reload requires a fresh process.
+This is a temporary explicit restriction, not completed root lifetime support.
+
+Local root/module evidence is 34 tests and 381 assertions, including production
+initializers under hardware-free native fault injection. The combined ownership
+suite passes 84 tests and 890 assertions. Pivotal review found no remaining R1
+correctness blocker, conditional on fresh-process device checks. A fresh capped
+REPL now passes 27 registration/boundary tests (250 assertions), seven actual-device
+execution tests (84 assertions), and six live-root/reset assertions across OpenCL
+and Level Zero. Exact-head CI is still required before merge.
+Next: generation-qualified session/buffer/registration/recording/event leases and
+direct allocation migration, followed by checked live teardown/reset. Do not let
+root-internal cache ownership masquerade as an external lease that prevents all
+teardown. The training, distributed simulator/exchange and durable PDE/AMR campaign
+requirements remain unchanged and incomplete.

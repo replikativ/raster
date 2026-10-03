@@ -2,6 +2,7 @@
   "Hardware-free native fault injection through the Level Zero module/kernel ownership path."
   (:require [clojure.test :refer [deftest is]]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.runtime-root :as root]
             [raster.gpu.ze-runtime :as ze])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
 
@@ -12,7 +13,7 @@
     (let [v #(ns-resolve 'raster.gpu.ze-runtime %)
           modules (atom {}) registry (atom {}) calls (atom []) next-handle (atom 100)
           context (MemorySegment/ofAddress 900)
-          state (atom {:initialized? true :arena arena :context context
+          state (atom {:initialized? false :arena arena :context context
                        :device (MemorySegment/ofAddress 901) :modules modules})
           failure (ex-info "native outcome unknown" {})
           native (fn [operation _ args]
@@ -33,8 +34,11 @@
          (v 'ensure-init!) (fn []) (v 'ze-call!) native
          (v 'h-zeModuleCreate) (delay :fake) (v 'h-zeModuleDestroy) (delay :fake)
          (v 'h-zeKernelCreate) (delay :fake) (v 'h-zeKernelDestroy) (delay :fake)}
-        #(test! {:modules modules :registry registry :calls calls :failure failure :state state
-                 :close! @(v 'close-module-cache!)})))))
+        #(do
+           (root/initialize! state [] (fn [_] {:arena arena :context context
+                                             :device (:device @state) :modules modules}))
+           (test! {:modules modules :registry registry :calls calls :failure failure :state state
+                   :close! @(v 'close-module-cache!)}))))))
 
 (deftest module-cache-snapshots-payload-and-shares-exact-content-and-flags
   (let [input (byte-array [1 2 3]) seen (atom [])]
@@ -128,15 +132,16 @@
 
 (deftest failed-module-destruction-retains-runtime-and-attempts-independent-siblings
   (with-runtime {:fail "zeModuleDestroy"}
-    (fn [{:keys [modules calls state failure]}]
+    (fn [{:keys [modules calls state failure close!]}]
       (ze/load-module! (byte-array [1]))
       (ze/load-module! (byte-array [2]))
-      (is (identical? failure (error-of ze/shutdown!)))
+      (is (= :runtime-root-leases-incomplete (:reason (ex-data (error-of ze/shutdown!)))))
+      (is (identical? failure (error-of close!)))
       (is (:initialized? @state))
       (is (= 2 (count @modules)))
       (is (= 2 (count (filter #{"zeModuleDestroy"} @calls))))
       (let [before @calls]
-        (is (identical? failure (error-of ze/shutdown!)))
+        (is (identical? failure (error-of close!)))
         (is (= before @calls))))))
 
 (deftest publication-loss-rolls-back-created-module-without-dropping-another-generation
@@ -188,7 +193,7 @@
       (ze/load-module! (byte-array [1]))
       (swap! registry assoc "live" {:not-a-native-handle true})
       (let [before @calls]
-        (is (= :registrations-in-use (:reason (ex-data (error-of ze/shutdown!)))))
+        (is (= :runtime-root-leases-incomplete (:reason (ex-data (error-of ze/shutdown!)))))
         (is (:initialized? @state))
         (is (= before @calls))))))
 

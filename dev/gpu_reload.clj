@@ -8,9 +8,10 @@
    'works only on a fresh REPL' confusion: a stale par-opencl dropped the fp64 pragma, etc.).
 
    FIX: reload the whole chain LEAVES-FIRST in dependency order, so each namespace re-requires
-   already-reloaded deps and every edit is picked up. Then reset the GPU runtime for clean device
-   state. Load once per REPL with (load-file \"dev/gpu_reload.clj\"); call (gpu-reload/reload!)
-   after any edit to the GPU path — no REPL restart needed.")
+   already-reloaded deps and every edit is picked up. Load once per REPL with
+   (load-file \"dev/gpu_reload.clj\"). Native runtime namespaces must not be reloaded over live
+   owners; restart the REPL process after native representation changes. Live runtime reset
+   currently fails closed until the complete child-resource lease contract lands.")
 
 (def gpu-pipeline-nses
   "GPU compile-pipeline namespaces, LEAVES FIRST (deps before dependents). Reloading in this
@@ -27,13 +28,15 @@
     raster.gpu.core])
 
 (defn reload!
-  "Reload the GPU compile pipeline leaves-first + reset the GPU runtime. Returns the reloaded
-   namespace count. opts :ze-runtime? true also reloads ze-runtime (do this only after editing it
-   — it clears the kernel registry and bounces the device); :reset? false skips the GPU reset."
+  "Reload the compiler pipeline leaves-first. Native runtime reload is rejected before changes;
+   use a process restart. :reset? true requests checked reset (currently fail-closed for live roots)."
   ([] (reload! {}))
-  ([{:keys [ze-runtime? reset?] :or {reset? true}}]
-   (let [nses (cond-> gpu-pipeline-nses
-                ze-runtime? (-> vec (conj 'raster.gpu.ze-runtime)))]
+  ([{:keys [ze-runtime? reset?] :or {reset? false}}]
+   (when ze-runtime?
+     (throw (ex-info "Native runtime reload would discard live ownership; restart the REPL process"
+                     {:reason :runtime-reload-requires-process-restart})))
+   ;; Admit an explicitly requested reset before reloading any compiler namespaces.
+   (when reset? ((requiring-resolve 'raster.gpu.ze-runtime/reset!)))
+   (let [nses gpu-pipeline-nses]
      (doseq [n nses] (require n :reload))
-     (when reset? ((requiring-resolve 'raster.gpu.ze-runtime/reset!)))
      {:reloaded (count nses) :nses nses})))
