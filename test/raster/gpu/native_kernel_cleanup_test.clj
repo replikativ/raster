@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.storage-representation :as probe]
             [raster.compiler.ir.kernel-call :as call]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.runtime-root :as root]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
@@ -84,21 +85,24 @@
           release-call (fn [context _ args]
                          (swap! releases conj [context (first args)])
                          (when fail-release? (throw native-fault)))
+          state (atom {:initialized? false})
+          _ (root/initialize! state [] (fn [_] {}))
           redefs (merge
-                   {(v 'kernel-registry) (atom {(:kernel-name artifact) artifact})
-                    (v 'ensure-kernel-loaded!) (fn [_] {:module handle :program handle :entry-name "probe"})
-                    (v 'create-kernel-fresh) (fn [& _] (swap! acquired inc)
+                  {(v 'state) state
+                   (v 'kernel-registry) (atom {(:kernel-name artifact) artifact})
+                   (v 'ensure-kernel-loaded!) (fn [_] {:module handle :program handle :entry-name "probe"})
+                   (v 'create-kernel-fresh) (fn [& _] (swap! acquired inc)
                                               (if (= backend :ze) {:handle handle} handle))}
-                   (if (= backend :ze)
-                     {(v 'h-zeKernelDestroy) (delay :fake)
-                      (v 'ze-call!) release-call
-                      (v 'destroy-kernel!) #(release-call "zeKernelDestroy" nil [(:handle %)])
-                      (v 'bind-kernel!) (fn [& _]
+                  (if (= backend :ze)
+                    {(v 'h-zeKernelDestroy) (delay :fake)
+                     (v 'ze-call!) release-call
+                     (v 'destroy-kernel!) #(release-call "zeKernelDestroy" nil [(:handle %)])
+                     (v 'bind-kernel!) (fn [& _]
                                          (when fail-build? (throw primary))
                                          {:kernel handle :gc-seg (MemorySegment/ofArray (int-array 3))})}
-                     {(v 'h-clReleaseKernel) (delay :fake)
-                      (v 'cl-call!) release-call
-                      (v 'set-kernel-arg-buffer!) (fn [_handle ^long _index _buffer]
+                    {(v 'h-clReleaseKernel) (delay :fake)
+                     (v 'cl-call!) release-call
+                     (v 'set-kernel-arg-buffer!) (fn [_handle ^long _index _buffer]
                                                    (when fail-build? (throw primary)))}))]
       (with-redefs-fn redefs
         (fn []
@@ -118,7 +122,38 @@
               (is (= :missing-cleanup-owner
                      (:reason (ex-data (error-of #(destroy! (dissoc prepared ::cleanup/owner)))))))))
           (is (= 1 @acquired))
+          (when (= backend :ocl)
+            (is (= (if fail-release? 1 0) (root/lease-count state))))
           (is (= [[(if (= backend :ze) "zeKernelDestroy" "clReleaseKernel") handle]] @releases)))))))
+
+(deftest opencl-unknown-prepared-create-retains-the-composite-owner-and-root
+  (let [v #(ns-resolve 'raster.gpu.ocl-runtime %)
+        artifact (probe/emit-artifact :float :opencl-portable)
+        kernel-call (call/make artifact [(MemorySegment/ofArray (float-array 2))])
+        state (atom {:initialized? false})
+        primary (ex-info "fresh kernel acquisition outcome unknown" {})
+        acquired (atom 0) released (atom 0) adopted (atom [])]
+    (root/initialize! state [] (fn [_] {}))
+    (with-redefs-fn
+      {(v 'state) state
+       (v 'kernel-registry) (atom {(:kernel-name artifact) artifact})
+       (v 'ensure-kernel-loaded!) (fn [_] {:program :program})
+       (v 'create-kernel-fresh) (fn [& _] (swap! acquired inc) (throw primary))
+       (v 'h-clReleaseKernel) (delay :fake)
+       (v 'cl-call!) (fn [& _] (swap! released inc))}
+      (fn []
+        (is (identical? primary
+                        (error-of #(ocl/bind-kernel-call kernel-call
+                                                         {:adopt-cleanup! (fn [owner]
+                                                                            (swap! adopted conj owner))}))))
+        (is (= 1 @acquired))
+        (is (= 1 (count @adopted)))
+        (is (= 1 (root/lease-count state)))
+        (let [owner (first @adopted)]
+          (is (= [:kernel :runtime-root-lease] (cleanup/pending owner)))
+          (is (identical? primary (error-of #(cleanup/release! owner))))
+          (is (= 1 (root/lease-count state)))
+          (is (zero? @released)))))))
 
 (deftest ze-recording-keeps-dependent-pool-and-attempts-independent-destruction
   (doseq [failed-id [:list [:event 0] :pool :queue]]

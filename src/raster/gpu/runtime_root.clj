@@ -160,20 +160,23 @@
   [state]
   (cleanup/with-registry-use state (lease-under-lock! state)))
 
+(defn- capture-lease-under-lock!
+  [state slot]
+  (when-not (= :not-acquired (:phase @slot))
+    (throw (ex-info "Runtime lease acquisition slot is not fresh"
+                    {:reason :acquisition-already-started})))
+  (let [lease (lease-under-lock! state)]
+      ;; Even JVM publication may fail after the pin exists. The common transaction
+      ;; releases that exact lease or returns its unresolved owner, preserving the cause.
+    (cleanup/build! (::cleanup/owner lease)
+                    #(do (vreset! slot {:phase :live :resource lease}) lease)
+                    nil)))
+
 (defn capture-lease!
   "Capture a lease in an existing child's reserved acquisition slot. Admission is pure:
    rejection leaves the slot untouched, unlike an indeterminate native create/readback."
   [state slot]
-  (cleanup/with-registry-use state
-    (when-not (= :not-acquired (:phase @slot))
-      (throw (ex-info "Runtime lease acquisition slot is not fresh"
-                      {:reason :acquisition-already-started})))
-    (let [lease (lease-under-lock! state)]
-      ;; Even JVM publication may fail after the pin exists. The common transaction
-      ;; releases that exact lease or returns its unresolved owner, preserving the cause.
-      (cleanup/build! (::cleanup/owner lease)
-                      #(do (vreset! slot {:phase :live :resource lease}) lease)
-                      nil))))
+  (cleanup/with-registry-use state (capture-lease-under-lock! state slot)))
 
 (defn construct-child!
   "Construct one canonical child owner, with the root lease as its final dependency.
@@ -184,18 +187,18 @@
                  (or (nil? adopt-cleanup!) (fn? adopt-cleanup!)))
     (throw (ex-info "Runtime child construction requires a checked plan"
                     {:reason :invalid-cleanup-plan})))
-  (let [lease-slot (volatile! nil)
+  (let [lease-slot (cleanup/acquisition-slot)
         owner (cleanup/owner
                (conj resources
                      {:id :runtime-root-lease :after (set (map :id resources))
-                      :release #(when-let [lease @lease-slot]
-                                  (cleanup/release! (::cleanup/owner lease)))}))]
+                      :release #(cleanup/release-native!
+                                 lease-slot (fn [lease]
+                                              (cleanup/release! (::cleanup/owner lease))))}))]
     (cleanup/with-registry-use state
       (cleanup/build!
        owner
        (fn []
-         (let [lease (lease-under-lock! state)]
-           (vreset! lease-slot lease)
+         (let [lease (capture-lease-under-lock! state lease-slot)]
            (build owner (::entry lease))))
        adopt-cleanup!))))
 

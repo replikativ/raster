@@ -1746,6 +1746,7 @@
                                   {:reason :runtime-generation-mismatch})))
               token (random-uuid)
               slot (cleanup/acquisition-slot)
+              root-lease (cleanup/acquisition-slot)
               borrowers (:borrowers entry)
               owner (cleanup/owner
                      [{:id :kernel
@@ -1757,7 +1758,11 @@
                                                                               {:reason :runtime-generation-mismatch})))
                                                             (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel])))}
                       {:id :module-borrow :after #{:kernel}
-                       :release #(vswap! borrowers dissoc token)}])
+                       :release #(vswap! borrowers dissoc token)}
+                      {:id :runtime-root-lease :after #{:kernel :module-borrow}
+                       :release #(cleanup/release-native!
+                                  root-lease (fn [lease]
+                                               (cleanup/release! (::cleanup/owner lease))))}])
               kern-desc (.allocate arena 32)
               _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
               name-seg (.allocateFrom arena kernel-name)
@@ -1767,7 +1772,8 @@
        ;; This pin is private, not watchable metadata. Unknown native acquisition keeps it:
        ;; neither a module-cache teardown nor a new load may guess that no kernel exists.
           (try (cleanup/build! owner
-                               #(let [kernel (cleanup/acquire-native! slot
+                               #(let [_ (root/capture-lease! state root-lease)
+                                      kernel (cleanup/acquire-native! slot
                                                                       (fn []
                                                                         (cleanup/assert-registration-current! modules key entry)
                                                                         (ze-call! "zeKernelCreate" @h-zeKernelCreate [(:handle module) kern-desc kern-out])
