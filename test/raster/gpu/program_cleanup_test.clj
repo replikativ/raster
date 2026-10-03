@@ -23,6 +23,55 @@
      :allocation-keys [:x :y] :closed? (atom false) :lifetime-lock (Object.)
      :output-leases (atom 0) :execution-state (atom {:value-epoch 0})})))
 
+(deftest partial-program-construction-retains-failed-cleanup
+  ;; Stub only compiler validation/staging: this oracle concerns returned runtime handles,
+  ;; not acceptance of a numerical program. Native acquisition before a returned handle
+  ;; remains the injected executor's responsibility.
+  (doseq [adopt? [false true]]
+    (let [primary (ex-info "third bind failed" {}) secondary (ex-info "b destroy uncertain" {})
+          released (atom []) adopted (atom nil)
+          error (with-redefs-fn
+                  {#'call/validate! identity
+                   (ns-resolve 'raster.gpu.parallel-program 'preparation-plan)
+                   (fn [& _] {:entries [{:key :a} {:key :b} {:key :c}] :step-keys {}})}
+                  #(try
+                     (program/prepare-with!
+                      {:steps []}
+                      (cond-> {:bind! (fn [key & _] (if (= :c key) (throw primary) key))
+                               :run! identity
+                               :release! (fn [key] (swap! released conj key)
+                                           (when (= :b key) (throw secondary)))}
+                        adopt? (assoc :adopt-cleanup! (fn [owner] (reset! adopted owner)))))
+                     (catch Throwable e e)))
+          owner (if adopt? @adopted (::cleanup/unresolved (ex-data error)))]
+      (is (some? owner))
+      (is (identical? primary (if adopt? error (.getCause error))))
+      (is (= [secondary] (vec (.getSuppressed primary))))
+      (is (= [:b :a] @released))
+      (is (= [[:graph :b]] (cleanup/pending owner)))
+      (is (identical? secondary (try (cleanup/release! owner) (catch Throwable e e))))
+      (is (= [:b :a] @released)))))
+
+(deftest partial-sequence-construction-retains-child-ownership
+  (let [primary (ex-info "third program failed" {}) secondary (ex-info "child uncertain" {})
+        released (atom []) adopted (atom nil)]
+    (with-redefs [program/prepare-with!
+                  (fn [id _]
+                    (when (= :c id) (throw primary))
+                    (prepared [id] identity
+                              (fn [key] (swap! released conj key)
+                                (when (= :b key) (throw secondary)))))]
+      (is (identical? primary
+                     (try (program/prepare-sequence-with!
+                           [{:id :a :call :a} {:id :b :call :b} {:id :c :call :c}]
+                           {:adopt-cleanup! (fn [owner] (reset! adopted owner))})
+                          (catch Throwable e e)))))
+    (is (= [:b :a] @released))
+    (is (= [secondary] (vec (.getSuppressed primary))))
+    (is (= [[:instance :b]] (cleanup/pending @adopted)))
+    (is (identical? secondary (try (cleanup/release! @adopted) (catch Throwable e e))))
+    (is (= [:b :a] @released))))
+
 (deftest repeated-parallel-close-preserves-failures-without-repeating-success
   (let [calls (atom []) primary (ex-info "b uncertain" {}) secondary (ex-info "a uncertain" {})
         p (prepared [:a :b :c] identity

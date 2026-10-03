@@ -1971,3 +1971,12 @@ Construction-time partial program/link cleanup, publication/adoption of unfinish
 ownership, output-value destruction and public/root/view/event acquisition remain separate
 follow-ups. Completed-value close tests do not certify those acquisition paths, provider-backed
 durability, distributed fabric execution or external model training.
+
+Construction follow-up in progress: generic program/sequence staging now reserves the common
+cleanup plan before binding and retains failed rollback via executor `:adopt-cleanup!` or the
+existing `::resource-cleanup/unresolved` exception contract. Only successfully returned handles
+enter that plan; an executor must retain indeterminate native acquisition that throws before
+returning. Fault oracles cover independent sibling cleanup and sticky child failures. This is
+not yet a completed Link instantiation vertical: session adoption and dependent root retention
+must be integrated and verified before publishing the follow-up. In particular, an adopted
+program debt must not also free session root allocations, which remain session-owned.
