@@ -21,7 +21,8 @@
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.layout-transform-device-support :as layout]))
 
 (defn- rnd ^floats [n seed]
   (let [a (float-array n) r (java.util.Random. (long seed))]
@@ -93,33 +94,27 @@
   ;; launch still needs one workgroup and every inactive unrolled element must remain masked.
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "unrolled layout convert")
-    (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
-          make-buffer (ns-resolve ze 'make-buffer)
-          upload!     (ns-resolve ze 'array->buffer!)
-          download    (ns-resolve ze 'buffer->array)
-          free!       (ns-resolve ze 'free-buffer!)
-          record!     (ns-resolve ze 'record-graph!)
-          replay!     (ns-resolve ze 'replay-graph!)
-          destroy!    (ns-resolve ze 'destroy-graph!)
-          convert!    (ns-resolve ze 'bind-registered-convert!)]
+    (gpu/with-gpu-session [session :ze:0]
       (doseq [n [1 2 3 4 5 7 8 33 255 1023 4096 40961]
               w [1 2 4]]
-        (let [a  (rnd n (+ n w))
-              af (make-buffer n :float)
-              h  (make-buffer n :half)]
-          (upload! af a)
-          (let [g (record! [{:bound (convert! af h n w)}])]
-            (replay! g) (destroy! g))
+        (let [a (rnd n (+ n w))]
+          (gpu/alloc! session {:input [:float n a] :output [:half n nil]})
+          (let [handle (gpu/bind-kernel-call!
+                        session :cast (layout/cast-artifact w)
+                        [:input :output {:type :int :value n}])]
+            (try (gpu/run-kernel-graph! session handle)
+                 (finally (gpu/release-kernel-graph! session handle))))
           ;; buffer->array on a :half buffer returns the RAW FP16 BITS (a short[]) — exactly
           ;; what a bit-exactness check wants. Float/floatToFloat16 is the JVM's own RTE
           ;; conversion, so the two shorts must be equal, bit for bit.
-          (let [^shorts got (download h)]
+          (let [^shorts got (gpu/download session :output)]
             (is (every? true?
                         (for [i (range n)]
                           (= (Float/floatToFloat16 (aget ^floats a i))
                              (aget got i))))
                 (str "vectorized convert w=" w " n=" n " is not bit-exact")))
-          (free! af) (free! h))))))
+          (gpu/free-buffer! session :input)
+          (gpu/free-buffer! session :output))))))
 
 (deftest split-k-policy-only-fires-on-low-occupancy-gemms
   ;; Realize the compiler IR expression used by both KernelDispatch selection and graph-private

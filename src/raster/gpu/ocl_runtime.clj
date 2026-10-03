@@ -1923,14 +1923,6 @@
     (throw (ex-info "Recorded graph has lost its cleanup owner" {:reason :missing-cleanup-owner})))
   nil)
 
-(defn bind-registered-convert!
-  [& _]
-  (throw (ex-info "bind-registered-convert! (fp16 cast for XMX) is Level-Zero/Intel-only" {})))
-
-(defn bind-registered-transpose!
-  [& _]
-  (throw (ex-info "bind-registered-transpose! (XMX operand transpose) is Level-Zero/Intel-only" {})))
-
 (defn shutdown!
   "Shutdown OpenCL runtime, releasing all handles."
   []

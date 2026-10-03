@@ -1865,3 +1865,19 @@ and root/view/event owners remain unfinished; these wrapper checks do not certif
 Fault oracles cover multiple recordings borrowing one source, unknown teardown with successful
 independent sibling release, adopted constructor debt, failed replacement, and failed prologue replay.
 These are lifecycle/correctness checks, not performance or distributed-ownership evidence.
+
+#### Raw layout-binder retirement
+
+The runtime-only convert/transpose binders and their separate Level Zero module/kernel caches
+have no production callers. Their three native test consumers now construct target-neutral layout
+bodies, project checked ScheduledKernelBody artifacts through the common target emitter, and bind
+them through public KernelCall/session APIs. Byte-granularity transpose and all 36 nearest-even
+FP16 conversion cases (ragged tails and extents below the unroll width) remain numerical oracles;
+the int8 contraction route still checks its inserted transpose against the CPU reference.
+
+The raw binders and OpenCL rejection stubs are removed rather than assigned another ownership
+system. Tests release their modern graph bindings; migrated transpose/conversion storage follows
+the session lifetime. This removes a duplicate acquisition/cache path, not an emitter capability.
+Other legacy routing-test allocation/launch helpers and the raw map preparation binder remain
+separate consolidation work. No performance or cross-vendor execution claim follows from this
+Intel-native migration; hardware-free target compilation remains its own gate.
