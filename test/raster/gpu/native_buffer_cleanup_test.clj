@@ -4,6 +4,11 @@
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]
             [raster.gpu.core :as gpu]
+            [raster.gpu.resident-value :as resident]
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.runtime-root :as root]
             [raster.gpu.resource-cleanup :as cleanup])
   (:import [java.lang.foreign Arena MemorySegment]
@@ -46,7 +51,10 @@
                             0 (into-array Class [MemorySegment Long/TYPE Integer/TYPE
                                                  MemorySegment MemorySegment])))
                     (v 'read-int) (fn ^long [_] (swap! creates inc)
-                                    (when-let [failure (:create-failure options)] (throw failure)) 0)
+                                    (when-let [failure (:create-failure options)]
+                                      (when (or (nil? (:create-failure-at options))
+                                                (= (:create-failure-at options) @creates))
+                                        (throw failure))) 0)
                     (v 'h-clReleaseMemObject) (delay :fake)
                     (v 'cl-call!) (fn [label _ args]
                                     (is (= "clReleaseMemObject" label))
@@ -54,7 +62,10 @@
                    {(v 'ensure-init!) (fn [])
                     (v 'state) state
                     (v 'alloc-shared-raw) (fn [_ _ _ n] (swap! creates inc)
-                                            (when-let [failure (:create-failure options)] (throw failure))
+                                            (when-let [failure (:create-failure options)]
+                                              (when (or (nil? (:create-failure-at options))
+                                                        (= (:create-failure-at options) @creates))
+                                                (throw failure)))
                                             (if (:null? options) MemorySegment/NULL (.allocate arena (long n))))
                     (v 'free-in-context!) (fn [_ segment] (release segment))})]
       (with-redefs-fn redefs #(test! {:make! make! :free! free! :creates creates
@@ -329,7 +340,8 @@
       (let [sess (atom {:device-id (if (= :ocl backend) :ocl:0 :ze:0)
                         :session-id :test :arena-id :test
                         :buffers {} :allocations {} :buffer-owners {} :closed? false})
-            arena-closes (atom 0)]
+            arena-closes (atom 0)
+            uploads (atom 0)]
         (with-redefs-fn
           {(ns-resolve (the-ns (quote raster.gpu.core)) (quote rt-resolve))
            (fn [_ name]
@@ -338,7 +350,11 @@
                "device-buffer?" (if (= :ocl backend) ocl/device-buffer? ze/device-buffer?)
                "assert-buffer-live!" (if (= :ocl backend) ocl/assert-buffer-live! ze/assert-buffer-live!)
                "array->buffer!" (fn [buffer source]
-                                  (when-let [failure (:upload-failure options)] (throw failure)) buffer)
+                                  (swap! uploads inc)
+                                  (when-let [failure (:upload-failure options)]
+                                    (when (or (nil? (:upload-failure-at options))
+                                              (= (:upload-failure-at options) @uploads))
+                                      (throw failure))) buffer)
                "close-kernel-arena!" (fn [_] (swap! arena-closes inc)
                                        (when-let [failure (:arena-failure options)] (throw failure)))
                (throw (ex-info "Unexpected session runtime function" {:name name}))))}
@@ -396,6 +412,39 @@
           (dotimes [_ 2] (is (identical? primary (error-of #(gpu/close-session! sess)))))
           (is (empty? @releases))
           (is (zero? @arena-closes)))))))
+
+(deftest multi-field-allocation-failure-retires-known-prefix-and-retains-only-unknown-child
+  (doseq [backend [:ocl :ze] stage [:create :upload] uncertain-free? [false true]
+          :when (or (= stage :upload) (not uncertain-free?))]
+    (let [primary (ex-info "second field failed" {})
+          secondary (ex-info "second field destruction uncertain" {})
+          options (cond-> {(if (= stage :create) :create-failure :upload-failure) primary
+                           (if (= stage :create) :create-failure-at :upload-failure-at) 2}
+                    uncertain-free? (assoc :release-failure secondary :release-failure-at 1))]
+      (with-session-backend
+        backend options
+        (fn [{:keys [sess creates releases state arena-closes]}]
+          (is (identical? primary
+                          (error-of #(gpu/alloc! sess
+                                                 (array-map :x [:float 4 (float-array 4)]
+                                                            :id [:int 4 (int-array 4)])))))
+          (is (= 2 @creates))
+          (is (empty? (:buffers @sess)))
+          (is (empty? (:allocations @sess)))
+          (let [retained? (or (= stage :create) uncertain-free?)]
+            (is (= (if retained? #{:id} #{}) (set (keys (:buffer-owners @sess)))))
+            (is (= (if retained? 1 0) (root/lease-count state)))
+            (is (= (if (= stage :create) 1 2) (count @releases)))
+            (if retained?
+              (let [failure (if uncertain-free? secondary primary)
+                    attempts (count @releases)]
+                (is (:closed? @sess))
+                (dotimes [_ 2]
+                  (is (identical? failure (error-of #(gpu/close-session! sess)))))
+                (is (= attempts (count @releases)))
+                (is (zero? @arena-closes)))
+              (do (gpu/close-session! sess)
+                  (is (= 1 @arena-closes))))))))))
 
 (deftest session-close-removes-successful-roots-before-reporting-sibling-failure
   (doseq [backend [:ocl :ze]]
@@ -650,6 +699,36 @@
               (is (empty? @destroyed)))
           (do (is (not (contains? (get @sess registry) :key)))
               (is (= [old] @destroyed))))))))
+
+(deftest composite-field-retirement-is-rejected-before-kernel-driver-contact
+  (doseq [backend [:ocl :ze]]
+    (with-backend
+      backend {}
+      (fn [{:keys [make! free! v releases]}]
+        (let [x (make! 4 :float) y (make! 4 :float)
+              abi [(kabi/slot 'x :input :float :binding 'particles :field "x")
+                   (kabi/slot 'y :output :float :binding 'particles :field "y")]
+              executable (artifact/make
+                          {:kernel-name "retired_composite_field"
+                           :source "__kernel void retired_composite_field(__global const float* x, __global float* y) {}"
+                           :abi abi :arguments '[x y]
+                           :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+              value (resident/composite :particles [{:name "y" :value y} {:name "x" :value x}])
+              physical ((v 'expand-pointer-binding) {:binding 'particles :slots abi} value)
+              kernel-call (call/make executable physical)
+              contacts (atom 0)]
+          (try
+            (is (= [x y] physical) "ABI order is independent of composite storage order")
+            (free! y)
+            (with-redefs-fn
+              {(v 'kernel-registry) (atom {(:kernel-name executable) executable})
+               (v 'ensure-kernel-loaded!) (fn [_] (swap! contacts inc)
+                                            (throw (ex-info "unexpected driver contact" {})))}
+              (fn [] (is (= :owner-releasing
+                            (:reason (ex-data (error-of #((v 'bind-kernel-call) kernel-call))))))))
+            (is (zero? @contacts))
+            (finally (free! x) (free! y)))
+          (is (= 2 (count @releases))))))))
 
 (defn- buffer-uses [backend v buffer]
   (let [arr (float-array 4)

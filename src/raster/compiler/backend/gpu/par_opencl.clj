@@ -135,7 +135,7 @@
         ;; The ABI describes the PHYSICAL C signature. An SoA contributes one pointer per field,
         ;; each linked back to the single logical caller binding via :binding. This lets source
         ;; validation and driver binding share one record without making the marker flatten a
-        ;; GpuSoA itself.
+        ;; logical resident composite itself.
         abi (kabi/validate!
              (vec
               (concat

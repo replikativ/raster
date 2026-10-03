@@ -1,8 +1,6 @@
 (ns raster.gpu.soa-test
-  "Tests for GPU SoA features: GpuSoA type, OpenCL SoA kernel generation,
-  deftm inlining, display module, and copy round-trips.
-
-  GPU-dependent tests are gated behind when-ze."
+  "Hardware-free typed SoA emission and CPU display tests. Production resident composites
+  are exercised on both device backends by public-aggregate-test."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [clojure.string :as str]
@@ -14,101 +12,19 @@
             [raster.runtime.display :as display])
   (:import [java.lang.foreign MemorySegment ValueLayout]))
 
-;; ================================================================
-;; GPU availability check (mirrors ze_runtime_test)
-;; ================================================================
-
-(defn- ze-available? []
-  (try
-    (require 'raster.gpu.ze-runtime)
-    (let [query-fn (resolve 'raster.gpu.ze-runtime/query-devices)]
-      (and query-fn (seq (query-fn))))
-    (catch Exception _ false)))
-
-(defmacro when-ze [& body]
-  `(if (ze-available?)
-     (do ~@body)
-     (println "  [SKIP] No Level Zero GPU available")))
 
 ;; ================================================================
 ;; Test types
 ;; ================================================================
 
 (defvalue TestParticle [x :- Float, y :- Float, vx :- Float, vy :- Float])
-(defvalue TestVec2 [a :- Double, b :- Double])
 
-;; ================================================================
-;; Phase 2: GpuSoA allocation and copy
-;; ================================================================
-
-(deftest gpu-soa-allocation-test
-  (when-ze
-   (testing "gpu-array creates GpuSoA with correct fields"
-     (require 'raster.gpu.ze-runtime)
-     (let [gpu-array   (resolve 'raster.gpu.ze-runtime/gpu-array)
-           gpu-soa?    (resolve 'raster.gpu.ze-runtime/gpu-soa?)
-           n-elements  (resolve 'raster.gpu.ze-runtime/n-elements)
-           g           (gpu-array 'TestParticle 256)]
-       (is (gpu-soa? g))
-       (is (= 256 (n-elements g)))
-       (is (= 'TestParticle (:scalar-tag g)))
-       (is (= 'TestParticleSoA (:soa-tag g)))
-       (is (= 4 (count (:field-segs g))))
-       (is (= ["x" "y" "vx" "vy"] (mapv :name (:field-segs g))))
-       (is (every? #(= :float (:dtype %)) (:field-segs g)))))))
-
-(deftest gpu-soa-device-allocation-test
-  (when-ze
-   (testing "gpu-array-device creates device-only GpuSoA"
-     (require 'raster.gpu.ze-runtime)
-     (let [gpu-array-device (resolve 'raster.gpu.ze-runtime/gpu-array-device)
-           g (gpu-array-device 'TestParticle 128)]
-       (is ((resolve 'raster.gpu.ze-runtime/gpu-soa?) g))
-       (is (= 128 ((resolve 'raster.gpu.ze-runtime/n-elements) g)))))))
-
-(deftest gpu-soa-double-fields-test
-  (when-ze
-   (testing "gpu-array works with double fields"
-     (require 'raster.gpu.ze-runtime)
-     (let [g ((resolve 'raster.gpu.ze-runtime/gpu-array) 'TestVec2 64)]
-       (is (= 'TestVec2 (:scalar-tag g)))
-       (is (= ["a" "b"] (mapv :name (:field-segs g))))
-       (is (every? #(= :double (:dtype %)) (:field-segs g)))))))
-
-(deftest gpu-soa-copy-roundtrip-test
-  (when-ze
-   (testing "copy-to-gpu! and copy-from-gpu! preserve data"
-     (require 'raster.gpu.ze-runtime)
-     (let [gpu-array    (resolve 'raster.gpu.ze-runtime/gpu-array)
-           copy-to-gpu  (resolve 'raster.gpu.ze-runtime/copy-to-gpu!)
-           copy-from-gpu (resolve 'raster.gpu.ze-runtime/copy-from-gpu!)
-           n  16
-            ;; Create and fill a JVM SoA
-           soa1 (make-test-particle-soa n)
-           _    (do (aset (.x soa1) 0 (float 1.5))
-                    (aset (.x soa1) 5 (float -3.0))
-                    (aset (.y soa1) 0 (float 10.0))
-                    (aset (.vx soa1) 3 (float 42.0))
-                    (aset (.vy soa1) 15 (float 99.0)))
-            ;; Round-trip through GPU
-           g    (gpu-array 'TestParticle n)
-           _    (copy-to-gpu g soa1)
-           soa2 (make-test-particle-soa n)
-           _    (copy-from-gpu g soa2)]
-       (is (= 1.5  (aget (.x soa2) 0)))
-       (is (= -3.0 (aget (.x soa2) 5)))
-       (is (= 10.0 (aget (.y soa2) 0)))
-       (is (= 42.0 (aget (.vx soa2) 3)))
-       (is (= 99.0 (aget (.vy soa2) 15)))
-        ;; Untouched elements should be 0.0
-       (is (= 0.0 (aget (.x soa2) 1)))))))
-
-(deftest gpu-soa-unknown-type-test
-  (testing "gpu-array throws for unregistered types"
-    (when-ze
-     (require 'raster.gpu.ze-runtime)
-     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No SoA registered"
-                           ((resolve 'raster.gpu.ze-runtime/gpu-array) 'NonExistentType 10))))))
+(deftest legacy-ze-raw-composite-constructors-are-retired
+  (require 'raster.gpu.ze-runtime)
+  (doseq [name '[GpuSoA ->GpuSoA map->GpuSoA gpu-soa? gpu-array gpu-array-device
+                 n-elements copy-to-gpu! copy-from-gpu!]]
+    (is (nil? (ns-resolve 'raster.gpu.ze-runtime name))
+        "SoA leaves use canonical session buffers, not a raw backend composite allocator")))
 
 ;; ================================================================
 ;; Phase 1: SoA OpenCL kernel generation
@@ -160,7 +76,7 @@
       (is (str/includes? source "__global float* particles_vy"))
       ;; Should NOT have a single particles param
       (is (not (re-find #"__global float\* particles[^_]" source))))
-    (testing "physical field slots retain one logical GpuSoA binding"
+    (testing "physical field slots retain one logical resident composite binding"
       (let [body (tag-body
                   (list 'raster.par/map-void! 'i 'n
                         '(let* [p (aget particles i)]

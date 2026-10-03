@@ -334,12 +334,6 @@
             {:type :int :value 65}]
            physical))
     (is (= [2] (get-in call [:geometry :group-count])))
-    (is (= [:seg-x :seg-id]
-           (ze/expand-pointer-binding
-            (first plan)
-            (ze/->GpuSoA 'Particle 'ParticleSoA 65
-                         [{:name "x" :dtype :float :seg :seg-x}
-                          {:name "id" :dtype :int :seg :seg-id}]))))
     (let [resident (resident-value/composite
                     :particles
                     [{:name :x :value {:dtype :float :resident :x}}
@@ -348,13 +342,14 @@
              (ze/expand-pointer-binding (first plan) resident)))
       (is (= [{:dtype :float :resident :x} {:dtype :int :resident :id}]
              (ocl/expand-pointer-binding (first plan) resident))))
-    (is (= [:seg-x :seg-id]
-           (ze/expand-pointer-binding
-            (first plan)
-            (ze/->GpuSoA 'Particle 'ParticleSoA 65
-                         [{:name "id" :dtype :int :seg :seg-id}
-                          {:name "x" :dtype :float :seg :seg-x}])))
-        "explicit fields project a physical value whose storage order differs from the kernel ABI")
+    (let [reordered (resident-value/composite
+                     :particles
+                     [{:name :id :value {:dtype :int :resident :id}}
+                      {:name :x :value {:dtype :float :resident :x}}])]
+      (doseq [expand [ze/expand-pointer-binding ocl/expand-pointer-binding]]
+        (is (= [{:dtype :float :resident :x} {:dtype :int :resident :id}]
+               (expand (first plan) reordered))
+            "explicit fields project storage order independently of physical ABI order")))
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"differs from physical ABI"
          (kcall/expand-logical-arguments soa-artifact
@@ -373,12 +368,10 @@
            (ze/expand-pointer-binding group resident)))
     (is (= [{:dtype :float :resident :x}]
            (ocl/expand-pointer-binding group resident)))
-    (is (= [:seg-x]
-           (ze/expand-pointer-binding
-            group
-            (ze/->GpuSoA 'Particle 'ParticleSoA 8
-                         [{:name :x :dtype :float :seg :seg-x}
-                          {:name :id :dtype :int :seg :seg-id}]))))))
+    (doseq [expand [ze/expand-pointer-binding ocl/expand-pointer-binding]]
+      (is (= [{:dtype :float :resident :x}]
+             (expand group (update resident :fields #(vec (reverse %)))))
+          "subset projection is independent of composite field storage order"))))
 
 (deftest both-resident-backends-consume-the-same-call-contract
   (let [call (kcall/make artifact args)]

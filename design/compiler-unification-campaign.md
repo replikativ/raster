@@ -2454,3 +2454,28 @@ ownership suite passes 182 tests / 1,898 assertions. Exact-head review and all s
 required before merge. The GpuSoA review recommends retirement in favor of the already working
 ResidentComposite/session-owned field path; do not extend raw composite allocation as a second
 ownership framework. External training and distributed/AMR completion remain on the campaign.
+
+### Retire ZE-only raw SoA ownership — 2026-10-03
+
+The reference audit found no production/dev/benchmark caller of ZE `GpuSoA`, its raw shared/device
+allocators, or its reflection-based copy helpers. The supported `defvalue` SoA vertical already
+uses typed field projection, ordered `:binding`/`:field` ABI slots, session-owned DeviceBuffers
+and non-owning ResidentComposite values. Retire the separate ZE record, constructors, predicate,
+copy helpers, `n-elements` helper and binding arms rather than adding another composite owner.
+Direct callers of these internal ZE Vars must migrate; supported SoA source semantics are unchanged.
+Vulkan's separate GpuSoA implementation and general raw allocation APIs are untouched.
+
+Five leaking/exception-swallowing raw-allocation tests are replaced by a cold namespace absence
+ratchet. Ordered/subset composite binding checks now exercise both backends; actual public
+aggregate device tests remain. New hardware-free tests exercise second-field create/upload
+failure through canonical session allocation, including uncertain native destruction: no partial
+value is published, known prefixes retire, only the exact uncertain child retains its root pin,
+and subsequent close never repeats uncertain native destruction. A freed composite field is
+rejected by both production binders before driver loading. This is not a new concurrent-borrow
+or live-reset guarantee.
+
+The capped REPL passes 74 affected tests / 749 assertions, including public aggregate execution
+on OpenCL and Level Zero. Deleted source and test Vars were explicitly unmapped without reloading
+native records; cold CI remains required. Exact-head independent review and all seven CI gates
+remain mandatory before merge. The eight-item campaign, including external training acceptance,
+distributed execution and multilevel/AMR validation, is not complete.

@@ -171,7 +171,7 @@
   "Logical caller pointer values, in first physical-signature occurrence order.
 
    Usually this is simply `(mapv :name (pointer-slots abi))`. An SoA occupies several physical
-   C pointer slots but is supplied by one logical GpuSoA value; those slots carry a shared
+   C pointer slots but is supplied by one logical resident composite; those slots carry a shared
    `:binding` and collapse to one name here."
   [abi]
   (mapv :binding (logical-pointer-slot-groups abi)))

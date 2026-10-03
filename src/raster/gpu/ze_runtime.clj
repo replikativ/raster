@@ -33,7 +33,6 @@
            [java.lang.invoke MethodHandle]
            [java.nio.file Files Path])
   (:require [clojure.string]
-            [raster.compiler.core.types :as types]
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -1343,34 +1342,12 @@
 
 (declare launch-2d!)
 
-;; ================================================================
-;; GpuSoA — GPU-resident SoA for defvalue types
-;; ================================================================
-
-(def ^:private element-tag->bytes-map
-  {'double 8 'float 4 'long 8 'int 4})
-
-(def ^:private element-tag->dtype-map
-  {'double :double 'float :float 'long :long 'int :int})
-
-(defrecord GpuSoA
-           [scalar-tag    ;; Symbol, e.g. 'Particle
-            soa-tag       ;; Symbol, e.g. 'ParticleSoA
-            n             ;; number of scalar elements (long)
-            field-segs    ;; ordered vec: [{:name "x" :dtype :float :seg MemorySegment} ...]
-            ])
-
-(defn gpu-soa?
-  "Returns true if x is a GpuSoA."
-  [x]
-  (instance? GpuSoA x))
 
 (defn- physical-pointer-dtypes
   "Storage dtypes after expanding each logical map/map-void pointer binding."
   [arrays]
   (reduce (fn [dtypes arr]
             (cond
-              (gpu-soa? arr) (into dtypes (mapv :dtype (:field-segs ^GpuSoA arr)))
               (device-buffer? arr) (conj dtypes (:dtype (assert-buffer-live! arr)))
               (instance? MemorySegment arr) (conj dtypes :opaque)
               :else (conj dtypes (dt/dtype-for-jvm-array arr))))
@@ -1378,132 +1355,23 @@
 
 (defn expand-pointer-binding
   "Expand one logical artifact pointer binding into Level Zero's physical resident values.
-   A ResidentComposite or legacy GpuSoA supplies one checked value per ABI field; ordinary resident
+   A ResidentComposite supplies one checked value per ABI field; ordinary resident
    buffers supply one slot. This function is driver-free and runs before KernelCall construction."
   [{:keys [binding slots] :as group} value]
   (cond
     (resident-value/resident-composite? value)
     (resident-value/expand group value)
 
-    (gpu-soa? value)
-    (let [fields (resident-value/select-fields group (:field-segs ^GpuSoA value))]
-      (doseq [[slot field] (map vector slots fields)]
-        (let [expected-name (symbol (str (name binding) "_" (name (:name field))))]
-          (when-not (= expected-name (:name slot))
-            (throw (ex-info "GpuSoA field order/name differs from its physical ABI slot"
-                            {:binding binding :slot slot :field (:name field)
-                             :expected expected-name :actual (:name slot)}))))
-        (when-not (= (:dtype slot) (dt/canon (:dtype field)))
-          (throw (ex-info "GpuSoA field dtype differs from its physical ABI slot"
-                          {:binding binding :slot slot :field (:name field)
-                           :expected (:dtype slot) :actual (dt/canon (:dtype field))}))))
-      (mapv :seg fields))
-
     (not= 1 (count slots))
-    (throw (ex-info "multi-slot logical pointer requires a resident composite or GpuSoA value"
+    (throw (ex-info "multi-slot logical pointer requires a resident composite value"
                     {:binding binding :slots slots :value-type (type value)}))
 
     (or (device-buffer? value) (instance? MemorySegment value))
     [value]
 
     :else
-    (throw (ex-info "Level Zero logical pointer requires DeviceBuffer/GpuSoA/MemorySegment"
+    (throw (ex-info "Level Zero logical pointer requires DeviceBuffer/MemorySegment"
                     {:binding binding :slot (first slots) :value-type (type value)}))))
-
-(defn gpu-array
-  "Allocate GPU-resident (shared) storage for n elements of scalar-type.
-   scalar-type: the defvalue type symbol (e.g. 'Particle) or Class.
-   Returns GpuSoA. Works with any SoA-eligible defvalue type (all-primitive fields)."
-  [scalar-type n]
-  (let [scalar-tag (cond
-                     (symbol? scalar-type) scalar-type
-                     (class? scalar-type)  (symbol (.getSimpleName ^Class scalar-type))
-                     :else (symbol (str scalar-type)))
-        soa-reg @types/soa-registry
-        soa-info (get soa-reg scalar-tag)]
-    (when-not soa-info
-      (throw (ex-info (str "No SoA registered for type: " scalar-tag
-                           ". Use defvalue with all-primitive fields.")
-                      {:scalar-type scalar-type :registered (keys soa-reg)})))
-    (let [fields  (:fields soa-info)
-          soa-tag (:soa-type-tag soa-info)
-          field-segs (mapv (fn [{:keys [name element-tag]}]
-                             (let [dtype      (get element-tag->dtype-map element-tag :float)
-                                   elem-bytes (long (get element-tag->bytes-map element-tag 4))
-                                   seg        (alloc-shared (* (long n) elem-bytes))]
-                               {:name name :dtype dtype :seg seg}))
-                           fields)]
-      (->GpuSoA scalar-tag soa-tag (long n) field-segs))))
-
-(defn gpu-array-device
-  "Allocate device-only GPU storage for n elements of scalar-type.
-   Faster than gpu-array for GPU-only data; requires explicit copy via
-   ze/copy! for transfers. Returns GpuSoA."
-  [scalar-type n]
-  (let [scalar-tag (cond
-                     (symbol? scalar-type) scalar-type
-                     (class? scalar-type)  (symbol (.getSimpleName ^Class scalar-type))
-                     :else (symbol (str scalar-type)))
-        soa-reg @types/soa-registry
-        soa-info (get soa-reg scalar-tag)]
-    (when-not soa-info
-      (throw (ex-info (str "No SoA registered for type: " scalar-tag) {})))
-    (let [fields  (:fields soa-info)
-          soa-tag (:soa-type-tag soa-info)
-          field-segs (mapv (fn [{:keys [name element-tag]}]
-                             (let [dtype      (get element-tag->dtype-map element-tag :float)
-                                   elem-bytes (long (get element-tag->bytes-map element-tag 4))
-                                   seg        (alloc-device (* (long n) elem-bytes))]
-                               {:name name :dtype dtype :seg seg}))
-                           fields)]
-      (->GpuSoA scalar-tag soa-tag (long n) field-segs))))
-
-(defn n-elements
-  "Return the number of elements in a DeviceBuffer or GpuSoA."
-  [buf]
-  (cond
-    (instance? DeviceBuffer buf) (:n-elements ^DeviceBuffer buf)
-    (instance? GpuSoA buf)       (:n ^GpuSoA buf)
-    :else (throw (ex-info "Not a DeviceBuffer or GpuSoA" {:type (type buf)}))))
-
-(defn- get-soa-field-arr
-  "Get array field from a JVM SoA object by field name using reflection."
-  [soa-obj ^String field-name]
-  (let [cls   (class soa-obj)
-        ^java.lang.reflect.Field field
-        (doto (.getDeclaredField cls field-name)
-          (.setAccessible true))]
-    (.get field soa-obj)))
-
-(defn- dtype->elem-bytes ^long [dtype]
-  (case dtype :double 8 :float 4 :long 8 :int 4 (:byte :int8) 1))
-
-(defn copy-to-gpu!
-  "Copy a JVM SoA object (defvalue SoA type) into the GpuSoA's field segments.
-   Uses zero-copy MemorySegment/copy for shared memory.
-   Returns gpu-buf."
-  [^GpuSoA gpu-buf soa-obj]
-  (let [field-segs (:field-segs gpu-buf)
-        n          (long (:n gpu-buf))]
-    (doseq [{:keys [name dtype seg]} field-segs]
-      (let [jvm-arr (get-soa-field-arr soa-obj name)
-            n-bytes (* n (dtype->elem-bytes dtype))
-            src-seg (MemorySegment/ofArray jvm-arr)]
-        (MemorySegment/copy src-seg 0 seg 0 n-bytes)))
-    gpu-buf))
-
-(defn copy-from-gpu!
-  "Copy GpuSoA field segments back into a JVM SoA object.
-   Returns soa-obj."
-  [^GpuSoA gpu-buf soa-obj]
-  (let [field-segs (:field-segs gpu-buf)
-        n          (long (:n gpu-buf))]
-    (doseq [{:keys [name dtype seg]} field-segs]
-      (let [jvm-arr (get-soa-field-arr soa-obj name)
-            n-bytes (* n (dtype->elem-bytes dtype))
-            dst-seg (MemorySegment/ofArray jvm-arr)]
-        (MemorySegment/copy seg 0 dst-seg 0 n-bytes)))
-    soa-obj))
 
 ;; ================================================================
 ;; GPU weight buffer manager (persistent FP16 across training)
@@ -2499,18 +2367,12 @@
                            (alength ^bytes arr)
                            :else
                            (* n default-dtype-size)))
-        ;; Build expanded entries: GpuSoA expands to N field segments,
-        ;; DeviceBuffer passes through, JVM arrays get copied to shared memory.
+        ;; Physical DeviceBuffers pass through; JVM arrays get copied to shared memory.
         ;; Each entry: {:seg MemorySegment :source JVM-arr-or-nil :ab byte-count-or-nil}
          expanded-entries
          (reduce
           (fn [acc [idx arr]]
             (cond
-              ;; GpuSoA: expand to one segment per field (already shared memory)
-              (gpu-soa? arr)
-              (into acc (mapv (fn [{:keys [seg]}]
-                                {:seg seg :source nil :ab nil})
-                              (:field-segs ^GpuSoA arr)))
               ;; DeviceBuffer: pass segment through (no copy)
               (device-buffer? arr)
               (conj acc {:seg (:segment ^DeviceBuffer arr) :source nil :ab nil})
@@ -2546,7 +2408,7 @@
          wg (long (or workgroup-size 256))
          group-count (long (Math/ceil (/ (double n) wg)))]
      (launch! kernel-handle group-count wg all-args)
-    ;; Copy back only JVM arrays (GpuSoA/DeviceBuffer have :source nil)
+    ;; Copy back only JVM arrays (DeviceBuffer has :source nil)
      (doseq [{:keys [seg source ab write?]} expanded-entries]
        (when (and source (or (nil? abi) write?))
          (MemorySegment/copy seg 0 (MemorySegment/ofArray source) 0 (long ab))))
