@@ -7,6 +7,16 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.map-read-requirements :as requirements]))
 
+(deftest graph-minimum-requires-structural-capacity-or-the-exact-checked-guard
+  (is (requirements/graph-capacity-covers? 8 4 []))
+  (is (requirements/graph-capacity-covers? 'capacity 'n
+                                           [{:expression 'capacity :op :>= :value 'n}]))
+  (doseq [conditions [[]
+                      [{:expression 'other :op :>= :value 'n}]
+                      [{:expression 'capacity :op :<= :value 'n}]
+                      [{:expression 'capacity :op :>= :value 'other}]]]
+    (is (not (requirements/graph-capacity-covers? 'capacity 'n conditions)))))
+
 (deftest source-read-rewriting-keeps-embedded-compiler-records-opaque
   (let [certificate (scan/->AssociativeScan 'acc 0.0 '+ '(aget input i) 0.0 :float)
         expression (list 'pair certificate '(aget input i))
@@ -50,6 +60,36 @@
     (is (nil? (requirements/symbolic-read-requirements
                (packed-head-map coordinate)
                {:scalar-definitions {'total (launch/product 'rows 'heads 'width)}})))))
+
+(defn- scalar-scan [element inputs bound]
+  (segop/map->SegScan
+   {:id :scan-read-proof :space (segop/make-seg-space 'i bound)
+    :scan-op {:element element} :inputs inputs :outputs #{'out}
+    :scalars #{'n} :phase :single :dtype :float}))
+
+(deftest fold-read-minima-are-complete-per-buffer
+  (is (= {'labels 'n}
+         (requirements/fold-read-requirements
+          (scalar-scan '(+ (aget labels i) (aget logits (aget indices i)))
+                       #{'labels 'logits} 'n) {})))
+  (doseq [element ['(aget input (+ i 1))
+                   '(aget input (aget indices i))
+                   '(+ (aget input i) (aget input (+ i 1)))]]
+    (is (= {} (requirements/fold-read-requirements
+               (scalar-scan element #{'input} 'n) {}))))
+  (is (= {'input 0}
+         (requirements/fold-read-requirements
+          (scalar-scan '(aget input i) #{'input} 0) {}))))
+
+(deftest resident-fold-minima-only-name-current-phase-inputs
+  (let [operation (assoc (scalar-scan '(aget input i) #{'input 'capture} 0)
+                         :reduction {:attributes
+                                     {:resident-scalar-captures #{'capture 'absent}}})]
+    (is (= {'input 0 'capture 1}
+           (requirements/fold-read-requirements operation {})))
+    (is (= {'input 'n 'capture 1}
+           (requirements/fold-read-requirements
+            (assoc operation :space (segop/make-seg-space 'i 'n)) {})))))
 
 (deftest ordered-loop-read-span-includes-the-counted-axis
   (let [operation

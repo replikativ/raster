@@ -7,6 +7,8 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.parallel-program :as program]
@@ -363,6 +365,20 @@
        requirements))
    {} operations))
 
+(defn- contraction-read-requirements
+  "Project independent typed operand maps, including stage and epilogue operands."
+  [equations]
+  (reduce
+   (fn [requirements equation]
+     (let [{:keys [kind attributes arrays captures]} (soac/operation-parts equation)]
+       (if (= 'contract kind)
+         (let [bindings (contraction-closure/bindings attributes arrays captures)]
+           (reduce (fn [result {:keys [parameter elements]}]
+                     (update result (get bindings parameter) (fnil conj []) elements))
+                   requirements (contraction-closure/storage-requirements attributes)))
+         requirements)))
+   {} equations))
+
 (defn- algorithm-boundary?
   [equation algorithm]
   (and (= algorithm (soac/validate! algorithm))
@@ -461,6 +477,21 @@
                     "a KernelGraph requires at least one scheduled operation" {}))
          derived-scalars (derived-scalar-expressions (:values scheduled) host-prefix)
          values (:values scheduled)
+         transform-read-requirements
+         (into {}
+               (map (fn [equation]
+                      [(second equation)
+                       (reduce
+                        (fn [requirements {:keys [value] operand-map :map}]
+                          (let [minimum (value-elements values derived-scalars
+                                                        {:shape (axis-map/shape operand-map)})]
+                            (update requirements value
+                                    (fn [prior]
+                                      (if (or (nil? prior) (= prior minimum)) minimum
+                                          (launch/maximum prior minimum))))))
+                        {} (get-in (soac/operation-parts equation)
+                                   [:attributes :result-transform :operands]))]))
+               retained-equations)
          map-read-options
          {:array-types (into {} (map (fn [[id v]] [id (:dtype v)])) values)
           :scalar-types (into {} (keep (fn [[id v]]
@@ -493,33 +524,72 @@
          read-requirements
          (reduce
           (fn [requirements [operation certificate]]
-            (if (and (some (fn [id]
+            (let [marked-inputs
+                  (set/intersection
+                   (set (:inputs operation))
+                   (set (mapcat #(get-in (soac/operation-parts %)
+                                        [:attributes :attributes :pointwise-storage-inputs])
+                                (filter #(= (second %) (:algorithm-equation operation))
+                                        retained-equations))))]
+            (if (and (or (seq marked-inputs)
+                         (some (fn [id]
                              (unresolved-capacity? id (get values id)
                                                    (get-in buffer-specs [id :elements])))
-                           (:inputs operation))
+                           (:inputs operation)))
                      (every? (fn [id]
                           (let [value (get values id)]
-                            (and (= {:kind :plain} (:representation value))
-                                 (nil? (:logical-layout value)))))
+                            (or (not (unresolved-capacity?
+                                      id value (get-in buffer-specs [id :elements])))
+                                (and (= {:kind :plain} (:representation value))
+                                     (nil? (:logical-layout value))))))
                         (:inputs operation)))
-              (let [derived (or (:requirements certificate)
-                                (map-reads/static-read-requirements
-                                 operation map-read-options))]
+              (let [fold-reads (map-reads/fold-read-requirements operation map-read-options)
+                    pure-map? (and (segop/seg-map? operation)
+                                   (:out-sym operation)
+                                   (not (seq (get-in operation [:scalar-region :effects]))))
+                    independent-reads (when pure-map?
+                                  ;; Read footprints do not authorize in-place execution.
+                                  ;; The map owner separately checks same-lane alias legality.
+                                  (map-reads/independent-read-requirements
+                                   operation map-read-options))
+                    optional-reads (merge-with
+                                    (fn [left right]
+                                      (if (= left right) left (launch/maximum left right)))
+                                    (:requirements certificate) independent-reads fold-reads
+                                    (get transform-read-requirements (:algorithm-equation operation)))
+                    static-reads (when (and pure-map?
+                                            (some #(not (contains? optional-reads %))
+                                                  (:inputs operation)))
+                                   (map-reads/static-read-requirements operation map-read-options))
+                    derived (merge-with (fn [left right]
+                                          (if (= left right) left (launch/maximum left right)))
+                                        optional-reads static-reads)
+                    _ (doseq [id marked-inputs
+                              :when (not (contains? derived id))]
+                          (fail! :scheduled-equation-read-capacity
+                                 "pointwise storage refinement must retain its read-span proof"
+                                 {:operation (:id operation) :phase (:phase operation)
+                                  :input id :source operation}))]
                 (merge-with into requirements
                             (into {} (map (fn [[id extent]] [id [extent]])) derived)))
-              requirements))
-          (product-read-requirements values operations derived-scalars)
+              requirements)))
+          (merge-with into
+                      (contraction-read-requirements retained-equations)
+                      (product-read-requirements values operations derived-scalars)
+                      (reduce (fn [requirements reads]
+                                (merge-with into requirements
+                                            (into {} (map (fn [[id minimum]] [id [minimum]])) reads)))
+                              {} (vals transform-read-requirements)))
           (map vector operations read-capacity-certificates))
          buffer-specs (reduce-kv
                        (fn [specs id requirements]
-                         (let [extents (vec (distinct
-                                             (cond-> requirements
-                                               (not (unresolved-capacity?
-                                                     id (get values id) (get-in specs [id :elements])))
-                                               (conj (get-in specs [id :elements])))))
-                               required (if (= 1 (count extents)) (first extents)
-                                            (apply launch/maximum extents))]
-                           (assoc-in specs [id :elements] required)))
+                         (if (not (unresolved-capacity?
+                                    id (get values id) (get-in specs [id :elements])))
+                           specs
+                           (let [extents (vec (distinct requirements))
+                                 required (if (= 1 (count extents)) (first extents)
+                                              (apply launch/maximum extents))]
+                             (assoc-in specs [id :elements] required))))
                        buffer-specs read-requirements)
          ;; An aliased destination can have unknown capacity while the typed result has a
          ;; precise written extent (e.g. an exclusive scan writes n+1 elements). That semantic
@@ -540,8 +610,9 @@
                            specs))
                        buffer-specs result-storage-values)
          capacity-preconditions
-         (->> read-capacity-certificates
-              (mapcat (comp seq :requirements))
+         (->> (concat (mapcat (comp seq :requirements) read-capacity-certificates)
+                      (mapcat (fn [[id requirements]] (map #(vector id %) requirements))
+                              read-requirements))
               (keep (fn [[id required]]
                       (let [capacity (get-in buffer-specs [id :elements])]
                         (when-not (map-reads/capacity-covers? capacity required)

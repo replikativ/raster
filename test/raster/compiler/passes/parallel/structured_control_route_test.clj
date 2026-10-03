@@ -714,7 +714,12 @@
         linked-plan (equation-first/lower compilation arguments)
         call (get-in linked-plan [:instances 0 :call])
         staging (program-runtime/staging-plan call :loop-free-mlp)
-        first-layer-rows (first (get-in semantic [:values 'b1 :shape]))]
+        first-layer-bias (:id (first (filter #(= 'b1 (:symbol %))
+                                            (:parameters invocation-plan))))
+        first-layer-rows (:symbol (first (filter #(and (invocation/shape-projection? %)
+                                                   (= first-layer-bias (:source %))
+                                                   (= 0 (:axis %)))
+                                            (:steps invocation-plan))))]
     (is (= :typed-parallel (:dialect semantic)))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
@@ -724,6 +729,7 @@
         "pure host scalar/shape equations belong to the typed invocation plan")
     (is (= 0 (get-in compilation [:stats :emission :host-scalar-equations])))
     (is (= 2 (count staging)))
+    (is (some? first-layer-rows))
     (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
         "program shape facts remain available when a later kernel has no ABI use for them")
     (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))))

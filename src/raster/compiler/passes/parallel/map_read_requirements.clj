@@ -10,6 +10,7 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.scalar-range :as ranges]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.patterns :as patterns]
@@ -238,6 +239,52 @@
   [operation options]
   (:requirements (symbolic-read-certificate operation options)))
 
+(defn independent-read-requirements
+  "Prove all reads of each input independently, without certifying alias legality or execution."
+  [operation options]
+  (reduce (fn [requirements id]
+            (merge requirements
+                   (symbolic-read-requirements
+                    (assoc operation :inputs #{id} :outputs #{}) options)))
+          {} (:inputs operation)))
+
+(defn fold-read-requirements
+  "Minimum capacities of a scalar reduction/scan's retained one-dimensional element region.
+
+   Reuse the same lexical dense-span analysis as maps; the analysis-only map projects reads,
+   not a rewrite, scheduling choice, or independent execution certificate. Unknown/indirect
+   coordinates still decline. Combine/post-result reads are not justified by this domain."
+  [operation options]
+  (when (and (nil? (:lambda operation))
+             (= 1 (count (get-in operation [:space :dims]))))
+    (let [operator (:reduction operation)
+          region (cond
+                   (and (segop/seg-red? operation) operator (:step operator))
+                   (reduction/fold-region operator)
+                   (segop/seg-scan? operation)
+                   {:bindings [] :results [(get-in operation [:scan-op :element])]})
+          locals (mapv (fn [[id init]] {:id id :init init}) (partition 2 (:bindings region)))
+          reads (when (and region (every? some? (:results region)))
+                  ;; Certify every read of each buffer independently. An indirect read of
+                  ;; another buffer must not erase a valid dense proof, but one unsupported
+                  ;; read of this buffer still prevents its capacity projection.
+                  (independent-read-requirements
+                   (segop/map->SegMap
+                    {:id (:id operation) :space (:space operation)
+                     :scalar-region {:locals locals :result (list* 'do (:results region))}
+                     :inputs (:inputs operation) :outputs #{} :scalars (:scalars operation)})
+                   options))]
+      (when reads
+        ;; Completed scalar captures are read outside the reduction's active element domain.
+        ;; Their distinct, already retained one-element contract survives even at width zero.
+        (merge-with (fn [read-minimum scalar-minimum]
+                      (if (= read-minimum scalar-minimum) read-minimum
+                          (launch/maximum read-minimum scalar-minimum)))
+                    reads (into {} (map (fn [id] [id 1]))
+                                (set/intersection
+                                 (set (:inputs operation))
+                                 (set (get-in operator [:attributes :resident-scalar-captures])))))))))
+
 (defn capacity-covers?
   "Whether a symbolic graph capacity structurally proves one certified minimum."
   [capacity required]
@@ -253,6 +300,13 @@
                (extent/equivalent? expression capacity)
                (extent/equivalent? value required)))
         conditions))
+
+(defn graph-capacity-covers?
+  "Whether a validated graph enforces a proved read minimum, structurally or by
+   an explicit checked capacity guard. This does not prove source indices."
+  [capacity required conditions]
+  (or (capacity-covers? capacity required)
+      (precondition-covers? conditions capacity required)))
 
 (defn- address-substitutions
   [locals expression]
@@ -358,9 +412,7 @@
                               (:temporaries kernel-graph)))
         _ (doseq [[id required] (:requirements attached)]
             (let [capacity (:elements (get buffers id))]
-              (when-not (or (capacity-covers? capacity required)
-                            (precondition-covers? (:preconditions kernel-graph)
-                                                 capacity required))
+              (when-not (graph-capacity-covers? capacity required (:preconditions kernel-graph))
                 (throw (ex-info "graph buffer does not enforce the certified map read span"
                                 {:reason :map-address-certificate-capacity
                                  :buffer id :required required :capacity capacity})))))

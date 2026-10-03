@@ -336,7 +336,8 @@
        value
        (seq (:shape value))
        (av/storage-contract-compatible? value (av/tensor {:dtype dtype :shape [elements]}))
-       (= elements (shape-elements (:shape value)))))
+       (or (= elements (shape-elements (:shape value)))
+           (= [(list 'extent (:id descriptor))] (:shape value)))))
 
 (defn- plan-value-contract?
   "Source arrays are flat contiguous values; the plan retains its mathematical axes. Accept that
@@ -400,7 +401,12 @@
            (= #{:memory/read :memory/write} (:effects equation))
            (= storage (get-in equation [:attributes :result-storage]))
            (every? (fn [{:keys [id] :as descriptor}]
-                     (plan-value-contract? (get values id) descriptor))
+                     (or (plan-value-contract? (get values id) descriptor)
+                         ;; Public backing capacity is distinct from the plan's
+                         ;; logical shape. The emitted graph still checks the
+                         ;; descriptor's footprint before allocation/execution.
+                         (and (= [(list 'extent id)] (:shape (get values id)))
+                              (storage-contract? (get values id) descriptor))))
                    input-descriptors)
            (storage-contract? (get values (:id output-descriptor)) output-descriptor)
            (plan-value-contract? (get values (first results)) output-descriptor)

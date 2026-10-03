@@ -15,6 +15,8 @@
               [[#'storage/regrouped-map [(float-array [0.25 -2.5 8.0 1.0 2.0 3.0]) 1 2 3]
                 [2.5 -3.0 18.0 4.0 6.0 8.0]]
                [#'storage/prefix-map [(float-array [0.25 -2.5 8.0 1.0 2.0 3.0]) 6 4]
+                [0.25 -2.5 8.0 1.0]]
+               [#'storage/prefix-map [(float-array [0.25 -2.5 8.0 1.0 2.0 3.0]) 4 4]
                 [0.25 -2.5 8.0 1.0]]]]
         (is (= expected (vec (apply function args))))
         (let [live (compiled/compile function args

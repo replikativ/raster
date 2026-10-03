@@ -39,6 +39,22 @@
     (is (= '[n x] (:inputs (dialect/facts typed-result))))
     (is (not (contains? (:values (dialect/facts typed-result)) 'y)))))
 
+(deftest fusion-preserves-pointwise-storage-capacity-obligations
+  (doseq [[source array-types expected]
+          [[map-map-source {'x :float} #{'x}]
+           [horizontal-map-source {'a :float 'b :float} #{'a 'b}]]]
+    (let [program (frontend/form->program
+                   source {:dtype :float :array-types array-types :scalar-types {'n :long}
+                           :values (into {} (map (fn [[id dtype]]
+                                                  [id (av/tensor {:dtype dtype
+                                                                  :shape [(list 'extent id)]})]))
+                                         array-types)})
+          [fused _] (typed-fusion/fusion-fixpoint program)
+          operation (dialect/operation-parts (first (dialect/equations fused)))]
+      (is (= 1 (count (dialect/equations fused))))
+      (is (= expected (set (get-in operation [:attributes :attributes :pointwise-storage-inputs]))))
+      (is (= fused (dialect/validate! fused))))))
+
 (deftest vertical-fusion-preserves-a-checked-producer-completion-boundary
   (let [source '(let* [y (raster.par/map! tmp i n int (clojure.core/aget input i))
                        z (raster.par/map! out j n int (clojure.core/aget y j))]
@@ -417,7 +433,8 @@
 
 (defn- contract-result-map-program
   ([map-expression] (contract-result-map-program map-expression 'D))
-  ([map-expression destination]
+  ([map-expression destination] (contract-result-map-program map-expression destination {}))
+  ([map-expression destination options]
   (frontend/form->program
    (list 'let*
          ['contract-step
@@ -428,9 +445,26 @@
           'map-step
           (list 'raster.par/map! destination 't 32 nil map-expression)]
          'map-step)
-   {:dtype :float
+   (merge {:dtype :float
     :array-types '{A :float B :float C :float D :float bias :float residual :float}
-    :scalar-types '{scale :float}})))
+    :scalar-types '{scale :float}} options))))
+
+(deftest result-map-stable-storage-requires-the-complete-producer-axis-map
+  (doseq [[index fused?] [['t true] ['(mod t 8) false] ['(inc t) false]]]
+    (let [read (with-meta (list 'clojure.core/aget 'C index)
+                         {:raster.type/tag 'Float :raster.op/original 'clojure.core/aget})
+          program (contract-result-map-program
+                   (list 'max '(float 0.0) read) 'D
+                   {:values {'C (av/tensor {:dtype :float :shape '[(extent C)]})}})
+          [result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= (if fused? 1 0) (:vertical stats)))
+      (is (= (if fused? 1 2) (count (dialect/equations result))))
+      (is (= result (dialect/validate! result)))))
+  (let [read (with-meta '(clojure.core/aget bias t)
+                       {:raster.type/tag 'Float :raster.op/original 'clojure.core/aget})
+        rewritten (#'typed-fusion/erase-axis-mapped-load-indices read #{'bias})]
+    (is (= '(clojure.core/aget bias 0) rewritten))
+    (is (= (meta read) (meta rewritten)))))
 
 (defn- map-initialized-contract-program
   ([initializer-expression]
@@ -457,6 +491,27 @@
           'product)
     {:dtype :float
      :array-types '{A :float B :float C :float bias :float}})))
+
+(deftest result-transform-capacity-maps-own-their-axis-extents-and-storage-types
+  (let [[program _] (typed-fusion/fusion-fixpoint
+                     (map-initialized-contract-program
+                      '(clojure.core/aget bias (clojure.core/rem t 8))))
+        rewrite (fn [path value]
+                  (let [equation (first (dialect/equations program))
+                        operation (nth equation 3)
+                        attributes (assoc-in (second operation) path value)]
+                    (list 'soac-program (dialect/facts program)
+                          [(apply list (assoc (vec equation) 3
+                                             (apply list (assoc (vec operation) 1 attributes))))]
+                          (dialect/outputs program))))]
+    (doseq [[path value expected]
+            [[[:result-transform :operands 0 :map :groups 0 0 1]
+              1 :typed-soac-result-transform-axis-extent]
+             [[:result-transform :operands 0 :dtype]
+              :double :typed-soac-result-transform-operand-type]]]
+      (is (= expected
+             (try (dialect/validate! (rewrite path value)) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
 (deftest dense-initializer-map-becomes-a-contraction-result-transform
   (let [program (map-initialized-contract-program

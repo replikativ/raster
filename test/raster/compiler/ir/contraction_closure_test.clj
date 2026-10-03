@@ -136,6 +136,8 @@
     (doseq [[label transform]
             [[:short-core #(assoc-in % ['a :shape] [287])]
              [:short-scale #(assoc-in % ['da :shape] [8])]
+             [:cross-core-extent #(assoc-in % ['a :shape] '[(extent b)])]
+             [:cross-output-extent #(assoc-in % ['out :shape] '[(extent a)])]
              [:wrong-core-type #(assoc-in % ['a :dtype] :float)]
              [:wrong-scale-type #(assoc-in % ['da :dtype] :byte)]
              [:encoded-input #(assoc-in % ['a :representation] {:kind :quantized})]
@@ -151,6 +153,12 @@
              [:wrong-result-shape #(assoc-in % ['result :shape] [15])]]]
       (testing (name label)
         (is (thrown? clojure.lang.ExceptionInfo (soac/validate! (with-values transform))))))
+    (let [self-capacities (with-values
+                          #(reduce (fn [values id]
+                                     (assoc-in values [id :shape] [(list 'extent id)]))
+                                   % '[a b da db out]))]
+      (is (= self-capacities (soac/validate! self-capacities))
+          "self-capacities remain unresolved; independent graph minima enforce invocation sizes"))
     (is (thrown? clojure.lang.ExceptionInfo
                  (soac/validate! (rewrite-attributes #(assoc % :array-parameters '[a b da])))))
     (is (thrown? clojure.lang.ExceptionInfo

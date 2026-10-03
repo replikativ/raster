@@ -161,8 +161,12 @@
                   shape (:shape value)]]
       (when-not (and (= :tensor (:kind value)) (plain-storage? value)
                      (= dtype (:dtype value))
-                     (seq shape) (every? #(and (integer? %) (pos? %)) shape)
-                     (>= (reduce *' 1 shape) elements))
+                     (or (and (seq shape) (every? #(and (integer? %) (pos? %)) shape)
+                              (>= (reduce *' 1 shape) elements))
+                         ;; Unresolved self-capacity is specialized at invocation.
+                         ;; The closure's independent typed storage requirement remains the
+                         ;; graph minimum and must fit before any target is allocated/launched.
+                         (= [(list 'extent (get bound parameter))] shape)))
         (fail! :operand-storage {:operand requirement :value value :required elements})))
     (doseq [id captures :let [value (get values id)]]
       (when-not (and (= :tensor (:kind value)) (= [] (:shape value)) (plain-storage? value)

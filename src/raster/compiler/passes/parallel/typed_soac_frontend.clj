@@ -4843,7 +4843,9 @@
                            (elementize expressions arrays parameters index))]
     (list '= id results
           (list 'map {:index index :extent extent
-                      :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
+                      :attributes {:stable-array-captures (vec (sort-by pr-str stable))
+                                   :pointwise-storage-inputs
+                                   (vec (sort-by pr-str (:storage-inputs description)))}}
                 arrays captures
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms body-results)))))
@@ -5002,11 +5004,13 @@
                 (dialect/lambda-form parameters [(if cast (list cast body) body)])))))
 
 (defn- reduce-equation
-  [{:keys [id extent inputs scalars product]}]
+  [{:keys [id extent inputs scalars product storage-inputs]}]
   (let [component (first (:components product))
         expressions (:results (reduction/fold-region product))
         index (:index product)
-        [pointwise stable] ((juxt filter remove) #(pointwise-input? expressions % index) inputs)
+        [pointwise stable] ((juxt filter remove)
+                            #(and (not (contains? storage-inputs %))
+                                  (pointwise-input? expressions % index)) inputs)
         arrays (vec (sort-by pr-str pointwise))
         captures (vec (sort-by pr-str (distinct (concat stable scalars))))
         elements (element-symbols (count arrays))
@@ -5020,7 +5024,8 @@
                  (:dtype component))]
     (list '= id (vec (filter some? (reduction/results product)))
           (list 'reduce {:index index :extent extent
-                         :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
+                         :attributes {:stable-array-captures (vec (sort-by pr-str stable))
+                                      :pointwise-storage-inputs (vec (sort-by pr-str storage-inputs))}
                          :accumulators [(:accumulator component)]
                          :identities [(:neutral component)]
                          :dtypes [(:dtype component)]
@@ -5162,8 +5167,10 @@
                 [] captures fold-forms map-lambda))))
 
 (defn- scan-equation
-  [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body]}]
-  (let [[pointwise stable] ((juxt filter remove) #(pointwise-input? [body] % index) inputs)
+  [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body storage-inputs]}]
+  (let [[pointwise stable] ((juxt filter remove)
+                            #(and (not (contains? storage-inputs %))
+                                  (pointwise-input? [body] % index)) inputs)
         arrays (vec (sort-by pr-str pointwise))
         ;; The caller-owned destination is physical result storage, not a value read by the
         ;; functional scan. Keeping it out of captures prevents a false read/alias contract.
@@ -5178,7 +5185,8 @@
                                :out primary-out} dtype)]
     (list '= id [sym]
           (list 'scan {:mode mode :index index :extent extent
-                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
+                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))
+                                    :pointwise-storage-inputs (vec (sort-by pr-str storage-inputs))}
                        :accumulators [accumulator]
                        :identities [identity]
                        :dtypes [dtype]
@@ -5428,6 +5436,9 @@
   (let [[_ _ results] equation
         {:keys [kind attributes arrays captures destinations]} (dialect/operation-parts equation)
         result-destinations (zipmap results destinations)
+        array-types (merge (into {} (map (juxt :value :dtype))
+                                 (get-in attributes [:result-transform :operands]))
+                           array-types)
         extent (:extent attributes)
         dimension-ids (set (filter dialect/value-id? (dialect/operation-extents equation)))
         dimension-value
@@ -5559,16 +5570,22 @@
   "Project the exact logical and physical tensor contracts already carried by a protected plan.
    Runtime scalars remain ordinary source scalar values and are checked below; this helper neither
    infers their types nor changes the plan's storage layout."
-  [{:keys [sym plan]}]
+  [{:keys [sym plan]} known-values]
   (let [plan (swr/validate! plan)
         output (:output plan)]
     ;; Source arrays are flat contiguous buffers. Mathematical rank remains authoritative in the
     ;; plan; the shared boundary checks the exact physical footprint without teaching pmap a
     ;; second tensor layout convention.
     (into {sym (tensor-value (:dtype output) [(:elements output)])
-           (:id output) (tensor-value (:dtype output) [(:elements output)])}
+           (:id output) (let [known (get known-values (:id output))]
+                          (if (= [(list 'extent (:id output))] (:shape known))
+                            known
+                            (tensor-value (:dtype output) [(:elements output)])))}
           (map (fn [{:keys [id dtype elements]}]
-                 [id (tensor-value dtype [elements])]))
+                 [id (let [known (get known-values id)]
+                       (if (= [(list 'extent id)] (:shape known))
+                         known
+                         (tensor-value dtype [elements])))]))
           (:operands plan))))
 
 (defn- merge-value
@@ -5600,7 +5617,7 @@
 (declare form->program*)
 
 (defn- preserve-map-storage-inputs
-  "Use indexed captures when pointwise element-shape equality is not established.
+  "Use indexed captures in maps, reductions and scans when element-shape equality is not established.
    Retain source-ordered producer storage shapes; a different symbolic traversal extent is not
    permission to retype that storage. Existing indexed access/range validation remains mandatory."
   [descriptions values]
@@ -5625,10 +5642,13 @@
     (:descriptions
      (reduce
       (fn [{:keys [shapes] :as state}
-           {:keys [kind extent inputs locals bodies index results] :as description}]
-        (if-not (= :map kind)
+           {:keys [kind extent inputs locals bodies body product index results] :as description}]
+        (if-not (contains? #{:map :reduce :scan} kind)
           (update state :descriptions conj description)
-          (let [expressions (into (mapv :init locals) bodies)
+          (let [expressions (case kind
+                              :reduce (:results (reduction/fold-region product))
+                              :scan [body]
+                              (into (mapv :init locals) bodies))
                 pointwise (filter #(pointwise-input? expressions % index) inputs)
                 storage-inputs
                 (into (set (:storage-inputs description))
@@ -5648,7 +5668,7 @@
                                    known (assoc known id [extent])))
                                shapes pointwise)]
             (-> state
-                (assoc :shapes (reduce #(assoc %1 %2 [extent]) shapes results))
+                (assoc :shapes (reduce #(assoc %1 %2 (if (= :reduce kind) [] [extent])) shapes results))
                 (update :descriptions conj
                         (assoc description :storage-inputs storage-inputs))))))
       {:descriptions [] :shapes (into {} (map (juxt key (comp :shape val))) values)}
@@ -5853,7 +5873,7 @@
               inferred-values
               (reduce (fn [contracts description]
                         (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
-                                   (swr-description-values description)))
+                                   (swr-description-values description values)))
                       inferred-values swr-descriptions)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                 inferred-values values)

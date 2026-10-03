@@ -240,12 +240,66 @@
   (doseq [target [ocl-target cuda-target hip-target]]
     (is (map? (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 6 4]
                              {:compiler :equation-first :target target :dtype :float})))
+    (is (map? (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 4 4]
+                             {:compiler :equation-first :target target :dtype :float})))
+    (is (= :program-link-graph-range
+           (try
+             (compiled/lower #'symbolic-storage/prefix-map [(float-array 3) 4 4]
+                             {:compiler :equation-first :target target :dtype :float})
+             nil
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (is (= :program-link-graph-range
            (try
              (compiled/lower #'symbolic-storage/prefix-map [(float-array 6) 6 7]
                              {:compiler :equation-first :target target :dtype :float})
              nil
-             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (compiled/lower #'symbolic-storage/prefix-map [(float-array 3) 4 4]
+                                 {:compiler :equation-first :target target :dtype :float
+                                  :values {'x (av/tensor {:dtype :float :shape [3]})}}))
+        "a supplied static capacity cannot erase the reclassified pointwise minimum")))
+
+(deftest public-effect-storage-is-capacity-not-traversal
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [lower (fn [nx nb no full owned]
+                  (compiled/lower #'symbolic-storage/fill-and-read-prefix!
+                                  [(float-array nx) (float-array nb) (float-array no) full owned]
+                                  {:compiler :equation-first :target target :dtype :float
+                                   :outputs '[out]}))]
+      (is (map? (lower 32 32 16 32 16)))
+      (doseq [[nx nb no full owned reason]
+              [[31 32 16 32 16 :program-link-graph-range] ; input shorter than fill reads
+               [32 31 16 32 16 :program-link-value-contract] ; destination shorter than fill writes
+               [16 16 17 16 17 :program-link-graph-range] ; later read exceeds boundary storage
+               [32 32 15 32 16 :program-link-value-contract]]] ; prefix destination too small
+        (is (= reason
+               (try (lower nx nb no full owned) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
+(deftest indexed-captures-retain-capacity-without-claiming-a-dense-read-proof
+  (doseq [target [ocl-target cuda-target hip-target]
+          [source arguments capacity]
+          [[#'symbolic-storage/shifted-map [(float-array 5) 4] 5]
+           [#'symbolic-storage/indirect-map [(float-array 6) (long-array [0 2 4 5]) 4] 6]
+           [#'symbolic-storage/shifted-scan [(float-array 5) 4] 5]
+           [#'symbolic-storage/indirect-scan [(float-array 6) (long-array [0 2 4 5]) 4] 6]]]
+    (is (map? (compiled/lower source arguments
+                             {:compiler :equation-first :target target :dtype :float
+                              :values {'x (av/tensor {:dtype :float :shape [capacity]})
+                                       'indices (av/tensor {:dtype :long :shape [4]})}}))
+        "indexed captures retain caller bounds obligations, not a dense traversal certificate")))
+
+(deftest fused-result-transform-retains-its-independent-operand-minimum
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'symbolic-storage/fused-bias-contract!
+                                             {:target target :dtype :float})
+          arguments [(float-array 64) (float-array 128) (float-array 8) (float-array 32)]]
+      (is (= 1 (count (:kernels compilation))) "initializer and contraction are fused")
+      (is (map? (equation-first/lower compilation arguments)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (equation-first/lower compilation (assoc arguments 2 (float-array 7))))
+          "a fused epilogue cannot erase the bias capacity requirement"))))
 
 (use-fixtures
   :once
