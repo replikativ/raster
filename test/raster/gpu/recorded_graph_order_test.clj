@@ -1,9 +1,31 @@
 (ns raster.gpu.recorded-graph-order-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.ir.kernel-abi :as abi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.core :as gpu]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.link :as link]))
+
+(defn- owned-phase [entry]
+  (assoc entry ::cleanup/owner (cleanup/owner [])))
+
+(deftest ownerless-plain-phases-cannot-execute-or-be-recorded
+  (let [sess (atom {:device-id :ocl:0 :closed? false :graphs {}
+                    :prepared {:phase {:phase :kernel}}})
+        contacts (atom [])]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [_ name] (swap! contacts conj name)
+         (throw (ex-info "Unexpected native contact" {})))}
+      (fn []
+        (doseq [f [#(gpu/invoke-bound! sess :phase)
+                   #(gpu/record-graph! sess [:phase] :graph)]]
+          (is (= :missing-cleanup-owner
+                 (try (f) (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+        (is (empty? @contacts))
+        (is (empty? (:graphs @sess)))))))
 
 (defn- with-recording-runtime [record replay destroy f]
   (with-redefs-fn
@@ -18,7 +40,8 @@
 (deftest independent-recordings-pin-the-same-prepared-source
   (let [calls (atom [])
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :buffers {:data :buffer} :prepared {:phase {:phase :kernel}}})]
+                    :buffers {:data :buffer}
+                    :prepared {:phase {:phase :kernel ::cleanup/owner (cleanup/owner [])}}})]
     (with-recording-runtime
       (fn [prepareds _] {:prepareds prepareds}) (fn [_])
       (fn [_] (swap! calls conj :destroy))
@@ -35,7 +58,7 @@
           (gpu/release-recorded-graph! sess key))
         (is (= [:destroy :destroy] @calls))
         (is (empty? (:graphs @sess)))
-        (is (= {:phase :kernel} (get-in @sess [:prepared :phase])))
+        (is (= :kernel (get-in @sess [:prepared :phase :phase])))
         (is (nil? (gpu/release-prepared! sess :phase)))
         (is (nil? (get-in @sess [:prepared :phase])))
         (gpu/free-buffer! sess :data)
@@ -44,7 +67,14 @@
 (deftest prepared-root-footprints-allow-disjoint-staging-and-pin-owned-aliases
   (let [root (Object.) staging (Object.) freed (atom [])
         sess (atom {:device-id :ocl:0 :closed? false :graphs {} :prepared {}
-                    :kernels {:phase [{:kernel-name "root-probe" :array-params '[x]}]}
+                    :kernels {:phase [(artifact/make
+                                      {:kernel-name "root_probe"
+                                       :source "__kernel void root_probe(__global float* x, int n) { x[0] = x[0]; }"
+                                       :abi [(abi/slot 'x :inout :float)
+                                             (abi/slot 'n :scalar :int :role :bound)]
+                                       :arguments '[x n]
+                                       :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                                       :effects {:kind :in-place}})]}
                     :buffers {:data root :staging staging}
                     :allocations {:data {:id :root :ownership :owned}
                                   :staging {:id :staging :ownership :owned}}})]
@@ -52,14 +82,18 @@
       {(ns-resolve 'raster.gpu.core 'rt-resolve)
        (fn [_ name]
          (case name
-           "bind-registered-map-void-kernel" (fn [_ buffers _ _ _]
-                                                {:phase :kernel :bound-buffers buffers})
+           "expand-pointer-binding" (fn [_ value] [value])
+           "bind-kernel-call" (fn [call _]
+                                  {:phase :kernel :kernel-call call ::cleanup/owner (cleanup/owner [])})
            "record-graph!" (fn [_ _] {:native :graph})
            "free-buffer!" (fn [buffer] (swap! freed conj buffer))))
        (ns-resolve 'raster.gpu.core 'rt-resolve-soft)
        (fn [_ name] (when (= name "destroy-graph!") (fn [_])))}
       (fn []
         (gpu/prepare! sess :phase {"x" :data} [] 1)
+        (is (= :prepared-buffer-retained
+               (try (gpu/free-buffer! sess :data)
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
         (gpu/record-graph! sess [:phase] :graph)
         (is (= #{:data} (get-in @sess [:graphs :graph :resident-footprint :buffer-keys])))
         (gpu/free-buffer! sess :staging)
@@ -106,7 +140,7 @@
 (deftest recorded-replay-serializes-native-use-with-release
   (let [entered (promise) allow-return (promise) release-started (promise) destroyed (promise)
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :prepared {:phase {:phase :kernel}}})]
+                    :prepared {:phase (owned-phase {:phase :kernel})}})]
     (with-recording-runtime
       (fn [_ _] {:native :graph})
       (fn [_] (deliver entered true)
@@ -132,8 +166,8 @@
   (let [calls (atom [])
         failure (ex-info "Unknown native destruction outcome" {})
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :prepared {:constant {:phase :constant :const-prologue? true}
-                               :phase {:phase :kernel}}})]
+                    :prepared {:constant (owned-phase {:phase :constant :const-prologue? true})
+                               :phase (owned-phase {:phase :kernel})}})]
     (with-recording-runtime
       (fn [prepareds _] {:prepareds prepareds}) (fn [_])
       (fn [graph]
@@ -157,7 +191,7 @@
         (is (identical? failure
                         (try (gpu/close-session! sess) (catch Throwable e e))))
         (is (= :releasing (:lifecycle @sess)))
-        (is (= {:phase :kernel} (get-in @sess [:prepared :phase])))
+        (is (= :kernel (get-in @sess [:prepared :phase :phase])))
         (is (= [:kernel :constant] @calls))))))
 
 (deftest failed-construction-adopts-unresolved-native-debt-before-rethrow
@@ -166,7 +200,7 @@
         releases (atom 0)
         debt (cleanup/owner [{:id :native :release #(do (swap! releases inc) (throw secondary))}])
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :prepared {:phase {:phase :kernel}}})]
+                    :prepared {:phase (owned-phase {:phase :kernel})}})]
     (with-recording-runtime
       (fn [_ {:keys [adopt-cleanup!]}] (adopt-cleanup! debt) (throw primary))
       (fn [_]) (fn [_] (throw (ex-info "No successful graph was acquired" {})))
@@ -192,7 +226,7 @@
         generation (atom 0)
         destroyed (atom [])
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :prepared {:phase {:phase :kernel}}})]
+                    :prepared {:phase (owned-phase {:phase :kernel})}})]
     (with-recording-runtime
       (fn [_ _] {:generation (swap! generation inc)}) (fn [_])
       (fn [{:keys [generation]}]
@@ -216,8 +250,8 @@
         secondary (ex-info "Prologue release indeterminate" {})
         recordings (atom 0)
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :prepared {:constant {:phase :constant :const-prologue? true}
-                               :phase {:phase :kernel}}})]
+                    :prepared {:constant (owned-phase {:phase :constant :const-prologue? true})
+                               :phase (owned-phase {:phase :kernel})}})]
     (with-recording-runtime
       (fn [_ _] (swap! recordings inc) {:prologue true})
       (fn [_] (throw primary)) (fn [_] (throw secondary))
@@ -234,7 +268,7 @@
 (deftest measurement-hook-cannot-release-then-replay-a-recording
   (let [calls (atom [])
         sess (atom {:device-id :ocl:0 :closed? false :graphs {}
-                    :prepared {:phase {:phase :kernel}}})]
+                    :prepared {:phase (owned-phase {:phase :kernel})}})]
     (with-redefs-fn
       {(ns-resolve 'raster.gpu.core 'rt-resolve)
        (fn [_ name]
@@ -269,9 +303,9 @@
 (deftest graph-order-separates-record-time-prologue-from-replay
   (let [calls (atom [])
         sess (atom {:device-id :ocl:0 :prepared
-                    {:phase-a {:phase :a}
-                     :phase-b {:phase :b :const-prologue? true}
-                     :phase-c {:phase :c}}
+                    {:phase-a (owned-phase {:phase :a})
+                     :phase-b (owned-phase {:phase :b :const-prologue? true})
+                     :phase-c (owned-phase {:phase :c})}
                     :graphs {} :closed? false})
         resolve-runtime (fn [_device-id name]
                           (case name
@@ -347,9 +381,9 @@
   (let [calls (atom [])
         handle (gpu/->KernelGraphHandle :emitted)
         sess (atom {:device-id :ocl:0 :closed? false
-                    :prepared {:before {:phase :before}
-                               :constant {:phase :constant :const-prologue? true}
-                               :after {:phase :after}}
+                    :prepared {:before (owned-phase {:phase :before})
+                               :constant (owned-phase {:phase :constant :const-prologue? true})
+                               :after (owned-phase {:phase :after})}
                     :kernel-graphs {:emitted {:prepareds [{:phase :producer}
                                                           {:phase :consumer}]}}
                     :graphs {}})

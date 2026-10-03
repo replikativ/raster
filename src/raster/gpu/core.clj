@@ -261,18 +261,24 @@
    before their private storage because their argument state still refers to those buffers."
   [device-id entry]
   (when entry
-    (when-let [destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
-      (doseq [prepared (prepared-bindings entry)]
-        (try (destroy-prepared! prepared) (catch Exception _))))
-    ;; Level Zero slices are non-owning pointers. OpenCL sub-buffers are independently
-    ;; reference-counted cl_mem values and follow the executable step that materialized them.
-    (when (and (bound-executable-step? entry) (seq (:owned-view-buffers entry)))
-      (when-let [free! (rt-resolve-soft device-id "free-buffer!")]
-        (doseq [buffer (:owned-view-buffers entry)]
-          (try (free! buffer) (catch Exception _)))))
-    (when (and (bound-executable-step? entry) (seq (:temporary-buffers entry)))
-      (try (free-buffers-internal! (:temporary-buffers entry) device-id)
-           (catch Exception _)))))
+    (if-not (bound-executable-step? entry)
+      (if-let [owner (::cleanup/owner entry)]
+        (cleanup/release! owner)
+        (throw (ex-info "Prepared binding has lost its cleanup owner"
+                        {:reason :missing-cleanup-owner})))
+      ;; Multi-child descriptor ownership is the next migration, not an owner-less fallback
+      ;; for a plain KernelCall binding. Its existing rollback debt remains explicit here.
+      (do
+        (when-let [destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
+          (doseq [prepared (prepared-bindings entry)]
+            (try (destroy-prepared! prepared) (catch Exception _))))
+        (when (seq (:owned-view-buffers entry))
+          (when-let [free! (rt-resolve-soft device-id "free-buffer!")]
+            (doseq [buffer (:owned-view-buffers entry)]
+              (try (free! buffer) (catch Exception _)))))
+        (when (seq (:temporary-buffers entry))
+          (try (free-buffers-internal! (:temporary-buffers entry) device-id)
+               (catch Exception _)))))))
 
 (defn- recorded-graph-entry?
   [value]
@@ -341,9 +347,9 @@
     (throw (ex-info "KernelGraph entry has lost its cleanup owner"
                     {:reason :missing-cleanup-owner}))))
 
-(defn- rollback-kernel-graph-entry!
+(defn- rollback-bound-resources!
   "Retain unresolved partial binding ownership in this session before dependent storage dies."
-  [sess entry ^Throwable primary]
+  [sess registry entry ^Throwable primary]
   (let [owned (own-kernel-graph-entry (:device-id @sess)
                                     entry)]
     (try
@@ -351,7 +357,8 @@
       (catch Throwable secondary
         (when-not (identical? primary secondary) (.addSuppressed primary secondary))))
     (when (seq (cleanup/pending (::cleanup/owner owned)))
-      (swap! sess assoc-in [:kernel-graphs [::failed-construction (random-uuid)]] owned))))
+      (swap! sess assoc-in [registry [::failed-construction (random-uuid)]]
+             (assoc owned :failed-construction? true)))))
 
 (defn- adopt-cleanup! [debts owner]
   (vswap! debts (fn [owners]
@@ -692,7 +699,7 @@
    the device completed: awaiting establishes visibility and releases backend staging first."
   [sess key]
   (locking sess
-    (let [{:keys [device-id buffers allocations kernel-graphs events graphs]} @sess
+    (let [{:keys [device-id buffers allocations kernel-graphs events graphs prepared]} @sess
           footprint {:buffer-keys #{key}
                      :allocation-ids #{(get-in allocations [key :id])}
                      :resident-buffers [(get buffers key)]}
@@ -706,6 +713,11 @@
                                                             (resident-footprints-overlap?
                                                              release-footprint (:resident-footprint entry))))
                                                graph-key))) graphs)
+          prepared-borrowers (into [] (keep (fn [[phase entry]]
+                                             (when (or (nil? (:resident-footprint entry))
+                                                       (resident-footprints-overlap?
+                                                        release-footprint (:resident-footprint entry)))
+                                               phase))) prepared)
           bound-graphs (->> kernel-graphs
                             (keep (fn [[graph-key entry]]
                                     (when (some #(= key (:key %))
@@ -717,6 +729,9 @@
         (when (seq recorded-borrowers)
           (throw (ex-info "cannot release storage retained by a recorded sequence"
                           {:reason :recorded-buffer-retained :key key :graphs recorded-borrowers})))
+        (when (seq prepared-borrowers)
+          (throw (ex-info "cannot release storage retained by a prepared binding"
+                          {:reason :prepared-buffer-retained :key key :phases prepared-borrowers})))
         (when (seq bound-graphs)
           (throw (ex-info "cannot release a buffer while a kernel graph holds one of its views"
                           {:key key :kernel-graphs bound-graphs})))
@@ -759,6 +774,28 @@
 ;; ================================================================
 ;; Kernel invocation
 ;; ================================================================
+
+(defn- preparation-call
+  "Project split convenience arguments into the artifact's one logical/physical ABI."
+  [device-id artifact buffers scalars n]
+  (let [artifact (kart/validate! artifact)
+        _ (kabi/validate-split-binding! (:abi artifact) buffers scalars)
+        arguments
+        (loop [entries (seq (kcall/logical-argument-plan artifact))
+               pointers (seq buffers) values (seq scalars) result []]
+          (if-let [{:keys [pointer? slots]} (first entries)]
+            (let [slot (first slots)
+                  bound? (= :bound (:role slot))
+                  value (if pointer? (first pointers)
+                            (kexec/physical-runtime-scalar slot
+                                                         (if bound? n (first values))))]
+              (recur (next entries) (if pointer? (next pointers) pointers)
+                     (if (or pointer? bound?) values (next values))
+                     (conj result value)))
+            result))]
+    (kcall/make artifact
+                (kcall/expand-logical-arguments
+                 artifact arguments (rt-resolve device-id "expand-pointer-binding")))))
 
 (defn invoke!
   "Invoke a compiled kernel from the session.
@@ -809,12 +846,36 @@
          kernel-info (nth kernel-vec index)
          buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
          device-id (:device-id @sess)
-         bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
-         prepared (assoc (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})
-                         :resident-footprint (registered-buffer-footprint sess buf-vec))]
-     (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
-     (swap! sess assoc-in [:prepared phase-key] prepared)
-     prepared))))
+         call (preparation-call device-id kernel-info buf-vec scalars n)
+         footprint (registered-buffer-footprint sess buf-vec)
+         bind-fn (rt-resolve device-id "bind-kernel-call")
+         prepared (volatile! nil)
+         debts (volatile! [])]
+     (try
+       (let [candidate (assoc (bind-fn call {:async? (boolean async?)
+                                            :adopt-cleanup! #(adopt-cleanup! debts %)})
+                              :resident-footprint footprint)]
+         (vreset! prepared candidate)
+         (when-not (::cleanup/owner candidate)
+           (throw (ex-info "KernelCall preparation has lost its cleanup owner"
+                           {:reason :missing-cleanup-owner})))
+         (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
+         (swap! sess assoc-in [:prepared phase-key] candidate)
+         candidate)
+       (catch Throwable primary
+         (rollback-bound-resources!
+          sess :prepared {:prepareds (if @prepared [@prepared] []) :cleanup-debts @debts
+                          :resident-footprint footprint :temporary-buffers {}
+                          :owned-view-buffers []} primary)
+         (throw primary)))))))
+
+(defn- assert-prepared-live!
+  [entry]
+  (if-let [owner (::cleanup/owner entry)]
+    (cleanup/assert-live! owner)
+    (when-not (bound-executable-step? entry)
+      (throw (ex-info "Prepared kernel has no cleanup owner"
+                      {:reason :missing-cleanup-owner})))))
 
 (defn invoke-bound!
   "Dispatch a kernel previously bound with prepare!. No arg setup, no barrier — the
@@ -822,11 +883,13 @@
   (call sync! before reading results); otherwise it completes synchronously.
   Throws if the phase was not prepared."
   [sess phase-key]
+  (locking sess
   (assert-session-open! sess)
   (let [prepared (or (get-in @sess [:prepared phase-key])
                      (throw (ex-info (str "Phase not prepared: " phase-key " — call prepare! first")
                                      {:prepared (keys (:prepared @sess))})))
         bindings (prepared-bindings prepared)
+        _ (assert-prepared-live! prepared)
         _ (when-not (= 1 (count bindings))
             (throw (ex-info (str "Phase " phase-key " is a " (count bindings)
                                  "-kernel executable step — record it with record-graph! instead of "
@@ -834,7 +897,7 @@
                             {:phase phase-key :kernel-count (count bindings)})))
         device-id (:device-id @sess)
         launch-fn (rt-resolve device-id "launch-registered-bound!")]
-    (launch-fn (first bindings))))
+    (launch-fn (first bindings)))))
 
 (defn sync!
   "Block until all async-dispatched kernels on this device have completed. Call once after a
@@ -857,7 +920,8 @@
       (let [entry (or (get-in @sess [:prepared phase])
                        (throw (ex-info (str "Phase not prepared: " phase " — call prepare! first")
                                        {:reason :gpu-recording-unbound-phase
-                                        :phase phase :prepared (keys (:prepared @sess))})))]
+                                        :phase phase :prepared (keys (:prepared @sess))})))
+            _ (assert-prepared-live! entry)]
         {:identity phase :prepareds (prepared-bindings entry)
          :resident-footprint (:resident-footprint entry)}))
     :graph
@@ -1783,8 +1847,8 @@
              (swap! sess assoc-in [:kernel-graphs graph-key] entry)
              (->KernelGraphHandle graph-key (:session-id @sess) (:generation entry))))
          (catch Throwable e
-           (rollback-kernel-graph-entry!
-            sess {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
+           (rollback-bound-resources!
+            sess :kernel-graphs {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
                   :buffer-keys buffer-keys
                   :resident-footprint (binding-footprint sess external-bindings)
                   :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) external-bindings)
@@ -1877,8 +1941,8 @@
            (swap! sess assoc-in [:kernel-graphs call-key] entry)
            (->KernelGraphHandle call-key (:session-id @sess) (:generation entry)))
          (catch Throwable e
-           (rollback-kernel-graph-entry!
-            sess {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
+           (rollback-bound-resources!
+            sess :kernel-graphs {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
                   :resident-footprint (binding-footprint sess pointer-bindings)
                   :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) pointer-bindings)
                        :prepareds @prepareds
