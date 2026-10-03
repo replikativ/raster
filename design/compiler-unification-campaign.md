@@ -2424,3 +2424,29 @@ Persistent native namespaces are not reloaded: only the three deleted Vars were 
 unmapped. Cold CI remains necessary to validate source loading; final review and all seven
 exact-head gates are required before merge. This retirement narrows ownership debt, not the
 original training, distributed or AMR completion requirements.
+
+### Display allocation uses canonical ownership — 2026-10-03
+
+The live `runtime/display.clj` GPU constructor previously resolved raw ZE `alloc-shared`, exposed
+an allocation without a release API, and called nonexistent JDK 25 `MemorySegment.copyInto`.
+It now allocates through the existing canonical `make-buffer` transaction and retains that exact
+child cleanup before native contact. The enclosing RenderBuffer cleanup delegates to the child
+owner; it creates no second native destruction authority. Construction and initialization failure
+retire known resources or return explicit unresolved cleanup containing the exact child debt.
+Pixels are initialized to zero before publication; invalid/overflowing dimensions fail before
+driver contact. The record's shape is unchanged and native namespaces/records are not reloaded.
+
+The surface lifetime addition is `close-render-buffer!`: GPU callers must establish completion
+and end all pointer borrows before closing. `:device-buffer` exposes the canonical allocation;
+`:seg` remains a borrowed pointer, not ownership authority. CPU close is a no-op. Synchronization
+checks both the render owner and allocation owner and copies completed pixels into the existing
+AWT int array. It is not an implicit wait or a zero-copy GPU-to-AWT view; CPU-to-AWT remains
+zero-copy. This does not establish arbitrary concurrent kernel borrowing or safe live reset.
+
+Five hardware-free fault tests plus nine actual root-lease device tests pass 14 tests / 80
+assertions, including real ZE render allocation/synchronization and balanced root-pin retirement.
+The existing display compatibility cases pass 3 tests / 11 assertions and the affected canonical
+ownership suite passes 182 tests / 1,898 assertions. Exact-head review and all seven CI gates are
+required before merge. The GpuSoA review recommends retirement in favor of the already working
+ResidentComposite/session-owned field path; do not extend raw composite allocation as a second
+ownership framework. External training and distributed/AMR completion remain on the campaign.

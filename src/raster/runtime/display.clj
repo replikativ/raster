@@ -1,9 +1,10 @@
 (ns raster.runtime.display
-  "Zero-copy GPU → display path for Raster.
+  "CPU display and explicitly owned GPU pixel storage for Raster.
 
-  Uses Java AWT to render GPU compute output directly to screen without
-  intermediate copies. GPU writes to shared MemorySegment; AWT reads from
-  the same memory via a DataBufferInt wrapping an int[].
+  Java AWT wraps the CPU int[] without copying. GPU storage is a separate owned
+  shared-memory DeviceBuffer; sync-from-gpu! copies completed pixels into that int[].
+  GPU callers must establish completion before synchronization or close, and call
+  close-render-buffer! when the allocation is no longer borrowed by a kernel.
 
   Usage:
     (def screen (render-buffer 800 600))
@@ -21,6 +22,7 @@
       (display! screen frame)
       (Thread/sleep 16)
       (recur))"
+  (:require [raster.gpu.resource-cleanup :as cleanup])
   (:import [java.awt Canvas Frame Graphics]
            [java.awt.image BufferedImage DataBufferInt]
            [java.lang.foreign MemorySegment ValueLayout]
@@ -41,7 +43,7 @@
   "Allocate a shared CPU/GPU pixel buffer for width×height RGBA pixels.
   Returns a RenderBuffer. The backing int[] is directly usable by:
   - CPU code via (:pixels buf)
-  - GPU via ze/alloc-shared wrapping or MemorySegment/ofArray
+  - Host transfer staging via MemorySegment/ofArray
   - AWT via DataBufferInt (zero-copy)"
   [^long width ^long height]
   (let [n      (* width height)
@@ -52,18 +54,42 @@
 (defn render-buffer-gpu
   "Allocate a GPU-shared pixel buffer for width×height RGBA pixels.
   Allocates shared memory via Level Zero so GPU kernels can write directly.
-  Returns a RenderBuffer backed by ze shared memory."
+  Returns a RenderBuffer with :device-buffer holding the canonical allocation and
+  :seg a borrowed pointer into it. Close with close-render-buffer! after GPU completion.
+  Display uses a separate CPU pixel array, not a zero-copy GPU-to-AWT view."
   [^long width ^long height]
-  (let [n       (* width height)
-        n-bytes (* n 4)
-        ze-alloc (requiring-resolve 'raster.gpu.ze-runtime/alloc-shared)
-        seg     (ze-alloc n-bytes)
-        ;; Wrap shared MemorySegment as int[] for AWT access
-        pixels  (int-array n)
-        _       (.copyInto seg (MemorySegment/ofArray pixels) 0 0 n-bytes)]
-    ;; We store the seg; pixels is a view copy for initial use.
-    ;; For zero-copy from GPU, call display-from-seg! instead of display!
-    (->RenderBuffer width height pixels seg)))
+  (when (or (neg? width) (neg? height))
+    (throw (ex-info "Render dimensions must be non-negative"
+                    {:reason :invalid-render-dimensions :width width :height height})))
+  (let [n (Math/multiplyExact width height)
+        pixels (int-array (Math/toIntExact n))
+        make-buffer (requiring-resolve 'raster.gpu.ze-runtime/make-buffer)
+        child (volatile! nil)
+        owner (cleanup/owner [{:id :pixel-allocation
+                               :release #(when-let [buffer-owner @child]
+                                           (cleanup/release! buffer-owner))}])
+        retain! #(vreset! child %)]
+    (cleanup/build!
+     owner
+     (fn []
+       (let [buffer (make-buffer n :int {:retain-owner! retain! :adopt-cleanup! retain!})
+             segment (:segment buffer)]
+         (when-not (and (::cleanup/owner buffer)
+                        (identical? @child (::cleanup/owner buffer)))
+           (throw (ex-info "Render allocation has no retained canonical owner"
+                           {:reason :missing-cleanup-owner})))
+         ;; Shared memory is host-visible. Initialize it deterministically before publication.
+         (MemorySegment/copy (MemorySegment/ofArray pixels) 0 segment 0 (* n 4))
+         (assoc (->RenderBuffer width height pixels segment) :device-buffer buffer)))
+     nil)))
+
+(defn close-render-buffer!
+  "Retire an owned GPU RenderBuffer exactly once, after callers establish GPU completion.
+  CPU render buffers own no native resource; closing one is a no-op. Unknown native teardown
+  remains retained by the canonical cleanup owner; this function does not cancel GPU work."
+  [^RenderBuffer buf]
+  (when-let [owner (::cleanup/owner buf)] (cleanup/release! owner))
+  nil)
 
 ;; ================================================================
 ;; Pixel packing helpers
@@ -110,7 +136,7 @@
   the int[] backing the RenderBuffer is wrapped as a DataBufferInt
   and used directly as the BufferedImage's raster data.
 
-  For GPU-written pixels (via ze alloc-shared): call sync-from-gpu!
+  For GPU-written pixels in a render-buffer-gpu allocation: call sync-from-gpu!
   first to copy from MemorySegment into the pixels int[].
 
   Returns nil."
@@ -146,12 +172,18 @@
 
 (defn sync-from-gpu!
   "Copy GPU-written pixels from RenderBuffer's MemorySegment into its int[] array.
-  Call before display! when the GPU has written to (:seg buf) via ze shared memory."
+  Call after GPU completion and before display!. This function does not wait for a kernel."
   [^RenderBuffer buf]
-  (let [n-bytes (* (:width buf) (:height buf) 4)
-        dst-seg (MemorySegment/ofArray (:pixels buf))]
-    (MemorySegment/copy (:seg buf) 0 dst-seg 0 n-bytes)
-    buf))
+  (let [copy! #(let [n-bytes (* (:width buf) (:height buf) 4)
+                     dst-seg (MemorySegment/ofArray (:pixels buf))]
+                 (MemorySegment/copy (:seg buf) 0 dst-seg 0 n-bytes)
+                 buf)]
+    (if-let [owner (::cleanup/owner buf)]
+      (locking (:state owner)
+        (cleanup/assert-live! owner)
+        (cleanup/assert-live! (::cleanup/owner (:device-buffer buf)))
+        (copy!))
+      (copy!))))
 
 ;; ================================================================
 ;; Convenience: animate loop
