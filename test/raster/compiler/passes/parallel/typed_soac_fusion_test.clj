@@ -474,6 +474,27 @@
     {:dtype :float
      :array-types '{A :float B :float C :float bias :float}})))
 
+(deftest result-transform-capacity-maps-own-their-axis-extents-and-storage-types
+  (let [[program _] (typed-fusion/fusion-fixpoint
+                     (map-initialized-contract-program
+                      '(clojure.core/aget bias (clojure.core/rem t 8))))
+        rewrite (fn [path value]
+                  (let [equation (first (dialect/equations program))
+                        operation (nth equation 3)
+                        attributes (assoc-in (second operation) path value)]
+                    (list 'soac-program (dialect/facts program)
+                          [(apply list (assoc (vec equation) 3
+                                             (apply list (assoc (vec operation) 1 attributes))))]
+                          (dialect/outputs program))))]
+    (doseq [[path value expected]
+            [[[:result-transform :operands 0 :map :groups 0 0 1]
+              1 :typed-soac-result-transform-axis-extent]
+             [[:result-transform :operands 0 :dtype]
+              :double :typed-soac-result-transform-operand-type]]]
+      (is (= expected
+             (try (dialect/validate! (rewrite path value)) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
 (deftest dense-initializer-map-becomes-a-contraction-result-transform
   (let [program (map-initialized-contract-program
                  '(clojure.core/aget bias (clojure.core/rem t 8)))

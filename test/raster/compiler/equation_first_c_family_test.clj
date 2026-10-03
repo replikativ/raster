@@ -290,6 +290,17 @@
                                        'indices (av/tensor {:dtype :long :shape [4]})}}))
         "indexed captures retain caller bounds obligations, not a dense traversal certificate")))
 
+(deftest fused-result-transform-retains-its-independent-operand-minimum
+  (doseq [target [ocl-target cuda-target hip-target]]
+    (let [compilation (equation-first/compile #'symbolic-storage/fused-bias-contract!
+                                             {:target target :dtype :float})
+          arguments [(float-array 64) (float-array 128) (float-array 8) (float-array 32)]]
+      (is (= 1 (count (:kernels compilation))) "initializer and contraction are fused")
+      (is (map? (equation-first/lower compilation arguments)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (equation-first/lower compilation (assoc arguments 2 (float-array 7))))
+          "a fused epilogue cannot erase the bias capacity requirement"))))
+
 (use-fixtures
   :once
   (fn [f]

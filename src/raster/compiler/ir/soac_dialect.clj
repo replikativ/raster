@@ -2021,6 +2021,13 @@
                      "result-transform operand maps may reference only segment axes"
                      {:equation equation-id :axes map-axes
                       :segment-axes segment-indices}))
+            (doseq [operand (:operands transform)
+                    [axis axis-extent] (mapcat identity (get-in operand [:map :groups]))]
+              (when-not (= axis-extent (get (into {} (:segment-axes attributes)) axis))
+                (fail! :typed-soac-result-transform-axis-extent
+                       "result-transform operand extents must agree with their segment axes"
+                       {:equation equation-id :operand operand :axis axis
+                        :extent axis-extent :segment-axes (:segment-axes attributes)})))
             (when (seq unbound)
               (fail! :typed-soac-result-transform-expression
                      "result-transform expressions may reference only their typed region boundary"
@@ -2243,6 +2250,18 @@
             (fail! :typed-soac-stable-array-type
                    "stable captures require tensor storage or an explicit resident scalar buffer"
                    {:equation equation-id :id id :value value})))))
+    (doseq [{:keys [value dtype] :as operand}
+            (get-in attributes [:result-transform :operands])
+            :let [storage (get values value)]]
+      (when (and storage
+                 (not (and (= :tensor (:kind storage))
+                           (seq (:shape storage))
+                           (= {:kind :plain} (:representation storage))
+                           (nil? (:logical-layout storage))
+                           (= dtype (:dtype storage)))))
+        (fail! :typed-soac-result-transform-operand-type
+               "result-transform operands require plain tensor storage with their declared dtype"
+               {:equation equation-id :operand operand :value storage})))
     (case kind
       scalar
       (doseq [[id dtype] (map vector results (:dtypes attributes))]

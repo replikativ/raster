@@ -44,3 +44,15 @@
   (let [out (float-array n)]
     (p/scan out acc (float 0.0) i n float
             (raster.numeric/+ acc (a/aget x (a/aget indices i))))))
+
+(deftm fused-bias-contract!
+  [a :- (Array float), b :- (Array float), bias :- (Array float), out :- (Array float)] :- Void
+  (p/map! out t 32 nil (a/aget bias (rem t 8)))
+  (p/contract out [[i 4] [j 8]] [[k 16]]
+              (raster.numeric/* (a/aget a (+ (* i 16) k))
+                                (a/aget b (+ (* k 8) j)))
+              :epilogue {:acc acc
+                         :expr (+ acc (clojure.core/aget out (+ (* i 8) j)))
+                         :operands [{:sym out :map {:groups [[[i 4]] [[j 8]]]}
+                                     :dtype :float}]
+                         :scalars [] :dtype :float}))
