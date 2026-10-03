@@ -1756,3 +1756,33 @@ Regression acceptance includes every acquisition/release fault, suppressed clean
 the primary failure, old graphs surviving failed new construction, stale-handle rejection, no double
 release, and failed dependent destruction preventing buffer free. Performance acceptance remains
 separate from correctness under laptop power-save/background-load conditions.
+
+#### Native KernelCall acquisition and common graph ownership
+
+Both resident backends now reserve a cleanup owner before creating each production KernelCall's
+dedicated native kernel, then use checked native destruction. Argument-binding failures roll back
+immediately; if destruction is unresolved, an explicit synchronous adoption callback transfers the
+original owner into the surrounding session. Suppressed errors are diagnostics, never the lifetime
+channel. The raw one-argument backend API preserves unresolved ownership in ExceptionInfo data and
+keeps the original failure as its cause; it cannot promise identical top-level exception identity.
+
+Common KernelGraph entries use the shared dependency plan for recordings, individual prepared
+kernels, views and temporary buffers. Failed construction retains the same resident root views and
+footprints, preventing root release. Successful cleanup is retired incrementally; session close
+attempts all independent siblings in a layer, then stops before dependent roots/arena on failure.
+Its sticky :releasing lifecycle marks :closed? true to reject further use, without pretending native
+disposal succeeded. Repeated close remains available for retained cleanup. Modern bind/run sequences
+are serialized by the session lock. Graph handles now carry session and generation; a stale or foreign
+handle cannot drain or destroy a replacement's resources. A failed old-generation destruction keeps
+that non-runnable owner, and does not publish the newly constructed replacement.
+
+The migrated KernelGraph swallowing destructor is removed; a missing owner fails loudly. Backend
+production prepared maps likewise cannot fall through the compatibility destructor if their owner is
+missing. A duplicate shadowed ZE fresh-kernel factory is removed. Numeric surface semantics and IR
+are unchanged; handle identity, close lifecycle and raw-backend exception handling become stricter.
+
+This is not complete native reclamation. Legacy descriptor bindings, backend recording/view/event
+partial constructors and destruction, asynchronous-event failure cleanup, root-buffer/arena failure
+retention, and linked-wrapper close remain acceptance work. In particular native graph destructors
+still contain swallowed-error debt, and general legacy concurrent operations are not certified by
+the modern graph locking tests. No native error is automatically classified retry-safe.

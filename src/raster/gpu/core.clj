@@ -41,7 +41,8 @@
             [raster.core :as rcore]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.runtime-backend :as runtime-backend]
-            [raster.gpu.resident-value :as resident-value])
+            [raster.gpu.resident-value :as resident-value]
+            [raster.gpu.resource-cleanup :as cleanup])
   (:import [java.lang AutoCloseable]))
 
 ;; ================================================================
@@ -287,25 +288,56 @@
               :when graph]
         (try (destroy-graph! graph) (catch Exception _))))))
 
+(defn- own-kernel-graph-entry
+  [device-id {:keys [runtime-graph prepareds owned-view-buffers temporary-buffers cleanup-debts]
+              :as entry}]
+  (let [recording (when runtime-graph #{:recording})
+        kernel-ids (set (map-indexed (fn [i _] [:kernel i]) prepareds))
+        debt-ids (set (map-indexed (fn [i _] [:debt i]) cleanup-debts))
+        view-ids (set (map-indexed (fn [i _] [:view i]) owned-view-buffers))
+        dependencies (into (into (or recording #{}) kernel-ids) debt-ids)
+        resources (vec
+                   (concat
+                    (map-indexed (fn [i debt]
+                                   {:id [:debt i] :release #(cleanup/release! debt)}) cleanup-debts)
+                    (when runtime-graph
+                      [{:id :recording :release #((rt-resolve-soft device-id "destroy-graph!") runtime-graph)}])
+                    (map-indexed (fn [i prepared]
+                                   {:id [:kernel i] :after (or recording #{})
+                                    :release #((rt-resolve-soft device-id "destroy-prepared!") prepared)}) prepareds)
+                    (map-indexed (fn [i buffer]
+                                   {:id [:view i] :after dependencies
+                                    :release #((rt-resolve device-id "free-buffer!") buffer)}) owned-view-buffers)
+                    (map (fn [[id buffer]]
+                           {:id [:temporary id] :after (into dependencies view-ids)
+                            :release #((rt-resolve device-id "free-buffer!") buffer)}) temporary-buffers)))]
+    (assoc entry ::cleanup/owner (cleanup/owner resources)
+                 :generation (or (:generation entry) (random-uuid)))))
+
 (defn- destroy-kernel-graph-entry!
   "Destroy one bound graph's backend recording, dedicated kernel handles and graph-owned
    temporaries/view handles. External root buffers remain session-owned and are never freed here."
-  [device-id {:keys [runtime-graph prepareds owned-view-buffers temporary-buffers]}]
-  (let [destroy-graph! (rt-resolve-soft device-id "destroy-graph!")
-        destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
-    (when (and destroy-graph! runtime-graph)
-      (try (destroy-graph! runtime-graph) (catch Exception _)))
-    (when destroy-prepared!
-      (doseq [prepared prepareds]
-        (try (destroy-prepared! prepared) (catch Exception _))))
-    ;; OpenCL cl_mem sub-buffers are independently reference-counted native objects. Kernel
-    ;; bindings must die first because their argument state still refers to these handles.
-    (when (seq owned-view-buffers)
-      (let [free! (rt-resolve device-id "free-buffer!")]
-        (doseq [buffer owned-view-buffers]
-          (try (free! buffer) (catch Exception _)))))
-    (when (seq temporary-buffers)
-      (free-buffers-internal! temporary-buffers device-id))))
+  [_device-id entry]
+  (if-let [owner (::cleanup/owner entry)]
+    (cleanup/release! owner)
+    (throw (ex-info "KernelGraph entry has lost its cleanup owner"
+                    {:reason :missing-cleanup-owner}))))
+
+(defn- rollback-kernel-graph-entry!
+  "Retain unresolved partial binding ownership in this session before dependent storage dies."
+  [sess entry ^Throwable primary]
+  (let [owned (own-kernel-graph-entry (:device-id @sess)
+                                    entry)]
+    (try
+      (destroy-kernel-graph-entry! (:device-id @sess) owned)
+      (catch Throwable secondary
+        (when-not (identical? primary secondary) (.addSuppressed primary secondary))))
+    (when (seq (cleanup/pending (::cleanup/owner owned)))
+      (swap! sess assoc-in [:kernel-graphs [::failed-construction (random-uuid)]] owned))))
+
+(defn- adopt-cleanup! [debts owner]
+  (vswap! debts (fn [owners]
+                 (if (some #(identical? owner %) owners) owners (conj owners owner)))))
 
 (def ^:private array-tag->dtype
   {'doubles :double
@@ -413,6 +445,24 @@
 
 (declare release-event!)
 
+(defn- assert-session-open! [sess]
+  (when (or (:closed? @sess) (= :releasing (:lifecycle @sess)))
+    (throw (ex-info "GPU session is closing or closed" {:reason :session-releasing}))))
+
+(defn- release-session-layer!
+  "Attempt all independent children in a dependency layer; do not descend on any failure."
+  [sess groups]
+  (let [primary (volatile! nil)]
+    (doseq [[table release!] groups [key entry] (get @sess table)]
+      (try
+        (release! entry)
+        (swap! sess update table dissoc key)
+        (catch Throwable error
+          (if-let [first-error @primary]
+            (when-not (identical? first-error error) (.addSuppressed ^Throwable first-error error))
+            (vreset! primary error)))))
+    (when-let [error @primary] (throw error))))
+
 (defn close-session!
   "Free all buffers and kernels in a session. Idempotent and thread-safe.
 
@@ -422,22 +472,21 @@
   this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
   (locking sess
-    (when-not (:closed? @sess)
+    (when-not (or (= :closed (:lifecycle @sess))
+                  (and (:closed? @sess) (nil? (:lifecycle @sess))))
+      ;; closed? means no further use; lifecycle distinguishes retained teardown from disposal.
+      (swap! sess assoc :lifecycle :releasing :closed? true)
       ;; Completion owns the right to keep graph recordings, bound kernels, and buffers alive.
       ;; Drain and release every event before tearing any of those resources down.
-      (doseq [[_ {:keys [event]}] (:events @sess)]
-        (release-event! sess event))
+      (release-session-layer! sess [[:events #(release-event! sess (:event %))]])
       (let [{:keys [device-id arena-id buffers allocations prepared graphs kernel-graphs]} @sess]
-        (doseq [[_ graph-entry] graphs]
-          (destroy-recorded-graph-entry! device-id graph-entry))
-        (doseq [[_ prepared-entry] prepared]
-          (destroy-prepared-entry! device-id prepared-entry))
-        (doseq [[_ graph-entry] kernel-graphs]
-          (destroy-kernel-graph-entry! device-id graph-entry))
+        (release-session-layer! sess [[:graphs #(destroy-recorded-graph-entry! device-id %)]])
+        (release-session-layer! sess [[:prepared #(destroy-prepared-entry! device-id %)]
+                                     [:kernel-graphs #(destroy-kernel-graph-entry! device-id %)]])
         (free-session-buffers! buffers allocations device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :allocations {} :kernels {} :dispatches {}
+        (swap! sess assoc :closed? true :lifecycle :closed :buffers {} :allocations {} :kernels {} :dispatches {}
                :prepared {} :graphs {} :kernel-graphs {} :events {})))))
 
 (defn with-gpu-session*
@@ -477,6 +526,7 @@
    opts: {:dtype :float, :min-elements 0, :preserve-declared-array-storage? false}"
   ([sess phase-key v] (compile! sess phase-key v {}))
   ([sess phase-key v opts]
+   (assert-session-open! sess)
    (let [device-id (:device-id @sess)
          ;; Dedup generation by (op, dtype): compile-deftm-internal! emits a gensym-named kernel
          ;; each call, so without this N phases of the SAME deftm produce N distinct kernel SOURCES
@@ -674,6 +724,7 @@
   ([sess phase-key sym->buf-key scalars n]
    (invoke! sess phase-key sym->buf-key scalars n {}))
   ([sess phase-key sym->buf-key scalars n {:keys [index] :or {index 0}}]
+   (assert-session-open! sess)
    (let [{:keys [kernels buffers]} @sess
          kernel-vec (or (get kernels phase-key)
                         (throw (ex-info (str "No kernel for phase: " phase-key)
@@ -696,6 +747,7 @@
   ([sess phase-key sym->buf-key scalars n]
    (prepare! sess phase-key sym->buf-key scalars n {}))
   ([sess phase-key sym->buf-key scalars n {:keys [index async? kernel-phase] :or {index 0}}]
+   (assert-session-open! sess)
    (let [{:keys [kernels buffers]} @sess
          ;; The COMPILED kernel comes from kernel-phase (defaults to phase-key); the bound
          ;; argument-set is stored under phase-key. This lets one compiled kernel back many
@@ -719,6 +771,7 @@
   (call sync! before reading results); otherwise it completes synchronously.
   Throws if the phase was not prepared."
   [sess phase-key]
+  (assert-session-open! sess)
   (let [prepared (or (get-in @sess [:prepared phase-key])
                      (throw (ex-info (str "Phase not prepared: " phase-key " — call prepare! first")
                                      {:prepared (keys (:prepared @sess))})))
@@ -736,6 +789,7 @@
   "Block until all async-dispatched kernels on this device have completed. Call once after a
   batch of async invoke-bound! calls, before downloading results."
   [sess]
+  (assert-session-open! sess)
   (let [device-id (:device-id @sess)]
     ((rt-resolve device-id "synchronize-async!"))))
 
@@ -854,6 +908,7 @@
   "Execute a recorded command graph once (synchronous). Reads current buffer contents."
   ([sess] (replay! sess :graph))
   ([sess graph-key]
+   (assert-session-open! sess)
    (let [device-id (:device-id @sess)
          entry (or (get-in @sess [:graphs graph-key])
                    (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))
@@ -897,6 +952,7 @@
    output-key: buffer key for output
    n: number of elements"
   [sess phase-key input-keys output-key n]
+  (assert-session-open! sess)
   (let [dispatches (get-in @sess [:dispatches phase-key])
         _ (when-not (= 1 (count dispatches))
             (throw (ex-info "compiled scan phase must retain exactly one KernelDispatch"
@@ -950,6 +1006,7 @@
    n: number of elements
    base-seed: long seed value"
   [sess phase-key buf-key n base-seed]
+  (assert-session-open! sess)
   (let [{:keys [kernels buffers]} @sess
         kernel-info (first (get kernels phase-key))
         device-id (:device-id @sess)
@@ -967,6 +1024,7 @@
    n-total: total population size (modulus)
    base-seed: long seed value"
   [sess phase-key buf-key n-active n-total base-seed]
+  (assert-session-open! sess)
   (let [{:keys [kernels buffers]} @sess
         kernel-info (first (get kernels phase-key))
         device-id (:device-id @sess)
@@ -987,6 +1045,7 @@
    key: buffer key
    arr: JVM array to upload"
   [sess key arr]
+  (assert-session-open! sess)
   (let [{:keys [device-id buffers]} @sess
         buf (or (get buffers key)
                 (throw (ex-info (str "No buffer for key: " key)
@@ -999,6 +1058,7 @@
    sess: session atom
    key: buffer key"
   [sess key]
+  (assert-session-open! sess)
   (let [{:keys [device-id buffers]} @sess
         buf (or (get buffers key)
                 (throw (ex-info (str "No buffer for key: " key)
@@ -1217,7 +1277,13 @@
 ;; Executable KernelGraphs
 ;; ================================================================
 
-(defrecord KernelGraphHandle [key])
+(defrecord KernelGraphHandle [key session-id generation])
+
+(defn ->KernelGraphHandle
+  ;; One-argument construction is retained only for synthetic nil-session test fixtures.
+  ([key] (map->KernelGraphHandle {:key key}))
+  ([key session-id generation]
+   (map->KernelGraphHandle {:key key :session-id session-id :generation generation})))
 (defrecord GPUEvent [session-id id queue])
 
 (defn kernel-graph-handle? [x]
@@ -1420,7 +1486,12 @@
   (when-not (kernel-graph-handle? handle)
     (throw (ex-info "kernel graph runner requires a KernelGraphHandle"
                     {:handle handle :actual (type handle)})))
-  (or (get-in @sess [:kernel-graphs (:key handle)])
+  (when-not (= (:session-id @sess) (:session-id handle))
+    (throw (ex-info "Kernel graph handle belongs to another session" {:reason :foreign-graph-handle})))
+  (if-let [entry (get-in @sess [:kernel-graphs (:key handle)])]
+    (do (when-not (= (:generation entry) (:generation handle))
+          (throw (ex-info "Kernel graph handle names a retired generation" {:reason :stale-graph-handle})))
+        (when-let [owner (::cleanup/owner entry)] (cleanup/assert-live! owner)) entry)
       (throw (ex-info "kernel graph is not bound in this session"
                       {:key (:key handle)
                        :bound (keys (:kernel-graphs @sess))}))))
@@ -1454,7 +1525,7 @@
         {:keys [status backend-event kind submitted-ns submit-return-ns retained-resources]
          :as entry}
         (resolve-event-entry sess event)]
-    (when closed?
+    (when (and closed? (not= :releasing (:lifecycle @sess)))
       (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
     (if (= :complete status)
       entry
@@ -1560,6 +1631,7 @@
    (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
   ([sess graph-key graph buffer-keys scalar-values {:keys [profile? record?]
                                                     :or {profile? false record? true}}]
+   (locking sess
    (let [{:keys [device-id closed?]} @sess
          graph (kexec/validate! graph)
          external-ids (external-graph-buffer-ids graph)]
@@ -1582,6 +1654,7 @@
            temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
            owned-view-buffers (volatile! [])
            prepareds (volatile! [])
+           cleanup-debts (volatile! [])
            runtime-graph (volatile! nil)]
        (try
          (let [{:keys [buffers] :as materialized}
@@ -1603,7 +1676,8 @@
              (let [artifact (:operation node)]
                (register! (:kernel-name artifact) artifact)))
            (doseq [node-call (:nodes graph-call)]
-             (let [prepared (assoc (bind-call! (:call node-call))
+             (let [prepared (assoc (bind-call! (:call node-call)
+                                              {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)})
                                    :phase (:id node-call))]
                (vswap! prepareds conj prepared)))
           ;; Graph verification proves every dependency names an earlier node and every hazard is
@@ -1612,7 +1686,7 @@
            (when record?
              (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true}
                                                           profile? (assoc :profile? true)))))
-           (let [entry {:graph-call graph-call
+           (let [entry (own-kernel-graph-entry device-id {:graph-call graph-call
                         :execution-plan execution-plan
                         :runtime-graph @runtime-graph
                         :prepareds @prepareds
@@ -1624,18 +1698,21 @@
                                                         [id (:resident binding)]))
                                               external-bindings)
                         :outputs (select-keys all-buffers (map :id (:outputs graph)))
-                        :profile? (boolean profile?)}
+                        :profile? (boolean profile?)})
                  old (get-in @sess [:kernel-graphs graph-key])]
-             (swap! sess assoc-in [:kernel-graphs graph-key] entry)
              (when old (destroy-kernel-graph-entry! device-id old))
-             (->KernelGraphHandle graph-key)))
-         (catch Exception e
-           (destroy-kernel-graph-entry!
-            device-id {:runtime-graph @runtime-graph
+             (swap! sess assoc-in [:kernel-graphs graph-key] entry)
+             (->KernelGraphHandle graph-key (:session-id @sess) (:generation entry))))
+         (catch Throwable e
+           (rollback-kernel-graph-entry!
+            sess {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
+                  :buffer-keys buffer-keys
+                  :resident-footprint (binding-footprint sess external-bindings)
+                  :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) external-bindings)
                        :prepareds @prepareds
                        :owned-view-buffers @owned-view-buffers
-                       :temporary-buffers temporary-buffers})
-           (throw e)))))))
+                       :temporary-buffers temporary-buffers} e)
+           (throw e))))))))
 
 (defn bind-kernel-call!
   "Bind one emitted KernelArtifact over session-resident arguments as a replayable graph.
@@ -1647,12 +1724,14 @@
    validate and device-time one schedule alternative during explicit offline tuning.
 
    Options: :profile? records device timestamp events; :group-count may override only the realized
-   grid, never the emitted workgroup geometry. Rebinding `call-key` replaces and releases the old
-   recording transactionally after the new recording succeeds."
+  grid, never the emitted workgroup geometry. Rebinding `call-key` replaces and releases the old
+   recording after the new recording succeeds. If old teardown fails, retain its non-runnable
+   generation and dispose/retain the new provisional resources without publishing the new call."
   ([sess call-key artifact arguments]
    (bind-kernel-call! sess call-key artifact arguments {}))
   ([sess call-key artifact arguments {:keys [profile? group-count]
                                       :or {profile? false}}]
+   (locking sess
    (let [{:keys [device-id closed?]} @sess
          artifact (kart/validate! artifact)
          abi (:abi artifact)]
@@ -1670,6 +1749,7 @@
            _ (release-graph-events! sess call-key)
            owned-view-buffers (volatile! [])
            prepareds (volatile! [])
+           cleanup-debts (volatile! [])
            runtime-graph (volatile! nil)]
        (try
          (let [{:keys [buffers] :as materialized}
@@ -1686,7 +1766,7 @@
                bind-call! (rt-resolve device-id "bind-kernel-call")
                record! (rt-resolve device-id "record-graph!")
                _ (register! (:kernel-name artifact) artifact)
-               prepared (assoc (bind-call! call) :phase call-key)
+               prepared (assoc (bind-call! call {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}) :phase call-key)
                _ (vreset! prepareds [prepared])
                _ (vreset! runtime-graph
                           (record! [prepared] {:barriers? true
@@ -1699,7 +1779,7 @@
                           [(or (:binding slot) (:name slot))
                            (nth runtime-arguments index)])))
                      abi)
-               entry {:kernel-call call
+               entry (own-kernel-graph-entry device-id {:kernel-call call
                       :execution-plan execution-plan
                       :runtime-graph @runtime-graph
                       :prepareds @prepareds
@@ -1710,18 +1790,20 @@
                                                      [index (:resident binding)]))
                                             pointer-bindings)
                       :outputs outputs
-                      :profile? (boolean profile?)}
+                      :profile? (boolean profile?)})
                old (get-in @sess [:kernel-graphs call-key])]
-           (swap! sess assoc-in [:kernel-graphs call-key] entry)
            (when old (destroy-kernel-graph-entry! device-id old))
-           (->KernelGraphHandle call-key))
-         (catch Exception e
-           (destroy-kernel-graph-entry!
-            device-id {:runtime-graph @runtime-graph
+           (swap! sess assoc-in [:kernel-graphs call-key] entry)
+           (->KernelGraphHandle call-key (:session-id @sess) (:generation entry)))
+         (catch Throwable e
+           (rollback-kernel-graph-entry!
+            sess {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
+                  :resident-footprint (binding-footprint sess pointer-bindings)
+                  :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) pointer-bindings)
                        :prepareds @prepareds
                        :owned-view-buffers @owned-view-buffers
-                       :temporary-buffers {}})
-           (throw e)))))))
+                       :temporary-buffers {}} e)
+           (throw e))))))))
 
 (defn bind-kernel-executable!
   "Bind one KernelArtifact or emitted KernelGraph through its common ordered external ABI.
@@ -1992,6 +2074,7 @@
 (defn run-kernel-graph!
   "Submit a bound graph, wait for completion, and return its resident output buffers."
   [sess handle]
+  (locking sess
   (let [{:keys [device-id]} @sess
         {:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)
         event (submit-kernel-graph! sess handle)]
@@ -2003,7 +2086,7 @@
           ((rt-resolve device-id "reset-graph-events!") runtime-graph))
         outputs)
       (finally
-        (release-event! sess event)))))
+        (release-event! sess event))))))
 
 (defn release-kernel-graph!
   "Release one bound graph and its graph-owned temporaries. External session buffers survive.
@@ -2013,10 +2096,14 @@
     (throw (ex-info "release-kernel-graph! requires a KernelGraphHandle"
                     {:handle handle :actual (type handle)})))
   (locking sess
-    (release-graph-events! sess (:key handle))
+    (when-not (= (:session-id @sess) (:session-id handle))
+      (throw (ex-info "Kernel graph handle belongs to another session" {:reason :foreign-graph-handle})))
     (when-let [entry (get-in @sess [:kernel-graphs (:key handle)])]
-      (swap! sess update :kernel-graphs dissoc (:key handle))
-      (destroy-kernel-graph-entry! (:device-id @sess) entry)))
+      (when-not (= (:generation entry) (:generation handle))
+        (throw (ex-info "Kernel graph handle names a retired generation" {:reason :stale-graph-handle})))
+      (release-graph-events! sess (:key handle))
+      (destroy-kernel-graph-entry! (:device-id @sess) entry)
+      (swap! sess update :kernel-graphs dissoc (:key handle))))
   nil)
 
 ;; ================================================================
@@ -2182,6 +2269,7 @@
   ([sess step args sym->key]
    (bind-step! sess step args sym->key {}))
   ([sess step args sym->key {:keys [schedule roles] :or {roles {}}}]
+   (assert-session-open! sess)
    (let [device-id (:device-id @sess)
          {:keys [kernel-name phase]} step
          materialized (volatile! {})
@@ -2396,17 +2484,20 @@
    Returns the same profile as profile-recorded-graph! without exposing runtime handles.
    Callers own input restoration and output validation outside this measured replay."
   [sess handle]
+  (locking sess
+  (assert-session-open! sess)
   (let [{:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)]
     (when-not profile?
       (throw (ex-info "bound kernel graph was not recorded with :profile? true"
                       {:handle handle})))
-    (profile-runtime-graph! (:device-id @sess) runtime-graph)))
+    (profile-runtime-graph! (:device-id @sess) runtime-graph))))
 
 (defn profile-recorded-graph!
   "Replay a graph recorded by record-graph! with `{:profile? true}` and return its backend-neutral
    device-event profile. Unlike replay!, this consumes (and resets) the timestamps instead of
    discarding them. The graph representation remains private to the session layer."
   [sess graph-key]
+  (assert-session-open! sess)
   (let [device-id (:device-id @sess)
         entry (or (get-in @sess [:graphs graph-key])
                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first")
@@ -2423,6 +2514,8 @@
         replay-fn (rt-resolve device-id "replay-graph!")
         read-ts-fn (rt-resolve device-id "read-graph-timestamps!")]
     (fn []
+      (locking sess
+      (assert-session-open! sess)
       (when before-sample! (before-sample!))
       (replay-fn graph)
       (let [wall-ms (:wall-ms (read-ts-fn graph))]
@@ -2431,7 +2524,7 @@
                       (not (neg? (double wall-ms))))
           (throw (ex-info "device graph profiler returned no finite wall duration"
                           {:device-id device-id :wall-ms wall-ms})))
-        (* 1.0e6 (double wall-ms))))))
+        (* 1.0e6 (double wall-ms)))))))
 
 (defn measure-graph!
   "Repeatedly measure a PROFILING runtime graph with backend device events.
@@ -2515,6 +2608,7 @@
        [[(.effort agents) :effort]
         [(.income agents) :income]])"
   [sess mappings]
+  (assert-session-open! sess)
   (let [{:keys [device-id buffers]} @sess
         download-fn (rt-resolve device-id "buffer->array")
         bufs buffers]

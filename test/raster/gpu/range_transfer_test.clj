@@ -167,7 +167,7 @@
                                                :execution-plan {:queues [{:class :compute}]}
                                                :resident-footprint footprint}}
                        :events {} :closed? false})
-        handle (g/->KernelGraphHandle :graph)
+        handle (g/->KernelGraphHandle :graph :cross-queue nil)
         source (float-array 8)
         resolver (fn [_ name]
                    (case name

@@ -42,7 +42,7 @@
   (fn [_ name]
     (case name
       "register-kernel!" (fn [& _] (swap! calls conj :register))
-      "bind-kernel-call" (fn [call] (swap! calls conj call) {:call call})
+      "bind-kernel-call" (fn [call & _] (swap! calls conj call) {:call call})
       "record-graph!" (fn [& _] (swap! calls conj :record) {})
       "make-buffer" (fn [& _] (throw (ex-info "unexpected allocation" {})))
       (throw (ex-info "unexpected runtime request" {:name name})))))

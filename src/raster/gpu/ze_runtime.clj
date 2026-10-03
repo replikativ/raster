@@ -41,7 +41,8 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.gpu.resident-value :as resident-value]))
+            [raster.gpu.resident-value :as resident-value]
+            [raster.gpu.resource-cleanup :as cleanup]))
 
 ;; ================================================================
 ;; Library loading
@@ -691,21 +692,6 @@
             kernel (read-ptr kern-out)]
         (swap! state assoc-in [:kernels cache-key] kernel)
         kernel))))
-
-(defn create-kernel-fresh
-  "Create a NEW kernel handle from a module (never cached). Each handle has independent,
-  mutable argument state — use one per pre-bound argument-set so concurrent bindings of the
-  same kernel source don't clobber each other (create-kernel shares one cached handle)."
-  ^MemorySegment [^MemorySegment module ^String kernel-name]
-  (ensure-init!)
-  (let [arena (:arena @state)
-        kern-desc (.allocate ^Arena arena 32)
-        _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
-        name-seg (.allocateFrom ^Arena arena kernel-name)
-        _ (.set kern-desc PTR 24 name-seg)
-        kern-out (ptr-seg arena)
-        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])]
-    (read-ptr kern-out)))
 
 ;; ================================================================
 ;; Memory allocation
@@ -1722,8 +1708,11 @@
         name-seg (.allocateFrom arena kernel-name)
         _ (.set kern-desc PTR 24 name-seg)
         kern-out (ptr-seg arena)
-        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])]
-    (read-ptr kern-out)))
+        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])
+        kernel (read-ptr kern-out)]
+    (when (or (nil? kernel) (.equals MemorySegment/NULL kernel))
+      (throw (ex-info "zeKernelCreate returned no kernel handle" {:reason :invalid-native-kernel-handle})))
+    kernel))
 
 (defn record-graph!
   "Record an ordered seq of bound kernels into a regular (replayable) command list.
@@ -2470,7 +2459,8 @@
 (defn bind-kernel-call
   "Bind a backend-neutral KernelCall over Level Zero resident buffers. ABI order and complete
    1-3D geometry come exclusively from the call; no map/reduction convention is interpreted."
-  [call]
+  ([call] (bind-kernel-call call {}))
+  ([call {:keys [adopt-cleanup!]}]
   (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
         (kcall/binding-plan call)
         registered (or (get @kernel-registry kernel-name)
@@ -2493,25 +2483,30 @@
                (instance? MemorySegment value)
                (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-        {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
-        kernel-handle (create-kernel-fresh module entry-name)
-        native-args (mapv (fn [[slot value]]
-                            (if (= :scalar (:kind slot))
-                              value
-                              (if (device-buffer? value)
-                                (:segment ^DeviceBuffer value)
-                                value)))
-                          pairs)
-        bound (bind-kernel! kernel-handle workgroup-size native-args)
-        ^MemorySegment gc (:gc-seg bound)]
-    (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
-      (.set gc I32 (long (* axis 4)) (int count)))
-    {:bound bound
-     ;; Geometry is already baked into gc-seg. record-graph! must not reinterpret X specially.
-     :group-count nil
-     :kernel-name kernel-name
-     :kernel-call call
-     :binding-plan plan}))
+        {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)]
+    (cleanup/construct!
+     :kernel #(create-kernel-fresh module entry-name)
+     #(ze-call! "zeKernelDestroy" @h-zeKernelDestroy [%])
+     (fn [kernel-handle owner]
+       (let [native-args (mapv (fn [[slot value]]
+                                (if (= :scalar (:kind slot))
+                                  value
+                                  (if (device-buffer? value)
+                                    (:segment ^DeviceBuffer value)
+                                    value)))
+                              pairs)
+             bound (bind-kernel! kernel-handle workgroup-size native-args)
+             ^MemorySegment gc (:gc-seg bound)]
+         (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
+           (.set gc I32 (long (* axis 4)) (int count)))
+         {:bound bound
+          ::cleanup/owner owner
+          ;; Geometry is already baked into gc-seg. record-graph! must not reinterpret X specially.
+          :group-count nil
+          :kernel-name kernel-name
+          :kernel-call call
+          :binding-plan plan}))
+     adopt-cleanup!))))
 
 (defn bind-registered-map-void-kernel
   "Pre-bind a registered void-map kernel's arguments ONCE for fast repeated dispatch.
@@ -2752,7 +2747,12 @@
   Without this every prepare!/bind leaks a zeKernel driver object → the driver's kernel table
   fills → zeKernelCreate / launch eventually fail (SIGABRT). Idempotent; safe on partial maps."
   [prepared]
-  (destroy-handle! @h-zeKernelDestroy (get-in prepared [:bound :kernel])))
+  (if-let [owner (::cleanup/owner prepared)]
+    (cleanup/release! owner)
+    (if (contains? prepared :kernel-call)
+      (throw (ex-info "KernelCall binding has lost its cleanup owner" {:reason :missing-cleanup-owner}))
+    ;; Descriptor compatibility bindings have not yet migrated to retained ownership.
+    (destroy-handle! @h-zeKernelDestroy (get-in prepared [:bound :kernel])))))
 
 (defn destroy-graph!
   "Destroy a recorded command graph's queue + list (record-graph! creates one of each per graph

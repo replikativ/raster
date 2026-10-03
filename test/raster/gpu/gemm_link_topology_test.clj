@@ -103,7 +103,7 @@
             "buffer-as-float-buffer" (fn [& _] (throw (AssertionError. "unused")))
             "buffer-as-int-buffer" (fn [& _] (throw (AssertionError. "unused")))
             "register-kernel!" (fn [name artifact] (swap! registered conj [name artifact]))
-            "bind-kernel-call" (fn [call] {:kernel-call call})
+            "bind-kernel-call" (fn [call & _] {:kernel-call call})
             "record-graph!" (fn [bounds & [options]]
                               (let [graph {:bounds (vec bounds) :options options}]
                                 (swap! recorded conj graph)

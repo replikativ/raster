@@ -852,7 +852,7 @@
           (case function-name
             "register-kernel!" (fn [_ _])
             "make-buffer" (fn [elements dtype] {:elements elements :dtype dtype})
-            "bind-kernel-call" (fn [call] {:kernel-call call})
+            "bind-kernel-call" (fn [call & _] {:kernel-call call})
             "record-graph!" (fn [prepareds]
                               (let [recording {:prepareds (vec prepareds)}]
                                 (swap! recorded conj recording)
@@ -906,7 +906,7 @@
                                (swap! slices conj slice)
                                slice))
             "register-kernel!" (fn [& _])
-            "bind-kernel-call" (fn [call] {:call call})
+            "bind-kernel-call" (fn [call & _] {:call call})
             (throw (ex-info "unexpected runtime resolution" {:name name}))))
         soft-resolver
         (fn [_ name]
