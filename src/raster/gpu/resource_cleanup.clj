@@ -7,6 +7,24 @@
 (defrecord Cleanup [state])
 
 (def ^:dynamic *registry-uses* [])
+(defn- assert-not-building! [cleanup]
+  (when (::construction-token @(:state cleanup))
+    (throw (ex-info "Native owner construction is still in progress"
+                    {:reason :owner-construction-in-progress :cleanup-retry-safe? true}))))
+
+(defn- clear-construction! [cleanup token]
+  (locking (:state cleanup)
+    (when-not (identical? token (::construction-token @(:state cleanup)))
+      (throw (ex-info "Native construction marker changed generation"
+                      {:reason :owner-construction-generation-mismatch})))
+    (swap! (:state cleanup)
+           #(if (identical? token (::construction-token %))
+              (dissoc % ::construction-token)
+              (throw (ex-info "Native construction marker changed generation"
+                              {:reason :owner-construction-generation-mismatch}))))
+    (when (::construction-token @(:state cleanup))
+      (throw (ex-info "Native construction marker was reinserted during retirement"
+                      {:reason :owner-construction-generation-mismatch})))))
 
 (defn assert-registry-mutable!
   "Reject same-thread lifecycle mutation while native registration acquisition is in flight.
@@ -86,6 +104,7 @@
   [cleanup]
   (let [state (:state cleanup)]
     (locking state
+      (assert-not-building! cleanup)
       (when (= :releasing (:phase @state))
         (throw (ex-info "Recursive native owner teardown"
                         {:reason :recursive-cleanup})))
@@ -114,7 +133,7 @@
                            (fn [entries]
                              (mapv #(if (= id (:id %))
                                       (assoc % :failure error
-                                               :retry-safe? (true? (:cleanup-retry-safe? (ex-data error))))
+                                             :retry-safe? (true? (:cleanup-retry-safe? (ex-data error))))
                                       %) entries)))
                     (record-error! error))))))
           (finally
@@ -277,29 +296,48 @@
   [cleanup build adopt-cleanup!]
   (when-not (and (fn? build) (or (nil? adopt-cleanup!) (fn? adopt-cleanup!)))
     (throw (ex-info "Native construction requires callbacks" {:reason :invalid-cleanup-plan})))
-  (try
-    (let [value (build)]
-      (when-not (map? value)
-        (throw (ex-info "Native construction must return an owning map"
-                        {:reason :invalid-owned-value})))
-      (assoc value ::owner cleanup))
-    (catch Throwable primary
-      (try (release! cleanup)
-           (catch Throwable secondary
-             (when-not (or (identical? primary secondary)
-                           (some #(identical? secondary %) (.getSuppressed ^Throwable primary)))
-               (.addSuppressed primary secondary))))
-      (when (seq (pending cleanup))
-        (let [fallback #(ex-info "Native construction retains unresolved cleanup ownership"
-                                 {::unresolved cleanup} primary)]
-          (if adopt-cleanup!
-            (try (adopt-cleanup! cleanup)
-                 (catch Throwable adoption-error
-                   (let [wrapper (fallback)]
-                     (.addSuppressed wrapper adoption-error)
-                     (throw wrapper))))
-            (throw (fallback)))))
-      (throw primary))))
+  ;; A prepublished owner may already be visible to another thread. Decline teardown while
+  ;; building, without holding its monitor across arbitrary callbacks or native contact.
+  (let [token (Object.) admitted? (volatile! false)]
+    (try
+      (locking (:state cleanup)
+        (assert-not-building! cleanup)
+        (assert-live! cleanup)
+        (vreset! admitted? true)
+        (swap! (:state cleanup) assoc ::construction-token token)
+        (when-not (identical? token (::construction-token @(:state cleanup)))
+          (throw (ex-info "Native construction marker changed during publication"
+                          {:reason :owner-construction-generation-mismatch})))
+        (assert-live! cleanup))
+      (let [value (build)]
+        (when-not (map? value)
+          (throw (ex-info "Native construction must return an owning map"
+                          {:reason :invalid-owned-value})))
+        (clear-construction! cleanup token)
+        (assoc value ::owner cleanup))
+      (catch Throwable primary
+      ;; An overlapping build owns the existing marker. Never clear or retire its generation.
+        (when-not @admitted? (throw primary))
+        (try (when (identical? token (::construction-token @(:state cleanup)))
+               (clear-construction! cleanup token))
+             (catch Throwable secondary
+               (when-not (identical? primary secondary) (.addSuppressed primary secondary))))
+        (try (release! cleanup)
+             (catch Throwable secondary
+               (when-not (or (identical? primary secondary)
+                             (some #(identical? secondary %) (.getSuppressed ^Throwable primary)))
+                 (.addSuppressed primary secondary))))
+        (when (seq (pending cleanup))
+          (let [fallback #(ex-info "Native construction retains unresolved cleanup ownership"
+                                   {::unresolved cleanup} primary)]
+            (if adopt-cleanup!
+              (try (adopt-cleanup! cleanup)
+                   (catch Throwable adoption-error
+                     (let [wrapper (fallback)]
+                       (.addSuppressed wrapper adoption-error)
+                       (throw wrapper))))
+              (throw (fallback)))))
+        (throw primary)))))
 
 (defn acquisition-slot
   "Reserve backend-local acquisition state before native contact. Not compiler IR/evidence."

@@ -2233,9 +2233,52 @@ suite passes 84 tests and 890 assertions. Pivotal review found no remaining R1
 correctness blocker, conditional on fresh-process device checks. A fresh capped
 REPL now passes 27 registration/boundary tests (250 assertions), seven actual-device
 execution tests (84 assertions), and six live-root/reset assertions across OpenCL
-and Level Zero. Exact-head CI is still required before merge.
+and Level Zero. PR #1017 passed all seven exact-head CI gates and merged as `66ace972`.
 Next: generation-qualified session/buffer/registration/recording/event leases and
 direct allocation migration, followed by checked live teardown/reset. Do not let
 root-internal cache ownership masquerade as an external lease that prevents all
 teardown. The training, distributed simulator/exchange and durable PDE/AMR campaign
 requirements remain unchanged and incomplete.
+
+### Resource-lease follow-up (R2, in progress)
+
+PR #1017 landed R1; work continues on `runtime/root-resource-leases`. Its first hardware-free gate exercises
+generation-qualified lease admission/retirement, concurrent independent leases,
+failed lazy-child acquisition, and lost-generation cleanup debt. No live teardown
+is enabled by introducing this primitive. Canonical OCL/ZE buffers now acquire a
+lease before native contact; independently owned OCL sub-buffers own separate leases,
+while ZE pointer views share their root allocation's owner. The lease is the final
+dependency in the same canonical child cleanup DAG. Known cleanup retires it; unknown
+creation/destruction retains the composite child owner and keeps the root pinned.
+
+Shared `cleanup/build!` now marks the exact owner as constructing, without holding
+its monitor across callbacks. Concurrent or reentrant release declines before mutation
+with `:owner-construction-in-progress` and explicit retry-safe metadata. Marker install
+and retirement check exact token identity after watches; mismatches retain unresolved
+authority rather than clearing another generation. Rollback clears its own marker
+before native cleanup. This closes a publish-before-contact race in the common owner
+construction boundary, not a buffer-specific dispatch convention.
+
+Current focused evidence: 169 tests, 1,770 assertions pass; seven real-device boundary
+checks (84 assertions), six live-root/reset checks, and two real-device buffer/view
+lease checks (eight assertions) pass on Intel Arc OpenCL and Level Zero. Pivotal review
+and exact-head CI are required before this follow-up merges. No timing or full live
+root teardown claim follows from these tests.
+
+Integration must retain the authoritative child cleanup as well as its root pin;
+a count or raw pointer alone is insufficient. Session construction currently creates
+only a kernel-arena identifier and must remain lazy (no GPU initialization merely to
+construct a session in hardware-free CI). Canonical native buffer owners, independently
+owned OpenCL sub-buffers, kernel/program registrations, prepared bindings, graph
+recordings and asynchronous events must retire their root lease only after all native
+children are released. ZE non-owning views inherit the allocation's lifetime rather
+than fabricating a separate owner. Root-owned cached modules are internal children,
+not permanent external leases.
+
+Direct allocation debt found in the production inventory: `runtime/display.clj`
+resolves raw ZE `alloc-shared`; ZE SoA construction uses `alloc-shared`/`alloc-device`;
+the scan helper allocates raw block-sum/offset scratch. Migrate these to canonical
+owners or retire the paths, including their fault and view coverage, before changing
+the fail-closed live reset gate. Buffer/registration/session lock ordering must be
+reviewed against concurrent acquisition and teardown, not inferred from single-thread
+test success.
