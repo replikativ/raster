@@ -187,15 +187,22 @@
   (doseq [backend [:ocl :ze]]
     (let [observed (atom [])
           shutdown! (if (= backend :ocl) ocl/shutdown! ze/shutdown!)
-          register! (if (= backend :ocl) ocl/register-kernel! ze/register-kernel!)]
+          register! (if (= backend :ocl) ocl/register-kernel! ze/register-kernel!)
+          namespace (if (= backend :ocl) 'raster.gpu.ocl-runtime 'raster.gpu.ze-runtime)
+          v #(ns-resolve namespace %)
+          operations (cond-> [shutdown!
+                              #(register! "reentry" {:source "fake"} :arena)
+                              #((v 'close-kernel-arena!) :arena)
+                              #((v 'ensure-kernel-loaded!) "reentry")
+                              #((v (if (= backend :ocl) 'ensure-host-seg 'ensure-seg)) "reentry" :stage 1)]
+                       (= backend :ze) (conj #((v 'ensure-arr) "reentry" :array 1)))]
       (with-runtime backend
         {:on-contact (fn [_ id]
                        (when (= id :context)
-                         (swap! observed conj (error-of shutdown!)
-                                (error-of #(register! "reentry" {:source "fake"} :arena)))))}
+                         (swap! observed into (mapv error-of operations))))}
         (fn [{:keys [init! registry]}]
           (init!)
-          (is (= [:registration-in-use :registration-in-use]
+          (is (= (vec (repeat (count operations) :registration-in-use))
                  (mapv #(-> % ex-data :reason) @observed)))
           (is (empty? @registry)))))))
 

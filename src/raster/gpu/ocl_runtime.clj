@@ -955,6 +955,9 @@
 
 (defn- assert-registration-live! [info]
   (cleanup/assert-live! (registration-owner! info))
+  (when-let [slot (:root-lease (::registration info))]
+    (when (= :live (:phase @slot))
+      (root/assert-lease-live! state (:resource @slot))))
   (when-let [context @(:context (::registration info))]
     (when-not (identical? context (:context @state))
       (throw (ex-info "Kernel belongs to a retired OpenCL context"
@@ -964,6 +967,7 @@
 (defn- reserve-registration [info compiler-info]
   (let [kernel (cleanup/acquisition-slot) program (cleanup/acquisition-slot)
         staging (cleanup/acquisition-slot) context (volatile! nil)
+        root-lease (cleanup/acquisition-slot)
         release! (fn [slot label handle]
                    (cleanup/release-native!
                     slot (fn [value]
@@ -976,14 +980,18 @@
                 {:id :program :after #{:kernel}
                  :release #(release! program "clReleaseProgram" h-clReleaseProgram)}
                 {:id :staging :after #{:kernel}
-                 :release #(cleanup/release-native! staging (fn [^Arena arena] (.close arena)))}])]
+                 :release #(cleanup/release-native! staging (fn [^Arena arena] (.close arena)))}
+                {:id :runtime-root-lease :after #{:kernel :program :staging}
+                 :release #(cleanup/release-native! root-lease
+                                                    (fn [lease] (cleanup/release! (::cleanup/owner lease))))}])]
     (assoc info ::cleanup/owner owner
            ::registration {:kernel kernel :program program :staging staging :context context
-                           :cached (atom {}) :artifact compiler-info})))
+                           :root-lease root-lease :cached (atom {}) :artifact compiler-info})))
 
 (defn close-kernel-arena!
   "Release exact arena registrations, retaining uncertain failures; never scan metadata pointers."
   [arena-id]
+  (cleanup/assert-registry-mutable! state)
   (cleanup/with-registry-use kernel-registry
     (cleanup/release-entries!
      kernel-registry (filterv (fn [[_ info]] (= (:arena-id info) arena-id)) @kernel-registry)
@@ -1111,6 +1119,7 @@
   "Lazily compile source and create kernel for a registered kernel.
   Returns updated kernel-info with :program and :kernel-handle."
   [kernel-name]
+  (cleanup/assert-registry-mutable! state)
   (cleanup/with-registry-use kernel-registry
     (let [info (get @kernel-registry kernel-name)]
       (when-not info
@@ -1124,8 +1133,10 @@
         (cleanup/build!
          (registration-owner! info)
          (fn []
-           (let [{:keys [arena context]} @state
-                 slots (::registration info)
+           (let [slots (::registration info)
+                 lease (root/capture-lease! state (:root-lease slots))
+                 _ (root/assert-lease-live! state lease)
+                 {:keys [arena context]} @(:projection (::root/entry lease))
                  _ (vreset! (:context slots) context)
                  source (:source info)
                  _ (when-not source
@@ -1210,6 +1221,7 @@
   "Return a cached host MemorySegment for [kernel-name k],
   allocating if absent or smaller than n-bytes."
   ^MemorySegment [^String kernel-name k ^long n-bytes]
+  (cleanup/assert-registry-mutable! state)
   (when (neg? n-bytes)
     (throw (ex-info "Registration staging extent must be non-negative" {:reason :invalid-staging-extent})))
   (cleanup/with-registry-use kernel-registry

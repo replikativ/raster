@@ -9,6 +9,34 @@
     (root/initialize! state [] (fn [_] {:context (Object.)}))
     state))
 
+(deftest pure-lease-admission-failure-leaves-the-reserved-slot-fresh
+  (let [state (atom {:initialized? false}) slot (cleanup/acquisition-slot)]
+    (is (= :runtime-root-unavailable
+           (:reason (ex-data (error-of #(root/capture-lease! state slot))))))
+    (is (= {:phase :not-acquired} @slot))
+    (root/initialize! state [] (fn [_] {}))
+    (let [lease (root/capture-lease! state slot)]
+      (is (= 1 (root/lease-count state)))
+      (is (identical? (::cleanup/owner lease) (::cleanup/owner (:resource @slot))))
+      (cleanup/release-native! slot #(cleanup/release! (::cleanup/owner %)))
+      (is (= {:phase :released} @slot))
+      (is (zero? (root/lease-count state))))))
+
+(deftest lease-slot-publication-failure-does-not-strand-an-unreferenced-root-pin
+  (doseq [after-write? [false true]]
+    (let [state (live-state) slot (cleanup/acquisition-slot)
+          primary (ex-info "lease publication failed" {})
+          write! vreset!]
+      (with-redefs [clojure.core/vreset! (fn [target value]
+                                           (if (identical? target slot)
+                                             (do (when after-write? (write! target value))
+                                                 (throw primary))
+                                             (write! target value)))]
+        (is (identical? primary (error-of #(root/capture-lease! state slot)))))
+      (is (zero? (root/lease-count state)))
+      (cleanup/release-native! slot #(cleanup/release! (::cleanup/owner %)))
+      (is (zero? (root/lease-count state))))))
+
 (deftest leases-pin-exact-generations-and-release-idempotently
   (let [state (live-state) other (live-state)
         lease (root/lease! state) owner (::cleanup/owner lease)]

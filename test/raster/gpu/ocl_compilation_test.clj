@@ -1,7 +1,8 @@
 (ns raster.gpu.ocl-compilation-test
   "Hardware-free checks at the native OpenCL compilation boundary."
   (:require [clojure.test :refer [deftest is]]
-            [raster.gpu.ocl-runtime :as ocl])
+            [raster.gpu.ocl-runtime :as ocl]
+            [raster.gpu.runtime-root :as root])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]
            [java.lang.invoke MethodHandles MethodType]))
 
@@ -31,6 +32,10 @@
           fail? (atom false)
           diagnostic-fail? (atom false)
           program (.allocate arena 8)
+          state (atom {:initialized? false})
+          _ (root/initialize! state []
+                              (fn [_] {:arena arena :context MemorySegment/NULL
+                                       :device MemorySegment/NULL :device-info {}}))
           compile! (fn [source compilation]
                      (let [name (str (gensym "compile_test_"))]
                        (ocl/register-kernel! name {:source source :target :opencl-c
@@ -42,8 +47,7 @@
           {(runtime-var 'ensure-init!) (fn [])
            (runtime-var 'kernel-registry) (atom {})
            (runtime-var 'kernel-dispatch-registry) (atom {})
-           (runtime-var 'state) (atom {:arena arena :context MemorySegment/NULL
-                                       :device MemorySegment/NULL :device-info {}})
+           (runtime-var 'state) state
            (runtime-var 'h-clCreateProgramWithSource)
            (native 5 (fn [_ _ _ _ err]
                        (swap! calls conj :create)
