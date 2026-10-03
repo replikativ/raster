@@ -1539,7 +1539,11 @@ provider/tier/content placement and drains before returning. A source arena can 
 placement await. Ingestion attests the supplied stream only; the existing reopen/extent/SHA
 verification remains required before durable availability and metadata publication.
 
-Focused ingestion/content/publication tests pass 34 tests / 686 assertions in the capped REPL.
+Pivotal review found that a provider could catch a reader/digest error then replace it with its
+own submission error. The wrapper now captures both outcomes, preserving the exact first callback
+fault and suppressing a distinct provider error without inventing an event handoff. Expired reader
+closures also clear fault data so retained callbacks cannot keep source objects through an error.
+Focused ingestion/content/publication tests pass 35 tests / 698 assertions in the capped REPL.
 This adds no producer provenance, numerical field selection, transactional metadata publication
 or completed-receipt-to-manifest vertical; those remain the next integration work. The original
 eight-item campaign, external training acceptance and AMR/subcycling requirements remain open.

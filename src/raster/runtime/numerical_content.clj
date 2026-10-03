@@ -488,10 +488,20 @@
                         (catch Throwable error
                           (compare-and-set! fault nil error)
                           (throw error))))
-           event (try (-submit-ingestion! provider content target-tier byte-length consume! opts)
-                      (finally (vreset! active? false) (vreset! source-reader nil)))]
+           submission (try {:event (-submit-ingestion! provider content target-tier byte-length consume! opts)}
+                           (catch Throwable error {:error error})
+                           (finally (vreset! active? false) (vreset! source-reader nil)))
+           read-failure @fault
+           ;; A provider-retained expired callback must not retain source objects via error data.
+           _ (reset! fault nil)
+           event (:event submission)
+           _ (when-let [error (:error submission)]
+               (when (and read-failure (not (identical? error read-failure))
+                          (not-any? #(identical? error %) (.getSuppressed ^Throwable read-failure)))
+                 (.addSuppressed ^Throwable read-failure error))
+               (throw (or read-failure error)))]
        (try
-         (when-let [error @fault] (throw error))
+         (when read-failure (throw read-failure))
          (when-not (= byte-length @offset)
            (fail! "provider did not consume the complete source"
                   :numerical-content-ingestion-incomplete {:expected byte-length :actual @offset}))

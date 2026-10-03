@@ -261,3 +261,30 @@
     (is (= :numerical-content-ingestion-reentrant (:reason (ex-data failure))))
     (is (identical? failure @observed))
     (is (= 1 (count @releases)))))
+
+(deftest provider-submission-error-cannot-replace-caught-source-or-digest-fault
+  (doseq [mode [:source :digest]]
+    (let [source (MemorySegment/ofArray (byte-array [1]))
+          primary (ex-info "source fault retains authority" {})
+          secondary (ex-info "provider submission also failed" {})
+          releases (atom []) observed (atom nil) calls (atom [])
+          {:keys [provider saved]}
+          (fixture (fn [{:keys [read!]}]
+                     (reset! observed (error-of #(read! 0 (MemorySegment/ofArray (byte-array 1)))))
+                     (throw secondary)) #(swap! releases conj %))
+          address (if (= mode :digest)
+                    (content/content-address-of (MemorySegment/ofArray (byte-array [2])))
+                    (content/content-address-of source))
+          read! (if (= mode :source)
+                  (fn [_ _] (swap! calls conj :read) (throw primary))
+                  (reader source calls))
+          failure (error-of #(content/submit-ingestion! provider address :local 1 read!))]
+      (is (identical? @observed failure))
+      (when (= mode :source) (is (identical? primary failure)))
+      (when (= mode :digest) (is (= :numerical-content-ingestion-digest (:reason (ex-data failure)))))
+      (is (= [secondary] (vec (.getSuppressed ^Throwable failure))))
+      (is (empty? @releases))
+      (let [before @calls]
+        (is (= :numerical-content-ingestion-expired
+               (:reason (ex-data (error-of #(@saved 0 (MemorySegment/ofArray (byte-array 1))))))))
+        (is (= before @calls))))))
