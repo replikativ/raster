@@ -543,6 +543,20 @@
   (ensure-init!)
   (:device-info @state))
 
+(defn execution-device-info
+  "Actual selected device/driver description for offline evidence, without catalogue estimates."
+  []
+  (let [info (selected-device-info)
+        extensions (set (clojure.string/split (or (:extensions info) "") #"\s+"))]
+    {:backend :ocl
+     :device (select-keys info [:name :vendor :type :version])
+     :driver {:version (:driver-version info)}
+     :extensions extensions
+     :storage-types (cond-> #{:byte :int :long :float}
+                      (contains? extensions "cl_khr_fp16") (conj :half)
+                      (or (contains? extensions "cl_khr_fp64")
+                          (contains? extensions "cl_amd_fp64")) (conj :double))}))
+
 ;; ================================================================
 ;; DeviceBuffer (OpenCL cl_mem backed)
 ;; ================================================================

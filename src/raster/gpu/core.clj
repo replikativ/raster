@@ -384,6 +384,21 @@
            :events {}           ;; {event-id → session-owned asynchronous completion}
            :closed?   false})))
 
+(defn execution-device-info
+  "Query the selected live backend device/driver, not the cross-compilation catalogue.
+   A closed session cannot supply execution evidence. Queries fail loudly."
+  [sess]
+  (when (:closed? @sess)
+    (throw (ex-info "cannot query execution identity for a closed GPU session"
+                    {:reason :gpu-execution-device-closed})))
+  ((rt-resolve (:device-id @sess) "execution-device-info")))
+
+(defn kernel-body-c-dialect
+  "The common emitter dialect accepted by this registered resident runtime. Compile-only
+   targets do not acquire a live runtime by selecting an emitter dialect."
+  [sess]
+  (:kernel-body-c-dialect (runtime-backend/descriptor (:device-id @sess))))
+
 (defn transfer-capabilities
   "Return backend transfer execution capabilities for `sess`.
 

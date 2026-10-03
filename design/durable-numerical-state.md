@@ -15,6 +15,47 @@ are ordinary data, not sealed session evidence. CompletedEvidence remains device
 not acquire a manifest byte-order label until a measured fact is bound to its exact live owner.
 These finite tests do not prove arbitrary arithmetic, NaN payload behavior or target equivalence.
 
+### Live owner-bound storage evidence — 2026-10-03
+
+`compiled/measure-storage-representation!` runs a generated dtype probe for an original retained
+Compiled through the existing exclusive-mutation lifetime guard. It queries the exact selected
+runtime device and driver (including Level Zero driver/device UUIDs and module flags), not the
+cross-compilation catalogue. The existing resident-backend descriptor chooses the common emitter
+dialect. The sealed result retains the exact Compiled, LinkedExecutable, session object and
+session identity outside portable metadata; a copied record does not retain authority. Its
+historical data names the program, probe artifact, observed bytes/hash, declared ABI encoding and
+actual device/driver description. Dereferencing this data does not authorize another owner.
+
+Measurement is explicit/offline and happens before obtaining a completed-output lease. Unsupported
+capabilities, active leases, pending session events and invalid owners decline before mutation.
+The exclusive scope invalidates old output wrappers/readiness and state continuity, but never
+credits a full-program replay. Scratch allocation, binding, execution, readback, classification
+and every surfaced cleanup failure return no evidence and poison the owner. Graph release precedes
+scratch release; both API releases are attempted, preserving the primary failure and suppressing
+later reported errors. The older shared native graph/prepared destructors still swallow some
+driver destruction failures. This slice does not prove native reclamation in those cases; strict
+native destruction and failed-resource retention remain a common-runtime cleanup obligation.
+Identical Level Zero registration now retains its cached module/kernel/staging instead of leaking
+a registry kernel on each measurement, with a repeated-measurement regression on both backends.
+Registration-time payload identity distinguishes source-compiled bytes from explicit SPIR-V;
+explicit bytes are snapshotted and hashed before any reuse decision. Matching metadata alone
+cannot cause a source-only artifact to run an unrelated explicitly supplied binary.
+
+`compiled/completed-storage-description` joins a live original CompletedEvidence with original
+measurements for every canonical dtype in its input/output/post-state leaves. It checks exact
+owner/session identity, program identity and current actual runtime facts. The output is portable
+inspection data: existing byte addresses and physical leaf shapes plus explicit `:raw-array`
+storage order. Byte storage can use either order and is labeled little-endian canonically.
+It does not change the original receipt, invent logical quantization semantics, certify arithmetic
+from finite sentinels or publish a state. Pure descriptions/manifests alone are declarations, not
+reusable authority; a caller still keeps the original receipt lease while staging and verifying
+its addressed bytes. Raw shared-session/runtime mutation is outside the owned-execution contract.
+
+The affected owner/fault/native/output-lease/backend suites pass 20 tests / 289 assertions. Both
+local backends execute real original retained compiler programs; packaged-build fixtures are
+explicitly synthetic, not release provenance. Next: connect these addressed physical leaves to
+explicit semantic field/coordinate contracts and bounded provider staging before manifest commit.
+
 Status: compiler/runtime contracts and strict semantic restore gates, 2026-10-02. Production
 publication, compiler-derived provenance and distributed durability acceptance remain open.
 
