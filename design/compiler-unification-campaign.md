@@ -2063,3 +2063,38 @@ Link topology and recorded-root ordering. Their mock constructors now use the sh
 acquisition/retention fixture, and the owned staging root carries its exact owner in the session.
 All 45 tests / 256 assertions in those three namespaces pass in the existing REPL. No production
 ownership check was weakened; the rerun must still pass all seven exact-head CI gates.
+
+#### Kernel-arena ownership: next coherent vertical
+
+The entry-generation publication transaction moves from session-private code into the existing
+`resource-cleanup` namespace, with a path-based registry interface. Prepared steps, graphs and
+calls use it directly; no adapter or second transaction remains. It checks the exact old entry
+after teardown and inside the publication CAS, and checks the exact candidate after atom watches
+return. An unrelated generation installed during teardown/publication is never overwritten or
+removed. Root and nested registry paths share the same recovery rule. This prerequisite passes
+105 tests / 1005 assertions across the affected publication, ownership and topology namespaces.
+
+The rest of this vertical remains implementation work, not an achieved ownership claim:
+
+1. Reserve one owner at registration, before lazy native contact. OpenCL owns its cached kernel,
+   program and per-entry shared staging arena; Level Zero owns its fresh base kernel and declared
+   cached staging buffers. Destruction orders kernel before program/staging. Dedicated bound
+   KernelCall handles remain separately owned.
+2. Acquire/load through reserved slots; retain unknown load/rollback outcomes in the exact
+   registration. Publish only into that generation. Identical registration preserves the exact
+   owner, handles and staging; incompatible replacement uses the shared transaction.
+3. Level Zero `ensure-seg` uses canonical byte-buffer constructors/owners, not naked allocation
+   and free. Growth publishes an acquired candidate only after safe old teardown, preserving or
+   adopting every failure. OpenCL staging is per-entry, not runtime-global.
+4. Close independent entries, remove only successfully released exact generations, and retain
+   failed/blocked entries. Remove arbitrary MemorySegment scans and representation-based cache
+   preservation. Audit/remove the unused ZE cached-kernel/invoke pair and duplicate registry
+   accessor only after confirming there are no consumers.
+5. Prove acquisition/build/release faults, staging growth, shared-module arena isolation, repeated
+   close and registration replacement, plus a real-device close/re-register smoke check.
+
+Level Zero modules are content-shared global-cache resources, *borrowed* by registrations. They
+must not be freed by an arena. Their canonical cache ownership and shutdown-before-context order
+are the immediately following runtime-root slice; the arena slice must not claim reset recovery
+or silently drop those debts. These two slices precede the still-open training/model and durable
+distributed acceptance items rather than replacing them.
