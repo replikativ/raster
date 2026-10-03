@@ -8,7 +8,9 @@
    - pitch-unaligned f16 (N=70)         → :regtiled → == CPU matmul (fallback: n-pitch-unaligned)
    Gated on a real GPU."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.passes.parallel.contract-route :as route])
+            [raster.compiler.passes.parallel.contract-route :as route]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.layout-transform-device-support :as layout])
   (:import [java.lang.foreign MemorySegment]))
 
 (def ^:private gpu?
@@ -264,19 +266,20 @@
           (is (close? gpu cpu)))))))
 
 ;; ── B3-insert (Option 1): :nn int8 reaches the dp4a PEAK leaf via an inserted transpose ──
-(defn- exec-pre-step [bufs {:keys [src dst rows cols dtype]}]
-  (let [ze (find-ns 'raster.gpu.ze-runtime)
-        d ((ns-resolve ze 'make-buffer) (* rows cols) dtype)
-        g ((ns-resolve ze 'record-graph!)
-           [{:bound ((ns-resolve ze 'bind-registered-transpose!) (get bufs src) d rows cols dtype)
-             :kernel-name "t"}])]
-    ((ns-resolve ze 'replay-graph!) g)
-    (assoc bufs dst d)))
+(defn- exec-pre-step [session bufs {:keys [src dst rows cols dtype]}]
+  (gpu/alloc! session {dst [dtype (* rows cols) nil]})
+  (let [handle (gpu/bind-kernel-call!
+                session [:transpose dst] (layout/transpose-artifact dtype)
+                [src dst {:type :int :value rows} {:type :int :value cols}])]
+    (try (gpu/run-kernel-graph! session handle)
+         (finally (gpu/release-kernel-graph! session handle))))
+  (assoc bufs dst (get-in @session [:buffers dst])))
 
 (deftest b3insert-nn-int8-reaches-dp4a-via-transpose
   (if-not @gpu?
     (println "[skip] b3insert-nn-dp4a: no GPU")
     (testing ":nn int8 matmul + :prefer-peak? → transpose pre-step + dp4a; == reference on device"
+      (gpu/with-gpu-session [session :ze:0]
       (let [M 4 K 8 N 4 scale 0.01
             Ab (mapv #(byte (- (mod % 255) 127)) (range (* M K)))
             Bnn (mapv #(byte (- (mod (* 3 %) 255) 127)) (range (* K N)))   ; [K,N] (:nn)
@@ -286,7 +289,10 @@
                        :epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
                                   :scalars [{:sym 's :dtype :float}]})
             r (route/route-contraction form :dtype :byte :prefer-peak? true)
-            bufs (reduce exec-pre-step {'A (mk-i8 Ab) 'B (mk-i8 Bnn)} (:pre-steps r))
+            _ (gpu/alloc! session {'A [:byte (* M K) (byte-array Ab)]
+                                   'B [:byte (* K N) (byte-array Bnn)]})
+            bufs (reduce (partial exec-pre-step session)
+                         (select-keys (:buffers @session) ['A 'B]) (:pre-steps r))
             gpu (launch-int8-routed r bufs {'s scale})
             cpu (for [i (range M) j (range N)]
                   (* scale (reduce + (for [l (range K)] (* (int (nth Ab (+ (* i K) l))) (int (nth Bnn (+ (* l N) j))))))))]
@@ -294,7 +300,7 @@
         (is (= 1 (count (:pre-steps r))))
         (is (= :byte (:dtype (first (:pre-steps r)))))            ; byte-granularity transpose
         (is (every? true? (map #(< (/ (Math/abs (- (double %1) (double %2)))
-                                      (max 1.0 (Math/abs (double %2)))) 1.0e-6) gpu cpu)))))))
+                                      (max 1.0 (Math/abs (double %2)))) 1.0e-6) gpu cpu))))))))
 
 (deftest b3insert-refuses-to-retarget-an-unverified-layout
   ;; device-free. The previous :nn→:nt rewrite substituted ASSUMED canonical strides having only
