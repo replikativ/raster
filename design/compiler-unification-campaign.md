@@ -2433,7 +2433,11 @@ It now allocates through the existing canonical `make-buffer` transaction and re
 child cleanup before native contact. The enclosing RenderBuffer cleanup delegates to the child
 owner; it creates no second native destruction authority. Construction and initialization failure
 retire known resources or return explicit unresolved cleanup containing the exact child debt.
-Pixels are initialized to zero before publication; invalid/overflowing dimensions fail before
+Repeated retain/adopt callbacks must name the identical canonical child owner; a distinct
+generation is rejected without overwriting the first. The constructor's unresolved-error chain
+retains any rejected second generation, while the enclosing cleanup retires or retains the first.
+Pixels are initialized to zero before publication; each axis and pixel count are checked, so
+invalid/overflowing dimensions, including an oversized axis paired with zero, fail before
 driver contact. The record's shape is unchanged and native namespaces/records are not reloaded.
 
 The surface lifetime addition is `close-render-buffer!`: GPU callers must establish completion
@@ -2443,7 +2447,7 @@ checks both the render owner and allocation owner and copies completed pixels in
 AWT int array. It is not an implicit wait or a zero-copy GPU-to-AWT view; CPU-to-AWT remains
 zero-copy. This does not establish arbitrary concurrent kernel borrowing or safe live reset.
 
-Five hardware-free fault tests plus nine actual root-lease device tests pass 14 tests / 80
+Six hardware-free fault tests plus nine actual root-lease device tests pass 15 tests / 92
 assertions, including real ZE render allocation/synchronization and balanced root-pin retirement.
 The existing display compatibility cases pass 3 tests / 11 assertions and the affected canonical
 ownership suite passes 182 tests / 1,898 assertions. Exact-head review and all seven CI gates are

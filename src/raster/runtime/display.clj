@@ -29,14 +29,14 @@
            [java.awt.event WindowAdapter WindowEvent]))
 
 ;; ================================================================
-;; RenderBuffer — shared GPU/CPU pixel buffer (RGBA8, packed as ARGB int)
+;; RenderBuffer — CPU pixels plus an optional owned GPU allocation (packed ARGB int)
 ;; ================================================================
 
 (defrecord RenderBuffer
            [^long   width
             ^long   height
             ^ints   pixels      ;; int[] — writable by CPU; wrap for AWT
-            ^MemorySegment seg  ;; shared MemorySegment over the same backing int[]
+            ^MemorySegment seg  ;; CPU array view or borrowed GPU allocation pointer
             ])
 
 (defn render-buffer
@@ -61,14 +61,20 @@
   (when (or (neg? width) (neg? height))
     (throw (ex-info "Render dimensions must be non-negative"
                     {:reason :invalid-render-dimensions :width width :height height})))
-  (let [n (Math/multiplyExact width height)
+  (let [_ (Math/toIntExact width)
+        _ (Math/toIntExact height)
+        n (Math/multiplyExact width height)
         pixels (int-array (Math/toIntExact n))
         make-buffer (requiring-resolve 'raster.gpu.ze-runtime/make-buffer)
         child (volatile! nil)
         owner (cleanup/owner [{:id :pixel-allocation
                                :release #(when-let [buffer-owner @child]
                                            (cleanup/release! buffer-owner))}])
-        retain! #(vreset! child %)]
+        retain! (fn [candidate]
+                  (when (and @child (not (identical? @child candidate)))
+                    (throw (ex-info "Render buffer constructor changed canonical owner"
+                                    {:reason :cleanup-owner-mismatch})))
+                  (vreset! child candidate))]
     (cleanup/build!
      owner
      (fn []

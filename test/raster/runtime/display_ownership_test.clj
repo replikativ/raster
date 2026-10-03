@@ -65,6 +65,36 @@
       (is (= 1 @released))
       (is (empty? (cleanup/pending owner))))))
 
+(deftest gpu-render-retention-cannot-replace-the-first-canonical-owner
+  (doseq [first-unknown? [false true]]
+    (let [attempts (atom [])
+          unknown (ex-info "native retirement unknown" {})
+          first-owner (cleanup/owner [{:id :first
+                                       :release #(do (swap! attempts conj :first)
+                                                     (when first-unknown? (throw unknown)))}])
+          second-owner (cleanup/owner [{:id :second
+                                        :release #(do (swap! attempts conj :second)
+                                                      (throw unknown))}])]
+      (with-redefs [ze/make-buffer
+                    (fn [_ _ options]
+                      ((:retain-owner! options) first-owner)
+                      ;; A mismatched constructor must itself preserve its rejected second
+                      ;; generation. Use the production transaction's unresolved-error contract.
+                      (cleanup/build! second-owner
+                                      #(do ((:adopt-cleanup! options) second-owner) {}) nil))]
+        (let [error (error-of #(display/render-buffer-gpu 2 2))
+              chain (take-while some? (iterate #(.getCause ^Throwable %) error))
+              retained (keep #(-> % ex-data ::cleanup/unresolved) chain)]
+          (is (some #(= :cleanup-owner-mismatch (:reason (ex-data %))) chain))
+          (is (= [:second :first] @attempts) "the first generation was not overwritten")
+          (is (some #(identical? second-owner %) retained))
+          (if first-unknown?
+            (is (some #(= [:pixel-allocation] (cleanup/pending %)) retained)
+                "outer authority retains the first generation as well")
+            (is (empty? (cleanup/pending first-owner))))
+          (doseq [owner retained] (error-of #(cleanup/release! owner)))
+          (is (= [:second :first] @attempts) "unknown destruction is never retried"))))))
+
 (deftest gpu-render-dimensions-decline-before-driver-contact
   (let [calls (atom 0)]
     (with-redefs [ze/make-buffer (fn [& _] (swap! calls inc))]
@@ -74,6 +104,10 @@
                      (error-of #(display/render-buffer-gpu Long/MAX_VALUE 2))))
       (is (instance? ArithmeticException
                      (error-of #(display/render-buffer-gpu (inc (long Integer/MAX_VALUE)) 1))))
+      (is (instance? ArithmeticException
+                     (error-of #(display/render-buffer-gpu Long/MAX_VALUE 0))))
+      (is (instance? ArithmeticException
+                     (error-of #(display/render-buffer-gpu 0 Long/MAX_VALUE))))
       (is (zero? @calls)))))
 
 (deftest cpu-render-close-preserves-the-zero-copy-array-path
