@@ -2278,7 +2278,7 @@ including ZE module-cache callbacks, before lock-order inversion can occur.
 Registration-slice acceptance: 176 focused tests / 1,844 assertions pass in the persistent
 REPL; seven actual-device boundary checks / 84 assertions, six live-root/reset assertions,
 and two buffer/view tests / eight assertions pass on the local OpenCL/Level Zero device.
-Review found no remaining blocker; final exact-head review and CI remain required.
+PR #1019 passed all seven exact-head CI gates and merged as `8268509f`.
 Prepared calls, recordings/events and raw allocation consumers are still outstanding.
 
 The prepared-resource follow-up starts with ZE's public `create-kernel-fresh`: every
@@ -2289,8 +2289,21 @@ before the module borrow retires, and both precede root-pin retirement. Unknown 
 NULL readback or destruction leaves both borrow and pin retained. Hardware-free tests
 exercise two independent kernels and all three uncertain outcomes; 178 focused tests /
 1,860 assertions and seven actual-device boundary tests / 84 assertions pass.
-This is the first prepared-resource step, not completion of both public binders:
-OpenCL fresh kernels still need equivalent ownership, and recordings/events remain next.
+OpenCL's public binder now constructs its independent kernel through the canonical
+root-child owner, with a reserved native acquisition slot and exact root Arena projection.
+The registration lock covers loading through fresh creation; logical native-use admission
+is scoped separately so loading does not recursively enter the same guarded registry.
+Unknown create/readback or destruction retains the composite kernel/root owner; known
+argument-binding failure retires both. Root-child construction shares the transactional
+lease-slot publication helper, with before/after-write failure tests proving no native
+contact or stranded root pin.
+
+Final local acceptance: 180 focused tests / 1,878 assertions, seven actual-device boundary
+tests / 84 assertions, and four buffer/view/prepared device tests / 16 assertions pass.
+On both backends a prepared generated kernel survives base-registration retirement,
+executes correctly, and balances its independent pin. This does not establish arbitrary
+concurrent root reset: recordings/events, use admission and raw consumers remain next.
+Pivotal final review and seven exact-head CI gates are required before merging this slice.
 
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates

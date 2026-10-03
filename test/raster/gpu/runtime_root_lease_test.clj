@@ -37,6 +37,24 @@
       (cleanup/release-native! slot #(cleanup/release! (::cleanup/owner %)))
       (is (zero? (root/lease-count state))))))
 
+(deftest composite-child-lease-publication-failure-balances-the-root-before-native-contact
+  (doseq [after-write? [false true]]
+    (let [state (live-state) lease-slot (atom nil) contacted? (atom false)
+          primary (ex-info "child lease publication failed" {})
+          make-slot cleanup/acquisition-slot write! vreset!]
+      (with-redefs [cleanup/acquisition-slot
+                    #(let [slot (make-slot)] (reset! lease-slot slot) slot)
+                    clojure.core/vreset!
+                    (fn [target value]
+                      (if (and (identical? target @lease-slot) (= :live (:phase value)))
+                        (do (when after-write? (write! target value)) (throw primary))
+                        (write! target value)))]
+        (is (identical? primary
+                        (error-of #(root/construct-child! state []
+                                                          (fn [& _] (reset! contacted? true)) nil)))))
+      (is (false? @contacted?))
+      (is (zero? (root/lease-count state))))))
+
 (deftest leases-pin-exact-generations-and-release-idempotently
   (let [state (live-state) other (live-state)
         lease (root/lease! state) owner (::cleanup/owner lease)]

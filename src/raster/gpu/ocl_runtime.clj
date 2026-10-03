@@ -1517,8 +1517,8 @@
 (defn- create-kernel-fresh
   "A DEDICATED cl_kernel per binding — kernel args are mutable state on the
   kernel object (same clobbering hazard as Level Zero shared handles)."
-  ^MemorySegment [^MemorySegment program ^String kernel-name]
-  (let [{:keys [arena]} @state
+  ^MemorySegment [^MemorySegment program ^String kernel-name root-entry]
+  (let [{:keys [arena]} @(:projection root-entry)
         err-seg (.allocate ^Arena arena I32)
         kname-seg (.allocateFrom ^Arena arena kernel-name)
         kh (.invokeWithArguments ^MethodHandle @h-clCreateKernel
@@ -1544,40 +1544,51 @@
    geometry come exclusively from the call; no map/reduction convention is interpreted."
   ([call] (bind-kernel-call call {}))
   ([call {:keys [adopt-cleanup!]}]
-  (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
-        (kcall/binding-plan call)
-        registered (or (get @kernel-registry kernel-name)
-                       (throw (ex-info (str "Kernel not registered: " kernel-name)
-                                       {:kernel-name kernel-name
-                                        :registered (keys @kernel-registry)})))
-        _ (kcall/validate-registered! call registered)
-        pointer-values (mapv second pointer-pairs)
-        _ (doseq [[slot value] pointer-pairs]
-            (when-not (or (device-buffer? value) (instance? MemorySegment value))
-              (throw (ex-info "OpenCL KernelCall requires OclBuffer/MemorySegment pointers"
-                              {:kernel-name kernel-name :slot slot :value-type (type value)}))))
-        _ (kabi/validate-physical-pointer-dtypes!
-           abi (physical-pointer-dtypes pointer-values))
+   (cleanup/assert-registry-mutable! state)
+   (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
+         (kcall/binding-plan call)
+         registered (or (get @kernel-registry kernel-name)
+                        (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                        {:kernel-name kernel-name
+                                         :registered (keys @kernel-registry)})))
+         _ (kcall/validate-registered! call registered)
+         pointer-values (mapv second pointer-pairs)
+         _ (doseq [[slot value] pointer-pairs]
+             (when-not (or (device-buffer? value) (instance? MemorySegment value))
+               (throw (ex-info "OpenCL KernelCall requires OclBuffer/MemorySegment pointers"
+                               {:kernel-name kernel-name :slot slot :value-type (type value)}))))
+         _ (kabi/validate-physical-pointer-dtypes!
+            abi (physical-pointer-dtypes pointer-values))
         ;; cl_mem MemorySegments are opaque handles, not allocation byte ranges.
-        _ (kcall/validate-resident-output-capacities!
-           call plan registered (fn [value _] (known-buffer-capacity value)))
-        ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-        {:keys [program]} (ensure-kernel-loaded! kernel-name)]
-    (cleanup/construct!
-     :kernel #(create-kernel-fresh program kernel-name)
-     #(cl-call! "clReleaseKernel" @h-clReleaseKernel [%])
-     (fn [kh owner]
-       (doseq [[idx [slot value]] (map-indexed vector pairs)]
-         (if (= :scalar (:kind slot))
-           (set-kernel-arg-scalar! kh idx value)
-           (set-kernel-arg-buffer! kh idx (device-mem-of value))))
-       {:bound {:kernel kh :wg workgroup-size}
-        ::cleanup/owner owner
-        :group-count group-count
-        :kernel-name kernel-name
-        :kernel-call call
-        :binding-plan plan})
-     adopt-cleanup!))))
+         _ (kcall/validate-resident-output-capacities!
+            call plan registered (fn [value _] (known-buffer-capacity value)))
+         kernel-slot (cleanup/acquisition-slot)]
+    ;; Serialize the exact registration through fresh-kernel creation: releasing its
+    ;; program before clCreateKernel returns would otherwise race the independent pin.
+     (locking kernel-registry
+       (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+      ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
+       (let [{:keys [program]} (ensure-kernel-loaded! kernel-name)]
+         (cleanup/with-registry-use kernel-registry
+           (root/construct-child!
+            state [{:id :kernel
+                    :release #(cleanup/release-native!
+                               kernel-slot (fn [kh]
+                                             (cl-call! "clReleaseKernel" @h-clReleaseKernel [kh])))}]
+            (fn [owner entry]
+              (let [kh (cleanup/acquire-native! kernel-slot
+                                                #(create-kernel-fresh program kernel-name entry))]
+                (doseq [[idx [slot value]] (map-indexed vector pairs)]
+                  (if (= :scalar (:kind slot))
+                    (set-kernel-arg-scalar! kh idx value)
+                    (set-kernel-arg-buffer! kh idx (device-mem-of value))))
+                {:bound {:kernel kh :wg workgroup-size}
+                 ::cleanup/owner owner
+                 :group-count group-count
+                 :kernel-name kernel-name
+                 :kernel-call call
+                 :binding-plan plan}))
+            adopt-cleanup!)))))))
 
 (defn- enqueue-bound!
   "Enqueue one pre-bound kernel (no finish)."
