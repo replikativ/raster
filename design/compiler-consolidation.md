@@ -1583,3 +1583,26 @@ packaged build identity and a bounded test provider, not release-build or produc
 validation. The existing multilevel/AMR operators remain unchanged. General device packing,
 partial-chunk codecs, scalable AMR/subcycling/reflux and external training acceptance remain open;
 this slice does not complete the eight-item campaign.
+
+### Coarse/fine restart consumes completed producer evidence — 2026-10-03
+
+The existing full-domain refined-heat continuation fixture no longer handwrites a producer string
+or assumes little-endian storage when constructing its manifest. It uses the same public completed
+receipt, measured representation and resident-state capture boundary for the coarse output and
+evolving fine post-state. Its original generated four-fine-step/restriction program, JVM reference,
+six-step uninterrupted baseline, actual mapped-file leases and mass checks remain independent.
+
+Each of three replays captures both fields and finalizes availability before a small test metadata
+callback records the manifest. That callback checks that declared state parents already exist;
+the child also checks its execution-parent fingerprint against the preceding captured replay.
+Numerical state parents and execution replay parents stay distinct. Runtime tensor shape is the
+actual dense one-dimensional buffer; declared grid geometry is retained in field coordinates,
+not silently reinterpreted as a compiler-certified reshape. All producer sessions close before
+the final files are mapped for fresh continuation. Native OpenCL/Level Zero and host checks pass
+3 tests / 64 assertions, including same-backend exact coarse/fine restoration and conservation.
+
+These are synthetic packaged-build and bounded provider/metadata fixtures, not release-build
+authentication, transactional distributed lineage or a production persistent store. Mapped-file
+realization independently verifies content before upload. Partial-patch producer integration,
+device packing, scalable hierarchy validation, temporal interpolation/subcycling/reflux and
+external numerical comparisons remain open.

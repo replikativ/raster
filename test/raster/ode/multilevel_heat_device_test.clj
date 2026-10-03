@@ -3,18 +3,22 @@
    AMR, a network benchmark, or a production persistence-provider implementation."
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
+            [raster.compiler.build-manifest :as build]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.numerical-state :as state]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.completed-evidence-device-test :as producer]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.link :as link]
             [raster.ode.multilevel :as multilevel]
             [raster.ode.multilevel-heat-test :as host]
             [raster.ode.pde :as pde]
             [raster.runtime.numerical-content :as content]
+            [raster.runtime.resident-state :as resident]
+            [raster.runtime.resident-state-test :as capture-fixture]
             [raster.test-support.numerical-checkpoint :as checkpoint])
-  (:import [java.nio.file Files]))
+  (:import [java.nio.file Files OpenOption]))
 
 (deftm refined-heat-checkpoint-step!
   [coarse :- (Array double), fine :- (Array double), scratch :- (Array double),
@@ -37,40 +41,78 @@
 
 (defn- prepare [target coarse fine nx ny alpha dt]
   (let [scratch (double-array (repeat (alength ^doubles fine) Double/NaN))
-        prepared (compiled/lower #'refined-heat-checkpoint-step!
-                                 [coarse fine scratch nx ny alpha dt]
-                                 {:compiler :equation-first :target target :dtype :double
-                                  :inline? true :donate '[fine] :outputs '[coarse]})
+        prepared (with-redefs [build/current-identity #'producer/test-build]
+                   (compiled/lower #'refined-heat-checkpoint-step!
+                                   [coarse fine scratch nx ny alpha dt]
+                                   {:compiler :equation-first :target target :dtype :double
+                                    :inline? true :donate '[fine] :outputs '[coarse]}))
         plan (compiled/plan prepared)
         ids (into {} (for [[id node] (:nodes plan)
-                          [field array] [[:coarse coarse] [:fine fine]]
-                          :when (identical? array (:source node))]
-                      [field id]))]
+                           [field array] [[:coarse coarse] [:fine fine]]
+                           :when (identical? array (:source node))]
+                       [field id]))]
     (is (= #{:coarse :fine} (set (keys ids))))
     (is (= 2 (count (:outputs plan))))
     (is (= 0 (get-in plan [:attributes :driver-allocations])))
-    {:plan plan :ids ids}))
+    {:prepared prepared :plan plan :ids ids}))
 
-(defn- snapshot [captured nx ny]
-  (state/certify
-   (state/manifest
-    {:id :heat/refined-step-3 :parents [] :logical-coordinate {:step 3 :time 0.003}
-     :fields
-     (mapv (fn [[field shape level]]
-             (state/field
-              {:id field :value (av/tensor {:dtype :double :shape shape}) :chunk-shape shape
-               :coordinate-space {:hierarchy :heat/full-domain :level level :patch field
-                                  :axes [{:name :x :centering :cell} {:name :y :centering :cell}]}
-               :chunks [(state/chunk
-                         {:id [field 0] :offsets [0 0] :shape shape
-                          :logical-byte-length (get-in captured [field :bytes])
-                          :stored-byte-length (get-in captured [field :bytes])
-                          :content (get-in captured [field :content])
-                          :storage {:format :raw-array :byte-order :little-endian}})]}))
-           [[:coarse [nx ny] 0] [:fine [(* 2 nx) (* 2 ny)] 1]])
-     :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
-                          :compatibility-id "periodic-heat-full-refinement-f64-v1"}
-     :provenance {:program-fingerprint "refined-heat-checkpoint-step-v1"}})))
+(defn- capture-midpoint! [midpoint paths nx ny dt]
+  ;; The existing fixture provides explicitly synthetic packaged build evidence; this is
+  ;; real compiler-owned execution provenance, not release-build authentication.
+  (with-redefs [build/current-identity #'producer/test-build]
+    (let [{:keys [provider blobs events]} (#'capture-fixture/provider (fn [& _]))
+          published (atom {})
+          c (compiled/instantiate! (:prepared midpoint))]
+      (try
+        (let [fact (compiled/measure-storage-representation! c :double)
+              fields (mapv (fn [[field source grid-shape level]]
+                             {:id field :source source :node (get-in midpoint [:ids field])
+                              :value (av/tensor {:dtype :double :shape [(reduce * grid-shape)]})
+                              :coordinate-space {:hierarchy :heat/full-domain :level level :patch field
+                                                 :grid-shape grid-shape :centering :cell}})
+                           [[:coarse :outputs [nx ny] 0] [:fine :post-state [(* 2 nx) (* 2 ny)] 1]])
+              opts {:fields fields
+                    :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
+                                         :compatibility-id "periodic-heat-full-refinement-f64-v1"}}
+              captures
+              (loop [step 1 previous nil captured []]
+                (if (> step 3)
+                  captured
+                  (let [result
+                        (with-open [receipt (compiled/invoke-with-evidence c {})]
+                          (let [result (resident/capture!
+                                        receipt {:double fact} provider :local
+                                        (assoc opts :id (keyword "heat" (str "refined-step-" step))
+                                               :parents (if previous [(get-in previous [:state :manifest :id])] [])
+                                               :logical-coordinate {:step step :time (* step dt)}))]
+                            (when previous
+                              (is (= (get-in previous [:state :manifest :provenance :completed-fingerprint])
+                                     (get-in result [:state :manifest :provenance :parent-replay]))))
+                            (is (= :published (:publication (content/finalize-state-availability!
+                                                             provider (:state result) :durable
+                                                             (fn [manifest]
+                                                               (is (every? #(contains? @published %) (:parents manifest)))
+                                                               (swap! published assoc (:id manifest) manifest)
+                                                               :published)))))
+                            result))]
+                    ;; Close before the next replay; captures contain no output/session ownership.
+                    (recur (inc step) result (conj captured result)))))
+              certificate (:state (peek captures))]
+          (is (= [:heat/refined-step-2] (get-in certificate [:manifest :parents])))
+          (is (= #{:heat/refined-step-1 :heat/refined-step-2 :heat/refined-step-3}
+                 (set (keys @published))))
+          (is (= [:outputs :post-state]
+                 (mapv :source (get-in certificate [:manifest :provenance :field-producers]))))
+          (is (seq (get-in certificate [:manifest :provenance :bound-schedules])))
+          (is (empty? @events))
+          ;; Realize the verified provider bytes in actual files. The existing mapped leases
+          ;; independently recheck each chunk before upload into the fresh continuation owner.
+          (doseq [field (get-in certificate [:manifest :fields])]
+            (Files/write (paths (:id field))
+                         ^bytes (get @blobs (:content (first (:chunks field))))
+                         (make-array OpenOption 0)))
+          certificate)
+        (finally (compiled/close! c))))))
 
 (defn- near? [expected actual]
   (and (= (count expected) (count actual))
@@ -99,14 +141,7 @@
               (into {} (for [[field id] (:ids uninterrupted)]
                          [field (vec (link/download executable id))])))
             midpoint (prepare target (aclone coarse) (aclone fine) nx ny alpha dt)
-            captured
-            (with-open [executable (link/instantiate! (:plan midpoint))]
-              (dotimes [_ 3] (link/run! executable))
-              (into {} (for [[field id] (:ids midpoint)]
-                         [field (checkpoint/capture-f64!
-                                 (:session executable) (link/node-view executable id)
-                                 (paths field) (if (= field :fine) (* 4 nx ny) (* nx ny)))])))
-            certificate (snapshot captured nx ny)
+            certificate (capture-midpoint! midpoint paths nx ny dt)
             chunks (into {} (for [field (get-in certificate [:manifest :fields])]
                               [(:id field) (first (:chunks field))]))
             fresh (prepare target (double-array (* nx ny)) (double-array (* 4 nx ny))
@@ -118,9 +153,9 @@
         (with-open [coarse-lease (checkpoint/open-chunk-lease (paths :coarse) (chunks :coarse))
                     fine-lease (checkpoint/open-chunk-lease (paths :fine) (chunks :fine))]
           (let [restored (reduce (fn [plan [field lease]]
-                                  (assoc-in plan [:nodes (get-in fresh [:ids field]) :source]
-                                            (content/lease-segment lease)))
-                                (:plan fresh) [[:coarse coarse-lease] [:fine fine-lease]])]
+                                   (assoc-in plan [:nodes (get-in fresh [:ids field]) :source]
+                                             (content/lease-segment lease)))
+                                 (:plan fresh) [[:coarse coarse-lease] [:fine fine-lease]])]
             (with-open [executable (link/instantiate! restored)]
               ;; Synchronous initialization completes before the mmap arenas are released.
               (.close coarse-lease)
