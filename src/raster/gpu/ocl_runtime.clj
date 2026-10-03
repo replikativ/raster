@@ -29,7 +29,8 @@
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.resident-value :as resident-value]
-            [raster.gpu.resource-cleanup :as cleanup]))
+            [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.runtime-root :as root]))
 
 ;; ================================================================
 ;; Library loading
@@ -261,9 +262,7 @@
          :device-name nil
          :device-info nil
          :unified-memory? false
-         :buffer-offset-alignment nil ;; bytes; CL_DEVICE_MEM_BASE_ADDR_ALIGN is reported in bits
-         :programs {}        ;; source-hash -> cl_program handle
-         :kernels {}}))      ;; [program kernel-name] -> cl_kernel handle
+         :buffer-offset-alignment nil})) ;; bytes; CL_DEVICE_MEM_BASE_ADDR_ALIGN is reported in bits
 
 (def kernel-registry
   "Global registry mapping kernel-name → kernel info.
@@ -377,7 +376,21 @@
 (declare init!)
 
 (defn- ensure-init! []
-  (when-not (:initialized? @state) (init!)))
+  (if (:initialized? @state) (root/assert-live! state) (init!)))
+
+(defn- runtime-root-plan []
+  [{:id :compute :release #(cl-call! "clReleaseCommandQueue(compute)" @h-clReleaseCommandQueue [%])}
+   {:id :transfer :release #(cl-call! "clReleaseCommandQueue(transfer)" @h-clReleaseCommandQueue [%])}
+   {:id :context :after #{:compute :transfer}
+    :release #(cl-call! "clReleaseContext" @h-clReleaseContext [%])}
+   {:id :arena :after #{:context} :release #(.close ^Arena %)}])
+
+(defn- checked-native-handle [operation handle status]
+  (check-cl-result! operation status)
+  (when (or (nil? handle) (.equals MemorySegment/NULL handle))
+    (throw (ex-info "OpenCL creation returned no native handle"
+                    {:reason :invalid-native-root-handle :operation operation})))
+  handle)
 
 (defn init!
   "Initialize OpenCL runtime. Idempotent.
@@ -386,104 +399,81 @@
   runtime, vendor-portability testing), creates a context plus independent
   in-order compute and transfer queues."
   []
-  (when-not (:initialized? @state)
-    (let [arena (Arena/ofShared)
+  (root/initialize! state (runtime-root-plan)
+                    (fn [entry]
+                      (let [arena (root/acquire! entry :arena #(Arena/ofShared))
           ;; Get platforms
-          num-plat-seg (.allocate arena I32)
-          _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
-                      [(int 0) MemorySegment/NULL num-plat-seg])
-          num-plat (read-int num-plat-seg)
-          _ (when (zero? num-plat)
-              (throw (ex-info "No OpenCL platforms found" {})))
-          plat-buf (.allocate arena (* num-plat 8))
-          _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
-                      [(int num-plat) plat-buf num-plat-seg])
+                            num-plat-seg (.allocate arena I32)
+                            _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
+                                        [(int 0) MemorySegment/NULL num-plat-seg])
+                            num-plat (read-int num-plat-seg)
+                            _ (when (zero? num-plat)
+                                (throw (ex-info "No OpenCL platforms found" {})))
+                            plat-buf (.allocate arena (* num-plat 8))
+                            _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
+                                        [(int num-plat) plat-buf num-plat-seg])
 
           ;; Find first platform with a GPU device
-          [platform device]
-          (or (some
-               (fn [plat-idx]
-                 (let [plat (.get plat-buf PTR (* plat-idx 8))
-                       num-dev-seg (.allocate arena I32)
-                       ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
-                                                      (into-array Object [plat (long (requested-device-type))
-                                                                          (int 0) MemorySegment/NULL num-dev-seg])))]
-                   (cond
-                     (= CL_DEVICE_NOT_FOUND ret) nil
-                     (not= CL_SUCCESS ret) (check-cl-result! "clGetDeviceIDs" ret)
-                     :else
-                     (let [num-dev (read-int num-dev-seg)]
-                       (when (> num-dev 0)
-                         (let [dev-buf (.allocate arena 8)
-                               _ (cl-call! "clGetDeviceIDs" @h-clGetDeviceIDs
-                                           [plat (long (requested-device-type)) (int 1) dev-buf num-dev-seg])
-                               dev (.get dev-buf PTR 0)]
-                           [plat dev]))))))
-               (range num-plat))
-              (throw (ex-info "No OpenCL GPU devices found" {:num-platforms num-plat})))
+                            [platform device]
+                            (or (some
+                                 (fn [plat-idx]
+                                   (let [plat (.get plat-buf PTR (* plat-idx 8))
+                                         num-dev-seg (.allocate arena I32)
+                                         ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
+                                                                        (into-array Object [plat (long (requested-device-type))
+                                                                                            (int 0) MemorySegment/NULL num-dev-seg])))]
+                                     (cond
+                                       (= CL_DEVICE_NOT_FOUND ret) nil
+                                       (not= CL_SUCCESS ret) (check-cl-result! "clGetDeviceIDs" ret)
+                                       :else
+                                       (let [num-dev (read-int num-dev-seg)]
+                                         (when (> num-dev 0)
+                                           (let [dev-buf (.allocate arena 8)
+                                                 _ (cl-call! "clGetDeviceIDs" @h-clGetDeviceIDs
+                                                             [plat (long (requested-device-type)) (int 1) dev-buf num-dev-seg])
+                                                 dev (.get dev-buf PTR 0)]
+                                             [plat dev]))))))
+                                 (range num-plat))
+                                (throw (ex-info "No OpenCL GPU devices found" {:num-platforms num-plat})))
 
           ;; Complete all fallible capability queries before allocating a context/queue.  A broken
           ;; clGetDeviceInfo must not leave native execution resources unreachable.
-          device-info (device-info device)
-          dev-name (:name device-info)
-          unified? (:integrated? device-info)
-          buffer-offset-alignment (:buffer-offset-alignment device-info)
+                            device-info (device-info device)
+                            dev-name (:name device-info)
+                            unified? (:integrated? device-info)
+                            buffer-offset-alignment (:buffer-offset-alignment device-info)
 
           ;; Create context
-          err-seg (.allocate arena I32)
-          ctx (.invokeWithArguments ^MethodHandle @h-clCreateContext
-                                    (into-array Object [MemorySegment/NULL (int 1)
-                                                        (.allocateFrom arena PTR device)
-                                                        MemorySegment/NULL MemorySegment/NULL err-seg]))
-          _ (when (not= CL_SUCCESS (read-int err-seg))
-              (.close arena)
-              (throw (ex-info "clCreateContext failed" {:error (read-int err-seg)})))
+                            err-seg (.allocate arena I32)
+                            ctx (root/acquire! entry :context
+                                               #(let [handle (.invokeWithArguments ^MethodHandle @h-clCreateContext
+                                                                                   (into-array Object [MemorySegment/NULL (int 1)
+                                                                                                       (.allocateFrom arena PTR device)
+                                                                                                       MemorySegment/NULL MemorySegment/NULL err-seg]))]
+                                                  (checked-native-handle "clCreateContext" handle (read-int err-seg))))
 
           ;; Compute and transfer are distinct physical in-order queues. Callers establish
           ;; cross-queue dependencies by awaiting an event before the same buffer changes roles;
           ;; unrelated immutable transfer and compute work may proceed independently.
-          queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
-                                      (into-array Object
-                                                  [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))
-          _ (when (not= CL_SUCCESS (read-int err-seg))
-              (try
-                (.invokeWithArguments ^MethodHandle @h-clReleaseContext
-                                      (into-array Object [ctx]))
-                (catch Exception _))
-              (.close arena)
-              (throw (ex-info "clCreateCommandQueue(compute) failed"
-                              {:error (read-int err-seg)})))
-          transfer-queue
-          (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
-                                (into-array Object
-                                            [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))
-          _ (when (not= CL_SUCCESS (read-int err-seg))
-              (try
-                (.invokeWithArguments ^MethodHandle @h-clReleaseCommandQueue
-                                      (into-array Object [queue]))
-                (catch Exception _))
-              (try
-                (.invokeWithArguments ^MethodHandle @h-clReleaseContext
-                                      (into-array Object [ctx]))
-                (catch Exception _))
-              (.close arena)
-              (throw (ex-info "clCreateCommandQueue(transfer) failed"
-                              {:error (read-int err-seg)})))]
-
-      (swap! state assoc
-             :initialized? true
-             :platform platform
-             :device device
-             :context ctx
-             :queue queue
-             :transfer-queue transfer-queue
-             :arena arena
-             :device-name dev-name
-             :device-info device-info
-             :unified-memory? unified?
-             :buffer-offset-alignment buffer-offset-alignment)
-      (println (str "[ocl-runtime] Initialized: " dev-name
-                    (when unified? " (unified memory)"))))))
+                            queue (root/acquire! entry :compute
+                                                 #(let [handle (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
+                                                                                     (into-array Object [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))]
+                                                    (checked-native-handle "clCreateCommandQueue(compute)" handle (read-int err-seg))))
+                            transfer-queue
+                            (root/acquire! entry :transfer
+                                           #(let [handle (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
+                                                                               (into-array Object [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))]
+                                              (checked-native-handle "clCreateCommandQueue(transfer)" handle (read-int err-seg))))]
+                        {:platform platform
+                         :device device
+                         :context ctx
+                         :queue queue
+                         :transfer-queue transfer-queue
+                         :arena arena
+                         :device-name dev-name
+                         :device-info device-info
+                         :unified-memory? unified?
+                         :buffer-offset-alignment buffer-offset-alignment}))))
 
 (defn query-devices
   "Query all requested OpenCL devices across all platforms.
@@ -1009,6 +999,7 @@
   ([kernel-name kernel-info]
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
+   (cleanup/assert-registry-mutable! state)
    (cleanup/assert-registry-mutable! kernel-registry)
    (let [_ (when (some #(contains? kernel-info %) [:arena-id :program :kernel-handle ::cleanup/owner ::registration])
              (throw (ex-info "Registration cannot import native lifetime fields"
@@ -2008,47 +1999,13 @@
   nil)
 
 (defn shutdown!
-  "Shutdown OpenCL runtime, releasing all handles."
+  "Clean failed initialization; live teardown declines until child resource leases are complete."
   []
-  (let [{:keys [queue transfer-queue context arena initialized?]} @state]
-    (when initialized?
-      (when transfer-queue
-        (let [ret (int (.invokeWithArguments ^MethodHandle @h-clReleaseCommandQueue
-                                             (into-array Object [transfer-queue])))]
-          (when-not (zero? ret)
-            (println (str "[ocl-runtime] WARNING: clReleaseCommandQueue(transfer) failed with error " ret)))))
-      (when queue
-        (let [ret (int (.invokeWithArguments ^MethodHandle @h-clReleaseCommandQueue
-                                             (into-array Object [queue])))]
-          (when-not (zero? ret)
-            (println (str "[ocl-runtime] WARNING: clReleaseCommandQueue failed with error " ret)))))
-      (when context
-        (let [ret (int (.invokeWithArguments ^MethodHandle @h-clReleaseContext
-                                             (into-array Object [context])))]
-          (when-not (zero? ret)
-            (println (str "[ocl-runtime] WARNING: clReleaseContext failed with error " ret)))))
-      (when arena
-        (.close ^Arena arena))
-      (clojure.core/reset! state
-                           {:initialized? false :platform nil :device nil :context nil
-                            :queue nil :transfer-queue nil
-                            :arena nil :device-name nil :device-info nil
-                            :unified-memory? false
-                            :buffer-offset-alignment nil
-                            :programs {} :kernels {}}))))
+  (cleanup/assert-registry-mutable! state)
+  (cleanup/with-registry-use kernel-registry
+    (root/shutdown-construction! state)))
 
 (defn reset!
-  "Reset the state atom. Use with caution."
+  "Checked construction cleanup. Live reset awaits resource leases; never discard native owners."
   []
-  (let [{:keys [arena]} @state]
-    (when arena
-      (.close ^Arena arena)))
-  (clojure.core/reset! state
-                       {:initialized? false :platform nil :device nil :context nil
-                        :queue nil :transfer-queue nil
-                        :arena nil :device-name nil :device-info nil
-                        :unified-memory? false
-                        :buffer-offset-alignment nil
-                        :programs {} :kernels {}})
-  (clojure.core/reset! kernel-registry {})
-  (clojure.core/reset! kernel-dispatch-registry {}))
+  (shutdown!))
