@@ -8,6 +8,7 @@
             [raster.compiler.ir.kernel-call :as call]
             [raster.gpu.runtime-root :as root]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.runtime.display :as display]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
 
@@ -43,6 +44,25 @@
   (if @ze-probe/gpu-available?
     (run-buffer-lease-case! :ze)
     (ze-probe/gpu-skip! "canonical root buffer/view leases")))
+
+(deftest level-zero-render-buffer-has-a-balanced-canonical-allocation-lease
+  (if @ze-probe/gpu-available?
+    (do
+      ((ns-resolve 'raster.gpu.ze-runtime 'ensure-init!))
+      (let [state @(ns-resolve 'raster.gpu.ze-runtime 'state)
+            before (root/lease-count state)
+            render (display/render-buffer-gpu 2 2)]
+        (try
+          (is (= (inc before) (root/lease-count state)))
+          (is (= [0 0 0 0] (vec (:pixels render))))
+          (.set ^java.lang.foreign.MemorySegment (:seg render)
+                java.lang.foreign.ValueLayout/JAVA_INT 0 (int 42))
+          (display/sync-from-gpu! render)
+          (is (= 42 (aget ^ints (:pixels render) 0)))
+          (finally (display/close-render-buffer! render)))
+        (display/close-render-buffer! render)
+        (is (= before (root/lease-count state)))))
+    (ze-probe/gpu-skip! "canonical render pixel allocation lease")))
 
 (defn- run-prepared-lease-case!
   ([backend] (run-prepared-lease-case! backend nil))
