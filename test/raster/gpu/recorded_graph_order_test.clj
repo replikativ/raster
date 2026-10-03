@@ -6,6 +6,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.measurement :as measurement]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]))
 
 (defn- owned-phase [entry]
@@ -334,7 +335,7 @@
                              {:phase :phase-c :kernel-phase :c}]
                 :completion :unproven}
                (gpu/graph-execution-order sess :graph)))
-        (let [linked (link/map->LinkedExecutable
+        (let [linked (raster.gpu.test-lifecycle/linked-executable
                       {:plan {:id :model-plan :target :ocl:0
                               :instances [{:id :model
                                            :descriptor {:steps [{} {} {}]}}]}

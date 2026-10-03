@@ -22,6 +22,7 @@
             [raster.compiler.pipeline :as pl]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.resident-value :as resident-value]
             [raster.gpu.value :as value])
@@ -69,7 +70,7 @@
 (deftest public-output-order-is-not-limited-by-array-map-size
   (let [output-ids (mapv #(keyword (str "output-" %)) (range 12))
         resident-values (zipmap output-ids (range 12))
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:outputs output-ids}
                      :node-views resident-values
                      :closed? (atom false)})]
@@ -85,7 +86,7 @@
         dense (link-plan/value
                {:id :dense :abstract (av/tensor {:dtype :float :shape [4]})
                 :leaves [{:name :value :node :dense-node}]})
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:outputs [:data :scale :dense-node]
                             :values {:pair composite :dense dense}}
                      :node-views {:data :data-view :scale :scale-view :dense-node :dense-view}
@@ -188,7 +189,7 @@
 
 (deftest attached-close-does-not-descend-after-recording-teardown-fails
   (let [calls (atom [])
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:session ::caller-session
                      :owns-session? false
                      :graph-key :graph
@@ -211,7 +212,7 @@
 (deftest attached-close-attempts-independent-phases-but-retains-dependent-roots
   (let [calls (atom []) failure (ex-info "phase failed" {})
         secondary (ex-info "other phase failed" {})
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                      {:session ::caller-session :owns-session? false :graph-key :graph
                       :phases [:phase-0 :phase-1] :allocation-keys [:allocation]
                       :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)})]
@@ -236,7 +237,7 @@
         destination-view (bview/view destination-allocation {:dtype :float :shape [4]})
         source-view (bview/view source-allocation {:dtype :float :shape [4]})
         resident (gpu/->ResidentBufferView :session :destination-key destination-view)
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:target :ze:0
                             :nodes {:destination {:id :destination :role :input
                                                   :view destination-view}}}
@@ -340,7 +341,7 @@
                :alias (bview/view allocation {:dtype :float :shape [4]})
                :partial (bview/view allocation {:dtype :float :shape [4] :byte-offset 4})
                :untouched (bview/view allocation {:dtype :float :shape [3] :byte-offset 20})}
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :failed-transfer :target :ze:0 :outputs []
                             :nodes (into {} (map (fn [[id view]]
                                                   [id (link-plan/map->LinkNode
@@ -442,7 +443,7 @@
                              :ms 1.0}
                             {:kernel-name "prologue" :phase :unmapped :ms 0.5}]
                   :kernel-total-ms 3.5 :device-wall-ms 3.5}
-        executable (gpu-link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:instances [{:id instance-id
                                          :descriptor
                                          {:steps [{:convention :contract

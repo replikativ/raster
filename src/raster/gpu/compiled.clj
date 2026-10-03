@@ -1842,10 +1842,7 @@
   [^Compiled c]
   (let [executable (:executable c)]
     (locking (:lifetime-lock executable)
-      (if @(:closed? executable)
-        (invalidate-live-outputs! c)
-        (gpu-link/with-unleased-execution!
-         executable :compiled-close!
-         #(do (invalidate-live-outputs! c)
-              (gpu-link/close! executable))))))
+      (gpu-link/assert-closeable! executable)
+      (invalidate-live-outputs! c)
+      (gpu-link/close! executable)))
   nil)

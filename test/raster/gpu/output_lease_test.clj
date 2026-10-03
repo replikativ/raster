@@ -3,13 +3,14 @@
             [raster.compiler.ir.link-plan :as plan]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.value :as value]))
 
 (defn- executable
   ([] (executable :owned true))
   ([ownership owns-session?]
-   (link/map->LinkedExecutable
+   (raster.gpu.test-lifecycle/linked-executable
     {:plan {:id :resident-result :outputs [:out]
             :nodes {:out {:view {:allocation {:ownership ownership}}}}}
      :session (atom {}) :owns-session? owns-session? :graph-key :graph

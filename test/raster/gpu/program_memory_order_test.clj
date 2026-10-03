@@ -10,6 +10,7 @@
             [raster.compiler.passes.local-storage-reuse :as reuse]
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]
             [raster.gpu.device-probe :as opencl]
@@ -111,7 +112,7 @@
                   call {:bind! (fn [key graph _ _] {:key key :graph graph})
                         :run! #(swap! visited conj (:key %))
                         :release! (fn [_])})
-        executable (link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan linked :prepared-program prepared
                      :closed? (atom false) :pending-inputs (atom #{})})]
     (try
@@ -267,7 +268,7 @@
                   (fn [plan]
                     (swap! bindings inc)
                     (when (= failure :bind) (fail!))
-                    (let [e (link/map->LinkedExecutable {:plan plan :ordinal (count @created)})]
+                    (let [e (raster.gpu.test-lifecycle/linked-executable {:plan plan :ordinal (count @created)})]
                       (swap! created conj e)
                       e))
                   link/instantiation-report

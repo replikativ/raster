@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.storage-representation :as probe]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -11,7 +12,7 @@
 (defn- owner []
   (let [session (atom {:device-id :ocl:unit :session-id (random-uuid)
                       :buffers {} :kernel-graphs {} :events {}})
-        executable (link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :unit :outputs [:out]
                             :nodes {:out {:view {:allocation {:ownership :owned}}}}}
                      :session session :owns-session? true :closed? (atom false)

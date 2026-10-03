@@ -4,11 +4,13 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.structured-loop-call :as loop-call]
             [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]))
 
 (defn- stub-program [id released]
-  (program/map->PreparedParallelProgram
+  ((ns-resolve 'raster.gpu.parallel-program 'own-prepared)
+   (program/map->PreparedParallelProgram
    {:call {:id id :outputs {id id}
            :steps [(program-call/map->EmittedEquationCall {})]}
     :plan {:step-keys {0 id}}
@@ -16,7 +18,7 @@
     :binding-order [id]
     :run! (fn [handle] (swap! released conj [:run handle]))
     :release! (fn [handle] (swap! released conj [:release handle]))
-    :closed? (atom false)}))
+    :closed? (atom false)})))
 
 (deftest ordered-programs-bind-replay-report-and-release-together
   (let [events (atom [])
@@ -125,11 +127,12 @@
                               :run! (fn [_]
                                       (throw (ex-info "second replay failed"
                                                       {:reason :second-replay}))))
-        prepared (program/map->PreparedParallelSequence
+        prepared ((ns-resolve 'raster.gpu.parallel-program 'own-prepared)
+                  (program/map->PreparedParallelSequence
                   {:instances [{:id :first :program first-program}
                                {:id :second :program second-program}]
-                   :closed? (atom false)})
-        executable (link/map->LinkedExecutable
+                   :closed? (atom false)}))
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :two-programs}
                      :prepared-program prepared
                      :pending-inputs (atom #{})
@@ -168,7 +171,7 @@
 (deftest recorded-mixed-executable-replays-only-the-composite-graph
   (let [runs (atom [])
         prepared (stub-program :program runs)
-        executable (link/map->LinkedExecutable
+        executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :mixed} :session :session :graph-key :composite
                      :prepared-program prepared :pending-inputs (atom #{})
                      :output-ready? (atom false) :execution-state (atom {:value-epoch 0}) :completed-replays (atom 0)

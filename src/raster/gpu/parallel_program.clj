@@ -8,9 +8,11 @@
   (:require [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
-(declare release-prepared!)
+(declare release-prepared! straight-line-handles run-prepared! execution-order execution-info
+         profile-prepared!)
 
 (defrecord PreparedParallelProgram [call plan handles binding-order run! release! closed?]
   java.io.Closeable
@@ -34,6 +36,45 @@
   [value]
   (and value (= "raster.gpu.parallel_program.PreparedParallelProgram"
                 (.getName (class value)))))
+
+(defn- own-prepared
+  "Completed prepared values retain one cleanup plan across every close attempt."
+  [prepared]
+  (let [resources
+        (cond
+          (prepared-kernel-graph? prepared)
+          [{:id :graph :release #((:release! prepared) (:handle prepared))}]
+
+          (prepared-sequence? prepared)
+          (mapv (fn [{:keys [id program]}]
+                  {:id [:instance id] :release #(release-prepared! program)})
+                (rseq (:instances prepared)))
+
+          :else
+          (mapv (fn [key]
+                  {:id [:graph key] :release #((:release! prepared) (get (:handles prepared) key))})
+                (rseq (:binding-order prepared))))]
+    (assoc prepared ::cleanup/owner (cleanup/owner resources) ::active-uses (atom 0))))
+
+(defn- with-live-prepared
+  [prepared operation use!]
+  (when-not (or (prepared-parallel-program? prepared) (prepared-sequence? prepared)
+                (prepared-kernel-graph? prepared))
+    (throw (ex-info "Operation requires a prepared parallel program"
+                    {:operation operation :actual (type prepared)})))
+  (locking (:closed? prepared)
+    (when @(:closed? prepared)
+      (throw (ex-info "Prepared parallel program is closed"
+                      {:reason :parallel-program-closed :operation operation})))
+    (if-let [owner (::cleanup/owner prepared)]
+      (cleanup/assert-live! owner)
+      (throw (ex-info "Prepared program has lost its cleanup owner"
+                      {:reason :missing-cleanup-owner})))
+    (when-not (::active-uses prepared)
+      (throw (ex-info "Prepared program has lost its use-scope state"
+                      {:reason :parallel-program-use-state-missing})))
+    (swap! (::active-uses prepared) inc)
+    (try (use!) (finally (swap! (::active-uses prepared) dec)))))
 
 (defn straight-line-call?
   "Whether an emitted call has one statically ordered graph sequence. Host equations are
@@ -171,7 +212,8 @@
           (let [handle (bind! key graph buffers scalar-values)]
             (vswap! handles assoc key handle)
             (vswap! binding-order conj key)))
-        (->PreparedParallelProgram call plan @handles @binding-order run! release! (atom false))
+        (own-prepared
+         (->PreparedParallelProgram call plan @handles @binding-order run! release! (atom false)))
         (catch Throwable error
           (doseq [key (rseq @binding-order)]
             (try (release! (get @handles key)) (catch Throwable _)))
@@ -195,11 +237,11 @@
                                  (let [{:keys [graph bindings scalar-values]} call
                                        key [:parallel-program (random-uuid) id]
                                        handle ((:bind! executor) key graph bindings scalar-values)]
-                                   (->PreparedKernelGraph graph bindings handle
+                                   (own-prepared (->PreparedKernelGraph graph bindings handle
                                                           (:run! executor) (:release! executor)
-                                                          (atom false)))
+                                                          (atom false))))
                                  (prepare-with! call executor))}))
-      (->PreparedParallelSequence @prepared (atom false))
+      (own-prepared (->PreparedParallelSequence @prepared (atom false)))
       (catch Throwable error
         (doseq [{:keys [program]} (rseq @prepared)]
           (try (release-prepared! program) (catch Throwable _)))
@@ -237,7 +279,7 @@
             (visit-key! key)))))
     (persistent! @results)))
 
-(defn straight-line-handles
+(defn- straight-line-handles-unlocked
   "Return bound handles in exact source order without expanding structured control. Each entry
    carries its program step, and a prepared sequence also carries its LinkPlan instance id.
    Used only when a caller will record one command graph from the existing bound kernels."
@@ -273,7 +315,7 @@
                               (get-in prepared [:plan :step-keys step-index]))}))
             (get-in prepared [:call :steps]))))))
 
-(defn run-prepared!
+(defn- run-prepared-unlocked!
   "Replay a prepared program and return its resident output bindings.
    A sequence keys each component's outputs by its stable LinkPlan instance identity."
   [prepared]
@@ -300,7 +342,7 @@
       (visit-handles! prepared :run-prepared! (:run! prepared))
       (:outputs (:call prepared)))))
 
-(defn execution-order
+(defn- execution-order-unlocked
   "Compose selected graph orders for a straight-line prepared program, retaining source step
    indices (including skipped host equations). Structured control deliberately declines rather
    than expanding trip counts or confusing one-time preparation with repeated execution."
@@ -338,7 +380,7 @@
          (let [key (get-in prepared [:plan :step-keys step-index])]
            (graph-order (get (:handles prepared) key))))))))
 
-(defn execution-info
+(defn- execution-info-unlocked
   "Describe each distinct prepared graph binding once, in binding order. Structured-loop carry
    variants stay bounded; this is neither expanded replay order nor measured execution evidence."
   [prepared graph-info]
@@ -370,7 +412,7 @@
               {:phase key :executable (graph-info (get (:handles prepared) key))})
             (:binding-order prepared)))))
 
-(defn profile-prepared!
+(defn- profile-prepared-unlocked!
   "Replay a prepared program in exact program order through `profile-handle!` and aggregate its
    device-event intervals. Every handle callback must consume/reset one completed profiling replay;
    no host duration is substituted for device time. Repeated loop handles remain repeated samples
@@ -417,33 +459,54 @@
                                            profiles)))
                      :single-graph-span :sum-of-graph-events)}))
 
+(defn straight-line-handles
+  "Return borrowed bound handles in source order while the prepared owner is live.
+   The returned handles do not pin its lifetime after this call: keep the prepared owner alive
+   through their use, or use the run/profile callback-under-lock APIs."
+  [prepared]
+  (with-live-prepared prepared :straight-line-handles #(straight-line-handles-unlocked prepared)))
+
+(defn run-prepared!
+  "Replay the prepared program; release cannot race replay or occur reentrantly within it."
+  [prepared]
+  (with-live-prepared prepared :run-prepared! #(run-prepared-unlocked! prepared)))
+
+(defn execution-order
+  "Observe selected graph order under the prepared lifetime lock."
+  [prepared graph-order]
+  (with-live-prepared prepared :execution-order #(execution-order-unlocked prepared graph-order)))
+
+(defn execution-info
+  "Describe distinct selected bindings under the prepared lifetime lock. Any handles in the
+   returned report remain borrowed; this observation does not extend the owner's lifetime."
+  [prepared graph-info]
+  (with-live-prepared prepared :execution-info #(execution-info-unlocked prepared graph-info)))
+
+(defn profile-prepared!
+  "Replay and aggregate device-event profiles under the prepared lifetime lock."
+  [prepared profile-handle!]
+  (with-live-prepared prepared :profile-prepared! #(profile-prepared-unlocked! prepared profile-handle!)))
+
 (defn release-prepared!
-  "Release every prepared graph in reverse binding order. Idempotent."
+  "Release graphs in reverse binding order. Failed ownership stays visible on later calls;
+   successful releases are never repeated and uncertain native outcomes are not retried."
   [prepared]
   (when-not (or (prepared-parallel-program? prepared) (prepared-sequence? prepared)
                 (prepared-kernel-graph? prepared))
     (throw (ex-info "release-prepared! requires a prepared parallel program"
                     {:actual (type prepared)})))
-  (when (compare-and-set! (:closed? prepared) false true)
-    (let [failure (volatile! nil)]
-      (cond
-        (prepared-kernel-graph? prepared)
-        (try ((:release! prepared) (:handle prepared))
-             (catch Throwable error (vreset! failure error)))
-
-        (prepared-sequence? prepared)
-        (doseq [{:keys [program]} (rseq (:instances prepared))]
-          (try (release-prepared! program)
-               (catch Throwable error
-                 (when-not @failure (vreset! failure error)))))
-
-        :else
-        (doseq [key (rseq (:binding-order prepared))]
-          (try
-            ((:release! prepared) (get (:handles prepared) key))
-            (catch Throwable error
-              (when-not @failure (vreset! failure error))))))
-      (when-let [error @failure] (throw error))))
+  (locking (:closed? prepared)
+    (when-not (::cleanup/owner prepared)
+      (throw (ex-info "Prepared program has lost its cleanup owner"
+                      {:reason :missing-cleanup-owner})))
+    (when-not (::active-uses prepared)
+      (throw (ex-info "Prepared program has lost its use-scope state"
+                      {:reason :parallel-program-use-state-missing})))
+    (when (and (::active-uses prepared) (pos? @(::active-uses prepared)))
+      (throw (ex-info "Cannot release a prepared program from its active use callback"
+                      {:reason :parallel-program-in-use})))
+    (reset! (:closed? prepared) true)
+    (cleanup/release! (::cleanup/owner prepared)))
   nil)
 
 (defn run-with!

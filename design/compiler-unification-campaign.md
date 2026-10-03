@@ -1935,3 +1935,38 @@ otherwise independent private storage; it does not justify freeing possibly refe
 Scope remains explicit: public/root allocation constructors, modern graph external materialization,
 global registries, root/view/event owners and sticky linked/parallel close are separate follow-ups.
 This closes the descriptor-specific lifetime exception, not the entire memory-management campaign.
+
+#### Retained linked/parallel close
+
+Completed prepared programs, program sequences, direct prepared graphs and LinkedExecutables
+retain the common cleanup owner across close attempts. Marking a value unusable no longer hides
+failed cleanup on later calls. Successful sibling releases are not repeated; only failures
+explicitly declaring retry safety are retried. Unknown outcomes preserve their original exception
+and ownership. Attached linked teardown is recording → independent phase/program siblings → all
+dependent allocation registrations. An owned linked executable has one session-close resource,
+not a second competing resource plan for the same native children.
+
+Prepared run/profile/report operations serialize with release, and active-use depth rejects
+same-thread reentrant destruction before the closed flag changes. Linked execution scopes use
+the same principle under their existing lifetime lock; live operations require a live cleanup
+owner. Zero-depth bookkeeping is removed so it does not alter completed value-state projections.
+Returned raw handle reports remain **borrowed**, not lifetime leases: keeping an owner alive or
+using callback-under-lock run/profile APIs remains the caller's responsibility.
+
+Compiled close now performs pure close admission under the linked lifetime lock, invalidates
+projected output wrappers, and always delegates to retained linked cleanup. It no longer mistakes
+teardown for an active numerical execution scope or silently skips cleanup when the unusable flag
+is already set. Output leases, active callbacks and missing owners decline before invalidation or
+close-state mutation. This intentionally changes failed-close behavior from a later silent no-op
+to a repeated report of retained ownership; numerical surface semantics are unchanged.
+
+Fault oracles cover suppression and independent sibling attempts, nested sequences, explicitly
+retry-safe cleanup, unknown outcomes without retry, concurrent use/release, reentrant callbacks,
+owned/attached link dependency order, lease preflight and compiled output invalidation. Hand-built
+host test fixtures share an ownership-complete helper; it does not validate plans or manufacture
+native evidence. Native linked composition remains an affected numerical oracle.
+
+Construction-time partial program/link cleanup, publication/adoption of unfinished composite
+ownership, output-value destruction and public/root/view/event acquisition remain separate
+follow-ups. Completed-value close tests do not certify those acquisition paths, provider-backed
+durability, distributed fabric execution or external model training.
