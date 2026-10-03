@@ -13,6 +13,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.ocl-runtime :as ocl]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.ze-runtime :as ze]))
 
 (def ^:private abi
@@ -813,7 +814,8 @@
                (fn [_ function-name]
                  (case function-name
                    "register-kernel!" (fn [_ _])
-                   "bind-kernel-call" identity
+                   "bind-kernel-call" (fn [call & _]
+                                        (assoc call ::cleanup/owner (cleanup/owner [])))
                    (throw (ex-info "unexpected runtime resolution"
                                    {:function function-name}))))}
               #(gpu/bind-step! session step {:width width} identity))
@@ -852,7 +854,7 @@
           (case function-name
             "register-kernel!" (fn [_ _])
             "make-buffer" (fn [elements dtype] {:elements elements :dtype dtype})
-            "bind-kernel-call" (fn [call & _] {:kernel-call call})
+            "bind-kernel-call" (fn [call & _] {:kernel-call call ::cleanup/owner (cleanup/owner [])})
             "record-graph!" (fn [prepareds & _]
                               (let [recording {:prepareds (vec prepareds)}]
                                 (swap! recorded conj recording)
@@ -912,7 +914,8 @@
                                (swap! slices conj slice)
                                slice))
             "register-kernel!" (fn [& _])
-            "bind-kernel-call" (fn [call & _] {:call call})
+            "bind-kernel-call" (fn [call & _] {:call call ::cleanup/owner (cleanup/owner [])})
+            "free-buffer!" #(swap! freed conj %)
             (throw (ex-info "unexpected runtime resolution" {:name name}))))
         soft-resolver
         (fn [_ name]
