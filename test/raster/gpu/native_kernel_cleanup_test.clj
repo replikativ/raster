@@ -58,6 +58,9 @@
                   (ze/destroy-graph! result)
                   (let [before @calls]
                     (ze/destroy-graph! result)
+                    (is (= before @calls))
+                    (doseq [operation [ze/submit-graph! ze/reset-graph-events! ze/read-graph-timestamps!]]
+                      (is (= :owner-releasing (:reason (ex-data (error-of #(operation result)))))))
                     (is (= before @calls)))
                   (is (= ["zeCommandListDestroy" "zeEventDestroy" "zeEventPoolDestroy"
                           "zeCommandQueueDestroy"] (filterv release? @calls)))
