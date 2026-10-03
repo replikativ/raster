@@ -39,22 +39,24 @@
 
 (defn- own-prepared
   "Completed prepared values retain one cleanup plan across every close attempt."
-  [prepared]
-  (let [resources
-        (cond
-          (prepared-kernel-graph? prepared)
-          [{:id :graph :release #((:release! prepared) (:handle prepared))}]
+  ([prepared]
+   (let [resources
+         (cond
+           (prepared-kernel-graph? prepared)
+           [{:id :graph :release #((:release! prepared) (:handle prepared))}]
 
-          (prepared-sequence? prepared)
-          (mapv (fn [{:keys [id program]}]
-                  {:id [:instance id] :release #(release-prepared! program)})
-                (rseq (:instances prepared)))
+           (prepared-sequence? prepared)
+           (mapv (fn [{:keys [id program]}]
+                   {:id [:instance id] :release #(release-prepared! program)})
+                 (rseq (:instances prepared)))
 
-          :else
-          (mapv (fn [key]
-                  {:id [:graph key] :release #((:release! prepared) (get (:handles prepared) key))})
-                (rseq (:binding-order prepared))))]
-    (assoc prepared ::cleanup/owner (cleanup/owner resources) ::active-uses (volatile! 0))))
+           :else
+           (mapv (fn [key]
+                   {:id [:graph key] :release #((:release! prepared) (get (:handles prepared) key))})
+                 (rseq (:binding-order prepared))))]
+     (own-prepared prepared (cleanup/owner resources))))
+  ([prepared owner]
+   (assoc prepared ::cleanup/owner owner ::active-uses (volatile! 0))))
 
 (defn- with-live-prepared
   [prepared operation use!]
@@ -171,10 +173,39 @@
   (let [call (program-call/validate! call)]
     (:entries (preparation-plan call execution-id))))
 
+(defn- validate-executor! [executor]
+  (doseq [operation [:bind! :run! :release!]]
+    (when-not (ifn? (get executor operation))
+      (throw (ex-info "parallel program executor requires callable operations"
+                      {:reason :parallel-program-executor
+                       :operation operation :executor executor}))))
+  (when (and (:adopt-cleanup! executor) (not (fn? (:adopt-cleanup! executor))))
+    (throw (ex-info "parallel program cleanup adoption requires a function"
+                    {:reason :parallel-program-executor :operation :adopt-cleanup!})))
+  executor)
+
+(defn- prepare-graph-with! [id call executor]
+  (let [{:keys [graph bindings scalar-values]} call
+        key [:parallel-program (random-uuid) id]
+        handle (volatile! {})
+        owner (cleanup/owner [{:id :graph
+                               :release #(when (contains? @handle :value)
+                                           ((:release! executor) (:value @handle)))}])]
+    (cleanup/build!
+     owner
+     (fn []
+       (vreset! handle {:value ((:bind! executor) key graph bindings scalar-values)})
+       (own-prepared (->PreparedKernelGraph graph bindings (:value @handle)
+                                            (:run! executor) (:release! executor) (atom false))
+                     owner))
+     (:adopt-cleanup! executor))))
+
 (defn prepare-with!
   "Bind every distinct graph/carry variant once and return a reusable prepared program.
 
-   Preparation is transactional: a failed binding releases all earlier handles in reverse order.
+   A failed binding attempts earlier handle releases in reverse order. Failed cleanup remains
+   owned: executor :adopt-cleanup! receives the owner, or the exception retains ::cleanup/unresolved.
+   The executor must retain any native acquisition that throws before returning a handle.
    `run-prepared!` streams loop replay from the bounded binding table, so preparation remains
    constant in the loop trip count. Calls with logical result views additionally require the
    executor's `:buffer-view` resolver from a buffer token to its checked live BufferView; exact
@@ -199,29 +230,32 @@
         (when-not (bview/prefix-view? base view)
           (throw (ex-info "runtime result view is not a prefix of its physical destination"
                           {:reason :parallel-program-result-view :result result :physical physical})))))
-    (doseq [[operation function] [[:bind! bind!] [:run! run!] [:release! release!]]]
-      (when-not (ifn? function)
-        (throw (ex-info "parallel program executor requires callable operations"
-                        {:reason :parallel-program-executor
-                         :operation operation :executor executor}))))
+    (validate-executor! executor)
     (let [handles (volatile! {})
           binding-order (volatile! [])
-          plan (preparation-plan call (random-uuid))]
-      (try
-        (doseq [{:keys [key graph buffers scalar-values]} (:entries plan)]
-          (let [handle (bind! key graph buffers scalar-values)]
-            (vswap! handles assoc key handle)
-            (vswap! binding-order conj key)))
-        (own-prepared
-         (->PreparedParallelProgram call plan @handles @binding-order run! release! (atom false)))
-        (catch Throwable error
-          (doseq [key (rseq @binding-order)]
-            (try (release! (get @handles key)) (catch Throwable _)))
-          (throw error))))))
+          plan (preparation-plan call (random-uuid))
+          owner (cleanup/owner
+                 (mapv (fn [{:keys [key]}]
+                         {:id [:graph key]
+                          :release #(when (contains? @handles key)
+                                      (release! (get @handles key)))})
+                       (rseq (:entries plan))))]
+      (cleanup/build!
+       owner
+       (fn []
+         (doseq [{:keys [key graph buffers scalar-values]} (:entries plan)]
+           (let [handle (bind! key graph buffers scalar-values)]
+             (vswap! handles assoc key handle)
+             (vswap! binding-order conj key)))
+         (own-prepared
+          (->PreparedParallelProgram call plan @handles @binding-order run! release! (atom false))
+          owner))
+       (:adopt-cleanup! executor)))))
 
 (defn prepare-sequence-with!
   "Prepare ordered emitted programs and direct graphs over one shared resident binding.
-   A later binding failure releases all earlier programs before their storage is freed."
+   A later binding failure attempts earlier program cleanup before their storage may be freed.
+   Unresolved cleanup is adopted through the executor or retained on the thrown exception."
   [instances executor]
   (when-not (and (vector? instances) (seq instances)
                  (every? #(and (contains? % :id) (contains? % :call)
@@ -229,23 +263,26 @@
                  (= (count instances) (count (distinct (map :id instances)))))
     (throw (ex-info "prepared sequence requires unique ordered instance calls"
                     {:reason :parallel-program-sequence-instances})))
-  (let [prepared (volatile! [])]
-    (try
-      (doseq [{:keys [id call kind]} instances]
-        (vswap! prepared conj {:id id :program
-                               (if (= :graph kind)
-                                 (let [{:keys [graph bindings scalar-values]} call
-                                       key [:parallel-program (random-uuid) id]
-                                       handle ((:bind! executor) key graph bindings scalar-values)]
-                                   (own-prepared (->PreparedKernelGraph graph bindings handle
-                                                          (:run! executor) (:release! executor)
-                                                          (atom false))))
-                                 (prepare-with! call executor))}))
-      (own-prepared (->PreparedParallelSequence @prepared (atom false)))
-      (catch Throwable error
-        (doseq [{:keys [program]} (rseq @prepared)]
-          (try (release-prepared! program) (catch Throwable _)))
-        (throw error)))))
+  (validate-executor! executor)
+  (let [prepared (volatile! [])
+        owner (cleanup/owner
+               (mapv (fn [{:keys [id]}]
+                       {:id [:instance id]
+                        :release #(when-let [program (some (fn [instance]
+                                                             (when (= id (:id instance))
+                                                               (:program instance))) @prepared)]
+                                    (release-prepared! program))})
+                     (rseq instances)))]
+    (cleanup/build!
+     owner
+     (fn []
+       (doseq [{:keys [id call kind]} instances]
+         (vswap! prepared conj {:id id :program
+                                (if (= :graph kind)
+                                  (prepare-graph-with! id call executor)
+                                  (prepare-with! call executor))}))
+       (own-prepared (->PreparedParallelSequence @prepared (atom false)) owner))
+     (:adopt-cleanup! executor))))
 
 (defn- visit-handles!
   [prepared operation visit!]

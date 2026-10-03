@@ -116,7 +116,9 @@
     (catch Throwable primary
       (try (release! cleanup)
            (catch Throwable secondary
-             (when-not (identical? primary secondary) (.addSuppressed primary secondary))))
+             (when-not (or (identical? primary secondary)
+                           (some #(identical? secondary %) (.getSuppressed ^Throwable primary)))
+               (.addSuppressed primary secondary))))
       (when (seq (pending cleanup))
         (let [fallback #(ex-info "Native construction retains unresolved cleanup ownership"
                                  {::unresolved cleanup} primary)]

@@ -2,9 +2,11 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
             [raster.nn :as nn]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.analysis.physical-liveness :as liveness]
             [raster.compiler.ir.link-plan :as plan]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.passes.local-storage-reuse :as reuse]
@@ -13,6 +15,7 @@
             [raster.gpu.test-lifecycle]
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as device]))
 
@@ -30,6 +33,57 @@
 
 (defn- lowered [target args]
   (equation/lower (equation/compile #'four-layers {:target target :dtype :double}) args))
+
+(deftest real-typed-program-bind-failure-retains-dependent-link-roots
+  (doseq [owns? [false true]]
+    (let [linked (lowered :ocl:0 (arguments))
+          primary (ex-info "third graph bind failed" {}) secondary (ex-info "second graph uncertain" {})
+          binds (atom 0) released (atom []) native-frees (atom [])
+          sess (atom {:device-id :ocl:0 :session-id (random-uuid) :buffers {} :allocations {}
+                      :prepared {} :kernel-graphs {} :graphs {} :events {}})]
+    ;; Keep the actual equation lowering, LinkPlan validation, program staging, runtime views
+    ;; and cleanup/adoption. Only native allocation, upload and bind/release are fault doubles.
+      (with-redefs [gpu/make-session (fn [_] sess)
+                    gpu/alloc!
+                    (fn [session specs]
+                      (doseq [[key [dt n _ opts]] specs]
+                        (let [bytes (* n (dtype/bytes-of dt))
+                              allocation (bview/allocation
+                                          (merge {:id (:allocation-id opts) :device :ocl:0
+                                                  :byte-size bytes :ownership :owned}
+                                                 (select-keys opts [:memory-space :coherence :alignment])))]
+                          (swap! session #(-> %
+                                              (assoc-in [:buffers key] {:dtype dt :n-elements n :byte-size bytes})
+                                              (assoc-in [:allocations key] allocation))))))
+                    gpu/upload-range! (fn [& _])
+                    gpu/bind-kernel-graph! (fn [& _] (let [n (swap! binds inc)]
+                                                       (if (= 3 n) (throw primary) n)))
+                    gpu/release-kernel-graph! (fn [_ handle] (swap! released conj handle)
+                                                (when (= 2 handle) (throw secondary)))]
+        (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve)
+                         (fn [_ name]
+                           (when-not (= "free-buffer!" name)
+                             (throw (ex-info "unexpected native contact" {:name name})))
+                           #(swap! native-frees conj %))}
+          (fn []
+            (let [error (try (link/instantiate! linked (if owns? {} {:session sess}))
+                             (catch Throwable e e))]
+              (is (identical? primary (if owns? (.getCause error) error)))
+              (when owns?
+                (is (= [:session] (cleanup/pending (::cleanup/unresolved (ex-data error)))))))
+            (is (= 3 @binds))
+            (is (= [2 1] @released))
+            (is (= 1 (count (filter #(identical? secondary %) (.getSuppressed primary)))))
+            (is (= 1 (count (:prepared @sess))))
+            (is (seq (:buffers @sess)))
+            (doseq [key (keys (:buffers @sess))]
+              (is (= :prepared-buffer-retained
+                     (try (gpu/free-buffer! sess key)
+                          (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+            (is (empty? @native-frees))
+            (is (identical? secondary (try (gpu/close-session! sess) (catch Throwable e e))))
+            (is (= [2 1] @released))
+            (is (empty? @native-frees))))))))
 
 (defn- assert-candidate [linked order]
   (let [report (liveness/report linked order)

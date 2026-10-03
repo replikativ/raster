@@ -1967,7 +1967,25 @@ owned/attached link dependency order, lease preflight and compiled output invali
 host test fixtures share an ownership-complete helper; it does not validate plans or manufacture
 native evidence. Native linked composition remains an affected numerical oracle.
 
-Construction-time partial program/link cleanup, publication/adoption of unfinished composite
-ownership, output-value destruction and public/root/view/event acquisition remain separate
-follow-ups. Completed-value close tests do not certify those acquisition paths, provider-backed
-durability, distributed fabric execution or external model training.
+Generic program/sequence staging now reserves the common
+cleanup plan before binding and retains failed rollback via executor `:adopt-cleanup!` or the
+existing `::resource-cleanup/unresolved` exception contract. Only successfully returned handles
+enter that plan; an executor must retain indeterminate native acquisition that throws before
+returning. Direct-graph sequence executors are admitted before acquisition, and their handle
+slots/owners are reserved before binding. Completed values retain the exact construction owner.
+
+Link program cleanup debt is adopted into the existing session prepared layer with a conservative
+registered-root footprint. Original and late alias roots remain pinned. Session teardown treats
+prepared programs and kernel graphs as distinct dependency layers, so parent failure cannot
+trigger a second child retry in the same close. An adopted program owner contains binding
+destruction only: session root allocations stay session-owned and are not freed twice against
+the session's close snapshot. Owned Link construction reserves one session owner before target
+and external-binding admission; unresolved close keeps that owner (and session) reachable on
+the ordinary unresolved-cleanup exception. Successful construction retains that same owner.
+
+Fault oracles cover independent siblings, sticky child failures, direct-graph wrapper failure,
+owned admission/close failure and a real typed equation-program Link binding failure with both
+attached and owned sessions. The last uses production lowering/validation/staging/views/adoption
+and substitutes only native allocation/upload/bind/release. These checks do not certify all
+public/root/view/event acquisition, output-value destruction, provider-backed durability,
+distributed fabric execution or external model training, which remain explicit follow-ups.

@@ -41,27 +41,29 @@
   (and x (= "raster.gpu.link.LinkedExecutable" (.getName (class x)))))
 
 (defn- own-linked-executable
-  [executable]
-  (let [{:keys [session owns-session? graph-key phases prepared-program allocation-keys]} executable
-        recording (if graph-key #{:recording} #{})
-        phase-ids (set (map #(vector :phase %) phases))
-        program (if prepared-program #{:program} #{})
-        resources
-        (if owns-session?
-          [{:id :session :release #(gpu/close-session! session)}]
-          (vec (concat
-                (when graph-key
-                  [{:id :recording :release #(gpu/release-recorded-graph! session graph-key)}])
-                (map (fn [phase]
-                       {:id [:phase phase] :after recording
-                        :release #(gpu/release-prepared! session phase)}) (reverse phases))
-                (when prepared-program
-                  [{:id :program :after recording
-                    :release #(parallel-program/release-prepared! prepared-program)}])
-                (map (fn [key]
-                       {:id [:allocation key] :after (into (into recording phase-ids) program)
-                        :release #(gpu/free-buffer! session key)}) (reverse allocation-keys)))))]
-    (assoc executable ::cleanup/owner (cleanup/owner resources) ::active-uses (volatile! 0))))
+  ([executable]
+   (let [{:keys [session owns-session? graph-key phases prepared-program allocation-keys]} executable
+         recording (if graph-key #{:recording} #{})
+         phase-ids (set (map #(vector :phase %) phases))
+         program (if prepared-program #{:program} #{})
+         resources
+         (if owns-session?
+           [{:id :session :release #(gpu/close-session! session)}]
+           (vec (concat
+                 (when graph-key
+                   [{:id :recording :release #(gpu/release-recorded-graph! session graph-key)}])
+                 (map (fn [phase]
+                        {:id [:phase phase] :after recording
+                         :release #(gpu/release-prepared! session phase)}) (reverse phases))
+                 (when prepared-program
+                   [{:id :program :after recording
+                     :release #(parallel-program/release-prepared! prepared-program)}])
+                 (map (fn [key]
+                        {:id [:allocation key] :after (into (into recording phase-ids) program)
+                         :release #(gpu/free-buffer! session key)}) (reverse allocation-keys)))))]
+     (own-linked-executable executable (cleanup/owner resources))))
+  ([executable owner]
+   (assoc executable ::cleanup/owner owner ::active-uses (volatile! 0))))
 
 (defn instantiation-report
   "Return compact host-monotonic phase timings for construction of a linked executable. Binding
@@ -207,7 +209,7 @@
                                        program-instances))
          _ (when mixed?
              (doseq [instance program-instances
-                  :when (and (link-plan/program-link-instance? instance)
+                     :when (and (link-plan/program-link-instance? instance)
                                 (not (parallel-program/straight-line-call? (:call instance))))]
                (throw (ex-info
                        "mixed descriptor/program recording requires static emitted graph order"
@@ -215,12 +217,6 @@
                         :instance (:id instance)}))))
          target (:target plan)
          owns-session? (nil? session)
-         session (timed-phase! timings :session-setup #(or session (gpu/make-session target)))
-         _ (when-not (= target (:device-id @session))
-             (when owns-session? (gpu/close-session! session))
-             (throw (ex-info "link plan target differs from its runtime session"
-                             {:reason :link-session-target :target target
-                              :session-device (:device-id @session)})))
          execution-id (random-uuid)
          groups (allocation-groups plan)
          external-ids
@@ -234,189 +230,209 @@
          allocation-keys (volatile! [])
          phases (volatile! [])
          prepared-program (volatile! nil)
-         recorded-key (volatile! nil)]
-     (when-not (= external-ids supplied-external-ids)
-       (when owns-session? (gpu/close-session! session))
-       (throw (ex-info "external buffer bindings differ from the LinkPlan ownership contract"
-                       {:reason :link-external-bindings :expected external-ids
-                        :actual supplied-external-ids
-                        :missing (set/difference external-ids supplied-external-ids)
-                        :extra (set/difference supplied-external-ids external-ids)})))
-     (try
-       (let [key-by-allocation
-             (into {}
-                   (map (fn [[allocation-id _]]
-                          [allocation-id (allocation-key execution-id allocation-id)]))
-                   groups)
-             owned-specs
-             (into {}
-                   (keep (fn [[allocation-id nodes]]
-                           (when (= :owned (get-in (first nodes) [:view :allocation :ownership]))
-                             [(get key-by-allocation allocation-id) (allocation-spec nodes)])))
-                   groups)]
-         (when (seq owned-specs)
-           (timed-phase! timings :allocation #(gpu/alloc! session owned-specs))
-           (vswap! allocation-keys into (keys owned-specs)))
-         (timed-phase!
-          timings :external-buffer-registration
-          #(doseq [[allocation-id nodes] groups
-                   :let [allocation (get-in (first nodes) [:view :allocation])
-                         ownership (:ownership allocation)]
-                   :when (contains? #{:borrowed :external} ownership)]
-             (let [key (get key-by-allocation allocation-id)]
-               (gpu/register-buffer! session key (get external-buffers allocation-id)
-                                     {:ownership ownership
-                                      :allocation-id allocation-id
-                                      :memory-space (:memory-space allocation)
-                                      :coherence (:coherence allocation)
-                                      :alignment (:alignment allocation)})
-               (vswap! allocation-keys conj key))))
-         (let [node-views
-               (timed-phase!
-                timings :view-materialization
-                #(into {}
-                       (map (fn [[node-id {:keys [view]}]]
-                              [node-id
-                               (gpu/buffer-view
-                                session (get key-by-allocation (get-in view [:allocation :id]))
-                                {:id (:id view) :byte-offset (:byte-offset view)
-                                 :dtype (:dtype view) :shape (:shape view)
-                                 :strides (:strides view)})]))
-                       (:nodes plan)))]
-           (timed-phase!
-            timings :initial-upload
-            #(doseq [[node-id {:keys [source view]}] (:nodes plan)
-                     :when source]
-               (gpu/upload-range! session (get node-views node-id) source
-                                  {:elements (reduce * 1 (:shape view))})))
-           (when (seq program-instances)
-             (vreset!
-              prepared-program
-              (timed-phase!
-               timings :binding
-               (fn []
-                 (let [executor {:buffer-view (fn [value-id]
-                                                (:view (resident-link-value plan node-views value-id)))
-                                 :bind! (fn [key graph buffers scalars]
-                                          (let [resident-buffers
-                                                (into {}
-                                                      (map (fn [[compiler-value value-id]]
-                                                             [compiler-value
-                                                              (resident-link-value plan node-views value-id)]))
-                                                      buffers)
-                                                extent-scalars
-                                                (into {}
-                                                      (keep (fn [[compiler-value resident]]
-                                                              (when-let [extent (first (get-in resident [:view :shape]))]
-                                                                [(list 'extent compiler-value)
-                                                                 {:type :long :value extent}])))
-                                                      resident-buffers)]
-                                            (gpu/bind-kernel-graph!
-                                             session [::program-graph execution-id key] graph
-                                             resident-buffers (merge extent-scalars scalars)
-                                             {:profile? profile?
-                                              :record? (not static-programs?)})))
-                                 :run! #(gpu/run-kernel-graph! session %)
-                                 :release! #(gpu/release-kernel-graph! session %)}]
-                   (if (and (not mixed?) (= 1 (count program-instances))
-                            (link-plan/program-link-instance? (first program-instances)))
-                     (parallel-program/prepare-with! (:call (first program-instances)) executor)
-                     (parallel-program/prepare-sequence-with!
-                      (mapv (fn [instance]
-                              {:id (:id instance)
-                               :kind (if (link-plan/graph-link-instance? instance)
-                                       :graph :program)
-                               :call (if (link-plan/graph-link-instance? instance)
-                                       (select-keys instance [:graph :bindings :scalar-values])
-                                       (:call instance))})
-                            program-instances)
-                      executor)))))))
-           (when (or static-programs? (empty? program-instances))
-               (timed-phase!
-                timings :binding
-                (fn [] (doseq [instance (:instances plan)
-                               [step-index step]
-                               (map-indexed vector (get-in instance [:descriptor :steps]))]
-                         (let [phase (phase-key execution-id (:id instance) step-index)
-                               bindings (:bindings instance)]
-                           (gpu/bind-step!
-                            session (assoc step :phase phase) (link-plan/instance-arguments instance)
-                            (fn [symbol]
-                              (let [value-id (get bindings symbol)]
-                                (try (resident-link-value plan node-views value-id)
-                                     (catch clojure.lang.ExceptionInfo error
-                                       (throw (ex-info (.getMessage error)
-                                                       (assoc (ex-data error)
-                                                              :instance (:id instance) :symbol symbol)
-                                                       error))))))
-                            {:schedule (or (:schedule instance)
-                                           (get-in instance [:descriptor :schedule]))
+         recorded-key (volatile! nil)
+         session (timed-phase! timings :session-setup #(or session (gpu/make-session target)))
+         session-owner (when owns-session?
+                         (cleanup/owner [{:id :session :release #(gpu/close-session! session)}]))]
+     (let [build
+           (fn []
+             (when-not (= target (:device-id @session))
+               (throw (ex-info "link plan target differs from its runtime session"
+                               {:reason :link-session-target :target target
+                                :session-device (:device-id @session)})))
+             (when-not (= external-ids supplied-external-ids)
+               (throw (ex-info "external buffer bindings differ from the LinkPlan ownership contract"
+                               {:reason :link-external-bindings :expected external-ids
+                                :actual supplied-external-ids
+                                :missing (set/difference external-ids supplied-external-ids)
+                                :extra (set/difference supplied-external-ids external-ids)})))
+             (try
+               (let [key-by-allocation
+                     (into {}
+                           (map (fn [[allocation-id _]]
+                                  [allocation-id (allocation-key execution-id allocation-id)]))
+                           groups)
+                     owned-specs
+                     (into {}
+                           (keep (fn [[allocation-id nodes]]
+                                   (when (= :owned (get-in (first nodes) [:view :allocation :ownership]))
+                                     [(get key-by-allocation allocation-id) (allocation-spec nodes)])))
+                           groups)]
+                 (when (seq owned-specs)
+                   (timed-phase! timings :allocation #(gpu/alloc! session owned-specs))
+                   (vswap! allocation-keys into (keys owned-specs)))
+                 (timed-phase!
+                  timings :external-buffer-registration
+                  #(doseq [[allocation-id nodes] groups
+                           :let [allocation (get-in (first nodes) [:view :allocation])
+                                 ownership (:ownership allocation)]
+                           :when (contains? #{:borrowed :external} ownership)]
+                     (let [key (get key-by-allocation allocation-id)]
+                       (gpu/register-buffer! session key (get external-buffers allocation-id)
+                                             {:ownership ownership
+                                              :allocation-id allocation-id
+                                              :memory-space (:memory-space allocation)
+                                              :coherence (:coherence allocation)
+                                              :alignment (:alignment allocation)})
+                       (vswap! allocation-keys conj key))))
+                 (let [node-views
+                       (timed-phase!
+                        timings :view-materialization
+                        #(into {}
+                               (map (fn [[node-id {:keys [view]}]]
+                                      [node-id
+                                       (gpu/buffer-view
+                                        session (get key-by-allocation (get-in view [:allocation :id]))
+                                        {:id (:id view) :byte-offset (:byte-offset view)
+                                         :dtype (:dtype view) :shape (:shape view)
+                                         :strides (:strides view)})]))
+                               (:nodes plan)))]
+                   (timed-phase!
+                    timings :initial-upload
+                    #(doseq [[node-id {:keys [source view]}] (:nodes plan)
+                             :when source]
+                       (gpu/upload-range! session (get node-views node-id) source
+                                          {:elements (reduce * 1 (:shape view))})))
+                   (when (seq program-instances)
+                     (vreset!
+                      prepared-program
+                      (timed-phase!
+                       timings :binding
+                       (fn []
+                         (let [executor {:buffer-view (fn [value-id]
+                                                        (:view (resident-link-value plan node-views value-id)))
+                                         :bind! (fn [key graph buffers scalars]
+                                                  (let [resident-buffers
+                                                        (into {}
+                                                              (map (fn [[compiler-value value-id]]
+                                                                     [compiler-value
+                                                                      (resident-link-value plan node-views value-id)]))
+                                                              buffers)
+                                                        extent-scalars
+                                                        (into {}
+                                                              (keep (fn [[compiler-value resident]]
+                                                                      (when-let [extent (first (get-in resident [:view :shape]))]
+                                                                        [(list 'extent compiler-value)
+                                                                         {:type :long :value extent}])))
+                                                              resident-buffers)]
+                                                    (gpu/bind-kernel-graph!
+                                                     session [::program-graph execution-id key] graph
+                                                     resident-buffers (merge extent-scalars scalars)
+                                                     {:profile? profile?
+                                                      :record? (not static-programs?)})))
+                                         :adopt-cleanup! #(gpu/retain-program-cleanup!
+                                                           session % @allocation-keys)
+                                         :run! #(gpu/run-kernel-graph! session %)
+                                         :release! #(gpu/release-kernel-graph! session %)}]
+                           (if (and (not mixed?) (= 1 (count program-instances))
+                                    (link-plan/program-link-instance? (first program-instances)))
+                             (parallel-program/prepare-with! (:call (first program-instances)) executor)
+                             (parallel-program/prepare-sequence-with!
+                              (mapv (fn [instance]
+                                      {:id (:id instance)
+                                       :kind (if (link-plan/graph-link-instance? instance)
+                                               :graph :program)
+                                       :call (if (link-plan/graph-link-instance? instance)
+                                               (select-keys instance [:graph :bindings :scalar-values])
+                                               (:call instance))})
+                                    program-instances)
+                              executor)))))))
+                   (when (or static-programs? (empty? program-instances))
+                     (timed-phase!
+                      timings :binding
+                      (fn [] (doseq [instance (:instances plan)
+                                     [step-index step]
+                                     (map-indexed vector (get-in instance [:descriptor :steps]))]
+                               (let [phase (phase-key execution-id (:id instance) step-index)
+                                     bindings (:bindings instance)]
+                                 (gpu/bind-step!
+                                  session (assoc step :phase phase) (link-plan/instance-arguments instance)
+                                  (fn [symbol]
+                                    (let [value-id (get bindings symbol)]
+                                      (try (resident-link-value plan node-views value-id)
+                                           (catch clojure.lang.ExceptionInfo error
+                                             (throw (ex-info (.getMessage error)
+                                                             (assoc (ex-data error)
+                                                                    :instance (:id instance) :symbol symbol)
+                                                             error))))))
+                                  {:schedule (or (:schedule instance)
+                                                 (get-in instance [:descriptor :schedule]))
                      ;; Constant transforms may execute while recording, before run!'s input
                      ;; gate. Only captured, locally unwritten values can enter that prologue.
-                             :roles (instance-runtime-roles plan instance initialization)})
-                           (vswap! phases conj phase)))))
-               (let [gkey (graph-key execution-id)
-                     handles-by-instance
-                     (when static-programs?
-                       (group-by :instance
-                                 (ordered-program-handles @prepared-program program-instances)))
-                     sources
-                     (when static-programs?
-                       (vec
-                        (mapcat
-                         (fn [instance]
-                           (if (link-plan/link-instance? instance)
-                             (map-indexed
-                              (fn [step-index _]
-                                {:kind :phase
-                                 :phase (phase-key execution-id (:id instance) step-index)})
-                              (get-in instance [:descriptor :steps]))
-                             (map (fn [{:keys [handle]}]
-                                    {:kind :graph :handle handle})
-                                  (get handles-by-instance (:id instance)))))
-                         (:instances plan))))]
-                 (timed-phase! timings :graph-recording
-                               #(if static-programs?
-                                  (gpu/record-bound-sequence! session sources gkey
-                                                              {:profile? profile?})
-                                  (gpu/record-graph! session @phases gkey {:profile? profile?})))
-                 (vreset! recorded-key gkey)))
-           (own-linked-executable
-            (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
-                               @allocation-keys node-views
-                               {:timing-source :host-monotonic
-                                :validation-source (if retained-evidence
-                                                     :sealed-prepared :rederived)
-                                :total-ns (- (System/nanoTime) instantiation-started)
-                                :phases-ns @timings
-                                :owned-allocations (count owned-specs)
-                                :nodes (count (:nodes plan))
-                                :instances (count (:instances plan))
-                                :bound-phases (count @phases)}
-                               (atom (into #{}
-                                           (keep (fn [[node-id {:keys [view]}]]
-                                                   (when (and (contains? (:requires initialization)
-                                                                         node-id)
-                                                              (= :owned (get-in view
-                                                                                [:allocation
-                                                                                 :ownership])))
-                                                     node-id)))
-                                           (:nodes plan)))
-                               (atom #{})
-                               (boolean profile?)
-                               (atom false)
-                               (Object.)
-                               (atom 0)
-                               (atom 0)
-                               (atom false)
-                               (atom {:value-epoch 0})))))
-       (catch Throwable error
-         (if owns-session?
-           (try (gpu/close-session! session) (catch Throwable _))
-           (try (cleanup-attached! session @recorded-key @phases @prepared-program
-                                   @allocation-keys)
-                (catch Throwable _)))
-         (throw error))))))
+                                   :roles (instance-runtime-roles plan instance initialization)})
+                                 (vswap! phases conj phase)))))
+                     (let [gkey (graph-key execution-id)
+                           handles-by-instance
+                           (when static-programs?
+                             (group-by :instance
+                                       (ordered-program-handles @prepared-program program-instances)))
+                           sources
+                           (when static-programs?
+                             (vec
+                              (mapcat
+                               (fn [instance]
+                                 (if (link-plan/link-instance? instance)
+                                   (map-indexed
+                                    (fn [step-index _]
+                                      {:kind :phase
+                                       :phase (phase-key execution-id (:id instance) step-index)})
+                                    (get-in instance [:descriptor :steps]))
+                                   (map (fn [{:keys [handle]}]
+                                          {:kind :graph :handle handle})
+                                        (get handles-by-instance (:id instance)))))
+                               (:instances plan))))]
+                       (timed-phase! timings :graph-recording
+                                     #(if static-programs?
+                                        (gpu/record-bound-sequence! session sources gkey
+                                                                    {:profile? profile?})
+                                        (gpu/record-graph! session @phases gkey {:profile? profile?})))
+                       (vreset! recorded-key gkey)))
+                   ((if session-owner #(own-linked-executable % session-owner) own-linked-executable)
+                    (->LinkedExecutable plan session owns-session? @recorded-key @phases @prepared-program
+                                        @allocation-keys node-views
+                                        {:timing-source :host-monotonic
+                                         :validation-source (if retained-evidence
+                                                              :sealed-prepared :rederived)
+                                         :total-ns (- (System/nanoTime) instantiation-started)
+                                         :phases-ns @timings
+                                         :owned-allocations (count owned-specs)
+                                         :nodes (count (:nodes plan))
+                                         :instances (count (:instances plan))
+                                         :bound-phases (count @phases)}
+                                        (atom (into #{}
+                                                    (keep (fn [[node-id {:keys [view]}]]
+                                                            (when (and (contains? (:requires initialization)
+                                                                                  node-id)
+                                                                       (= :owned (get-in view
+                                                                                         [:allocation
+                                                                                          :ownership])))
+                                                              node-id)))
+                                                    (:nodes plan)))
+                                        (atom #{})
+                                        (boolean profile?)
+                                        (atom false)
+                                        (Object.)
+                                        (atom 0)
+                                        (atom 0)
+                                        (atom false)
+                                        (atom {:value-epoch 0})))))
+               (catch Throwable error
+                 (when-not owns-session?
+                   (do
+                     (try (cleanup-attached! session @recorded-key @phases @prepared-program
+                                             @allocation-keys)
+                          (catch Throwable secondary
+                            (when-not (identical? error secondary) (.addSuppressed error secondary))))
+                     (when-let [owner (some-> @prepared-program ::cleanup/owner)]
+                       (when (seq (cleanup/pending owner))
+                         (try (gpu/retain-program-cleanup! session owner @allocation-keys)
+                              (catch Throwable secondary
+                                (when-not (identical? error secondary)
+                                  (.addSuppressed error secondary))))))))
+                 (throw error))))]
+       (if session-owner
+         (cleanup/build! session-owner build nil)
+         (build))))))
 
 (defn ^:no-doc instantiate-certified!
   "Instantiate an exact in-process certified lowering whose enclosing Prepared identity was
