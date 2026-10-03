@@ -118,3 +118,52 @@
       (is (= 1 @calls))
       (is (empty? (cleanup/pending owner)))
       (finally (deliver proceed true)))))
+
+(deftest acquisition-rollback-retains-primary-and-uses-explicit-adoption
+  (doseq [primary [(ex-info "build failed" {})
+                   (proxy [RuntimeException] ["suppression disabled" nil false false])
+                   (AssertionError. "build failed")]]
+    (let [adopted (atom []) released (atom [])
+          native-fault (ex-info "destroy outcome unknown" {})
+          result (error-of #(cleanup/construct!
+                             :kernel (constantly :native)
+                             (fn [handle] (swap! released conj handle) (throw native-fault))
+                             (fn [_ _] (throw primary))
+                             (fn [owner] (swap! adopted conj owner))))]
+      (is (identical? primary result))
+      (is (= [:native] @released))
+      (is (= 1 (count @adopted)))
+      (is (= [:kernel] (cleanup/pending (first @adopted))))
+      (is (identical? native-fault (error-of #(cleanup/release! (first @adopted)))))
+      (is (= [:native] @released)))))
+
+(deftest raw-call-and-failed-adoption-retain-owner-with-original-cause
+  (doseq [sink [nil (fn [_] (throw (ex-info "sink failed" {})))]]
+    (let [primary (ex-info "build failed" {})
+          result (error-of #(cleanup/construct!
+                             :kernel (constantly :native)
+                             (fn [_] (throw (ex-info "release failed" {})))
+                             (fn [_ _] (throw primary)) sink))]
+      (is (identical? primary (.getCause result)))
+      (is (= [:kernel] (cleanup/pending (::cleanup/unresolved (ex-data result))))))))
+
+(deftest acquisition-success-and-early-failure-do-not-lose-or-double-release
+  (let [released (atom [])
+        result (cleanup/construct! :kernel (constantly :native) #(swap! released conj %)
+                                   (fn [handle owner] {:handle handle :owner owner}))]
+    (is (= :native (:handle result)))
+    (is (empty? @released))
+    (cleanup/release! (:owner result))
+    (cleanup/release! (:owner result))
+    (is (= [:native] @released)))
+  (doseq [handle [nil false]]
+    (let [released (atom []) primary (ex-info "build failed" {})]
+      (is (identical? primary (error-of #(cleanup/construct!
+                                         :kernel (constantly handle) (fn [value] (swap! released conj value))
+                                         (fn [_ _] (throw primary))))))
+      (is (= [handle] @released)) "sentinel distinguishes returned nil/false from no acquisition"))
+  (let [released (atom []) primary (ex-info "acquire failed" {})]
+    (is (identical? primary (error-of #(cleanup/construct!
+                                       :kernel (fn [] (throw primary)) (fn [value] (swap! released conj value))
+                                       (fn [_ _] (throw (AssertionError. "unreachable")))))))
+    (is (empty? @released))))

@@ -28,7 +28,8 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.gpu.resident-value :as resident-value]))
+            [raster.gpu.resident-value :as resident-value]
+            [raster.gpu.resource-cleanup :as cleanup]))
 
 ;; ================================================================
 ;; Library loading
@@ -1387,6 +1388,8 @@
     (when (not= CL_SUCCESS (read-int err-seg))
       (throw (ex-info (str "clCreateKernel (fresh) failed for " kernel-name)
                       {:error (read-int err-seg)})))
+    (when (or (nil? kh) (.equals MemorySegment/NULL kh))
+      (throw (ex-info "clCreateKernel returned no kernel handle" {:reason :invalid-native-kernel-handle})))
     kh))
 
 (defn- device-mem-of
@@ -1401,7 +1404,8 @@
 (defn bind-kernel-call
   "Bind a backend-neutral KernelCall over OpenCL resident buffers. ABI order and complete 1-3D
    geometry come exclusively from the call; no map/reduction convention is interpreted."
-  [call]
+  ([call] (bind-kernel-call call {}))
+  ([call {:keys [adopt-cleanup!]}]
   (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
         (kcall/binding-plan call)
         registered (or (get @kernel-registry kernel-name)
@@ -1420,17 +1424,22 @@
         _ (kcall/validate-resident-output-capacities!
            call plan registered (fn [value _] (known-buffer-capacity value)))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-        {:keys [program]} (ensure-kernel-loaded! kernel-name)
-        kh (create-kernel-fresh program kernel-name)]
-    (doseq [[idx [slot value]] (map-indexed vector pairs)]
-      (if (= :scalar (:kind slot))
-        (set-kernel-arg-scalar! kh idx value)
-        (set-kernel-arg-buffer! kh idx (device-mem-of value))))
-    {:bound {:kernel kh :wg workgroup-size}
-     :group-count group-count
-     :kernel-name kernel-name
-     :kernel-call call
-     :binding-plan plan}))
+        {:keys [program]} (ensure-kernel-loaded! kernel-name)]
+    (cleanup/construct!
+     :kernel #(create-kernel-fresh program kernel-name)
+     #(cl-call! "clReleaseKernel" @h-clReleaseKernel [%])
+     (fn [kh owner]
+       (doseq [[idx [slot value]] (map-indexed vector pairs)]
+         (if (= :scalar (:kind slot))
+           (set-kernel-arg-scalar! kh idx value)
+           (set-kernel-arg-buffer! kh idx (device-mem-of value))))
+       {:bound {:kernel kh :wg workgroup-size}
+        ::cleanup/owner owner
+        :group-count group-count
+        :kernel-name kernel-name
+        :kernel-call call
+        :binding-plan plan})
+     adopt-cleanup!))))
 
 (defn bind-registered-map-void-kernel
   "Pre-bind a registered void-map kernel's args ONCE over RESIDENT OclBuffers.
@@ -1801,10 +1810,15 @@
 (defn destroy-prepared!
   "Release the dedicated cl_kernel a binding owns."
   [prepared]
-  (when-let [^MemorySegment kh (get-in prepared [:bound :kernel])]
-    (try (.invokeWithArguments ^MethodHandle @h-clReleaseKernel
-                               (into-array Object [kh]))
-         (catch Exception _))))
+  (if-let [owner (::cleanup/owner prepared)]
+    (cleanup/release! owner)
+    (if (contains? prepared :kernel-call)
+      (throw (ex-info "KernelCall binding has lost its cleanup owner" {:reason :missing-cleanup-owner}))
+    ;; Descriptor compatibility bindings have not yet migrated to retained ownership.
+    (when-let [^MemorySegment kh (get-in prepared [:bound :kernel])]
+      (try (.invokeWithArguments ^MethodHandle @h-clReleaseKernel
+                                 (into-array Object [kh]))
+           (catch Exception _))))))
 
 (defn destroy-graph!
   "Release profiling-only OpenCL graph resources. Ordinary graphs own no driver objects."

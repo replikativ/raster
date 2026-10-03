@@ -8,6 +8,7 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.runtime.hardware :as hardware]))
 
 (defn- probe-artifact
@@ -92,7 +93,7 @@
             "free-buffer!" #(swap! freed conj %)
             "register-kernel!" (fn [kernel-name artifact]
                                  (swap! registered conj [kernel-name artifact]))
-            "bind-kernel-call" (fn [call]
+            "bind-kernel-call" (fn [call & _]
                                  (let [prepared {:mock-call call}]
                                    (swap! bound conj prepared)
                                    prepared))
@@ -192,7 +193,7 @@
           (case name
             "register-kernel!" (fn [kernel-name emitted]
                                  (swap! registered conj [kernel-name emitted]))
-            "bind-kernel-call" (fn [call] {:kernel-call call})
+            "bind-kernel-call" (fn [call & _] {:kernel-call call})
             "record-graph!" (fn [prepared opts]
                               {:prepared prepared :profile? (:profile? opts)})
             "submit-graph!" (fn [graph] {:graph graph})
@@ -236,6 +237,12 @@
           (is (= 1 @resets) "validation replay resets discarded profiling events")
           (is (= :device-event (:timing-source measured)))
           (is (= 1000.0 (:min-ns measured)))
+          (doseq [[field value reason] [[:session-id :foreign :foreign-graph-handle]
+                                        [:generation :retired :stale-graph-handle]]]
+            (is (= reason
+                   (try (gpu/release-kernel-graph! session (assoc handle field value))
+                        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+          (is (empty? @destroyed) "foreign/stale handles do not destroy the live generation")
           (is (= (+ 1 5 3) @replays))
           (gpu/release-kernel-graph! session handle)
           (is (= 2 (count @destroyed))))))))
@@ -278,7 +285,7 @@
                                slice))
             "free-buffer!" #(swap! freed conj %)
             "register-kernel!" (fn [& _])
-            "bind-kernel-call" (fn [call]
+            "bind-kernel-call" (fn [call & _]
                                  (when @fail-bind?
                                    (throw (ex-info "mock bind failure" {})))
                                  {:mock-call call})
@@ -321,3 +328,110 @@
         (is (= 2 (count (filter :sub-buffer @freed))))
         (is (some :temporary @freed))
         (is (empty? (:kernel-graphs @sess)))))))
+
+(deftest failed-construction-adopts-ownership-even-with-suppression-disabled
+  (let [buffer {:dtype :float :n-elements 128 :byte-size 512}
+        allocation (bview/allocation {:id :root :byte-size 512 :memory-space :shared
+                                      :device :ze:0 :coherence :host-coherent :ownership :owned})
+        sess (atom {:device-id :ze:0 :session-id :rollback :closed? false :events {}
+                    :buffers {:x buffer :out buffer} :allocations {:x allocation :out allocation}
+                    :kernel-graphs {} :prepared {} :graphs {}})
+        primary (proxy [RuntimeException] ["binding failed" nil false false])
+        destruction (ex-info "native outcome unknown" {})
+        destroyed (atom 0) freed (atom [])
+        resolver (fn [_ name]
+                   (case name
+                     "register-kernel!" (fn [& _])
+                     "record-graph!" (fn [& _] (throw (AssertionError. "unreachable after failed bind")))
+                     "bind-kernel-call"
+                     (fn [_ {:keys [adopt-cleanup!]}]
+                       (cleanup/construct! :kernel (constantly :native)
+                                           (fn [_] (swap! destroyed inc) (throw destruction))
+                                           (fn [_ _] (throw primary)) adopt-cleanup!))
+                     "free-buffer!" #(swap! freed conj %)
+                     (throw (ex-info "unexpected runtime call" {:name name}))))]
+    (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
+      (fn []
+        (is (identical? primary
+                        (try (gpu/bind-kernel-call! sess :failed (probe-artifact)
+                                                   [:x :out {:type :int :value 128}])
+                             (catch Throwable e e))))
+        (is (= 1 @destroyed))
+        (is (= 1 (count (:kernel-graphs @sess))))
+        (is (= #{:x :out} (-> @sess :kernel-graphs vals first :resident-footprint :buffer-keys)))
+        (is (thrown? clojure.lang.ExceptionInfo (gpu/free-buffer! sess :x)))
+        (dotimes [_ 2]
+          (is (identical? destruction (try (gpu/close-session! sess) (catch Throwable e e)))))
+        (is (= 1 @destroyed) "unknown destruction outcome is never retried")
+        (is (empty? @freed))
+        (is (true? (:closed? @sess)))
+        (is (= :releasing (:lifecycle @sess)))
+        (is (thrown? clojure.lang.ExceptionInfo (gpu/upload! sess :x (float-array 128))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (gpu/bind-kernel-call! sess :new (probe-artifact) [:x :out {:type :int :value 128}])))
+        (is (= #{:x :out} (set (keys (:buffers @sess)))))))))
+
+(deftest partial-session-close-retires-successes-before-a-later-failure
+  (let [calls (atom []) fault (ex-info "kernel outcome unknown" {})
+        resolver (fn [_ name]
+                   (case name
+                     "destroy-graph!" (fn [graph] (swap! calls conj [:graph graph]))
+                     "destroy-prepared!" (fn [prepared]
+                                           (swap! calls conj [:kernel prepared])
+                                           (when (= :bad prepared) (throw fault)))
+                     (throw (ex-info "unexpected destructor" {:name name}))))]
+    (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve-soft) resolver}
+      (fn []
+        (doseq [order [[:good :bad] [:bad :good]]]
+        (reset! calls [])
+        (let [own (ns-resolve 'raster.gpu.core 'own-kernel-graph-entry)
+              good (own :ze:0 {:runtime-graph :good :prepareds [:good]})
+              bad (own :ze:0 {:runtime-graph :bad :prepareds [:bad]})
+              sess (atom {:device-id :ze:0 :closed? false :events {} :graphs {} :prepared {}
+                          :kernel-graphs (into (array-map) (map (fn [id] [id (get {:good good :bad bad} id)]) order))})]
+          (dotimes [_ 2]
+            (is (identical? fault (try (gpu/close-session! sess) (catch Throwable e e)))))
+          (is (= (vec (mapcat (fn [id] [[:graph id] [:kernel id]]) order)) @calls))
+          (is (= [:bad] (vec (keys (:kernel-graphs @sess)))))
+          (is (true? (:closed? @sess)))
+          (is (= :releasing (:lifecycle @sess)))))))))
+
+(deftest close-waits-for-a-modern-profile-before-destroying-its-native-recording
+  (let [started (promise) proceed (promise) closing (promise) calls (atom [])
+        sess (atom {:device-id :ze:0 :session-id :profile-race :closed? false :events {}
+                    :graphs {} :prepared {} :buffers {} :allocations {} :kernel-graphs {}})
+        resolver (fn [_ name]
+                   (case name
+                     "destroy-graph!" (fn [_] (swap! calls conj :destroy))
+                     "free-buffer!" (fn [_])
+                     "close-kernel-arena!" (fn [_])
+                     (throw (ex-info "unexpected runtime call" {:name name}))))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) resolver
+       (ns-resolve 'raster.gpu.core 'profile-runtime-graph!)
+       (fn [_ _]
+         (swap! calls conj [:profile-lock (Thread/holdsLock sess)])
+         (deliver started true)
+         (when (= :timeout (deref proceed 5000 :timeout))
+           (throw (ex-info "test profile timed out" {})))
+         (swap! calls conj :profile-complete)
+         :profile)}
+      (fn []
+        (let [own (ns-resolve 'raster.gpu.core 'own-kernel-graph-entry)
+              entry (own :ze:0 {:runtime-graph :recording :prepareds [] :profile? true})
+              handle (gpu/->KernelGraphHandle :profile :profile-race (:generation entry))
+              _ (swap! sess assoc-in [:kernel-graphs :profile] entry)
+              profile (future (gpu/profile-bound-kernel-graph! sess handle))]
+          (try
+            (is (= true (deref started 5000 :timeout)))
+            (let [close (future (deliver closing true) (gpu/close-session! sess))]
+              (is (= true (deref closing 5000 :timeout)))
+              (is (= :blocked (deref close 50 :blocked)))
+              (is (= [[:profile-lock true]] @calls))
+              (deliver proceed true)
+              (is (= :profile (deref profile 5000 :timeout)))
+              (is (not= :timeout (deref close 5000 :timeout))))
+            (is (= [[:profile-lock true] :profile-complete :destroy] @calls))
+            (is (= :closed (:lifecycle @sess)))
+            (finally (deliver proceed true))))))))
