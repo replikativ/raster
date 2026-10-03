@@ -2350,6 +2350,22 @@ ordinary/profiled recording and prepared/buffer cases still pass. Pivotal final 
 seven exact-head CI gates remain required. Synchronous-use admission, raw allocation consumers and
 general live reset remain incomplete; these ownership tests do not establish performance.
 
+Review follow-up separates operation failure from destruction failure: an await/profiling error
+is recorded once, backend drain/release is still attempted, and host leases retire only after known
+backend retirement. A destruction failure retains the canonical debt without repeating await or
+an indeterminate native release; the original operation error is preserved with cleanup failure
+suppressed. Known retirement consumes a released event even when its operation failed. Session
+teardown uses the same private consumption path without treating an already retired operation
+error as remaining native debt. Public poll/await/release now admit through scoped session use,
+preventing callback/watch reentry into buffer or session lifetime mutation.
+
+The review-fix fault suite passes 11 tests / 159 assertions, including caught/uncaught native and
+cleanup-publication watch reentry and known-await-failure session teardown. An uncaught cleanup
+publication watch retains its exact owner and root pin before backend contact; this is fail-closed
+retention, not a general recovery guarantee for arbitrary throwing watches. The 182-test /
+1,898-assertion ownership suite also passes after these fixes. Final review and exact-head CI are
+still required; live reset admission remains deliberately unchanged.
+
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates
 only a kernel-arena identifier and must remain lazy (no GPU initialization merely to

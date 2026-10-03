@@ -27,6 +27,7 @@
               (v 'cl-call!)
               (fn [label _ args]
                 (swap! calls conj label)
+                (when-let [callback (:on-native options)] (callback label args))
                 (case label
                   "clEnqueueWriteBuffer"
                   (let [i (swap! index inc)]
@@ -40,6 +41,8 @@
                   "clReleaseEvent" (when (and (:fail-release? options)
                                               (= 200 (.address ^MemorySegment (first args))))
                                      (throw secondary))
+                  "clWaitForEvents" (when (:fail-wait? options) (throw primary))
+                  "clGetEventProfilingInfo" (when (:fail-profile? options) (throw primary))
                   nil))}
              (into {} (map (fn [name] [(v name) (delay :fake)])
                            '[h-clEnqueueWriteBuffer h-clFlush h-clFinish h-clReleaseEvent
@@ -179,3 +182,129 @@
             (gpu/release-event! session event)
             (is (= 1 @closed))
             (is (empty? (:events @session)))))))))
+
+(deftest await-operation-errors-do-not-prevent-backend-or-host-retirement
+  (doseq [fail-release? [false true] failure [:wait :profile]]
+    (with-transfer {(if (= failure :wait) :fail-wait? :fail-profile?) true
+                    :fail-release? fail-release?}
+      (fn [{:keys [state calls primary secondary]}]
+        (with-session-transfer
+          (fn [session]
+            (let [closed (atom 0)
+                  lease (reify AutoCloseable (close [_] (swap! closed inc)))
+                  event (gpu/submit-upload-ranges-retained!
+                         session [[:out (float-array [1 2]) {:elements 2}]] [lease])]
+              (is (identical? primary (error-of #(gpu/await-event! session event))))
+              (is (= (if fail-release? 1 0) (root/lease-count state)))
+              (is (= (if fail-release? 0 1) @closed))
+              (is (identical? primary (error-of #(gpu/event-measurement session event))))
+              (when fail-release?
+                (is (some #(identical? secondary %) (.getSuppressed primary))))
+              (let [before @calls]
+                (is (identical? primary (error-of #(gpu/release-event! session event))))
+                (is (= before @calls) "no repeated await or indeterminate native release"))
+              (is (= fail-release? (boolean (seq (:events @session))))))))))))
+
+(deftest event-consumption-cannot-reenter-session-root-lifetime-operations
+  (doseq [[operation native-label] [[gpu/event-complete? "clGetEventInfo"]
+                                    [gpu/await-event! "clWaitForEvents"]
+                                    [gpu/release-event! "clReleaseEvent"]]
+          uncaught? [false true]]
+    (let [session-slot (volatile! nil) declined (atom []) active? (atom true)]
+      (with-transfer
+        {:on-native
+         (fn [label _]
+           (when (and @active? (= label native-label))
+             (let [session @session-slot
+                   errors (mapv #(error-of %) [#(gpu/close-session! session)
+                                               #(gpu/free-buffer! session :out)])]
+               (swap! declined into errors)
+               (when uncaught? (throw (first errors))))))}
+        (fn [{:keys [state]}]
+          (with-session-transfer
+            (fn [session]
+              (vreset! session-slot session)
+              (let [event (gpu/submit-upload-ranges!
+                           session [[:out (float-array [1 2]) {:elements 2}]])
+                    error (error-of #(operation session event))]
+                (is (= [:reentrant-root-lifecycle :reentrant-root-lifecycle]
+                       (mapv #(-> % ex-data :reason) @declined)))
+                (is (= uncaught? (some? error)))
+                (is (false? (:closed? @session)))
+                (is (some? (gpu/buffer session :out)))
+                (reset! active? false)
+                (when (seq (:events @session))
+                  (error-of #(gpu/release-event! session event)))
+                (is (= (if (and uncaught? (= operation gpu/release-event!)) 1 0)
+                       (root/lease-count state)))))))))))
+
+(deftest cleanup-publication-watch-cannot-reenter-session-root-lifetime-operations
+  (doseq [operation [gpu/await-event! gpu/release-event!]
+          uncaught? [false true]]
+    (with-transfer {}
+      (fn [{:keys [state calls]}]
+        (with-session-transfer
+          (fn [session]
+            (let [event (gpu/submit-upload-ranges!
+                         session [[:out (float-array [1 2]) {:elements 2}]])
+                  owner (::cleanup/owner (get-in @session [:events (:id event)]))
+                  declined (atom [])
+                  before @calls]
+              (add-watch (:state owner) :lifecycle-reentry
+                         (fn [_ _ previous next-state]
+                           (when (and (not= :releasing (:phase previous))
+                                      (= :releasing (:phase next-state)))
+                             (let [errors (mapv error-of [#(gpu/close-session! session)
+                                                          #(gpu/free-buffer! session :out)])]
+                               (swap! declined into errors)
+                               (when uncaught? (throw (first errors)))))))
+              (let [error (error-of #(operation session event))]
+                (is (= [:reentrant-root-lifecycle :reentrant-root-lifecycle]
+                       (mapv #(-> % ex-data :reason) @declined)))
+                (is (= uncaught? (some? error)))
+                (is (false? (:closed? @session)))
+                (is (some? (gpu/buffer session :out)))
+                (remove-watch (:state owner) :lifecycle-reentry)
+                (if uncaught?
+                  (do
+                    (is (= before @calls) "publication failed before backend cleanup contact")
+                    (is (= 1 (root/lease-count state)))
+                    (is (identical? owner (::cleanup/owner
+                                           (get-in @session [:events (:id event)]))))
+                    (is (seq (cleanup/pending owner))))
+                  (do
+                    (when (seq (:events @session)) (gpu/release-event! session event))
+                    (is (zero? (root/lease-count state)))))))))))))
+
+(deftest session-teardown-retires-transfer-after-known-await-operation-failure
+  (doseq [failure [:wait :profile]]
+    (with-transfer {(if (= failure :wait) :fail-wait? :fail-profile?) true}
+      (fn [{:keys [state calls]}]
+        (with-session-transfer
+          (fn [session]
+            (let [closed (atom 0)
+                  lease (reify AutoCloseable (close [_] (swap! closed inc)))
+                  resolver (ns-resolve 'raster.gpu.core 'rt-resolve)
+                  original @resolver]
+              ;; The buffer is a hardware-free fixture; its empty canonical owner retires
+              ;; without native contact. The event still uses the production transfer owner.
+              (let [owner (cleanup/owner [])]
+                (swap! session #(-> %
+                                    (assoc :buffer-owners {:out owner})
+                                    (assoc-in [:buffers :out ::cleanup/owner] owner)
+                                    (assoc-in [:buffers :alias ::cleanup/lifetime-owner] owner))))
+              (gpu/submit-upload-ranges-retained!
+               session [[:out (float-array [1 2]) {:elements 2}]] [lease])
+              (with-redefs-fn
+                {resolver (fn [device name]
+                            (if (= name "close-kernel-arena!") (fn [_] nil)
+                                (original device name)))}
+                #(do
+                   (is (nil? (error-of (fn [] (gpu/close-session! session)))))
+                   (is (= :closed (:lifecycle @session)))
+                   (is (empty? (:events @session)))
+                   (is (zero? (root/lease-count state)))
+                   (is (= 1 @closed))
+                   (let [before @calls]
+                     (gpu/close-session! session)
+                     (is (= before @calls))))))))))))

@@ -395,7 +395,7 @@
            :backend (backend-type device-id)
            :device-id device-id)))
 
-(declare release-event!)
+(declare release-event! release-event-under-lock!)
 
 (def ^:dynamic ^:private *root-lifecycle-sessions* [])
 (def ^:dynamic ^:private *session-use-sessions* [])
@@ -477,7 +477,7 @@
       (swap! sess assoc :lifecycle :releasing :closed? true)
       ;; Completion owns the right to keep graph recordings, bound kernels, and buffers alive.
       ;; Drain and release every event before tearing any of those resources down.
-      (release-session-layer! sess [[:events #(release-event! sess (:event %))]])
+      (release-session-layer! sess [[:events #(release-event-under-lock! sess (:event %) false)]])
       (let [{:keys [device-id arena-id]} @sess]
         (release-session-layer! sess [[:graphs #(destroy-recorded-graph-entry! device-id %)]])
         (release-session-layer! sess [[:prepared #(destroy-prepared-entry! device-id %)]])
@@ -1551,14 +1551,24 @@
              completion (volatile! nil)
              submit-return-ns (volatile! nil)
              submission-error (volatile! nil)
+             awaited? (volatile! false)
+             await-error (volatile! nil)
              host-owned? (volatile! false)
              owner (cleanup/owner
                     (into [{:id :backend-completion
                             :release #(case (:kind @backend-state)
-                                        :token (let [token (:token @backend-state)
-                                                     result ((rt-resolve device-id "await-event!") token)]
+                                        :token (let [token (:token @backend-state)]
+                                                 (when-not @awaited?
+                                                   (vreset! awaited? true)
+                                                   (try
+                                                     (vreset! completion
+                                                              ((rt-resolve device-id "await-event!") token))
+                                                     (catch Throwable error
+                                                       (vreset! await-error error))))
+                                                 ;; Operation failure is not destruction failure.
+                                                 ;; Always drain/release, but never rerun await on retry.
                                                  ((rt-resolve device-id "release-event!") token)
-                                                 (vreset! completion result))
+                                                 nil)
                                         :debt (cleanup/release! (:owner @backend-state))
                                         nil nil)}]
                           (map-indexed
@@ -1572,7 +1582,8 @@
                     :status :pending
                     :submitted-ns submitted-ns
                     ::transfer-state {:backend backend-state :completion completion
-                                      :submit-return-ns submit-return-ns :error submission-error}
+                                      :submit-return-ns submit-return-ns :error submission-error
+                                      :await-error await-error}
                     :buffer-keys buffer-keys
                     :allocation-ids allocation-ids
                     :resident-buffers (:resident-buffers footprint)
@@ -1773,6 +1784,21 @@
           []
           (reverse resources)))
 
+(defn- transfer-operation-error [entry]
+  (when-let [state (::transfer-state entry)]
+    (or @(:error state) @(:await-error state))))
+
+(defn- settle-transfer-owner! [entry]
+  (try (cleanup/release! (::cleanup/owner entry))
+       (catch Throwable cleanup-error
+         (if-let [primary (transfer-operation-error entry)]
+           (do
+             (when-not (or (identical? primary cleanup-error)
+                           (some #(identical? cleanup-error %) (.getSuppressed ^Throwable primary)))
+               (.addSuppressed ^Throwable primary cleanup-error))
+             (throw primary))
+           (throw cleanup-error)))))
+
 (defn- await-event-under-lock!
   [sess event]
   (let [{:keys [device-id closed?]} @sess
@@ -1782,18 +1808,19 @@
     (when (and closed? (not= :releasing (:lifecycle @sess)))
       (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
     (if (= :complete status)
-      entry
+      (do (when-let [failure (transfer-operation-error entry)] (throw failure)) entry)
       (if-let [transfer-state (::transfer-state entry)]
         (do
-          (cleanup/release! (::cleanup/owner entry))
-          (when-let [failure @(:error transfer-state)] (throw failure))
+          (settle-transfer-owner! entry)
           (let [result @(:completion transfer-state)
-                completed (assoc entry :status :complete
-                                 :measurement (merge (when (map? result) result)
-                                                     {:host-wall-ns (- (System/nanoTime) submitted-ns)
-                                                      :submit-host-ns (- @(:submit-return-ns transfer-state)
-                                                                         submitted-ns)}))]
+                failure (transfer-operation-error entry)
+                completed (cond-> (assoc entry :status :complete)
+                            (nil? failure) (assoc :measurement (merge (when (map? result) result)
+                                                                      {:host-wall-ns (- (System/nanoTime) submitted-ns)
+                                                                       :submit-host-ns (- @(:submit-return-ns transfer-state)
+                                                                                          submitted-ns)})))]
             (swap! sess assoc-in [:events (:id event)] completed)
+            (when failure (throw failure))
             completed))
       ;; A successful status query is not necessarily a host memory-synchronization point
       ;; (notably in OpenCL). Await always calls the backend wait before releasing the token.
@@ -1824,7 +1851,7 @@
    substitute for await-event!: native handles remain live until a host wait establishes memory
    visibility or release-event! safely consumes the event."
   [sess event]
-  (locking sess
+  (with-session-use sess
     (let [{:keys [device-id closed?]} @sess
           {:keys [status backend-event] :as entry} (resolve-event-entry sess event)]
       (when closed?
@@ -1844,7 +1871,7 @@
   "Block until a GPUEvent completes and return the submission's value. For a KernelGraph this is
    its resident output-buffer map. Waiting is idempotent until release-event! consumes the event."
   [sess event]
-  (locking sess
+  (with-session-use sess
     (:value (await-event-under-lock! sess event))))
 
 (defn event-measurement
@@ -1855,7 +1882,8 @@
    measurement; graph profiling remains available through `measure-graph!`."
   [sess event]
   (locking sess
-    (let [{:keys [status kind measurement]} (resolve-event-entry sess event)]
+    (let [{:keys [status kind measurement] :as entry} (resolve-event-entry sess event)]
+      (when-let [failure (transfer-operation-error entry)] (throw failure))
       (when-not (= :transfer kind)
         (throw (ex-info "event does not describe a transfer submission"
                         {:event event :kind kind})))
@@ -1864,21 +1892,25 @@
                         {:event event :status status})))
       measurement)))
 
+(defn- release-event-under-lock! [sess event report-operation-error?]
+  (let [entry (resolve-event-entry sess event)
+        transfer-state (::transfer-state entry)]
+    (if transfer-state
+        ;; Failed submission did not produce a usable event. Close only its retained debt;
+        ;; never report the abandoned transfer as a successful data operation.
+      (settle-transfer-owner! entry)
+      (await-event-under-lock! sess event))
+    (swap! sess update :events dissoc (:id event))
+    (when (and report-operation-error? (transfer-operation-error entry))
+      (throw (transfer-operation-error entry))))
+  nil)
+
 (defn release-event!
   "Establish completion and remove a session-owned GPUEvent. This is deliberately safe rather
    than cancellation-like: releasing an in-flight event waits before permitting its graph or
-   buffers to be destroyed."
+   buffers to be destroyed. Known retirement consumes the event even when its operation failed."
   [sess event]
-  (locking sess
-    (let [entry (resolve-event-entry sess event)
-          transfer-state (::transfer-state entry)]
-      (if (and transfer-state @(:error transfer-state))
-        ;; Failed submission did not produce a usable event. Close only its retained debt;
-        ;; never report the abandoned transfer as a successful data operation.
-        (cleanup/release! (::cleanup/owner entry))
-        (await-event-under-lock! sess event)))
-    (swap! sess update :events dissoc (:id event)))
-  nil)
+  (with-session-use sess (release-event-under-lock! sess event true)))
 
 (defn- release-graph-events!
   [sess graph-key]
