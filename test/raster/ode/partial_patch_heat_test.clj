@@ -2,6 +2,7 @@
   "A synchronous conservative partial-patch oracle, not subcycled/refluxed AMR."
   (:require [clojure.test :refer [deftest is]]
             [raster.core :refer [deftm]]
+            [raster.compiler.build-manifest :as build]
             [raster.compiler.ir.amr-plan :as amr]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.numerical-state :as state]
@@ -11,14 +12,17 @@
             [raster.ode.amr-transfer :as transfer]
             [raster.linalg.sparse :as sparse]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.completed-evidence-device-test :as producer]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]
             [raster.gpu.link :as link]
             [raster.runtime.numerical-content :as content]
+            [raster.runtime.resident-state :as resident]
+            [raster.runtime.resident-state-test :as capture-fixture]
             [raster.test-support.numerical-checkpoint :as checkpoint])
   (:import [java.nio ByteBuffer ByteOrder]
-           [java.nio.file Files]))
+           [java.nio.file Files OpenOption]))
 
 (defn- hierarchy
   ([] (hierarchy [{:offsets [2 2] :shape [4 4]}]))
@@ -436,18 +440,22 @@
   (if @ze/gpu-available? (run-post-remap-layouts :ze:0)
       (ze/gpu-skip! "resident-post-remap-evolution-level-zero")))
 
-(defn- layout-restore-contract [geometry phase]
+(defn- layout-restore-semantics [geometry phase]
   (let [shape [(count (:cells geometry))]
         layout (fingerprint/fingerprint (:cells geometry))]
-    (state/restore-contract
+    (state/restore-semantics
      {:logical-coordinate {:phase phase}
       :fields [{:id :temperature :value (av/tensor {:dtype :double :shape shape})
                 :coordinate-space {:hierarchy :heat/partial :layout-fingerprint layout
                                    :active-cells (:cells geometry) :centering :cell}}]
       :numerical-contract {:mode :ieee-fp64 :determinism :reproducible-order
-                           :compatibility-id "partial-layout-face-flux-f64-test-v1"}
-      ;; Explicit fixture provenance, not a production compiler-build identity or publication.
-      :provenance {:program-fingerprint "partial-layout-evolution-test-v1"}})))
+                           :compatibility-id "partial-layout-face-flux-f64-test-v1"}})))
+
+(defn- layout-restore-contract [geometry phase]
+  ;; Independent host-only fixture, not a claim of resident producer evidence.
+  (state/restore-contract
+   (assoc (layout-restore-semantics geometry phase)
+          :provenance {:program-fingerprint "partial-layout-evolution-test-v1"})))
 
 (defn- layout-snapshot [captured geometry parents phase]
   (let [shape [(count (:cells geometry))]
@@ -498,69 +506,109 @@
 (defn- output-node [prepared key]
   (:node (first (filter #(= key (:key %)) (:out-tree prepared)))))
 
-(defn- run-regridded-continuation [target]
-  (let [[_ _ source destination] (remap-geometries)
-        uninterrupted (:prepared (prepare-post-remap-evolution target source destination 3))
-        midpoint (:prepared (prepare-post-remap-evolution target source destination 1))
-        source-field (nth (iterate #(reference-step % source 0.001)
-                                  (vec (initial (:cells source)))) 2)
-        transferred (reference-remap (:cells source) (:cells destination) source-field)
-        expected (nth (iterate #(reference-step % destination 0.001) transferred) 6)
-        paths (checkpoint/temp-files [:source :destination])]
+(defn- capture-regridded! [midpoint source destination paths]
+  (let [{:keys [provider blobs events]} (#'capture-fixture/provider (fn [& _]))
+        published (atom {}) c (compiled/instantiate! midpoint)]
     (try
-      (let [baseline (with-open [executable (link/instantiate! (compiled/plan uninterrupted))]
-                       (link/run! executable)
-                       (vec (link/download executable (output-node uninterrupted :destination))))
-            captured (with-open [executable (link/instantiate! (compiled/plan midpoint))]
-                       (link/run! executable)
-                       (into {} (for [[key geometry] [[:source source] [:destination destination]]]
-                                  [key (checkpoint/capture-f64!
-                                        (:session executable)
-                                        (link/node-view executable (output-node midpoint key))
-                                        (paths key) (count (:cells geometry)))])))
-            parent (layout-snapshot (:source captured) source [] :source-step-2)
-            child (layout-snapshot (:destination captured) destination
-                                   [(get-in parent [:manifest :id])] :target-step-2)
-            parent-chunk (get-in parent [:manifest :fields 0 :chunks 0])
-            child-chunk (get-in child [:manifest :fields 0 :chunks 0])
-            fresh-args (assoc (arguments destination) 0
-                              (double-array (repeat (count (:cells destination)) -997.0)))
-            fresh (compiled/lower #'pair-step! fresh-args
-                                  {:compiler :equation-first :target target :dtype :double :inline? true
-                                   :donate '[field]
-                                   :constants '[left right conductance offsets indices orientation inverse-volume]})
-            node (output-node fresh :field')]
-        (is (= 17 (reduce + (map #(count (get-in % [:call :steps]))
-                                 (:instances (compiled/plan uninterrupted))))))
-        (is (near? expected baseline))
-        (is (identical? parent (state/verify! parent)))
-        (is (identical? child (state/verify! child)))
-        (is (= (:cells destination) (get-in child [:manifest :fields 0 :coordinate-space :active-cells])))
+      (let [facts (into {} (map (fn [dt] [dt (compiled/measure-storage-representation! c dt)])
+                                [:int :double]))]
+        (with-open [receipt (compiled/invoke-with-evidence c {})]
+          (let [capture-field
+                (fn [key geometry phase parents]
+                  (let [semantics (layout-restore-semantics geometry phase)
+                        node (output-node midpoint key)
+                        result (resident/capture!
+                                receipt facts provider :local
+                                (assoc semantics
+                                       :id [:heat/partial-layout
+                                            (fingerprint/fingerprint (:cells geometry)) phase
+                                            (get-in @receipt [:outputs node :content])]
+                                       :parents parents
+                                       :fields [(assoc (first (:fields semantics)) :source :outputs :node node)]))
+                        certificate (:state result)]
+                    (is (identical? certificate
+                                    (resident/verify-restore! certificate semantics midpoint
+                                                              [{:id :temperature :source :outputs :key key}])))
+                    (is (= :published
+                           (:publication (content/finalize-state-availability!
+                                          provider certificate :durable
+                                          (fn [manifest]
+                                            (is (every? #(contains? @published %) (:parents manifest)))
+                                            (swap! published assoc (:id manifest) manifest)
+                                            :published)))))
+                    (Files/write (paths key)
+                                 ^bytes (get @blobs (get-in certificate [:manifest :fields 0 :chunks 0 :content]))
+                                 (make-array OpenOption 0))
+                    certificate))
+                parent (capture-field :source source :source-step-2 [])
+                child (capture-field :destination destination :target-step-2 [(get-in parent [:manifest :id])])]
+            (is (= 2 (count @published)))
+            (is (= [(get-in parent [:manifest :id])] (get-in child [:manifest :parents])))
+            (is (nil? (get-in child [:manifest :provenance :parent-replay]))
+                "two logical versions in one completed replay are not consecutive execution replays")
+            (is (empty? @events))
+            {:parent parent :child child})))
+      (finally (compiled/close! c)))))
+
+(defn- run-regridded-continuation [target]
+  ;; Retained source identities are built under the existing explicitly synthetic packaged fixture.
+  (with-redefs [build/current-identity #'producer/test-build]
+    (let [[_ _ source destination] (remap-geometries)
+          uninterrupted (:prepared (prepare-post-remap-evolution target source destination 3))
+          midpoint (:prepared (prepare-post-remap-evolution target source destination 1))
+          source-field (nth (iterate #(reference-step % source 0.001)
+                                     (vec (initial (:cells source)))) 2)
+          transferred (reference-remap (:cells source) (:cells destination) source-field)
+          expected (nth (iterate #(reference-step % destination 0.001) transferred) 6)
+          paths (checkpoint/temp-files [:source :destination])]
+      (try
+        (let [baseline (with-open [executable (link/instantiate! (compiled/plan uninterrupted))]
+                         (link/run! executable)
+                         (vec (link/download executable (output-node uninterrupted :destination))))
+              {:keys [parent child]} (capture-regridded! midpoint source destination paths)
+              parent-chunk (get-in parent [:manifest :fields 0 :chunks 0])
+              child-chunk (get-in child [:manifest :fields 0 :chunks 0])
+              fresh-args (assoc (arguments destination) 0
+                                (double-array (repeat (count (:cells destination)) -997.0)))
+              fresh (compiled/lower #'pair-step! fresh-args
+                                    {:compiler :equation-first :target target :dtype :double :inline? true
+                                     :donate '[field]
+                                     :constants '[left right conductance offsets indices orientation inverse-volume]})
+              node (output-node fresh :field')]
+          (is (= 17 (reduce + (map #(count (get-in % [:call :steps]))
+                                   (:instances (compiled/plan uninterrupted))))))
+          (is (near? expected baseline))
+          (is (identical? parent (state/verify! parent)))
+          (is (identical? child (state/verify! child)))
+          (is (= (:cells destination) (get-in child [:manifest :fields 0 :coordinate-space :active-cells])))
         ;; Target geometry and phase come from the intended continuation, not the incoming bytes.
-        (state/verify-restore! parent (layout-restore-contract source :source-step-2))
-        (state/verify-restore! child (layout-restore-contract destination :target-step-2))
-        (is (= :numerical-state-restore-incompatible
-               (try (state/verify-restore! child (layout-restore-contract source :target-step-2)) nil
-                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+          (resident/verify-restore! parent (layout-restore-semantics source :source-step-2) midpoint
+                                    [{:id :temperature :source :outputs :key :source}])
+          (resident/verify-restore! child (layout-restore-semantics destination :target-step-2) midpoint
+                                    [{:id :temperature :source :outputs :key :destination}])
+          (is (= :numerical-state-restore-incompatible
+                 (try (resident/verify-restore! child (layout-restore-semantics source :target-step-2) midpoint
+                                                [{:id :temperature :source :outputs :key :destination}]) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
         ;; Both producer sessions and writable mappings are gone before either read lease opens.
-        (with-open [parent-lease (checkpoint/open-chunk-lease (paths :source) parent-chunk)
-                    child-lease (checkpoint/open-chunk-lease (paths :destination) child-chunk)]
-          (let [restored (assoc-in (compiled/plan fresh) [:nodes node :source]
-                                   (content/lease-segment child-lease))]
-            (with-open [executable (link/instantiate! restored)]
+          (with-open [parent-lease (checkpoint/open-chunk-lease (paths :source) parent-chunk)
+                      child-lease (checkpoint/open-chunk-lease (paths :destination) child-chunk)]
+            (let [restored (assoc-in (compiled/plan fresh) [:nodes node :source]
+                                     (content/lease-segment child-lease))]
+              (with-open [executable (link/instantiate! restored)]
               ;; Initialization is synchronous; no mapping is retained across replay.
-              (.close parent-lease)
-              (.close child-lease)
-              (is (and (content/lease-closed? parent-lease) (content/lease-closed? child-lease)))
-              (dotimes [_ 2] (link/run! executable))
-              (let [actual (vec (link/download executable node))
-                    raw-bits #(mapv (fn [value] (Double/doubleToRawLongBits (double value))) %)]
-                (is (= (raw-bits baseline) (raw-bits actual))
-                    "same-backend restart after changing layout matches uninterrupted resident evolution bit-for-bit")
-                (is (near? expected actual))
-                (is (< (Math/abs (- (mass (initial (:cells source)) (:inverse-volume source))
-                                    (mass actual (:inverse-volume destination)))) 1.0e-12)))))))
-      (finally (doseq [path (vals paths)] (Files/deleteIfExists path))))))
+                (.close parent-lease)
+                (.close child-lease)
+                (is (and (content/lease-closed? parent-lease) (content/lease-closed? child-lease)))
+                (dotimes [_ 2] (link/run! executable))
+                (let [actual (vec (link/download executable node))
+                      raw-bits #(mapv (fn [value] (Double/doubleToRawLongBits (double value))) %)]
+                  (is (= (raw-bits baseline) (raw-bits actual))
+                      "same-backend restart after changing layout matches uninterrupted resident evolution bit-for-bit")
+                  (is (near? expected actual))
+                  (is (< (Math/abs (- (mass (initial (:cells source)) (:inverse-volume source))
+                                      (mass actual (:inverse-volume destination)))) 1.0e-12)))))))
+        (finally (doseq [path (vals paths)] (Files/deleteIfExists path)))))))
 
 (deftest opencl-regridded-state-resumes-from-addressed-bytes
   (if @opencl/opencl-fp64-available? (run-regridded-continuation :ocl:0)

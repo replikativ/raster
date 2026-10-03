@@ -1617,33 +1617,66 @@
            :inputs (project (:inputs data)) :outputs (project (:outputs data))
            :post-state (project (:post-state data))})))))
 
-(defn- completed-frontier! [c]
-  (let [executable (:executable c)
-        plan (:plan executable)
-        evidence (get-in c [:lowering :certificate :effect-evidence])
-        initialization (:initialization evidence)
-        fail (fn [reason] (throw (ex-info "compiled execution cannot attest resident byte history"
-                                         {:reason reason})))
-        _ (when-not (and (:owns-session? executable)
-                         (every? #(= :owned (get-in % [:view :allocation :ownership]))
-                                 (vals (:nodes plan))))
-            (fail :compiled-evidence-ownership))
+(defn- certified-byte-frontier! [plan evidence]
+  (let [initialization (:initialization evidence)
         _ (when-not (link-plan/retained-effect-evidence? plan evidence)
-            (fail :compiled-evidence-initialization))
-        _ (require-no-evidence-events! executable)
-        _ (when (seq (:record-time-prologue (gpu-link/execution-order executable)))
-            (fail :compiled-evidence-record-time-prologue))
+            (throw (ex-info "compiled byte frontier requires retained initialization evidence"
+                            {:reason :compiled-evidence-initialization})))
         roots (set/union (:requires initialization) (:initializers initialization))
         outputs (set (:outputs plan))
         written (mapv #(get-in plan [:nodes % :view]) (:writes initialization))
         state (into #{} (filter (fn [node]
-                                 (some #(bview/overlaps? (get-in plan [:nodes node :view]) %)
-                                       written))) roots)]
-    (doseq [node (set/union roots outputs)]
-      (let [view (get-in plan [:nodes node :view])]
-        (when-not (and view (= (:strides view) (bview/dense-strides (:shape view))))
-          (fail :compiled-evidence-noncontiguous))))
+                                  (some #(bview/overlaps? (get-in plan [:nodes node :view]) %)
+                                        written))) roots)]
     {:roots roots :outputs outputs :state state}))
+
+(defn- require-dense-byte-frontier! [plan {:keys [roots outputs] :as frontier}]
+  (doseq [node (set/union roots outputs)]
+    (let [view (get-in plan [:nodes node :view])]
+      (when-not (and view (= (:strides view) (bview/dense-strides (:shape view))))
+        (throw (ex-info "compiled byte frontier requires dense views"
+                        {:reason :compiled-evidence-noncontiguous})))))
+  frontier)
+
+(defn producer-interface
+  "Describe stable byte-producing semantic ports of an original sealed source Prepared.
+
+   The source producer is not necessarily the restore consumer. Exact retained program identity
+   and certified initialization/write overlap determine admissible output/post-state ports;
+   public keys resolve their nodes without a caller-supplied ABI/node heuristic. This pure
+   description allocates no device storage and attests neither execution nor input/output bytes.
+   It is ordinary portable expectation data, not an authority token or authentication proof."
+  [prepared]
+  (when-not (prepared? prepared)
+    (throw (ex-info "producer-interface requires a source Prepared"
+                    {:reason :compiled-producer-prepared})))
+  (let [identity (execution-identity prepared)
+        plan (get-in prepared [:lowering :plan])
+        frontier (require-dense-byte-frontier!
+                  plan (certified-byte-frontier! plan (get-in prepared [:lowering :certificate :effect-evidence])))
+        ports (fn [entries nodes]
+                (mapv #(select-keys % [:key :node :dtype :shape])
+                      (filter #(contains? nodes (:node %)) entries)))]
+    {:kind :raster.compiled/producer-interface-v1
+     :program (select-keys identity [:scope :fingerprint])
+     :outputs (ports (:out-tree prepared) (:outputs frontier))
+     :post-state (ports (:in-tree prepared) (:state frontier))}))
+
+(defn- completed-frontier! [c]
+  (let [executable (:executable c)
+        plan (:plan executable)
+        evidence (get-in c [:lowering :certificate :effect-evidence])
+        fail (fn [reason] (throw (ex-info "compiled execution cannot attest resident byte history"
+                                          {:reason reason})))
+        _ (when-not (and (:owns-session? executable)
+                         (every? #(= :owned (get-in % [:view :allocation :ownership]))
+                                 (vals (:nodes plan))))
+            (fail :compiled-evidence-ownership))
+        frontier (certified-byte-frontier! plan evidence)
+        _ (require-no-evidence-events! executable)
+        _ (when (seq (:record-time-prologue (gpu-link/execution-order executable)))
+            (fail :compiled-evidence-record-time-prologue))]
+    (require-dense-byte-frontier! plan frontier)))
 
 (defn- require-evidence-ready! [executable]
   (require-no-evidence-events! executable)

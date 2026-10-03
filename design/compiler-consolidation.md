@@ -1606,3 +1606,29 @@ authentication, transactional distributed lineage or a production persistent sto
 realization independently verifies content before upload. Partial-patch producer integration,
 device packing, scalable hierarchy validation, temporal interpolation/subcycling/reflux and
 external numerical comparisons remain open.
+
+### Captured partial-patch restore boundary — 2026-10-03
+
+The restore integration keeps the generic four-facet exact-provenance verifier unchanged. A
+separate fixed composition first verifies independently declared complete field geometry, phase
+and numerical policy, then resolves ordered source field keys through the original sealed
+producer Prepared. Source nodes and identity come from the existing certified byte frontier,
+not the continuation or an incoming-provenance subset. Current output/post-state exports remain
+distinct from historical inputs. Aliased public ports decline because node-only v1 capture
+cannot distinguish their keys; real composition already rejects duplicate output nodes.
+
+Each selected field must be one complete plain raw-array chunk with the exact producer dtype,
+shape and content reference. Its representation kind, dtype, program and normalized byte order
+must agree internally. Dynamic completed fingerprints, schedules and measured observations are
+audit data, not target predictions or serialized authentication. Numerical-state parents and
+execution-replay parents remain separate; no new store, session or cache convention is added.
+
+The partial-patch remap/restart fixture now captures its original composed midpoint producer,
+finalizes content availability, closes the source session and restores from independently
+verified mapped bytes. Independent geometry/active ordering, wrong-same-extent rejection,
+host evolution/remap, mass and exact uninterrupted 17-stage continuation checks remain. The
+capped REPL passes 82 affected tests / 1,404 assertions, including OpenCL and Level Zero and
+rejection against a real foreign sealed source program. Packaged build identities and bounded
+providers remain explicitly synthetic. Final independent review and all seven exact-head CI
+gates are still required before merge. Device packing, scalable hierarchy validation,
+subcycling/reflux, external training acceptance and real fabric execution remain open.

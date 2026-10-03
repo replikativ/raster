@@ -34,7 +34,10 @@
                              :representation :device-native
                              :storage {:format :raw-array :byte-order :little-endian}))
         description {:program-fingerprint "unit-producer" :completed-fingerprint "unit-completed"
-                     :representations {:float {:probe-fingerprint "unit-probe"}}
+                     :representations {:float {:kind :raster.compiled/resident-representation-v1
+                                               :dtype :float :byte-order :little-endian
+                                               :program-fingerprint "unit-producer"
+                                               :probe-fingerprint "unit-probe"}}
                      :outputs {:a (leaf :a) :b (leaf :b)} :post-state {:b (leaf :b)}}
         reads (atom [])]
     (with-redefs [link/output-values (constantly {})
@@ -248,3 +251,68 @@
           ;; The test knows its synthetic close did nothing; production cannot guess that.
           (finally (when-let [lease @held] (.close ^java.io.Closeable lease))))
         (is (= 1 @(:output-leases executable)))))))
+
+(deftest captured-restore-checks-independent-semantics-producer-and-full-field-content
+  (with-fixture 4
+    (fn [{:keys [receipt opts reads]}]
+      (let [{:keys [provider]} (provider (fn [& _]))
+            captured (:state (resident/capture! receipt {} provider :local opts))
+            semantics {:fields [{:id :field-a :value (av/tensor {:dtype :float :shape [4]}) :coordinate-space {}}
+                                {:id :field-b :value (av/tensor {:dtype :float :shape [4]}) :coordinate-space {}}]
+                       :logical-coordinate {:step 2} :numerical-contract (:numerical-contract opts)}
+            specs [{:id :field-a :source :outputs :key :a-key}
+                   {:id :field-b :source :post-state :key :b-key}]
+            ;; Explicit compiler-interface double; actual sealed Prepared/target/composition
+            ;; admission is independently tested in equation-artifact and native restore tests.
+            interface {:kind :raster.compiled/producer-interface-v1
+                       :program {:scope :exact-bound-program :fingerprint "unit-producer"}
+                       :outputs [{:key :a-key :node :a :dtype :float :shape [4]}]
+                       :post-state [{:key :b-key :node :b :dtype :float :shape [4]}]}
+            source ::synthetic-prepared
+            error #(error-of (fn [] (resident/verify-restore! %1 %2 source %3)))]
+        (reset! reads [])
+        (with-redefs [compiled/producer-interface (constantly interface)]
+          (is (identical? captured (resident/verify-restore! captured semantics source specs)))
+          (doseq [bad [(assoc semantics :logical-coordinate {:step 3})
+                       (assoc-in semantics [:fields 0 :coordinate-space] {:grid :wrong})
+                       (assoc-in semantics [:fields 0 :value] (av/tensor {:dtype :double :shape [4]}))
+                       (assoc-in semantics [:numerical-contract :compatibility-id] "wrong-policy")
+                       (assoc semantics :provenance (:provenance (:manifest captured)))]]
+            (is (some? (error captured bad specs))))
+          (doseq [bad [(vec (reverse specs))
+                       (assoc-in specs [0 :key] :absent)
+                       (assoc-in specs [0 :source] :inputs)
+                       (assoc-in specs [0 :node] :a)
+                       (assoc-in specs [1 :id] :field-a)]]
+            (is (some? (error captured semantics bad))))
+          (doseq [alter [#(assoc-in % [:provenance :field-producers 0 :content]
+                                    (get-in % [:fields 1 :chunks 0 :content]))
+                         #(assoc-in % [:provenance :field-producers 0 :node] :b)
+                         #(assoc-in % [:provenance :field-producers 0 :unexpected] true)
+                         #(assoc-in % [:provenance :scope] :declared-not-captured)
+                         #(assoc-in % [:provenance :unexpected] true)
+                         #(assoc-in % [:provenance :representations] {})
+                         #(assoc-in % [:provenance :representations :float :dtype] :double)
+                         #(assoc-in % [:provenance :representations :float :kind] :unknown)
+                         #(assoc-in % [:provenance :representations :float :program-fingerprint] "foreign")
+                         #(assoc-in % [:provenance :representations :float :byte-order] :big-endian)
+                         #(assoc-in % [:fields 0 :chunks 0 :id] :not-v1)]]
+            (is (some? (error (state/certify (alter (:manifest captured))) semantics specs))))
+          ;; Exact-provenance restoration has not become a subset/source-program matcher.
+          (let [strict (assoc semantics :provenance (:provenance (:manifest captured)))
+                changed (state/certify (assoc-in (:manifest captured)
+                                                 [:provenance :completed-fingerprint] "different-replay"))]
+            (is (identical? captured (state/verify-restore! captured strict)))
+            (is (= :provenance (:facet (ex-data (error-of #(state/verify-restore! changed strict))))))
+            (is (identical? changed (resident/verify-restore! changed semantics source specs))
+                "dynamic replay audit data is not a target-predicted compatibility value")))
+        (doseq [bad [(assoc-in interface [:program :fingerprint] "foreign-program")
+                     (assoc-in interface [:program :scope] :not-exact)
+                     (assoc interface :kind :future-unknown-schema)
+                     (update interface :outputs conj
+                             {:key :alias-key :node :a :dtype :float :shape [4]})
+                     (assoc-in interface [:outputs 0 :node] :b)
+                     (assoc-in interface [:outputs 0 :shape] [3])]]
+          (with-redefs [compiled/producer-interface (constantly bad)]
+            (is (some? (error captured semantics specs)))))
+        (is (empty? @reads) "verification never opens provider bytes or downloads resident storage")))))

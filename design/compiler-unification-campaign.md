@@ -22,6 +22,55 @@ notes retain the wider campaign and its implementation history.
 
 ## Current eight-item checkpoint — 2026-10-02
 
+### October 3 runtime/state integration update
+
+This update supersedes the producer-integration gaps below only for the specifically validated
+plain dense fields; it does not change the other seven campaign items or claim campaign completion.
+PR #1027 connects original completed receipts and exact owner-bound storage measurements to the
+existing numerical manifest/content-provider lifecycle. Selected output/post-state fields stream
+through bounded aligned downloads under a private output lease. Physical producer, schedule,
+representation and field/content bindings are derived; semantic coordinates/policy remain declared.
+Independent review fixed a cross-thread provider deadlock by restricting the lifetime monitor to
+validation/plan/lease acquisition. Affected content/capture/publication/skip tests pass 46 tests /
+962 assertions, including actual OpenCL and Level Zero generated heat capture and public-codec
+restored continuation. Exact-HEAD review and all seven CI gates preceded squash merge.
+
+PR #1028 migrates the existing full-domain coarse/fine heat restart oracle away from handwritten
+producer/byte-order metadata. Three witnessed replays capture both fields, verify availability,
+record numerical-state parents and separately check execution-replay parents. The independent
+JVM evolution, uninterrupted six-step device baseline, mapped-file restore and conservation checks
+remain. Affected multilevel/state/capture tests pass 27 tests / 257 assertions; exact rebased-HEAD
+review and all seven gates preceded squash merge. Both fixtures explicitly use synthetic packaged
+build evidence and test providers/metadata, not release authentication or a production store.
+
+#### Item-8 integration in review: captured partial-patch restore
+
+The current strict `verify-restore!` compares complete producer provenance. Completed capture
+retains dynamic execution fingerprints, schedules and representation observations; predicting
+those from a target would either become circular or confuse producer and consumer programs.
+Keep the existing strict four-facet API unchanged. Do not copy incoming provenance into expected
+contracts, introduce arbitrary subset matching, or substitute the continuation artifact for its
+source producer.
+
+Use a fixed composed boundary instead: independently specified complete field/geometry, phase
+and numerical-policy semantics, plus an expectation derived from the original sealed source
+Prepared and ordered semantic output/post-state keys. Resolve field/node bindings through the
+retained source interface/effect evidence; share the existing frontier calculation rather than
+adding a second role/donation heuristic. Check exact program identity and ordered source/node
+bindings, and require each captured field-producer content reference to match its full-field chunk.
+Reject ambiguous public aliases because v1 capture retains nodes, not public keys. Check the
+selected dtype's measured representation kind, dtype, source program and normalized byte order
+against its stored chunk; these are internal consistency checks, not predictions of target facts.
+Keep dynamic replay and numerical-state parent evidence distinct and auditable. Matching these
+contracts remains consistency/compatibility, not authentication of an untrusted serialized claim.
+
+The branch migrates the existing partial-patch remap/restart fixture while preserving its independent
+layout/active-cell ordering, phase, wrong-same-extent rejection, host remap/evolution, mass and
+same-backend exact continuation oracles. Add negative source-artifact, field-binding and content
+counterexamples before any lease/upload. This slice remains unmerged pending final independent
+review and all seven exact-head CI gates. Device packing, scalable hierarchy validation,
+subcycling/reflux, external training migration and real fabric/device measurements remain open.
+
 This section supersedes historical "next" and "still required" statements below where the cited
 implementation now exists. It records evidence, not a declaration that the campaign is complete.
 The detailed local execution and preparation evidence is in

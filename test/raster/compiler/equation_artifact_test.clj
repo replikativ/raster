@@ -6,6 +6,7 @@
             [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as gpu-link]
@@ -42,6 +43,43 @@
   (let [output (float-array n)]
     (raster.par/map! output index n float
                      (raster.numeric/* factor (raster.arrays/aget input index)))))
+
+(deftm artifact-state!
+  [state :- (Array float) n :- Long] :- (Array float)
+  (raster.par/map-void! index n
+                        (raster.arrays/aset state index
+                                            (raster.numeric/+ (raster.arrays/aget state index) (float 1.0))))
+  state)
+
+(defn- reason-of [thunk]
+  (try (thunk) nil
+       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest completed-frontier-keeps-effect-event-prologue-density-decline-order
+  (let [c {:executable {:owns-session? true
+                        :plan {:outputs [:a]
+                               :nodes {:a {:view {:allocation {:ownership :owned}
+                                                  :shape [4] :strides [2]}}}}}
+           :lowering {:certificate {:effect-evidence
+                                    {:initialization {:requires #{:a} :initializers #{} :writes #{}}}}}}
+        checks (atom 0)
+        event-error (ex-info "pending event" {:reason :unit-pending-event})
+        run #(reason-of (fn [] (#'compiled/completed-frontier! c)))]
+    (with-redefs-fn {#'link-plan/retained-effect-evidence? (constantly false)
+                     #'compiled/require-no-evidence-events! (fn [_] (swap! checks inc) (throw event-error))}
+      #(is (= :compiled-evidence-initialization (run))))
+    (is (zero? @checks))
+    (with-redefs-fn {#'link-plan/retained-effect-evidence? (constantly true)
+                     #'compiled/require-no-evidence-events! (fn [_] (throw event-error))}
+      #(is (= :unit-pending-event (run))))
+    (with-redefs-fn {#'link-plan/retained-effect-evidence? (constantly true)
+                     #'compiled/require-no-evidence-events! (fn [_])
+                     #'gpu-link/execution-order (constantly {:record-time-prologue [:unit]})}
+      #(is (= :compiled-evidence-record-time-prologue (run))))
+    (with-redefs-fn {#'link-plan/retained-effect-evidence? (constantly true)
+                     #'compiled/require-no-evidence-events! (fn [_])
+                     #'gpu-link/execution-order (constantly {})}
+      #(is (= :compiled-evidence-noncontiguous (run))))))
 
 (deftest equation-first-cache-normalizes-only-equivalent-schedule-spellings
   (let [args [(float-array 4) 4]
@@ -91,10 +129,6 @@
 
 (defonce ^:private compilation
   (delay (equation-first/compile #'artifact-map {:target target :dtype :float})))
-
-(defn- reason-of [thunk]
-  (try (thunk) nil
-       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
 (defn- with-temporary-directory [f]
   (let [directory (Files/createTempDirectory "raster-equation-artifacts-"
@@ -296,6 +330,50 @@
                 (is (= :exact-bound-program (:scope a)))
                 (is (string? (:fingerprint a)))
                 (is (= a b) "host array identity and contents are deliberately not attested")
+                (let [interface (compiled/producer-interface p)
+                      updated (compiled/lower #'artifact-state! [(:default (first (:in-tree p))) 4]
+                                              (assoc options :donate '[state]))
+                      state-interface (compiled/producer-interface updated)
+                      shared (compiled/compose
+                              {:id :producer/shared-state
+                               :components [{:id :update :program updated} {:id :forward :program p}]
+                               :mutable-shares [{:owner [:update :state] :borrowers [[:forward input]]
+                                                 :output [:update :state']}]
+                               :outputs [{:key :updated :from [:update :state']}
+                                         {:key :prediction :from [:forward output]}]})
+                      shared-interface (compiled/producer-interface shared)]
+                  (is (= :raster.compiled/producer-interface-v1 (:kind interface)))
+                  (is (= (select-keys a [:scope :fingerprint]) (:program interface)))
+                  (is (= interface (compiled/producer-interface q)))
+                  (is (= [(select-keys (first (:out-tree p)) [:key :node :dtype :shape])]
+                         (:outputs interface)))
+                  (is (empty? (:post-state interface)) "read-only input roots are not mutable state")
+                  (is (= [(select-keys (first (:in-tree updated)) [:key :node :dtype :shape])]
+                         (:post-state state-interface)))
+                  (is (= [:updated :prediction] (mapv :key (:outputs shared-interface))))
+                  (is (= [[:update :state]] (mapv :key (:post-state shared-interface))))
+                  (is (not-any? #(= [:forward input] (:key %)) (:post-state shared-interface))
+                      "mutable borrowers do not become independent public post-state ports")
+                  (is (= :compiled-execution-identity-owner
+                         (reason-of #(compiled/producer-interface (assoc p :target (:target p))))))
+                  (is (= :compiled-producer-prepared
+                         (reason-of #(compiled/producer-interface {})))))
+                (let [interface (compiled/producer-interface connected)]
+                  (is (= [(select-keys (first (:out-tree connected)) [:key :node :dtype :shape])]
+                         (:outputs interface)))
+                  (is (= [:result] (mapv :key (:outputs interface))))
+                  (is (empty? (:post-state interface)))
+                  (is (not-any? #(= [:a output] (:key %)) (:outputs interface))
+                      "connected component outputs are not public composition exports"))
+                ;; The real composition boundary already rejects duplicate output nodes.
+                ;; Restore independently rejects aliases too, rather than relying on this
+                ;; upstream invariant for every future public-port source.
+                (is (= :link-output-duplicates
+                       (reason-of #(compiled/compose
+                                    {:id :producer/aliased
+                                     :components [{:id :a :program p}]
+                                     :outputs [{:key :first :from [:a output]}
+                                               {:key :second :from [:a output]}]}))))
                 (is (false? (:attests-input-bytes? a)))
                 (with-redefs [gpu-link/instantiate-certified! (fn [& _] ::bound-executable)
                               gpu-link/instantiate! (fn [& _] ::independently-bound-executable)]

@@ -31,6 +31,17 @@
                                    [out initial nx ny alpha dt (double (* nx nx)) (double (* ny ny))]
                                    {:target target :compiler :equation-first :dtype :double
                                     :inline? true :outputs '[out]})
+          foreign (compiled/lower #'pde/periodic-heat-step-2d!
+                                  [(double-array n) initial nx ny alpha (* 2 dt)
+                                   (double (* nx nx)) (double (* ny ny))]
+                                  {:target target :compiler :equation-first :dtype :double
+                                   :inline? true :outputs '[out]})
+          semantics {:fields [{:id :temperature :value (av/tensor {:dtype :double :shape [n]})
+                               :coordinate-space {:grid-shape [nx ny] :boundary :periodic}}]
+                     :logical-coordinate {:step 1 :time dt}
+                     :numerical-contract {:mode :ieee-fp64 :determinism :toleranced
+                                          :compatibility-id "periodic-heat-capture-v1"}}
+          specs [{:id :temperature :source :outputs :key (:key (first (:out-tree prepared)))}]
           node (first (:outputs (compiled/plan prepared)))
           input-key (:key (first (filter #(and (= :input (:role %)) (= 'u (:sym %)))
                                          (:in-tree prepared))))
@@ -60,6 +71,17 @@
                                  (get-in result [:state :manifest :provenance :bound-schedules])))
                           (is (= 1 @(:output-leases (:executable c))))
                           (is (near? (vec first-host) (vec (link/download (:executable c) node))))
+                          (is (identical?
+                               (:state result)
+                               (resident/verify-restore!
+                                (:state result)
+                                semantics prepared specs)))
+                          (is (not= (compiled/execution-identity prepared)
+                                    (compiled/execution-identity foreign)))
+                          (is (= :resident-state-producer-program
+                                 (:reason (ex-data (#'unit/error-of
+                                                    #(resident/verify-restore!
+                                                      (:state result) semantics foreign specs))))))
                           (assoc result ::first-values (vec (link/download (:executable c) node)))))]
                   (compiled/invoke-compiled c {input-key (double-array (::first-values result))})
                   (assoc result ::uninterrupted (vec (link/download (:executable c) node))))

@@ -331,19 +331,17 @@
              :numerical-state-certificate {:expected expected :actual certificate}))
     certified))
 
-(defn restore-contract
-  "Validate a caller's expected semantic state boundary, independently of checkpoint bytes.
+(defn restore-semantics
+  "Validate the closed field/coordinate/numerical portion of an independent restore intent.
 
-   Fields name target AbstractValues and coordinate spaces. The complete field set, logical
-   coordinate, numerical contract and producer provenance must agree; this conservative policy
-   introduces no implicit migration or numerical-equivalence claims. Chunk partition, content,
-   storage tier, placement and ownership are not restore semantics. The caller must derive this
-   expectation from the intended continuation, not blindly copy the incoming manifest."
-  [{:keys [fields logical-coordinate numerical-contract provenance] :as contract}]
+   This is not a complete restore or producer check. Runtime captured-state restoration composes
+   this with a source-artifact producer check; ordinary restore-contract remains strict about
+   complete provenance. No caller-selected subset of semantic facets is supported."
+  [{:keys [fields logical-coordinate numerical-contract] :as contract}]
   (when-not (map? contract)
     (fail! "restore contract must be a map" :numerical-state-restore-contract {}))
   (exact-keys! "restore contract" :numerical-state-restore-contract-fields contract
-               #{:fields :logical-coordinate :numerical-contract :provenance})
+               #{:fields :logical-coordinate :numerical-contract})
   (when-not (and (vector? fields) (seq fields) (every? map? fields))
     (fail! "restore contract requires a complete non-empty target field vector"
            :numerical-state-restore-fields {}))
@@ -363,7 +361,6 @@
     (fail! "restore requires an explicit expected logical coordinate"
            :numerical-state-logical-coordinate {}))
   (validate-numerical-contract! numerical-contract)
-  (validate-provenance! provenance)
   (let [contract (assoc contract :fields
                         (mapv (fn [{:keys [id value coordinate-space]}]
                                 {:id id :coordinate-space coordinate-space
@@ -373,11 +370,51 @@
     (semantic-fingerprint/canonical-bytes contract)
     contract))
 
+(defn restore-contract
+  "Validate a complete independently supplied restore boundary, including exact provenance.
+
+   Fields, logical coordinate, numerical policy and complete producer provenance must agree.
+   Chunk partition/content/placement are not restore semantics. Derive this from the intended
+   continuation, never blindly copy incoming manifest metadata. No implicit migration is allowed."
+  [{:keys [provenance] :as contract}]
+  (when-not (map? contract)
+    (fail! "restore contract must be a map" :numerical-state-restore-contract {}))
+  (exact-keys! "restore contract" :numerical-state-restore-contract-fields contract
+               #{:fields :logical-coordinate :numerical-contract :provenance})
+  (let [semantics (restore-semantics (dissoc contract :provenance))]
+    (validate-provenance! provenance)
+    (let [contract (assoc semantics :provenance provenance)]
+      (semantic-fingerprint/canonical-bytes contract)
+      contract)))
+
 (defn- restore-field-contracts [fields]
   (into {}
         (map (fn [{:keys [id value coordinate-space]}]
                [id {:storage (abstract-value/storage-contract value)
                     :shape (mapv bigint (:shape value)) :coordinate-space coordinate-space}])) fields))
+
+(defn- require-matching-restore-facet! [facet expected actual]
+  (when-not (semantic-fingerprint/equivalent? expected actual)
+    (fail! "numerical snapshot does not match the intended restore boundary"
+           :numerical-state-restore-incompatible
+           {:facet facet :expected expected :actual actual})))
+
+(defn- compare-restore-semantics! [manifest expected]
+  (require-matching-restore-facet! :fields
+                                   (restore-field-contracts (:fields expected))
+                                   (restore-field-contracts (:fields manifest)))
+  (doseq [facet [:logical-coordinate :numerical-contract]]
+    (require-matching-restore-facet! facet (get expected facet) (get manifest facet))))
+
+(defn verify-restore-semantics!
+  "Verify the state and the fixed complete semantic boundary, but not producer compatibility.
+
+   This deliberately does not accept a provenance policy or arbitrary facet selector. Use the
+   composed captured-state runtime verifier or strict verify-restore! before opening bytes."
+  [certified expected]
+  (verify! certified)
+  (compare-restore-semantics! (:manifest certified) (restore-semantics expected))
+  certified)
 
 (defn verify-restore!
   "Verify the snapshot and require its semantics to match an independently supplied target.
@@ -390,13 +427,7 @@
   [certified expected]
   (verify! certified)
   (let [expected (restore-contract expected)
-        manifest (:manifest certified)
-        actual (assoc (select-keys manifest [:logical-coordinate :numerical-contract :provenance])
-                      :fields (restore-field-contracts (:fields manifest)))
-        expected (update expected :fields restore-field-contracts)]
-    (doseq [facet [:fields :logical-coordinate :numerical-contract :provenance]]
-      (when-not (semantic-fingerprint/equivalent? (get expected facet) (get actual facet))
-        (fail! "numerical snapshot does not match the intended restore boundary"
-               :numerical-state-restore-incompatible
-               {:facet facet :expected (get expected facet) :actual (get actual facet)})))
+        manifest (:manifest certified)]
+    (compare-restore-semantics! manifest expected)
+    (require-matching-restore-facet! :provenance (:provenance expected) (:provenance manifest))
     certified))
