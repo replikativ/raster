@@ -155,6 +155,21 @@
     (is (= :kernel-precondition-failed (reason-of #(check 2))))
     (is (true? (check 4)))))
 
+(deftest known-static-map-capacity-is-not-increased-by-a-read-requirement
+  (let [options {:dtype :float :target-device :ocl:0 :array-types {'x :float}
+                 :scalar-types {'n :long}
+                 :values {'x (av/tensor {:dtype :float :shape [3]})}}
+        typed (frontend/form->program
+               '(let* [result (raster.par/pmap i n float (aget x i))] result) options)
+        scheduled (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))
+        graph (:graph (equation-graph/make-for-equation scheduled (first (:equations scheduled))))
+        check #(precondition/check! (:preconditions graph)
+                                    (partial graph-call/resolve-integer {'n {:type :long :value %}}))]
+    (is (= 3 (:elements (first (:inputs graph)))))
+    (is (= [{:expression 3 :op :>= :value 'n}] (:preconditions graph)))
+    (is (true? (check 3)))
+    (is (= :kernel-precondition-failed (reason-of #(check 4))))))
+
 (deftest address-projection-recomputes-the-proof-and-requires-graph-capacity
   (let [scheduled (scheduled-three-maps)
         {:keys [graph]} (equation-graph/make-for-equation
@@ -250,6 +265,33 @@
     (is (= :typed-soac (get-in report [:route :source-dialect])))
     (is (= {:kernel-body 4} (get-in report [:emission :routes])))
     (is (empty? (get-in report [:route :declines])))))
+
+(deftest segmented-plan-public-capacity-keeps-descriptor-owned-minima
+  (let [program (indexed-plan-program)
+        equation (first (:equations program))
+        plan (:algorithm equation)
+        descriptors (conj (:operands plan) (:output plan))
+        capacity-program (reduce (fn [program {:keys [id]}]
+                                   (assoc-in program [:values id :shape] [(list 'extent id)]))
+                                 program descriptors)
+        graph (:graph (equation-graph/make-for-plan-equation capacity-program equation))]
+    (is (= (mapv swr/descriptor-launch-elements (:operands plan))
+           (mapv :elements (:inputs graph))))
+    (is (= (swr/descriptor-launch-elements (:output plan))
+           (get-in graph [:outputs 0 :elements])))
+    (is (= :segmented-plan-equation-boundary
+           (reason-of #(equation-graph/make-for-plan-equation
+                        (assoc-in capacity-program [:values (first (:results equation)) :shape]
+                                  [(list 'extent (first (:results equation)))])
+                        equation)))
+        "only backing storage, never the logical result, may use self-capacity")
+    (doseq [damaged [(assoc-in capacity-program [:values (get-in plan [:operands 0 :id]) :dtype] :double)
+                     (assoc-in capacity-program [:values (get-in plan [:operands 0 :id]) :representation]
+                               {:kind :quantized :scheme :q4-k})
+                     (assoc-in capacity-program [:values (get-in plan [:operands 0 :id]) :shape]
+                               '[(extent unrelated)])]]
+      (is (= :segmented-plan-equation-boundary
+             (reason-of #(equation-graph/make-for-plan-equation damaged equation)))))))
 
 (deftest segmented-plan-forms-one-exact-schedule-neutral-source-graph
   (let [parallel-program (indexed-plan-program)

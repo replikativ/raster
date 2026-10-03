@@ -301,6 +301,13 @@
                (extent/equivalent? value required)))
         conditions))
 
+(defn graph-capacity-covers?
+  "Whether a validated graph enforces a proved read minimum, structurally or by
+   an explicit checked capacity guard. This does not prove source indices."
+  [capacity required conditions]
+  (or (capacity-covers? capacity required)
+      (precondition-covers? conditions capacity required)))
+
 (defn- address-substitutions
   [locals expression]
   ;; A scalar region may contain large decoded/quantized values that have no bearing on this
@@ -405,9 +412,7 @@
                               (:temporaries kernel-graph)))
         _ (doseq [[id required] (:requirements attached)]
             (let [capacity (:elements (get buffers id))]
-              (when-not (or (capacity-covers? capacity required)
-                            (precondition-covers? (:preconditions kernel-graph)
-                                                 capacity required))
+              (when-not (graph-capacity-covers? capacity required (:preconditions kernel-graph))
                 (throw (ex-info "graph buffer does not enforce the certified map read span"
                                 {:reason :map-address-certificate-capacity
                                  :buffer id :required required :capacity capacity})))))

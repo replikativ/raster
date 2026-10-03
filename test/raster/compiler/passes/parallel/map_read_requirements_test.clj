@@ -7,6 +7,16 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.map-read-requirements :as requirements]))
 
+(deftest graph-minimum-requires-structural-capacity-or-the-exact-checked-guard
+  (is (requirements/graph-capacity-covers? 8 4 []))
+  (is (requirements/graph-capacity-covers? 'capacity 'n
+                                           [{:expression 'capacity :op :>= :value 'n}]))
+  (doseq [conditions [[]
+                      [{:expression 'other :op :>= :value 'n}]
+                      [{:expression 'capacity :op :<= :value 'n}]
+                      [{:expression 'capacity :op :>= :value 'other}]]]
+    (is (not (requirements/graph-capacity-covers? 'capacity 'n conditions)))))
+
 (deftest source-read-rewriting-keeps-embedded-compiler-records-opaque
   (let [certificate (scan/->AssociativeScan 'acc 0.0 '+ '(aget input i) 0.0 :float)
         expression (list 'pair certificate '(aget input i))

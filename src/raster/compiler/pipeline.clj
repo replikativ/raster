@@ -843,10 +843,8 @@
    coverage decline preserves the original source and remains visible beside any later TypedSOAC
    decline; certified contradictions are never converted into fallback."
   [source opts abstract-machine]
-  (let [;; Public physical storage capacity is not its first read/write traversal.
-        ;; Seed the fact after SoA replacement, before either semantic frontend.
-        ;; Concrete arguments remain absent from compilation and cache identity;
-        ;; scheduled read/write requirements still check each runtime capacity.
+  (let [;; A public array's backing capacity is independent of each traversal.
+        ;; Semantic owners must prove their logical access footprint separately.
         values (merge (when (device/gpu-target? (:target-device opts))
                         (into {} (map (fn [[parameter t]]
                                         [parameter (abstract-value/tensor

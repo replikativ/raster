@@ -583,14 +583,13 @@
           (map vector operations read-capacity-certificates))
          buffer-specs (reduce-kv
                        (fn [specs id requirements]
-                         (let [extents (vec (distinct
-                                             (cond-> requirements
-                                               (not (unresolved-capacity?
-                                                     id (get values id) (get-in specs [id :elements])))
-                                               (conj (get-in specs [id :elements])))))
-                               required (if (= 1 (count extents)) (first extents)
-                                            (apply launch/maximum extents))]
-                           (assoc-in specs [id :elements] required)))
+                         (if (not (unresolved-capacity?
+                                    id (get values id) (get-in specs [id :elements])))
+                           specs
+                           (let [extents (vec (distinct requirements))
+                                 required (if (= 1 (count extents)) (first extents)
+                                              (apply launch/maximum extents))]
+                             (assoc-in specs [id :elements] required))))
                        buffer-specs read-requirements)
          ;; An aliased destination can have unknown capacity while the typed result has a
          ;; precise written extent (e.g. an exclusive scan writes n+1 elements). That semantic
@@ -611,8 +610,9 @@
                            specs))
                        buffer-specs result-storage-values)
          capacity-preconditions
-         (->> read-capacity-certificates
-              (mapcat (comp seq :requirements))
+         (->> (concat (mapcat (comp seq :requirements) read-capacity-certificates)
+                      (mapcat (fn [[id requirements]] (map #(vector id %) requirements))
+                              read-requirements))
               (keep (fn [[id required]]
                       (let [capacity (get-in buffer-specs [id :elements])]
                         (when-not (map-reads/capacity-covers? capacity required)

@@ -16,6 +16,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.index-expression :as index-expression]
+            [raster.compiler.passes.parallel.map-read-requirements :as read-requirements]
             [raster.compiler.passes.parallel.product-reduction-regions :as regions]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
@@ -327,20 +328,16 @@
                                         (:equations scheduled-body)))
         buffers (into {} (map (juxt :id identity))
                       (concat (:inputs kernel-graph) (:outputs kernel-graph)
-                              (:temporaries kernel-graph)))
-        covers? (fn covers? [capacity required]
-                  (or (= capacity required)
-                      (and (= "raster.compiler.ir.kernel_launch.Maximum"
-                              (some-> capacity class .getName))
-                           (some #(covers? % required) (:values capacity)))))]
+                              (:temporaries kernel-graph)))]
     ;; Optional graph refinement can decline while scalar lowering later succeeds. Admission
     ;; must therefore check the resulting capacity, not assume the optional step ran. Exact
-    ;; equality or membership in a checked maximum suffices for this graph projection; do not
-    ;; invent a general symbolic inequality from guessed positivity or stripped casts.
+    ;; capacity evidence or an explicit checked guard suffices; never invent an inequality
+    ;; from guessed positivity or stripped casts. Share the map owner's guard interpretation.
     (doseq [[id extent] requirements
             :let [required (launch/rebind-expression extent scalar-definitions)
                   capacity (:elements (get buffers id))]]
-      (when-not (covers? capacity required)
+      (when-not (read-requirements/graph-capacity-covers?
+                 capacity required (:preconditions kernel-graph))
         (decline! :graph-read-capacity "product graph does not cover its typed read requirement"
                   {:input id :required required :capacity capacity})))
     ;; Replaying graph construction above derives these minima from the same typed loads; it

@@ -5436,6 +5436,9 @@
   (let [[_ _ results] equation
         {:keys [kind attributes arrays captures destinations]} (dialect/operation-parts equation)
         result-destinations (zipmap results destinations)
+        array-types (merge (into {} (map (juxt :value :dtype))
+                                 (get-in attributes [:result-transform :operands]))
+                           array-types)
         extent (:extent attributes)
         dimension-ids (set (filter dialect/value-id? (dialect/operation-extents equation)))
         dimension-value
@@ -5567,16 +5570,22 @@
   "Project the exact logical and physical tensor contracts already carried by a protected plan.
    Runtime scalars remain ordinary source scalar values and are checked below; this helper neither
    infers their types nor changes the plan's storage layout."
-  [{:keys [sym plan]}]
+  [{:keys [sym plan]} known-values]
   (let [plan (swr/validate! plan)
         output (:output plan)]
     ;; Source arrays are flat contiguous buffers. Mathematical rank remains authoritative in the
     ;; plan; the shared boundary checks the exact physical footprint without teaching pmap a
     ;; second tensor layout convention.
     (into {sym (tensor-value (:dtype output) [(:elements output)])
-           (:id output) (tensor-value (:dtype output) [(:elements output)])}
+           (:id output) (let [known (get known-values (:id output))]
+                          (if (= [(list 'extent (:id output))] (:shape known))
+                            known
+                            (tensor-value (:dtype output) [(:elements output)])))}
           (map (fn [{:keys [id dtype elements]}]
-                 [id (tensor-value dtype [elements])]))
+                 [id (let [known (get known-values id)]
+                       (if (= [(list 'extent id)] (:shape known))
+                         known
+                         (tensor-value dtype [elements])))]))
           (:operands plan))))
 
 (defn- merge-value
@@ -5864,7 +5873,7 @@
               inferred-values
               (reduce (fn [contracts description]
                         (reduce-kv #(merge-value %1 %2 %3 shape-equalities) contracts
-                                   (swr-description-values description)))
+                                   (swr-description-values description values)))
                       inferred-values swr-descriptions)
               values (reduce-kv #(merge-value %1 %2 %3 shape-equalities)
                                 inferred-values values)

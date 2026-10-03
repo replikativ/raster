@@ -10,6 +10,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -332,8 +333,10 @@
   (let [context #(graph-context true {:shape [1]} nil
                                 (assoc (:scalar-types options) 'alpha :float) false true)
         {:keys [algorithm body graph node]} (context)]
-    (is (= (launch/maximum (launch/product 'nrows 'width) 1)
-           (get-in graph [:inputs 0 :elements])))
+    (is (= 1 (get-in graph [:inputs 0 :elements])))
+    (is (some #{{:expression 1 :op :>= :value (launch/product 'nrows 'width)}}
+              (:preconditions graph))
+        "the declared capacity stays authoritative; a checked guard enforces the read span")
     (is (false? (get-in (product/schedule-for-node node graph algorithm body)
                         [:attributes :candidate-only])))
     (with-redefs-fn
@@ -351,10 +354,9 @@
   (let [{:keys [algorithm body graph node]} (graph-context true {:shape [1]})
         candidate (product/schedule (:operation node)
                                     (product/graph-options node graph algorithm body))]
-    ;; Required storage is now the maximum of the AV contract and the proven dense read.
+    ;; A capacity and its checked read-span guard do not prove arbitrary source indices.
     ;; This still does not authorize production or bypass the runtime buffer-capacity check.
-    (is (= (launch/maximum (launch/product 'nrows 'width) 1)
-           (get-in graph [:inputs 0 :elements])))
+    (is (= 1 (get-in graph [:inputs 0 :elements])))
     (is (= candidate (product/validate-against-node! candidate node graph algorithm body)))
     (is (true? (get-in candidate [:attributes :candidate-only])))
     (is (false? (get-in candidate [:attributes :source-storage-certified?])))))
@@ -362,13 +364,16 @@
 (deftest derived-read-capacity-is-a-checked-minimum
   (doseq [shape [[1] [4096]]]
     (let [{:keys [graph]} (graph-context true {:shape shape})
-          required (get-in graph [:inputs 0 :elements])]
-      (is (= (max (first shape) 12)
-             (launch/resolve-expression {'nrows 3 'width 4} required)))
+          capacity (get-in graph [:inputs 0 :elements])
+          check #(precondition/check! (:preconditions graph) %)]
+      (is (= (first shape) capacity))
+      (if (= [1] shape)
+        (is (thrown? clojure.lang.ExceptionInfo (check {'nrows 3 'width 4})))
+        (is (true? (check {'nrows 3 'width 4}))))
       (is (= (first shape)
-             (launch/resolve-expression {'nrows 0 'width 4} required)))
+             (launch/resolve-expression {'nrows 0 'width 4} capacity)))
       (is (thrown? ArithmeticException
-                   (launch/resolve-expression {'nrows Long/MAX_VALUE 'width 2} required))))))
+                   (check {'nrows Long/MAX_VALUE 'width 2}))))))
 
 (deftest shared-product-input-keeps-every-derived-read-requirement
   (let [{:keys [body node]} (graph-context false)

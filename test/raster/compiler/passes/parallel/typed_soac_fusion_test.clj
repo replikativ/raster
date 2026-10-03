@@ -433,7 +433,8 @@
 
 (defn- contract-result-map-program
   ([map-expression] (contract-result-map-program map-expression 'D))
-  ([map-expression destination]
+  ([map-expression destination] (contract-result-map-program map-expression destination {}))
+  ([map-expression destination options]
   (frontend/form->program
    (list 'let*
          ['contract-step
@@ -444,9 +445,26 @@
           'map-step
           (list 'raster.par/map! destination 't 32 nil map-expression)]
          'map-step)
-   {:dtype :float
+   (merge {:dtype :float
     :array-types '{A :float B :float C :float D :float bias :float residual :float}
-    :scalar-types '{scale :float}})))
+    :scalar-types '{scale :float}} options))))
+
+(deftest result-map-stable-storage-requires-the-complete-producer-axis-map
+  (doseq [[index fused?] [['t true] ['(mod t 8) false] ['(inc t) false]]]
+    (let [read (with-meta (list 'clojure.core/aget 'C index)
+                         {:raster.type/tag 'Float :raster.op/original 'clojure.core/aget})
+          program (contract-result-map-program
+                   (list 'max '(float 0.0) read) 'D
+                   {:values {'C (av/tensor {:dtype :float :shape '[(extent C)]})}})
+          [result stats] (typed-fusion/fusion-fixpoint program)]
+      (is (= (if fused? 1 0) (:vertical stats)))
+      (is (= (if fused? 1 2) (count (dialect/equations result))))
+      (is (= result (dialect/validate! result)))))
+  (let [read (with-meta '(clojure.core/aget bias t)
+                       {:raster.type/tag 'Float :raster.op/original 'clojure.core/aget})
+        rewritten (#'typed-fusion/erase-axis-mapped-load-indices read #{'bias})]
+    (is (= '(clojure.core/aget bias 0) rewritten))
+    (is (= (meta read) (meta rewritten)))))
 
 (defn- map-initialized-contract-program
   ([initializer-expression]

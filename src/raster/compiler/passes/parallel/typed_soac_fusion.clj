@@ -731,13 +731,11 @@
    disagree with the schedule.  The placeholder is intentionally inert; scalar-region lowering
    never consumes it."
   [expression operand-values]
-  (walk/postwalk
+  (descriptor/rewrite-aget-reads
+   expression
    (fn [form]
-     (if (and (descriptor/aget-call? form)
-              (contains? operand-values (descriptor/aget-array-sym form)))
-       (list 'clojure.core/aget (descriptor/aget-array-sym form) 0)
-       form))
-   expression))
+     (when (contains? operand-values (descriptor/aget-array-sym form))
+       (descriptor/rewrite-aget-index form 0)))))
 
 (defn- result-map-transform
   "Translate one pointwise map region into a typed post-reduction scalar region.
@@ -770,6 +768,19 @@
         capture-values (into {} (map (fn [[value parameter]] [parameter value])
                                      capture-bindings))
         stable-bindings (filterv #(contains? stable-values (first %)) capture-bindings)
+        ;; A public backing buffer remains a stable capture even when a preceding
+        ;; producer wrote a logical result into it. Substitute the accumulator
+        ;; only when every read follows the producer's complete output AxisMap.
+        consumed-binding (first (filter #(= consumed-value (first %)) stable-bindings))
+        consumed-parameter (second consumed-binding)
+        consumed-reads (filter #(= consumed-parameter (:sym %)) reads)
+        consumed-capture? (and consumed-binding (seq consumed-reads)
+                               (every? #(= output-map
+                                           (axis-map/flat-index->map
+                                            (util/subst-syms capture-values (:idx %))
+                                            map-index segment-axes))
+                                       consumed-reads))
+        stable-bindings (filterv #(not= consumed-value (first %)) stable-bindings)
         scalar-bindings (remove #(contains? stable-values (first %)) capture-bindings)
         indexed-operands
         (mapv (fn [[value parameter]]
@@ -803,6 +814,13 @@
                elements))
         capture-substitutions (into {} (map (fn [[value parameter]] [parameter value])
                                             capture-bindings))
+        expression (if consumed-capture?
+                     (descriptor/rewrite-aget-reads
+                      expression
+                      (fn [form]
+                        (when (= consumed-parameter (descriptor/aget-array-sym form))
+                          accumulator)))
+                     expression)
         expression (->> expression
                         (util/subst-syms (merge element-substitutions
                                                 capture-substitutions
@@ -819,7 +837,7 @@
                   (and extent-witness (not-any? #(= extent-witness (:value %)) scalars))
                   (conj {:value extent-witness :dtype :long}))]
     (when (and (or (= output-extent consumer-extent) extent-witness)
-               (= 1 (count consumed-indices))
+               (= 1 (+ (count consumed-indices) (if consumed-capture? 1 0)))
                (every? some? indexed-operands)
                (every? :dtype operands)
                (every? :dtype scalars)
@@ -1084,7 +1102,10 @@
                  (cond-> #{consumed-destination}
                    (symbol? producer-host-binding) (conj producer-host-binding))
                  consumed-values
-                 (vec (filter attested-consumed-values (:arrays consumer)))
+                 (vec (filter attested-consumed-values
+                              (concat (:arrays consumer)
+                                      (filter (stable-array-captures consumer)
+                                              (:captures consumer)))))
                  consumed-value (when (= 1 (count consumed-values))
                                   (first consumed-values))
                  consumer-result (first (:results consumer))
@@ -1106,7 +1127,8 @@
            :when (not (contains? (set (dialect/outputs program)) produced))
            :when (not (contains? (set (dialect/outputs program)) consumed-destination))
            :when (not (contains? (set (dialect/outputs program)) consumed-value))
-           :when (= 1 (count (filter #(= consumed-value %) (:arrays consumer))))
+           :when (= 1 (count (filter #(= consumed-value %)
+                                    (concat (:arrays consumer) (:captures consumer)))))
            :when (single-write-boundary? facts (:id producer) produced consumed-destination :write)
            :when (single-write-boundary? facts (:id consumer) consumer-result
                                          consumer-destination
