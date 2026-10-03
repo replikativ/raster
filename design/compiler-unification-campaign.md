@@ -2359,12 +2359,18 @@ teardown uses the same private consumption path without treating an already reti
 error as remaining native debt. Public poll/await/release now admit through scoped session use,
 preventing callback/watch reentry into buffer or session lifetime mutation.
 
-The review-fix fault suite passes 11 tests / 159 assertions, including caught/uncaught native and
+The review-fix fault suite passes 12 tests / 166 assertions, including caught/uncaught native and
 cleanup-publication watch reentry and known-await-failure session teardown. An uncaught cleanup
 publication watch retains its exact owner and root pin before backend contact; this is fail-closed
 retention, not a general recovery guarantee for arbitrary throwing watches. The 182-test /
 1,898-assertion ownership suite also passes after these fixes. Final review and exact-head CI are
 still required; live reset admission remains deliberately unchanged.
+
+Host-lease handoff follows the entire successful construction transaction, not merely native
+submission return. A final construction-marker watch can still reject submission after backend
+success: rollback retires the backend token but leaves host leases caller-owned, removes known
+retired event debt, and preserves the exact primary error. No fallible publication or callback
+follows the private host-ownership handoff. The dedicated regression exercises this boundary.
 
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates

@@ -1602,8 +1602,6 @@
                                           {:adopt-cleanup! #(vreset! backend-state {:kind :debt :owner %})})]
                                (vreset! backend-state {:kind :token :token token})
                                (vreset! submit-return-ns (System/nanoTime))
-                 ;; A throwing backend submission leaves host leases with the caller.
-                               (vreset! host-owned? true)
                                {}))
              ;; The exact event entry is already the session's durable cleanup sink.
                            (fn [_] nil))
@@ -1613,6 +1611,10 @@
                         (identical? entry (get-in @sess [:events event-id])))
                (swap! sess update :events dissoc event-id))
              (throw primary)))
+         ;; Commit host ownership only after the complete construction transaction succeeds,
+         ;; including marker retirement. A throwing submission leaves leases with the caller.
+         ;; No fallible publication or callback may follow this private handoff.
+         (vreset! host-owned? true)
          event)))))
 
 (defn submit-upload-ranges!

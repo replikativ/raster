@@ -183,6 +183,35 @@
             (is (= 1 @closed))
             (is (empty? (:events @session)))))))))
 
+(deftest construction-marker-retirement-failure-keeps-host-lease-with-caller
+  (with-transfer {}
+    (fn [{:keys [state calls]}]
+      (with-session-transfer
+        (fn [session]
+          (let [primary (ex-info "marker retirement rejected" {})
+                closed (atom 0)
+                watched-owner (atom nil)
+                lease (reify AutoCloseable (close [_] (swap! closed inc)))]
+            (add-watch session :observe-transfer-owner
+                       (fn [_ _ _ next-state]
+                         (when-let [owner (::cleanup/owner (first (vals (:events next-state))))]
+                           (when (compare-and-set! watched-owner nil owner)
+                             (add-watch (:state owner) :reject-marker-retirement
+                                        (fn [_ _ previous next-state]
+                                          (when (and (::cleanup/construction-token previous)
+                                                     (nil? (::cleanup/construction-token next-state)))
+                                            (throw primary))))))))
+            (is (identical? primary
+                            (error-of #(gpu/submit-upload-ranges-retained!
+                                        session [[:out (float-array [1 2]) {:elements 2}]] [lease]))))
+            (is (some #{"clFlush"} @calls) "backend submission returned before marker retirement")
+            (is (some #{"clReleaseEvent"} @calls) "rollback still retires backend ownership")
+            (is (zero? (root/lease-count state)))
+            (is (empty? (:events @session)))
+            (is (zero? @closed) "throwing submission never owns the caller's host lease")
+            (.close lease)
+            (is (= 1 @closed))))))))
+
 (deftest await-operation-errors-do-not-prevent-backend-or-host-retirement
   (doseq [fail-release? [false true] failure [:wait :profile]]
     (with-transfer {(if (= failure :wait) :fail-wait? :fail-profile?) true
