@@ -1799,12 +1799,35 @@ Live profiled/unprofiled graph replay remains numerically checked on both local 
 older Level Zero record/replay/destroy definitions are removed. Direct backend users must establish
 submission completion before destroying a recording; common session teardown drains tracked events.
 
-OpenCL recording/per-replay profiling ownership is still the next required slice: partial enqueue
-must prove queue completion before releasing referenced kernels/views, and event arenas must survive
-unresolved event release. This slice does not close that gap or the remaining descriptor/root-owner
-consolidation, and does not establish performance under varying laptop power/background load.
+The Level Zero slice alone does not close OpenCL per-replay ownership, descriptor/root-owner
+consolidation or establish performance under varying laptop power/background load.
 
-This is not complete native reclamation. Legacy descriptor bindings, backend recording/view/event
+#### OpenCL recording and per-replay ownership
+
+OpenCL recordings reserve their profiling queue and one retained submission dependency. Each replay,
+ordinary or profiled, installs a nested owner before enqueue. Its dependency plan proves queue
+completion before event release, and releases every event before closing the pointer arena. A
+successful wait/query records completion so subsequent cleanup does not add an unnecessary finish.
+If enqueue/flush fails before a public completion token exists, the recording still owns the partial
+submission. An unknown drain blocks every dependent resource. Independent event releases may proceed
+after successful drain; failed event release retains its arena and profiling queue, and the common
+recording dependency keeps prepared kernels and resident roots alive. No unknown native operation is
+automatically retried.
+
+Timestamp reads validate the nested owner as well as the recording: a retained vector must not
+permit queries on events already released by a partially failed cleanup. Nonempty graph tokens
+cannot fall back to legacy release if their owner is missing. Transfers and empty-completion tokens
+retain their existing contracts. Timestamp/await errors stay primary when cleanup also fails.
+Raw backend callers still must serialize graph use/destruction; common sessions use their lock.
+
+Hardware-free production fault tests cover partial enqueue, flush, unknown drain, queue creation,
+independent event release, retained arenas, missing-owner tokens and timestamp access after partial
+destruction. A common-session regression proves failed submission without a public event cannot free
+the graph's prepared kernels or roots. Live profiled/unprofiled replay and storage/transfer oracles
+remain separate checks. Ownership adds replay bookkeeping; performance acceptance remains pending
+stable power/load measurements, not inferred from these correctness tests.
+
+This is not complete native reclamation. Legacy descriptor bindings/recording wrappers, backend view/event
 partial constructors and destruction, asynchronous-event failure cleanup, root-buffer/arena failure
 retention, and linked-wrapper close remain acceptance work. In particular native graph destructors
 still contain swallowed-error debt, and general legacy concurrent operations are not certified by

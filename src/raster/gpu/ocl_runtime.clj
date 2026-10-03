@@ -1514,36 +1514,55 @@
   (enqueue-bound! (:bound prepared) (:group-count prepared))
   (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
 
+(declare clear-submission!)
+
+(defn- checked-event-handle [handle]
+  (when (or (nil? handle) (.equals MemorySegment/NULL handle))
+    (throw (ex-info "OpenCL acquisition returned no native handle"
+                    {:reason :invalid-native-recording-handle})))
+  handle)
+
+(defn- acquire-profile-queue! [slot]
+  (let [{:keys [context device]} @state]
+    (with-open [arena (Arena/ofConfined)]
+      (let [err-seg (.allocate arena I32)]
+        (cleanup/acquire-native! slot
+          (fn []
+            (let [queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
+                                              (into-array Object
+                                                          [context device CL_QUEUE_PROFILING_ENABLE err-seg]))]
+              (when-not (= CL_SUCCESS (read-int err-seg))
+                (throw (ex-info "clCreateCommandQueue(profile) failed" {:error (read-int err-seg)})))
+              (checked-event-handle queue))))))))
+
 (defn record-graph!
   "OpenCL 'graph': capture the ordered pre-bound launches for replay. The
   in-order queue serializes them (= ze per-kernel barriers). Profiling is opt-in: a dedicated
   CL_QUEUE_PROFILING_ENABLE queue and per-replay events exist only on a profiled graph."
   ([prepareds] (record-graph! prepareds {}))
-  ([prepareds {:keys [profile?] :or {profile? false}}]
+  ([prepareds {:keys [profile? adopt-cleanup!] :or {profile? false}}]
    (ensure-init!)
    (let [launches (mapv (fn [{:keys [bound group-count]}]
                           {:bound bound :group-count group-count})
-                        prepareds)]
-     (if-not profile?
-       {:launches launches}
-       (let [{:keys [context device]} @state
-             arena (Arena/ofConfined)]
-         (try
-           (let [err-seg (.allocate arena I32)
-                 queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
-                                             (into-array Object
-                                                         [context device
-                                                          CL_QUEUE_PROFILING_ENABLE err-seg]))]
-             (when-not (= CL_SUCCESS (read-int err-seg))
-               (throw (ex-info "clCreateCommandQueue(profile) failed"
-                               {:error (read-int err-seg)})))
-             {:launches launches
-              :profile? true
-              :profile-queue queue
-              :profile-state (atom nil)
-              :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
-              :phases (mapv :phase prepareds)})
-           (finally (.close arena))))))))
+                        prepareds)
+         submission-state (atom nil)
+         queue-slot (cleanup/acquisition-slot)
+         owner (cleanup/owner
+                 (cond-> [{:id :submission :release #(clear-submission! submission-state)}]
+                   profile? (conj {:id :queue :after #{:submission}
+                                    :release #(cleanup/release-native! queue-slot
+                                                (fn [queue]
+                                                  (cl-call! "clReleaseCommandQueue"
+                                                            @h-clReleaseCommandQueue [queue])))})))]
+     (cleanup/build! owner
+       (fn []
+         (cond-> {:launches launches :submission-state submission-state}
+           profile? (assoc :profile? true
+                           :profile-queue (acquire-profile-queue! queue-slot)
+                           :profile-state submission-state
+                           :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
+                           :phases (mapv :phase prepareds))))
+       adopt-cleanup!))))
 
 (defn- release-native-event!
   [event]
@@ -1638,59 +1657,124 @@
       (finally
         (.close arena)))))
 
-(defn- clear-profile-state!
-  [graph]
-  (when-let [profile-state (:profile-state graph)]
-    (when-let [{:keys [events ^Arena arena]} @profile-state]
-      (try
-        (doseq [event events] (release-native-event! event))
-        (finally
-          (.close arena)
-          (clojure.core/reset! profile-state nil))))))
+(defn- assert-recording-live! [graph]
+  (if-let [owner (::cleanup/owner graph)]
+    (cleanup/assert-live! owner)
+    (throw (ex-info "Recorded graph has lost its cleanup owner" {:reason :missing-cleanup-owner}))))
+
+(defn- clear-submission! [submission-state]
+  (locking submission-state
+    (when-let [submission @submission-state]
+      (cleanup/release! (::cleanup/owner submission))
+      ;; Retire only after successful drain, event release and arena close. Unknown outcomes
+      ;; remain strongly owned by this graph, blocking its queue and prepared-kernel teardown.
+      (compare-and-set! submission-state submission nil))))
+
+(defn- clear-profile-state! [graph]
+  (clear-submission! (:submission-state graph)))
+
+(defn- call-and-cleanup! [work release]
+  (let [failure (volatile! nil)
+        result (try (work) (catch Throwable error (vreset! failure error) nil))]
+    (try (release)
+         (catch Throwable secondary
+           (if-let [primary @failure]
+             (when-not (identical? primary secondary) (.addSuppressed primary secondary))
+             (throw secondary))))
+    (if-let [primary @failure] (throw primary) result)))
+
+(defn- reserve-submission [queue event-count]
+  (let [arena-slot (cleanup/acquisition-slot)
+        event-slots (mapv (fn [_] (cleanup/acquisition-slot)) (range event-count))
+        started? (atom false) completed? (atom false)
+        event-ids (set (map #(vector :event %) (range event-count)))
+        owner (cleanup/owner
+                (vec (concat
+                      [{:id :drain
+                        :release #(when (and @started? (not @completed?))
+                                    (cl-call! "clFinish" @h-clFinish [queue])
+                                    (clojure.core/reset! completed? true))}]
+                      (map-indexed
+                       (fn [index slot]
+                         {:id [:event index] :after #{:drain}
+                          :release #(cleanup/release-native! slot release-native-event!)}) event-slots)
+                      [{:id :arena :after (conj event-ids :drain)
+                        :release #(cleanup/release-native! arena-slot
+                                    (fn [^Arena arena] (.close arena)))}])))]
+    {::cleanup/owner owner :arena-slot arena-slot :event-slots event-slots
+     :started? started? :completed? completed?}))
 
 (defn submit-graph!
   "Submit an OpenCL graph without waiting. The in-order queue preserves the recorded order and
-   the final launch signals a native event held only by this runtime-private token."
+   the final launch signals a native event. A graph retains its nested submission owner before
+   any enqueue, even when submission fails before a completion token can be returned. Direct
+   backend callers must serialize graph use/destruction; gpu.core does so under the session lock."
   [graph]
+  (assert-recording-live! graph)
   (let [launches (:launches graph)
         profile? (:profile? graph)
         queue (or (:profile-queue graph) (:queue @state))]
     (if (empty? launches)
       {:complete? true}
-      (let [arena (Arena/ofShared)
-            event-outs (.allocate arena (long (* 8 (if profile? (count launches) 1))))
-            status-out (.allocate arena I32)]
+      (let [submission-state (:submission-state graph)
+            {:keys [arena-slot event-slots started? completed?] :as submission}
+            (reserve-submission queue (if profile? (count launches) 1))
+            owner (::cleanup/owner submission)]
+        ;; Publish the reserved owner BEFORE the first enqueue; even a throwing enqueue can
+        ;; have submitted commands, and the surrounding graph must retain those dependencies.
+        (when-not (compare-and-set! submission-state nil submission)
+          (throw (ex-info "OpenCL graph still owns its previous submission"
+                          {:reason :submission-still-owned})))
         (try
-          (when (and profile? @(:profile-state graph))
-            (throw (ex-info "profiled OpenCL graph events must be read or reset before replay"
-                            {})))
-          (doseq [[index {:keys [bound group-count]}] (map-indexed vector launches)]
-            (enqueue-bound! bound group-count
-                            (if (or profile? (= index (dec (count launches))))
-                              (.asSlice event-outs (long (if profile? (* 8 index) 0)) 8)
-                              MemorySegment/NULL)
-                            queue))
-          (cl-call! "clFlush" @h-clFlush [queue])
-          (let [events (when profile?
-                         (mapv #(.get event-outs PTR (long (* 8 %))) (range (count launches))))
-                final-offset (long (if profile? (* 8 (dec (count launches))) 0))
-                token {:event (.get event-outs PTR final-offset)
-                       :event-array (.asSlice event-outs final-offset 8)
-                       :status-out status-out
-                       :arena arena
-                       :profile? (boolean profile?)}]
-            (when profile?
-              (clojure.core/reset! (:profile-state graph) {:events events :arena arena}))
-            token)
-          (catch Exception e
-            (.close arena)
-            (throw e)))))))
+          (cleanup/build! owner
+            (fn []
+              (let [arena (cleanup/acquire-native! arena-slot #(Arena/ofShared))
+                    event-outs (.allocate ^Arena arena (long (* 8 (count event-slots))))
+                    status-out (.allocate ^Arena arena I32)]
+                (doseq [[index {:keys [bound group-count]}] (map-indexed vector launches)]
+                  (clojure.core/reset! started? true)
+                  (if (or profile? (= index (dec (count launches))))
+                    (let [event-index (if profile? index 0)
+                          event-out (.asSlice event-outs (long (* 8 event-index)) 8)]
+                      (cleanup/acquire-native! (nth event-slots event-index)
+                        #(do (enqueue-bound! bound group-count event-out queue)
+                             (checked-event-handle (.get event-out PTR 0)))))
+                    (enqueue-bound! bound group-count MemorySegment/NULL queue)))
+                (cl-call! "clFlush" @h-clFlush [queue])
+                (let [events (when profile?
+                               (mapv #(.get event-outs PTR (long (* 8 %))) (range (count launches))))
+                      final-offset (long (if profile? (* 8 (dec (count launches))) 0))
+                      token {:event (.get event-outs PTR final-offset)
+                             :event-array (.asSlice event-outs final-offset 8)
+                             :status-out status-out
+                             :arena arena
+                             :profile? (boolean profile?)
+                             :completed? completed?
+                             :submission-state submission-state}]
+                  (swap! submission-state assoc :events events)
+                  token)))
+            ;; The graph already owns this exact cleanup. This explicit sink keeps the original
+            ;; submit failure identity even when drain/release fails or suppression is disabled.
+            (fn [_] nil))
+          (catch Throwable primary
+            (when (empty? (cleanup/pending owner))
+              (clojure.core/reset! submission-state nil))
+            (throw primary)))))))
+
+(defn- token-owner! [token]
+  (let [owner (::cleanup/owner token)]
+    (when (and (contains? token :submission-state) (nil? owner))
+      (throw (ex-info "Graph completion token has lost its cleanup owner"
+                      {:reason :missing-cleanup-owner})))
+    owner))
 
 (defn await-event!
   "Wait for a runtime-private OpenCL completion token."
   [{:keys [complete? completion transfer? event-array] :as token}]
+  (when-let [owner (token-owner! token)] (cleanup/assert-live! owner))
   (when-not complete?
-    (cl-call! "clWaitForEvents" @h-clWaitForEvents [(int 1) event-array]))
+    (cl-call! "clWaitForEvents" @h-clWaitForEvents [(int 1) event-array])
+    (when-let [completed? (:completed? token)] (clojure.core/reset! completed? true)))
   (cond
     complete? completion
     transfer? (await-transfer! token)
@@ -1698,39 +1782,44 @@
 
 (defn event-complete?
   "Nonblocking query of a runtime-private OpenCL completion token."
-  [{:keys [complete? event status-out]}]
+  [{:keys [complete? event status-out completed?] :as token}]
+  (when-let [owner (token-owner! token)] (cleanup/assert-live! owner))
   (if complete?
     true
     (do
       (cl-call! "clGetEventInfo" @h-clGetEventInfo
                 [event (int CL_EVENT_COMMAND_EXECUTION_STATUS) (long 4)
                  status-out MemorySegment/NULL])
-      (= CL_COMPLETE (.get ^MemorySegment status-out I32 0)))))
+      (let [complete (= CL_COMPLETE (.get ^MemorySegment status-out I32 0))]
+        (when (and complete completed?) (clojure.core/reset! completed? true))
+        complete))))
 
 (defn release-event!
   "Release a runtime-private OpenCL completion token. The caller must establish completion."
-  [{:keys [complete? profile? transfer? events event ^Arena arena]}]
+  [{:keys [complete? profile? transfer? events event ^Arena arena submission-state]
+    :as token}]
+  (token-owner! token)
   (when-not complete?
-    ;; A profiled graph retains every event until read-graph-timestamps! (or reset) consumes the
-    ;; sample. The graph owns the shared arena in that interval. Ordinary completion tokens keep
-    ;; the previous immediate-release behavior.
+    ;; A profiled graph retains every event until read/reset consumes the sample. Ordinary
+    ;; graph tokens release their nested owner; transfer tokens await their separate migration.
     (when-not profile?
-      (try
-        (if transfer?
-          (doseq [native-event events] (release-native-event! native-event))
-          (release-native-event! event))
-        (finally
-          (.close arena)))))
+      (if-let [owner (::cleanup/owner token)]
+        (do (cleanup/release! owner)
+            (when (identical? owner (::cleanup/owner @submission-state))
+              (clojure.core/reset! submission-state nil)))
+        (try
+          (if transfer?
+            (doseq [native-event events] (release-native-event! native-event))
+            (release-native-event! event))
+          (finally
+            (.close arena))))))
   nil)
 
 (defn replay-graph!
   "Enqueue every recorded launch and wait for completion."
   [graph]
   (let [event (submit-graph! graph)]
-    (try
-      (await-event! event)
-      (finally
-        (release-event! event)))))
+    (call-and-cleanup! #(await-event! event) #(release-event! event))))
 
 (defn synchronize-async!
   "Block until all compute and transfer work completes."
@@ -1763,6 +1852,7 @@
 (defn reset-graph-events!
   "Discard the most recent OpenCL profiling sample and release its native events."
   [graph]
+  (assert-recording-live! graph)
   (clear-profile-state! graph)
   nil)
 
@@ -1772,14 +1862,20 @@
    OpenCL event timestamps are nanoseconds in the device time domain. The return shape matches
    Level Zero's `read-graph-timestamps!`, allowing gpu.core and autotuning to stay backend-neutral."
   [graph]
+  (assert-recording-live! graph)
   (when-not (:profile? graph)
     (throw (ex-info "read-graph-timestamps!: graph was not recorded with :profile? true" {})))
   (let [profile-state (:profile-state graph)
-        {:keys [events]} @profile-state]
+        {:keys [events completed?] :as submission} @profile-state]
+    (when submission (cleanup/assert-live! (::cleanup/owner submission)))
     (when-not (seq events)
       (throw (ex-info "read-graph-timestamps!: profiled graph has no completed replay" {})))
-    (let [arena (Arena/ofConfined)]
-      (try
+    (call-and-cleanup!
+     (fn []
+      (when-not @completed?
+        (cl-call! "clFinish" @h-clFinish [(:profile-queue graph)])
+        (clojure.core/reset! completed? true))
+      (with-open [arena (Arena/ofConfined)]
         (let [value (.allocate arena I64)
               read-timestamp
               (fn [event parameter]
@@ -1802,10 +1898,8 @@
                         (reduce min (map :start-ticks rows))))]
           {:kernels rows
            :wall-ms (when span (/ (double span) 1.0e6))
-           :ns-per-tick 1.0})
-        (finally
-          (.close arena)
-          (clear-profile-state! graph))))))
+           :ns-per-tick 1.0})))
+     #(clear-profile-state! graph))))
 
 (defn destroy-prepared!
   "Release the dedicated cl_kernel a binding owns."
@@ -1821,11 +1915,12 @@
            (catch Exception _))))))
 
 (defn destroy-graph!
-  "Release profiling-only OpenCL graph resources. Ordinary graphs own no driver objects."
+  "Release the retained submission before its profiling queue. Ordinary graphs also retain
+   partial submission dependencies, although their compute queue is backend-owned."
   [graph]
-  (clear-profile-state! graph)
-  (when-let [queue (:profile-queue graph)]
-    (cl-call! "clReleaseCommandQueue" @h-clReleaseCommandQueue [queue]))
+  (if-let [owner (::cleanup/owner graph)]
+    (cleanup/release! owner)
+    (throw (ex-info "Recorded graph has lost its cleanup owner" {:reason :missing-cleanup-owner})))
   nil)
 
 (defn bind-registered-convert!
