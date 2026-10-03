@@ -125,19 +125,27 @@
         (when-let [error @failure] (throw error)))))
   nil)
 
-(defn retain-registration!
-  "Keep unresolved cleanup reachable by arena teardown if a registry watch lost its generation.
-   Preserve unrelated registrations. This hidden entry carries authority, never native metadata."
-  [registry registration cleanup]
+(defn retain-owned-entry!
+  "Retain an exact owning entry after a watch loses its generation. Preserve unrelated entries.
+   Retained fields must be runtime state only, never portable compiler metadata."
+  [registry entry]
   (locking registry
-    (when-not (some #(identical? cleanup (::owner %)) (vals @registry))
+    (when-not (::owner entry)
+      (throw (ex-info "Retained entry requires cleanup authority" {:reason :missing-cleanup-owner})))
+    (when-not (some #(identical? (::owner entry) (::owner %)) (vals @registry))
       (let [key (random-uuid)
-            entry {:arena-id (:arena-id registration) ::owner cleanup ::failed-registration true}]
+            entry (assoc entry ::failed-registration true)]
         (swap! registry assoc key entry)
         (when-not (identical? entry (get @registry key))
           (throw (ex-info "Registry rejected unresolved registration cleanup"
                           {:reason :cleanup-retention-failed}))))))
   nil)
+
+(defn retain-registration!
+  "Keep unresolved cleanup reachable by arena teardown if a registry watch lost its generation.
+   Preserve unrelated registrations. This hidden entry carries authority, never native metadata."
+  [registry registration cleanup]
+  (retain-owned-entry! registry {:arena-id (:arena-id registration) ::owner cleanup}))
 
 (defn retaining-registration!
   "Run a registration operation without losing its existing owner on publication failure.

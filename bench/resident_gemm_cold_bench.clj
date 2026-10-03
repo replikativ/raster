@@ -52,6 +52,7 @@
         {:label \"large-grf\" :large-grf? true}])"
   (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
             [raster.gpu.ze-runtime :as ze]
+            [native-lifetime :as lifetime]
             [raster.compiler.backend.gpu.opencl-codegen :as cg]
             [raster.compiler.support.spirv-cache :as spv]
             [raster.runtime.hardware :as hw]))
@@ -116,19 +117,20 @@
 ;; ceil(m/bm). A wrong wg/grid for the tile geometry = garbage output, so this MUST match
 ;; the tile the kernel was emitted for.
 (defn- bind-gemm! [module kname a16 b16 c m n k tile]
-  (let [kh (ze/create-kernel-fresh module kname)
-        m (long m) n (long n) k (long k)
-        {:keys [block-m block-n sg-m sg-n matrix] :or {block-m 128 block-n 128 sg-m 32 sg-n 32}} (or tile {})
-        sg (long (:subgroup matrix 16))
-        wg (if tile (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)) sg) 256)
-        args [(:segment a16) (:segment b16) (:segment c)
-              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-        bnd (ze/bind-kernel-2d! kh [wg 1] args)
-        gc ^java.lang.foreign.MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
-    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))
-    (.set gc I32 8 (int 1))
-    bnd))
+  (lifetime/bind! module kname
+                  (fn [kh]
+                    (let [m (long m) n (long n) k (long k)
+                          {:keys [block-m block-n sg-m sg-n matrix] :or {block-m 128 block-n 128 sg-m 32 sg-n 32}} (or tile {})
+                          sg (long (:subgroup matrix 16))
+                          wg (if tile (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)) sg) 256)
+                          args [(:segment a16) (:segment b16) (:segment c)
+                                {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+                          bnd (ze/bind-kernel-2d! kh [wg 1] args)
+                          gc ^java.lang.foreign.MemorySegment (:gc-seg bnd)]
+                      (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
+                      (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))
+                      (.set gc I32 8 (int 1))
+                      bnd))))
 
 ;; Cached random host arrays (values are irrelevant to timing; DISTINCT DEVICE buffers
 ;; are what makes cold reads cold). Avoids regenerating millions of gaussians per pair.
@@ -149,12 +151,12 @@
    `pair-of` maps launch index -> a buffer pair. Identical launch cadence for warm/cold;
    the GPU stays boosted across the whole sequence, so only cache temperature differs."
   [module kname m n k launches pair-of tile]
-  (ze/record-graph!
-   (mapv (fn [i]
-           (let [p (pair-of i)]
-             {:bound (bind-gemm! module kname (:a p) (:b p) (:c p) m n k tile)
-              :kernel-name kname}))
-         (range launches))
+  (lifetime/record!
+   #(mapv (fn [i]
+            (let [p (pair-of i)]
+              {:bound (bind-gemm! module kname (:a p) (:b p) (:c p) m n k tile)
+               :kernel-name kname}))
+          (range launches))
    {:profile? true}))
 
 ;; ── the interleaved cold/warm measurement (THE method) ─────────────────────────────

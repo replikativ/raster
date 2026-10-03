@@ -49,6 +49,7 @@
      (soac-contract-bench/compare-ladder {:name \"proj\" :m 1024 :k 640 :n 2048} :golden? true)"
   (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
             [raster.gpu.ze-runtime :as ze]
+            [native-lifetime :as lifetime]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
@@ -149,10 +150,11 @@
         entry)))
 
 (defn- bind! [module kname wg args gx gy gz]
-  (let [kh (ze/create-kernel-fresh module kname)
-        bnd (ze/bind-kernel-2d! kh wg args)]
-    (set-gc! (:gc-seg bnd) gx gy gz)
-    bnd))
+  (lifetime/bind! module kname
+                  (fn [kh]
+                    (let [bnd (ze/bind-kernel-2d! kh wg args)]
+                      (set-gc! (:gc-seg bnd) gx gy gz)
+                      bnd))))
 
 (defn- naive-spec [dtype]
   {:label (str "naive-" (name dtype)) :dtype dtype
@@ -301,12 +303,12 @@
   "Record ONE graph of `launches` back-to-back launches of `spec` (barriers serialize).
    `triple-of` maps launch index → a buffer triple (distinct for cold, shared for warm)."
   [spec m n k launches triple-of]
-  (ze/record-graph!
-   (mapv (fn [i]
-           {:bound ((:bind spec) m n k (triple-of i))
-            :kernel-name (:label spec)
-            :phase (:label spec)})
-         (range launches))
+  (lifetime/record!
+   #(mapv (fn [i]
+            {:bound ((:bind spec) m n k (triple-of i))
+             :kernel-name (:label spec)
+             :phase (:label spec)})
+          (range launches))
    {:profile? true}))
 
 (defn compare-ladder

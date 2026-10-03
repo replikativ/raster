@@ -55,8 +55,8 @@
                     (v 'h-clReleaseKernel) (delay :kernel)
                     (v 'cl-call!) (fn [_ handle args] (release handle (first args)))}
                    {(v 'load-module!) (fn [_] (swap! calls conj [:borrow-module]) module)
-                    (v 'create-kernel-fresh) (fn [& _] (acquire :kernel))
-                    (v 'destroy-kernel!) #(release :kernel %)
+                    (v 'create-kernel-fresh) (fn [& _] {:handle (acquire :kernel)})
+                    (v 'destroy-kernel!) #(release :kernel (:handle %))
                     (v 'assert-buffer-live!) #(do (cleanup/assert-live! (::cleanup/owner %)) %)
                     (v 'make-buffer)
                     (fn [n dtype opts]
@@ -234,7 +234,7 @@
               release! (fn [handle]
                          (swap! calls conj [:release :kernel handle])
                          (when (identical? handle bad-handle) (throw failure)))
-              replacements (if (= :ze backend) {(v 'destroy-kernel!) release!}
+              replacements (if (= :ze backend) {(v 'destroy-kernel!) #(release! (:handle %))}
                                {(v 'cl-call!) (fn [_ kind args]
                                                 (if (= :kernel kind) (release! (first args))
                                                     (swap! calls conj [:release kind (first args)])))})]

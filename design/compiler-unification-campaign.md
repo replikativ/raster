@@ -2178,3 +2178,37 @@ teardown must not scan private session children or force-close live consumers. L
 These are the runtime prerequisites of the existing training/distributed campaign, not a new
 planner or a substitute completion target. The module-cache slice does not enable eviction or
 claim safe global reset while outstanding kernel/buffer/event borrowers remain.
+
+### Module-cache ownership continuation (2026-10-03, implementation in review)
+
+PR #1015 passed all seven exact-head gates and merged as `35a3a1af`. The next slice
+is being implemented on `runtime/module-cache-owners`; it is not yet released or
+approved for merge. It replaces raw ZE module-cache handles with exact owning
+cache references and gives each fresh kernel a `kernel -> module-borrow` cleanup
+dependency. A copied/stale handle is not authority. Payload hashing and native
+compilation consume the same snapshot; reservation/publication rollback uses the
+common cleanup transactions, and hidden failure debt retains the content key.
+Live or indeterminate kernel borrowers make module-cache teardown decline before
+any module destruction. Checked destruction retains failure debt without retrying
+unknown native outcomes. Shutdown admission holds registry -> state -> module-cache.
+
+Low-level API change: `load-module!` returns a cache reference, and
+`create-kernel-fresh` returns an owned kernel value. `destroy-kernel!` accepts that
+owned value, not a raw pointer. Compiler/session/KernelCall callers retain their
+existing public API. Both production kernel constructors are migrated. The two
+low-level reference benchmarks share a construction/rollback helper rather than
+duplicating success-only teardown. Moving these comparator harnesses entirely to
+the public Artifact/KernelCall surface remains a cleanup opportunity, not a claimed
+completed migration.
+
+Current focused evidence: 57 hardware-free tests, 568 assertions pass, including
+content snapshots, concurrent identical loads, creation/readback/destruction faults,
+shared borrowers, hidden-debt identity, reservation watches/validators, and stale
+cache/context references, loaded-publication rollback, destruction reentry, and
+benchmark prefix/recording rollback. A fresh JVM confirmed 27 registration/boundary
+tests (250 assertions), 38 ownership/benchmark fault tests (355 assertions), and
+seven actual-device boundary tests (84 assertions) against the final exact-reference
+representation. The pivotal reviewer approved the code subject to device/CI gates;
+the local device gate is now met. Full exact-head CI gates remain required. This slice does not certify
+root context, command-list, buffer or reset lifetime safety; those are the following
+steps, and the full eight-item compiler campaign remains open.

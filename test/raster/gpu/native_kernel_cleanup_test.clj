@@ -87,10 +87,12 @@
           redefs (merge
                    {(v 'kernel-registry) (atom {(:kernel-name artifact) artifact})
                     (v 'ensure-kernel-loaded!) (fn [_] {:module handle :program handle :entry-name "probe"})
-                    (v 'create-kernel-fresh) (fn [& _] (swap! acquired inc) handle)}
+                    (v 'create-kernel-fresh) (fn [& _] (swap! acquired inc)
+                                              (if (= backend :ze) {:handle handle} handle))}
                    (if (= backend :ze)
                      {(v 'h-zeKernelDestroy) (delay :fake)
                       (v 'ze-call!) release-call
+                      (v 'destroy-kernel!) #(release-call "zeKernelDestroy" nil [(:handle %)])
                       (v 'bind-kernel!) (fn [& _]
                                          (when fail-build? (throw primary))
                                          {:kernel handle :gc-seg (MemorySegment/ofArray (int-array 3))})}
