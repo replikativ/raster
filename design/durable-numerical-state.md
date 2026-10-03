@@ -1,5 +1,20 @@
 # Durable numerical state
 
+### Executed storage representation probes — 2026-10-03
+
+`compiler.backend.gpu.storage-representation` generates two finite asymmetric sentinels for each
+canonical dtype through verified KernelBody stores and the common C-family emitter. Explicit
+IEEE/two's-complement bit-pattern oracles classify the resulting bytes independently of host
+byte order. Byte storage is order-invariant; other types must match exactly one element-wise
+little/big encoding. Wrong extents, swapped elements and corrupt bytes reject. Compilation
+requirements survive artifact construction, and CUDA/HIP compiler fixtures include all six types.
+
+Actual resident bytes match these oracles on both local OpenCL and Level Zero, with graph, event
+and scratch-buffer cleanup checked. This establishes probe machinery, not authority: observations
+are ordinary data, not sealed session evidence. CompletedEvidence remains device-native and must
+not acquire a manifest byte-order label until a measured fact is bound to its exact live owner.
+These finite tests do not prove arbitrary arithmetic, NaN payload behavior or target equivalence.
+
 Status: compiler/runtime contracts and strict semantic restore gates, 2026-10-02. Production
 publication, compiler-derived provenance and distributed durability acceptance remain open.
 

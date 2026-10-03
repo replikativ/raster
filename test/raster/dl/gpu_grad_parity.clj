@@ -136,6 +136,19 @@
 
 ;; ── GPU session plumbing (mirrors gpu-ad-gemm-test/run-resident) ────────────────
 
+(defn gpu-capability-skip!
+  "Report an explicitly absent optional module capability through the shared skip ledger.
+   The caller must query the selected live device; missing/unknown facts are not absence."
+  [test-label capability capabilities]
+  (when-not (and @gpu-available? (contains? #{:fp16? :fp64?} capability)
+                 (false? (get capabilities capability)))
+    (throw (ex-info "optional GPU skip requires an explicitly false live capability"
+                    {:capability capability :capabilities capabilities :test-label test-label})))
+  @gpu-summary-hook
+  (swap! gpu-skip-log update capability (fnil inc 0))
+  (println (str "  [GPU CAPABILITY SKIP] " test-label " — " (name capability) " unsupported"))
+  (is true "gpu-capability-skip-marker"))
+
 (defn- run-resident
   "Bind + replay f-var's resident descriptor on ze:0 for `args`; returns the result array.
    gemm-precision is compile-gpu-program's :gemm-precision (:mixed-f16-f32 | :f32-scalar)."
