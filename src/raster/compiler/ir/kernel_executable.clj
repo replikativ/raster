@@ -176,16 +176,26 @@
   (mapv :kernel-name (artifacts (validate! executable))))
 
 (defn description
-  "Compact source-free description of a validated executable, without runtime selection claims."
+  "Compact source-free description of a validated executable, without runtime selection claims.
+   Graphs retain ordered leaf kernel labels separately from graph labels. Absent leaf facts stay
+   nil: the graph's requested precision or strategy is not evidence about an individual kernel."
   [executable]
   (let [executable (validate! executable)]
-    {:kind (kind executable)
-     :strategy (get-in executable [:attributes :strategy])
-     :precision (get-in executable [:attributes :precision])
-     :entry-points (case (kind executable)
-                     :kernel-artifact [(:kernel-name executable)]
-                     :kernel-graph (mapv #(get-in % [:operation :kernel-name])
-                                         (:nodes executable)))}))
+    (cond->
+     {:kind (kind executable)
+      :strategy (get-in executable [:attributes :strategy])
+      :precision (get-in executable [:attributes :precision])
+      :entry-points (case (kind executable)
+                      :kernel-artifact [(:kernel-name executable)]
+                      :kernel-graph (mapv #(get-in % [:operation :kernel-name])
+                                          (:nodes executable)))}
+      (kgraph/kernel-graph? executable)
+      (assoc :kernels
+             (mapv (fn [{:keys [operation]}]
+                     {:kernel-name (:kernel-name operation)
+                      :strategy (get-in operation [:attributes :strategy])
+                      :precision (get-in operation [:attributes :precision])})
+                   (:nodes executable))))))
 
 (defn- cast-runtime-scalar
   [dtype value]

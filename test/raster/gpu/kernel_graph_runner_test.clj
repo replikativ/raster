@@ -149,7 +149,12 @@
             (is (= :fixed (:selection info)))
             (is (= [] (:admission info)))
             (is (= (mapv #(get-in % [:operation :kernel-name]) (:nodes graph))
-                   (:entry-points info))))
+                   (:entry-points info)))
+            (is (= (:entry-points info) (mapv :kernel-name (:kernels info))))
+            (is (= (mapv #(select-keys (get-in % [:operation :attributes]) [:strategy :precision])
+                         (:nodes graph))
+                   (mapv #(into {} (remove (comp nil? val)) (select-keys % [:strategy :precision]))
+                         (:kernels info)))))
           (is (= {'n {:type :int :value 1025}}
                  (get-in @sess [:kernel-graphs :prefix :graph-call :scalar-values]))
               "enclosing shape bookkeeping does not widen the executable scalar ABI")

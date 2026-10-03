@@ -109,6 +109,43 @@ or a production store. Independent review and CI remain required before merge. G
 scaling, adaptive/multi-patch or mid-cycle restart, external accuracy/performance comparisons,
 external training migration and real distributed fabrics remain open.
 
+#### Public mixed-precision training integration — October 4
+
+The existing mixed Gemma training oracle still uses the compatibility descriptor fixture and
+manually observes candidate selection. Do not replace it with a weaker public test: a reproduced
+public `compiled/lower` at its `CFG-MP` shape with `:precision :mixed-f16-f32` binds portable
+contractions, because `:auto` deliberately remains portable. An explicit `:matrix` request
+correctly declines the FP32 storage with `:dtype-not-dpas`; that strategy is currently the direct
+half-storage instruction request, not the packing-plus-matrix schedule. Policy permission does
+not establish which instructions were emitted. This is a real integration gap, not an AD bug or
+evidence that mixed training already executes through the equation-first path.
+
+The reporting prerequisite adds ordered `:kernels` labels to the common executable description,
+which public execution reports already forward. Each leaf retains only its own artifact labels;
+missing precision remains nil rather than inheriting graph/request policy. Graph-level mixed
+precision and a leaf's numerical contract are different facts. Labels describe bound artifacts,
+not replay events, timing, or new compiler certification authority.
+
+Continue in this order, reusing the existing typed mixed-matrix builder and graph refinement:
+
+1. Extend equation dispatch and complete-write validation to consume independently validated
+   mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
+   the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.
+2. Share the existing FP32-to-FP16 packing/tile-local fusion, matrix, epilogue and split-K candidate
+   construction with equation-first emission, bound to the retained typed equation, source graph,
+   external ABI/effects and target descriptor. Add no training-specific emitter.
+3. Introduce an explicit mixed-matrix dispatch request alongside the exact portable default.
+   Do not redefine direct half-storage `:matrix` or change `:auto` before measurements justify it.
+4. Preserve actual selection/admission evidence at the equation binding boundary, separately from
+   its later fixed graph binding. Do not claim runtime candidate attempts from a requested policy.
+5. Migrate the existing 25-step Gemma trajectory test only when the public path retains its
+   selected matrix graph and leaf evidence. Keep loss reduction and FP32-versus-mixed trajectory
+   oracles intact. The existing mixed builder is initially Intel/DPAS gated; vendor matrix rows
+   must reuse this seam without claiming device acceptance from compiler-only CI.
+
+This interleaves with item 5 and the emitter consolidation; it does not replace the original
+eight-item campaign, external real-weight training, benchmarks or distributed execution work.
+
 This section supersedes historical "next" and "still required" statements below where the cited
 implementation now exists. It records evidence, not a declaration that the campaign is complete.
 The detailed local execution and preparation evidence is in

@@ -270,6 +270,26 @@
              [(kgraph/->ValueUse 'x :read) (kgraph/->ValueUse 'out :write)] #{'width} [])]
     :effects (:effects reference) :attributes {:strategy :direct}}))
 
+(deftest graph-descriptions-retain-leaf-facts-without-inheriting-policy
+  (let [graph (-> (staged-graph)
+                  (assoc-in [:attributes :precision] :mixed-f16-f32)
+                  (assoc-in [:nodes 0 :operation :attributes]
+                            {:strategy :layout-adapter})
+                  (assoc-in [:nodes 1 :operation :attributes]
+                            {:strategy :matrix :precision :mixed-f16-f32}))
+        info (kexec/description graph)]
+    (is (= :two-stage (:strategy info)))
+    (is (= :mixed-f16-f32 (:precision info)))
+    (is (= [{:kernel-name "dispatch_stage_one" :strategy :layout-adapter :precision nil}
+            {:kernel-name "dispatch_stage_two" :strategy :matrix :precision :mixed-f16-f32}]
+           (:kernels info)))
+    (is (= (:entry-points info) (mapv :kernel-name (:kernels info))))
+    (is (nil? (get-in (kexec/description (staged-graph)) [:kernels 1 :precision])))
+    (is (not (contains? (kexec/description reference) :kernels)))
+    (is (not-any? #(contains? % :source) (:kernels info)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (kexec/description (assoc-in graph [:nodes 1 :operation :abi 0 :dtype] :half))))))
+
 (defn- storage-dispatch []
   (kdispatch/make
    {:id "storage-dispatch" :alternatives [(staged-graph) (direct-graph)]
