@@ -6,6 +6,25 @@
 
 (defrecord Cleanup [state])
 
+(def ^:dynamic *registry-uses* [])
+
+(defn assert-registry-mutable!
+  "Reject same-thread lifecycle mutation while native registration acquisition is in flight.
+   The registry monitor serializes other threads; this guard also covers reentrant callbacks."
+  [registry]
+  (when (some #(identical? registry %) *registry-uses*)
+    (throw (ex-info "Registration lifecycle mutation during native use"
+                    {:reason :registration-in-use}))))
+
+(defmacro with-registry-use
+  "Serialize native use and prevent reentrant registration retirement on the same thread."
+  [registry & body]
+  `(let [registry# ~registry]
+     (assert-registry-mutable! registry#)
+     (locking registry#
+       (binding [*registry-uses* (conj *registry-uses* registry#)]
+         ~@body))))
+
 (defn lifetime-owner
   "Exact native lifetime identity for a root or a non-owning view. A borrowed lifetime reference
    is not destruction authority; only ::owner can release the value's native resource."
@@ -104,6 +123,92 @@
                          (some #(and (:failure %) (not (:retry-safe? %))) (:remaining @state)) :poisoned
                          :else :failed))))
         (when-let [error @failure] (throw error)))))
+  nil)
+
+(defn retain-registration!
+  "Keep unresolved cleanup reachable by arena teardown if a registry watch lost its generation.
+   Preserve unrelated registrations. This hidden entry carries authority, never native metadata."
+  [registry registration cleanup]
+  (locking registry
+    (when-not (some #(identical? cleanup (::owner %)) (vals @registry))
+      (let [key (random-uuid)
+            entry {:arena-id (:arena-id registration) ::owner cleanup ::failed-registration true}]
+        (swap! registry assoc key entry)
+        (when-not (identical? entry (get @registry key))
+          (throw (ex-info "Registry rejected unresolved registration cleanup"
+                          {:reason :cleanup-retention-failed}))))))
+  nil)
+
+(defn retaining-registration!
+  "Run a registration operation without losing its existing owner on publication failure.
+   Unlike candidate rollback, this also retains a live parent after successful child rollback."
+  [registry registration operation]
+  (try
+    (operation)
+    (catch Throwable primary
+      (let [cleanup (::owner registration)]
+        (when (seq (pending cleanup))
+          (try (retain-registration! registry registration cleanup)
+               (catch Throwable retention-error
+                 (let [wrapper (ex-info "Registration operation retains unresolved cleanup"
+                                        {::unresolved cleanup} primary)]
+                   (.addSuppressed wrapper retention-error)
+                   (throw wrapper))))))
+      (throw primary))))
+
+(defn assert-registration-current!
+  "Require the exact registration snapshot, not merely a live replacement generation."
+  [registry key registration]
+  (when-not (identical? registration (get @registry key))
+    (throw (ex-info "Registration generation changed during native use"
+                    {:reason :registry-generation-changed :key key})))
+  registration)
+
+(defn publish-owned-update!
+  "Publish metadata/cache fields within one canonical owner generation, without retiring it.
+   Failure preserves whatever exact generation is installed; construction callers still own
+   rollback. Reject owner changes and stale CAS input before publishing, and detect atom-watch
+   mutations before reporting success. The caller must admit owner liveness before native use."
+  [registry path prior updated]
+  (when-not (and (instance? clojure.lang.Atom registry)
+                 (vector? path) (seq path) (every? some? path)
+                 (::owner prior) (identical? (::owner prior) (::owner updated)))
+    (throw (ex-info "Registry update requires one canonical owner generation"
+                    {:reason :invalid-registry-update})))
+  (locking registry
+    (swap! registry
+           (fn [state]
+             (when-not (identical? prior (get-in state path))
+               (throw (ex-info "Registry generation changed before update"
+                               {:reason :registry-generation-changed :path path})))
+             (assoc-in state path updated)))
+    (when-not (identical? updated (get-in @registry path))
+      (throw (ex-info "Registry generation changed during update publication"
+                      {:reason :registry-generation-changed :path path})))
+    updated))
+
+(defn release-entries!
+  "Release independently owned entries from a runtime atom. Remove only exact successfully
+   released generations; preserve failed entries and unrelated reentrant replacements. Snapshot
+   entries must be supplied by the containing owner's serialized teardown, not inferred handles."
+  [registry entries destroy!]
+  (locking registry
+    (let [failure (volatile! nil)]
+      (doseq [[key entry] entries]
+        (when (identical? entry (get @registry key))
+          (try
+            (destroy! entry)
+            (swap! registry #(if (identical? entry (get % key)) (dissoc % key) %))
+            (when (identical? entry (get @registry key))
+              (throw (ex-info "Registry watch reinserted a released generation"
+                              {:reason :registry-generation-changed :key key})))
+            (catch Throwable error
+              (if-let [primary @failure]
+                (when-not (or (identical? primary error)
+                              (some #(identical? error %) (.getSuppressed primary)))
+                  (.addSuppressed primary error))
+                (vreset! failure error))))))
+      (when-let [primary @failure] (throw primary))))
   nil)
 
 (defn publish-replacement!

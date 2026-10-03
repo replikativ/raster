@@ -292,7 +292,8 @@
                   :dtype :float :array-types {'out :float 'input :float})
           kernel-name (:kernel-name kernel)
           register! (resolve 'raster.gpu.ocl-runtime/register-kernel!)
-          entry (resolve 'raster.gpu.ocl-runtime/kernel-registry-entry)
+          ;; Native cache identity is private runtime state, not compiler registry metadata.
+          entry (fn [name] (get @(deref (ns-resolve 'raster.gpu.ocl-runtime 'kernel-registry)) name))
           invoke! (resolve 'raster.gpu.ocl-runtime/invoke-registered-map-void-kernel)
           input (float-array [1.0 2.0 3.0])
           output (float-array 3)]

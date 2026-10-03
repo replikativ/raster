@@ -59,10 +59,9 @@
           ;; Measurement retires prior unleased output wrappers but cannot claim a plan replay.
           (let [output (first (vals (compiled/invoke-compiled c {})))
                 completed @(:completed-replays (:executable c))
-                registry-entry (requiring-resolve
-                                 (symbol (str (case target :ze:0 'raster.gpu.ze-runtime
-                                                          :ocl:0 'raster.gpu.ocl-runtime))
-                                         "kernel-registry-entry"))
+                registry (ns-resolve (case target :ze:0 'raster.gpu.ze-runtime
+                                                :ocl:0 'raster.gpu.ocl-runtime) 'kernel-registry)
+                registry-entry (fn [name] (get @(deref registry) name))
                 cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float"))]
             (compiled/measure-storage-representation! c :float)
             (is (some? cached-kernel))
