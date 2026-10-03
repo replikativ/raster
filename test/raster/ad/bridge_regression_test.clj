@@ -61,7 +61,18 @@
       (is (empty? (:agets (analyze scoped true))))
       (is (contains? (:free-syms (analyze scoped true)) 'b)))
     (let [tagged (with-meta body {:raster.type/tag 'double :line 42})]
-      (is (= (meta tagged) (meta (:body-result (analyze tagged true))))))))
+      (is (= (meta tagged) (meta (:body-result (analyze tagged true))))))
+    ;; The analyzer strips this outer let. Reads of its aliases/shadows must
+    ;; remain inline rather than being replayed before the bindings exist.
+    (doseq [scoped ['(let* [local b x (+ (aget local 0) 1.0)] (+ acc x))
+                    '(let* [local b] (+ acc (aget local 0)))
+                    '(let* [b other] (+ acc (aget b 0)))]]
+      (is (empty? (:agets (analyze scoped true)))))
+    ;; An initializer still sees the outer array before a later shadow binds it.
+    (is (= [['b 0]]
+           (mapv (juxt :arr :idx)
+                 (:agets (analyze '(let* [x (+ (aget b 0) 1.0) b other]
+                                    (+ acc x)) true)))))))
 
 (deftm normal-density-sum [mu :- Double, sigma :- Double,
                            ys :- (Array double), count :- Long] :- Double

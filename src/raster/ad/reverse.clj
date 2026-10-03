@@ -1893,7 +1893,6 @@
   ([body-expr idx-sym] (analyze-par-map-body body-expr idx-sym false))
   ([body-expr idx-sym literal-index-reads?]
   (let [agets (atom [])
-        scalar-bindings (atom [])
         ;; Extract let* bindings if present
         [bindings body-result0]
         (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
@@ -1901,17 +1900,17 @@
           [[] body-expr])]
     ;; (1) let*-bound agets
     (doseq [[sym init] bindings]
-      (if (gradient-bearing-array-read? init)
-        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
-        (swap! scalar-bindings conj [sym init])))
+      (when (gradient-bearing-array-read? init)
+        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})))
     ;; (2) lift admitted inline reads, deduplicating by array AND original index.
     ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
-          lift (fn lift [expr scoped?]
+          lift (fn lift [expr scoped? locals]
                  (cond
                    (and (gradient-bearing-array-read? expr)
                         (or (= idx-sym (nth expr 2))
                             (and literal-index-reads? (not scoped?)
+                                 (not (contains? locals (nth expr 1)))
                                  (integer? (nth expr 2)))))
                    (let [arr (nth expr 1) index (nth expr 2)
                          k [arr index]]
@@ -1923,11 +1922,20 @@
                    (seq? expr)
                    (let [{:keys [kind liftable?]} (form/form-info expr)
                          nested-scope? (or scoped? (= :binding kind) (not liftable?))]
-                     (with-meta (apply list (map #(lift % nested-scope?) expr)) (meta expr)))
-                   (vector? expr) (with-meta (mapv #(lift % scoped?) expr) (meta expr))
+                     (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr)))
+                   (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
                    :else expr))
-          body-result (lift body-result0 false)
-          scalar-bindings* (mapv (fn [[s init]] [s (lift init false)]) @scalar-bindings)]
+          ;; These top-level bindings were stripped above. A lifted read is replayed
+          ;; before scalar bindings, so it must not capture their aliases/shadows.
+          body-result (lift body-result0 false (set (map first bindings)))
+          scalar-bindings* (:bindings
+                            (reduce (fn [{:keys [locals bindings]} [s init]]
+                                      {:locals (conj locals s)
+                                       :bindings (if (gradient-bearing-array-read? init)
+                                                   bindings
+                                                   (conj bindings [s (lift init false locals)]))})
+                                    {:locals #{} :bindings []}
+                                    bindings))]
       (let [aget-syms (set (map :sym @agets))
             bound-syms (set (cons idx-sym (concat (map first scalar-bindings*) aget-syms)))
             free-syms (util/free-syms body-result bound-syms)
