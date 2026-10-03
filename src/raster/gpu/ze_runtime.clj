@@ -1106,21 +1106,22 @@
    performs the copies before submission returns. The common GPUEvent contract still represents
    this legal inline completion and reports host-monotonic timing rather than claiming a device
   event measurement."
-  [entries direction]
-  (doseq [[buffer _] entries] (assert-buffer-live! buffer))
-  (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
-        started (System/nanoTime)]
-    (doseq [[buffer plan] active]
-      (execute-range! buffer plan direction))
-    (let [elapsed (- (System/nanoTime) started)
-          bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
-      {:complete? true
-       :completion {:timing-source :host-monotonic
-                    :elapsed-ns elapsed
-                    :bytes bytes
-                    :commands (count active)
-                    :direction direction
-                    :asynchronous? false}})))
+  ([entries direction] (submit-range-batch! entries direction {}))
+  ([entries direction _options]
+   (doseq [[buffer _] entries] (assert-buffer-live! buffer))
+   (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
+         started (System/nanoTime)]
+     (doseq [[buffer plan] active]
+       (execute-range! buffer plan direction))
+     (let [elapsed (- (System/nanoTime) started)
+           bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
+       {:complete? true
+        :completion {:timing-source :host-monotonic
+                     :elapsed-ns elapsed
+                     :bytes bytes
+                     :commands (count active)
+                     :direction direction
+                     :asynchronous? false}}))))
 
 (defn transfer-capabilities
   "Return the Level Zero runtime's physical transfer execution contract."

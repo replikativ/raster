@@ -600,7 +600,7 @@
             {resolver-var (fn [device name]
                             (case name
                               "plan-range" (fn [_ _ _ _] {:n-bytes 4})
-                              "submit-range-batch!" (fn [_ _] :token)
+                              "submit-range-batch!" (fn [_ _ _] :token)
                               "await-event!" (constantly {:bytes 4 :commands 1})
                               "release-event!" (fn [_] (swap! released inc))
                               (resolver device name)))}
