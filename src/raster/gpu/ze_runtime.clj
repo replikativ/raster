@@ -1740,21 +1740,49 @@
   []
   (keyword (str "arena-" (gensym ""))))
 
+(defn- registration-owner! [info]
+  (or (::cleanup/owner info)
+      (throw (ex-info "Kernel registration has no cleanup owner"
+                      {:reason :missing-cleanup-owner :kernel-name (:kernel-name info)}))))
+
+(defn- assert-registration-live! [info]
+  (cleanup/assert-live! (registration-owner! info))
+  (when-let [context @(:context (::registration info))]
+    (when-not (identical? context (:context @state))
+      (throw (ex-info "Kernel belongs to a retired Level Zero context"
+                      {:reason :runtime-generation-mismatch}))))
+  (doseq [owner (vals @(:staging (::registration info)))]
+    (when-not (contains? #{:live :released} (:phase (cleanup/status owner)))
+      (cleanup/assert-live! owner)))
+  info)
+
+(defn- reserve-registration [info]
+  (let [kernel (cleanup/acquisition-slot) context (volatile! nil)
+        staging (atom {}) cached (atom {})
+        owner (cleanup/owner
+               [{:id :kernel
+                 :release #(cleanup/release-native!
+                            kernel (fn [handle]
+                                     (when-not (identical? @context (:context @state))
+                                       (throw (ex-info "Kernel belongs to a retired Level Zero context"
+                                                       {:reason :runtime-generation-mismatch})))
+                                     (destroy-kernel! handle)))}
+                {:id :staging :after #{:kernel}
+                 :release #(cleanup/release-entries! staging (vec @staging) cleanup/release!)}])]
+    (assoc info ::cleanup/owner owner
+           ::registration {:kernel kernel :context context :staging staging :cached cached
+                           :arrays (atom {})})))
+
 (defn close-kernel-arena!
-  "Free all GPU MemorySegments and remove all kernels registered
-  under arena-id from kernel-registry."
+  "Release exact base-kernel/staging owners; modules are borrowed from the shared runtime cache."
   [arena-id]
-  (let [reg @kernel-registry
-        arena-kernels (filter (fn [[_ info]] (= (:arena-id info) arena-id)) reg)]
-    (doseq [[kname info] arena-kernels]
-      (doseq [[k v] info]
-        (when (instance? MemorySegment v)
-          (try (free! v) (catch Exception _)))))
-    (swap! kernel-registry #(reduce dissoc % (map first arena-kernels)))
+  (cleanup/with-registry-use kernel-registry
+    (cleanup/release-entries!
+     kernel-registry (filterv (fn [[_ info]] (= (:arena-id info) arena-id)) @kernel-registry)
+     #(cleanup/release! (registration-owner! %)))
     (swap! kernel-dispatch-registry
            (fn [dispatches]
-             (into {} (remove (fn [[_ dispatch]] (= arena-id (:arena-id dispatch))))
-                   dispatches))))
+             (into {} (remove (fn [[_ dispatch]] (= arena-id (:arena-id dispatch)))) dispatches))))
   nil)
 
 (defmacro with-gpu-computation
@@ -1808,35 +1836,48 @@
   ([kernel-name kernel-info]
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
-   (let [_ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
+   (cleanup/assert-registry-mutable! kernel-registry)
+   (let [_ (when (some #(contains? kernel-info %) [:module :entry-name :kernel-handle ::cleanup/owner ::registration
+                                                   ::registration-payload-identity])
+             (throw (ex-info "Registration cannot import native lifetime fields"
+                             {:reason :invalid-kernel-registration})))
+         _ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
          _ (when (seq (kart/compilation kernel-info))
              (throw (ex-info "Level Zero offline compilation does not yet consume explicit compiler requirements"
                              {:reason :unsupported-compilation-contract :backend :ze
                               :compilation (kart/compilation kernel-info)})))
          payload (when-let [bytes (:spv-bytes kernel-info)] (aclone ^bytes bytes))
          info (cond-> (assoc kernel-info ::registration-payload-identity
-                            (when payload (bytes-digest payload)))
+                             (when payload (bytes-digest payload)))
                 payload (assoc :spv-bytes payload)
                 arena-id (assoc :arena-id arena-id))]
-     (swap! kernel-registry
-            (fn [registry]
-              (let [prior (get registry kernel-name)
-                    same-program? (and (:module prior) (:kernel-handle prior)
-                                       (= (:source prior) (:source info))
-                                       (= (:target prior) (:target info))
-                                       (= (kart/compilation prior) (kart/compilation info))
-                                       (= (:arena-id prior) (:arena-id info))
-                                       (contains? prior ::registration-payload-identity)
-                                       (= (::registration-payload-identity prior)
-                                          (::registration-payload-identity info)))]
-                ;; Binding owns a separate dedicated kernel. Re-registering the identical
-                ;; module must not discard the cached registry kernel and scalar staging.
-                (assoc registry kernel-name
-                       (if same-program?
-                         (merge info
-                                (select-keys prior [:module :kernel-handle :entry-name :spv-bytes])
-                                (into {} (filter (fn [[_ value]] (instance? MemorySegment value))) prior))
-                         info))))))))
+     (cleanup/with-registry-use kernel-registry
+       (let [prior (get @kernel-registry kernel-name)
+             same-program? (and prior
+                                (= (:source prior) (:source info))
+                                (= (:target prior) (:target info))
+                                (= (kart/compilation prior) (kart/compilation info))
+                                (= (:arena-id prior) (:arena-id info))
+                                (contains? prior ::registration-payload-identity)
+                                (= (::registration-payload-identity prior)
+                                   (::registration-payload-identity info)))
+             owner (when prior (registration-owner! prior))]
+         (if (and same-program? (= :live (:phase (cleanup/status owner))))
+           (do (assert-registration-live! prior)
+               (cleanup/retaining-registration!
+                kernel-registry prior
+                #(cleanup/publish-owned-update!
+                  kernel-registry [kernel-name] prior
+                  (cond-> (merge prior info)
+                    (:spv-bytes prior) (assoc :spv-bytes (:spv-bytes prior))))) nil)
+           (let [candidate (reserve-registration info)]
+             (cleanup/build! (registration-owner! candidate)
+                             #(do (cleanup/publish-replacement!
+                                   kernel-registry [kernel-name] candidate
+                                   (fn [old] (cleanup/release! (registration-owner! old))))
+                                  candidate)
+                             nil)
+             nil)))))))
 
 (defn kernel-registry-entry
   "Public read of a registered kernel's info map (source, :array-params, :scalar-params, dtype,
@@ -1923,67 +1964,110 @@
   "Lazily compile SPIR-V and load module for a registered kernel.
   Returns updated kernel-info with :module and :kernel-handle."
   [kernel-name]
-  (ensure-init!)
-  (let [info (get @kernel-registry kernel-name)]
-    (when-not info
-      (throw (ex-info (str "Kernel not registered: " kernel-name)
-                      {:kernel-name kernel-name
-                       :registered (keys @kernel-registry)})))
-    (if (:kernel-handle info)
-      info
-      (let [;; Precompiled SPIR-V was built with the registry name as its entry.
-            [entry-name source] (if (:spv-bytes info)
-                                  [kernel-name (:source info)]
-                                  (canonical-entry kernel-name (:source info)))
+  (cleanup/with-registry-use kernel-registry
+    (let [info (get @kernel-registry kernel-name)]
+      (when-not info
+        (throw (ex-info (str "Kernel not registered: " kernel-name)
+                        {:kernel-name kernel-name
+                         :registered (keys @kernel-registry)})))
+      (assert-registration-live! info)
+      (ensure-init!)
+      (if (:kernel-handle info)
+        info
+        (cleanup/build!
+         (registration-owner! info)
+         (fn []
+           (let [slots (::registration info)
+                 _ (vreset! (:context slots) (:context @state))
+            ;; Precompiled SPIR-V was built with the registry name as its entry.
+                 [entry-name source] (if (:spv-bytes info)
+                                       [kernel-name (:source info)]
+                                       (canonical-entry kernel-name (:source info)))
             ;; Compile SPIR-V if not already done
-            device-hex (:device-id-hex @state)
-            spv-bytes (or (:spv-bytes info)
-                          (let [cache (delay
-                                        ((requiring-resolve
-                                          'raster.compiler.support.spirv-cache/make-cache)))
-                                compile-fn (fn [src]
+                 device-hex (:device-id-hex @state)
+                 spv-bytes (or (:spv-bytes info)
+                               (let [cache (delay
                                              ((requiring-resolve
-                                               'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                                              src :device device-hex))
-                                get-or-compile (requiring-resolve
-                                                'raster.compiler.support.spirv-cache/get-or-compile)]
-                            (get-or-compile @cache source compile-fn device-hex)))
-            module (load-module! spv-bytes)
+                                               'raster.compiler.support.spirv-cache/make-cache)))
+                                     compile-fn (fn [src]
+                                                  ((requiring-resolve
+                                                    'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                                                   src :device device-hex))
+                                     get-or-compile (requiring-resolve
+                                                     'raster.compiler.support.spirv-cache/get-or-compile)]
+                                 (get-or-compile @cache source compile-fn device-hex)))
+                 module (load-module! spv-bytes)
+                 _ (assert-registration-live! info)
             ;; Identical kernels now share one module, so the entry's handle is
             ;; its own: registry entries never share mutable argument state.
-            kernel-handle (create-kernel-fresh module entry-name)
-            updated (assoc info
-                           :spv-bytes spv-bytes
-                           :entry-name entry-name
-                           :module module
-                           :kernel-handle kernel-handle)]
-        (swap! kernel-registry assoc kernel-name updated)
-        updated))))
+                 kernel-handle (cleanup/acquire-native! (:kernel slots)
+                                                        #(create-kernel-fresh module entry-name))
+                 updated (assoc info
+                                :spv-bytes spv-bytes
+                                :entry-name entry-name
+                                :module module
+                                :kernel-handle kernel-handle)]
+             (cleanup/publish-owned-update! kernel-registry [kernel-name] info updated)
+             (assert-registration-live! updated)
+             updated))
+         #(cleanup/retain-registration! kernel-registry info %))))))
 
 (defn- ensure-seg
-  "Return a cached MemorySegment for [kernel-name k], allocating via
-  alloc-shared if absent or smaller than n-bytes."
+  "Return a segment borrowed from a canonical registration-owned byte buffer."
   ^MemorySegment [^String kernel-name k ^long n-bytes]
-  (let [info (get @kernel-registry kernel-name)
-        cached (get info k)]
-    (if (and cached (>= (.byteSize ^MemorySegment cached) n-bytes))
-      cached
-      (let [seg (alloc-shared n-bytes)]
-        (when cached (free! cached))
-        (swap! kernel-registry assoc-in [kernel-name k] seg)
-        seg))))
+  (when (neg? n-bytes)
+    (throw (ex-info "Registration staging extent must be non-negative" {:reason :invalid-staging-extent})))
+  (cleanup/with-registry-use kernel-registry
+    (let [info (assert-registration-live! (get @kernel-registry kernel-name))
+          {:keys [cached staging]} (::registration info)
+          prior (get @cached k)]
+      (cleanup/retaining-registration!
+       kernel-registry info
+       (fn []
+         (if (and prior (>= (:byte-size prior) n-bytes))
+           (:segment (assert-buffer-live! prior))
+           (let [id (random-uuid)
+                 retain! (fn [owner] (swap! staging assoc id owner))
+                 candidate (make-buffer n-bytes :byte {:retain-owner! retain! :adopt-cleanup! retain!})]
+             (try
+               (cleanup/build!
+                (::cleanup/owner candidate)
+                #(do (cleanup/publish-replacement! cached [k] candidate free-buffer!)
+                     (cleanup/release-entries!
+                      staging (filterv (fn [[_ owner]] (= :released (:phase (cleanup/status owner)))) @staging)
+                      cleanup/release!)
+                     (assert-registration-live! (cleanup/assert-registration-current! kernel-registry kernel-name info))
+                     {:buffer candidate})
+                (fn [_] (cleanup/retain-registration! kernel-registry info (registration-owner! info))))
+               (catch Throwable primary
+                 (try
+                   (swap! cached #(if (identical? candidate (get % k)) (dissoc % k) %))
+                   (catch Throwable secondary
+                     (when-not (or (identical? primary secondary)
+                                   (some #(identical? secondary %) (.getSuppressed primary)))
+                       (.addSuppressed primary secondary))))
+                 (throw primary)))
+             (:segment candidate))))))))
 
 (defn- ensure-arr
   "Return a cached short-array for [kernel-name k], allocating if absent
   or smaller than n-elems."
   ^shorts [^String kernel-name k ^long n-elems]
-  (let [info (get @kernel-registry kernel-name)
-        ^shorts cached (get info k)]
-    (if (and cached (>= (alength cached) n-elems))
-      cached
-      (let [arr (short-array n-elems)]
-        (swap! kernel-registry assoc-in [kernel-name k] arr)
-        arr))))
+  (when (neg? n-elems)
+    (throw (ex-info "Registration staging extent must be non-negative" {:reason :invalid-staging-extent})))
+  (cleanup/with-registry-use kernel-registry
+    (let [info (assert-registration-live! (get @kernel-registry kernel-name))
+          cache (:arrays (::registration info))
+          ^shorts cached (get @cache k)]
+      (cleanup/retaining-registration!
+       kernel-registry info
+       (fn []
+         (if (and cached (>= (alength cached) n-elems))
+           cached
+           (let [arr (short-array n-elems)]
+             (swap! cache assoc k arr)
+             (assert-registration-live! (cleanup/assert-registration-current! kernel-registry kernel-name info))
+             arr)))))))
 
 (defn invoke-registered-kernel
   "Pipeline-friendly map invocation. Looks up the emitter-authored ordered ABI from the registry

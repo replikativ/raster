@@ -954,35 +954,50 @@
   []
   (keyword (str "arena-" (gensym ""))))
 
+(defn- registration-owner! [info]
+  (or (::cleanup/owner info)
+      (throw (ex-info "Kernel registration has no cleanup owner"
+                      {:reason :missing-cleanup-owner :kernel-name (:kernel-name info)}))))
+
+(defn- assert-registration-live! [info]
+  (cleanup/assert-live! (registration-owner! info))
+  (when-let [context @(:context (::registration info))]
+    (when-not (identical? context (:context @state))
+      (throw (ex-info "Kernel belongs to a retired OpenCL context"
+                      {:reason :runtime-generation-mismatch}))))
+  info)
+
+(defn- reserve-registration [info]
+  (let [kernel (cleanup/acquisition-slot) program (cleanup/acquisition-slot)
+        staging (cleanup/acquisition-slot) context (volatile! nil)
+        release! (fn [slot label handle]
+                   (cleanup/release-native!
+                    slot (fn [value]
+                           (when-not (identical? @context (:context @state))
+                             (throw (ex-info "Kernel belongs to a retired OpenCL context"
+                                             {:reason :runtime-generation-mismatch})))
+                           (cl-call! label @handle [value]))))
+        owner (cleanup/owner
+               [{:id :kernel :release #(release! kernel "clReleaseKernel" h-clReleaseKernel)}
+                {:id :program :after #{:kernel}
+                 :release #(release! program "clReleaseProgram" h-clReleaseProgram)}
+                {:id :staging :after #{:kernel}
+                 :release #(cleanup/release-native! staging (fn [^Arena arena] (.close arena)))}])]
+    (assoc info ::cleanup/owner owner
+           ::registration {:kernel kernel :program program :staging staging :context context
+                           :cached (atom {})})))
+
 (defn close-kernel-arena!
-  "Free all kernels registered under arena-id from kernel-registry."
+  "Release exact arena registrations, retaining uncertain failures; never scan metadata pointers."
   [arena-id]
-  (let [reg @kernel-registry
-        arena-kernels (filter (fn [[_ info]] (= (:arena-id info) arena-id)) reg)]
-    ;; Release OpenCL kernel/program handles
-    (doseq [[_ info] arena-kernels]
-      (when-let [kh (:kernel-handle info)]
-        (try (.invokeWithArguments ^MethodHandle @h-clReleaseKernel
-                                   (into-array Object [kh]))
-             (catch Exception _)))
-      (when-let [prog (:program info)]
-        (try (.invokeWithArguments ^MethodHandle @h-clReleaseProgram
-                                   (into-array Object [prog]))
-             (catch Exception _)))
-      ;; Free cached host segments
-      (doseq [[k v] info]
-        (when (and (instance? MemorySegment v)
-                   (not= k :kernel-handle)
-                   (not= k :program)
-                   (not= k :cl-mem))
-          ;; Host segments are arena-allocated, no explicit free needed
-          nil)))
-    ;; Remove from registry
-    (swap! kernel-registry #(reduce dissoc % (map first arena-kernels)))
+  (cleanup/with-registry-use kernel-registry
+    (cleanup/release-entries!
+     kernel-registry (filterv (fn [[_ info]] (= (:arena-id info) arena-id)) @kernel-registry)
+     #(cleanup/release! (registration-owner! %)))
     (swap! kernel-dispatch-registry
            (fn [dispatches]
-             (into {} (remove (fn [[_ dispatch]] (= arena-id (:arena-id dispatch))))
-                   dispatches)))))
+             (into {} (remove (fn [[_ dispatch]] (= arena-id (:arena-id dispatch)))) dispatches))))
+  nil)
 
 ;; ================================================================
 ;; Kernel registration and compilation
@@ -994,23 +1009,34 @@
   ([kernel-name kernel-info]
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
-   (let [_ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
+   (cleanup/assert-registry-mutable! kernel-registry)
+   (let [_ (when (some #(contains? kernel-info %) [:program :kernel-handle ::cleanup/owner ::registration])
+             (throw (ex-info "Registration cannot import native lifetime fields"
+                             {:reason :invalid-kernel-registration})))
+         _ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
          info (cond-> kernel-info
                 arena-id (assoc :arena-id arena-id))]
-     (swap! kernel-registry
-            (fn [registry]
-              (let [prior (get registry kernel-name)
-                    same-program? (and (:program prior) (:kernel-handle prior)
-                                       (= (:source prior) (:source info))
-                                       (= (kart/compilation prior) (kart/compilation info))
-                                       (= (:arena-id prior) (:arena-id info)))]
-                ;; Graph composition registers every emitted node before binding it. An
-                ;; identical registration must not discard a live cl_program and force
-                ;; clBuildProgram again for every instance of the same kernel.
-                (assoc registry kernel-name
-                       (if same-program?
-                         (merge info (select-keys prior [:program :kernel-handle]))
-                         info))))))))
+     (cleanup/with-registry-use kernel-registry
+       (let [prior (get @kernel-registry kernel-name)
+             same-program? (and prior
+                                (= (:source prior) (:source info))
+                                (= (:target prior) (:target info))
+                                (= (kart/compilation prior) (kart/compilation info))
+                                (= (:arena-id prior) (:arena-id info)))
+             owner (when prior (registration-owner! prior))]
+         (if (and same-program? (= :live (:phase (cleanup/status owner))))
+           (do (assert-registration-live! prior)
+               (cleanup/retaining-registration!
+                kernel-registry prior
+                #(cleanup/publish-owned-update! kernel-registry [kernel-name] prior (merge prior info))) nil)
+           (let [candidate (reserve-registration info)]
+             (cleanup/build! (registration-owner! candidate)
+                             #(do (cleanup/publish-replacement!
+                                   kernel-registry [kernel-name] candidate
+                                   (fn [old] (cleanup/release! (registration-owner! old))))
+                                  candidate)
+                             nil)
+             nil)))))))
 
 (defn register-kernel-dispatch!
   ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))
@@ -1040,7 +1066,7 @@
 
 (defn- compile-program!
   "Compile OpenCL C source to a cl_program. Returns the program handle."
-  ^MemorySegment [^String source compilation]
+  ^MemorySegment [^String source compilation program-slot]
   (ensure-init!)
   (let [{:keys [context device arena device-info]} @state
         options (.allocateFrom ^Arena arena ^String (compilation-options compilation device-info))
@@ -1050,12 +1076,17 @@
         src-ptr-seg (.allocate ^Arena arena PTR)
         _ (.set src-ptr-seg PTR 0 src-seg)
         ;; clCreateProgramWithSource
-        program (.invokeWithArguments ^MethodHandle @h-clCreateProgramWithSource
-                                      (into-array Object [context (int 1) src-ptr-seg
-                                                          MemorySegment/NULL err-seg]))
-        _ (when (not= CL_SUCCESS (read-int err-seg))
-            (throw (ex-info "clCreateProgramWithSource failed"
-                            {:error (read-int err-seg)})))
+        program (cleanup/acquire-native!
+                 program-slot
+                 (fn []
+                   (let [program (.invokeWithArguments ^MethodHandle @h-clCreateProgramWithSource
+                                                       (into-array Object [context (int 1) src-ptr-seg
+                                                                           MemorySegment/NULL err-seg]))]
+                     (when (or (not= CL_SUCCESS (read-int err-seg))
+                               (nil? program) (= MemorySegment/NULL program))
+                       (throw (ex-info "clCreateProgramWithSource failed"
+                                       {:error (read-int err-seg)})))
+                     program)))
         ;; clBuildProgram
         dev-seg (.allocateFrom ^Arena arena PTR device)
         ret (int (.invokeWithArguments ^MethodHandle @h-clBuildProgram
@@ -1063,8 +1094,7 @@
                                                            options MemorySegment/NULL MemorySegment/NULL])))]
     (when (not= CL_SUCCESS ret)
       ;; Get build log for diagnostics
-      (try
-        (let [log-size-seg (.allocate ^Arena arena I64)
+      (let [log-size-seg (.allocate ^Arena arena I64)
             _ (.invokeWithArguments ^MethodHandle @h-clGetProgramBuildInfo
                                     (into-array Object [program device (int CL_PROGRAM_BUILD_LOG)
                                                         (long 0) MemorySegment/NULL log-size-seg]))
@@ -1074,42 +1104,55 @@
                                     (into-array Object [program device (int CL_PROGRAM_BUILD_LOG)
                                                         log-size log-buf log-size-seg]))
             build-log (.getString log-buf 0)]
-          (throw (ex-info (str "clBuildProgram failed: " build-log)
-                          {:error ret :build-log build-log})))
-        (finally
-          (.invokeWithArguments ^MethodHandle @h-clReleaseProgram (into-array Object [program])))))
+        (throw (ex-info (str "clBuildProgram failed: " build-log)
+                        {:error ret :build-log build-log}))))
     program))
 
 (defn- ensure-kernel-loaded!
   "Lazily compile source and create kernel for a registered kernel.
   Returns updated kernel-info with :program and :kernel-handle."
   [kernel-name]
-  (ensure-init!)
-  (let [info (get @kernel-registry kernel-name)]
-    (when-not info
-      (throw (ex-info (str "Kernel not registered: " kernel-name)
-                      {:kernel-name kernel-name
-                       :registered (keys @kernel-registry)})))
-    (if (:kernel-handle info)
-      info
-      (let [{:keys [arena]} @state
-            source (:source info)
-            _ (when-not source
-                (throw (ex-info "Kernel has no :source for OpenCL compilation"
-                                {:kernel-name kernel-name})))
-            program (compile-program! source (kart/compilation info))
-            err-seg (.allocate ^Arena arena I32)
-            kname-seg (.allocateFrom ^Arena arena ^String kernel-name)
-            kernel-handle (.invokeWithArguments ^MethodHandle @h-clCreateKernel
-                                                (into-array Object [program kname-seg err-seg]))
-            _ (when (not= CL_SUCCESS (read-int err-seg))
-                (throw (ex-info (str "clCreateKernel failed for " kernel-name)
-                                {:error (read-int err-seg)})))
-            updated (assoc info
-                           :program program
-                           :kernel-handle kernel-handle)]
-        (swap! kernel-registry assoc kernel-name updated)
-        updated))))
+  (cleanup/with-registry-use kernel-registry
+    (let [info (get @kernel-registry kernel-name)]
+      (when-not info
+        (throw (ex-info (str "Kernel not registered: " kernel-name)
+                        {:kernel-name kernel-name
+                         :registered (keys @kernel-registry)})))
+      (assert-registration-live! info)
+      (ensure-init!)
+      (if (:kernel-handle info)
+        info
+        (cleanup/build!
+         (registration-owner! info)
+         (fn []
+           (let [{:keys [arena context]} @state
+                 slots (::registration info)
+                 _ (vreset! (:context slots) context)
+                 source (:source info)
+                 _ (when-not source
+                     (throw (ex-info "Kernel has no :source for OpenCL compilation"
+                                     {:kernel-name kernel-name})))
+                 program (compile-program! source (kart/compilation info) (:program slots))
+                 _ (assert-registration-live! info)
+                 err-seg (.allocate ^Arena arena I32)
+                 kname-seg (.allocateFrom ^Arena arena ^String kernel-name)
+                 kernel-handle (cleanup/acquire-native! (:kernel slots)
+                                                        (fn []
+                                                          (let [handle (.invokeWithArguments ^MethodHandle @h-clCreateKernel
+                                                                                             (into-array Object [program kname-seg err-seg]))
+                                                                _ (when (not= CL_SUCCESS (read-int err-seg))
+                                                                    (throw (ex-info (str "clCreateKernel failed for " kernel-name)
+                                                                                    {:error (read-int err-seg)})))
+                                                                _ (when (or (nil? handle) (= MemorySegment/NULL handle))
+                                                                    (throw (ex-info "clCreateKernel returned no handle" {})))]
+                                                            handle)))
+                 updated (assoc info
+                                :program program
+                                :kernel-handle kernel-handle)]
+             (cleanup/publish-owned-update! kernel-registry [kernel-name] info updated)
+             (assert-registration-live! updated)
+             updated))
+         #(cleanup/retain-registration! kernel-registry info %))))))
 
 ;; ================================================================
 ;; Kernel argument setup
@@ -1168,14 +1211,27 @@
   "Return a cached host MemorySegment for [kernel-name k],
   allocating if absent or smaller than n-bytes."
   ^MemorySegment [^String kernel-name k ^long n-bytes]
-  (let [info (get @kernel-registry kernel-name)
-        ^MemorySegment cached (get info k)]
-    (if (and cached (>= (.byteSize cached) n-bytes))
-      cached
-      (let [{:keys [arena]} @state
-            seg (.allocate ^Arena arena n-bytes)]
-        (swap! kernel-registry assoc-in [kernel-name k] seg)
-        seg))))
+  (when (neg? n-bytes)
+    (throw (ex-info "Registration staging extent must be non-negative" {:reason :invalid-staging-extent})))
+  (cleanup/with-registry-use kernel-registry
+    (let [info (get @kernel-registry kernel-name)
+          _ (assert-registration-live! info)
+          cache (:cached (::registration info))
+          ^MemorySegment cached (get @cache k)]
+      (cleanup/retaining-registration!
+       kernel-registry info
+       (fn []
+         (if (and cached (>= (.byteSize cached) n-bytes))
+           cached
+           (let [slot (:staging (::registration info))
+                 arena (case (:phase @slot)
+                         :not-acquired (cleanup/acquire-native! slot #(Arena/ofShared))
+                         :live (:resource @slot)
+                         (throw (ex-info "Registration staging is not live" {:reason :owner-releasing})))
+                 seg (.allocate ^Arena arena n-bytes)]
+             (swap! cache assoc k seg)
+             (assert-registration-live! (cleanup/assert-registration-current! kernel-registry kernel-name info))
+             seg)))))))
 
 ;; ================================================================
 ;; Kernel invocation

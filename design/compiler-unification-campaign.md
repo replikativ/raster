@@ -2111,3 +2111,34 @@ raw APIs; high-level `deftm`/prepared/Link semantics are unchanged. Adjacent emi
 binding checks pass (32 tests / 386 assertions), with the removed vars unmapped in the REPL.
 The old arena and global-module shutdown implementations still require the ownership migration
 above; dead-cache removal alone is not that proof.
+
+#### Registered native generations: implementation checkpoint (2026-10-03)
+
+The shared publication prerequisite is merged as #1014. Native arena ownership is still WIP,
+not released or accepted as complete. Registrations now reserve canonical cleanup before lazy
+loading. OpenCL owns kernel, program and a per-registration shared staging Arena; Level Zero
+owns its base kernel and canonical byte-buffer children while borrowing cached modules.
+Staging caches (including ZE host short arrays) live only in registration-owned state, not in
+compiler metadata. Identical compiler registration retains that exact state; importing native
+handles or cleanup authority through registration metadata is rejected before contact.
+
+Pivotal review identified and prompted tests for reentrant acquisition teardown, lost-generation
+cleanup retention, forged metadata and watch reinsertion of released entries. A shared native-use
+scope rejects same-thread public register/close callbacks before they can retire an acquiring
+slot. If a registry watch loses a generation whose rollback is unresolved, its exact owner and
+arena remain reachable through a hidden failed-registration entry. No uncertain native release
+is retried. Independent arena entries still close even if one retains failure debt.
+
+Persistent-REPL checks: 26 registration/load/arena tests with 228 assertions, plus 48 cleanup and
+native-buffer/kernel tests with 654 assertions, all passing. New regressions cover exact-parent
+loss on internal cache/array watches and same-owner refresh, including successful child rollback,
+and reentrant register/close during destruction/publication. Pruning only proven-released ZE
+children bounds historical owner retention; its final parent-generation postcheck has its own
+remove/replace watch regression. The pivotal reviewer approved this scoped semantic change.
+
+Actual OpenCL and Level Zero registration/load/staging/close/re-register smoke checks passed on
+the local device. Two OpenCL mixed-storage invocation/identical-refresh tests also pass (six
+assertions). These are ownership checks, not performance or reset-recovery claims. All seven
+exact-head CI gates remain required before merge.
+Global cached-module/runtime shutdown ownership remains the immediately following slice; neither
+this checkpoint nor green ownership tests close the training/distributed campaign requirements.
