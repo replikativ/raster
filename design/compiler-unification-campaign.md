@@ -71,6 +71,18 @@ counterexamples before any lease/upload. This slice remains unmerged pending fin
 review and all seven exact-head CI gates. Device packing, scalable hierarchy validation,
 subcycling/reflux, external training migration and real fabric/device measurements remain open.
 
+#### Resident patch packing acceptance
+
+The next slice exercises production hierarchy-derived local/packed indices through the existing
+typed gather/scatter source operations. A public compiled program packs a partially covered
+coarse patch and a fine patch into active-cell order, then unpacks into caller-owned patch fields.
+Independent host indexing and JVM execution agree bit-for-bit with OpenCL and Level Zero,
+including signed zero and preservation of unselected covered coarse cells. The affected geometry,
+packing and CI selection/skip ratchets pass 14 tests / 1,162 assertions in the capped REPL.
+This adds no AMR-specific kernel, owner, codec or session convention. It is bounded resident
+packing acceptance, not scalable hierarchy performance, general patch checkpoint materialization,
+temporal interpolation, subcycling or reflux. Independent review and CI remain required.
+
 This section supersedes historical "next" and "still required" statements below where the cited
 implementation now exists. It records evidence, not a declaration that the campaign is complete.
 The detailed local execution and preparation evidence is in
