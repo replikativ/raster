@@ -18,7 +18,9 @@ executors:
     working_directory: ~/repo
     resource_class: large
     environment:
-      JAVA_TOOL_OPTIONS: "-Xmx3200m"
+      # Keep native/JVM crash diagnostics alongside retained test artifacts. A crash remains
+      # a failed gate even if clojure.test already printed a passing assertion summary.
+      JAVA_TOOL_OPTIONS: "-Xmx3200m -XX:ErrorFile=test-results/hs_err_pid%p.log"
 
   cuda-compiler:
     docker:

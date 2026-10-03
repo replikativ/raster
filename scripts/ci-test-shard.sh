@@ -122,6 +122,10 @@ fi
 
 echo "Running test shard $((shard_index + 1))/${shard_count}: ${#namespaces[@]} namespaces, ${estimated_bytes} estimated work units (timings: ${timings:-source bytes})"
 
+# Exist before JVM/native initialization so ErrorFile diagnostics survive even an early crash.
+# --list/--plan stay read-only, and the JVM's nonzero exit status remains authoritative.
+mkdir -p test-results
+
 runner_args=()
 for namespace in "${namespaces[@]}"; do
   runner_args+=("-n" "${namespace}")
