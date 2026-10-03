@@ -502,6 +502,71 @@
           (remove-watch sess :range)
           (gpu/close-session! sess))))))
 
+(deftest event-publication-watch-cannot-close-retained-transfer
+  (doseq [backend [:ocl :ze]]
+    (with-session-backend
+      backend {}
+      (fn [{:keys [sess releases]}]
+        (gpu/alloc! sess {:root [:float 4 nil]})
+        (let [observed (atom []) closed (atom 0) released (atom 0)
+              resource (reify java.lang.AutoCloseable (close [_] (swap! closed inc)))
+              resolver-var (ns-resolve 'raster.gpu.core 'rt-resolve)
+              resolver @resolver-var]
+          (with-redefs-fn
+            {resolver-var (fn [device name]
+                            (case name
+                              "plan-range" (fn [_ _ _ _] {:n-bytes 4})
+                              "submit-range-batch!" (fn [_ _] :token)
+                              "await-event!" (constantly {:bytes 4 :commands 1})
+                              "release-event!" (fn [_] (swap! released inc))
+                              (resolver device name)))}
+            (fn []
+              (add-watch sess :event-close
+                         (fn [_ _ before after]
+                           (when (< (count (:events before)) (count (:events after)))
+                             (swap! observed conj (error-of #(gpu/close-session! sess))))))
+              (let [event (gpu/submit-upload-ranges-retained!
+                           sess [[(gpu/buffer-view sess :root) (float-array 1) {:elements 1}]]
+                           [resource])]
+                (is (= [:reentrant-root-lifecycle] (mapv #(-> % ex-data :reason) @observed)))
+                (is (not (:closed? @sess)))
+                (is (empty? @releases))
+                (is (zero? @closed))
+                (remove-watch sess :event-close)
+                (gpu/await-event! sess event)
+                (gpu/release-event! sess event)
+                (is (= 1 @closed @released))
+                (gpu/close-session! sess)
+                (is (= 1 (count @releases)))
+                (is (= 1 @closed @released))))))))))
+
+(deftest replacement-publication-failure-removes-only-retired-generations
+  (doseq [registry [:prepared :kernel-graphs] failure [:watch :validator :destruction]]
+    (let [old {:generation :old} candidate {:generation :new}
+          sess (atom {registry {:key old :unrelated :keep}})
+          destroyed (atom []) primary (ex-info "publication failed" {})
+          publish! @(ns-resolve 'raster.gpu.core 'publish-replacement!)]
+      (case failure
+        :watch (add-watch sess :throw
+                          (fn [_ _ before after]
+                            (when (and (not (identical? (get-in before [registry :key]) candidate))
+                                       (identical? (get-in after [registry :key]) candidate))
+                              (throw primary))))
+        :validator (set-validator! sess #(not (identical? (get-in % [registry :key]) candidate)))
+        :destruction nil)
+      (let [error (error-of #(publish! sess registry :key candidate
+                                       (fn [entry]
+                                         (if (= failure :destruction) (throw primary)
+                                             (swap! destroyed conj entry)))))]
+        (is (some? error))
+        (when (not= :validator failure) (is (identical? primary error)))
+        (is (= :keep (get-in @sess [registry :unrelated])))
+        (if (= :destruction failure)
+          (do (is (identical? old (get-in @sess [registry :key])))
+              (is (empty? @destroyed)))
+          (do (is (not (contains? (get @sess registry) :key)))
+              (is (= [old] @destroyed))))))))
+
 (defn- buffer-uses [backend v buffer]
   (let [arr (float-array 4)
         plan {:buf-off 0 :host-off 0 :n-bytes 4 :host-seg (MemorySegment/ofArray arr)}]
