@@ -9,6 +9,7 @@
    conversion/layout/contraction graph, yet two descriptor instances flatten into one replay graph
    with graph-private storage and captured-weight transforms kept out of replay."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.compiler.ir.abstract-value :as av]
@@ -185,7 +186,7 @@
                (vec (gpu-link/download executable difference-node))))
         (finally (gpu-link/close! executable))))))
 
-(deftest attached-close-attempts-the-entire-reverse-order-teardown
+(deftest attached-close-does-not-descend-after-recording-teardown-fails
   (let [calls (atom [])
         executable (gpu-link/map->LinkedExecutable
                     {:session ::caller-session
@@ -205,11 +206,23 @@
                   (fn [_ allocation] (swap! calls conj [:allocation allocation]))]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"destructor failed"
                             (gpu-link/close! executable))))
-    (is (= [[:graph :graph]
-            [:phase :phase-1] [:phase :phase-0]
-            [:allocation :allocation-1] [:allocation :allocation-0]]
-           @calls))
-    (is (nil? (gpu-link/close! executable)) "close remains idempotent after a destructor failure")))
+    (is (= [[:graph :graph]] @calls))))
+
+(deftest attached-close-attempts-independent-phases-but-retains-dependent-roots
+  (let [calls (atom []) failure (ex-info "phase failed" {})
+        secondary (ex-info "other phase failed" {})
+        executable (gpu-link/map->LinkedExecutable
+                     {:session ::caller-session :owns-session? false :graph-key :graph
+                      :phases [:phase-0 :phase-1] :allocation-keys [:allocation]
+                      :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)})]
+    (with-redefs [gpu/release-recorded-graph! (fn [& _] (swap! calls conj :graph))
+                  gpu/release-prepared! (fn [_ phase]
+                                          (swap! calls conj phase)
+                                          (throw (if (= phase :phase-1) failure secondary)))
+                  gpu/free-buffer! (fn [& _] (swap! calls conj :root))]
+      (is (identical? failure (try (gpu-link/close! executable) (catch Throwable error error))))
+      (is (= [secondary] (vec (.getSuppressed failure))))
+      (is (= [:graph :phase-1 :phase-0] @calls)))))
 
 (deftest linked-device-input-is-zero-copy-or-device-to-device
   (let [destination-buffer (Object.)
@@ -390,7 +403,7 @@
 (deftest stable-recorded-graph-profiling-keeps-backend-handles-private
   (let [graph (Object.)
         session (atom {:device-id :ze:0
-                       :graphs {:profiled {::gpu/recorded-graph true
+                       :graphs {:profiled {::gpu/recorded-graph true ::cleanup/owner (cleanup/owner [])
                                            :replay-graph graph :profile? true}}})
         calls (atom [])
         resolver (fn [_device name]

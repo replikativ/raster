@@ -278,15 +278,33 @@
   [value]
   (true? (::recorded-graph value)))
 
+(defn- recorded-owner! [entry]
+  (or (::cleanup/owner entry)
+      (throw (ex-info "Recorded wrapper has lost its cleanup owner" {:reason :missing-cleanup-owner}))))
+
+(defn- assert-source-unrecorded! [sess kind key]
+  (let [borrowers (into []
+                       (keep (fn [[graph-key entry]]
+                               (when (some #(and (= kind (:kind %)) (= key (:key %)))
+                                           (:recording-sources entry))
+                                 graph-key)))
+                       (:graphs @sess))]
+    (when (seq borrowers)
+      (throw (ex-info "Recorded graphs retain this bound source"
+                      {:reason :recorded-source-retained :kind kind :key key :graphs borrowers})))))
+
+(defn- destroy-runtime-recording! [device-id graph]
+  (if-let [destroy! (rt-resolve-soft device-id "destroy-graph!")]
+    (destroy! graph)
+    (throw (ex-info "Backend recording destructor is unavailable" {:reason :missing-recording-destructor}))))
+
 (defn- destroy-recorded-graph-entry!
   [device-id entry]
   (when entry
-    (when-let [destroy-graph! (rt-resolve-soft device-id "destroy-graph!")]
-      (doseq [graph (if (recorded-graph-entry? entry)
-                      [(:replay-graph entry) (:prologue-graph entry)]
-                      [entry])
-              :when graph]
-        (try (destroy-graph! graph) (catch Exception _))))))
+    (if (recorded-graph-entry? entry)
+      (cleanup/release! (recorded-owner! entry))
+      ;; Raw backend graph registrations remain checked by their backend owner contract.
+      (destroy-runtime-recording! device-id entry))))
 
 (defn- own-kernel-graph-entry
   [device-id {:keys [runtime-graph prepareds owned-view-buffers temporary-buffers cleanup-debts]
@@ -657,7 +675,9 @@
    the device completed: awaiting establishes visibility and releases backend staging first."
   [sess key]
   (locking sess
-    (let [{:keys [device-id buffers allocations kernel-graphs events]} @sess
+    (let [{:keys [device-id buffers allocations kernel-graphs events graphs]} @sess
+          recorded-borrowers (into [] (keep (fn [[graph-key entry]]
+                                              (when (recorded-graph-entry? entry) graph-key))) graphs)
           bound-graphs (->> kernel-graphs
                             (keep (fn [[graph-key entry]]
                                     (when (some #(= key (:key %))
@@ -669,6 +689,9 @@
                      :resident-buffers [(get buffers key)]}
           pending-transfers (pending-resident-events events :transfer footprint)]
       (when-let [buf (get buffers key)]
+        (when (seq recorded-borrowers)
+          (throw (ex-info "cannot release storage retained by a recorded sequence"
+                          {:reason :recorded-buffer-retained :key key :graphs recorded-borrowers})))
         (when (seq bound-graphs)
           (throw (ex-info "cannot release a buffer while a kernel graph holds one of its views"
                           {:key key :kernel-graphs bound-graphs})))
@@ -747,7 +770,9 @@
   ([sess phase-key sym->buf-key scalars n]
    (prepare! sess phase-key sym->buf-key scalars n {}))
   ([sess phase-key sym->buf-key scalars n {:keys [index async? kernel-phase] :or {index 0}}]
+   (locking sess
    (assert-session-open! sess)
+   (assert-source-unrecorded! sess :phase phase-key)
    (let [{:keys [kernels buffers]} @sess
          ;; The COMPILED kernel comes from kernel-phase (defaults to phase-key); the bound
          ;; argument-set is stored under phase-key. This lets one compiled kernel back many
@@ -763,7 +788,7 @@
          prepared (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})]
      (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
      (swap! sess assoc-in [:prepared phase-key] prepared)
-     prepared)))
+     prepared))))
 
 (defn invoke-bound!
   "Dispatch a kernel previously bound with prepare!. No arg setup, no barrier — the
@@ -829,6 +854,7 @@
   ([sess sources] (record-bound-sequence! sess sources :graph {}))
   ([sess sources graph-key] (record-bound-sequence! sess sources graph-key {}))
   ([sess sources graph-key {:keys [profile?] :or {profile? false}}]
+   (locking sess
    (when (or (:closed? @sess) (not (vector? sources)) (empty? sources))
      (throw (ex-info "recording requires an open session and nonempty ordered source vector"
                      {:reason :gpu-recording-invalid-sequence :graph-key graph-key})))
@@ -858,26 +884,48 @@
          prologue-prepareds (if mixed? [] (filterv :const-prologue? prepareds))
          replay-prepareds (if mixed? prepareds
                                (filterv (complement :const-prologue?) prepareds))
-         prologue-graph (when (seq prologue-prepareds) (record-fn prologue-prepareds))
-         graph (try
-                 (when prologue-graph
-                   ((rt-resolve device-id "replay-graph!") prologue-graph))
-                 ;; Keep the non-profiling recording on the backend's exact fast path. Profiling
-                 ;; events are a graph-construction property, not a replay flag.
-                 (if profile?
-                   (record-fn replay-prepareds {:barriers? true :profile? true})
-                   (record-fn replay-prepareds))
-                 (catch Exception e
-                   (destroy-recorded-graph-entry! device-id prologue-graph)
-                   (throw e)))
-         entry {::recorded-graph true
-                :replay-graph graph
-                :prologue-graph prologue-graph
-                :profile? (boolean profile?)
-                :execution-order execution-order}]
-     (destroy-recorded-graph-entry! device-id (get-in @sess [:graphs graph-key]))
+         slots {:replay (volatile! nil) :prologue (volatile! nil)}
+         owner (cleanup/owner
+                 (mapv (fn [id]
+                         {:id id
+                          :release #(when-let [{:keys [graph debt]} @(get slots id)]
+                                      (if debt (cleanup/release! debt)
+                                        (destroy-runtime-recording! device-id graph)))})
+                       [:replay :prologue]))
+         base-entry {::recorded-graph true ::cleanup/owner owner
+                     :recording-sources (mapv (fn [{:keys [kind phase handle]}]
+                                               (cond-> {:kind kind :key (if (= kind :phase) phase (:key handle))}
+                                                 (= kind :graph) (assoc :handle handle))) sources)
+                     ;; Descriptor phase footprints are incomplete. Until that migration lands,
+                     ;; free-buffer! conservatively blocks every registration under a wrapper.
+                     :source-bindings resolved
+                     :profile? (boolean profile?) :execution-order execution-order}
+         record-one! (fn [id bindings profiling?]
+                       (let [slot (get slots id)
+                             graph (record-fn bindings
+                                             {:barriers? true :profile? profiling?
+                                              :adopt-cleanup! (fn [debt]
+                                                                (when @slot
+                                                                  (throw (ex-info "Recording slot already owns an acquisition"
+                                                                                  {:reason :recording-slot-occupied :slot id})))
+                                                                (vreset! slot {:debt debt}))})]
+                         (vreset! slot {:graph graph})
+                         graph))
+         entry (cleanup/build! owner
+                 (fn []
+                   (let [prologue (when (seq prologue-prepareds)
+                                    (record-one! :prologue prologue-prepareds false))
+                         _ (when prologue ((rt-resolve device-id "replay-graph!") prologue))
+                         graph (record-one! :replay replay-prepareds (boolean profile?))]
+                     ;; Complete new construction before touching the old generation. If old
+                     ;; teardown fails, it stays registered; rollback owns the provisional new one.
+                     (destroy-recorded-graph-entry! device-id (get-in @sess [:graphs graph-key]))
+                     (assoc base-entry :replay-graph graph :prologue-graph prologue)))
+                 (fn [_]
+                   (swap! sess assoc-in [:graphs [::failed-recording (random-uuid)]]
+                          (assoc base-entry :failed-construction? true))))]
      (swap! sess assoc-in [:graphs graph-key] entry)
-     graph)))
+     (:replay-graph entry)))))
 
 (defn record-graph!
   "Record ordered prepared phase keys into one replayable command graph. This is the
@@ -908,10 +956,12 @@
   "Execute a recorded command graph once (synchronous). Reads current buffer contents."
   ([sess] (replay! sess :graph))
   ([sess graph-key]
+   (locking sess
    (assert-session-open! sess)
    (let [device-id (:device-id @sess)
          entry (or (get-in @sess [:graphs graph-key])
                    (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))
+         _ (when (recorded-graph-entry? entry) (cleanup/assert-live! (recorded-owner! entry)))
          graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
      ((rt-resolve device-id "replay-graph!") graph)
      ;; A normal replay intentionally discards profiling data, just like LinkedExecutable/run!.
@@ -919,7 +969,7 @@
      ;; resets them instead.
      (when (and (recorded-graph-entry? entry) (:profile? entry))
        (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
-         (reset-fn graph))))))
+         (reset-fn graph)))))))
 
 (defn release-recorded-graph!
   "Release one graph recorded by record-graph!. Idempotent. Prepared executable steps and their
@@ -927,8 +977,8 @@
   [sess graph-key]
   (locking sess
     (when-let [entry (get-in @sess [:graphs graph-key])]
-      (swap! sess update :graphs dissoc graph-key)
-      (destroy-recorded-graph-entry! (:device-id @sess) entry)))
+      (destroy-recorded-graph-entry! (:device-id @sess) entry)
+      (swap! sess update :graphs dissoc graph-key)))
   nil)
 
 (defn release-prepared!
@@ -937,8 +987,9 @@
   [sess phase-key]
   (locking sess
     (when-let [entry (get-in @sess [:prepared phase-key])]
-      (swap! sess update :prepared dissoc phase-key)
-      (destroy-prepared-entry! (:device-id @sess) entry)))
+      (assert-source-unrecorded! sess :phase phase-key)
+      (destroy-prepared-entry! (:device-id @sess) entry)
+      (swap! sess update :prepared dissoc phase-key)))
   nil)
 
 (declare bind-kernel-executable! run-kernel-graph! release-kernel-graph!)
@@ -1637,6 +1688,7 @@
          external-ids (external-graph-buffer-ids graph)]
      (when closed?
        (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
+     (assert-source-unrecorded! sess :graph graph-key)
      (when-not (= external-ids (set (keys buffer-keys)))
        (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
                        {:expected external-ids :bound (set (keys buffer-keys))})))
@@ -1738,6 +1790,7 @@
          abi (:abi artifact)]
      (when closed?
        (throw (ex-info "cannot bind a kernel call in a closed GPU session" {:key call-key})))
+     (assert-source-unrecorded! sess :graph call-key)
      (when (nil? call-key)
        (throw (ex-info "bound kernel call requires a non-nil key" {})))
      (kabi/validate-arguments! abi arguments)
@@ -2103,6 +2156,7 @@
     (when-let [entry (get-in @sess [:kernel-graphs (:key handle)])]
       (when-not (= (:generation entry) (:generation handle))
         (throw (ex-info "Kernel graph handle names a retired generation" {:reason :stale-graph-handle})))
+      (assert-source-unrecorded! sess :graph (:key handle))
       (release-graph-events! sess (:key handle))
       (destroy-kernel-graph-entry! (:device-id @sess) entry)
       (swap! sess update :kernel-graphs dissoc (:key handle))))
@@ -2271,7 +2325,9 @@
   ([sess step args sym->key]
    (bind-step! sess step args sym->key {}))
   ([sess step args sym->key {:keys [schedule roles] :or {roles {}}}]
+   (locking sess
    (assert-session-open! sess)
+   (assert-source-unrecorded! sess :phase (:phase step))
    (let [device-id (:device-id @sess)
          {:keys [kernel-name phase]} step
          materialized (volatile! {})
@@ -2316,7 +2372,7 @@
          old (get-in @sess [:prepared phase])]
      (swap! sess assoc-in [:prepared phase] bound-step)
      (destroy-prepared-entry! device-id old)
-     sess)))
+     sess))))
 
 ;; ----------------------------------------------------------------
 ;; Hand-authored op-chain (the manual resident decoder layer — gemma-first; converges to a single
@@ -2441,6 +2497,10 @@
    + attention scratch are sized to MAX positions at bind; cache-len/pos vary per token as scalars."
   ([sess ctx inputs] (run-chain-ctx! sess ctx inputs (:chain-dtype @sess)))
   ([sess ctx inputs dtype]
+   (locking sess
+   (assert-session-open! sess)
+   ;; Retire the prior recording before replacing the phase handles it borrows.
+   (release-recorded-graph! sess :chain)
    (let [steps (:chain-steps @sess) roles (:chain-roles @sess)
          resolve* (fn [v] (if (keyword? v) (get ctx v) v))
          ;; A step is POSITION-DEPENDENT iff a scalar value or its work-item count is a ctx keyword
@@ -2461,7 +2521,7 @@
      (record-graph! sess (mapv :phase steps) :chain)
      (doseq [[k arr] inputs] (upload! sess k arr))
      (replay! sess :chain)
-     (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)])))))
+     (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)]))))))
 
 (defn kernel
   "Get kernel info vector from the session by phase key."
@@ -2499,6 +2559,7 @@
    device-event profile. Unlike replay!, this consumes (and resets) the timestamps instead of
    discarding them. The graph representation remains private to the session layer."
   [sess graph-key]
+  (locking sess
   (assert-session-open! sess)
   (let [device-id (:device-id @sess)
         entry (or (get-in @sess [:graphs graph-key])
@@ -2508,7 +2569,8 @@
     (when-not (and (recorded-graph-entry? entry) (:profile? entry))
       (throw (ex-info "recorded graph was not created with {:profile? true}"
                       {:graph-key graph-key})))
-    (profile-runtime-graph! device-id graph)))
+    (cleanup/assert-live! (recorded-owner! entry))
+    (profile-runtime-graph! device-id graph))))
 
 (defn- graph-device-sampler
   [sess graph before-sample!]
@@ -2550,6 +2612,7 @@
   "Repeatedly measure a session graph recorded with `{:profile? true}`. This is the stable-key
    counterpart to measure-graph! and keeps backend graph handles out of compiler/runtime APIs."
   [sess graph-key & {:as opts}]
+  (locking sess
   (let [entry (or (get-in @sess [:graphs graph-key])
                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first")
                                   {:graph-key graph-key})))
@@ -2557,7 +2620,22 @@
     (when-not (and (recorded-graph-entry? entry) (:profile? entry))
       (throw (ex-info "recorded graph was not created with {:profile? true}"
                       {:graph-key graph-key})))
-    (apply measure-graph! sess graph (mapcat identity opts))))
+    (apply measure-graph! sess graph
+           (mapcat identity
+                   (assoc opts :before-sample!
+                          (fn []
+                            ;; graph-device-sampler runs this check under the session lock.
+                            (when-not (identical? entry (get-in @sess [:graphs graph-key]))
+                              (throw (ex-info "Recorded graph changed during measurement"
+                                              {:reason :stale-recording :graph-key graph-key})))
+                            (cleanup/assert-live! (recorded-owner! entry))
+                            (when-let [before (:before-sample! opts)] (before))
+                            ;; User hooks execute under a reentrant monitor and may themselves
+                            ;; close or replace the recording. Revalidate before native replay.
+                            (when-not (identical? entry (get-in @sess [:graphs graph-key]))
+                              (throw (ex-info "Recorded graph changed in the sample hook"
+                                              {:reason :stale-recording :graph-key graph-key})))
+                            (cleanup/assert-live! (recorded-owner! entry)))))))))
 
 (defn measure-bound-kernel-graph!
   "Device-event measurement of a bound KernelGraphHandle.
