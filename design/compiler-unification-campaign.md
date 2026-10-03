@@ -83,6 +83,32 @@ This adds no AMR-specific kernel, owner, codec or session convention. It is boun
 packing acceptance, not scalable hierarchy performance, general patch checkpoint materialization,
 temporal interpolation, subcycling or reflux. Independent review and CI remain required.
 
+#### Bounded subcycled diffusion and synchronized restart — October 4
+
+PR #1031 is merged after independent review and all seven exact-head CI gates. It adds
+temporal boundary interpolation and signed transport accumulation as ordinary source operations,
+and retains physical capacities independently of checked traversal minima. Fusion still proves
+the consumed output AxisMap; capacity guards do not substitute for source/index proofs.
+
+The next bounded numerical vertical composes those operations with existing finite-volume,
+CSR, gather/scatter and restriction operators: a complete coarse prediction, two ratio-2 fine
+substeps, signed reflux, then average-down. Pure projection admits one strictly interior aligned
+2D fine patch and periodic boundaries, checks enumeration budgets before materialization, and
+retains physical face-integrated rate units. Projection does not certify timestep stability,
+runtime ownership or a general adaptive cycle; synchronized inputs and a stable timestep remain
+explicit caller obligations. No AMR-specific emitter, cache, allocation or session is added.
+
+Independent coordinate-loop oracles cover square and anisotropic rectangular geometry,
+conservation, transport signs, coarse-boundary interpolation and equilibrium scratch replay.
+Completed capture stores both synchronized fields using original producer and owner-bound
+representation evidence. The source closes before mapped-byte restoration into a fresh execution;
+continuation matches uninterrupted resident feedback bit-for-bit on both OpenCL and Level Zero.
+A different declared phase is rejected. The affected suites pass 12 tests / 316 assertions locally,
+with both native backends available. Synthetic build/provider fixtures are not release provenance
+or a production store. Independent review and CI remain required before merge. General hierarchy
+scaling, adaptive/multi-patch or mid-cycle restart, external accuracy/performance comparisons,
+external training migration and real distributed fabrics remain open.
+
 This section supersedes historical "next" and "still required" statements below where the cited
 implementation now exists. It records evidence, not a declaration that the campaign is complete.
 The detailed local execution and preparation evidence is in
