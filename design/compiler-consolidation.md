@@ -1517,3 +1517,33 @@ receipt metadata out of the certified compiler state.
 This finalizes provider-declared availability, not producer authentication, codec verification,
 parent existence or transactional metadata publication. Orphan blobs and acknowledgment loss are
 explicit failure cases; receipt-to-manifest integration remains on the eight-item campaign.
+
+### Bounded source ingestion into the existing content lifecycle — 2026-10-03
+
+The missing producer-to-provider handoff is an optional ContentIngestor capability alongside
+ContentProvider, not a replacement store/session or a required method on existing providers.
+Explicit target-tier preflight precedes provider/source contact. Provider-owned writable windows
+are at most 64 KiB; source callbacks consume a contiguous complete stream synchronously on the
+submitting thread. Callback failures are sticky, including caught/retried and reentrant failures.
+The final callback verifies SHA-256 before returning success; empty-source digest validation is
+preflight. Every submission exit expires the callback and clears its source-reader reference.
+Provider windows are exclusive borrows during the callback; neither side may retain the other's
+source/window beyond that scope. These are trusted implementation obligations, not inferred
+escape proofs.
+
+The existing StorageEvent represents pending placement, not a source borrow or independent
+durability proof. Rejected returned events drain through the originating provider with cleanup
+errors suppressed onto the primary. Submission failure without an event leaves native/provider
+cleanup internal to that provider. The synchronous ingest-content! helper checks exact
+provider/tier/content placement and drains before returning. A source arena can close before
+placement await. Ingestion attests the supplied stream only; the existing reopen/extent/SHA
+verification remains required before durable availability and metadata publication.
+
+Pivotal review found that a provider could catch a reader/digest error then replace it with its
+own submission error. The wrapper now captures both outcomes, preserving the exact first callback
+fault and suppressing a distinct provider error without inventing an event handoff. Expired reader
+closures also clear fault data so retained callbacks cannot keep source objects through an error.
+Focused ingestion/content/publication tests pass 35 tests / 698 assertions in the capped REPL.
+This adds no producer provenance, numerical field selection, transactional metadata publication
+or completed-receipt-to-manifest vertical; those remain the next integration work. The original
+eight-item campaign, external training acceptance and AMR/subcycling requirements remain open.
