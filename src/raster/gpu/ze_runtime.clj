@@ -949,16 +949,18 @@
          _ (when-not (every? #(or (nil? %) (fn? %)) [retain-owner! adopt-cleanup!])
              (throw (ex-info "Buffer ownership requires callbacks" {:reason :invalid-cleanup-plan})))
          _ (ensure-init!)
-         {:keys [context device arena]} @state
          slot (cleanup/acquisition-slot)
-         owner (cleanup/owner [{:id :memory
-                                :release #(cleanup/release-native! slot (fn [segment]
-                                                                          (free-in-context! context segment)))}])]
-     (cleanup/build!
-      owner
-      (fn []
+         context-slot (volatile! nil)
+         resources [{:id :memory
+                     :release #(cleanup/release-native! slot (fn [segment]
+                                                               (free-in-context! @context-slot segment)))}]]
+     (root/construct-child!
+      state resources
+      (fn [owner entry]
         (when retain-owner! (retain-owner! owner))
-        (let [seg (cleanup/acquire-native!
+        (let [{:keys [context device arena]} @(:projection entry)
+              _ (vreset! context-slot context)
+              seg (cleanup/acquire-native!
                    slot #(let [segment (alloc-shared-raw context device arena (max 1 byte-size))]
                            (when (or (nil? segment) (zero? (.address ^MemorySegment segment)))
                              (throw (ex-info "zeMemAllocShared returned a null pointer"

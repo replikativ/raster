@@ -75,6 +75,7 @@
                            plan))
               entry {::root? true :generation (random-uuid) :phase (volatile! :constructing)
                      :ever-live? (volatile! false) :projection (volatile! {})
+                     :leases (volatile! {})
                      :slots slots ::cleanup/owner owner}]
           (try
             (cleanup/build! owner
@@ -129,6 +130,78 @@
                         (acquire! entry id acquire))
         (throw (ex-info "Runtime root child has unresolved acquisition"
                         {:reason :runtime-root-unavailable :slot id}))))))
+
+(defn- lease-under-lock!
+  [state]
+  (let [entry (assert-live! state)
+        token (random-uuid)
+        owner-slot (volatile! nil)
+        owner (cleanup/owner
+               [{:id :runtime-root-lease
+                 :release
+                 #(locking state
+                      ;; Failed lazy acquisition still permits known child retirement.
+                      ;; Lost-generation authority must remain reachable, never be guessed.
+                    (when-not (some (fn [[_ value]] (identical? entry value)) (entries state))
+                      (throw (ex-info "Runtime lease lost its exact root generation"
+                                      {:reason :runtime-generation-mismatch})))
+                    (when-not (identical? @owner-slot (get @(:leases entry) token))
+                      (throw (ex-info "Runtime lease lost its exact owner"
+                                      {:reason :cleanup-owner-mismatch})))
+                    (vswap! (:leases entry) dissoc token))}])]
+    (vreset! owner-slot owner)
+    (vswap! (:leases entry) assoc token owner)
+    {::entry entry ::lease-token token ::cleanup/owner owner}))
+
+(defn lease!
+  "Pin the admitted root generation until the returned Cleanup owner is released.
+   Runtime-only authority: callers retain this in their resource owner's cleanup DAG.
+   The private lease table holds owners, not native pointers or compiler metadata."
+  [state]
+  (cleanup/with-registry-use state (lease-under-lock! state)))
+
+(defn construct-child!
+  "Construct one canonical child owner, with the root lease as its final dependency.
+   build receives that composite Cleanup and the exact root entry under the lifecycle lock.
+   Retain/adopt the composite owner, never just the standalone root lease."
+  [state resources build adopt-cleanup!]
+  (when-not (and (vector? resources) (fn? build)
+                 (or (nil? adopt-cleanup!) (fn? adopt-cleanup!)))
+    (throw (ex-info "Runtime child construction requires a checked plan"
+                    {:reason :invalid-cleanup-plan})))
+  (let [lease-slot (volatile! nil)
+        owner (cleanup/owner
+               (conj resources
+                     {:id :runtime-root-lease :after (set (map :id resources))
+                      :release #(when-let [lease @lease-slot]
+                                  (cleanup/release! (::cleanup/owner lease)))}))]
+    (cleanup/with-registry-use state
+      (cleanup/build!
+       owner
+       (fn []
+         (let [lease (lease-under-lock! state)]
+           (vreset! lease-slot lease)
+           (build owner (::entry lease))))
+       adopt-cleanup!))))
+
+(defn assert-lease-live!
+  "Check lease authority and current root admission. Does not create another lease."
+  [state lease]
+  (locking state
+    (let [entry (assert-live! state)
+          owner (::cleanup/owner lease)]
+      (when-not (and (identical? entry (::entry lease)) owner
+                     (identical? owner (get @(:leases entry) (::lease-token lease))))
+        (throw (ex-info "Runtime lease does not belong to the admitted root"
+                        {:reason :runtime-generation-mismatch})))
+      (cleanup/assert-live! owner)
+      lease)))
+
+(defn lease-count
+  "Diagnostic live lease count of the exact admitted root, never destruction authority."
+  [state]
+  (locking state
+    (count @(:leases (assert-live! state)))))
 
 (defn shutdown-construction!
   "Clean failed initialization only. Ever-live roots fail closed until all child leases exist.

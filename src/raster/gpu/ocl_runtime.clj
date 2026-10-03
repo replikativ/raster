@@ -632,20 +632,21 @@
          _ (when-not (every? #(or (nil? %) (fn? %)) [retain-owner! adopt-cleanup!])
              (throw (ex-info "Buffer ownership requires callbacks" {:reason :invalid-cleanup-plan})))
          _ (ensure-init!)
-         {:keys [context]} @state
          alignment (long (buffer-offset-alignment))
-         arena (Arena/ofShared)
          slot (cleanup/acquisition-slot)
-         owner (cleanup/owner
-                [{:id :memory :release #(cleanup/release-native!
-                                         slot (fn [handle]
-                                                (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [handle])))}
-                 {:id :staging-arena :after #{:memory} :release #(.close arena)}])]
-     (cleanup/build!
-      owner
-      (fn []
+         arena-slot (cleanup/acquisition-slot)
+         resources [{:id :memory :release #(cleanup/release-native!
+                                            slot (fn [handle]
+                                                   (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [handle])))}
+                    {:id :staging-arena :after #{:memory}
+                     :release #(cleanup/release-native! arena-slot (fn [^Arena arena] (.close arena)))}]]
+     (root/construct-child!
+      state resources
+      (fn [owner entry]
         (when retain-owner! (retain-owner! owner))
-        (let [host-seg (.allocate ^Arena arena byte-size)
+        (let [context (:context @(:projection entry))
+              arena (cleanup/acquire-native! arena-slot #(Arena/ofShared))
+              host-seg (.allocate ^Arena arena byte-size)
               err-seg (.allocate ^Arena arena I32)
               cl-mem (cleanup/acquire-native!
                       slot
@@ -702,18 +703,21 @@
      (when-not (zero? (mod byte-offset alignment))
        (throw (ex-info "OpenCL sub-buffer origin violates the device alignment requirement"
                        {:byte-offset byte-offset :required-alignment alignment})))
-     (let [arena (Arena/ofShared)
-           slot (cleanup/acquisition-slot)
-           owner (cleanup/owner
-                  [{:id :memory :release #(cleanup/release-native!
-                                           slot (fn [handle]
-                                                  (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [handle])))}
-                   {:id :readback-arena :after #{:memory} :release #(.close arena)}])]
-       (cleanup/build!
-        owner
-        (fn []
+     (let [slot (cleanup/acquisition-slot)
+           arena-slot (cleanup/acquisition-slot)
+           resources [{:id :memory :release #(cleanup/release-native!
+                                              slot (fn [handle]
+                                                     (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [handle])))}
+                      {:id :readback-arena :after #{:memory}
+                       :release #(cleanup/release-native! arena-slot (fn [^Arena arena] (.close arena)))}]]
+       (root/construct-child!
+        state resources
+        (fn [owner _]
+          ;; Parent admission is rechecked under the same root-generation lifecycle scope.
+          (assert-buffer-live! buf)
           (when retain-owner! (retain-owner! owner))
-          (let [host-seg (.allocate arena byte-length)
+          (let [arena (cleanup/acquire-native! arena-slot #(Arena/ofShared))
+                host-seg (.allocate arena byte-length)
                 region (.allocate arena (long 16) (long 8))
                 err-seg (.allocate arena I32)
                 _ (.set region I64 0 byte-offset)

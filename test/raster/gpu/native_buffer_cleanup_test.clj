@@ -4,6 +4,7 @@
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]
             [raster.gpu.core :as gpu]
+            [raster.gpu.runtime-root :as root]
             [raster.gpu.resource-cleanup :as cleanup])
   (:import [java.lang.foreign Arena MemorySegment]
            [java.lang.invoke MethodHandles]))
@@ -17,6 +18,11 @@
           creates (atom 0) releases (atom [])
           make! (if (= :ocl backend) ocl/make-buffer ze/make-buffer)
           free! (if (= :ocl backend) ocl/free-buffer! ze/free-buffer!)
+          state (atom {:initialized? false})
+          _ (root/initialize! state []
+                              (fn [_] {:arena (or (:root-arena options) arena)
+                                       :context (if (= :ocl backend) MemorySegment/NULL
+                                                    (MemorySegment/ofAddress 300))}))
           release (fn [handle]
                     (swap! releases conj handle)
                     (when-let [failure (:release-failure options)]
@@ -25,7 +31,7 @@
                         (throw failure))))
           redefs (if (= :ocl backend)
                    {(v 'ensure-init!) (fn [])
-                    (v 'state) (atom {:arena arena :context MemorySegment/NULL})
+                    (v 'state) state
                     (v 'buffer-offset-alignment) (constantly 16)
                     (v 'h-clCreateBuffer)
                     (delay (MethodHandles/dropArguments
@@ -46,13 +52,13 @@
                                     (is (= "clReleaseMemObject" label))
                                     (release (first args)))}
                    {(v 'ensure-init!) (fn [])
-                    (v 'state) (atom {:arena arena :context (MemorySegment/ofAddress 300)})
+                    (v 'state) state
                     (v 'alloc-shared-raw) (fn [_ _ _ n] (swap! creates inc)
                                             (when-let [failure (:create-failure options)] (throw failure))
                                             (if (:null? options) MemorySegment/NULL (.allocate arena (long n))))
                     (v 'free-in-context!) (fn [_ segment] (release segment))})]
       (with-redefs-fn redefs #(test! {:make! make! :free! free! :creates creates
-                                      :releases releases :arena arena :v v})))))
+                                      :releases releases :arena arena :state state :v v})))))
 
 (deftest backend-buffer-preflight-has-no-native-contact
   (doseq [backend [:ocl :ze]]
@@ -78,6 +84,85 @@
           (free! buffer)
           (free! buffer)
           (is (= 1 (count @releases))))))))
+
+(deftest buffer-and-view-leases-retire-only-with-their-canonical-native-owners
+  (doseq [backend [:ocl :ze]]
+    (with-backend backend {}
+      (fn [{:keys [make! free! state v]}]
+        (let [buffer (make! 8 :float)
+              view ((v 'slice-buffer) buffer 16 16 :float)]
+          (is (= (if (= :ocl backend) 2 1) (root/lease-count state)))
+          (when (= :ocl backend)
+            (free! buffer)
+            (is (= 1 (root/lease-count state)))
+            (free! view))
+          (when (= :ze backend)
+            (is (identical? (cleanup/lifetime-owner buffer) (cleanup/lifetime-owner view)))
+            (is (= :non-owning-buffer (:reason (ex-data (error-of #(free! view))))))
+            (free! buffer))
+          (is (zero? (root/lease-count state))))))))
+
+(deftest unpublished-buffer-creation-debt-keeps-the-root-pinned
+  (doseq [backend [:ocl :ze]]
+    (let [failure (ex-info "unknown native create" {})]
+      (with-backend backend {:create-failure failure}
+        (fn [{:keys [make! state creates releases]}]
+          (let [error (error-of #(make! 4 :float))
+                owner (::cleanup/unresolved (ex-data error))]
+            (is (identical? failure (.getCause ^Throwable error)))
+            (is (some? owner))
+            (is (= 1 (root/lease-count state)))
+            (is (= :runtime-root-lease (last (cleanup/pending owner))))
+            (is (identical? failure (error-of #(cleanup/release! owner))))
+            (is (= 1 (root/lease-count state)))
+            (is (= 1 @creates))
+            (is (empty? @releases))))))))
+
+(deftest unknown-buffer-destruction-keeps-the-final-root-lease
+  (doseq [backend [:ocl :ze]]
+    (let [failure (ex-info "unknown native destroy" {})]
+      (with-backend backend {:release-failure failure}
+        (fn [{:keys [make! free! state releases]}]
+          (let [buffer (make! 4 :float)]
+            (is (identical? failure (error-of #(free! buffer))))
+            (is (= 1 (root/lease-count state)))
+            (is (= :runtime-root-lease (last (cleanup/pending (::cleanup/owner buffer)))))
+            (is (identical? failure (error-of #(free! buffer))))
+            (is (= 1 (count @releases)))))))))
+
+(deftest buffer-retention-rejection-releases-lease-before-any-native-create
+  (doseq [backend [:ocl :ze]]
+    (with-backend backend {}
+      (fn [{:keys [make! state creates releases]}]
+        (let [failure (ex-info "publication rejected" {})]
+          (is (identical? failure
+                          (error-of #(make! 4 :float
+                                            {:retain-owner! (fn [_] (throw failure))}))))
+          (is (zero? (root/lease-count state)))
+          (is (zero? @creates))
+          (is (empty? @releases)))))))
+
+(deftest buffer-retention-cannot-retire-the-owner-before-native-acquisition
+  (doseq [backend [:ocl :ze] caught? [false true]]
+    (with-backend backend {}
+      (fn [{:keys [make! free! state creates releases]}]
+        (let [retain! (fn [owner]
+                        (if caught?
+                          (is (= :owner-construction-in-progress
+                                 (:reason (ex-data (error-of #(cleanup/release! owner))))))
+                          (cleanup/release! owner)))]
+          (if caught?
+            (let [buffer (make! 4 :float {:retain-owner! retain!})]
+              (is (= 1 @creates))
+              (is (= 1 (root/lease-count state)))
+              (free! buffer)
+              (is (= 1 (count @releases))))
+            (do
+              (is (= :owner-construction-in-progress
+                     (:reason (ex-data (error-of #(make! 4 :float {:retain-owner! retain!}))))))
+              (is (zero? @creates))
+              (is (empty? @releases))))
+          (is (zero? (root/lease-count state))))))))
 
 (deftest canonical-owner-is-published-before-native-contact
   (doseq [backend [:ocl :ze]]
@@ -394,18 +479,17 @@
             (is (= :owner-releasing (:reason (ex-data (error-of #(live! slice))))))))))))
 
 (deftest opencl-staging-does-not-borrow-the-global-arena
-  (with-backend
-    :ocl {}
-    (fn [{:keys [make! free! v]}]
-      (let [global (Arena/ofShared)]
-        (try
-          (swap! @(v (quote state)) assoc :arena global)
+  (let [global (Arena/ofShared)]
+    (try
+      (with-backend
+        :ocl {:root-arena global}
+        (fn [{:keys [make! free!]}]
           (let [root (make! 4 :float)]
             (.close global)
             (is (.isAlive (.scope ^MemorySegment (:segment root))))
             (free! root)
-            (is (not (.isAlive (.scope ^MemorySegment (:segment root))))))
-          (finally (when (.isAlive (.scope global)) (.close global))))))))
+            (is (not (.isAlive (.scope ^MemorySegment (:segment root))))))))
+      (finally (when (.isAlive (.scope global)) (.close global))))))
 
 (deftest level-zero-setup-failure-releases-the-captured-native-pointer
   (with-backend

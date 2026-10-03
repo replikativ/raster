@@ -279,3 +279,119 @@
                                        :kernel (fn [] (throw primary)) (fn [value] (swap! released conj value))
                                        (fn [_ _] (throw (AssertionError. "unreachable")))))))
     (is (empty? @released))))
+
+(deftest prepublished-owner-construction-declines-concurrent-retirement-without-mutation
+  (let [entered (promise) finish (promise) retire-entered (promise)
+        calls (atom [])
+        owner (cleanup/owner [{:id :native :release #(swap! calls conj :release)}])
+        builder (future (cleanup/build! owner
+                                        (fn []
+                                          (deliver entered true)
+                                          @finish
+                                          (swap! calls conj :constructed)
+                                          {}) nil))]
+    (is (= true (deref entered 5000 :timeout)))
+    (let [before @(:state owner)
+          retirement (future (deliver retire-entered true) (error-of #(cleanup/release! owner)))]
+      (is (= true (deref retire-entered 5000 :timeout)))
+      (let [error (deref retirement 5000 :timeout)]
+        (is (= :owner-construction-in-progress (:reason (ex-data error))))
+        (is (true? (:cleanup-retry-safe? (ex-data error)))))
+      (is (identical? before @(:state owner)))
+      (is (empty? @calls))
+      (deliver finish true)
+      (is (map? (deref builder 5000 :timeout)))
+      (cleanup/release! owner)
+      (is (= [:constructed :release] @calls)))))
+
+(deftest construction-callback-cannot-retire-or-rebuild-its-own-owner
+  (doseq [operation [:release :rebuild]]
+    (let [calls (atom [])
+          owner (cleanup/owner [{:id :native :release #(swap! calls conj :release)}])
+          failure (error-of #(cleanup/build! owner
+                                             (fn []
+                                               (case operation
+                                                 :release (cleanup/release! owner)
+                                                 :rebuild (cleanup/build! owner (fn [] {}) nil))) nil))]
+      (is (= :owner-construction-in-progress (:reason (ex-data failure))))
+      (is (= [:release] @calls))
+      (is (empty? (cleanup/pending owner))))))
+
+(deftest caught-construction-retirement-decline-does-not-orphan-later-acquisition
+  (let [calls (atom [])
+        owner (cleanup/owner [{:id :native :release #(swap! calls conj :release)}])
+        value (cleanup/build! owner
+                              (fn []
+                                (is (= :owner-construction-in-progress
+                                       (:reason (ex-data (error-of #(cleanup/release! owner))))))
+                                (is (= :live (:phase (cleanup/status owner))))
+                                (swap! calls conj :constructed)
+                                {}) nil)]
+    (is (identical? owner (::cleanup/owner value)))
+    (cleanup/release! owner)
+    (is (= [:constructed :release] @calls))))
+
+(deftest marker-publication-watch-cannot-remove-or-replace-construction-authority
+  (doseq [mode [:remove :replace]]
+    (let [contact (atom 0) releases (atom 0)
+          owner (cleanup/owner [{:id :native :release #(swap! releases inc)}])
+          state (:state owner) replacement (Object.)]
+      (add-watch state :replace
+                 (fn [_ _ _ after]
+                   (when (::cleanup/construction-token after)
+                     (remove-watch state :replace)
+                     (swap! state #(cond-> (assoc % :unrelated :preserved)
+                                     (= mode :remove) (dissoc ::cleanup/construction-token)
+                                     (= mode :replace) (assoc ::cleanup/construction-token replacement))))))
+      (let [error (error-of #(cleanup/build! owner (fn [] (swap! contact inc) {}) nil))
+            primary (if (= mode :replace) (.getCause ^Throwable error) error)]
+        (is (= :owner-construction-generation-mismatch (:reason (ex-data primary))))
+        (is (zero? @contact))
+        (is (= :preserved (:unrelated @state)))
+        (if (= mode :remove)
+          (is (= 1 @releases))
+          (do (is (identical? replacement (::cleanup/construction-token @state)))
+              (is (identical? owner (::cleanup/unresolved (ex-data error))))
+              (is (zero? @releases))))))))
+
+(deftest marker-retirement-watch-cannot-reinsert-or-replace-authority
+  (doseq [mode [:reinsert :replace]]
+    (let [releases (atom 0)
+          owner (cleanup/owner [{:id :native :release #(swap! releases inc)}])
+          state (:state owner) replacement (Object.)]
+      (add-watch state :reinsert
+                 (fn [_ _ before after]
+                   (when (and (::cleanup/construction-token before)
+                              (not (::cleanup/construction-token after)))
+                     (remove-watch state :reinsert)
+                     (swap! state assoc ::cleanup/construction-token
+                            (if (= mode :reinsert) (::cleanup/construction-token before) replacement)
+                            :unrelated :preserved))))
+      (let [error (error-of #(cleanup/build! owner (fn [] {}) nil))]
+        (is (= :owner-construction-generation-mismatch
+               (:reason (ex-data (if (= mode :replace) (.getCause ^Throwable error) error)))))
+        (is (= :preserved (:unrelated @state)))
+        (if (= mode :reinsert)
+          (do (is (= 1 @releases))
+              (is (empty? (cleanup/pending owner))))
+          (do (is (identical? replacement (::cleanup/construction-token @state)))
+              (is (identical? owner (::cleanup/unresolved (ex-data error))))
+              (is (zero? @releases))))))))
+
+(deftest construction-decline-remains-retryable-in-an-outer-cleanup-dag
+  (let [entered (promise) finish (promise) releases (atom 0)
+        child (cleanup/owner [{:id :native :release #(swap! releases inc)}])
+        parent (cleanup/owner [{:id :child :release #(cleanup/release! child)}])
+        builder (future (cleanup/build! child (fn [] (deliver entered true) @finish {}) nil))]
+    (try
+      (is (= true (deref entered 5000 :timeout)))
+      (is (= :owner-construction-in-progress
+             (:reason (ex-data (error-of #(cleanup/release! parent))))))
+      (is (= :failed (:phase (cleanup/status parent))))
+      (is (= :retryable (:disposition (first (:remaining (cleanup/status parent))))))
+      (is (zero? @releases))
+      (finally (deliver finish true)))
+    (is (map? (deref builder 5000 :timeout)))
+    (cleanup/release! parent)
+    (is (= 1 @releases))
+    (is (empty? (cleanup/pending parent)))))
