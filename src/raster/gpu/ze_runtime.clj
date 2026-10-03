@@ -2355,7 +2355,7 @@
   "Bind a backend-neutral KernelCall over Level Zero resident buffers. ABI order and complete
    1-3D geometry come exclusively from the call; no map/reduction convention is interpreted."
   ([call] (bind-kernel-call call {}))
-  ([call {:keys [adopt-cleanup!]}]
+  ([call {:keys [adopt-cleanup! async?]}]
   (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
         (kcall/binding-plan call)
         registered (or (get @kernel-registry kernel-name)
@@ -2378,10 +2378,15 @@
                (instance? MemorySegment value)
                (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-        {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)]
+        {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
+        cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
     (cleanup/construct!
      :kernel #(create-kernel-fresh module entry-name)
-     #(ze-call! "zeKernelDestroy" @h-zeKernelDestroy [%])
+     (fn [kernel]
+       (when async?
+         (ze-call! "zeCommandListHostSynchronize" @h-zeCommandListHostSynchronize
+                   [cmd-list (long -1)]))
+       (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel]))
      (fn [kernel-handle owner]
        (let [native-args (mapv (fn [[slot value]]
                                 (if (= :scalar (:kind slot))
@@ -2390,7 +2395,7 @@
                                     (:segment ^DeviceBuffer value)
                                     value)))
                               pairs)
-             bound (bind-kernel! kernel-handle workgroup-size native-args)
+             bound (bind-kernel! kernel-handle workgroup-size native-args cmd-list)
              ^MemorySegment gc (:gc-seg bound)]
          (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
            (.set gc I32 (long (* axis 4)) (int count)))
@@ -2399,77 +2404,10 @@
           ;; Geometry is already baked into gc-seg. record-graph! must not reinterpret X specially.
           :group-count nil
           :kernel-name kernel-name
+          :async? (boolean async?)
           :kernel-call call
           :binding-plan plan}))
      adopt-cleanup!))))
-
-(defn bind-registered-map-void-kernel
-  "Pre-bind a registered void-map kernel's arguments ONCE for fast repeated dispatch.
-  All array args must be GPU-resident (DeviceBuffer / GpuSoA / MemorySegment) — no per-call
-  JVM-array staging copy is allowed, since the whole point is to skip per-launch arg setup.
-  Buffer CONTENTS may change between launches (the bound pointers are stable); only re-bind
-  if a buffer is reallocated or n changes. Returns a map for launch-registered-bound!.
-
-  This is the dispatch-overhead fix: launch! re-sets every arg + appends a barrier each call
-  (~450µs measured); a pre-bound kernel dispatches via launch-bound! (no arg setup, no barrier)."
-  ([^String kernel-name arrays scalar-args n]
-   (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
-  ([^String kernel-name arrays scalar-args n opts]
-   (let [abi (:abi (get @kernel-registry kernel-name))
-         split-binding (when abi
-                         (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
-                           (kabi/validate-physical-pointer-dtypes!
-                            abi (physical-pointer-dtypes arrays))
-                           (kabi/validate-logical-pointer-aliases!
-                            abi arrays kcall/pointer-overlaps?)
-                           binding))
-         checked-scalars (when split-binding
-                           (mapv kexec/physical-runtime-scalar
-                                 (:scalar-slots split-binding) scalar-args))
-         checked-bound (if split-binding
-                         (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
-                         {:type :int :value (Math/toIntExact (long n))})
-         {:keys [module entry-name] :as loaded} (ensure-kernel-loaded! kernel-name)
-         dtype (kernel-info-value loaded :dtype :float)
-         ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
-         ;; mutable state ON the kernel handle, so reusing the registry's shared handle would
-         ;; make every binding of the same kernel clobber the others (the last prepare! wins).
-         ;; A fresh handle per binding gives each its own arg state — required for the decode
-         ;; pattern (N matmuls share one kernel SOURCE but need N independent arg sets).
-         kernel-handle (create-kernel-fresh module entry-name)
-         workgroup-size (long (get opts :workgroup-size
-                                   (registered-1d-workgroup-size loaded)))
-         n (long n)
-         dev-segs (reduce
-                   (fn [acc arr]
-                     (cond
-                       (gpu-soa? arr)        (into acc (mapv :seg (:field-segs ^GpuSoA arr)))
-                       (device-buffer? arr)  (conj acc (:segment ^DeviceBuffer arr))
-                       (instance? MemorySegment arr) (conj acc arr)
-                       :else (throw (ex-info "bind-registered-map-void-kernel requires GPU-resident args (DeviceBuffer/GpuSoA); JVM-array staging is not supported on the bound path"
-                                             {:arr-type (type arr)}))))
-                   [] arrays)
-         scalar-type (if (= dtype :float) :float :double)
-         scalar-kernel-args (or checked-scalars
-                                (mapv (fn [v]
-                                        (if (map? v) v
-                                            {:type scalar-type
-                                             :value (if (= scalar-type :float)
-                                                      (float v) (double v))}))
-                                      scalar-args))
-         all-args (vec (concat dev-segs scalar-kernel-args [checked-bound]))
-         wg (long workgroup-size)
-         ;; A reduction binds via this same path (arrays..., scalars..., _n_bound) but launches a
-         ;; SINGLE workgroup so the kernel's grid-stride loop covers all n and writes output[0] —
-         ;; the result stays device-resident with no host cross-group combine. Callers pass
-         ;; {:group-count 1}; map/map-void leave it nil and get the full ceil(n/wg) grid.
-         group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
-         async? (boolean (get opts :async?))
-         cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
-     {:bound (bind-kernel! kernel-handle wg all-args cmd-list)
-      :group-count group-count
-      :kernel-name kernel-name
-      :async? async?})))
 
 (defn launch-registered-bound!
   "Dispatch a pre-bound kernel. A KernelCall has its complete geometry baked into :gc-seg;
@@ -2652,14 +2590,11 @@
   "Destroy the DEDICATED kernel handle a prepared binding owns (create-kernel-fresh allocates one
   per bind; it is NOT in the registry's cache, so shutdown!/free-arena-kernels! never reach it).
   Without this every prepare!/bind leaks a zeKernel driver object → the driver's kernel table
-  fills → zeKernelCreate / launch eventually fail (SIGABRT). Idempotent; safe on partial maps."
+  fills → zeKernelCreate / launch eventually fail (SIGABRT). Requires its retained owner."
   [prepared]
   (if-let [owner (::cleanup/owner prepared)]
     (cleanup/release! owner)
-    (if (contains? prepared :kernel-call)
-      (throw (ex-info "KernelCall binding has lost its cleanup owner" {:reason :missing-cleanup-owner}))
-    ;; Descriptor compatibility bindings have not yet migrated to retained ownership.
-    (destroy-handle! @h-zeKernelDestroy (get-in prepared [:bound :kernel])))))
+    (throw (ex-info "Prepared binding has lost its cleanup owner" {:reason :missing-cleanup-owner}))))
 
 (defn destroy-graph!
   "Destroy a recorded command graph's queue + list (record-graph! creates one of each per graph

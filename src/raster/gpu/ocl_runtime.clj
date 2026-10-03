@@ -1441,48 +1441,6 @@
         :binding-plan plan})
      adopt-cleanup!))))
 
-(defn bind-registered-map-void-kernel
-  "Pre-bind a registered void-map kernel's args ONCE over RESIDENT OclBuffers.
-  Same contract as ze-runtime/bind-registered-map-void-kernel: buffer CONTENTS
-  may change between launches; re-bind only on reallocation or n change."
-  ([^String kernel-name arrays scalar-args n]
-   (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
-  ([^String kernel-name arrays scalar-args n opts]
-   (let [abi (:abi (get @kernel-registry kernel-name))
-         split-binding (when abi
-                         (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
-                           (kabi/validate-physical-pointer-dtypes!
-                            abi (physical-pointer-dtypes arrays))
-                           (kabi/validate-logical-pointer-aliases!
-                            abi arrays kcall/pointer-overlaps?)
-                           binding))
-         checked-scalars (when split-binding
-                           (mapv kexec/physical-runtime-scalar
-                                 (:scalar-slots split-binding) scalar-args))
-         checked-bound (if split-binding
-                         (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
-                         {:type :int :value (Math/toIntExact (long n))})
-         {:keys [program] :as loaded} (ensure-kernel-loaded! kernel-name)
-         dtype (kernel-info-value loaded :dtype :float)
-         kh (create-kernel-fresh program kernel-name)
-         wg (long (get opts :workgroup-size (registered-1d-workgroup-size loaded)))
-         n (long n)
-         scalar-type (if (= dtype :float) :float :double)
-         idx (atom -1)
-         next-idx! #(swap! idx inc)]
-     (doseq [arr arrays]
-       (set-kernel-arg-buffer! kh (next-idx!) (device-mem-of arr)))
-     (doseq [v (or checked-scalars scalar-args)]
-       (set-kernel-arg-scalar! kh (next-idx!)
-                               (if (map? v) v
-                                   {:type scalar-type
-                                    :value (if (= scalar-type :float) (float v) (double v))})))
-     (set-kernel-arg-scalar! kh (next-idx!) checked-bound)
-     {:bound {:kernel kh :wg wg}
-      :group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
-      :kernel-name kernel-name
-      :async? (boolean (get opts :async?))})))
-
 (defn- enqueue-bound!
   "Enqueue one pre-bound kernel (no finish)."
   ([bound group-count]
@@ -1906,13 +1864,7 @@
   [prepared]
   (if-let [owner (::cleanup/owner prepared)]
     (cleanup/release! owner)
-    (if (contains? prepared :kernel-call)
-      (throw (ex-info "KernelCall binding has lost its cleanup owner" {:reason :missing-cleanup-owner}))
-    ;; Descriptor compatibility bindings have not yet migrated to retained ownership.
-    (when-let [^MemorySegment kh (get-in prepared [:bound :kernel])]
-      (try (.invokeWithArguments ^MethodHandle @h-clReleaseKernel
-                                 (into-array Object [kh]))
-           (catch Exception _))))))
+    (throw (ex-info "Prepared binding has lost its cleanup owner" {:reason :missing-cleanup-owner}))))
 
 (defn destroy-graph!
   "Release the retained submission before its profiling queue. Ordinary graphs also retain

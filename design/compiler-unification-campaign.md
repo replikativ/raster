@@ -1881,3 +1881,28 @@ the session lifetime. This removes a duplicate acquisition/cache path, not an em
 Other legacy routing-test allocation/launch helpers and the raw map preparation binder remain
 separate consolidation work. No performance or cross-vendor execution claim follows from this
 Intel-native migration; hardware-free target compilation remains its own gate.
+
+#### Plain prepared KernelCall ownership
+
+The public `prepare!` convenience API now projects its split pointer/scalar/bound arguments into
+the checked artifact's positional KernelCall ABI and full 1–3D launch geometry. It no longer uses
+the raw map preparation binders, which are removed from both runtimes. Argument names are not
+assumed unique: distinct physical positions survive projection, and scalar conversion uses the
+shared runtime scalar contract. This tightens admission to checked artifacts without changing
+the high-level argument convention or numerical surface semantics.
+
+Plain prepared bindings require a live cleanup owner before invocation or recording. Replacement
+builds the candidate before releasing the old generation, publishes only after successful release,
+and retains failed old registrations as non-live. Failed construction adopts unresolved debt into
+a private prepared registration, preserving the primary exception and pinning its resident roots.
+Unrecorded prepared bindings now pin their captured root footprint too. Invocation serializes with
+release under the session lock. Level Zero async KernelCall teardown drains the exact captured
+command list before destroying its kernel; this is not a new completion-event API.
+
+This slice does **not** certify all reclamation: legacy multi-child BoundExecutableStep teardown,
+backend pre-reserved acquisition, modern graph alias guards, root/view/event ownership and sticky
+linked/parallel close remain explicit follow-ups. Unknown cleanup outcomes are never retried just
+because the public entry remains registered. Fault tests cover missing owners, positional duplicate
+names, 3D launch projection, failed acquisition debt, replacement failure and launch/release ordering.
+Quantized replay tests observe actual intermediate uploads rather than conflating an allocation's
+one-time initialization source with hot-path transfers; CPU/device poison and replay oracles remain.

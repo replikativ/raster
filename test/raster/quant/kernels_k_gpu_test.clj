@@ -425,9 +425,7 @@
                       consumer (get mapping [:project
                                              (:node (first (filter #(= key (:key %))
                                                                    (:in-tree project))))])]]
-          (is (= producer consumer) (str key " has one resident allocation"))
-          (is (nil? (get-in plan [:nodes producer :source]))
-              (str key " is not re-uploaded between programs")))
+          (is (= producer consumer) (str key " has one resident allocation")))
         (let [artifact (compiled/instantiate! prepared)
               resident (:executable artifact)
               quant-nodes (into {}
@@ -467,7 +465,20 @@
                   (link/upload! resident (get quant-nodes key) poison))
                 (link/upload! resident output-node
                               (float-array (repeat (alength y) Float/NaN)))
-                (let [result (artifact {[:quant :x] input})]
+                ;; :source belongs to one-time instantiation, not replay transfers. Packed
+                ;; integer output storage may legitimately have an initialization source.
+                ;; Observe the actual invocation instead of equating those two contracts.
+                (let [uploads (atom [])
+                      upload-range! gpu/upload-range!
+                      result (with-redefs [gpu/upload-range!
+                                           (fn [session destination source options]
+                                             (swap! uploads conj destination)
+                                             (upload-range! session destination source options))]
+                               (artifact {[:quant :x] input}))]
+                  (doseq [key [:xp :xs :bsums]]
+                    (is (not-any? #(= (link/node-view resident (get quant-nodes key)) %)
+                                  @uploads)
+                        (str key " is not re-uploaded between programs")))
                   (is (= (vec expected-xp)
                          (vec (link/download resident (:xp quant-nodes)))))
                   (is (= (vec expected-xs)
