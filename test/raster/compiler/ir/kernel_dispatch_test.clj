@@ -853,7 +853,7 @@
             "register-kernel!" (fn [_ _])
             "make-buffer" (fn [elements dtype] {:elements elements :dtype dtype})
             "bind-kernel-call" (fn [call & _] {:kernel-call call})
-            "record-graph!" (fn [prepareds]
+            "record-graph!" (fn [prepareds & _]
                               (let [recording {:prepareds (vec prepareds)}]
                                 (swap! recorded conj recording)
                                 recording))
@@ -875,6 +875,12 @@
         (gpu/record-graph! session [:probe] :linked)
         (is (= 2 (count (get-in @recorded [0 :prepareds])))
             "recording flattens the semantic step into its ordered kernel launches")
+        (let [before [@destroyed @freed]]
+          (is (= :recorded-source-retained
+                 (try (gpu/bind-step! session step {:width 128} identity)
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (is (= before [@destroyed @freed])))
+        (gpu/release-recorded-graph! session :linked)
         (gpu/bind-step! session step {:width 128} identity)
         (is (= 2 (count (filter #(= :prepared (first %)) @destroyed)))
             "replacing the phase releases every old graph-node binding")

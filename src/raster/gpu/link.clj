@@ -99,16 +99,21 @@
 
 (defn- cleanup-attached!
   [session graph-key phases prepared-program allocation-keys]
-  ;; A failed backend destructor must not strand the resources that follow it. Preserve the first
-  ;; failure for the caller, but attempt the complete reverse-order teardown.
+  ;; A recording borrows its phases/programs and their roots. Never descend a failed dependency
+  ;; layer; only siblings within the same layer are independent cleanup attempts.
+  (when graph-key (gpu/release-recorded-graph! session graph-key))
   (let [failure (volatile! nil)
         attempt! (fn [f]
                    (try (f)
                         (catch Throwable error
-                          (when-not @failure (vreset! failure error)))))]
-    (when graph-key (attempt! #(gpu/release-recorded-graph! session graph-key)))
+                          (if-let [primary @failure]
+                            (when-not (or (identical? primary error)
+                                          (some #(identical? error %) (.getSuppressed ^Throwable primary)))
+                              (.addSuppressed ^Throwable primary error))
+                            (vreset! failure error)))))]
     (doseq [phase (reverse phases)] (attempt! #(gpu/release-prepared! session phase)))
     (when prepared-program (attempt! #(parallel-program/release-prepared! prepared-program)))
+    (when-let [error @failure] (throw error))
     (doseq [key (reverse allocation-keys)] (attempt! #(gpu/free-buffer! session key)))
     (when-let [error @failure] (throw error))))
 

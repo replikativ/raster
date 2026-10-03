@@ -1827,8 +1827,41 @@ the graph's prepared kernels or roots. Live profiled/unprofiled replay and stora
 remain separate checks. Ownership adds replay bookkeeping; performance acceptance remains pending
 stable power/load measurements, not inferred from these correctness tests.
 
-This is not complete native reclamation. Legacy descriptor bindings/recording wrappers, backend view/event
+This is not complete native reclamation. Legacy descriptor bindings, backend view/event
 partial constructors and destruction, asynchronous-event failure cleanup, root-buffer/arena failure
 retention, and linked-wrapper close remain acceptance work. In particular native graph destructors
 still contain swallowed-error debt, and general legacy concurrent operations are not certified by
 the modern graph locking tests. No native error is automatically classified retry-safe.
+
+#### Recorded wrappers and borrowed source retention
+
+The common recorded wrapper reserves prologue and replay ownership before construction, adopts
+unresolved backend acquisition debt synchronously, and publishes replacement recordings only after
+old-generation teardown succeeds. Failed teardown keeps the registration non-live; independent
+successful releases are not repeated. Failed provisional construction retains a private registration
+when rollback cannot finish, preserving the exact primary exception and its borrowed sources.
+
+Prepared phases and emitted graph handles cannot be released or rebound while any recorded wrapper
+borrows them. Recording, replay, profiling and complete measurement serialize under the session
+lock. The context-chain convenience API releases its previous recording before rebinding phases.
+Attached cleanup stops before source teardown if recording teardown fails, and before root teardown
+if any prepared source fails.
+
+Surface lifecycle tightening: `free-buffer!` rejects releases overlapping a recorded wrapper's
+retained source footprint, including failed provisional wrappers. Low-level preparation captures
+resolved root objects and their registrations; descriptor materialization captures every resolved
+leaf root, including views and composite arguments. A wrapper unions footprints only when every
+source has one. Legacy/manual bindings without a footprint retain the conservative **all-buffer**
+guard; missing is never interpreted as empty. Owned-root release checks keys, allocation identities
+and exact resident-buffer object identity, including aliases registered after binding. Distinct
+wrappers of the same native pointer require a shared allocation identity; no arbitrary pointer
+equivalence is inferred. Detaching a new
+borrowed/external alias checks its registration key because it cannot destroy the native root.
+Unrelated staging buffers may therefore be released without special-case key exemptions.
+Explicitly release recordings before freeing their buffers or replacing bindings; this does
+not change numerical surface semantics. Backend prepared factories, sticky linked/parallel close,
+and root/view/event owners remain unfinished; these wrapper checks do not certify their reclamation.
+
+Fault oracles cover multiple recordings borrowing one source, unknown teardown with successful
+independent sibling release, adopted constructor debt, failed replacement, and failed prologue replay.
+These are lifecycle/correctness checks, not performance or distributed-ownership evidence.
