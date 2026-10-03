@@ -106,6 +106,57 @@
         (when-let [error @failure] (throw error)))))
   nil)
 
+(defn publish-replacement!
+  "Replace one exact runtime registry generation, retiring the old entry before publication.
+   Holds the registry monitor. On failure after retirement, remove only the exact old/candidate
+   entry; preserve unrelated reentrant generations. The caller owns candidate rollback. A failed
+   old teardown remains registered as debt. Arbitrary validators can reject recovery mutations;
+   these errors are suppressed on the primary. This is runtime authority, never compiler evidence."
+  [registry path candidate destroy!]
+  (when-not (and (instance? clojure.lang.Atom registry)
+                 (vector? path) (seq path) (every? some? path)
+                 (some? candidate) (fn? destroy!))
+    (throw (ex-info "Registry replacement requires an atom, nonempty path, candidate and teardown callback"
+                    {:reason :invalid-replacement-contract})))
+  (locking registry
+    (let [old (get-in @registry path)
+          retired? (volatile! false)]
+      (when (identical? old candidate)
+        (throw (ex-info "Replacement must be a distinct registry generation"
+                        {:reason :replacement-generation-unchanged :path path})))
+      (try
+        (when (some? old) (destroy! old))
+        (vreset! retired? true)
+        (when-not (identical? old (get-in @registry path))
+          (throw (ex-info "GPU binding changed during retirement"
+                          {:reason :reentrant-binding-publication :path path})))
+        (swap! registry
+               (fn [state]
+                 (when-not (identical? old (get-in state path))
+                   (throw (ex-info "GPU binding changed before publication"
+                                   {:reason :reentrant-binding-publication :path path})))
+                 (assoc-in state path candidate)))
+        (when-not (identical? candidate (get-in @registry path))
+          (throw (ex-info "GPU binding changed during publication"
+                          {:reason :reentrant-binding-publication :path path})))
+        candidate
+        (catch Throwable primary
+          (when @retired?
+            (try
+              (swap! registry
+                     (fn [state]
+                       (let [installed (get-in state path)]
+                         (if (or (identical? installed old) (identical? installed candidate))
+                           (if (= 1 (count path))
+                             (dissoc state (first path))
+                             (update-in state (pop path) dissoc (peek path)))
+                           state))))
+              (catch Throwable secondary
+                (when-not (or (identical? primary secondary)
+                              (some #(identical? secondary %) (.getSuppressed primary)))
+                  (.addSuppressed primary secondary)))))
+          (throw primary))))))
+
 (defn build!
   "Build an owning map using an already reserved cleanup owner; attach ::owner automatically.
    Rollback/adoption has the same

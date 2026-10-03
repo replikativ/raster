@@ -5,7 +5,7 @@
   Analogous to par_cuda.clj but targets Intel GPUs via OpenCL C → SPIR-V → Level Zero.
 
   Pipeline: par forms → OpenCL C source → SPIR-V (via ocloc, cached)
-            → (raster.ze/invoke-kernel ...) S-expression markers
+            → registered ABI-backed kernel invocation markers
 
   Usage:
     (opencl-pass form :device-id :ze:0)

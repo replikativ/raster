@@ -545,7 +545,7 @@
     (let [old {:generation :old} candidate {:generation :new}
           sess (atom {registry {:key old :unrelated :keep}})
           destroyed (atom []) primary (ex-info "publication failed" {})
-          publish! @(ns-resolve 'raster.gpu.core 'publish-replacement!)]
+          publish! cleanup/publish-replacement!]
       (case failure
         :watch (add-watch sess :throw
                           (fn [_ _ before after]
@@ -554,7 +554,7 @@
                               (throw primary))))
         :validator (set-validator! sess #(not (identical? (get-in % [registry :key]) candidate)))
         :destruction nil)
-      (let [error (error-of #(publish! sess registry :key candidate
+      (let [error (error-of #(publish! sess [registry :key] candidate
                                        (fn [entry]
                                          (if (= failure :destruction) (throw primary)
                                              (swap! destroyed conj entry)))))]

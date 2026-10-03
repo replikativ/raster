@@ -16,7 +16,7 @@
 
     ;; Module/kernel management
     (ze/load-module! spv-bytes)
-    (ze/create-kernel module \"kernel_name\")
+    (ze/create-kernel-fresh module \"kernel_name\") ; pair with destroy-kernel!
 
     ;; Memory
     (ze/alloc-shared n-bytes)
@@ -296,8 +296,7 @@
          :context nil      ;; MemorySegment (ze_context_handle_t)
          :cmd-list nil     ;; MemorySegment (ze_command_list_handle_t)
          :arena nil        ;; Arena for long-lived allocations
-         :modules {}       ;; hash -> module handle
-         :kernels {}}))    ;; [module kernel-name] -> kernel handle
+         :modules {}}))    ;; hash -> module handle
 
 ;; ================================================================
 ;; Invocation helper (uses invokeWithArguments for boxing compat)
@@ -385,8 +384,7 @@
                                       :cmd-list cmd-list
                                       :arena arena
                                       :device-id-hex (format "0x%04x" device-id-val)
-                                      :modules {}
-                                      :kernels {}}))))))
+                                      :modules {}}))))))
       nil)))
 
 (defn- ensure-init! []
@@ -673,26 +671,6 @@
          (swap! state assoc-in [:modules hash] module)
          module)))))
 
-(defn create-kernel
-  "Create a kernel from a loaded module. Returns the kernel handle.
-  Cached by [module, kernel-name]."
-  ^MemorySegment [^MemorySegment module ^String kernel-name]
-  (ensure-init!)
-  (let [cache-key [module kernel-name]]
-    (if-let [cached (get-in @state [:kernels cache-key])]
-      cached
-      (let [arena (:arena @state)
-            kern-desc (.allocate arena 32)
-            _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
-            name-seg (.allocateFrom arena kernel-name)
-            _ (.set kern-desc PTR 24 name-seg)
-            kern-out (ptr-seg arena)
-            _ (ze-call! "zeKernelCreate" @h-zeKernelCreate
-                        [module kern-desc kern-out])
-            kernel (read-ptr kern-out)]
-        (swap! state assoc-in [:kernels cache-key] kernel)
-        kernel))))
-
 ;; ================================================================
 ;; Memory allocation
 ;; ================================================================
@@ -795,7 +773,7 @@
   Sets workgroup size and arguments, then dispatches.
   Synchronous (uses immediate command list with barrier).
 
-  kernel: kernel handle from create-kernel
+  kernel: registered kernel handle or owned handle from create-kernel-fresh
   group-count-x: number of workgroups in X dimension
   workgroup-size-x: threads per workgroup in X
   kernel-args: seq of kernel argument specs, each one of:
@@ -1503,76 +1481,6 @@
   [gpu-bufs]
   (doseq [[_ buf] gpu-bufs]
     (free-buffer! buf)))
-
-;; ================================================================
-;; High-level convenience
-;; ================================================================
-
-(defn invoke-kernel
-  "High-level kernel invocation for Raster pipeline.
-  Handles array arguments: copies JVM arrays to shared memory,
-  launches kernel, copies results back.
-
-  Supports both JVM arrays and DeviceBuffers as inputs/output.
-  DeviceBuffers are passed directly (no copy), JVM arrays are
-  copied to temp shared memory (allocated+freed per call).
-
-  input-arrays: seq of JVM arrays or DeviceBuffers
-  output-array: JVM array or DeviceBuffer to receive results
-  scalar-args: seq of {:type :int/:long/:float/:double, :value N}
-  n: number of elements
-  workgroup-size: threads per workgroup
-  dtype-size: bytes per element (8 for double, 4 for float)"
-  ([kernel-name module input-arrays output-array scalar-args n workgroup-size]
-   (invoke-kernel kernel-name module input-arrays output-array scalar-args n workgroup-size 8))
-  ([^String kernel-name ^MemorySegment module
-    input-arrays output-array scalar-args
-    n workgroup-size dtype-size]
-   (assert-buffer-values-live! (conj (vec input-arrays) output-array))
-   (let [n (long n)
-         workgroup-size (long workgroup-size)
-         dtype-size (long dtype-size)
-         kernel (create-kernel module kernel-name)
-         n-bytes (* n (long dtype-size))
-        ;; Resolve inputs: DeviceBuffers pass through, arrays get temp alloc
-         temp-segs (atom [])
-         dev-inputs (mapv (fn [arr]
-                            (if (device-buffer? arr)
-                              (:segment ^DeviceBuffer arr)
-                              (let [arr-bytes (if (instance? (Class/forName "[D") arr)
-                                                (* (alength ^doubles arr) 8)
-                                                (* (alength ^floats arr) 4))
-                                    seg (alloc-shared arr-bytes)
-                                    src (MemorySegment/ofArray arr)]
-                                (MemorySegment/copy src 0 seg 0 arr-bytes)
-                                (swap! temp-segs conj seg)
-                                seg)))
-                          input-arrays)
-        ;; Resolve output
-         output-is-buffer? (device-buffer? output-array)
-         dev-output (if output-is-buffer?
-                      (:segment ^DeviceBuffer output-array)
-                      (let [seg (alloc-shared n-bytes)]
-                        (swap! temp-segs conj seg)
-                        seg))
-        ;; Build arg list: input ptrs, output ptr, scalars, n
-         all-args (vec (concat dev-inputs
-                               [dev-output]
-                               scalar-args
-                               [{:type :int :value n}]))
-         group-count (long (Math/ceil (/ (double n) workgroup-size)))]
-
-     (launch! kernel group-count workgroup-size all-args)
-
-    ;; Copy results back only for JVM array output
-     (when-not output-is-buffer?
-       (let [dst-seg (MemorySegment/ofArray output-array)]
-         (MemorySegment/copy dev-output 0 dst-seg 0 n-bytes)))
-
-    ;; Free only temporary allocations
-     (doseq [seg @temp-segs] (free! seg))
-
-     output-array)))
 
 ;; ================================================================
 ;; 2D kernel launch (for matmul, stencil, etc.)
@@ -2293,11 +2201,6 @@
 ;; ================================================================
 ;; Void-map kernel invocation (side-effect-only kernels)
 ;; ================================================================
-
-(defn kernel-registry-entry
-  "Registry info for a kernel-name (source, :array-params, :written-arrays, dtype…)."
-  [kernel-name]
-  (get @kernel-registry kernel-name))
 
 (defn invoke-registered-map-void-kernel
   "Pipeline-friendly void-map kernel invocation. No dedicated output array.
@@ -3207,10 +3110,6 @@
           (try (free! v) (catch Exception _)))))
     (clojure.core/reset! kernel-registry {})
     (clojure.core/reset! kernel-dispatch-registry {})
-    (doseq [[_ k] (:kernels @state)]
-      (try (.invokeWithArguments ^MethodHandle @h-zeKernelDestroy
-                                 ^java.util.List (java.util.List/of (object-array [k])))
-           (catch Exception _)))
     (doseq [[_ m] (:modules @state)]
       (try (.invokeWithArguments ^MethodHandle @h-zeModuleDestroy
                                  ^java.util.List (java.util.List/of (object-array [m])))
@@ -3219,7 +3118,7 @@
       (.close arena))
     (clojure.core/reset! state {:initialized? false :driver nil :device nil
                                 :context nil :cmd-list nil :arena nil
-                                :modules {} :kernels {}}))
+                                :modules {}}))
   nil)
 
 (defn reset!

@@ -883,34 +883,6 @@
            invoke-fn! (rt-resolve device-id "invoke-registered-map-void-kernel")]
        (invoke-fn! (:kernel-name kernel-info) buf-vec scalars n)))))
 
-(defn- publish-replacement!
-  "Retire the old binding and publish its replacement. Publication failure leaves the key
-   unbound, never registered to a destroyed generation. The caller owns candidate rollback."
-  [sess registry key candidate destroy!]
-  (let [old (get-in @sess [registry key])
-        retired? (volatile! false)]
-    (try
-      (when old (destroy! old))
-      (vreset! retired? true)
-      (swap! sess assoc-in [registry key] candidate)
-      (when-not (identical? candidate (get-in @sess [registry key]))
-        (throw (ex-info "GPU binding changed during publication"
-                        {:reason :reentrant-binding-publication :registry registry :key key})))
-      candidate
-      (catch Throwable primary
-        (when @retired?
-          (try
-            (swap! sess
-                   (fn [state]
-                     (let [installed (get-in state [registry key])]
-                       (if (or (identical? installed old) (identical? installed candidate))
-                         (update state registry dissoc key)
-                         state))))
-            (catch Throwable secondary
-              (when-not (identical? primary secondary)
-                (.addSuppressed primary secondary)))))
-        (throw primary)))))
-
 (defn prepare!
   "Pre-bind a kernel's arguments ONCE for fast repeated dispatch (the launch-overhead fix).
   Resolves the session buffers for the kernel's params, binds them + scalars + n, and caches
@@ -950,8 +922,8 @@
            (when-not (::cleanup/owner candidate)
              (throw (ex-info "KernelCall preparation has lost its cleanup owner"
                              {:reason :missing-cleanup-owner})))
-           (publish-replacement! sess :prepared phase-key candidate
-                                 #(destroy-prepared-entry! device-id %))
+           (cleanup/publish-replacement! sess [:prepared phase-key] candidate
+                                         #(destroy-prepared-entry! device-id %))
            candidate)
          (catch Throwable primary
            (rollback-bound-resources!
@@ -1947,8 +1919,8 @@
                                                                                   external-bindings)
                                                             :outputs (select-keys all-buffers (map :id (:outputs graph)))
                                                             :profile? (boolean profile?)})]
-               (publish-replacement! sess :kernel-graphs graph-key entry
-                                     #(destroy-kernel-graph-entry! device-id %))
+               (cleanup/publish-replacement! sess [:kernel-graphs graph-key] entry
+                                             #(destroy-kernel-graph-entry! device-id %))
                (->KernelGraphHandle graph-key (:session-id @sess) (:generation entry))))
            (catch Throwable e
              (rollback-bound-resources!
@@ -2043,8 +2015,8 @@
                                                                                 pointer-bindings)
                                                           :outputs outputs
                                                           :profile? (boolean profile?)})]
-             (publish-replacement! sess :kernel-graphs call-key entry
-                                   #(destroy-kernel-graph-entry! device-id %))
+             (cleanup/publish-replacement! sess [:kernel-graphs call-key] entry
+                                           #(destroy-kernel-graph-entry! device-id %))
              (->KernelGraphHandle call-key (:session-id @sess) (:generation entry)))
            (catch Throwable e
              (rollback-bound-resources!
@@ -2612,8 +2584,8 @@
                                   :owned-view-buffers @owned-view-buffers
                                   :resident-footprint (registered-buffer-footprint sess @root-buffers)))]
            (vreset! candidate bound-step)
-           (publish-replacement! sess :prepared phase bound-step
-                                 #(destroy-prepared-entry! device-id %))
+           (cleanup/publish-replacement! sess [:prepared phase] bound-step
+                                         #(destroy-prepared-entry! device-id %))
            sess)
          (catch Throwable primary
            (rollback-bound-resources!
