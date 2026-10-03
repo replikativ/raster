@@ -2305,6 +2305,25 @@ executes correctly, and balances its independent pin. This does not establish ar
 concurrent root reset: recordings/events, use admission and raw consumers remain next.
 Pivotal final review and seven exact-head CI gates are required before merging this slice.
 
+Recording follow-up: both `record-graph!` implementations construct through the canonical
+root-child owner. The OpenCL submission and optional profiling queue precede root release;
+ordinary graphs pin their borrowed compute queue's root too. ZE derives its existing native
+list/event/pool/independent-queue DAG as a resource plan, then uses the same root construction
+transaction rather than building a second owner. Native descriptor allocations and queue
+creation consume the exact admitted root projection. Uncertain acquisition or drain retains
+the graph's composite owner and its root pin.
+
+Acceptance so far: 182 focused tests / 1,898 assertions, seven actual boundary tests /
+84 assertions, and six buffer/view/prepared/recording device tests / 36 assertions pass.
+The latter replay ordinary and profiled graphs on OpenCL and ZE after retiring their base
+registrations, and verify independent root-pin balance through graph/prepared/buffer teardown.
+Final pivotal review and exact-head CI remain required. These pins do not automatically borrow
+every child kernel or buffer: existing session ownership still controls those dependencies.
+Standalone asynchronous range transfers remain debt, especially OpenCL's old exception path
+that swallows drain/event-release failures before closing staging. Migrate that path to retained
+completion cleanup before enabling any live reset; synchronous-use and raw-allocation debt also
+remain. No throughput or complete distributed-runtime ownership claim follows from these gates.
+
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates
 only a kernel-arena identifier and must remain lazy (no GPU initialization merely to

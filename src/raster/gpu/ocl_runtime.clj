@@ -1629,18 +1629,18 @@
                     {:reason :invalid-native-recording-handle})))
   handle)
 
-(defn- acquire-profile-queue! [slot]
-  (let [{:keys [context device]} @state]
+(defn- acquire-profile-queue! [slot entry]
+  (let [{:keys [context device]} @(:projection entry)]
     (with-open [arena (Arena/ofConfined)]
       (let [err-seg (.allocate arena I32)]
         (cleanup/acquire-native! slot
-          (fn []
-            (let [queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
-                                              (into-array Object
-                                                          [context device CL_QUEUE_PROFILING_ENABLE err-seg]))]
-              (when-not (= CL_SUCCESS (read-int err-seg))
-                (throw (ex-info "clCreateCommandQueue(profile) failed" {:error (read-int err-seg)})))
-              (checked-event-handle queue))))))))
+                                 (fn []
+                                   (let [queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
+                                                                     (into-array Object
+                                                                                 [context device CL_QUEUE_PROFILING_ENABLE err-seg]))]
+                                     (when-not (= CL_SUCCESS (read-int err-seg))
+                                       (throw (ex-info "clCreateCommandQueue(profile) failed" {:error (read-int err-seg)})))
+                                     (checked-event-handle queue))))))))
 
 (defn record-graph!
   "OpenCL 'graph': capture the ordered pre-bound launches for replay. The
@@ -1654,22 +1654,21 @@
                         prepareds)
          submission-state (atom nil)
          queue-slot (cleanup/acquisition-slot)
-         owner (cleanup/owner
-                 (cond-> [{:id :submission :release #(clear-submission! submission-state)}]
-                   profile? (conj {:id :queue :after #{:submission}
-                                    :release #(cleanup/release-native! queue-slot
-                                                (fn [queue]
-                                                  (cl-call! "clReleaseCommandQueue"
-                                                            @h-clReleaseCommandQueue [queue])))})))]
-     (cleanup/build! owner
-       (fn []
-         (cond-> {:launches launches :submission-state submission-state}
-           profile? (assoc :profile? true
-                           :profile-queue (acquire-profile-queue! queue-slot)
-                           :profile-state submission-state
-                           :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
-                           :phases (mapv :phase prepareds))))
-       adopt-cleanup!))))
+         resources (cond-> [{:id :submission :release #(clear-submission! submission-state)}]
+                     profile? (conj {:id :queue :after #{:submission}
+                                     :release #(cleanup/release-native! queue-slot
+                                                                        (fn [queue]
+                                                                          (cl-call! "clReleaseCommandQueue"
+                                                                                    @h-clReleaseCommandQueue [queue])))}))]
+     (root/construct-child! state resources
+                            (fn [_owner entry]
+                              (cond-> {:launches launches :submission-state submission-state}
+                                profile? (assoc :profile? true
+                                                :profile-queue (acquire-profile-queue! queue-slot entry)
+                                                :profile-state submission-state
+                                                :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
+                                                :phases (mapv :phase prepareds))))
+                            adopt-cleanup!))))
 
 (defn- release-native-event!
   [event]

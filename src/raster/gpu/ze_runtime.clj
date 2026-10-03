@@ -1796,26 +1796,25 @@
                             (throw wrapper)))))
                  (throw primary))))))))
 
-(defn- recording-owner
+(defn- recording-plan
   [event-count]
   (let [slots (into {:list (cleanup/acquisition-slot)
-                    :pool (cleanup/acquisition-slot)
-                    :queue (cleanup/acquisition-slot)}
-                   (map (fn [i] [[:event i] (cleanup/acquisition-slot)]) (range event-count)))
+                     :pool (cleanup/acquisition-slot)
+                     :queue (cleanup/acquisition-slot)}
+                    (map (fn [i] [[:event i] (cleanup/acquisition-slot)]) (range event-count)))
         entry (fn [id after label handle]
                 {:id id :after after
                  :release #(cleanup/release-native! (get slots id)
-                             (fn [resource] (ze-call! label @handle [resource])))})
+                                                    (fn [resource] (ze-call! label @handle [resource])))})
         event-ids (mapv #(vector :event %) (range event-count))]
     {:slots slots
-     :owner (cleanup/owner
-              (vec (concat [(entry :list #{} "zeCommandListDestroy" h-zeCommandListDestroy)]
-                           (map #(entry % #{:list} "zeEventDestroy" h-zeEventDestroy) event-ids)
-                           [(entry :pool (conj (set event-ids) :list)
-                                   "zeEventPoolDestroy" h-zeEventPoolDestroy)
+     :resources (vec (concat [(entry :list #{} "zeCommandListDestroy" h-zeCommandListDestroy)]
+                             (map #(entry % #{:list} "zeEventDestroy" h-zeEventDestroy) event-ids)
+                             [(entry :pool (conj (set event-ids) :list)
+                                     "zeEventPoolDestroy" h-zeEventPoolDestroy)
                             ;; A recording has not been submitted during construction. The queue
                             ;; is independent, even when list/event destruction is indeterminate.
-                            (entry :queue #{} "zeCommandQueueDestroy" h-zeCommandQueueDestroy)])))}))
+                              (entry :queue #{} "zeCommandQueueDestroy" h-zeCommandQueueDestroy)]))}))
 
 (defn- acquire-recording-handle! [slot label create readback]
   (cleanup/acquire-native! slot
@@ -2645,45 +2644,45 @@
    (ensure-init!)
    (let [prepareds (vec prepareds)
          n-kernels (count prepareds)
-         {:keys [slots owner]} (recording-owner (if profile? n-kernels 0))]
-     (cleanup/build! owner
-       (fn []
-   (let [{:keys [arena context device]} @state
-         cq-desc (.allocate ^Arena arena 40)
-         _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+         {:keys [slots resources]} (recording-plan (if profile? n-kernels 0))]
+     (root/construct-child! state resources
+                            (fn [_owner entry]
+                              (let [{:keys [arena context device]} @(:projection entry)
+                                    cq-desc (.allocate ^Arena arena 40)
+                                    _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
          ;; The public replay path still waits, but submit-graph! can now return immediately and
          ;; expose queue completion through the backend-neutral runtime event contract.
-         _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS))
-         q-out (ptr-seg arena)
-         queue (acquire-recording-handle! (:queue slots) "zeCommandQueueCreate"
-                  #(ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
-                             [context device cq-desc q-out]) #(read-ptr q-out))
-         cl-desc (.allocate ^Arena arena 24)
-         _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
-         l-out (ptr-seg arena)
-         lst (acquire-recording-handle! (:list slots) "zeCommandListCreate"
-                #(ze-call! "zeCommandListCreate" @h-zeCommandListCreate
-                           [context device cl-desc l-out]) #(read-ptr l-out))
-         h-launch @h-zeCommandListAppendLaunchKernel
-         h-barrier @h-zeCommandListAppendBarrier
+                                    _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS))
+                                    q-out (ptr-seg arena)
+                                    queue (acquire-recording-handle! (:queue slots) "zeCommandQueueCreate"
+                                                                     #(ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
+                                                                                [context device cq-desc q-out]) #(read-ptr q-out))
+                                    cl-desc (.allocate ^Arena arena 24)
+                                    _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
+                                    l-out (ptr-seg arena)
+                                    lst (acquire-recording-handle! (:list slots) "zeCommandListCreate"
+                                                                   #(ze-call! "zeCommandListCreate" @h-zeCommandListCreate
+                                                                              [context device cl-desc l-out]) #(read-ptr l-out))
+                                    h-launch @h-zeCommandListAppendLaunchKernel
+                                    h-barrier @h-zeCommandListAppendBarrier
          ;; Profiling event pool + one timestamp event per launch. HOST_VISIBLE so the host
          ;; can query/reset; KERNEL_TIMESTAMP so zeEventQueryKernelTimestamp is valid.
-         event-pool (when (and profile? (pos? n-kernels))
-                      (let [pool-desc (.allocate ^Arena arena 24)
-                            _ (.set pool-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_POOL_DESC))
-                            _ (.set pool-desc I32 16 (int (bit-or ZE_EVENT_POOL_FLAG_HOST_VISIBLE
-                                                                  ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP)))
-                            _ (.set pool-desc I32 20 (int n-kernels))
-                            p-out (ptr-seg arena)]
-                        (acquire-recording-handle! (:pool slots) "zeEventPoolCreate"
-                          #(ze-call! "zeEventPoolCreate" @h-zeEventPoolCreate
-                                     [context pool-desc (int 0) MemorySegment/NULL p-out])
-                          #(read-ptr p-out))))
-         events (when event-pool
-                  (mapv (fn [i]
-                          (let [ev-desc (.allocate ^Arena arena 32)
-                                _ (.set ev-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_DESC))
-                                _ (.set ev-desc I32 16 (int i))  ;; index
+                                    event-pool (when (and profile? (pos? n-kernels))
+                                                 (let [pool-desc (.allocate ^Arena arena 24)
+                                                       _ (.set pool-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_POOL_DESC))
+                                                       _ (.set pool-desc I32 16 (int (bit-or ZE_EVENT_POOL_FLAG_HOST_VISIBLE
+                                                                                             ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP)))
+                                                       _ (.set pool-desc I32 20 (int n-kernels))
+                                                       p-out (ptr-seg arena)]
+                                                   (acquire-recording-handle! (:pool slots) "zeEventPoolCreate"
+                                                                              #(ze-call! "zeEventPoolCreate" @h-zeEventPoolCreate
+                                                                                         [context pool-desc (int 0) MemorySegment/NULL p-out])
+                                                                              #(read-ptr p-out))))
+                                    events (when event-pool
+                                             (mapv (fn [i]
+                                                     (let [ev-desc (.allocate ^Arena arena 32)
+                                                           _ (.set ev-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_DESC))
+                                                           _ (.set ev-desc I32 16 (int i))  ;; index
                                 ;; signal scope 0 (in-command-list only), NOT HOST: a HOST-scope
                                 ;; signal forces a cache-hierarchy flush after EVERY kernel, which
                                 ;; measured 3-5x slower on the gemma layer graphs (fwd 32→170 ms)
@@ -2691,13 +2690,13 @@
                                 ;; HOST_VISIBLE, so event status + kernel timestamps are readable
                                 ;; from the host after the synchronous queue-execute returns
                                 ;; (validated vs host wall time on iGPU; re-validate on dGPU).
-                                _ (.set ev-desc I32 20 (int 0))  ;; signal scope
-                                _ (.set ev-desc I32 24 (int 0))  ;; wait scope
-                                e-out (ptr-seg arena)]
-                            (acquire-recording-handle! (get slots [:event i]) "zeEventCreate"
-                              #(ze-call! "zeEventCreate" @h-zeEventCreate
-                                         [event-pool ev-desc e-out]) #(read-ptr e-out))))
-                        (range n-kernels)))]
+                                                           _ (.set ev-desc I32 20 (int 0))  ;; signal scope
+                                                           _ (.set ev-desc I32 24 (int 0))  ;; wait scope
+                                                           e-out (ptr-seg arena)]
+                                                       (acquire-recording-handle! (get slots [:event i]) "zeEventCreate"
+                                                                                  #(ze-call! "zeEventCreate" @h-zeEventCreate
+                                                                                             [event-pool ev-desc e-out]) #(read-ptr e-out))))
+                                                   (range n-kernels)))]
     ;; append each bound kernel's launch (args already live on its dedicated handle; the
     ;; group-count value is captured into the recorded command at append time). A barrier
     ;; after each launch enforces ordering so a kernel sees the previous one's writes — the
@@ -2705,27 +2704,27 @@
     ;; each is memory-bound so overlap buys little; correctness first. (Measured: an IN_ORDER
     ;; command list with no barriers is the same replay time — the ~50µs/kernel floor on this
     ;; iGPU is per-dispatch overhead, not the barrier. Fewer/bigger kernels is the lever.)
-     (doseq [[i {:keys [bound group-count]}] (map-indexed vector prepareds)]
-       (let [^MemorySegment gc (:gc-seg bound)
-             signal-ev (if events (nth events i) MemorySegment/NULL)]
+                                (doseq [[i {:keys [bound group-count]}] (map-indexed vector prepareds)]
+                                  (let [^MemorySegment gc (:gc-seg bound)
+                                        signal-ev (if events (nth events i) MemorySegment/NULL)]
         ;; A 1D map/map-void carries its X-grid as group-count (Y=Z=1 pre-filled). A GEMM /
         ;; convert / transpose expansion pre-bakes its FULL (2D) gc-seg at bind time and passes
         ;; group-count = nil — leave its X/Y/Z untouched (overwriting X would break the 2D grid).
-         (when (some? group-count) (.set gc I32 0 (int group-count)))
-         (ze-call! "zeCommandListAppendLaunchKernel" h-launch
-                   [lst (:kernel bound) gc signal-ev (int 0) MemorySegment/NULL])
-         (when barriers?
-           (ze-call! "zeCommandListAppendBarrier" h-barrier
-                     [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
-     (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
-     (let [lists-arr (ptr-seg arena)]
-       (.set lists-arr PTR 0 ^MemorySegment lst)
-       (cond-> {:queue queue :list lst :lists-arr lists-arr}
-         events (assoc :events events
-                       :event-pool event-pool
-                       :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
-                       :phases (mapv :phase prepareds))))))
-       adopt-cleanup!))))
+                                    (when (some? group-count) (.set gc I32 0 (int group-count)))
+                                    (ze-call! "zeCommandListAppendLaunchKernel" h-launch
+                                              [lst (:kernel bound) gc signal-ev (int 0) MemorySegment/NULL])
+                                    (when barriers?
+                                      (ze-call! "zeCommandListAppendBarrier" h-barrier
+                                                [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
+                                (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
+                                (let [lists-arr (ptr-seg arena)]
+                                  (.set lists-arr PTR 0 ^MemorySegment lst)
+                                  (cond-> {:queue queue :list lst :lists-arr lists-arr}
+                                    events (assoc :events events
+                                                  :event-pool event-pool
+                                                  :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
+                                                  :phases (mapv :phase prepareds))))))
+                            adopt-cleanup!))))
 
 (defn- assert-recording-live! [graph]
   (if-let [owner (::cleanup/owner graph)]
