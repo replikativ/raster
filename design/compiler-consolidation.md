@@ -1547,3 +1547,39 @@ Focused ingestion/content/publication tests pass 35 tests / 698 assertions in th
 This adds no producer provenance, numerical field selection, transactional metadata publication
 or completed-receipt-to-manifest vertical; those remain the next integration work. The original
 eight-item campaign, external training acceptance and AMR/subcycling requirements remain open.
+
+### Completed resident fields to numerical manifests — 2026-10-03
+
+`raster.runtime.resident-state/capture!` connects original completed execution receipts and
+owner-bound measured storage facts to the existing manifest and content-provider lifecycle.
+It introduces no compiler cache, session convention or persistence implementation. All selected
+fields are validated and the manifest certified before provider writes. An extra existing Link
+output lease pins the entire synchronous capture, including placement await, even if a provider
+callback closes the caller receipt. Historical input frontiers are not current state sources.
+
+Version 1 accepts exact positive plain contiguous tensor leaves and emits one complete raw-array
+chunk per field. Provider byte windows may be unaligned: downloads align outward within the
+selected leaf and bounded scratch storage, copying only the requested bytes to the provider.
+Byte order comes from owner-bound generated probe evidence, not the host. Semantic names,
+coordinates, parent state IDs and numerical policy are application declarations; completed
+producer fingerprints, bound schedules, representation facts and ordered field-to-node/content
+bindings are derived. Placement events stay outside the certified numerical manifest.
+
+The lifetime monitor covers receipt validation, pure plan certification and lease acquisition
+only; provider submit/await runs outside it under the private lease. A cross-thread provider
+callback can therefore acquire the monitor and promptly receive the lease-active decline rather
+than deadlock with capture. Known failure releases the private lease; unknown cleanup retains explicit cleanup authority.
+Later-field failure may leave earlier verified orphan blobs and returns no state. Availability
+finalization still independently reopens, hashes and promotes the chunks before invoking external
+metadata publication. Neither capture nor finalization is transactional publication, codec
+verification, mathematical equivalence, or a proof of parent existence.
+
+Focused hardware-free and actual OpenCL/Level Zero tests pass 10 tests / 117 assertions. Generated
+periodic heat evolution is captured, the producer session is closed, and a fresh execution resumes
+from the stored bytes through the public verified raw-array decoder after availability finalization.
+Same-backend continuation matches uninterrupted execution exactly; JVM
+comparison uses the declared FP64 tolerance. These native tests use an explicitly synthetic
+packaged build identity and a bounded test provider, not release-build or production-store
+validation. The existing multilevel/AMR operators remain unchanged. General device packing,
+partial-chunk codecs, scalable AMR/subcycling/reflux and external training acceptance remain open;
+this slice does not complete the eight-item campaign.
