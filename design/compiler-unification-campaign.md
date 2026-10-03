@@ -1847,11 +1847,18 @@ lock. The context-chain convenience API releases its previous recording before r
 Attached cleanup stops before source teardown if recording teardown fails, and before root teardown
 if any prepared source fails.
 
-Surface lifecycle tightening: `free-buffer!` currently rejects **all** registered-buffer releases
-while any recorded wrapper remains, including a failed provisional wrapper. Descriptor phase
-footprints are incomplete, so an apparently precise key snapshot would be unsound. The next ownership
-slice must retain complete source footprints and replace this conservative guard with exact root/view
-dependencies. Explicitly release recordings before freeing buffers or replacing bindings; this does
+Surface lifecycle tightening: `free-buffer!` rejects releases overlapping a recorded wrapper's
+retained source footprint, including failed provisional wrappers. Low-level preparation captures
+resolved root objects and their registrations; descriptor materialization captures every resolved
+leaf root, including views and composite arguments. A wrapper unions footprints only when every
+source has one. Legacy/manual bindings without a footprint retain the conservative **all-buffer**
+guard; missing is never interpreted as empty. Owned-root release checks keys, allocation identities
+and exact resident-buffer object identity, including aliases registered after binding. Distinct
+wrappers of the same native pointer require a shared allocation identity; no arbitrary pointer
+equivalence is inferred. Detaching a new
+borrowed/external alias checks its registration key because it cannot destroy the native root.
+Unrelated staging buffers may therefore be released without special-case key exemptions.
+Explicitly release recordings before freeing their buffers or replacing bindings; this does
 not change numerical surface semantics. Backend prepared factories, sticky linked/parallel close,
 and root/view/event owners remain unfinished; these wrapper checks do not certify their reclamation.
 

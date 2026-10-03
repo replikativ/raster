@@ -41,6 +41,46 @@
         (gpu/free-buffer! sess :data)
         (is (nil? (get-in @sess [:buffers :data])))))))
 
+(deftest prepared-root-footprints-allow-disjoint-staging-and-pin-owned-aliases
+  (let [root (Object.) staging (Object.) freed (atom [])
+        sess (atom {:device-id :ocl:0 :closed? false :graphs {} :prepared {}
+                    :kernels {:phase [{:kernel-name "root-probe" :array-params '[x]}]}
+                    :buffers {:data root :staging staging}
+                    :allocations {:data {:id :root :ownership :owned}
+                                  :staging {:id :staging :ownership :owned}}})]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [_ name]
+         (case name
+           "bind-registered-map-void-kernel" (fn [_ buffers _ _ _]
+                                                {:phase :kernel :bound-buffers buffers})
+           "record-graph!" (fn [_ _] {:native :graph})
+           "free-buffer!" (fn [buffer] (swap! freed conj buffer))))
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft)
+       (fn [_ name] (when (= name "destroy-graph!") (fn [_])))}
+      (fn []
+        (gpu/prepare! sess :phase {"x" :data} [] 1)
+        (gpu/record-graph! sess [:phase] :graph)
+        (is (= #{:data} (get-in @sess [:graphs :graph :resident-footprint :buffer-keys])))
+        (gpu/free-buffer! sess :staging)
+        (is (= [staging] @freed))
+        ;; Aliases registered after binding are not in its key set; native identity still pins
+        ;; owned roots. Detaching a new borrowed alias never destroys that root.
+        (swap! sess (fn [state]
+                      (-> state (assoc-in [:buffers :owned-alias] root)
+                          (assoc-in [:allocations :owned-alias] {:id :another-id :ownership :owned})
+                          (assoc-in [:buffers :borrowed-alias] root)
+                          (assoc-in [:allocations :borrowed-alias] {:id :borrowed :ownership :borrowed}))))
+        (doseq [key [:data :owned-alias]]
+          (is (= :recorded-buffer-retained
+                 (try (gpu/free-buffer! sess key)
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+        (gpu/free-buffer! sess :borrowed-alias)
+        (is (= [staging] @freed))
+        (is (nil? (get-in @sess [:buffers :borrowed-alias])))
+        (gpu/release-recorded-graph! sess :graph)
+        (gpu/release-prepared! sess :phase)))))
+
 (deftest qualified-emitted-source-remains-pinned-until-wrapper-release
   (let [calls (atom []) source-owner (cleanup/owner [])
         handle (gpu/map->KernelGraphHandle {:key :source :session-id :session :generation :generation})

@@ -659,6 +659,23 @@
               (some #(identical? buffer %) (:resident-buffers right)))
             (:resident-buffers left))))
 
+(defn- registered-buffer-footprint
+  "Capture every registration alias of the resolved root objects, not their native view handles."
+  [sess root-buffers]
+  (let [keys (into #{} (keep (fn [[key buffer]]
+                              (when (some #(identical? buffer %) root-buffers) key)))
+                   (:buffers @sess))]
+    {:buffer-keys keys
+     :allocation-ids (into #{} (keep #(get-in @sess [:allocations % :id])) keys)
+     :resident-buffers (vec root-buffers)}))
+
+(defn- merge-resident-footprints [footprints]
+  ;; Missing is different from a proved empty footprint. Legacy/manual bindings remain guarded.
+  (when (every? map? footprints)
+    {:buffer-keys (into #{} (mapcat :buffer-keys) footprints)
+     :allocation-ids (into #{} (mapcat :allocation-ids) footprints)
+     :resident-buffers (into [] (mapcat :resident-buffers) footprints)}))
+
 (defn- pending-resident-events
   [events kind footprint]
   (->> events
@@ -676,17 +693,25 @@
   [sess key]
   (locking sess
     (let [{:keys [device-id buffers allocations kernel-graphs events graphs]} @sess
+          footprint {:buffer-keys #{key}
+                     :allocation-ids #{(get-in allocations [key :id])}
+                     :resident-buffers [(get buffers key)]}
+          ;; Detaching an external/borrowed alias does not destroy its native root. Its own
+          ;; registration still cannot disappear while borrowed by a recorded source.
+          release-footprint (if (= :owned (get-in allocations [key :ownership])) footprint
+                              {:buffer-keys #{key}})
           recorded-borrowers (into [] (keep (fn [[graph-key entry]]
-                                              (when (recorded-graph-entry? entry) graph-key))) graphs)
+                                             (when (and (recorded-graph-entry? entry)
+                                                        (or (nil? (:resident-footprint entry))
+                                                            (resident-footprints-overlap?
+                                                             release-footprint (:resident-footprint entry))))
+                                               graph-key))) graphs)
           bound-graphs (->> kernel-graphs
                             (keep (fn [[graph-key entry]]
                                     (when (some #(= key (:key %))
                                                 (vals (:resident-views entry)))
                                       graph-key)))
                             vec)
-          footprint {:buffer-keys #{key}
-                     :allocation-ids #{(get-in allocations [key :id])}
-                     :resident-buffers [(get buffers key)]}
           pending-transfers (pending-resident-events events :transfer footprint)]
       (when-let [buf (get buffers key)]
         (when (seq recorded-borrowers)
@@ -785,7 +810,8 @@
          buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
          device-id (:device-id @sess)
          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
-         prepared (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})]
+         prepared (assoc (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})
+                         :resident-footprint (registered-buffer-footprint sess buf-vec))]
      (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
      (swap! sess assoc-in [:prepared phase-key] prepared)
      prepared))))
@@ -828,19 +854,20 @@
       (when-not (and (contains? source :phase) (not (contains? source :handle)))
         (throw (ex-info "phase recording source requires only :phase"
                         {:reason :gpu-recording-invalid-source :source source})))
-      {:identity phase
-       :prepareds (prepared-bindings
-                   (or (get-in @sess [:prepared phase])
+      (let [entry (or (get-in @sess [:prepared phase])
                        (throw (ex-info (str "Phase not prepared: " phase " — call prepare! first")
                                        {:reason :gpu-recording-unbound-phase
-                                        :phase phase :prepared (keys (:prepared @sess))}))))})
+                                        :phase phase :prepared (keys (:prepared @sess))})))]
+        {:identity phase :prepareds (prepared-bindings entry)
+         :resident-footprint (:resident-footprint entry)}))
     :graph
     (do
       (when-not (and (contains? source :handle) (not (contains? source :phase)))
         (throw (ex-info "graph recording source requires only :handle"
                         {:reason :gpu-recording-invalid-source :source source})))
-      {:identity handle
-       :prepareds (:prepareds (resolve-kernel-graph-entry sess handle))})
+      (let [entry (resolve-kernel-graph-entry sess handle)]
+        {:identity handle :prepareds (:prepareds entry)
+         :resident-footprint (:resident-footprint entry)}))
     (throw (ex-info "recording source must be a bound phase or emitted graph"
                     {:reason :gpu-recording-invalid-source :source source}))))
 
@@ -896,8 +923,7 @@
                      :recording-sources (mapv (fn [{:keys [kind phase handle]}]
                                                (cond-> {:kind kind :key (if (= kind :phase) phase (:key handle))}
                                                  (= kind :graph) (assoc :handle handle))) sources)
-                     ;; Descriptor phase footprints are incomplete. Until that migration lands,
-                     ;; free-buffer! conservatively blocks every registration under a wrapper.
+                     :resident-footprint (merge-resident-footprints (mapv :resident-footprint resolved))
                      :source-bindings resolved
                      :profile? (boolean profile?) :execution-order execution-order}
          record-one! (fn [id bindings profiling?]
@@ -2331,6 +2357,7 @@
    (let [device-id (:device-id @sess)
          {:keys [kernel-name phase]} step
          materialized (volatile! {})
+         root-buffers (volatile! [])
          owned-view-buffers (volatile! [])
          materialize
          (fn materialize [sym key-or-view]
@@ -2341,6 +2368,7 @@
              (resident-buffer-view? key-or-view)
              (or (get @materialized key-or-view)
                  (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+                       _ (vswap! root-buffers conj buffer)
                        _ (when-not (bview/contiguous? view)
                            (throw (ex-info
                                    "resident descriptor binding requires a contiguous view"
@@ -2354,15 +2382,18 @@
                    runtime-buffer))
 
              :else
-             (or (get-in @sess [:buffers key-or-view])
-                 (throw (ex-info (str "No buffer for kernel arg: " sym " → " key-or-view)
-                                 {:kernel kernel-name
-                                  :available (keys (:buffers @sess))})))))
+             (let [buffer (or (get-in @sess [:buffers key-or-view])
+                              (throw (ex-info (str "No buffer for kernel arg: " sym " → " key-or-view)
+                                              {:kernel kernel-name
+                                               :available (keys (:buffers @sess))})))]
+               (vswap! root-buffers conj buffer)
+               buffer)))
          resolve-buf (fn [sym] (materialize sym (sym->key sym)))
          bound-step
          (try
            (assoc (bind-resident-step device-id step args resolve-buf schedule roles)
-                  :owned-view-buffers @owned-view-buffers)
+                  :owned-view-buffers @owned-view-buffers
+                  :resident-footprint (registered-buffer-footprint sess @root-buffers))
            (catch Exception e
              (when (seq @owned-view-buffers)
                (when-let [free! (rt-resolve-soft device-id "free-buffer!")]
