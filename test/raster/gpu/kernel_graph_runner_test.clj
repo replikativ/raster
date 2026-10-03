@@ -9,6 +9,7 @@
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.runtime.hardware :as hardware]))
 
 (defn- probe-artifact
@@ -38,10 +39,11 @@
 (deftest integrated-opencl-allocation-still-uploads-through-cl-mem
   (let [source (float-array [1.0 2.0])
         uploaded (atom [])
-        mock-buffer (Object.)
+        mock-buffer {:dtype :float :n-elements 2 :byte-size 8}
         resolver (fn [_device-id name]
                    (case name
-                     "make-buffer" (fn [_n _dtype] mock-buffer)
+                     "make-buffer" (fn [_n _dtype opts]
+                                     (lifecycle/native-buffer (constantly mock-buffer) (fn [_]) opts))
                      "array->buffer!" (fn [buffer array]
                                         (swap! uploaded conj [buffer array])
                                         buffer)
@@ -53,10 +55,10 @@
       {#'hardware/memory-topology (constantly {:model :unified :integrated? true})
        (ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
       (fn []
-        (let [allocated ((ns-resolve 'raster.gpu.core 'alloc-buffers-internal)
-                         {:input [:float 2 source]} :ocl:0)]
-          (is (identical? mock-buffer (:input allocated)))
-          (is (= [[mock-buffer source]] @uploaded)))))))
+        (let [sess (atom {:device-id :ocl:0 :session-id :test :buffers {} :allocations {}})
+              allocated (gpu/alloc! sess {:input [:float 2 source]})]
+          (is (= mock-buffer (dissoc (:input allocated) ::cleanup/owner)))
+          (is (= [[(:input allocated) source]] @uploaded)))))))
 
 (deftest session-runner-owns-only-graph-temporaries-and-bound-driver-objects
   (let [graph (emitted-graph)
@@ -86,7 +88,10 @@
         resolver
         (fn [_device-id name]
           (case name
-            "make-buffer" (fn [n dtype] {:temporary true :elements n :dtype dtype})
+            "make-buffer" (fn [n dtype opts]
+                            (lifecycle/native-buffer
+                             #(hash-map :temporary true :elements n :dtype dtype)
+                             #(swap! freed conj %) opts))
             "array->buffer!" (fn [buffer _] buffer)
             "buffer-as-float-buffer" identity
             "buffer-as-int-buffer" identity
@@ -273,16 +278,20 @@
         resolver
         (fn [_device-id name]
           (case name
-            "make-buffer" (fn [elements dtype]
-                            {:temporary true :n-elements elements
-                             :byte-size (* elements 4) :dtype dtype})
+            "make-buffer" (fn [elements dtype opts]
+                            (lifecycle/native-buffer
+                             #(hash-map :temporary true :n-elements elements
+                                        :byte-size (* elements 4) :dtype dtype)
+                             #(swap! freed conj %) opts))
             "array->buffer!" (fn [buffer _] buffer)
             "buffer-as-float-buffer" identity
             "buffer-as-int-buffer" identity
-            "slice-buffer" (fn [buffer byte-offset byte-length dtype]
-                             (let [slice {:sub-buffer true :parent buffer
-                                          :byte-offset byte-offset :byte-size byte-length
-                                          :n-elements (quot byte-length 4) :dtype dtype}]
+            "slice-buffer" (fn [buffer byte-offset byte-length dtype opts]
+                             (let [slice (lifecycle/native-buffer
+                                          #(hash-map :sub-buffer true :parent buffer
+                                                     :byte-offset byte-offset :byte-size byte-length
+                                                     :n-elements (quot byte-length 4) :dtype dtype)
+                                          #(swap! freed conj %) opts)]
                                (swap! slices conj slice)
                                slice))
             "free-buffer!" #(swap! freed conj %)

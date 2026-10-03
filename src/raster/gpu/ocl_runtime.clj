@@ -572,6 +572,18 @@
 (defn device-buffer? [x]
   (instance? OclBuffer x))
 
+(defn assert-buffer-live!
+  "Validate retained destruction authority and runtime context before buffer use. Raw opaque
+   handles are outside this owned-buffer contract; this check is not a concurrency lease."
+  [buf]
+  (when-not (::cleanup/owner buf)
+    (throw (ex-info "OpenCL buffer has no lifetime owner" {:reason :missing-cleanup-owner})))
+  (cleanup/assert-live! (::cleanup/owner buf))
+  (when-not (identical? (::allocation-context buf) (:context @state))
+    (throw (ex-info "Buffer belongs to a retired OpenCL runtime context"
+                    {:reason :runtime-generation-mismatch})))
+  buf)
+
 (defn- known-buffer-capacity
   "Return a device allocation's element capacity when Raster owns that fact.
 
@@ -583,7 +595,7 @@
 
 (defn- physical-pointer-dtypes [arrays]
   (mapv #(cond
-           (device-buffer? %) (:dtype ^OclBuffer %)
+           (device-buffer? %) (:dtype (assert-buffer-live! %))
            (instance? MemorySegment %) :opaque
            :else (dt/dtype-for-jvm-array %))
         arrays))
@@ -614,27 +626,54 @@
 
 (defn make-buffer
   "Allocate a persistent GPU buffer via clCreateBuffer. A zero-length logical buffer owns one
-   native byte so it can still be bound as a pointer; its visible capacity remains zero."
+   native byte so it can still be bound as a pointer; its visible capacity remains zero.
+   :retain-owner! publishes the canonical owner before native contact. :adopt-cleanup! retains
+   unresolved rollback debt; containers must deduplicate both callbacks by owner identity."
   ([n] (make-buffer n :float))
-  ([n dtype]
-   (ensure-init!)
-   (let [{:keys [context arena]} @state
-         n (long n)
-         elem-size (long (get dtype-byte-sizes dtype 4))
+  ([n dtype] (make-buffer n dtype {}))
+  ([n dtype {:keys [retain-owner! adopt-cleanup!]}]
+   (let [n (long n)
+         dtype (dt/canon dtype)
+         elem-size (long (dt/bytes-of dtype))
          _ (when (neg? n)
              (throw (ex-info "GPU buffer element count must be non-negative"
                              {:reason :gpu-buffer-negative-elements :elements n})))
          byte-size (Math/multiplyExact n elem-size)
-         err-seg (.allocate ^Arena arena I32)
-         cl-mem (.invokeWithArguments ^MethodHandle @h-clCreateBuffer
-                                      (into-array Object [context (long CL_MEM_READ_WRITE)
-                                                          (long (max 1 byte-size)) MemorySegment/NULL err-seg]))
-         _ (when (not= CL_SUCCESS (read-int err-seg))
-             (throw (ex-info "clCreateBuffer failed" {:error (read-int err-seg) :size byte-size})))
-         ;; Host staging buffer for data transfer
-         host-seg (.allocate ^Arena arena byte-size)]
-     (->OclBuffer host-seg cl-mem n byte-size dtype
-                  (long (buffer-offset-alignment))))))
+         _ (when-not (every? #(or (nil? %) (fn? %)) [retain-owner! adopt-cleanup!])
+             (throw (ex-info "Buffer ownership requires callbacks" {:reason :invalid-cleanup-plan})))
+         _ (ensure-init!)
+         {:keys [context]} @state
+         alignment (long (buffer-offset-alignment))
+         arena (Arena/ofShared)
+         slot (cleanup/acquisition-slot)
+         owner (cleanup/owner
+                [{:id :memory :release #(cleanup/release-native!
+                                         slot (fn [handle]
+                                                (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [handle])))}
+                 {:id :staging-arena :after #{:memory} :release #(.close arena)}])]
+     (cleanup/build!
+      owner
+      (fn []
+        (when retain-owner! (retain-owner! owner))
+        (let [host-seg (.allocate ^Arena arena byte-size)
+              err-seg (.allocate ^Arena arena I32)
+              cl-mem (cleanup/acquire-native!
+                      slot
+                      #(let [handle (.invokeWithArguments ^MethodHandle @h-clCreateBuffer
+                                                          (into-array Object
+                                                                      [context (long CL_MEM_READ_WRITE)
+                                                                       (long (max 1 byte-size))
+                                                                       MemorySegment/NULL err-seg]))
+                             error (read-int err-seg)]
+                         (when-not (= CL_SUCCESS error)
+                           (throw (ex-info "clCreateBuffer failed" {:error error :size byte-size})))
+                         (when (or (nil? handle) (zero? (.address ^MemorySegment handle)))
+                           (throw (ex-info "clCreateBuffer returned a null handle"
+                                           {:reason :native-buffer-null :size byte-size})))
+                         handle))]
+          (assoc (->OclBuffer host-seg cl-mem n byte-size dtype alignment)
+                 ::allocation-context context)))
+      (or adopt-cleanup! retain-owner!)))))
 
 (defn buffer-offset-alignment
   "Minimum byte alignment for a clCreateSubBuffer origin on the selected OpenCL device."
@@ -648,55 +687,79 @@
    Unlike Level Zero's non-owning sliced pointer, the returned OclBuffer owns one native
    cl_mem reference and MUST be passed to free-buffer!. `byte-offset` is relative to the root
    buffer and must satisfy CL_DEVICE_MEM_BASE_ADDR_ALIGN; dtype reinterpretation is forbidden."
-  [^OclBuffer buf byte-offset byte-length dtype]
-  (ensure-init!)
-  (let [byte-offset (long byte-offset)
-        byte-length (long byte-length)
-        dtype (dt/canon dtype)
-        raw-dtype (dt/canon (:dtype buf))
-        element-bytes (long (dt/bytes-of dtype))
-        alignment (long (buffer-offset-alignment))]
-    (when-not (= raw-dtype dtype)
-      (throw (ex-info "OpenCL sub-buffer cannot reinterpret its parent dtype"
-                      {:buffer-dtype raw-dtype :dtype dtype})))
-    (when (or (neg? byte-offset) (not (pos? byte-length))
-              (> (+ byte-offset byte-length) (:byte-size buf))
-              (not (zero? (mod byte-offset element-bytes)))
-              (not (zero? (mod byte-length element-bytes))))
-      (throw (ex-info "OpenCL sub-buffer range is invalid"
-                      {:byte-offset byte-offset :byte-length byte-length
-                       :buffer-bytes (:byte-size buf) :dtype dtype})))
-    (when-not (zero? (mod byte-offset alignment))
-      (throw (ex-info "OpenCL sub-buffer origin violates the device alignment requirement"
-                      {:byte-offset byte-offset :required-alignment alignment})))
-    (let [arena (Arena/ofConfined)]
-      (try
-        (let [region (.allocate arena (long 16) (long 8))
-              err-seg (.allocate arena I32)
-              _ (.set region I64 0 byte-offset)
-              _ (.set region I64 8 byte-length)
-              cl-mem (.invokeWithArguments
-                      ^MethodHandle @h-clCreateSubBuffer
-                      (into-array Object [(:cl-mem buf) (long CL_MEM_READ_WRITE)
-                                          (int CL_BUFFER_CREATE_TYPE_REGION) region err-seg]))
-              error (read-int err-seg)]
-          (when-not (= CL_SUCCESS error)
-            (throw (ex-info "clCreateSubBuffer failed"
-                            {:error error :byte-offset byte-offset :byte-length byte-length
-                             :required-alignment alignment})))
-          (->OclBuffer (.asSlice ^MemorySegment (:segment buf) byte-offset byte-length)
-                       cl-mem (quot byte-length element-bytes) byte-length dtype alignment))
-        (finally
-          (.close arena))))))
+  ([buf byte-offset byte-length dtype] (slice-buffer buf byte-offset byte-length dtype {}))
+  ([^OclBuffer buf byte-offset byte-length dtype {:keys [retain-owner! adopt-cleanup!]}]
+   (when-not (every? #(or (nil? %) (fn? %)) [retain-owner! adopt-cleanup!])
+     (throw (ex-info "Buffer ownership requires callbacks" {:reason :invalid-cleanup-plan})))
+   (assert-buffer-live! buf)
+   (ensure-init!)
+   (let [byte-offset (long byte-offset)
+         byte-length (long byte-length)
+         dtype (dt/canon dtype)
+         raw-dtype (dt/canon (:dtype buf))
+         element-bytes (long (dt/bytes-of dtype))
+         alignment (long (buffer-offset-alignment))]
+     (when-not (= raw-dtype dtype)
+       (throw (ex-info "OpenCL sub-buffer cannot reinterpret its parent dtype"
+                       {:buffer-dtype raw-dtype :dtype dtype})))
+     (when (or (neg? byte-offset) (not (pos? byte-length))
+               (> (Math/addExact byte-offset byte-length) (:byte-size buf))
+               (not (zero? (mod byte-offset element-bytes)))
+               (not (zero? (mod byte-length element-bytes))))
+       (throw (ex-info "OpenCL sub-buffer range is invalid"
+                       {:byte-offset byte-offset :byte-length byte-length
+                        :buffer-bytes (:byte-size buf) :dtype dtype})))
+     (when-not (zero? (mod byte-offset alignment))
+       (throw (ex-info "OpenCL sub-buffer origin violates the device alignment requirement"
+                       {:byte-offset byte-offset :required-alignment alignment})))
+     (let [arena (Arena/ofShared)
+           slot (cleanup/acquisition-slot)
+           owner (cleanup/owner
+                  [{:id :memory :release #(cleanup/release-native!
+                                           slot (fn [handle]
+                                                  (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [handle])))}
+                   {:id :readback-arena :after #{:memory} :release #(.close arena)}])]
+       (cleanup/build!
+        owner
+        (fn []
+          (when retain-owner! (retain-owner! owner))
+          (let [host-seg (.allocate arena byte-length)
+                region (.allocate arena (long 16) (long 8))
+                err-seg (.allocate arena I32)
+                _ (.set region I64 0 byte-offset)
+                _ (.set region I64 8 byte-length)
+                cl-mem (cleanup/acquire-native!
+                        slot
+                        #(let [handle (.invokeWithArguments
+                                       ^MethodHandle @h-clCreateSubBuffer
+                                       (into-array Object [(:cl-mem buf) (long CL_MEM_READ_WRITE)
+                                                           (int CL_BUFFER_CREATE_TYPE_REGION) region err-seg]))
+                               error (read-int err-seg)]
+                           (when-not (= CL_SUCCESS error)
+                             (throw (ex-info "clCreateSubBuffer failed"
+                                             {:error error :byte-offset byte-offset :byte-length byte-length
+                                              :required-alignment alignment})))
+                           (when (or (nil? handle) (zero? (.address ^MemorySegment handle)))
+                             (throw (ex-info "clCreateSubBuffer returned a null handle"
+                                             {:reason :native-buffer-null})))
+                           handle))]
+            (assoc (->OclBuffer host-seg
+                                cl-mem (quot byte-length element-bytes) byte-length dtype alignment)
+                   ::allocation-context (::allocation-context buf))))
+        (or adopt-cleanup! retain-owner!))))))
 
 (defn free-buffer!
-  "Free an OclBuffer's cl_mem."
+  "Release the buffer's canonical cl_mem owner. Unknown native outcomes are never retried."
   [^OclBuffer buf]
-  (cl-call! "clReleaseMemObject" @h-clReleaseMemObject [(:cl-mem buf)]))
+  (if-let [owner (::cleanup/owner buf)]
+    (cleanup/release! owner)
+    (throw (ex-info "OpenCL buffer has no destruction authority"
+                    {:reason :missing-cleanup-owner}))))
 
 (defn buffer-as-float-buffer
   "Return a java.nio.FloatBuffer view over the host staging segment."
   [^OclBuffer buf]
+  (assert-buffer-live! buf)
   (.asSlice (:segment buf) 0 (:byte-size buf))
   (-> (.asByteBuffer (:segment buf))
       (.order (java.nio.ByteOrder/nativeOrder))
@@ -705,6 +768,7 @@
 (defn buffer-as-int-buffer
   "Return a java.nio.IntBuffer view over the host staging segment."
   [^OclBuffer buf]
+  (assert-buffer-live! buf)
   (-> (.asByteBuffer (:segment buf))
       (.order (java.nio.ByteOrder/nativeOrder))
       (.asIntBuffer)))
@@ -712,6 +776,7 @@
 (defn array->buffer!
   "Copy a JVM array into an OclBuffer (host → device). Returns the buffer."
   [^OclBuffer buf arr]
+  (assert-buffer-live! buf)
   (ensure-init!)
   (let [{:keys [queue]} @state
         src-seg (MemorySegment/ofArray arr)
@@ -748,6 +813,7 @@
    the ze runtime's `plan-range`; split from execution so a batch validates everything first."
   [^OclBuffer buf host {:keys [src-element dst-element elements]
                         :or {src-element 0 dst-element 0}} direction]
+  (assert-buffer-live! buf)
   (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
         host-seg (as-segment host)
         [buf-el host-el] (case direction :upload [dst-element src-element] :download [src-element dst-element])
@@ -762,21 +828,22 @@
    the host staging segment and a clEnqueueWrite/ReadBuffer at the byte offset — only the RANGE
    crosses the bus."
   [^OclBuffer buf {:keys [buf-off host-off n-bytes host-seg]} direction]
+  (assert-buffer-live! buf)
   (ensure-init!)
   (let [{:keys [queue]} @state
         staging (.asSlice ^MemorySegment (:segment buf) (long buf-off))]
     (when (pos? (long n-bytes))
       (case direction
-      :upload
-      (do (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
-          (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
-                    [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
-                     staging (int 0) MemorySegment/NULL MemorySegment/NULL]))
-      :download
-      (do (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
-                    [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
-                     staging (int 0) MemorySegment/NULL MemorySegment/NULL])
-          (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes)))))))
+        :upload
+        (do (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
+            (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
+                      [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
+                       staging (int 0) MemorySegment/NULL MemorySegment/NULL]))
+        :download
+        (do (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
+                      [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
+                       staging (int 0) MemorySegment/NULL MemorySegment/NULL])
+            (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes)))))))
 
 (defn upload-range!
   "Ranged host → device copy; returns the buffer."
@@ -793,6 +860,8 @@
 (defn copy-buffer-range!
   "Synchronously enqueue a device-resident OpenCL buffer range copy."
   [^OclBuffer src ^OclBuffer dst src-element dst-element elements]
+  (assert-buffer-live! src)
+  (assert-buffer-live! dst)
   (when-not (= (:dtype src) (:dtype dst))
     (throw (ex-info "OpenCL resident copy requires matching dtypes"
                     {:source-dtype (:dtype src) :destination-dtype (:dtype dst)})))
@@ -812,6 +881,7 @@
 (defn buffer->array
   "Copy an OclBuffer's contents to a new JVM array (device → host)."
   [^OclBuffer buf]
+  (assert-buffer-live! buf)
   (ensure-init!)
   (let [{:keys [queue]} @state
         byte-size (:byte-size buf)
@@ -852,20 +922,18 @@
   "Create a new OclBuffer from a JVM array (allocates + copies)."
   ([arr] (buffer-of-array arr nil))
   ([arr dtype]
-   (let [dt (or dtype
-                (cond (instance? (Class/forName "[F") arr) :float
-                      (instance? (Class/forName "[I") arr) :int
-                      (instance? (Class/forName "[J") arr) :long
-                      (instance? (Class/forName "[D") arr) :double
-                      :else :float))
+   (let [storage (or (dt/dtype-for-jvm-array arr)
+                     (throw (ex-info "Unsupported array type" {:type (type arr)})))
+         dt (or dtype storage)
          n (java.lang.reflect.Array/getLength arr)
          buf (make-buffer n dt)]
-     (array->buffer! buf arr)
-     buf)))
+     (cleanup/build! (::cleanup/owner buf)
+                     #(do (array->buffer! buf arr) buf) nil))))
 
 (defn zero-buffer!
   "Zero out an OclBuffer. Returns the buffer."
   [^OclBuffer buf]
+  (assert-buffer-live! buf)
   (ensure-init!)
   (let [{:keys [queue arena]} @state
         zero-pattern (.allocate ^Arena arena 4)]
@@ -1267,6 +1335,9 @@
   n: number of elements"
   [^String block-kernel-name ^String prop-kernel-name
    input-arrays output-array n]
+  (doseq [value (conj (vec input-arrays) output-array)
+          :when (device-buffer? value)]
+    (assert-buffer-live! value))
   (let [{:keys [kernel-handle workgroup-size block-size scan-dtype]
          :or {workgroup-size 256}} (ensure-kernel-loaded! block-kernel-name)
         n (long n)
@@ -1396,7 +1467,7 @@
   "cl_mem of a resident arg (OclBuffer or raw cl_mem MemorySegment)."
   ^MemorySegment [arr]
   (cond
-    (device-buffer? arr) (:cl-mem arr)
+    (device-buffer? arr) (:cl-mem (assert-buffer-live! arr))
     (instance? MemorySegment arr) arr
     :else (throw (ex-info "bound path requires GPU-resident args (OclBuffer); JVM-array staging is not supported here"
                           {:arr-type (type arr)}))))
@@ -1535,6 +1606,7 @@
    destinations are populated only by await-event!, after device completion establishes host
    visibility."
   [entries direction]
+  (doseq [[buffer _] entries] (assert-buffer-live! buffer))
   (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
         total-bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
     (if (empty? active)

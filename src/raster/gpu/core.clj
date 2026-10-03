@@ -150,51 +150,6 @@
 ;; Internal: buffer allocation
 ;; ================================================================
 
-(defn- alloc-buffers-internal
-  "Allocate DeviceBuffers from a spec map. Topology-aware."
-  [buffer-specs device-id]
-  (let [hw-topo  (try ((requiring-resolve 'raster.runtime.hardware/memory-topology) device-id)
-                      (catch Exception _ {:model :discrete :integrated? false}))
-        unified? (= :unified (:model hw-topo))
-        ;; Level Zero's integrated allocation is genuinely host-coherent. OpenCL's OclBuffer,
-        ;; however, always owns a cl_mem plus a separate host staging segment: writing that segment
-        ;; is not an upload even when the physical GPU shares system memory. Treating topology
-        ;; `:unified` as API-level coherence left newly allocated OpenCL inputs full of zeroes.
-        coherent-host-view? (and unified? (= :ze (backend-type device-id)))
-        mk       (rt-resolve device-id "make-buffer")
-        upload   (rt-resolve device-id "array->buffer!")
-        as-fbuf  (rt-resolve device-id "buffer-as-float-buffer")
-        as-ibuf  (rt-resolve device-id "buffer-as-int-buffer")
-
-        buf-of (fn [arr dtype n]
-                 (let [buf (mk n dtype)]
-                   (if arr
-                     (if coherent-host-view?
-                       (case dtype
-                         :float (let [fb (as-fbuf buf)]
-                                  (.put fb ^floats arr 0 (int n))
-                                  buf)
-                         :int   (let [ib (as-ibuf buf)]
-                                  (.put ib ^ints arr 0 (int n))
-                                  buf)
-                         ;; The fast coherent host views are currently specialized for the two
-                         ;; common storage types. All other typed buffers still use the ordinary
-                         ;; backend upload contract; allocation must never guess from dtype.
-                         (upload buf arr))
-                         (upload buf arr))
-                     buf)))]
-    (into {}
-          (map (fn [[k [dtype n source-arr]]]
-                 [k (buf-of source-arr dtype n)]))
-          buffer-specs)))
-
-(defn- free-buffers-internal!
-  "Free all DeviceBuffers in a buffer map."
-  [bufs device-id]
-  (let [free! (rt-resolve device-id "free-buffer!")]
-    (doseq [[_ buf] bufs]
-      (free! buf))))
-
 (defn- allocation-contract
   [device-id session-id key buffer ownership opts]
   (let [{:keys [memory-space coherence]} (runtime-backend/descriptor device-id)]
@@ -206,28 +161,6 @@
       :alignment (or (:alignment opts) (:alignment buffer) 1)
       :coherence (or (:coherence opts) coherence)
       :ownership ownership})))
-
-(defn- free-session-buffers!
-  "Free only session-owned allocations. Borrowed/external registrations are detached, never
-   destroyed by Raster."
-  [buffers allocations device-id]
-  (let [free! (rt-resolve device-id "free-buffer!")]
-    (doseq [[key buffer] buffers
-            :when (= :owned (:ownership (get allocations key)))]
-      (free! buffer))))
-
-(defn- alloc-buffers-transactional
-  "Allocate buffer specs one at a time and free the successful prefix on failure."
-  [buffer-specs device-id]
-  (let [allocated (volatile! {})]
-    (try
-      (doseq [[key spec] buffer-specs]
-        (vswap! allocated merge (alloc-buffers-internal {key spec} device-id)))
-      @allocated
-      (catch Exception e
-        (when (seq @allocated)
-          (free-buffers-internal! @allocated device-id))
-        (throw e)))))
 
 (defrecord BoundExecutableStep [prepareds temporary-buffers owned-view-buffers])
 
@@ -430,6 +363,7 @@
            :dispatches {}      ;; {phase-key → [KernelDispatch ...]}
            :buffers   {}       ;; {buf-key → DeviceBuffer}
            :allocations {}     ;; {buf-key → backend-neutral BufferAllocation}
+           :buffer-owners {}   ;; exact canonical backend owners of owned roots, including debt
            :kernel-graphs {}    ;; {graph-key → bound emitted KernelGraph}
            :events {}           ;; {event-id → session-owned asynchronous completion}
            :closed?   false})))
@@ -463,9 +397,56 @@
 
 (declare release-event!)
 
+(def ^:dynamic ^:private *root-lifecycle-sessions* [])
+(def ^:dynamic ^:private *session-use-sessions* [])
+
+(defmacro ^:private with-root-lifecycle [sess & body]
+  `(locking ~sess
+     (when (some #(identical? ~sess %) (concat *root-lifecycle-sessions* *session-use-sessions*))
+       (throw (ex-info "Reentrant GPU root lifetime operation"
+                       {:reason :reentrant-root-lifecycle})))
+     (binding [*root-lifecycle-sessions* (conj *root-lifecycle-sessions* ~sess)]
+       ~@body)))
+
+(defn- release-root-owner! [sess key owner]
+  (when-not owner
+    (throw (ex-info "Owned session root has no canonical cleanup owner"
+                    {:reason :missing-cleanup-owner :key key})))
+  (when-let [buffer (get-in @sess [:buffers key])]
+    (when-not (identical? owner (::cleanup/owner buffer))
+      (throw (ex-info "Published root and session table have different native owners"
+                      {:reason :cleanup-owner-mismatch :key key}))))
+  (cleanup/release! owner)
+  (swap! sess (fn [state]
+                (-> state
+                    (update :buffer-owners dissoc key)
+                    (update :buffers dissoc key)
+                    (update :allocations dissoc key)))))
+
+(defn- release-root-layer! [sess]
+  (let [primary (volatile! nil)]
+    (doseq [[key owner] (:buffer-owners @sess)]
+      (try (release-root-owner! sess key owner)
+           (catch Throwable error
+             (if-let [first-error @primary]
+               (when-not (or (identical? first-error error)
+                             (some #(identical? error %) (.getSuppressed ^Throwable first-error)))
+                 (.addSuppressed ^Throwable first-error error))
+               (vreset! primary error)))))
+    (when-let [error @primary] (throw error))))
+
 (defn- assert-session-open! [sess]
+  (when (some #(identical? sess %) *root-lifecycle-sessions*)
+    (throw (ex-info "GPU use cannot reenter a root lifetime operation"
+                    {:reason :reentrant-root-lifecycle})))
   (when (or (:closed? @sess) (= :releasing (:lifecycle @sess)))
     (throw (ex-info "GPU session is closing or closed" {:reason :session-releasing}))))
+
+(defmacro ^:private with-session-use [sess & body]
+  `(locking ~sess
+     (assert-session-open! ~sess)
+     (binding [*session-use-sessions* (conj *session-use-sessions* ~sess)]
+       ~@body)))
 
 (defn- release-session-layer!
   "Attempt all independent children in a dependency layer; do not descend on any failure."
@@ -489,7 +470,7 @@
   graph) that are NOT in the kernel registry, so close-kernel-arena! never reaches them — without
   this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
-  (locking sess
+  (with-root-lifecycle sess
     (when-not (or (= :closed (:lifecycle @sess))
                   (and (:closed? @sess) (nil? (:lifecycle @sess))))
       ;; closed? means no further use; lifecycle distinguishes retained teardown from disposal.
@@ -497,17 +478,25 @@
       ;; Completion owns the right to keep graph recordings, bound kernels, and buffers alive.
       ;; Drain and release every event before tearing any of those resources down.
       (release-session-layer! sess [[:events #(release-event! sess (:event %))]])
-      (let [{:keys [device-id arena-id buffers allocations prepared graphs kernel-graphs]} @sess]
+      (let [{:keys [device-id arena-id]} @sess]
         (release-session-layer! sess [[:graphs #(destroy-recorded-graph-entry! device-id %)]])
         (release-session-layer! sess [[:prepared #(destroy-prepared-entry! device-id %)]])
         ;; Composite program debt may borrow graph bindings. Do not descend after a failed
         ;; parent release, or retry its retry-safe child again within this same close attempt.
         (release-session-layer! sess [[:kernel-graphs #(destroy-kernel-graph-entry! device-id %)]])
-        (free-session-buffers! buffers allocations device-id)
+        (doseq [[key allocation] (:allocations @sess)
+                :when (= :owned (:ownership allocation))]
+          (when-not (get-in @sess [:buffer-owners key])
+            (throw (ex-info "Owned session root has no canonical cleanup owner"
+                            {:reason :missing-cleanup-owner :key key}))))
+        (release-root-layer! sess)
+        ;; Remove root metadata before arena destruction. A later arena failure must not
+        ;; resurrect already released root handles on a repeated close.
+        (swap! sess assoc :buffers {} :allocations {})
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
         (swap! sess assoc :closed? true :lifecycle :closed :buffers {} :allocations {} :kernels {} :dispatches {}
-               :prepared {} :graphs {} :kernel-graphs {} :events {})))))
+               :buffer-owners {} :prepared {} :graphs {} :kernel-graphs {} :events {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -597,30 +586,65 @@
    Buffers are merged into the session — call multiple times to add more.
    If allocation fails partway through, already-allocated buffers are freed."
   [sess buffer-specs]
-  (locking sess
-    (let [{:keys [device-id session-id buffers closed?]} @sess
-          duplicate-keys (set (filter #(contains? buffers %) (keys buffer-specs)))]
+  (with-root-lifecycle sess
+    (let [{:keys [device-id session-id buffers buffer-owners closed?]} @sess
+          duplicate-keys (set (filter #(or (contains? buffers %) (contains? buffer-owners %))
+                                      (keys buffer-specs)))]
       (when closed?
         (throw (ex-info "cannot allocate in a closed GPU session" {})))
       (when (seq duplicate-keys)
         (throw (ex-info "session buffer keys must identify one stable allocation lifetime"
                         {:duplicate-keys duplicate-keys})))
-      (let [new-bufs (alloc-buffers-transactional buffer-specs device-id)]
-        (let [new-allocations
-              (try
-                (into {}
-                      (map (fn [[key buffer]]
-                             [key (allocation-contract device-id session-id key buffer :owned
-                                                       (or (nth (get buffer-specs key) 3 nil) {}))]))
-                      new-bufs)
-                (catch Exception e
-                  (free-buffers-internal! new-bufs device-id)
-                  (throw e)))]
-          (swap! sess (fn [state]
-                        (-> state
-                            (update :buffers merge new-bufs)
-                            (update :allocations merge new-allocations))))
-          new-bufs)))))
+      (let [slots (mapv (fn [[key spec]] [key spec (volatile! nil)]) buffer-specs)
+            rollback (cleanup/owner
+                      (mapv (fn [[key _ slot]]
+                              {:id key :release #(when-let [owner @slot]
+                                                   (release-root-owner! sess key owner))})
+                            (vec (reverse slots))))
+            make! (rt-resolve device-id "make-buffer")
+            upload! (rt-resolve device-id "array->buffer!")]
+        (try
+          (:buffers
+           (cleanup/build!
+            rollback
+            (fn []
+              (let [new-bufs
+                    (into {}
+                          (map (fn [[key [dtype n source] slot]]
+                                 (let [retain! (fn [owner]
+                                                 (when (and @slot (not (identical? @slot owner)))
+                                                   (throw (ex-info "Buffer constructor changed owner"
+                                                                   {:reason :cleanup-owner-mismatch :key key})))
+                                                 (vreset! slot owner)
+                                                 (swap! sess assoc-in [:buffer-owners key] owner))
+                                       buffer (make! n dtype {:retain-owner! retain!
+                                                              :adopt-cleanup! retain!})]
+                                   (when-not (and @slot (identical? @slot (::cleanup/owner buffer)))
+                                     (throw (ex-info "Buffer constructor did not retain its canonical owner"
+                                                     {:reason :missing-cleanup-owner :key key})))
+                                   (when source (upload! buffer source))
+                                   [key buffer]))) slots)
+                    new-allocations
+                    (into {}
+                          (map (fn [[key buffer]]
+                                 [key (allocation-contract device-id session-id key buffer :owned
+                                                           (or (nth (get buffer-specs key) 3 nil) {}))]))
+                          new-bufs)]
+                ;; Publish values/contracts only after all initializers and admission succeed.
+                (swap! sess (fn [state]
+                              (-> state
+                                  (update :buffers merge new-bufs)
+                                  (update :allocations merge new-allocations))))
+                {:buffers new-bufs}))
+            ;; The session already retains each exact child owner, including uncertain creates.
+            (fn [_] nil)))
+          (catch Throwable primary
+            (when (some (fn [[_ _ slot]] (and @slot (seq (cleanup/pending @slot)))) slots)
+              (try (swap! sess assoc :closed? true :lifecycle :failed-root-cleanup)
+                   (catch Throwable secondary
+                     (when-not (identical? primary secondary)
+                       (.addSuppressed ^Throwable primary secondary)))))
+            (throw primary)))))))
 
 (defn register-buffer!
   "Register an existing backend buffer without taking ownership by default.
@@ -631,7 +655,7 @@
    and a stable :allocation-id. Raster never frees external/borrowed registrations."
   ([sess key buffer] (register-buffer! sess key buffer {}))
   ([sess key buffer opts]
-   (locking sess
+   (with-root-lifecycle sess
      (let [{:keys [device-id session-id buffers closed?]} @sess
            ownership (or (:ownership opts) :external)
            device-buffer? (rt-resolve device-id "device-buffer?")]
@@ -645,6 +669,7 @@
        (when-not (device-buffer? buffer)
          (throw (ex-info "registered value is not a buffer for this session backend"
                          {:key key :device-id device-id :actual (type buffer)})))
+       ((rt-resolve device-id "assert-buffer-live!") buffer)
        (let [allocation (allocation-contract device-id session-id key buffer ownership opts)]
          (swap! sess (fn [state]
                        (-> state
@@ -718,7 +743,7 @@
    An unawaited transfer retains its resident buffers even when a nonblocking status query says
    the device completed: awaiting establishes visibility and releases backend staging first."
   [sess key]
-  (locking sess
+  (with-root-lifecycle sess
     (let [{:keys [device-id buffers allocations kernel-graphs events graphs prepared]} @sess
           footprint {:buffer-keys #{key}
                      :allocation-ids #{(get-in allocations [key :id])}
@@ -726,18 +751,18 @@
           ;; Detaching an external/borrowed alias does not destroy its native root. Its own
           ;; registration still cannot disappear while borrowed by a recorded source.
           release-footprint (if (= :owned (get-in allocations [key :ownership])) footprint
-                              {:buffer-keys #{key}})
+                                {:buffer-keys #{key}})
           recorded-borrowers (into [] (keep (fn [[graph-key entry]]
-                                             (when (and (recorded-graph-entry? entry)
-                                                        (or (nil? (:resident-footprint entry))
-                                                            (resident-footprints-overlap?
-                                                             release-footprint (:resident-footprint entry))))
-                                               graph-key))) graphs)
+                                              (when (and (recorded-graph-entry? entry)
+                                                         (or (nil? (:resident-footprint entry))
+                                                             (resident-footprints-overlap?
+                                                              release-footprint (:resident-footprint entry))))
+                                                graph-key))) graphs)
           prepared-borrowers (into [] (keep (fn [[phase entry]]
-                                             (when (or (nil? (:resident-footprint entry))
-                                                       (resident-footprints-overlap?
-                                                        release-footprint (:resident-footprint entry)))
-                                               phase))) prepared)
+                                              (when (or (nil? (:resident-footprint entry))
+                                                        (resident-footprints-overlap?
+                                                         release-footprint (:resident-footprint entry)))
+                                                phase))) prepared)
           bound-graphs (->> kernel-graphs
                             (keep (fn [[graph-key entry]]
                                     (when (some #(= key (:key %))
@@ -760,7 +785,25 @@
                           {:reason :buffer-pending-transfer :key key
                            :events pending-transfers})))
         (when (= :owned (:ownership (get allocations key)))
-          ((rt-resolve device-id "free-buffer!") buf))
+          (let [aliases (into [] (keep (fn [[other-key other-buffer]]
+                                         (when (and (not= key other-key)
+                                                    (or (identical? buf other-buffer)
+                                                        (and (cleanup/lifetime-owner buf)
+                                                             (identical? (cleanup/lifetime-owner buf)
+                                                                         (cleanup/lifetime-owner other-buffer)))
+                                                        (= (get-in allocations [key :id])
+                                                           (get-in allocations [other-key :id]))))
+                                           other-key))) buffers)]
+            (when (seq aliases)
+              (throw (ex-info "Owned buffer still has registered aliases"
+                              {:reason :registered-buffer-alias :key key :aliases aliases}))))
+          (try (release-root-owner! sess key (get-in @sess [:buffer-owners key]))
+               (catch Throwable primary
+                 (try (swap! sess assoc :closed? true :lifecycle :failed-root-cleanup)
+                      (catch Throwable secondary
+                        (when-not (identical? primary secondary)
+                          (.addSuppressed ^Throwable primary secondary))))
+                 (throw primary))))
         (swap! sess (fn [state]
                       (-> state
                           (update :buffers dissoc key)
@@ -829,16 +872,16 @@
   ([sess phase-key sym->buf-key scalars n]
    (invoke! sess phase-key sym->buf-key scalars n {}))
   ([sess phase-key sym->buf-key scalars n {:keys [index] :or {index 0}}]
-   (assert-session-open! sess)
-   (let [{:keys [kernels buffers]} @sess
-         kernel-vec (or (get kernels phase-key)
-                        (throw (ex-info (str "No kernel for phase: " phase-key)
-                                        {:available (keys kernels)})))
-         kernel-info (nth kernel-vec index)
-         buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
-         device-id (:device-id @sess)
-         invoke-fn! (rt-resolve device-id "invoke-registered-map-void-kernel")]
-     (invoke-fn! (:kernel-name kernel-info) buf-vec scalars n))))
+   (with-session-use sess
+     (let [{:keys [kernels buffers]} @sess
+           kernel-vec (or (get kernels phase-key)
+                          (throw (ex-info (str "No kernel for phase: " phase-key)
+                                          {:available (keys kernels)})))
+           kernel-info (nth kernel-vec index)
+           buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
+           device-id (:device-id @sess)
+           invoke-fn! (rt-resolve device-id "invoke-registered-map-void-kernel")]
+       (invoke-fn! (:kernel-name kernel-info) buf-vec scalars n)))))
 
 (defn prepare!
   "Pre-bind a kernel's arguments ONCE for fast repeated dispatch (the launch-overhead fix).
@@ -852,42 +895,42 @@
   ([sess phase-key sym->buf-key scalars n]
    (prepare! sess phase-key sym->buf-key scalars n {}))
   ([sess phase-key sym->buf-key scalars n {:keys [index async? kernel-phase] :or {index 0}}]
-   (locking sess
-   (assert-session-open! sess)
-   (assert-source-unrecorded! sess :phase phase-key)
-   (let [{:keys [kernels buffers]} @sess
+   (with-session-use sess
+     (assert-session-open! sess)
+     (assert-source-unrecorded! sess :phase phase-key)
+     (let [{:keys [kernels buffers]} @sess
          ;; The COMPILED kernel comes from kernel-phase (defaults to phase-key); the bound
          ;; argument-set is stored under phase-key. This lets one compiled kernel back many
          ;; distinct bindings (e.g. every matmul in a decode token shares one dp4a kernel).
-         klookup (or kernel-phase phase-key)
-         kernel-vec (or (get kernels klookup)
-                        (throw (ex-info (str "No kernel for phase: " klookup)
-                                        {:available (keys kernels)})))
-         kernel-info (nth kernel-vec index)
-         buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
-         device-id (:device-id @sess)
-         call (preparation-call device-id kernel-info buf-vec scalars n)
-         footprint (registered-buffer-footprint sess buf-vec)
-         bind-fn (rt-resolve device-id "bind-kernel-call")
-         prepared (volatile! nil)
-         debts (volatile! [])]
-     (try
-       (let [candidate (assoc (bind-fn call {:async? (boolean async?)
-                                            :adopt-cleanup! #(adopt-cleanup! debts %)})
-                              :resident-footprint footprint)]
-         (vreset! prepared candidate)
-         (when-not (::cleanup/owner candidate)
-           (throw (ex-info "KernelCall preparation has lost its cleanup owner"
-                           {:reason :missing-cleanup-owner})))
-         (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
-         (swap! sess assoc-in [:prepared phase-key] candidate)
-         candidate)
-       (catch Throwable primary
-         (rollback-bound-resources!
-          sess :prepared {:prepareds (if @prepared [@prepared] []) :cleanup-debts @debts
-                          :resident-footprint footprint :temporary-buffers {}
-                          :owned-view-buffers []} primary)
-         (throw primary)))))))
+           klookup (or kernel-phase phase-key)
+           kernel-vec (or (get kernels klookup)
+                          (throw (ex-info (str "No kernel for phase: " klookup)
+                                          {:available (keys kernels)})))
+           kernel-info (nth kernel-vec index)
+           buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
+           device-id (:device-id @sess)
+           call (preparation-call device-id kernel-info buf-vec scalars n)
+           footprint (registered-buffer-footprint sess buf-vec)
+           bind-fn (rt-resolve device-id "bind-kernel-call")
+           prepared (volatile! nil)
+           debts (volatile! [])]
+       (try
+         (let [candidate (assoc (bind-fn call {:async? (boolean async?)
+                                               :adopt-cleanup! #(adopt-cleanup! debts %)})
+                                :resident-footprint footprint)]
+           (vreset! prepared candidate)
+           (when-not (::cleanup/owner candidate)
+             (throw (ex-info "KernelCall preparation has lost its cleanup owner"
+                             {:reason :missing-cleanup-owner})))
+           (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
+           (swap! sess assoc-in [:prepared phase-key] candidate)
+           candidate)
+         (catch Throwable primary
+           (rollback-bound-resources!
+            sess :prepared {:prepareds (if @prepared [@prepared] []) :cleanup-debts @debts
+                            :resident-footprint footprint :temporary-buffers {}
+                            :owned-view-buffers []} primary)
+           (throw primary)))))))
 
 (defn- assert-prepared-live!
   [entry]
@@ -1166,13 +1209,13 @@
    n: number of elements
    base-seed: long seed value"
   [sess phase-key buf-key n base-seed]
-  (assert-session-open! sess)
-  (let [{:keys [kernels buffers]} @sess
-        kernel-info (first (get kernels phase-key))
-        device-id (:device-id @sess)
-        invoke! (rt-resolve device-id "invoke-registered-kernel")]
-    (invoke! (:kernel-name kernel-info) [] (get buffers buf-key)
-             [{:type :long :value (long base-seed)}] n)))
+  (with-session-use sess
+    (let [{:keys [kernels buffers]} @sess
+          kernel-info (first (get kernels phase-key))
+          device-id (:device-id @sess)
+          invoke! (rt-resolve device-id "invoke-registered-kernel")]
+      (invoke! (:kernel-name kernel-info) [] (get buffers buf-key)
+               [{:type :long :value (long base-seed)}] n))))
 
 (defn invoke-active-ids!
   "Invoke the compiled typed-map active-id artifact from the session.
@@ -1184,15 +1227,15 @@
    n-total: total population size (modulus)
    base-seed: long seed value"
   [sess phase-key buf-key n-active n-total base-seed]
-  (assert-session-open! sess)
-  (let [{:keys [kernels buffers]} @sess
-        kernel-info (first (get kernels phase-key))
-        device-id (:device-id @sess)
-        invoke! (rt-resolve device-id "invoke-registered-kernel")]
-    (invoke! (:kernel-name kernel-info) [] (get buffers buf-key)
-             [{:type :long :value (long base-seed)}
-              {:type :long :value (long n-total)}]
-             n-active)))
+  (with-session-use sess
+    (let [{:keys [kernels buffers]} @sess
+          kernel-info (first (get kernels phase-key))
+          device-id (:device-id @sess)
+          invoke! (rt-resolve device-id "invoke-registered-kernel")]
+      (invoke! (:kernel-name kernel-info) [] (get buffers buf-key)
+               [{:type :long :value (long base-seed)}
+                {:type :long :value (long n-total)}]
+               n-active))))
 
 ;; ================================================================
 ;; Data transfer
@@ -1205,12 +1248,12 @@
    key: buffer key
    arr: JVM array to upload"
   [sess key arr]
-  (assert-session-open! sess)
-  (let [{:keys [device-id buffers]} @sess
-        buf (or (get buffers key)
-                (throw (ex-info (str "No buffer for key: " key)
-                                {:available (keys buffers)})))]
-    ((rt-resolve device-id "array->buffer!") buf arr)))
+  (with-session-use sess
+    (let [{:keys [device-id buffers]} @sess
+          buf (or (get buffers key)
+                  (throw (ex-info (str "No buffer for key: " key)
+                                  {:available (keys buffers)})))]
+      ((rt-resolve device-id "array->buffer!") buf arr))))
 
 (defn download
   "Download a session buffer to a new JVM array.
@@ -1218,12 +1261,12 @@
    sess: session atom
    key: buffer key"
   [sess key]
-  (assert-session-open! sess)
-  (let [{:keys [device-id buffers]} @sess
-        buf (or (get buffers key)
-                (throw (ex-info (str "No buffer for key: " key)
-                                {:available (keys buffers)})))]
-    ((rt-resolve device-id "buffer->array") buf)))
+  (with-session-use sess
+    (let [{:keys [device-id buffers]} @sess
+          buf (or (get buffers key)
+                  (throw (ex-info (str "No buffer for key: " key)
+                                  {:available (keys buffers)})))]
+      ((rt-resolve device-id "buffer->array") buf))))
 
 (defrecord ResidentBufferView [session-id key view])
 
@@ -1259,36 +1302,38 @@
    capacity. Byte offsets are relative to the allocation, and all bounds are checked now."
   ([sess key] (buffer-view sess key {}))
   ([sess key opts]
-   (let [{:keys [session-id buffers allocations closed?]} @sess
-         buffer (get buffers key)
-         allocation (get allocations key)]
-     (when closed?
-       (throw (ex-info "cannot create a buffer view in a closed GPU session" {:key key})))
-     (when-not (and buffer allocation)
-       (throw (ex-info (str "No buffer for key: " key " (or no live allocation contract)")
-                       {:key key :available (keys buffers)})))
-     (let [view-dtype (or (:dtype opts) (:dtype buffer))
-           byte-offset (long (or (:byte-offset opts) 0))
-           element-bytes (long (dtype/bytes-of view-dtype))
-           remaining (- (:byte-size allocation) byte-offset)
-           _ (when (or (neg? byte-offset) (neg? remaining)
-                       (not (zero? (mod remaining element-bytes))))
-               (throw (ex-info "buffer view offset leaves no integral typed capacity"
-                               {:key key :byte-offset byte-offset :dtype view-dtype
-                                :allocation-bytes (:byte-size allocation)})))
-           shape (or (:shape opts) [(quot remaining element-bytes)])
-           descriptor (bview/view allocation
-                                  (assoc opts :byte-offset byte-offset
-                                         :dtype view-dtype
-                                         :shape shape))]
-       (->ResidentBufferView session-id key descriptor)))))
+   (with-session-use sess
+     (let [{:keys [session-id buffers allocations closed?]} @sess
+           buffer (get buffers key)
+           allocation (get allocations key)]
+       (when closed?
+         (throw (ex-info "cannot create a buffer view in a closed GPU session" {:key key})))
+       (when-not (and buffer allocation)
+         (throw (ex-info (str "No buffer for key: " key " (or no live allocation contract)")
+                         {:key key :available (keys buffers)})))
+       (let [view-dtype (or (:dtype opts) (:dtype buffer))
+             byte-offset (long (or (:byte-offset opts) 0))
+             element-bytes (long (dtype/bytes-of view-dtype))
+             remaining (- (:byte-size allocation) byte-offset)
+             _ (when (or (neg? byte-offset) (neg? remaining)
+                         (not (zero? (mod remaining element-bytes))))
+                 (throw (ex-info "buffer view offset leaves no integral typed capacity"
+                                 {:key key :byte-offset byte-offset :dtype view-dtype
+                                  :allocation-bytes (:byte-size allocation)})))
+             shape (or (:shape opts) [(quot remaining element-bytes)])
+             descriptor (bview/view allocation
+                                    (assoc opts :byte-offset byte-offset
+                                           :dtype view-dtype
+                                           :shape shape))]
+         (->ResidentBufferView session-id key descriptor))))))
 
 (defn sub-buffer-view
   "Create a checked resident view contained by `base`; :byte-offset is relative to `base`."
   [sess base opts]
-  (let [base (checked-resident-view sess base)]
-    (->ResidentBufferView (:session-id base) (:key base)
-                          (bview/subview (:view base) opts))))
+  (with-session-use sess
+    (let [base (checked-resident-view sess base)]
+      (->ResidentBufferView (:session-id base) (:key base)
+                            (bview/subview (:view base) opts)))))
 
 (defn- resolve-resident-binding
   [sess key-or-view]
@@ -1347,17 +1392,19 @@
    `maxpos` positions and position-major, so a continuation of `t` tokens is one contiguous
    prefix — exporting it should move `t` rows, not `maxpos`."
   [sess key-or-view src spec]
-  (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
-        spec (checked-view-range-spec buffer view spec :upload)]
-    ((rt-resolve (:device-id @sess) "upload-range!") buffer src spec)))
+  (with-session-use sess
+    (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+          spec (checked-view-range-spec buffer view spec :upload)]
+      ((rt-resolve (:device-id @sess) "upload-range!") buffer src spec))))
 
 (defn download-range!
   "Copy a SUB-RANGE of a session buffer into a host array or MemorySegment; mirror of
    `upload-range!`. Returns `dst`."
   [sess key-or-view dst spec]
-  (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
-        spec (checked-view-range-spec buffer view spec :download)]
-    ((rt-resolve (:device-id @sess) "download-range!") buffer dst spec)))
+  (with-session-use sess
+    (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+          spec (checked-view-range-spec buffer view spec :download)]
+      ((rt-resolve (:device-id @sess) "download-range!") buffer dst spec))))
 
 (defn copy-range!
   "Copy a contiguous element range between resident buffers or views.
@@ -1369,19 +1416,20 @@
   [sess src dst {:keys [src-element dst-element elements]
                  :or {src-element 0 dst-element 0}
                  :as spec}]
-  (let [{src-buffer :buffer src-view :view} (resolve-resident-binding sess src)
-        {dst-buffer :buffer dst-view :view} (resolve-resident-binding sess dst)
-        src-spec (checked-view-range-spec src-buffer src-view spec :download)
-        dst-spec (checked-view-range-spec dst-buffer dst-view spec :upload)
-        src-dtype (dtype/canon (:dtype src-buffer))
-        dst-dtype (dtype/canon (:dtype dst-buffer))]
-    (when-not (= src-dtype dst-dtype)
-      (throw (ex-info "resident range copy requires identical storage dtypes"
-                      {:source-dtype src-dtype :destination-dtype dst-dtype})))
-    ((rt-resolve (:device-id @sess) "copy-buffer-range!")
-     src-buffer dst-buffer
-     (:src-element src-spec) (:dst-element dst-spec) elements)
-    dst))
+  (with-session-use sess
+    (let [{src-buffer :buffer src-view :view} (resolve-resident-binding sess src)
+          {dst-buffer :buffer dst-view :view} (resolve-resident-binding sess dst)
+          src-spec (checked-view-range-spec src-buffer src-view spec :download)
+          dst-spec (checked-view-range-spec dst-buffer dst-view spec :upload)
+          src-dtype (dtype/canon (:dtype src-buffer))
+          dst-dtype (dtype/canon (:dtype dst-buffer))]
+      (when-not (= src-dtype dst-dtype)
+        (throw (ex-info "resident range copy requires identical storage dtypes"
+                        {:source-dtype src-dtype :destination-dtype dst-dtype})))
+      ((rt-resolve (:device-id @sess) "copy-buffer-range!")
+       src-buffer dst-buffer
+       (:src-element src-spec) (:dst-element dst-spec) elements)
+      dst)))
 
 (defn- plan-transfer-ranges
   "Resolve and validate every range before either synchronous or asynchronous execution."
@@ -1402,11 +1450,12 @@
    bounds. (A failure DURING execution — a device fault — is still partial; that is a different
    class and is not promised here.)"
   [sess entries direction]
-  (let [device-id (:device-id @sess)
-        exec (rt-resolve device-id "execute-range!")
-        plans (plan-transfer-ranges sess entries direction)]
+  (with-session-use sess
+    (let [device-id (:device-id @sess)
+          exec (rt-resolve device-id "execute-range!")
+          plans (plan-transfer-ranges sess entries direction)]
     ;; phase 2: execute in order
-    (mapv (fn [[buf p host]] (exec buf p direction) (if (= :upload direction) buf host)) plans)))
+      (mapv (fn [[buf p host]] (exec buf p direction) (if (= :upload direction) buf host)) plans))))
 
 (defn upload-ranges!
   "BATCHED `upload-range!`: many `[key src spec]` entries in one call, e.g. every layer of a KV
@@ -1616,33 +1665,37 @@
     (if whole-buffer?
       {:buffer buffer :owned-view? false}
       (let [owned? (:owned-slice? (runtime-backend/descriptor device-id))
-            acquire #((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
-                                                                    (:byte-length view) view-dtype)]
-        {:buffer (if (and owned? acquire-owned) (acquire-owned acquire) (acquire))
+            acquire (fn [opts]
+                      (let [slice! (rt-resolve device-id "slice-buffer")]
+                        (if owned?
+                          (slice! buffer (:byte-offset view) (:byte-length view) view-dtype opts)
+                          (slice! buffer (:byte-offset view) (:byte-length view) view-dtype))))]
+        {:buffer (if (and owned? acquire-owned) (acquire-owned acquire) (acquire {}))
          :owned-view? owned?})))))
+
+(declare acquire-private-buffer! allocate-executable-temporaries remove-owner)
 
 (defn- materialize-external-buffers!
   "Turn checked external BufferViews into backend ABI buffers. Level Zero slices are non-owning
-   pointers. OpenCL slices are owned cl_mem sub-buffers and are transactionally released if any
-   later view fails to materialize."
-  [device-id external-bindings]
-  (let [owned (volatile! [])]
-    (try
-      {:buffers
-       (into {}
-             (map (fn [[id {:keys [buffer view]}]]
-                    (let [{runtime-buffer :buffer owned-view? :owned-view?}
-                          (runtime-buffer-for-view device-id buffer view)]
-                      (when owned-view? (vswap! owned conj runtime-buffer))
-                      [id runtime-buffer])))
-             external-bindings)
-       :owned-view-buffers @owned}
-      (catch Exception e
-        (when (seq @owned)
-          (let [free! (rt-resolve device-id "free-buffer!")]
-            (doseq [buffer @owned]
-              (try (free! buffer) (catch Exception _)))))
-        (throw e)))))
+   pointers. OpenCL slices retain their canonical backend owners in the same construction
+   accumulator used for graph temporaries; the caller owns rollback, including unknown creation."
+  [device-id external-bindings construction]
+  (into {}
+        (map (fn [[id {:keys [buffer view]}]]
+               (let [{runtime-buffer :buffer}
+                     (runtime-buffer-for-view
+                      device-id buffer view
+                      (fn [acquire]
+                        (let [{:keys [buffer owner]} (acquire-private-buffer! device-id construction acquire)]
+                          (vswap! construction
+                                  (fn [state]
+                                    (-> state
+                                        (update :owned-view-buffers conj buffer)
+                                        (update :owned-view-owners conj owner)
+                                        (update :cleanup-debts remove-owner owner))))
+                          buffer)))]
+                 [id runtime-buffer])))
+        external-bindings))
 
 (defn- resolve-kernel-graph-entry
   [sess handle]
@@ -1794,90 +1847,95 @@
    (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
   ([sess graph-key graph buffer-keys scalar-values {:keys [profile? record?]
                                                     :or {profile? false record? true}}]
-   (locking sess
-   (let [{:keys [device-id closed?]} @sess
-         graph (kexec/validate! graph)
-         external-ids (external-graph-buffer-ids graph)]
-     (when closed?
-       (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
-     (assert-source-unrecorded! sess :graph graph-key)
-     (when-not (= external-ids (set (keys buffer-keys)))
-       (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
-                       {:expected external-ids :bound (set (keys buffer-keys))})))
-     (let [graph-buffer-by-id (into {} (map (juxt :id identity))
-                                    (concat (:inputs graph) (:outputs graph)))
-           external-bindings (into {}
-                                   (map (fn [[id key-or-view]]
-                                          [id (resolve-resident-binding sess key-or-view)]))
-                                   buffer-keys)
-           _ (doseq [[id {:keys [view]}] external-bindings]
-               (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
-           _ (kgcall/validate-binding-aliases! graph (update-vals external-bindings :view) bview/overlaps?)
-           _ (release-graph-events! sess graph-key)
-           temporary-specs (kgcall/temporary-specs graph scalar-values)
-           temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
-           owned-view-buffers (volatile! [])
-           prepareds (volatile! [])
-           cleanup-debts (volatile! [])
-           runtime-graph (volatile! nil)]
-       (try
-         (let [{:keys [buffers] :as materialized}
-               (materialize-external-buffers! device-id external-bindings)
-               _ (vreset! owned-view-buffers (:owned-view-buffers materialized))
-               all-buffers (merge buffers temporary-buffers)
-               register! (rt-resolve device-id "register-kernel!")
-               bind-call! (rt-resolve device-id "bind-kernel-call")
-               record! (rt-resolve device-id "record-graph!")
+   (with-session-use sess
+     (let [{:keys [device-id closed?]} @sess
+           graph (kexec/validate! graph)
+           external-ids (external-graph-buffer-ids graph)]
+       (when closed?
+         (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
+       (assert-source-unrecorded! sess :graph graph-key)
+       (when-not (= external-ids (set (keys buffer-keys)))
+         (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
+                         {:expected external-ids :bound (set (keys buffer-keys))})))
+       (let [graph-buffer-by-id (into {} (map (juxt :id identity))
+                                      (concat (:inputs graph) (:outputs graph)))
+             external-bindings (into {}
+                                     (map (fn [[id key-or-view]]
+                                            [id (resolve-resident-binding sess key-or-view)]))
+                                     buffer-keys)
+             _ (doseq [[id {:keys [view]}] external-bindings]
+                 (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
+             _ (kgcall/validate-binding-aliases! graph (update-vals external-bindings :view) bview/overlaps?)
+             _ (release-graph-events! sess graph-key)
+             temporary-specs (kgcall/temporary-specs graph scalar-values)
+             construction (volatile! {:temporary-buffers {} :temporary-owners {}
+                                      :owned-view-buffers [] :owned-view-owners [] :cleanup-debts []})
+             prepareds (volatile! [])
+             cleanup-debts (volatile! [])
+             runtime-graph (volatile! nil)]
+         (try
+           (let [temporary-buffers (allocate-executable-temporaries device-id temporary-specs construction)
+                 buffers (materialize-external-buffers! device-id external-bindings construction)
+                 all-buffers (merge buffers temporary-buffers)
+                 register! (rt-resolve device-id "register-kernel!")
+                 bind-call! (rt-resolve device-id "bind-kernel-call")
+                 record! (rt-resolve device-id "record-graph!")
                ;; Buffer extents above may use enclosing-program shape values. They are not
                ;; executable arguments: preserve the graph call's exact public ABI boundary.
-               call-scalars (select-keys scalar-values
-                                         (keep (fn [[slot argument]]
-                                                 (when (= :scalar (:kind slot)) argument))
-                                               (map vector (:abi graph) (:arguments graph))))
-               graph-call (kgcall/make graph all-buffers call-scalars)
-               execution-plan (execution/from-kernel-graph-call graph-call)]
-           (doseq [node (:nodes graph)]
-             (let [artifact (:operation node)]
-               (register! (:kernel-name artifact) artifact)))
-           (doseq [node-call (:nodes graph-call)]
-             (let [prepared (assoc (bind-call! (:call node-call)
-                                              {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)})
-                                   :phase (:id node-call))]
-               (vswap! prepareds conj prepared)))
+                 call-scalars (select-keys scalar-values
+                                           (keep (fn [[slot argument]]
+                                                   (when (= :scalar (:kind slot)) argument))
+                                                 (map vector (:abi graph) (:arguments graph))))
+                 graph-call (kgcall/make graph all-buffers call-scalars)
+                 execution-plan (execution/from-kernel-graph-call graph-call)]
+             (doseq [node (:nodes graph)]
+               (let [artifact (:operation node)]
+                 (register! (:kernel-name artifact) artifact)))
+             (doseq [node-call (:nodes graph-call)]
+               (let [prepared (assoc (bind-call! (:call node-call)
+                                                 {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)})
+                                     :phase (:id node-call))]
+                 (vswap! prepareds conj prepared)))
           ;; Graph verification proves every dependency names an earlier node and every hazard is
           ;; represented. Serial recording is therefore a safe implementation of that partial
           ;; order on today's single in-order compute queues; the logical plan retains the DAG.
-           (when record?
-             (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true
-                                                               :adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}
-                                                          profile? (assoc :profile? true)))))
-           (let [entry (own-kernel-graph-entry device-id {:graph-call graph-call
-                        :execution-plan execution-plan
-                        :runtime-graph @runtime-graph
-                        :prepareds @prepareds
-                        :owned-view-buffers @owned-view-buffers
-                        :temporary-buffers temporary-buffers
-                        :buffer-keys buffer-keys
-                        :resident-footprint (binding-footprint sess external-bindings)
-                        :resident-views (into {} (map (fn [[id binding]]
-                                                        [id (:resident binding)]))
-                                              external-bindings)
-                        :outputs (select-keys all-buffers (map :id (:outputs graph)))
-                        :profile? (boolean profile?)})
-                 old (get-in @sess [:kernel-graphs graph-key])]
-             (when old (destroy-kernel-graph-entry! device-id old))
-             (swap! sess assoc-in [:kernel-graphs graph-key] entry)
-             (->KernelGraphHandle graph-key (:session-id @sess) (:generation entry))))
-         (catch Throwable e
-           (rollback-bound-resources!
-            sess :kernel-graphs {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
-                  :buffer-keys buffer-keys
-                  :resident-footprint (binding-footprint sess external-bindings)
-                  :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) external-bindings)
-                       :prepareds @prepareds
-                       :owned-view-buffers @owned-view-buffers
-                       :temporary-buffers temporary-buffers} e)
-           (throw e))))))))
+             (when record?
+               (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true
+                                                                   :adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}
+                                                            profile? (assoc :profile? true)))))
+             (let [entry (own-kernel-graph-entry device-id {:graph-call graph-call
+                                                            :execution-plan execution-plan
+                                                            :runtime-graph @runtime-graph
+                                                            :prepareds @prepareds
+                                                            :owned-view-buffers (:owned-view-buffers @construction)
+                                                            :owned-view-owners (:owned-view-owners @construction)
+                                                            :temporary-owners (:temporary-owners @construction)
+                                                            :cleanup-debts (into @cleanup-debts (:cleanup-debts @construction))
+                                                            :temporary-buffers temporary-buffers
+                                                            :buffer-keys buffer-keys
+                                                            :resident-footprint (binding-footprint sess external-bindings)
+                                                            :resident-views (into {} (map (fn [[id binding]]
+                                                                                            [id (:resident binding)]))
+                                                                                  external-bindings)
+                                                            :outputs (select-keys all-buffers (map :id (:outputs graph)))
+                                                            :profile? (boolean profile?)})
+                   old (get-in @sess [:kernel-graphs graph-key])]
+               (when old (destroy-kernel-graph-entry! device-id old))
+               (swap! sess assoc-in [:kernel-graphs graph-key] entry)
+               (->KernelGraphHandle graph-key (:session-id @sess) (:generation entry))))
+           (catch Throwable e
+             (rollback-bound-resources!
+              sess :kernel-graphs {:runtime-graph @runtime-graph
+                                   :cleanup-debts (into @cleanup-debts (:cleanup-debts @construction))
+                                   :buffer-keys buffer-keys
+                                   :resident-footprint (binding-footprint sess external-bindings)
+                                   :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) external-bindings)
+                                   :prepareds @prepareds
+                                   :owned-view-buffers (:owned-view-buffers @construction)
+                                   :owned-view-owners (:owned-view-owners @construction)
+                                   :temporary-owners (:temporary-owners @construction)
+                                   :temporary-buffers (:temporary-buffers @construction)} e)
+             (throw e))))))))
 
 (defn bind-kernel-call!
   "Bind one emitted KernelArtifact over session-resident arguments as a replayable graph.
@@ -1896,81 +1954,83 @@
    (bind-kernel-call! sess call-key artifact arguments {}))
   ([sess call-key artifact arguments {:keys [profile? group-count]
                                       :or {profile? false}}]
-   (locking sess
-   (let [{:keys [device-id closed?]} @sess
-         artifact (kart/validate! artifact)
-         abi (:abi artifact)]
-     (when closed?
-       (throw (ex-info "cannot bind a kernel call in a closed GPU session" {:key call-key})))
-     (assert-source-unrecorded! sess :graph call-key)
-     (when (nil? call-key)
-       (throw (ex-info "bound kernel call requires a non-nil key" {})))
-     (kabi/validate-arguments! abi arguments)
-     (let [pointer-bindings
-           (into {}
-                 (keep-indexed (fn [index [slot value]]
-                                 (when-not (= :scalar (:kind slot))
-                                   [index (resolve-resident-binding sess value)])))
-                 (mapv vector abi arguments))
-           _ (release-graph-events! sess call-key)
-           owned-view-buffers (volatile! [])
-           prepareds (volatile! [])
-           cleanup-debts (volatile! [])
-           runtime-graph (volatile! nil)]
-       (try
-         (let [{:keys [buffers] :as materialized}
-               (materialize-external-buffers! device-id pointer-bindings)
-               _ (vreset! owned-view-buffers (:owned-view-buffers materialized))
-               runtime-arguments
-               (mapv (fn [index [slot value]]
-                       (if (= :scalar (:kind slot)) value (get buffers index)))
-                     (range) (mapv vector abi arguments))
-               call (kcall/make artifact runtime-arguments
-                                (cond-> {} group-count (assoc :group-count group-count)))
-               execution-plan (execution/from-kernel-call call-key call)
-               register! (rt-resolve device-id "register-kernel!")
-               bind-call! (rt-resolve device-id "bind-kernel-call")
-               record! (rt-resolve device-id "record-graph!")
-               _ (register! (:kernel-name artifact) artifact)
-               prepared (assoc (bind-call! call {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}) :phase call-key)
-               _ (vreset! prepareds [prepared])
-               _ (vreset! runtime-graph
-                          (record! [prepared] {:barriers? true
-                                               :adopt-cleanup! #(adopt-cleanup! cleanup-debts %)
-                                               :profile? (boolean profile?)}))
-               outputs
-               (into {}
-                     (keep-indexed
-                      (fn [index slot]
-                        (when (kabi/writable? slot)
-                          [(or (:binding slot) (:name slot))
-                           (nth runtime-arguments index)])))
-                     abi)
-               entry (own-kernel-graph-entry device-id {:kernel-call call
-                      :execution-plan execution-plan
-                      :runtime-graph @runtime-graph
-                      :prepareds @prepareds
-                      :owned-view-buffers @owned-view-buffers
-                      :temporary-buffers {}
-                      :resident-footprint (binding-footprint sess pointer-bindings)
-                      :resident-views (into {} (map (fn [[index binding]]
-                                                     [index (:resident binding)]))
-                                            pointer-bindings)
-                      :outputs outputs
-                      :profile? (boolean profile?)})
-               old (get-in @sess [:kernel-graphs call-key])]
-           (when old (destroy-kernel-graph-entry! device-id old))
-           (swap! sess assoc-in [:kernel-graphs call-key] entry)
-           (->KernelGraphHandle call-key (:session-id @sess) (:generation entry)))
-         (catch Throwable e
-           (rollback-bound-resources!
-            sess :kernel-graphs {:runtime-graph @runtime-graph :cleanup-debts @cleanup-debts
-                  :resident-footprint (binding-footprint sess pointer-bindings)
-                  :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) pointer-bindings)
-                       :prepareds @prepareds
-                       :owned-view-buffers @owned-view-buffers
-                       :temporary-buffers {}} e)
-           (throw e))))))))
+   (with-session-use sess
+     (let [{:keys [device-id closed?]} @sess
+           artifact (kart/validate! artifact)
+           abi (:abi artifact)]
+       (when closed?
+         (throw (ex-info "cannot bind a kernel call in a closed GPU session" {:key call-key})))
+       (assert-source-unrecorded! sess :graph call-key)
+       (when (nil? call-key)
+         (throw (ex-info "bound kernel call requires a non-nil key" {})))
+       (kabi/validate-arguments! abi arguments)
+       (let [pointer-bindings
+             (into {}
+                   (keep-indexed (fn [index [slot value]]
+                                   (when-not (= :scalar (:kind slot))
+                                     [index (resolve-resident-binding sess value)])))
+                   (mapv vector abi arguments))
+             _ (release-graph-events! sess call-key)
+             construction (volatile! {:owned-view-buffers [] :owned-view-owners [] :cleanup-debts []})
+             prepareds (volatile! [])
+             cleanup-debts (volatile! [])
+             runtime-graph (volatile! nil)]
+         (try
+           (let [buffers (materialize-external-buffers! device-id pointer-bindings construction)
+                 runtime-arguments
+                 (mapv (fn [index [slot value]]
+                         (if (= :scalar (:kind slot)) value (get buffers index)))
+                       (range) (mapv vector abi arguments))
+                 call (kcall/make artifact runtime-arguments
+                                  (cond-> {} group-count (assoc :group-count group-count)))
+                 execution-plan (execution/from-kernel-call call-key call)
+                 register! (rt-resolve device-id "register-kernel!")
+                 bind-call! (rt-resolve device-id "bind-kernel-call")
+                 record! (rt-resolve device-id "record-graph!")
+                 _ (register! (:kernel-name artifact) artifact)
+                 prepared (assoc (bind-call! call {:adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}) :phase call-key)
+                 _ (vreset! prepareds [prepared])
+                 _ (vreset! runtime-graph
+                            (record! [prepared] {:barriers? true
+                                                 :adopt-cleanup! #(adopt-cleanup! cleanup-debts %)
+                                                 :profile? (boolean profile?)}))
+                 outputs
+                 (into {}
+                       (keep-indexed
+                        (fn [index slot]
+                          (when (kabi/writable? slot)
+                            [(or (:binding slot) (:name slot))
+                             (nth runtime-arguments index)])))
+                       abi)
+                 entry (own-kernel-graph-entry device-id {:kernel-call call
+                                                          :execution-plan execution-plan
+                                                          :runtime-graph @runtime-graph
+                                                          :prepareds @prepareds
+                                                          :owned-view-buffers (:owned-view-buffers @construction)
+                                                          :owned-view-owners (:owned-view-owners @construction)
+                                                          :cleanup-debts (into @cleanup-debts (:cleanup-debts @construction))
+                                                          :temporary-buffers {}
+                                                          :resident-footprint (binding-footprint sess pointer-bindings)
+                                                          :resident-views (into {} (map (fn [[index binding]]
+                                                                                          [index (:resident binding)]))
+                                                                                pointer-bindings)
+                                                          :outputs outputs
+                                                          :profile? (boolean profile?)})
+                 old (get-in @sess [:kernel-graphs call-key])]
+             (when old (destroy-kernel-graph-entry! device-id old))
+             (swap! sess assoc-in [:kernel-graphs call-key] entry)
+             (->KernelGraphHandle call-key (:session-id @sess) (:generation entry)))
+           (catch Throwable e
+             (rollback-bound-resources!
+              sess :kernel-graphs {:runtime-graph @runtime-graph
+                                   :cleanup-debts (into @cleanup-debts (:cleanup-debts @construction))
+                                   :resident-footprint (binding-footprint sess pointer-bindings)
+                                   :resident-views (into {} (map (fn [[id binding]] [id (:resident binding)])) pointer-bindings)
+                                   :prepareds @prepareds
+                                   :owned-view-buffers (:owned-view-buffers @construction)
+                                   :owned-view-owners (:owned-view-owners @construction)
+                                   :temporary-buffers {}} e)
+             (throw e))))))))
 
 (defn bind-kernel-executable!
   "Bind one KernelArtifact or emitted KernelGraph through its common ordered external ABI.
@@ -2197,7 +2257,7 @@
    replayable command-list ownership and remains correct on OpenCL's in-order queue. Await or
    release the prior event before submitting the same graph again."
   [sess handle]
-  (locking sess
+  (with-session-use sess
     (let [{:keys [device-id session-id closed? events]} @sess]
       (when closed?
         (throw (ex-info "cannot submit a kernel graph in a closed GPU session" {:handle handle})))
@@ -2241,19 +2301,19 @@
 (defn run-kernel-graph!
   "Submit a bound graph, wait for completion, and return its resident output buffers."
   [sess handle]
-  (locking sess
-  (let [{:keys [device-id]} @sess
-        {:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)
-        event (submit-kernel-graph! sess handle)]
-    (try
-      (let [outputs (await-event! sess event)]
+  (with-session-use sess
+    (let [{:keys [device-id]} @sess
+          {:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)
+          event (submit-kernel-graph! sess handle)]
+      (try
+        (let [outputs (await-event! sess event)]
         ;; A validation replay of a profiled graph intentionally discards its timestamps. Reset
         ;; the per-kernel events so a subsequent measure-graph! replay can signal them legally.
-        (when profile?
-          ((rt-resolve device-id "reset-graph-events!") runtime-graph))
-        outputs)
-      (finally
-        (release-event! sess event))))))
+          (when profile?
+            ((rt-resolve device-id "reset-graph-events!") runtime-graph))
+          outputs)
+        (finally
+          (release-event! sess event))))))
 
 (defn release-kernel-graph!
   "Release one bound graph and its graph-owned temporaries. External session buffers survive.
@@ -2279,17 +2339,21 @@
 ;; ================================================================
 
 (defn- acquire-private-buffer!
-  "Reserve uncertain private native allocation ownership before contacting the driver."
+  "Retain the backend's canonical private-buffer owner before native contact. No second native
+   acquisition/destruction authority is created by the graph container."
   [device-id construction acquire]
-  (let [slot (cleanup/acquisition-slot)
-        owner (cleanup/owner
-               [{:id :allocation
-                 :release #(cleanup/release-native!
-                            slot (fn [buffer] ((rt-resolve device-id "free-buffer!") buffer)))}])]
-    ;; Remains debt if acquisition or caller bookkeeping throws. A successful caller moves
-    ;; this owner to the post-kernel view/temporary dependency layer atomically.
-    (vswap! construction update :cleanup-debts conj owner)
-    {:buffer (cleanup/acquire-native! slot acquire) :owner owner}))
+  (let [retain! (fn [owner]
+                  (vswap! construction update :cleanup-debts
+                          (fn [owners]
+                            (if (some #(identical? owner %) owners) owners (conj owners owner)))))
+        buffer (acquire {:retain-owner! retain! :adopt-cleanup! retain!})
+        owner (::cleanup/owner buffer)]
+    (when-not (and owner (some #(identical? owner %) (:cleanup-debts @construction)))
+      (throw (ex-info "Private buffer constructor did not retain its canonical owner"
+                      {:reason :missing-cleanup-owner :device-id device-id})))
+    ;; Remains debt if caller bookkeeping throws. A successful caller moves this exact owner
+    ;; to the post-kernel view/temporary dependency layer atomically.
+    {:buffer buffer :owner owner}))
 
 (defn- remove-owner [owners owner]
   (filterv #(not (identical? owner %)) owners))
@@ -2299,7 +2363,7 @@
   (let [make-buffer (rt-resolve device-id "make-buffer")]
     (doseq [[id [temporary-dtype elements _]] temporary-specs]
       (let [{:keys [buffer owner]} (acquire-private-buffer!
-                                   device-id construction #(make-buffer elements temporary-dtype))]
+                                    device-id construction #(make-buffer elements temporary-dtype %))]
         (vswap! construction (fn [state]
                                (-> state
                                    (assoc-in [:temporary-buffers id] buffer)
@@ -2460,80 +2524,80 @@
   ([sess step args sym->key]
    (bind-step! sess step args sym->key {}))
   ([sess step args sym->key {:keys [schedule roles] :or {roles {}}}]
-   (locking sess
-   (assert-session-open! sess)
-   (assert-source-unrecorded! sess :phase (:phase step))
-   (let [device-id (:device-id @sess)
-         {:keys [kernel-name phase]} step
-         materialized (volatile! {})
-         construction (volatile! {:prepareds [] :temporary-buffers {} :temporary-owners {}
-                                 :owned-view-owners [] :cleanup-debts []})
-         candidate (volatile! nil)
-         root-buffers (volatile! [])
-         owned-view-buffers (volatile! [])
-         materialize
-         (fn materialize [sym key-or-view]
-           (cond
-             (resident-value/resident-composite? key-or-view)
-             (resident-value/map-values #(materialize sym %) key-or-view)
+   (with-session-use sess
+     (assert-session-open! sess)
+     (assert-source-unrecorded! sess :phase (:phase step))
+     (let [device-id (:device-id @sess)
+           {:keys [kernel-name phase]} step
+           materialized (volatile! {})
+           construction (volatile! {:prepareds [] :temporary-buffers {} :temporary-owners {}
+                                    :owned-view-owners [] :cleanup-debts []})
+           candidate (volatile! nil)
+           root-buffers (volatile! [])
+           owned-view-buffers (volatile! [])
+           materialize
+           (fn materialize [sym key-or-view]
+             (cond
+               (resident-value/resident-composite? key-or-view)
+               (resident-value/map-values #(materialize sym %) key-or-view)
 
-             (resident-buffer-view? key-or-view)
-             (or (get @materialized key-or-view)
-                 (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
-                       _ (vswap! root-buffers conj buffer)
-                       _ (when-not (bview/contiguous? view)
-                           (throw (ex-info
-                                   "resident descriptor binding requires a contiguous view"
-                                   {:kernel kernel-name :symbol sym :view (:id view)
-                                    :shape (:shape view) :strides (:strides view)})))
-                       {runtime-buffer :buffer owned-view? :owned-view?}
-                       (runtime-buffer-for-view
-                        device-id buffer view
-                        (fn [acquire]
-                          (let [{:keys [buffer owner]}
-                                (acquire-private-buffer! device-id construction acquire)]
-                            (vswap! construction
-                                    (fn [state]
-                                      (-> state
-                                          (update :owned-view-owners conj owner)
-                                          (update :cleanup-debts remove-owner owner))))
-                            buffer)))]
-                   (when owned-view?
-                     (vswap! owned-view-buffers conj runtime-buffer))
-                   (vswap! materialized assoc key-or-view runtime-buffer)
-                   runtime-buffer))
+               (resident-buffer-view? key-or-view)
+               (or (get @materialized key-or-view)
+                   (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+                         _ (vswap! root-buffers conj buffer)
+                         _ (when-not (bview/contiguous? view)
+                             (throw (ex-info
+                                     "resident descriptor binding requires a contiguous view"
+                                     {:kernel kernel-name :symbol sym :view (:id view)
+                                      :shape (:shape view) :strides (:strides view)})))
+                         {runtime-buffer :buffer owned-view? :owned-view?}
+                         (runtime-buffer-for-view
+                          device-id buffer view
+                          (fn [acquire]
+                            (let [{:keys [buffer owner]}
+                                  (acquire-private-buffer! device-id construction acquire)]
+                              (vswap! construction
+                                      (fn [state]
+                                        (-> state
+                                            (update :owned-view-owners conj owner)
+                                            (update :cleanup-debts remove-owner owner))))
+                              buffer)))]
+                     (when owned-view?
+                       (vswap! owned-view-buffers conj runtime-buffer))
+                     (vswap! materialized assoc key-or-view runtime-buffer)
+                     runtime-buffer))
 
-             :else
-             (let [buffer (or (get-in @sess [:buffers key-or-view])
-                              (throw (ex-info (str "No buffer for kernel arg: " sym " → " key-or-view)
-                                              {:kernel kernel-name
-                                               :available (keys (:buffers @sess))})))]
-               (vswap! root-buffers conj buffer)
-               buffer)))
-         resolve-buf (fn [sym] (materialize sym (sym->key sym)))]
-     (try
-       (let [bound-step (own-kernel-graph-entry
-                         device-id
-                         (assoc (bind-resident-step device-id step args resolve-buf schedule roles
-                                                    construction)
-                                :cleanup-debts (:cleanup-debts @construction)
-                                :temporary-owners (:temporary-owners @construction)
-                                :owned-view-owners (:owned-view-owners @construction)
-                                :owned-view-buffers @owned-view-buffers
-                                :resident-footprint (registered-buffer-footprint sess @root-buffers)))]
-         (vreset! candidate bound-step)
-         (destroy-prepared-entry! device-id (get-in @sess [:prepared phase]))
-         (swap! sess assoc-in [:prepared phase] bound-step)
-         sess)
-       (catch Throwable primary
-         (rollback-bound-resources!
-          sess :prepared
-          (or @candidate
-              (assoc @construction
-                     :owned-view-buffers @owned-view-buffers
-                     :resident-footprint (registered-buffer-footprint sess @root-buffers)))
-          primary)
-         (throw primary)))))))
+               :else
+               (let [buffer (or (get-in @sess [:buffers key-or-view])
+                                (throw (ex-info (str "No buffer for kernel arg: " sym " → " key-or-view)
+                                                {:kernel kernel-name
+                                                 :available (keys (:buffers @sess))})))]
+                 (vswap! root-buffers conj buffer)
+                 buffer)))
+           resolve-buf (fn [sym] (materialize sym (sym->key sym)))]
+       (try
+         (let [bound-step (own-kernel-graph-entry
+                           device-id
+                           (assoc (bind-resident-step device-id step args resolve-buf schedule roles
+                                                      construction)
+                                  :cleanup-debts (:cleanup-debts @construction)
+                                  :temporary-owners (:temporary-owners @construction)
+                                  :owned-view-owners (:owned-view-owners @construction)
+                                  :owned-view-buffers @owned-view-buffers
+                                  :resident-footprint (registered-buffer-footprint sess @root-buffers)))]
+           (vreset! candidate bound-step)
+           (destroy-prepared-entry! device-id (get-in @sess [:prepared phase]))
+           (swap! sess assoc-in [:prepared phase] bound-step)
+           sess)
+         (catch Throwable primary
+           (rollback-bound-resources!
+            sess :prepared
+            (or @candidate
+                (assoc @construction
+                       :owned-view-buffers @owned-view-buffers
+                       :resident-footprint (registered-buffer-footprint sess @root-buffers)))
+            primary)
+           (throw primary)))))))
 
 ;; ----------------------------------------------------------------
 ;; Hand-authored op-chain (the manual resident decoder layer — gemma-first; converges to a single

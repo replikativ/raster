@@ -15,6 +15,8 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as g]
+            [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.device-probe :as device-probe])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
 
@@ -100,19 +102,22 @@
           (is (empty? (:events @session))))))))
 
 (deftest pending-transfer-retains-only-its-resident-buffer
-  (let [buffer {:dtype :float :n-elements 8 :byte-size 32}
-        idle-buffer (assoc buffer :test-id :idle)
+  (let [freed (atom [])
+        buffer (lifecycle/native-buffer #(hash-map :dtype :float :n-elements 8 :byte-size 32)
+                                        #(swap! freed conj %) {})
+        idle-buffer (lifecycle/native-buffer #(hash-map :dtype :float :n-elements 8 :byte-size 32 :test-id :idle)
+                                             #(swap! freed conj %) {})
         allocation (fn [id]
                      (bview/allocation
                       {:id id :byte-size 32 :memory-space :device
                        :device :ze:0 :coherence :host-coherent :ownership :owned}))
         session (atom {:device-id :ze:0 :session-id :transfer-lifetime
                        :buffers {:busy buffer :busy-alias buffer :idle idle-buffer}
+                       :buffer-owners {:busy (::cleanup/owner buffer) :idle (::cleanup/owner idle-buffer)}
                        :allocations {:busy (allocation :busy-allocation)
-                                     :busy-alias (allocation :busy-allocation)
+                                     :busy-alias (assoc (allocation :busy-allocation) :ownership :borrowed)
                                      :idle (allocation :idle-allocation)}
-                       :kernel-graphs {} :events {} :closed? false})
-        freed (atom [])]
+                       :kernel-graphs {} :events {} :closed? false})]
     (with-redefs-fn
       {(ns-resolve 'raster.gpu.core 'rt-resolve)
        (fn [_ name]
@@ -145,6 +150,7 @@
                       (catch clojure.lang.ExceptionInfo error
                         (:reason (ex-data error))))))
           (g/await-event! session event)
+          (g/free-buffer! session :busy-alias)
           (g/free-buffer! session :busy)
           (is (= [idle-buffer buffer] @freed))
           (g/release-event! session event))))))

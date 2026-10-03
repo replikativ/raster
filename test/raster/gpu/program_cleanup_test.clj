@@ -103,7 +103,9 @@
         owner (cleanup/owner [{:id :program
                                :release #(do (swap! releases conj :program)
                                              (when (= 1 (swap! attempts inc)) (throw failure)))}])
-        sess (atom {:device-id :ocl:0 :buffers {:x root} :prepared {}
+        root-owner (cleanup/owner [{:id :memory :release #(swap! releases conj :root)}])
+        sess (atom {:device-id :ocl:0 :buffers {:x (assoc root ::cleanup/owner root-owner)} :prepared {}
+                    :buffer-owners {:x root-owner}
                     :allocations {:x {:id :root :ownership :owned}}
                     :kernel-graphs {} :graphs {} :events {}})]
     (is (identical? failure (try (cleanup/release! owner) (catch Throwable e e))))

@@ -48,12 +48,16 @@
                     (fn [session specs]
                       (doseq [[key [dt n _ opts]] specs]
                         (let [bytes (* n (dtype/bytes-of dt))
+                              buffer (raster.gpu.test-lifecycle/native-buffer
+                                      #(hash-map :dtype dt :n-elements n :byte-size bytes)
+                                      #(swap! native-frees conj %) {})
                               allocation (bview/allocation
                                           (merge {:id (:allocation-id opts) :device :ocl:0
                                                   :byte-size bytes :ownership :owned}
                                                  (select-keys opts [:memory-space :coherence :alignment])))]
                           (swap! session #(-> %
-                                              (assoc-in [:buffers key] {:dtype dt :n-elements n :byte-size bytes})
+                                              (assoc-in [:buffers key] buffer)
+                                              (assoc-in [:buffer-owners key] (::cleanup/owner buffer))
                                               (assoc-in [:allocations key] allocation))))))
                     gpu/upload-range! (fn [& _])
                     gpu/bind-kernel-graph! (fn [& _] (let [n (swap! binds inc)]

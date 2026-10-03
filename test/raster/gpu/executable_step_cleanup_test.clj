@@ -5,7 +5,8 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
-            [raster.gpu.resource-cleanup :as cleanup]))
+            [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.test-lifecycle :as lifecycle]))
 
 (def ^:private scan-graph
   (delay
@@ -38,16 +39,18 @@
   (doseq [kind [:temporary :owned-view] ordinal [1 2]]
     (let [sess (session) failure (ex-info "Native create outcome unknown" {:kind kind})
           created (atom 0) freed (atom [])
-          acquire (fn [n dtype]
-                    (let [i (swap! created inc)]
-                      (when (= i ordinal) (throw failure))
-                      {:id [:private i] :dtype dtype :n-elements n :byte-size (* 4 n)}))
+          acquire (fn [n dtype opts]
+                    (lifecycle/native-buffer
+                     #(let [i (swap! created inc)]
+                        (when (= i ordinal) (throw failure))
+                        {:id [:private i] :dtype dtype :n-elements n :byte-size (* 4 n)})
+                     #(swap! freed conj %) opts))
           resolver (fn [_ name]
                      (case name
                        "register-kernel!" (fn [& _])
                        "bind-kernel-call" (fn [& _] (throw (ex-info "Binding reached after expected allocation failure" {})))
                        "make-buffer" acquire
-                       "slice-buffer" (fn [_ _ bytes dtype] (acquire (quot bytes 4) dtype))
+                       "slice-buffer" (fn [_ _ bytes dtype opts] (acquire (quot bytes 4) dtype opts))
                        "free-buffer!" #(swap! freed conj %)
                        (throw (ex-info "Unexpected native contact" {:name name}))))
           bindings (if (= kind :owned-view)
@@ -59,7 +62,7 @@
         (fn []
           (is (identical? failure
                           (try (gpu/bind-step! sess (step (if (= kind :owned-view) 512 1025))
-                                              [] bindings)
+                                               [] bindings)
                                (catch Throwable e e))) (str kind " " ordinal))
           (is (= ordinal @created))
           (is (nil? (get-in @sess [:prepared :scan])))
@@ -84,9 +87,11 @@
         resolver (fn [_ name]
                    (case name
                      "register-kernel!" (fn [& _])
-                     "make-buffer" (fn [n dtype]
-                                     {:id (swap! created inc) :dtype dtype
-                                      :n-elements n :byte-size (* 4 n)})
+                     "make-buffer" (fn [n dtype opts]
+                                     (lifecycle/native-buffer
+                                      #(hash-map :id (swap! created inc) :dtype dtype
+                                                 :n-elements n :byte-size (* 4 n))
+                                      #(swap! releases conj [:buffer (:id %)]) opts))
                      "bind-kernel-call" (fn [call _]
                                           (let [i (swap! bound inc)]
                                             {:kernel-call call ::cleanup/owner
@@ -117,8 +122,10 @@
         resolver (fn [_ name]
                    (case name
                      "register-kernel!" (fn [& _])
-                     "make-buffer" (fn [n dtype]
-                                     {:dtype dtype :n-elements n :byte-size (* 4 n)})
+                     "make-buffer" (fn [n dtype opts]
+                                     (lifecycle/native-buffer
+                                      #(hash-map :dtype dtype :n-elements n :byte-size (* 4 n))
+                                      #(swap! freed conj %) opts))
                      "bind-kernel-call"
                      (fn [call _]
                        (when (= 2 (swap! binds inc)) (throw primary))
