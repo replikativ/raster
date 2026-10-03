@@ -52,6 +52,16 @@
   (-storage-event-measurement [provider event])
   (-release-storage-event! [provider event]))
 
+(defprotocol ContentIngestor
+  "Optional ingestion capability alongside ContentProvider, using its existing event lifecycle.
+   Each provider-owned window is lent exclusively for the synchronous callback; the reader must
+   not retain or access it afterwards. Providers must not commit addressed content after a callback
+   failure. Submission failure without a returned event leaves cleanup internal to the provider."
+  (-submit-ingestion! [provider content target-tier byte-length read! opts]
+    "Consume ordered source windows synchronously on the submitting thread, then return an
+     :ingest placement event. Never retain or asynchronously invoke read!. Each writable window
+     is at most 64 KiB and filled completely. Source lifetime ends when submission returns."))
+
 (defn storage-tier? [value] (instance? StorageTier value))
 (defn provider-descriptor? [value] (instance? ContentProviderDescriptor value))
 (defn content-placement? [value] (instance? ContentPlacement value))
@@ -392,6 +402,108 @@
         (release-after-error! error #(-release-storage-event! provider event))
         (throw error)))))
 
+(defn submit-ingestion!
+  "Ingest exact immutable source bytes through bounded provider-owned windows.
+
+   read! receives [offset destination] and returns the bytes filled. The source must remain live
+   and immutable throughout this call; no source borrow survives submission. Consumption must be
+   synchronous, ordered, complete and on this thread. The wrapper verifies SHA-256, expires the
+   reader on every exit, and safely drains rejected event handoffs. An accepted event describes
+   provider placement work, not source ownership. Stored bytes are independently verified by the
+   ordinary localization/publication path; hashing source windows alone does not attest storage."
+  ([provider content target-tier byte-length read!]
+   (submit-ingestion! provider content target-tier byte-length read! {}))
+  ([provider content target-tier byte-length read! opts]
+   (let [description (provider-descriptor provider)]
+     (when-not (and (numerical-state/content-address? content) (= :sha-256 (:algorithm content)))
+       (fail! "content ingestion requires a SHA-256 content address"
+              :numerical-content-ingestion-content {:content content}))
+     (when-not (and (integer? byte-length) (<= 0 byte-length Long/MAX_VALUE) (ifn? read!))
+       (fail! "content ingestion requires a bounded byte extent and reader"
+              :numerical-content-ingestion-reader {:byte-length byte-length}))
+     (when-not (map? opts)
+       (fail! "content ingestion options must be a map"
+              :numerical-content-ingestion-options {:opts opts}))
+     (require-capability! description :ingest)
+     (when-not (satisfies? ContentIngestor provider)
+       (fail! "ingesting provider must implement ContentIngestor"
+              :numerical-content-ingestion-provider {}))
+     (tier-by-id description target-tier)
+     (let [thread (Thread/currentThread)
+           active? (volatile! true)
+           source-reader (volatile! read!)
+           reading? (volatile! false)
+           offset (volatile! 0)
+           fault (atom nil)
+           digest (MessageDigest/getInstance "SHA-256")
+           empty-address (when (zero? byte-length)
+                           (numerical-state/content-address :sha-256
+                                                            (.formatHex (HexFormat/of) (.digest digest))))
+           _ (when (and empty-address (not= content empty-address))
+               (fail! "empty ingestion source differs from its content address"
+                      :numerical-content-ingestion-digest {:expected content :actual empty-address}))
+           verified? (volatile! (zero? byte-length))
+           consume! (fn [position destination]
+                      (when-not @active?
+                        (fail! "ingestion reader has expired" :numerical-content-ingestion-expired {}))
+                      (try
+                        (when-not (identical? thread (Thread/currentThread))
+                          (fail! "ingestion must consume source on the submitting thread"
+                                 :numerical-content-ingestion-thread {}))
+                        (when-let [error @fault] (throw error))
+                        (when @reading?
+                          (fail! "ingestion reader cannot reenter itself"
+                                 :numerical-content-ingestion-reentrant {}))
+                        (when-not (and (integer? position) (= position @offset))
+                          (fail! "ingestion windows must be contiguous and ordered"
+                                 :numerical-content-ingestion-order {:expected @offset :actual position}))
+                        (when-not (and (instance? MemorySegment destination)
+                                       (.isAlive (.scope ^MemorySegment destination))
+                                       (.isAccessibleBy ^MemorySegment destination thread)
+                                       (not (.isReadOnly ^MemorySegment destination))
+                                       (<= 1 (.byteSize ^MemorySegment destination) 65536)
+                                       (<= (.byteSize ^MemorySegment destination) (- byte-length @offset)))
+                          (fail! "ingestion destination must be a live writable bounded window"
+                                 :numerical-content-ingestion-window {:offset @offset}))
+                        (let [n (.byteSize ^MemorySegment destination)
+                              actual (do (vreset! reading? true)
+                                         (try (@source-reader position destination)
+                                              (finally (vreset! reading? false))))]
+                          (when-let [error @fault] (throw error))
+                          (when-not (= n actual)
+                            (fail! "ingestion reader did not fill its window"
+                                   :numerical-content-ingestion-short-read
+                                   {:offset position :expected n :actual actual}))
+                          (.update digest (.asByteBuffer ^MemorySegment destination))
+                          (vreset! offset (Math/addExact (long @offset) (long n)))
+                          (when (= byte-length @offset)
+                            (let [actual-address (numerical-state/content-address :sha-256
+                                                                                  (.formatHex (HexFormat/of) (.digest digest)))]
+                              (when-not (= content actual-address)
+                                (fail! "ingested source bytes differ from their content address"
+                                       :numerical-content-ingestion-digest
+                                       {:expected content :actual actual-address}))
+                              (vreset! verified? true)))
+                          n)
+                        (catch Throwable error
+                          (compare-and-set! fault nil error)
+                          (throw error))))
+           event (try (-submit-ingestion! provider content target-tier byte-length consume! opts)
+                      (finally (vreset! active? false) (vreset! source-reader nil)))]
+       (try
+         (when-let [error @fault] (throw error))
+         (when-not (= byte-length @offset)
+           (fail! "provider did not consume the complete source"
+                  :numerical-content-ingestion-incomplete {:expected byte-length :actual @offset}))
+         (when-not @verified?
+           (fail! "ingestion stream has no completed digest verification"
+                  :numerical-content-ingestion-digest {}))
+         (validate-provider-event! description :ingest event)
+         (catch Throwable error
+           (if (storage-event? event)
+             (release-after-error! error #(-release-storage-event! provider event))
+             (throw error))))))))
+
 (defn submit-promotion!
   "Submit promotion of immutable content to a declared durable tier."
   ([provider content target-tier] (submit-promotion! provider content target-tier {}))
@@ -516,6 +628,17 @@
     #(checked-placement! description content tier (await-storage-event! provider event))
     ;; This scope owns the exact accepted handoff. Descriptor drift must not prevent safe drain.
     #(-release-storage-event! provider event)))
+
+(defn ingest-content!
+  "Consume bounded source bytes and settle the exact requested placement before returning.
+   No source borrow survives submission; provider work is safely drained on success/failure.
+   Placement durability is only the selected tier's declared contract, not producer provenance."
+  ([provider content target-tier byte-length read!]
+   (ingest-content! provider content target-tier byte-length read! {}))
+  ([provider content target-tier byte-length read! opts]
+   (let [description (provider-descriptor provider)
+         event (submit-ingestion! provider content target-tier byte-length read! opts)]
+     (await-placement! provider description content target-tier event))))
 
 (defn finalize-state-availability!
   "Verify/promote a certified state's blobs before invoking publish-manifest! with its manifest.
