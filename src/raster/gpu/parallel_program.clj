@@ -54,7 +54,7 @@
           (mapv (fn [key]
                   {:id [:graph key] :release #((:release! prepared) (get (:handles prepared) key))})
                 (rseq (:binding-order prepared))))]
-    (assoc prepared ::cleanup/owner (cleanup/owner resources) ::active-uses (atom 0))))
+    (assoc prepared ::cleanup/owner (cleanup/owner resources) ::active-uses (volatile! 0))))
 
 (defn- with-live-prepared
   [prepared operation use!]
@@ -73,8 +73,8 @@
     (when-not (::active-uses prepared)
       (throw (ex-info "Prepared program has lost its use-scope state"
                       {:reason :parallel-program-use-state-missing})))
-    (swap! (::active-uses prepared) inc)
-    (try (use!) (finally (swap! (::active-uses prepared) dec)))))
+    (vswap! (::active-uses prepared) inc)
+    (try (use!) (finally (vswap! (::active-uses prepared) dec)))))
 
 (defn straight-line-call?
   "Whether an emitted call has one statically ordered graph sequence. Host equations are
@@ -505,7 +505,7 @@
     (when (and (::active-uses prepared) (pos? @(::active-uses prepared)))
       (throw (ex-info "Cannot release a prepared program from its active use callback"
                       {:reason :parallel-program-in-use})))
-    (reset! (:closed? prepared) true)
+    (when-not @(:closed? prepared) (reset! (:closed? prepared) true))
     (cleanup/release! (::cleanup/owner prepared)))
   nil)
 

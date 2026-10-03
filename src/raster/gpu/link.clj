@@ -61,7 +61,7 @@
                 (map (fn [key]
                        {:id [:allocation key] :after (into (into recording phase-ids) program)
                         :release #(gpu/free-buffer! session key)}) (reverse allocation-keys)))))]
-    (assoc executable ::cleanup/owner (cleanup/owner resources))))
+    (assoc executable ::cleanup/owner (cleanup/owner resources) ::active-uses (volatile! 0))))
 
 (defn instantiation-report
   "Return compact host-monotonic phase timings for construction of a linked executable. Binding
@@ -462,17 +462,13 @@
                      :plan (get-in executable [:plan :id])}))))
 
 (defn- start-use! [executable]
-  (when-not (:execution-state executable)
-    (throw (ex-info "Linked executable lacks execution state"
-                    {:reason :link-execution-state-missing})))
-  (swap! (:execution-state executable) update :active-use-depth (fnil inc 0)))
+  (when-not (::active-uses executable)
+    (throw (ex-info "Linked executable lacks use-scope state"
+                    {:reason :link-use-state-missing})))
+  (vswap! (::active-uses executable) inc))
 
 (defn- finish-use! [executable]
-  (swap! (:execution-state executable)
-         (fn [state]
-           (let [depth (dec (:active-use-depth state))]
-             (if (zero? depth) (dissoc state :active-use-depth)
-                 (assoc state :active-use-depth depth))))))
+  (vswap! (::active-uses executable) dec))
 
 (defn with-unleased-execution!
   "Run a composite Link/Compiled mutation under the same lifetime guard as replay and leases.
@@ -508,9 +504,9 @@
 (defn- execute-once! [executable operation execute!]
   (ensure-live! executable operation)
   (ensure-no-output-leases! executable operation)
-  (begin-mutation! executable)
   (start-use! executable)
   (try
+    (begin-mutation! executable)
     (let [result (execute!)]
       (swap! (:completed-replays executable) inc)
       (reset! (:output-ready? executable) true)
@@ -1000,14 +996,17 @@
         (node-view executable node-id))
       ;; Reject dtype/length mistakes before the backend copy sees them.
       (link-plan/validate-node-source! node source)
-      (begin-mutation! executable)
-      (try
-        (gpu/upload-range! (:session executable) (node-view executable node-id) source
-                           {:elements (reduce * 1 (get-in node [:view :shape]))})
-        (catch Throwable error (failed-write! executable node-id error)))
-      (swap! (:pending-inputs executable) disj node-id)
-      (swap! (:tainted-inputs executable) disj node-id)
-      executable)))
+      (with-unleased-execution!
+       executable :upload!
+       (fn []
+         (begin-mutation! executable)
+         (try
+           (gpu/upload-range! (:session executable) (node-view executable node-id) source
+                              {:elements (reduce * 1 (get-in node [:view :shape]))})
+           (catch Throwable error (failed-write! executable node-id error)))
+         (swap! (:pending-inputs executable) disj node-id)
+         (swap! (:tainted-inputs executable) disj node-id)
+         executable)))))
 
 (defn- same-buffer-range?
   [left-buffer left-view right-buffer right-view]
@@ -1154,9 +1153,11 @@
         (let [facts (device-write-facts executable node-id source)]
           ;; Pure compatibility failures must preserve readiness. A subsequent runtime copy or
           ;; registration failure cannot promise that the destination still has its old bytes.
-          (try
-            (write-device-array! executable node-id facts)
-            (catch Throwable error (failed-write! executable node-id error))))
+          (with-unleased-execution!
+           executable :write!
+           #(try
+              (write-device-array! executable node-id facts)
+              (catch Throwable error (failed-write! executable node-id error)))))
         (upload! executable node-id source)))))
 
 (defn- descriptor-source-map
@@ -1413,7 +1414,10 @@
       (throw (ex-info "Linked executable has lost its cleanup owner"
                       {:reason :missing-cleanup-owner})))
     (ensure-no-output-leases! executable :close!)
-    (when (pos? (or (some-> executable :execution-state deref :active-use-depth) 0))
+    (when-not (::active-uses executable)
+      (throw (ex-info "Linked executable lacks use-scope state"
+                      {:reason :link-use-state-missing})))
+    (when (pos? @(::active-uses executable))
       (throw (ex-info "Cannot close a linked executable from its active use callback"
                       {:reason :link-execution-in-use}))))
   executable)
@@ -1427,7 +1431,7 @@
     (throw (ex-info "close! requires a LinkedExecutable" {:actual (type executable)})))
   (locking (:lifetime-lock executable)
     (assert-closeable! executable)
-    (reset! (:closed? executable) true)
+    (when-not @(:closed? executable) (reset! (:closed? executable) true))
     (cleanup/release! (::cleanup/owner executable)))
   nil)
 

@@ -261,7 +261,9 @@
                      :handles {:fixed-phase :bound-handle}
                      :closed? (atom false)}))
           fixed-info (assoc info :selection :fixed :admission [])
-          artifact (assoc compiled :executable (assoc live :prepared-program prepared))]
+          artifact (assoc compiled :executable
+                          (raster.gpu.test-lifecycle/linked-executable
+                           (assoc live :prepared-program prepared)))]
       (with-redefs [gpu/kernel-graph-execution-info
                     (fn [actual-session handle]
                       (is (identical? session actual-session))

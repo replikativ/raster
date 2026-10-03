@@ -1,6 +1,7 @@
 (ns raster.gpu.program-cleanup-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.emitted-parallel-program-call :as call]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
@@ -166,7 +167,7 @@
                             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
       (is (false? @(:closed? p)))
       (is (= :live (:phase (cleanup/status (::cleanup/owner p)))))
-      (is (zero? (get @(:execution-state p) :active-use-depth 0)))
+      (is (zero? @(::link/active-uses p)))
       (reset! (:output-leases p) 1)
       (is (= :link-output-lease-active
              (try (link/close! p)
@@ -176,6 +177,75 @@
       (reset! (:output-leases p) 0)
       (link/close! p)
       (is (= 1 @calls)))))
+
+(deftest execution-state-watch-cannot-close-before-replay
+  (let [p (assoc (linked true) :pending-inputs (atom #{}) :plan {:nodes {}}
+                 :output-ready? (atom false) :completed-replays (atom 0))
+        attempts (atom []) replays (atom 0) closes (atom 0)]
+    (add-watch (:execution-state p) ::close
+               (fn [_ _ before after]
+                 (when (not= (:value-epoch before) (:value-epoch after))
+                   (swap! attempts conj
+                          (try (link/close! p)
+                               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (with-redefs [gpu/replay! (fn [& _] (swap! replays inc))
+                  gpu/close-session! (fn [_] (swap! closes inc))
+                  link/outputs (fn [_] {})]
+      (try
+        (link/run! p)
+        (is (= [:link-execution-in-use] @attempts))
+        (is (= 1 @replays))
+        (is (zero? @closes))
+        (is (false? @(:closed? p)))
+        (is (true? @(:output-ready? p)))
+        (is (zero? @(::link/active-uses p)))
+        (finally (remove-watch (:execution-state p) ::close)))
+      (link/close! p)
+      (is (= 1 @closes)))))
+
+(deftest upload-state-watch-cannot-close-before-transfer
+  (let [p (assoc (linked true) :plan {:nodes {:x {:view {:shape [1]}}}}
+                 :pending-inputs (atom #{:x}) :tainted-inputs (atom #{})
+                 :output-ready? (atom false))
+        attempts (atom []) transfers (atom 0) closes (atom 0)]
+    (add-watch (:execution-state p) ::close
+               (fn [_ _ before after]
+                 (when (not= (:value-epoch before) (:value-epoch after))
+                   (swap! attempts conj
+                          (try (link/close! p)
+                               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (with-redefs [link-plan/validate-node-source! (fn [& _])
+                  link/node-view (fn [& _] ::view)
+                  gpu/upload-range! (fn [& _] (swap! transfers inc))
+                  gpu/close-session! (fn [_] (swap! closes inc))]
+      (try
+        (is (identical? p (link/upload! p :x (float-array [1]))))
+        (is (= [:link-execution-in-use] @attempts))
+        (is (= 1 @transfers))
+        (is (zero? @closes))
+        (is (empty? @(:pending-inputs p)))
+        (is (zero? @(::link/active-uses p)))
+        (finally (remove-watch (:execution-state p) ::close)))
+      (link/close! p)
+      (is (= 1 @closes)))))
+
+(deftest throwing-mutation-watch-balances-use-and-prevents-replay
+  (let [p (assoc (linked true) :pending-inputs (atom #{}) :plan {:nodes {}}
+                 :output-ready? (atom false) :completed-replays (atom 0))
+        failure (ex-info "watch failed" {}) replays (atom 0) closes (atom 0)]
+    (add-watch (:execution-state p) ::throw
+               (fn [_ _ before after]
+                 (when (not= (:value-epoch before) (:value-epoch after)) (throw failure))))
+    (with-redefs [gpu/replay! (fn [& _] (swap! replays inc))
+                  gpu/close-session! (fn [_] (swap! closes inc))]
+      (try
+        (is (identical? failure (try (link/run! p) (catch Throwable e e))))
+        (is (zero? @replays))
+        (is (identical? failure (:failure @(:execution-state p))))
+        (is (zero? @(::link/active-uses p)))
+        (finally (remove-watch (:execution-state p) ::throw)))
+      (link/close! p)
+      (is (= 1 @closes)))))
 
 (deftest missing-cleanup-owners-decline-before-close-state-mutation
   (doseq [[p close!] [[(dissoc (prepared [:a] identity identity) ::cleanup/owner)

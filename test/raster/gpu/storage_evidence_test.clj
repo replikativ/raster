@@ -119,7 +119,10 @@
 (deftest admission-failures-do-not-mutate-or-allocate
   (doseq [scenario [:unsupported :lease :events :closed-session :closed-executable :attached :poisoned]]
     (let [c (owner) executable (:executable c)
-          c (if (= :attached scenario) (seal (assoc c :executable (assoc executable :owns-session? false))) c)
+          c (if (= :attached scenario)
+              (seal (assoc c :executable
+                           (raster.gpu.test-lifecycle/linked-executable
+                            (assoc executable :owns-session? false)))) c)
           executable (:executable c)]
       (case scenario
         :lease (reset! (:output-leases executable) 1)

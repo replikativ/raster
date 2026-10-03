@@ -1949,7 +1949,8 @@ not a second competing resource plan for the same native children.
 Prepared run/profile/report operations serialize with release, and active-use depth rejects
 same-thread reentrant destruction before the closed flag changes. Linked execution scopes use
 the same principle under their existing lifetime lock; live operations require a live cleanup
-owner. Zero-depth bookkeeping is removed so it does not alter completed value-state projections.
+owner. Private, non-watchable active-use counters are installed before observable atom mutations
+and balanced even when a watch throws; they do not alter numerical execution-state projections.
 Returned raw handle reports remain **borrowed**, not lifetime leases: keeping an owner alive or
 using callback-under-lock run/profile APIs remains the caller's responsibility.
 
