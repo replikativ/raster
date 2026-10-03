@@ -843,8 +843,18 @@
    coverage decline preserves the original source and remains visible beside any later TypedSOAC
    decline; certified contradictions are never converted into fallback."
   [source opts abstract-machine]
-  (let [common {:dtype (:dtype opts)
-                :values (:values opts)
+  (let [;; Public physical storage capacity is not its first read/write traversal.
+        ;; Seed the fact after SoA replacement, before either semantic frontend.
+        ;; Concrete arguments remain absent from compilation and cache identity;
+        ;; scheduled read/write requirements still check each runtime capacity.
+        values (merge (when (device/gpu-target? (:target-device opts))
+                        (into {} (map (fn [[parameter t]]
+                                        [parameter (abstract-value/tensor
+                                                    {:dtype t :shape [(list 'extent parameter)]})]))
+                              (:array-types opts)))
+                      (:values opts))
+        common {:dtype (:dtype opts)
+                :values values
                 :array-types (:array-types opts)
                 :scalar-types (:scalar-types opts)
                 :public-parameters (or (:public-parameters opts) (:active-params opts))
@@ -861,7 +871,7 @@
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
                     :segmented-plans? (true? (:segmented-plans? opts))
                     :scalar-types (:scalar-types opts)
-                    :values (:values opts)
+                    :values values
                     :abstract-machine abstract-machine})
             ;; Mixed source construction shares the ordinary frontend but cannot depend on
             ;; this route's validator without a namespace cycle. Certify the closed algorithm

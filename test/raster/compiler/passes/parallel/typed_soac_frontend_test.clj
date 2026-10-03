@@ -2304,6 +2304,25 @@
                          (dialect/equations program))))
         "both product computations remain distinct and in source order")))
 
+(deftest effect-destination-storage-survives-a-later-prefix-read
+  (let [source '(let* [fill (raster.par/map-void! i full
+                             (clojure.core/aset boundary i (clojure.core/aget current i)))
+                       consume (raster.par/map-void! j owned
+                                (clojure.core/aset out j (clojure.core/aget boundary j)))]
+                     consume)
+        program (frontend/form->program source
+                                        {:dtype :double
+                                         :array-types {'boundary :double 'current :double 'out :double}
+                                         :values {'boundary (av/tensor {:dtype :double
+                                                                       :shape '[(extent boundary)]})}
+                                         :scalar-types {'full :long 'owned :long}})
+        consumer (dialect/operation-parts (last (dialect/equations program)))]
+    (is (some? program))
+    (is (= '[(extent boundary)] (get-in (dialect/facts program) [:values 'boundary :shape])))
+    (is (= 'owned (get-in consumer [:attributes :extent])))
+    (is (empty? (:arrays consumer)) "a prefix traversal is not the original buffer's shape")
+    (is (= ['boundary] (get-in consumer [:attributes :attributes :stable-array-captures])))))
+
 (deftest repeated-input-traversals-do-not-retype-external-storage
   (let [source '(let* [a (raster.par/pmap i n float (aget x i))
                        b (raster.par/pmap j m float (aget x j))]
@@ -2315,7 +2334,13 @@
     (is (= '[n] (get-in (dialect/facts program) [:values 'x :shape])))
     (is (= 'm (get-in consumer [:attributes :extent])))
     (is (empty? (:arrays consumer)))
-    (is (= ['x] (get-in consumer [:attributes :attributes :stable-array-captures])))))
+    (is (= ['x] (get-in consumer [:attributes :attributes :stable-array-captures])))
+    (is (= ['x] (get-in consumer [:attributes :attributes :pointwise-storage-inputs])))
+    (let [renamed (dialect/remap-values program {'x 'renamed-x})
+          renamed-consumer (dialect/operation-parts (last (dialect/equations renamed)))]
+      (is (= ['renamed-x]
+             (get-in renamed-consumer [:attributes :attributes :pointwise-storage-inputs])))
+      (is (= renamed (dialect/validate! renamed))))))
 
 (deftest symbolic-storage-promotion-preserves-element-fusion-and-layout-boundaries
   (let [source '(let* [a (raster.par/pmap i n float (aget x i))

@@ -252,9 +252,19 @@
   (set (get-in info [:attributes :attributes :stable-array-captures])))
 
 (defn- with-stable-array-captures
-  [attributes captures stable]
-  (assoc-in attributes [:attributes :stable-array-captures]
-            (vec (filter stable captures))))
+  ([attributes captures stable]
+   (with-stable-array-captures
+    attributes captures stable
+    (set (get-in attributes [:attributes :pointwise-storage-inputs]))))
+  ([attributes captures stable pointwise-storage]
+   (-> attributes
+       (assoc-in [:attributes :stable-array-captures] (vec (filter stable captures)))
+       (assoc-in [:attributes :pointwise-storage-inputs]
+                 (vec (filter (set/intersection stable pointwise-storage) captures))))))
+
+(defn- pointwise-storage-inputs
+  [info]
+  (set (get-in info [:attributes :attributes :pointwise-storage-inputs])))
 
 (defn- freshen-parameters
   "Give one equation's parameters and local SSA definitions private names before scopes combine."
@@ -1023,7 +1033,10 @@
                             (set (map :value (:operands transform))))
           updated (assoc consumer
                          :attributes (-> (:attributes consumer)
-                                         (with-stable-array-captures (:captures canonical) stable)
+                                         (with-stable-array-captures
+                                           (:captures canonical) stable
+                                           (set/union (pointwise-storage-inputs producer)
+                                                      (pointwise-storage-inputs consumer)))
                                          (assoc :result-transform transform))
                          :arrays (:arrays canonical)
                          :captures (:captures canonical)
@@ -1128,7 +1141,10 @@
           updated (assoc producer
                          :results (:results consumer)
                          :attributes (-> (:attributes producer)
-                                         (with-stable-array-captures (:captures canonical) stable)
+                                         (with-stable-array-captures
+                                           (:captures canonical) stable
+                                           (set/union (pointwise-storage-inputs producer)
+                                                      (pointwise-storage-inputs consumer)))
                                          (assoc :result-transform transform))
                          :arrays (:arrays canonical)
                          :captures (:captures canonical)
@@ -1317,7 +1333,9 @@
                             (stable-array-captures consumer))
           updated (assoc consumer
                          :attributes (with-stable-array-captures
-                                       (:attributes consumer) (:captures canonical) stable)
+                                       (:attributes consumer) (:captures canonical) stable
+                                       (set/union (pointwise-storage-inputs producer)
+                                                  (pointwise-storage-inputs consumer)))
                          :arrays (:arrays canonical)
                          :captures (:captures canonical)
                          :parameters (vec (concat (:accumulators consumer-parameters)
@@ -1431,7 +1449,9 @@
           stable (set/union (stable-array-captures left) (stable-array-captures right))
           updated (assoc left
                          :attributes (with-stable-array-captures
-                                       (:attributes left) (:captures canonical) stable)
+                                       (:attributes left) (:captures canonical) stable
+                                       (set/union (pointwise-storage-inputs left)
+                                                  (pointwise-storage-inputs right)))
                          :results (vec (concat (:results left) (:results right)))
                          :arrays (:arrays canonical)
                          :captures (:captures canonical)

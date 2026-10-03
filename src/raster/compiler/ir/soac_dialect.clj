@@ -1671,7 +1671,15 @@
         (fail! :typed-soac-stable-array-captures
                "stable array capture roles must be an ordered subset of captures"
                {:equation equation-id :stable-array-captures stable-array-captures
-                :captures captures})))
+                :captures captures}))
+      (let [pointwise-storage-inputs
+            (get-in attributes [:attributes :pointwise-storage-inputs] [])]
+        (when-not (and (distinct-vector? pointwise-storage-inputs)
+                       (set/subset? (set pointwise-storage-inputs)
+                                    (set stable-array-captures)))
+          (fail! :typed-soac-pointwise-storage-inputs
+                 "pointwise storage inputs must be an ordered subset of stable array captures"
+                 {:equation equation-id :pointwise-storage-inputs pointwise-storage-inputs}))))
     (when-not (distinct-vector? parameters)
       (fail! :typed-soac-lambda-parameters "SOAC lambda parameters must be distinct"
              {:equation equation-id :parameters parameters}))
@@ -2462,10 +2470,14 @@
                 :let [logical (get-in program-facts [:values result])
                       physical (get-in program-facts [:values destination])]]
           (when (and (= 'contract kind)
-                     (not (and (seq (:shape physical))
+                     (not (or
+                           ;; Unresolved self-capacity is not a claim that the entire buffer
+                           ;; is written. The graph retains and checks the logical write minimum.
+                           (= [(list 'extent destination)] (:shape physical))
+                           (and (seq (:shape physical))
                                 (every? #(and (integer? %) (pos? %)) (:shape physical))
                                 (>= (reduce *' 1 (:shape physical))
-                                    (reduce *' 1 (:shape logical))))))
+                                    (reduce *' 1 (:shape logical)))))))
             (fail! :typed-soac-contraction-output-capacity
                    "contraction destination must cover its free-axis result space"
                    {:equation equation-id :logical logical :physical physical}))
@@ -2618,6 +2630,10 @@
                                    (seq (get-in attributes
                                                 [:attributes :stable-array-captures]))
                                    (update-in [:attributes :stable-array-captures]
+                                              #(mapv rename %))
+                                   (seq (get-in attributes
+                                                [:attributes :pointwise-storage-inputs]))
+                                   (update-in [:attributes :pointwise-storage-inputs]
                                               #(mapv rename %)))
                       attributes (if (contains? #{'segmented-reduce 'product-reduce
                                                   'segmented-fold-map} kind)

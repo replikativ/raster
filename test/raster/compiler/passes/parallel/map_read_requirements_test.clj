@@ -51,6 +51,36 @@
                (packed-head-map coordinate)
                {:scalar-definitions {'total (launch/product 'rows 'heads 'width)}})))))
 
+(defn- scalar-scan [element inputs bound]
+  (segop/map->SegScan
+   {:id :scan-read-proof :space (segop/make-seg-space 'i bound)
+    :scan-op {:element element} :inputs inputs :outputs #{'out}
+    :scalars #{'n} :phase :single :dtype :float}))
+
+(deftest fold-read-minima-are-complete-per-buffer
+  (is (= {'labels 'n}
+         (requirements/fold-read-requirements
+          (scalar-scan '(+ (aget labels i) (aget logits (aget indices i)))
+                       #{'labels 'logits} 'n) {})))
+  (doseq [element ['(aget input (+ i 1))
+                   '(aget input (aget indices i))
+                   '(+ (aget input i) (aget input (+ i 1)))]]
+    (is (= {} (requirements/fold-read-requirements
+               (scalar-scan element #{'input} 'n) {}))))
+  (is (= {'input 0}
+         (requirements/fold-read-requirements
+          (scalar-scan '(aget input i) #{'input} 0) {}))))
+
+(deftest resident-fold-minima-only-name-current-phase-inputs
+  (let [operation (assoc (scalar-scan '(aget input i) #{'input 'capture} 0)
+                         :reduction {:attributes
+                                     {:resident-scalar-captures #{'capture 'absent}}})]
+    (is (= {'input 0 'capture 1}
+           (requirements/fold-read-requirements operation {})))
+    (is (= {'input 'n 'capture 1}
+           (requirements/fold-read-requirements
+            (assoc operation :space (segop/make-seg-space 'i 'n)) {})))))
+
 (deftest ordered-loop-read-span-includes-the-counted-axis
   (let [operation
         (segop/map->SegMap

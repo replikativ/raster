@@ -18,3 +18,29 @@
   [x :- (Array float) n :- Long m :- Long] :- (Array float)
   (let [first-row (p/pmap i n float (a/aget x i))]
     (p/pmap j m float (a/aget first-row j))))
+
+(deftm fill-and-read-prefix!
+  [x :- (Array float), boundary :- (Array float), out :- (Array float),
+   full :- Long, owned :- Long] :- Void
+  (p/map-void! i full (a/aset boundary i (a/aget x i)))
+  (p/map-void! j owned (a/aset out j (a/aget boundary j))))
+
+(deftm shifted-map
+  [x :- (Array float), n :- Long] :- (Array float)
+  (p/pmap i n float (a/aget x (inc i))))
+
+(deftm indirect-map
+  [x :- (Array float), indices :- (Array long), n :- Long] :- (Array float)
+  (p/pmap i n float (a/aget x (a/aget indices i))))
+
+(deftm shifted-scan
+  [x :- (Array float), n :- Long] :- (Array float)
+  (let [out (float-array n)]
+    (p/scan out acc (float 0.0) i n float
+            (raster.numeric/+ acc (a/aget x (inc i))))))
+
+(deftm indirect-scan
+  [x :- (Array float), indices :- (Array long), n :- Long] :- (Array float)
+  (let [out (float-array n)]
+    (p/scan out acc (float 0.0) i n float
+            (raster.numeric/+ acc (a/aget x (a/aget indices i))))))

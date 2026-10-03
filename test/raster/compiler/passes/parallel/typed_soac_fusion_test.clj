@@ -39,6 +39,22 @@
     (is (= '[n x] (:inputs (dialect/facts typed-result))))
     (is (not (contains? (:values (dialect/facts typed-result)) 'y)))))
 
+(deftest fusion-preserves-pointwise-storage-capacity-obligations
+  (doseq [[source array-types expected]
+          [[map-map-source {'x :float} #{'x}]
+           [horizontal-map-source {'a :float 'b :float} #{'a 'b}]]]
+    (let [program (frontend/form->program
+                   source {:dtype :float :array-types array-types :scalar-types {'n :long}
+                           :values (into {} (map (fn [[id dtype]]
+                                                  [id (av/tensor {:dtype dtype
+                                                                  :shape [(list 'extent id)]})]))
+                                         array-types)})
+          [fused _] (typed-fusion/fusion-fixpoint program)
+          operation (dialect/operation-parts (first (dialect/equations fused)))]
+      (is (= 1 (count (dialect/equations fused))))
+      (is (= expected (set (get-in operation [:attributes :attributes :pointwise-storage-inputs]))))
+      (is (= fused (dialect/validate! fused))))))
+
 (deftest vertical-fusion-preserves-a-checked-producer-completion-boundary
   (let [source '(let* [y (raster.par/map! tmp i n int (clojure.core/aget input i))
                        z (raster.par/map! out j n int (clojure.core/aget y j))]
