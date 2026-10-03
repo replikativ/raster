@@ -40,6 +40,36 @@
            (test! {:modules modules :registry registry :calls calls :failure failure :state state
                    :close! @(v 'close-module-cache!)}))))))
 
+(deftest fresh-kernel-pins-the-root-independently-of-module-cache-ownership
+  (with-runtime {}
+    (fn [{:keys [state close!]}]
+      (let [module (ze/load-module! (byte-array [1 2]))
+            first-kernel (ze/create-kernel-fresh module "first")
+            second-kernel (ze/create-kernel-fresh module "second")]
+        (is (= 2 (root/lease-count state)))
+        (is (= :module-in-use (:reason (ex-data (error-of close!)))))
+        (ze/destroy-kernel! first-kernel)
+        (is (= 1 (root/lease-count state)))
+        (ze/destroy-kernel! second-kernel)
+        (is (zero? (root/lease-count state)))
+        (close!)))))
+
+(deftest uncertain-fresh-kernel-native-outcomes-retain-the-root-pin
+  (doseq [options [{:fail "zeKernelCreate"} {:null-kernel? true}
+                   {:fail "zeKernelDestroy"}]]
+    (with-runtime options
+      (fn [{:keys [state calls close!]}]
+        (let [module (ze/load-module! (byte-array [1 2]))
+              result (try (ze/create-kernel-fresh module "uncertain")
+                          (catch Throwable error error))
+              error (if (instance? Throwable result)
+                      result (error-of #(ze/destroy-kernel! result)))
+              before @calls]
+          (is (some? error))
+          (is (= 1 (root/lease-count state)))
+          (is (= :module-in-use (:reason (ex-data (error-of close!)))))
+          (is (= before @calls)))))))
+
 (deftest module-cache-snapshots-payload-and-shares-exact-content-and-flags
   (let [input (byte-array [1 2 3]) seen (atom [])]
     (with-runtime

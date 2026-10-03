@@ -2281,6 +2281,17 @@ and two buffer/view tests / eight assertions pass on the local OpenCL/Level Zero
 Review found no remaining blocker; final exact-head review and CI remain required.
 Prepared calls, recordings/events and raw allocation consumers are still outstanding.
 
+The prepared-resource follow-up starts with ZE's public `create-kernel-fresh`: every
+fresh kernel now has an independent root pin in its existing kernel/module-borrow
+cleanup DAG. The module cache remains a root-internal resource, while a fresh kernel
+is a lifetime that may survive the base registration. Kernel destruction must finish
+before the module borrow retires, and both precede root-pin retirement. Unknown create,
+NULL readback or destruction leaves both borrow and pin retained. Hardware-free tests
+exercise two independent kernels and all three uncertain outcomes; 178 focused tests /
+1,860 assertions and seven actual-device boundary tests / 84 assertions pass.
+This is the first prepared-resource step, not completion of both public binders:
+OpenCL fresh kernels still need equivalent ownership, and recordings/events remain next.
+
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates
 only a kernel-arena identifier and must remain lazy (no GPU initialization merely to
