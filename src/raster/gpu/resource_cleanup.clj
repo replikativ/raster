@@ -100,6 +100,77 @@
         (when-let [error @failure] (throw error)))))
   nil)
 
+(defn build!
+  "Build an owning map using an already reserved cleanup owner; attach ::owner automatically.
+   Rollback/adoption has the same
+   failure contract as construct!, including original-primary identity when adoption succeeds."
+  [cleanup build adopt-cleanup!]
+  (when-not (and (fn? build) (or (nil? adopt-cleanup!) (fn? adopt-cleanup!)))
+    (throw (ex-info "Native construction requires callbacks" {:reason :invalid-cleanup-plan})))
+  (try
+    (let [value (build)]
+      (when-not (map? value)
+        (throw (ex-info "Native construction must return an owning map"
+                        {:reason :invalid-owned-value})))
+      (assoc value ::owner cleanup))
+    (catch Throwable primary
+      (try (release! cleanup)
+           (catch Throwable secondary
+             (when-not (identical? primary secondary) (.addSuppressed primary secondary))))
+      (when (seq (pending cleanup))
+        (let [fallback #(ex-info "Native construction retains unresolved cleanup ownership"
+                                 {::unresolved cleanup} primary)]
+          (if adopt-cleanup!
+            (try (adopt-cleanup! cleanup)
+                 (catch Throwable adoption-error
+                   (let [wrapper (fallback)]
+                     (.addSuppressed wrapper adoption-error)
+                     (throw wrapper))))
+            (throw (fallback)))))
+      (throw primary))))
+
+(defn acquisition-slot
+  "Reserve backend-local acquisition state before native contact. Not compiler IR/evidence."
+  []
+  (volatile! {:phase :not-acquired}))
+
+(defn acquire-native!
+  "Capture a native create-and-readback result. A throwing native callback/readback has an
+   indeterminate outcome; never infer that no object was created because no value returned."
+  [slot acquire]
+  (when-not (fn? acquire)
+    (throw (ex-info "Native acquisition requires a callback" {:reason :invalid-cleanup-plan})))
+  (when-not (= :not-acquired (:phase @slot))
+    (throw (ex-info "Native acquisition slot is not fresh" {:reason :acquisition-already-started})))
+  (vreset! slot {:phase :acquiring})
+  (try
+    (let [resource (acquire)]
+      (vreset! slot {:phase :live :resource resource})
+      resource)
+    (catch Throwable error
+      (vreset! slot {:phase :indeterminate :error error})
+      (throw error))))
+
+(defn release-native!
+  "Release a successful native acquisition, or report an indeterminate acquisition unchanged.
+   Use only within the containing reserved cleanup owner's serialized callback."
+  [slot release]
+  (when-not (fn? release)
+    (throw (ex-info "Native release requires a callback" {:reason :invalid-cleanup-plan})))
+  (case (:phase @slot)
+    (:not-acquired :released) nil
+    :indeterminate (throw (:error @slot))
+    :live (let [resource (:resource @slot)]
+            (try
+              (release resource)
+              (vreset! slot {:phase :released})
+              nil
+              (catch Throwable error
+                (when-not (true? (:cleanup-retry-safe? (ex-data error)))
+                  (vreset! slot {:phase :indeterminate :error error}))
+                (throw error))))
+    (throw (ex-info "Native acquisition has not completed" {:reason :acquisition-in-progress}))))
+
 (defn construct!
   "Acquire one native resource and build its owning value under immediate rollback ownership.
    build receives [resource cleanup] and must retain cleanup in its returned value. If build
@@ -118,22 +189,6 @@
         acquired (volatile! not-acquired)
         cleanup (owner [{:id id :release #(when-not (identical? not-acquired @acquired)
                                             (release @acquired))}])]
-    (try
-      (vreset! acquired (acquire))
-      (build @acquired cleanup)
-      (catch Throwable primary
-        (try (release! cleanup)
-             (catch Throwable secondary
-               (when-not (identical? primary secondary)
-                 (.addSuppressed primary secondary))))
-        (when (seq (pending cleanup))
-          (let [fallback #(ex-info "Native construction retains unresolved cleanup ownership"
-                                   {::unresolved cleanup} primary)]
-            (if adopt-cleanup!
-              (try (adopt-cleanup! cleanup)
-                   (catch Throwable adoption-error
-                     (let [wrapper (fallback)]
-                       (.addSuppressed wrapper adoption-error)
-                       (throw wrapper))))
-              (throw (fallback)))))
-        (throw primary))))))
+    (build! cleanup
+            #(do (vreset! acquired (acquire)) (build @acquired cleanup))
+            adopt-cleanup!))))

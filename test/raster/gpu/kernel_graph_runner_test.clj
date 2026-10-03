@@ -151,7 +151,9 @@
           (is (= 3 (count @registered)))
           (is (= 3 (count @bound)))
           (is (= 1 (count @recorded)))
-          (is (= {:barriers? true :profile? true} (get-in @recorded [0 :opts])))
+          (is (= {:barriers? true :profile? true}
+                 (select-keys (get-in @recorded [0 :opts]) [:barriers? :profile?])))
+          (is (fn? (get-in @recorded [0 :opts :adopt-cleanup!])))
           (is (= 2 (count @submitted)))
           (is (= @submitted @awaited @released-events))
           (is (empty? (:events @sess)))
@@ -369,6 +371,45 @@
         (is (thrown? clojure.lang.ExceptionInfo (gpu/upload! sess :x (float-array 128))))
         (is (thrown? clojure.lang.ExceptionInfo
                      (gpu/bind-kernel-call! sess :new (probe-artifact) [:x :out {:type :int :value 128}])))
+        (is (= #{:x :out} (set (keys (:buffers @sess)))))))))
+
+(deftest unresolved-recording-construction-blocks-prepared-kernel-destruction
+  (let [buffer {:dtype :float :n-elements 128 :byte-size 512}
+        allocation (bview/allocation {:id :root :byte-size 512 :memory-space :shared
+                                      :device :ze:0 :coherence :host-coherent :ownership :owned})
+        sess (atom {:device-id :ze:0 :session-id :recording-rollback :closed? false :events {}
+                    :buffers {:x buffer :out buffer} :allocations {:x allocation :out allocation}
+                    :kernel-graphs {} :prepared {} :graphs {}})
+        primary (ex-info "append failed" {})
+        destruction (ex-info "list destruction outcome unknown" {})
+        calls (atom [])
+        resolver (fn [_ name]
+                   (case name
+                     "register-kernel!" (fn [& _])
+                     "bind-kernel-call" (fn [& _] {:kernel :prepared})
+                     "record-graph!"
+                     (fn [_ {:keys [adopt-cleanup!]}]
+                       (let [owner (cleanup/owner
+                                     [{:id :list :release #(do (swap! calls conj :list) (throw destruction))}
+                                      {:id :queue :release #(swap! calls conj :queue)}])]
+                         (cleanup/build! owner (fn [] (throw primary)) adopt-cleanup!)))
+                     "destroy-prepared!" (fn [_] (swap! calls conj :kernel))
+                     "free-buffer!" (fn [_] (swap! calls conj :buffer))
+                     (throw (ex-info "unexpected runtime call" {:name name}))))
+        soft (fn [device name] (when (= name "destroy-prepared!") (resolver device name)))]
+    (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+                    (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft}
+      (fn []
+        (is (identical? primary
+                       (try (gpu/bind-kernel-call! sess :failed-recording (probe-artifact)
+                                                  [:x :out {:type :int :value 128}])
+                            (catch Throwable error error))))
+        (is (= [:list :queue] @calls))
+        (is (= 1 (count (:kernel-graphs @sess))))
+        (is (thrown? clojure.lang.ExceptionInfo (gpu/free-buffer! sess :x)))
+        (dotimes [_ 2]
+          (is (identical? destruction (try (gpu/close-session! sess) (catch Throwable error error)))))
+        (is (= [:list :queue] @calls) "neither referenced kernels nor roots may be freed")
         (is (= #{:x :out} (set (keys (:buffers @sess)))))))))
 
 (deftest partial-session-close-retires-successes-before-a-later-failure
