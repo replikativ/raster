@@ -5,10 +5,12 @@
 
 (def ^:private resident-backends
   {:ze {:namespace 'raster.gpu.ze-runtime
+        :kernel-body-c-dialect :opencl-portable
         :memory-space :shared
         :coherence :host-coherent
         :owned-slice? false}
    :ocl {:namespace 'raster.gpu.ocl-runtime
+         :kernel-body-c-dialect :opencl-portable
          :memory-space :device
          :coherence :explicit-transfer
          :owned-slice? true}})

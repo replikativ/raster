@@ -171,6 +171,9 @@
 (def ^:private h-zeDriverGet
   (delay (make-handle "zeDriverGet" (fd I32 PTR PTR))))
 
+(def ^:private h-zeDriverGetProperties
+  (delay (make-handle "zeDriverGetProperties" (fd I32 PTR PTR))))
+
 (def ^:private h-zeDeviceGet
   (delay (make-handle "zeDeviceGet" (fd I32 PTR PTR PTR))))
 
@@ -409,6 +412,39 @@
        :fp16-flags (.get props I32 24)
        :fp32-flags (.get props I32 28)
        :fp64-flags (.get props I32 32)})))
+
+(defn execution-device-info
+  "Actual selected device/driver identity and storage capabilities for offline execution evidence.
+   No catalogue, measurements, native pointers or session UUIDs enter this portable description."
+  []
+  (ensure-init!)
+  (with-open [arena (Arena/ofConfined)]
+    (let [{:keys [driver device]} @state
+          device-props (.allocate arena 512)
+          driver-props (.allocate arena 64)
+          _ (.set device-props I32 0 (int ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES))
+          _ (.set driver-props I32 0 (int 0x1)) ; ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES
+          _ (ze-call! "zeDeviceGetProperties(evidence)" @h-zeDeviceGetProperties
+                      [device device-props])
+          _ (ze-call! "zeDriverGetProperties(evidence)" @h-zeDriverGetProperties
+                      [driver driver-props])
+          unsigned-bytes (fn [segment offset]
+                           (mapv #(bit-and 255 (.get ^MemorySegment segment ValueLayout/JAVA_BYTE
+                                                    (+ (long offset) (long %)))) (range 16)))
+          caps (module-capabilities)]
+      {:backend :ze
+       :device {:uuid (unsigned-bytes device-props 96)
+                :name (.getString device-props 112)
+                :vendor-id (.get device-props I32 20)
+                :device-id (.get device-props I32 24)
+                :flags (.get device-props I32 28)
+                :subdevice-id (.get device-props I32 32)}
+       :driver {:uuid (unsigned-bytes driver-props 16)
+                :version (bit-and 0xffffffff (long (.get driver-props I32 32)))}
+       :module-capabilities caps
+       :storage-types (cond-> #{:byte :int :long :float}
+                        (:fp16? caps) (conj :half)
+                        (:fp64? caps) (conj :double))})))
 
 (defn async-cmd-list
   "The shared ASYNCHRONOUS immediate command list, created lazily. Unlike the default
@@ -1848,9 +1884,30 @@
              (throw (ex-info "Level Zero offline compilation does not yet consume explicit compiler requirements"
                              {:reason :unsupported-compilation-contract :backend :ze
                               :compilation (kart/compilation kernel-info)})))
-         info (cond-> kernel-info
+         payload (when-let [bytes (:spv-bytes kernel-info)] (aclone ^bytes bytes))
+         info (cond-> (assoc kernel-info ::registration-payload-identity
+                            (when payload (bytes-digest payload)))
+                payload (assoc :spv-bytes payload)
                 arena-id (assoc :arena-id arena-id))]
-     (swap! kernel-registry assoc kernel-name info))))
+     (swap! kernel-registry
+            (fn [registry]
+              (let [prior (get registry kernel-name)
+                    same-program? (and (:module prior) (:kernel-handle prior)
+                                       (= (:source prior) (:source info))
+                                       (= (:target prior) (:target info))
+                                       (= (kart/compilation prior) (kart/compilation info))
+                                       (= (:arena-id prior) (:arena-id info))
+                                       (contains? prior ::registration-payload-identity)
+                                       (= (::registration-payload-identity prior)
+                                          (::registration-payload-identity info)))]
+                ;; Binding owns a separate dedicated kernel. Re-registering the identical
+                ;; module must not discard the cached registry kernel and scalar staging.
+                (assoc registry kernel-name
+                       (if same-program?
+                         (merge info
+                                (select-keys prior [:module :kernel-handle :entry-name :spv-bytes])
+                                (into {} (filter (fn [[_ value]] (instance? MemorySegment value))) prior))
+                         info))))))))
 
 (defn kernel-registry-entry
   "Public read of a registered kernel's info map (source, :array-params, :scalar-params, dtype,

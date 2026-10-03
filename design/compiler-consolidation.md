@@ -1450,6 +1450,33 @@ patterns, staging boundaries, digest failures, overflow, partial overlap and clo
 Pivotal review found no blocker. Full CI remains required; publication and independent semantic
 restore matching are not established by this codec alone.
 
+### Owner-bound resident storage evidence — 2026-10-03
+
+The new measurement API uses the existing exact-artifact seal and LinkedExecutable exclusive
+mutation guard, not another session convention or cache. An original Compiled owns generated
+probe scratch/binding/readback; success leaves no scratch graph/buffer/event, invalidates old
+output readiness/wrappers and does not credit a program replay. Runtime emitter selection comes
+from the existing resident-backend descriptor. Actual selected device/driver facts are queried
+directly on OpenCL/Level Zero, not inferred from catalogue scheduling estimates.
+
+Completed storage descriptions require a live original receipt and matching original dtype facts
+from the same exact executable/session/session-id and program. Portable data labels the already
+addressed physical leaf bytes with explicit raw-array order; it is not a new authority token,
+logical quantization descriptor, state commit or universal codec proof. Pure admission failures
+do not mutate; surfaced in-scope native/cleanup faults poison the owner and preserve primary errors
+while attempting both graph/scratch API releases. Existing shared destructors can swallow native
+destruction failures, so strict native destruction/failed-resource retention is still explicit
+runtime cleanup debt, not a reclamation proof from these tests. Identical ZE registration retains
+cached module/kernel/staging; native repeated measurement checks that the registry handle survives.
+Registration-time target/source/compiler/arena identity distinguishes source-compiled cache bytes
+from explicitly supplied SPIR-V. Explicit payloads are cloned and fingerprinted on registration;
+source-only and explicit modes cannot alias after lazy loading. Six hardware-free registry tests
+cover both transitions, target/arena/source/payload changes, unknown provenance and caller mutation.
+Focused owner, fault, native, output-lease and backend suites pass
+20 tests / 289 assertions; actual OpenCL and Level Zero integration has no local native skip.
+Semantic field selection, bounded provider staging and producer-derived manifest construction
+remain the next seam. General device-side canonical packing remains a separate IR vertical.
+
 ### Generated storage representation probes — 2026-10-03
 
 The resident producer path hashes device-native bytes and deliberately supplies no byte order.

@@ -1687,3 +1687,38 @@ and six scalar routes out of 251 functions; it has no compatibility route. That 
 ratchet for the selected corpus, not proof that the compatibility pipeline is dead for external
 programs such as city-rstr. Remove compatibility lowering only after a production-path reachability
 audit and explicit fail-loud replacements for its remaining admitted forms.
+
+### 2026-10-03 — durable producer/storage authority seam
+
+Items 1–8 remain the campaign, not just the currently active storage slice. Recent producer work
+retains original compiler-owned Prepared/Compiled identity, tracks synchronous replay completion,
+pins byte receipts and hashes actual resident initialization/output/post-state rather than caller
+defaults. Verified raw-array decoding uses explicit dtype/byte order and bounded staging. Provider
+availability finalization closes verified local leases and awaits matching durable placements
+before invoking external metadata publication; provider/store realization is still separate.
+
+Generated per-dtype KernelBody probes now establish measured storage order on local OpenCL and
+Level Zero; all six sources also pass the exact-head CUDA/HIP compile gates (#1001). Owner-bound
+measurement shares the artifact seal, lifetime guard, emitter and binder rather than adding a
+cache/session convention. A live completed receipt can join only original same-owner/session/dtype
+facts, then expose addressed physical leaf bytes with explicit raw-array storage. This is not
+logical quantization inference, universal arithmetic/codec equivalence or a durable state commit.
+
+Pivotal review caught loose byte coercion, dishonest optional-capability coverage, repeated ZE
+registry-kernel leakage and source-only/explicit-SPIR-V cache aliasing. These have independent
+regressions; focused storage/owner/registry/native/CI-ratchet suites pass 36 tests / 767 assertions.
+Both local native backends execute actual retained compiler programs, not only emitted-source
+tests. No timing claim is made under varying load and power-save settings.
+
+Next acceptance order within item 8:
+
+1. Make shared native graph/prepared destruction report failures and retain unresolved resources
+   honestly. Current older destructors swallow some native errors; surfaced API cleanup tests do
+   not prove native reclamation. Do not invent a separate checkpoint-only lifetime convention.
+2. Bind semantic field/coordinate selection to the addressed producer leaves, stage/verify bounded
+   immutable chunks and construct producer-derived manifests before real provider publication.
+3. Extend scalable hierarchy/patch packing and temporal interpolation/subcycling/reflux validation.
+
+Canonical external training/package migration, performance/selection evidence, real fabric and
+multi-device collectives and production storage/AMR acceptance remain open as listed above. The
+local evidence and compile-only vendor gates do not establish those broader end states.
