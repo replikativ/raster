@@ -277,3 +277,26 @@
                 (is (identical? error (error-of #(ze/destroy-kernel! kernel))))
                 (is (= :module-in-use (:reason (ex-data (error-of close!)))))
                 (is (= ["zeModuleCreate" "zeKernelCreate" "zeKernelDestroy"] @calls))))))))))
+
+(deftest direct-module-and-kernel-native-callbacks-cannot-enter-the-registration-registry
+  (doseq [operation ["zeModuleCreate" "zeKernelCreate" "zeKernelDestroy"]]
+    (let [observed (atom [])
+          v #(ns-resolve 'raster.gpu.ze-runtime %)]
+      (with-runtime
+        {:on-native (fn [current _ _]
+                      (when (= current operation)
+                        (swap! observed into
+                               (mapv error-of
+                                     [#(ze/close-kernel-arena! :unregistered)
+                                      #((v 'ensure-kernel-loaded!) "unregistered")
+                                      #((v 'ensure-seg) "unregistered" :stage 1)
+                                      #((v 'ensure-arr) "unregistered" :array 1)]))))}
+        (fn [{:keys [registry calls close!]}]
+          (let [module (ze/load-module! (byte-array [1]))
+                kernel (ze/create-kernel-fresh module "k")]
+            (ze/destroy-kernel! kernel)
+            (is (= (vec (repeat 4 :registration-in-use))
+                   (mapv #(-> % ex-data :reason) @observed)))
+            (is (empty? @registry))
+            (is (= ["zeModuleCreate" "zeKernelCreate" "zeKernelDestroy"] @calls))
+            (close!)))))))

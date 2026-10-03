@@ -1880,6 +1880,9 @@
 
 (defn- assert-registration-live! [info]
   (cleanup/assert-live! (registration-owner! info))
+  (when-let [slot (:root-lease (::registration info))]
+    (when (= :live (:phase @slot))
+      (root/assert-lease-live! state (:resource @slot))))
   (when-let [context @(:context (::registration info))]
     (when-not (identical? context (:context @state))
       (throw (ex-info "Kernel belongs to a retired Level Zero context"
@@ -1891,6 +1894,7 @@
 
 (defn- reserve-registration [info compiler-info]
   (let [kernel (cleanup/acquisition-slot) context (volatile! nil)
+        root-lease (cleanup/acquisition-slot)
         staging (atom {}) cached (atom {})
         owner (cleanup/owner
                [{:id :kernel
@@ -1901,14 +1905,19 @@
                                                        {:reason :runtime-generation-mismatch})))
                                      (destroy-kernel! handle)))}
                 {:id :staging :after #{:kernel}
-                 :release #(cleanup/release-entries! staging (vec @staging) cleanup/release!)}])]
+                 :release #(cleanup/release-entries! staging (vec @staging) cleanup/release!)}
+                {:id :runtime-root-lease :after #{:kernel :staging}
+                 :release #(cleanup/release-native! root-lease
+                                                    (fn [lease] (cleanup/release! (::cleanup/owner lease))))}])]
     (assoc info ::cleanup/owner owner
            ::registration {:kernel kernel :context context :staging staging :cached cached
-                           :arrays (atom {}) :artifact compiler-info})))
+                           :root-lease root-lease :arrays (atom {}) :artifact compiler-info})))
 
 (defn close-kernel-arena!
   "Release exact base-kernel/staging owners; modules are borrowed from the shared runtime cache."
   [arena-id]
+  (cleanup/assert-registry-mutable! state)
+  (cleanup/assert-registry-mutable! (:modules @state))
   (cleanup/with-registry-use kernel-registry
     (cleanup/release-entries!
      kernel-registry (filterv (fn [[_ info]] (= (:arena-id info) arena-id)) @kernel-registry)
@@ -2100,6 +2109,8 @@
   "Lazily compile SPIR-V and load module for a registered kernel.
   Returns updated kernel-info with :module and :kernel-handle."
   [kernel-name]
+  (cleanup/assert-registry-mutable! state)
+  (cleanup/assert-registry-mutable! (:modules @state))
   (cleanup/with-registry-use kernel-registry
     (let [info (get @kernel-registry kernel-name)]
       (when-not info
@@ -2114,13 +2125,16 @@
          (registration-owner! info)
          (fn []
            (let [slots (::registration info)
-                 _ (vreset! (:context slots) (:context @state))
+                 lease (root/capture-lease! state (:root-lease slots))
+                 _ (root/assert-lease-live! state lease)
+                 projection @(:projection (::root/entry lease))
+                 _ (vreset! (:context slots) (:context projection))
             ;; Precompiled SPIR-V was built with the registry name as its entry.
                  [entry-name source] (if (:spv-bytes info)
                                        [kernel-name (:source info)]
                                        (canonical-entry kernel-name (:source info)))
             ;; Compile SPIR-V if not already done
-                 device-hex (:device-id-hex @state)
+                 device-hex (:device-id-hex projection)
                  spv-bytes (or (:spv-bytes info)
                                (let [cache (delay
                                              ((requiring-resolve
@@ -2151,6 +2165,8 @@
 (defn- ensure-seg
   "Return a segment borrowed from a canonical registration-owned byte buffer."
   ^MemorySegment [^String kernel-name k ^long n-bytes]
+  (cleanup/assert-registry-mutable! state)
+  (cleanup/assert-registry-mutable! (:modules @state))
   (when (neg? n-bytes)
     (throw (ex-info "Registration staging extent must be non-negative" {:reason :invalid-staging-extent})))
   (cleanup/with-registry-use kernel-registry
@@ -2189,6 +2205,8 @@
   "Return a cached short-array for [kernel-name k], allocating if absent
   or smaller than n-elems."
   ^shorts [^String kernel-name k ^long n-elems]
+  (cleanup/assert-registry-mutable! state)
+  (cleanup/assert-registry-mutable! (:modules @state))
   (when (neg? n-elems)
     (throw (ex-info "Registration staging extent must be non-negative" {:reason :invalid-staging-extent})))
   (cleanup/with-registry-use kernel-registry

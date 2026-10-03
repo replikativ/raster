@@ -2242,7 +2242,8 @@ requirements remain unchanged and incomplete.
 
 ### Resource-lease follow-up (R2, in progress)
 
-PR #1017 landed R1; work continues on `runtime/root-resource-leases`. Its first hardware-free gate exercises
+PR #1017 landed R1; PR #1018 passed all seven exact-head CI gates and merged as
+`d4cb8c17`. Its first hardware-free gate exercises
 generation-qualified lease admission/retirement, concurrent independent leases,
 failed lazy-child acquisition, and lost-generation cleanup debt. No live teardown
 is enabled by introducing this primitive. Canonical OCL/ZE buffers now acquire a
@@ -2261,9 +2262,24 @@ construction boundary, not a buffer-specific dispatch convention.
 
 Current focused evidence: 169 tests, 1,770 assertions pass; seven real-device boundary
 checks (84 assertions), six live-root/reset checks, and two real-device buffer/view
-lease checks (eight assertions) pass on Intel Arc OpenCL and Level Zero. Pivotal review
-and exact-head CI are required before this follow-up merges. No timing or full live
+lease checks (eight assertions) pass on Intel Arc OpenCL and Level Zero. No timing or full live
 root teardown claim follows from these tests.
+
+The next slice, `runtime/registration-root-leases`, keeps metadata-only registrations
+lazy. Loading acquires one exact root lease before native program/module/kernel contact;
+the registration cleanup DAG releases it only after kernel, program and staging cleanup.
+Identical registration reuses that authority. Known rollback retires the pin, while
+unknown native acquisition/destruction retains the composite owner and blocks retirement.
+Pure root-admission rejection leaves its reserved slot fresh; publication failure uses
+the common owner transaction rather than pretending a native acquisition occurred.
+Pre-lock lifecycle guards also reject native callbacks entering the registration registry,
+including ZE module-cache callbacks, before lock-order inversion can occur.
+
+Registration-slice acceptance: 176 focused tests / 1,844 assertions pass in the persistent
+REPL; seven actual-device boundary checks / 84 assertions, six live-root/reset assertions,
+and two buffer/view tests / eight assertions pass on the local OpenCL/Level Zero device.
+Review found no remaining blocker; final exact-head review and CI remain required.
+Prepared calls, recordings/events and raw allocation consumers are still outstanding.
 
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates

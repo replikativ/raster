@@ -6,6 +6,7 @@
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.runtime-root :as root]
             [raster.gpu.test-lifecycle :as lifecycle])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]
            [java.lang.invoke MethodHandles MethodType]))
@@ -23,6 +24,10 @@
           registry (atom {}) dispatches (atom {})
           context (MemorySegment/ofAddress 900)
           module (MemorySegment/ofAddress 901)
+          state (atom {:initialized? false})
+          _ (root/initialize! state []
+                              (fn [_] {:arena arena :context context :device MemorySegment/NULL
+                                       :device-info {}}))
           calls (atom []) next-handle (atom 100)
           failure (ex-info "native fault" {})
           acquire (fn [kind]
@@ -36,8 +41,7 @@
                     (when (= kind (:release-failure options)) (throw failure)))
           common {(v 'kernel-registry) registry (v 'kernel-dispatch-registry) dispatches
                   (v 'ensure-init!) (fn [])
-                  (v 'state) (atom {:arena arena :context context :device MemorySegment/NULL
-                                    :device-info {} :initialized? true})}
+                  (v 'state) state}
           native (if (= :ocl backend)
                    {(v 'h-clCreateProgramWithSource)
                     (native-handle 5 (fn [_ _ _ _ err]
@@ -75,6 +79,70 @@
 
 (defn- spec [name] {:kernel-name name :source "source" :spv-bytes (byte-array [1 2])})
 (defn- releases [calls] (mapv second (filter #(= :release (first %)) @calls)))
+
+(deftest registration-remains-lazy-and-loaded-generations-have-one-balanced-root-pin
+  (doseq [backend [:ocl :ze]]
+    (with-backend backend {}
+      (fn [{:keys [register! load! close! state registry calls]}]
+        (let [info (spec "lazy_pin")]
+          (register! "lazy_pin" info :fixture)
+          (is (zero? (root/lease-count state)))
+          (is (empty? @calls))
+          (let [loaded (load! "lazy_pin")
+                owner (::cleanup/owner loaded)]
+            (is (= 1 (root/lease-count state)))
+            (is (identical? owner (::cleanup/owner (load! "lazy_pin"))))
+            (register! "lazy_pin" info :fixture)
+            (is (identical? owner (::cleanup/owner (get @registry "lazy_pin"))))
+            (is (= 1 (root/lease-count state)))
+            (close! :fixture)
+            (is (zero? (root/lease-count state)))
+            (is (empty? @registry))))))))
+
+(deftest unknown-registration-create-and-destroy-keep-the-root-pinned
+  (doseq [backend [:ocl :ze] fault [:create :destroy]]
+    (with-backend backend
+      (if (= fault :create)
+        {:acquire-failure (if (= backend :ocl) :program :kernel)}
+        {:release-failure :kernel})
+      (fn [{:keys [register! load! close! state registry failure]}]
+        (register! "uncertain_pin" (spec "uncertain_pin") :fixture)
+        (if (= fault :create)
+          (is (identical? failure (error-of #(load! "uncertain_pin"))))
+          (do (load! "uncertain_pin")
+              (is (identical? failure (error-of #(close! :fixture))))))
+        (is (= 1 (root/lease-count state)))
+        (let [owner (::cleanup/owner (get @registry "uncertain_pin"))]
+          (is (some? owner))
+          (is (= :runtime-root-lease (last (cleanup/pending owner))))
+          (is (identical? failure (error-of #(close! :fixture))))
+          (is (= 1 (root/lease-count state))))))))
+
+(deftest known-build-failure-retires-program-before-releasing-the-root-pin
+  (with-backend :ocl {:build-failure true}
+    (fn [{:keys [register! load! state calls failure]}]
+      (register! "failed_build" (spec "failed_build") :fixture)
+      (is (identical? failure (error-of #(load! "failed_build"))))
+      (is (= [:program] (releases calls)))
+      (is (zero? (root/lease-count state))))))
+
+(deftest pure-root-admission-decline-does-not-create-indeterminate-registration-debt
+  (doseq [backend [:ocl :ze]]
+    (with-backend backend {}
+      (fn [{:keys [register! load! state registry calls v]}]
+        (register! "unavailable_root" (spec "unavailable_root") :fixture)
+        (with-redefs-fn {(v 'ensure-init!) #(swap! state assoc :initialized? false)}
+          (fn []
+            (let [error (error-of #(load! "unavailable_root"))
+                  info (get @registry "unavailable_root")]
+              (is (= :runtime-root-unavailable (:reason (ex-data error))))
+              (is (nil? (::cleanup/unresolved (ex-data error))))
+              (is (empty? (cleanup/pending (::cleanup/owner info))))
+              (is (= :not-acquired
+                     (:phase @(:root-lease
+                               ((if (= backend :ocl) ::ocl/registration ::ze/registration)
+                                info)))))
+              (is (empty? @calls)))))))))
 
 (deftest compiler-registry-read-preserves-artifacts-without-importing-runtime-authority
   (doseq [backend [:ocl :ze]]

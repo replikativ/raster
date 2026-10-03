@@ -160,6 +160,21 @@
   [state]
   (cleanup/with-registry-use state (lease-under-lock! state)))
 
+(defn capture-lease!
+  "Capture a lease in an existing child's reserved acquisition slot. Admission is pure:
+   rejection leaves the slot untouched, unlike an indeterminate native create/readback."
+  [state slot]
+  (cleanup/with-registry-use state
+    (when-not (= :not-acquired (:phase @slot))
+      (throw (ex-info "Runtime lease acquisition slot is not fresh"
+                      {:reason :acquisition-already-started})))
+    (let [lease (lease-under-lock! state)]
+      ;; Even JVM publication may fail after the pin exists. The common transaction
+      ;; releases that exact lease or returns its unresolved owner, preserving the cause.
+      (cleanup/build! (::cleanup/owner lease)
+                      #(do (vreset! slot {:phase :live :resource lease}) lease)
+                      nil))))
+
 (defn construct-child!
   "Construct one canonical child owner, with the root lease as its final dependency.
    build receives that composite Cleanup and the exact root entry under the lifecycle lock.
