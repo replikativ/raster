@@ -276,15 +276,6 @@
 (def ^:private h-zeModuleDestroy
   (delay (make-handle "zeModuleDestroy" (fd I32 PTR))))
 
-(def ^:private h-zeKernelDestroy
-  (delay (make-handle "zeKernelDestroy" (fd I32 PTR))))
-
-(def ^:private h-zeCommandListDestroy
-  (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
-
-(def ^:private h-zeCommandQueueDestroy
-  (delay (make-handle "zeCommandQueueDestroy" (fd I32 PTR))))
-
 ;; ================================================================
 ;; State
 ;; ================================================================
@@ -2621,12 +2612,6 @@
       (await-event! event)
       (finally
         (release-event! event)))))
-
-(defn- destroy-handle!
-  [^MethodHandle mh ^MemorySegment seg]
-  (when (and seg (not (.equals MemorySegment/NULL seg)))
-    (try (.invokeWithArguments mh ^java.util.List (java.util.List/of (object-array [seg])))
-         (catch Exception _))))
 
 (defn destroy-prepared!
   "Destroy the DEDICATED kernel handle a prepared binding owns (create-kernel-fresh allocates one
