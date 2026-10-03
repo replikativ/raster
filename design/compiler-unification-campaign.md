@@ -1722,3 +1722,37 @@ Next acceptance order within item 8:
 Canonical external training/package migration, performance/selection evidence, real fabric and
 multi-device collectives and production storage/AMR acceptance remain open as listed above. The
 local evidence and compile-only vendor gates do not establish those broader end states.
+
+#### Shared native teardown consolidation: acceptance slices
+
+The resource-cleanup mechanism is owner-local runtime state, not compiler IR or a second authority
+registry. Ordered destruction dependencies retain failed and blocked resources; successful releases
+are removed exactly once. A thrown error defaults to an indeterminate outcome, so another close
+reports it without repeating the native call. Only failures explicitly classified retry-safe by
+the internal callback contract retry; this ordinary error marker is not authority or evidence.
+No native OpenCL/Level Zero error is classified as retry-safe merely because it is nonzero.
+
+Land this consolidation in dependency order, keeping items 1–8 above intact:
+
+1. Validate the small owner-local mechanism with dependency, suppression, concurrency, recursive
+   teardown and indeterminate-outcome tests. This alone makes no native reclamation claim.
+2. Capture ownership immediately after each backend acquisition, including partial constructors;
+   check native release statuses. Retain event arenas until all dependent events are released.
+3. Integrate KernelGraph lifecycle under the session lock. Handle identity must include the session
+   and generation, avoiding cross-session/key-replacement ABA. Retain provisional/retired owners on
+   failed construction or replacement; drain events first; remove ownership only after success.
+4. Extend the same ownership to descriptor prepared/recorded graphs and their exact dependencies,
+   then root buffers, kernel arenas and LinkedExecutable/parallel-program close. Do not mark a
+   wrapper closed before failed teardown resources have an honest retained disposition.
+
+Pivotal review identified constructor rollback, stale graph handles and early wrapper-close flags
+as correctness requirements, not optional cleanup. Native dependency ordering is graph recordings
+before prepared kernels, kernels before private views/buffers, profiling events before pools and
+pointer arenas, and session children before root storage. Independent siblings may continue after
+failure only when that independence is actually established. Use of the owner must share the
+surrounding session lock with release; a standalone live-status check does not pin resources.
+
+Regression acceptance includes every acquisition/release fault, suppressed cleanup errors retaining
+the primary failure, old graphs surviving failed new construction, stale-handle rejection, no double
+release, and failed dependent destruction preventing buffer free. Performance acceptance remains
+separate from correctness under laptop power-save/background-load conditions.
