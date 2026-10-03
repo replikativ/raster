@@ -4,6 +4,62 @@
 
 (defn- error-of [f] (try (f) nil (catch Throwable e e)))
 
+(deftest reserved-acquisitions-retain-unknown-outcomes-and-independent-resources
+  (let [calls (atom []) list-slot (cleanup/acquisition-slot)
+        queue-slot (cleanup/acquisition-slot) pool-slot (cleanup/acquisition-slot)
+        failure (ex-info "create/readback outcome unknown" {})
+        adopted (atom nil)
+        owner (cleanup/owner
+                [{:id :list :release #(cleanup/release-native! list-slot
+                                      (fn [v] (swap! calls conj [:list v])))}
+                 {:id :pool :after #{:list}
+                  :release #(cleanup/release-native! pool-slot
+                              (fn [v] (swap! calls conj [:pool v])))}
+                 {:id :queue :release #(cleanup/release-native! queue-slot
+                                       (fn [v] (swap! calls conj [:queue v])))}])]
+    (is (identical? failure
+          (error-of #(cleanup/build! owner
+                        (fn []
+                          (cleanup/acquire-native! queue-slot (constantly :queue-handle))
+                          (cleanup/acquire-native! list-slot (fn [] (throw failure)))
+                          (throw (AssertionError. "unreachable")))
+                        (fn [retained] (reset! adopted retained))))))
+    (is (identical? owner @adopted))
+    (is (= [[:queue :queue-handle]] @calls))
+    ;; The never-created pool is a blocked plan entry, not evidence of an allocation.
+    (is (= [:list :pool] (cleanup/pending owner)))
+    (is (identical? failure (error-of #(cleanup/release! owner))))
+    (is (= [[:queue :queue-handle]] @calls))))
+
+(deftest reserved-acquisition-release-is-exact-once-and-retry-is-explicit
+  (doseq [retry-safe? [true false]]
+    (let [slot (cleanup/acquisition-slot) calls (atom 0)
+          failure (ex-info "release failed" {:cleanup-retry-safe? retry-safe?})
+          release (fn [_] (when (= 1 (swap! calls inc)) (throw failure)))]
+      (cleanup/acquire-native! slot (constantly :native))
+      (is (identical? failure (error-of #(cleanup/release-native! slot release))))
+      (if retry-safe?
+        (do (is (nil? (cleanup/release-native! slot release)))
+            (is (nil? (cleanup/release-native! slot release)))
+            (is (= 2 @calls)))
+        (do (is (identical? failure (error-of #(cleanup/release-native! slot release))))
+            (is (= 1 @calls)))))))
+
+(deftest owning-build-attaches-owner-and-invalid-results-roll-back
+  (let [calls (atom 0) owner (cleanup/owner [{:id :native :release #(swap! calls inc)}])]
+    (is (identical? owner (::cleanup/owner (cleanup/build! owner (constantly {}) nil))))
+    (is (zero? @calls))
+    (is (= :invalid-owned-value
+           (:reason (ex-data (error-of #(cleanup/build! owner (constantly :not-a-map) nil))))))
+    (is (= 1 @calls)))
+  (let [slot (cleanup/acquisition-slot)]
+    (is (= :invalid-cleanup-plan
+           (:reason (ex-data (error-of #(cleanup/acquire-native! slot nil))))))
+    (is (= :not-acquired (:phase @slot)))
+    (cleanup/acquire-native! slot (constantly :native))
+    (is (= :acquisition-already-started
+           (:reason (ex-data (error-of #(cleanup/acquire-native! slot (constantly :other)))))))))
+
 (deftest validates-the-entire-plan-before-release
   (let [calls (atom 0) release #(swap! calls inc)]
     (doseq [plan [nil (list {:id :a :release release})
