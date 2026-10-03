@@ -11,6 +11,7 @@
             [raster.compiler.ir.kernel-executable :as kernel-executable]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.link :as gpu-link]))
 
 (defn- split-gemm-descriptor
@@ -103,7 +104,7 @@
             "buffer-as-float-buffer" (fn [& _] (throw (AssertionError. "unused")))
             "buffer-as-int-buffer" (fn [& _] (throw (AssertionError. "unused")))
             "register-kernel!" (fn [name artifact] (swap! registered conj [name artifact]))
-            "bind-kernel-call" (fn [call & _] {:kernel-call call})
+            "bind-kernel-call" (fn [call & _] {:kernel-call call ::cleanup/owner (cleanup/owner [])})
             "record-graph!" (fn [bounds & [options]]
                               (let [graph {:bounds (vec bounds) :options options}]
                                 (swap! recorded conj graph)
