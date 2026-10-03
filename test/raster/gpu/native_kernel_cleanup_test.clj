@@ -120,6 +120,13 @@
 
 (deftest ze-recording-keeps-dependent-pool-and-attempts-independent-destruction
   (doseq [failed-id [:list [:event 0] :pool :queue]]
+    ;; recording-owner captures the handle delays while reserving callbacks: replace them
+    ;; before reservation, not just before release. Otherwise laptop-loaded delays hide a
+    ;; dependency on the native loader that fails on hardware-free CI.
+    (with-redefs-fn
+      (into {} (map (fn [name] [(ns-resolve 'raster.gpu.ze-runtime name) (delay :fake)])
+                    '[h-zeCommandListDestroy h-zeEventDestroy h-zeEventPoolDestroy h-zeCommandQueueDestroy]))
+      (fn []
     (let [{:keys [slots owner]} ((ns-resolve 'raster.gpu.ze-runtime 'recording-owner) 2)
           calls (atom []) failure (ex-info "destroy outcome unknown" {})
           label->id {"zeCommandListDestroy" :list "zeEventPoolDestroy" :pool
@@ -129,7 +136,11 @@
       (doseq [[id address] resources]
         (cleanup/acquire-native! (get slots id) #(MemorySegment/ofAddress (long address))))
       (with-redefs-fn
-        {(ns-resolve 'raster.gpu.ze-runtime 'ze-call!)
+        {(ns-resolve 'raster.gpu.ze-runtime 'h-zeCommandListDestroy) (delay :fake)
+         (ns-resolve 'raster.gpu.ze-runtime 'h-zeEventDestroy) (delay :fake)
+         (ns-resolve 'raster.gpu.ze-runtime 'h-zeEventPoolDestroy) (delay :fake)
+         (ns-resolve 'raster.gpu.ze-runtime 'h-zeCommandQueueDestroy) (delay :fake)
+         (ns-resolve 'raster.gpu.ze-runtime 'ze-call!)
          (fn [label _ args]
            (let [id (if (= "zeEventDestroy" label)
                       (reverse-resources (.address ^MemorySegment (first args)))
@@ -149,4 +160,4 @@
                    :queue [:queue]) (cleanup/pending owner)))
           (let [before @calls]
             (is (identical? failure (error-of #(ze/destroy-graph! {::cleanup/owner owner}))))
-            (is (= before @calls))))))))
+            (is (= before @calls))))))))))
