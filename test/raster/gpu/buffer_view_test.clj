@@ -3,6 +3,8 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.core :as gpu]))
 
 (defn- allocation [id bytes ownership]
@@ -10,8 +12,16 @@
                      :coherence :host-coherent :ownership ownership}))
 
 (defn- mock-session [buffer allocation]
-  (atom {:device-id :ze:0 :session-id :session :buffers {:cache buffer}
-         :allocations {:cache allocation} :kernel-graphs {} :events {} :closed? false}))
+  (let [owned? (= :owned (:ownership allocation))
+        buffer (if owned?
+                 (lifecycle/native-buffer
+                  (constantly buffer)
+                  #(((ns-resolve (the-ns (quote raster.gpu.core)) (quote rt-resolve))
+                     :ze:0 "free-buffer!") %) {})
+                 buffer)]
+    (atom {:device-id :ze:0 :session-id :session :buffers {:cache buffer}
+           :buffer-owners (if owned? {:cache (::cleanup/owner buffer)} {})
+           :allocations {:cache allocation} :kernel-graphs {} :events {} :closed? false})))
 
 (deftest resident-views-translate-ranges-and-expire-with-the-allocation
   (let [buffer {:dtype :float :n-elements 16 :byte-size 64}
@@ -31,7 +41,7 @@
           (is (gpu/resident-buffer-view? middle))
           (gpu/upload-range! sess middle (float-array 2)
                              {:src-element 0 :dst-element 1 :elements 2})
-          (is (= [buffer {:src-element 0 :dst-element 5 :elements 2}] @uploaded))
+          (is (= [(get-in @sess [:buffers :cache]) {:src-element 0 :dst-element 5 :elements 2}] @uploaded))
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds the buffer view"
                                 (gpu/upload-range! sess middle (float-array 2)
                                                    {:dst-element 7 :elements 2})))
@@ -41,13 +51,14 @@
                                                      {:dtype :float :shape [1]}))))))))
 
 (deftest external-registrations-are-never-freed-by-raster
-  (let [buffer {:dtype :float :n-elements 4 :byte-size 16}
+  (let [buffer {:dtype :float :n-elements 4 :byte-size 16 ::cleanup/owner (cleanup/owner [])}
         sess (atom {:device-id :ze:0 :session-id :session :buffers {} :allocations {}
                     :closed? false})
         freed (atom [])
         resolver (fn [_ name]
                    (case name
                      "device-buffer?" map?
+                     "assert-buffer-live!" #(cleanup/assert-live! (cleanup/lifetime-owner %))
                      "free-buffer!" #(swap! freed conj %)
                      (throw (ex-info "unexpected runtime function" {:name name}))))]
     (with-redefs-fn

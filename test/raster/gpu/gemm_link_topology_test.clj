@@ -12,6 +12,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.test-lifecycle :as lifecycle]
             [raster.gpu.link :as gpu-link]))
 
 (defn- split-gemm-descriptor
@@ -93,12 +94,15 @@
         (fn [_ name]
           (case name
             "device-buffer?" (fn [buffer] (some? (:mock-allocation-id buffer)))
+            "assert-buffer-live!" (fn [buffer] (cleanup/assert-live! (::cleanup/owner buffer)) buffer)
             "make-buffer"
-            (fn [elements dtype]
-              {:mock-allocation-id (swap! buffer-counter inc)
-               :dtype dtype :n-elements elements
-               :byte-size (* (long elements) (element-bytes dtype))
-               :alignment 64})
+            (fn [elements dtype opts]
+              (lifecycle/native-buffer
+               #(hash-map :mock-allocation-id (swap! buffer-counter inc)
+                          :dtype dtype :n-elements elements
+                          :byte-size (* (long elements) (element-bytes dtype))
+                          :alignment 64)
+               (fn [_]) opts))
 
             "array->buffer!" (fn [buffer _] buffer)
             "buffer-as-float-buffer" (fn [& _] (throw (AssertionError. "unused")))
@@ -117,7 +121,7 @@
         (let [executable (gpu-link/instantiate!
                           plan (cond-> {:session session}
                                  captured? (assoc :external-buffers
-                                                   {:b ((runtime-function :ze:0 "make-buffer") (* n k) :float)})))
+                                                   {:b ((runtime-function :ze:0 "make-buffer") (* n k) :float {})})))
               phase (first (:phases executable))
               bound (get-in @session [:prepared phase])
               prepareds (:prepareds bound)

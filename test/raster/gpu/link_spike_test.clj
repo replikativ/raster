@@ -382,14 +382,14 @@
                        :buffers {} :allocations {} :closed? false})
         buffer {:byte-size 16 :alignment 64 :dtype :float :n-elements 4}]
     (with-redefs-fn
-      {(ns-resolve 'raster.gpu.core 'alloc-buffers-transactional)
-       (fn [specs _device]
-         (is (= {:node [:float 4 nil {:allocation-id :certified
-                                      :memory-space :device
-                                      :coherence :device-only
-                                      :alignment 64}]}
-                specs))
-         {:node buffer})}
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [_device name]
+         (case name
+           "make-buffer" (fn [n dtype opts]
+                           (is (= [4 :float] [n dtype]))
+                           (raster.gpu.test-lifecycle/native-buffer (constantly buffer) (fn [_]) opts))
+           "array->buffer!" (fn [buffer _] buffer)
+           (throw (ex-info "Unexpected runtime function" {:name name}))))}
       (fn []
         (gpu/alloc! session
                     {:node [:float 4 nil {:allocation-id :certified

@@ -697,21 +697,32 @@
 ;; Memory allocation
 ;; ================================================================
 
-(defn alloc-shared
-  "Allocate shared (host+device visible) memory. Returns MemorySegment."
-  ^MemorySegment [^long n-bytes]
-  (ensure-init!)
-  (let [arena (:arena @state)
-        ctx (:context @state)
-        dev (:device @state)
-        dev-desc (.allocate arena 24)
+(defn- alloc-shared-raw
+  "Return the native allocation pointer before any reinterpretation/setup can throw."
+  ^MemorySegment [ctx dev ^Arena arena n-bytes]
+  (let [dev-desc (.allocate arena 24)
         _ (.set dev-desc I32 0 (int ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC))
         host-desc (.allocate arena 24)
         _ (.set host-desc I32 0 (int ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC))
         out-ptr (ptr-seg arena)]
     (ze-call! "zeMemAllocShared" @h-zeMemAllocShared
               [ctx dev-desc host-desc (long n-bytes) (long 64) dev out-ptr])
-    (.reinterpret (read-ptr out-ptr) n-bytes)))
+    (read-ptr out-ptr)))
+
+(defn alloc-shared
+  "Allocate shared (host+device visible) memory. Returns MemorySegment."
+  ^MemorySegment [^long n-bytes]
+  (ensure-init!)
+  (let [{:keys [context device arena]} @state]
+    (.reinterpret (alloc-shared-raw context device arena n-bytes) n-bytes)))
+
+(defn- free-in-context!
+  "Destroy with the exact allocation context; never initialize/guess a replacement context."
+  [context segment]
+  (when-not (identical? context (:context @state))
+    (throw (ex-info "Buffer belongs to a retired Level Zero runtime context"
+                    {:reason :runtime-generation-mismatch})))
+  (ze-call! "zeMemFree" @h-zeMemFree [context segment]))
 
 (defn alloc-device
   "Allocate device-only memory. Returns MemorySegment."
@@ -855,6 +866,21 @@
   [x]
   (instance? DeviceBuffer x))
 
+(defn assert-buffer-live!
+  "Validate root-owner liveness, including for non-owning pointer slices. Not a concurrent-use
+   lease: the containing session still serializes use and destruction."
+  [buf]
+  (if-let [owner (cleanup/lifetime-owner buf)]
+    (cleanup/assert-live! owner)
+    (throw (ex-info "Level Zero buffer has no lifetime owner" {:reason :missing-cleanup-owner})))
+  (when-not (identical? (::allocation-context buf) (:context @state))
+    (throw (ex-info "Buffer belongs to a retired Level Zero runtime context"
+                    {:reason :runtime-generation-mismatch})))
+  buf)
+
+(defn- assert-buffer-values-live! [values]
+  (doseq [value values :when (device-buffer? value)] (assert-buffer-live! value)))
+
 (def ^:private dtype-byte-sizes
   {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2 :byte 1 :int8 1})
 
@@ -863,18 +889,41 @@
   physical byte for a bindable pointer while retaining zero visible capacity.
   Returns a DeviceBuffer that survives across kernel launches.
 
+  :retain-owner! publishes the canonical owner before native contact. :adopt-cleanup! retains
+  unresolved rollback debt; containers must deduplicate both callbacks by owner identity.
   n: number of elements
   dtype: :double, :float, :int, :long, or :half (default :float)"
   ([n] (make-buffer n :float))
-  ([n dtype]
+  ([n dtype] (make-buffer n dtype {}))
+  ([n dtype {:keys [retain-owner! adopt-cleanup!]}]
    (let [n (long n)
-         elem-size (long (get dtype-byte-sizes dtype 4))
+         dtype (dt/canon dtype)
+         elem-size (long (dt/bytes-of dtype))
          _ (when (neg? n)
              (throw (ex-info "GPU buffer element count must be non-negative"
                              {:reason :gpu-buffer-negative-elements :elements n})))
          byte-size (Math/multiplyExact n elem-size)
-         seg (alloc-shared (max 1 byte-size))]
-     (->DeviceBuffer seg n byte-size dtype))))
+         _ (when-not (every? #(or (nil? %) (fn? %)) [retain-owner! adopt-cleanup!])
+             (throw (ex-info "Buffer ownership requires callbacks" {:reason :invalid-cleanup-plan})))
+         _ (ensure-init!)
+         {:keys [context device arena]} @state
+         slot (cleanup/acquisition-slot)
+         owner (cleanup/owner [{:id :memory
+                                :release #(cleanup/release-native! slot (fn [segment]
+                                                                          (free-in-context! context segment)))}])]
+     (cleanup/build!
+      owner
+      (fn []
+        (when retain-owner! (retain-owner! owner))
+        (let [seg (cleanup/acquire-native!
+                   slot #(let [segment (alloc-shared-raw context device arena (max 1 byte-size))]
+                           (when (or (nil? segment) (zero? (.address ^MemorySegment segment)))
+                             (throw (ex-info "zeMemAllocShared returned a null pointer"
+                                             {:reason :native-buffer-null :size byte-size})))
+                           segment))]
+          (assoc (->DeviceBuffer (.reinterpret ^MemorySegment seg (max 1 byte-size)) n byte-size dtype)
+                 ::allocation-context context)))
+      (or adopt-cleanup! retain-owner!)))))
 
 (defn make-buffer-like
   "Allocate a DeviceBuffer with the same shape/dtype as an existing one."
@@ -886,6 +935,7 @@
    freed independently: its MemorySegment is a slice of the base allocation and exists only for
    ABI binding. Bounds and dtype alignment are established by the backend-neutral BufferView."
   [^DeviceBuffer buf byte-offset byte-length dtype]
+  (assert-buffer-live! buf)
   (let [byte-offset (long byte-offset)
         byte-length (long byte-length)
         element-size (get dtype-byte-sizes dtype)]
@@ -893,24 +943,31 @@
       (throw (ex-info "cannot slice a Level Zero buffer with an unknown dtype" {:dtype dtype})))
     (let [element-bytes (long element-size)]
       (when (or (neg? byte-offset) (neg? byte-length)
-                (> (+ byte-offset byte-length) (:byte-size buf))
+                (> (Math/addExact byte-offset byte-length) (:byte-size buf))
                 (not (zero? (mod byte-length element-bytes))))
         (throw (ex-info "Level Zero buffer slice is out of bounds or misaligned"
                         {:byte-offset byte-offset :byte-length byte-length
                          :buffer-bytes (:byte-size buf) :dtype dtype})))
-      (->DeviceBuffer (.asSlice ^MemorySegment (:segment buf) byte-offset byte-length)
-                      (quot byte-length element-bytes) byte-length dtype))))
+      (assoc (->DeviceBuffer (.asSlice ^MemorySegment (:segment buf) byte-offset byte-length)
+                             (quot byte-length element-bytes) byte-length dtype)
+             ::non-owning? true
+             ::cleanup/lifetime-owner (cleanup/lifetime-owner buf)
+             ::allocation-context (::allocation-context buf)))))
 
 (defn free-buffer!
-  "Free a DeviceBuffer's GPU memory."
+  "Release the canonical root allocation owner. Non-owning slices cannot destroy a root."
   [^DeviceBuffer buf]
-  (free! (:segment buf)))
+  (if-let [owner (::cleanup/owner buf)]
+    (cleanup/release! owner)
+    (throw (ex-info "Level Zero buffer has no destruction authority"
+                    {:reason (if (::non-owning? buf) :non-owning-buffer :missing-cleanup-owner)}))))
 
 (defn buffer-as-float-buffer
   "Return a java.nio.FloatBuffer view over a :float DeviceBuffer's shared memory.
   Zero-copy on unified-memory GPUs: reads/writes go directly to GPU-accessible memory.
   The buffer uses native byte order. Valid only while the DeviceBuffer is alive."
   ^java.nio.FloatBuffer [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (-> (.asByteBuffer ^MemorySegment (:segment buf))
       (.order (java.nio.ByteOrder/nativeOrder))
       (.asFloatBuffer)))
@@ -918,6 +975,7 @@
 (defn buffer-as-int-buffer
   "Return a java.nio.IntBuffer view over a :int DeviceBuffer's shared memory."
   ^java.nio.IntBuffer [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (-> (.asByteBuffer ^MemorySegment (:segment buf))
       (.order (java.nio.ByteOrder/nativeOrder))
       (.asIntBuffer)))
@@ -925,6 +983,7 @@
 (defn buffer-as-long-buffer
   "Return a java.nio.LongBuffer view over a :long DeviceBuffer's shared memory."
   ^java.nio.LongBuffer [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (-> (.asByteBuffer ^MemorySegment (:segment buf))
       (.order (java.nio.ByteOrder/nativeOrder))
       (.asLongBuffer)))
@@ -932,6 +991,7 @@
 (defn array->buffer!
   "Copy a JVM array into an existing DeviceBuffer. Returns the buffer."
   [^DeviceBuffer buf arr]
+  (assert-buffer-live! buf)
   (let [seg (:segment buf)
         src (MemorySegment/ofArray arr)
         n-bytes (min (:byte-size buf) (.byteSize src))]
@@ -972,6 +1032,7 @@
    single-range API could never produce."
   [^DeviceBuffer buf host {:keys [src-element dst-element elements]
                            :or {src-element 0 dst-element 0}} direction]
+  (assert-buffer-live! buf)
   (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
         host-seg (as-segment host)
         ;; for :upload the host side is src and the buffer side is dst; :download is the mirror
@@ -988,6 +1049,7 @@
    MemorySegment host side (e.g. an mmap'd file) is copied directly without materializing a JVM
    array."
   [^DeviceBuffer buf {:keys [buf-off host-off n-bytes host-seg]} direction]
+  (assert-buffer-live! buf)
   (case direction
     :upload   (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
     :download (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes))))
@@ -1000,6 +1062,7 @@
    this legal inline completion and reports host-monotonic timing rather than claiming a device
   event measurement."
   [entries direction]
+  (doseq [[buffer _] entries] (assert-buffer-live! buffer))
   (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
         started (System/nanoTime)]
     (doseq [[buffer plan] active]
@@ -1051,6 +1114,8 @@
 (defn copy-buffer-range!
   "Synchronously copy an element range between resident Level Zero buffers."
   [^DeviceBuffer src ^DeviceBuffer dst src-element dst-element elements]
+  (assert-buffer-live! src)
+  (assert-buffer-live! dst)
   (when-not (= (:dtype src) (:dtype dst))
     (throw (ex-info "Level Zero resident copy requires matching dtypes"
                     {:source-dtype (:dtype src) :destination-dtype (:dtype dst)})))
@@ -1068,6 +1133,7 @@
   For :float16/:half, returns a short array of encoded FP16 values.
   Use buffer->float-array or buffer->double-array for decoded values."
   [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (let [seg (:segment buf)
         dtype (:dtype buf)
         n (:n-elements buf)]
@@ -1104,23 +1170,17 @@
   dtype is auto-detected from array type if not specified."
   ([arr] (buffer-of-array arr nil))
   ([arr dtype]
-   (let [dtype (or dtype
-                   (cond (instance? (Class/forName "[F") arr) :float
-                         (instance? (Class/forName "[D") arr) :double
-                         (instance? (Class/forName "[I") arr) :int
-                         (instance? (Class/forName "[J") arr) :long
-                         :else :float))
-         n (cond (instance? (Class/forName "[F") arr) (alength ^floats arr)
-                 (instance? (Class/forName "[D") arr) (alength ^doubles arr)
-                 (instance? (Class/forName "[I") arr) (alength ^ints arr)
-                 (instance? (Class/forName "[J") arr) (alength ^longs arr)
-                 :else (throw (ex-info "Unsupported array type" {:type (type arr)})))
+   (let [storage (or (dt/dtype-for-jvm-array arr)
+                     (throw (ex-info "Unsupported array type" {:type (type arr)})))
+         dtype (or dtype storage)
+         n (java.lang.reflect.Array/getLength arr)
          buf (make-buffer n dtype)]
-     (array->buffer! buf arr))))
+     (cleanup/build! (::cleanup/owner buf) #(do (array->buffer! buf arr) buf) nil))))
 
 (defn zero-buffer!
   "Zero out a DeviceBuffer. Returns the buffer."
   [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (let [seg (:segment buf)]
     (.fill seg (byte 0))
     buf))
@@ -1132,12 +1192,8 @@
   (let [n (alength arr)
         shorts (short-array n)
         _ (dotimes [i n]
-            (aset shorts i (short (Float/floatToFloat16 (aget arr i)))))
-        buf (make-buffer n :float16)
-        seg (:segment buf)
-        src (MemorySegment/ofArray shorts)]
-    (MemorySegment/copy src 0 seg 0 (* n 2))
-    buf))
+            (aset shorts i (short (Float/floatToFloat16 (aget arr i)))))]
+    (buffer-of-array shorts :half)))
 
 (defn buffer-of-doubles-as-half
   "Create a :float16 DeviceBuffer from a double array.
@@ -1146,27 +1202,19 @@
   (let [n (alength arr)
         shorts (short-array n)
         _ (dotimes [i n]
-            (aset shorts i (short (Float/floatToFloat16 (float (aget arr i))))))
-        buf (make-buffer n :float16)
-        seg (:segment buf)
-        src (MemorySegment/ofArray shorts)]
-    (MemorySegment/copy src 0 seg 0 (* n 2))
-    buf))
+            (aset shorts i (short (Float/floatToFloat16 (float (aget arr i))))))]
+    (buffer-of-array shorts :half)))
 
 (defn buffer-of-short-array
   "Create a :float16 DeviceBuffer from a pre-encoded short array.
   Each short is an IEEE 754 float16 encoded value."
   [^shorts arr]
-  (let [n (alength arr)
-        buf (make-buffer n :float16)
-        seg (:segment buf)
-        src (MemorySegment/ofArray arr)]
-    (MemorySegment/copy src 0 seg 0 (* n 2))
-    buf))
+  (buffer-of-array arr :half))
 
 (defn buffer->short-array
   "Copy a :float16 DeviceBuffer's raw short values (IEEE 754 encoded)."
   [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (let [n (:n-elements buf)
         out (short-array n)
         dst (MemorySegment/ofArray out)]
@@ -1177,6 +1225,7 @@
   "Read a DeviceBuffer's contents as a double array.
   Handles all dtypes including :float16 with conversion."
   [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (let [seg (:segment buf)
         n (:n-elements buf)
         out (double-array n)]
@@ -1206,6 +1255,7 @@
   "Copy a double array into an existing :float16 DeviceBuffer.
   Converts float64 → float16 in-place. Returns the buffer."
   [^DeviceBuffer buf ^doubles arr]
+  (assert-buffer-live! buf)
   (let [n (min (:n-elements buf) (alength arr))
         seg (:segment buf)]
     (dotimes [i n]
@@ -1217,6 +1267,7 @@
   "Copy a :float16 DeviceBuffer into an existing double array.
   Converts float16 → float64 in-place. Returns the double array."
   [^DeviceBuffer buf ^doubles arr]
+  (assert-buffer-live! buf)
   (let [n (min (:n-elements buf) (alength arr))
         seg (:segment buf)]
     (dotimes [i n]
@@ -1227,6 +1278,7 @@
 (defn buffer->float-array
   "Read a :float16 DeviceBuffer back as a float array."
   [^DeviceBuffer buf]
+  (assert-buffer-live! buf)
   (let [n (:n-elements buf)
         seg (:segment buf)
         out (float-array n)]
@@ -1273,7 +1325,7 @@
   (reduce (fn [dtypes arr]
             (cond
               (gpu-soa? arr) (into dtypes (mapv :dtype (:field-segs ^GpuSoA arr)))
-              (device-buffer? arr) (conj dtypes (:dtype ^DeviceBuffer arr))
+              (device-buffer? arr) (conj dtypes (:dtype (assert-buffer-live! arr)))
               (instance? MemorySegment arr) (conj dtypes :opaque)
               :else (conj dtypes (dt/dtype-for-jvm-array arr))))
           [] arrays))
@@ -1476,6 +1528,7 @@
   ([^String kernel-name ^MemorySegment module
     input-arrays output-array scalar-args
     n workgroup-size dtype-size]
+   (assert-buffer-values-live! (conj (vec input-arrays) output-array))
    (let [n (long n)
          workgroup-size (long workgroup-size)
          dtype-size (long dtype-size)
@@ -2062,7 +2115,7 @@
                              :actual (count scalar-args) :abi abi})))
         _ (doseq [[slot value] pairs :when (not= :scalar (:kind slot))]
             (let [actual (if (device-buffer? value)
-                           (dt/canon (:dtype ^DeviceBuffer value))
+                           (dt/canon (:dtype (assert-buffer-live! value)))
                            (dt/dtype-for-jvm-array value))]
               (when-not actual
                 (throw (ex-info "map kernel ABI pointer value is not a supported buffer/array"
@@ -2128,6 +2181,7 @@
    check runs before kernel loading touches the driver. Returns a scalar double after combining
    workgroup partials on the host."
   [^String kernel-name arguments]
+  (assert-buffer-values-live! arguments)
   (let [registered (or (get @kernel-registry kernel-name)
                        (throw (ex-info (str "Kernel not registered: " kernel-name)
                                        {:kernel-name kernel-name
@@ -2754,6 +2808,7 @@
                      Only block-sums (~num_blocks*4 bytes) cross CPU/GPU boundary.
   n:                 number of input elements (output has n+1)"
   [^String block-kernel-name ^String prop-kernel-name input-arrays output-array n]
+  (assert-buffer-values-live! (conj (vec input-arrays) output-array))
   (let [{:keys [kernel-handle workgroup-size block-size scan-dtype
                 identity-num combine-op]
          :or {workgroup-size 256}
@@ -2834,6 +2889,7 @@
   Copies arrays to/from device. The kernel runs the full time-stepping
   loop on-device with __local scratch arrays."
   [^String kernel-name arrays scalar-args nsteps n]
+  (assert-buffer-values-live! arrays)
   (let [{:keys [kernel-handle dtype]
          :or {dtype :double}
          :as info} (ensure-kernel-loaded! kernel-name)
@@ -2893,6 +2949,7 @@
 
   Backend-agnostic: works with Level Zero today, CUDA/ROCm later."
   [^String kernel-name input-bufs output-buf scalar-args n]
+  (assert-buffer-values-live! (conj (vec input-bufs) output-buf))
   (let [{:keys [kernel-handle workgroup-size dtype]
          :or {workgroup-size 256 dtype :float}
          :as info} (ensure-kernel-loaded! kernel-name)
@@ -2919,6 +2976,7 @@
 
   Backend-agnostic: works with Level Zero today, CUDA/ROCm later."
   [^String kernel-name input-bufs n]
+  (assert-buffer-values-live! input-bufs)
   (let [{:keys [kernel-handle workgroup-size identity-val c-op dtype]
          :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :float}
          :as info} (ensure-kernel-loaded! kernel-name)
@@ -2955,6 +3013,7 @@
   "In-place axpy on DeviceBuffers: y += alpha * x.
   Uses registered axpy kernel. Zero CPU↔GPU copies."
   [^String kernel-name ^DeviceBuffer y-buf ^DeviceBuffer x-buf alpha n]
+  (assert-buffer-values-live! [y-buf x-buf])
   (let [{:keys [kernel-handle workgroup-size dtype]
          :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
         n (long n)
@@ -3030,6 +3089,7 @@
    Packed kernels therefore retain byte storage while declaring a distinct int32 kernel view.
    Output extent and 1-3D geometry are resolved from the artifact, never marker positions."
   [^String kernel-name arguments]
+  (assert-buffer-values-live! arguments)
   (let [registered (get @kernel-registry kernel-name)
         _ (when-not registered
             (throw (ex-info (str "Kernel not registered: " kernel-name)
@@ -3119,6 +3179,7 @@
   in-buf: DeviceBuffer [rows x cols] row-major
   out-buf: DeviceBuffer [cols x rows] row-major (transposed)"
   [^String kernel-name ^DeviceBuffer in-buf ^DeviceBuffer out-buf rows cols]
+  (assert-buffer-values-live! [in-buf out-buf])
   (let [{:keys [kernel-handle workgroup-size]
          :or {workgroup-size 256}} (ensure-kernel-loaded! kernel-name)
         total (long (* (long rows) (long cols)))

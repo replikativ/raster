@@ -122,6 +122,43 @@
                         (try (gpu/release-prepared! sess :phase) (catch Throwable e e))))
         (is (= [:old :new] @destroyed))))))
 
+(deftest failed-publication-unbinds-retired-preparation-and-releases-candidate
+  (doseq [failure [:watch :validator :release]]
+    (let [destroyed (atom []) primary (ex-info "Publication watch failed" {})
+          owned (fn [id] {:phase id ::cleanup/owner
+                          (cleanup/owner [{:id :kernel :release #(swap! destroyed conj id)}])})
+          old (owned :old)
+          sess (atom {:device-id :ocl:0 :closed? false :graphs {} :prepared {:phase old}
+                      :kernels {:phase [(projection-artifact)]} :buffers {:data (Object.)}})]
+      (if (contains? #{:watch :release} failure)
+        (add-watch sess :throw-publication
+                   (fn [_ _ _ after]
+                     (when (= :new (get-in after [:prepared :phase :phase]))
+                       (if (= :release failure) (gpu/release-prepared! sess :phase)
+                           (throw primary)))))
+        (set-validator! sess #(not= :new (get-in % [:prepared :phase :phase]))))
+      (with-redefs-fn
+        {(ns-resolve 'raster.gpu.core 'rt-resolve)
+         (fn [_ name]
+           (case name
+             "expand-pointer-binding" (fn [_ value] [value])
+             "bind-kernel-call" (fn [& _] (owned :new))
+             (throw (ex-info "Unexpected native contact" {:name name}))))
+         (ns-resolve 'raster.gpu.core 'rt-resolve-soft)
+         (fn [_ name]
+           (when (= name "destroy-prepared!")
+             (fn [entry] (cleanup/release! (::cleanup/owner entry)))))}
+        (fn []
+          (let [error (try (gpu/prepare! sess :phase {"x" :data} [11 29] 17)
+                           nil (catch Throwable error error))]
+            (is (some? error))
+            (when (= :watch failure) (is (identical? primary error)))
+            (when (= :release failure)
+              (is (= :reentrant-binding-publication (:reason (ex-data error)))))
+            (is (nil? (get-in @sess [:prepared :phase])))
+            (is (empty? (:prepared @sess)))
+            (is (= [:old :new] @destroyed))))))))
+
 (deftest bound-launch-serializes-with-kernel-release
   (let [entered (promise) resume (promise) releasing (promise) destroyed (promise)
         sess (atom {:device-id :ocl:0 :closed? false

@@ -1989,3 +1989,77 @@ attached and owned sessions. The last uses production lowering/validation/stagin
 and substitutes only native allocation/upload/bind/release. These checks do not certify all
 public/root/view/event acquisition, output-value destruction, provider-backed durability,
 distributed fabric execution or external model training, which remain explicit follow-ups.
+
+The canonical backend-buffer ownership slice is implemented; final CI gates remain pending.
+OpenCL/Level Zero root constructors
+reserve a canonical backend buffer owner and can publish it through `:retain-owner!` before
+native contact. Unresolved rollback uses `:adopt-cleanup!` (or the retention callback); containers
+deduplicate those notifications by owner identity. Array initialization rolls back through that
+same owner. OpenCL sub-buffers own a separate native reference; root and slice staging has
+per-buffer shared arenas independent of the global runtime arena and parent staging segment.
+Level Zero pointer slices remain non-owning and retain the root lifetime reference. Level Zero
+captures the pointer before reinterpretation/record setup and destroys with its allocation
+context; a retired context is rejected before native free. Transfer/binding admission checks
+owner liveness and context identity. These are not concurrent-use leases or automatic reset
+recovery. Slice extent arithmetic is checked for overflow.
+
+Modern graph-private allocation/view construction now retains that exact backend owner rather
+than creating a second native acquisition/destruction authority. Public session allocation
+retains exact root owners before contact, publishes values/contracts after initialization, and
+rolls back through those owners on any Throwable. Unknown outcomes remain session-owned and
+make the session non-live. Close attempts independent root siblings and removes successful roots
+incrementally, before kernel-arena teardown. Root lifecycle operations reject reentrant close,
+free, registration and ordinary session use from synchronous atom watches.
+
+Graph/call external materialization uses the same construction accumulator and canonical owners
+as modern graph-private staging. The old temporary allocator, successful-prefix-only rollback,
+raw session-root free and swallowed view-rollback helpers are removed. Fault doubles share one
+ownership-complete constructor, not production inference from a partially returned buffer.
+
+Synchronous session transfers hold the session monitor through resolution, validation and
+execution. A scoped-use guard prevents a callback from reentrantly destroying roots. Common
+`resource-cleanup/lifetime-owner` distinguishes destruction authority from borrowed lifetime
+identity; registration validates the backend buffer, and free compares exact owner identity as
+well as registration/object/allocation identity. A registered Level Zero slice or copied root
+cannot hide the native alias behind a different allocation ID. Published root/table owner
+mismatch declines before native free.
+
+Asynchronous transfer submission uses the same scoped-use guard through event publication,
+including retained host resources. Binding replacement uses one shared publication transaction
+for prepare, step, graph and call: after successful old-generation teardown, a rejected or
+throwing publication removes the exact retired/candidate registration before candidate rollback.
+Successful publication also revalidates candidate identity, so a watch that releases the new
+binding cannot return an already-dead handle. Replacement publication failure may leave the key
+unbound; it cannot restore a destroyed old generation. A failed old-generation destruction still
+retains that generation's cleanup debt. General atom validators that reject recovery mutations
+can prevent deregistration; the primary error retains that recovery failure as a suppressed error.
+
+The combined affected ownership, graph, transfer, Link composition, program-memory and adjacent
+ABI/binding/native-recording checks pass (160 tests, 1572 assertions) in the existing REPL.
+Oracles cover actual backend API calls after free/context
+retirement, staging independence, setup/upload rollback, uncertain creation/free, independent
+siblings, repeated close, reentrant/throwing watches and blocked transfer versus concurrent
+free/close. Linked numerical replays retain their CPU parity anchors.
+
+Surface lifetime behavior is intentionally stricter: directly fabricated backend records have
+no native destruction authority; borrowed aliases must be detached before freeing their owned
+root. `deftm` numerical semantics are unchanged. Raw backend callers, opaque native segments and
+returned NIO views still require external lifetime/concurrency discipline; these checks do not
+grant a lease or make concurrent runtime reset safe. Kernel-arena destruction itself still needs
+retained outcome ownership; this slice only prevents an arena-close failure from repeating
+successful root frees. Final review/CI remain pending. No performance claim follows from these
+correctness tests, and the full distributed/training campaign remains incomplete.
+
+Review-driven regressions cover retained-event publication with reentrant close, exact registry
+removal on throwing watches/validator rejection, preserved unrelated generations and failed
+old-generation destruction, plus public prepare rollback after a watch releases its candidate.
+The next native lifetime consolidation is kernel-arena teardown: both backend arena closers still
+swallow native release errors, and Level Zero scans arbitrary MemorySegment metadata rather than
+declared owned resources. Replace these with retained outcome owners before claiming complete
+native lifetime coverage; do not infer destructor authority from a value's representation.
+
+The first #1013 full CI run exposed four remaining legacy fixture failures in dispatch, GEMM
+Link topology and recorded-root ordering. Their mock constructors now use the shared canonical
+acquisition/retention fixture, and the owned staging root carries its exact owner in the session.
+All 45 tests / 256 assertions in those three namespaces pass in the existing REPL. No production
+ownership check was weakened; the rerun must still pass all seven exact-head CI gates.

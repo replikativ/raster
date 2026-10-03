@@ -6,6 +6,12 @@
 
 (defrecord Cleanup [state])
 
+(defn lifetime-owner
+  "Exact native lifetime identity for a root or a non-owning view. A borrowed lifetime reference
+   is not destruction authority; only ::owner can release the value's native resource."
+  [value]
+  (or (::owner value) (::lifetime-owner value)))
+
 (defn owner
   "Capture an ordered destruction plan. Each entry has :id, :release (zero-argument function),
    and optional :after IDs that must have been successfully released first. Dependencies must
