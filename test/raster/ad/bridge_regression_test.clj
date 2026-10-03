@@ -7,6 +7,62 @@
             [raster.ad.reverse :as rev]
             [raster.sci.distributions :as dist]))
 
+(deftm constant-latent-loop [b :- (Array double), count :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i count)
+      (recur (inc i) (n/+ acc (aget b 0)))
+      acc)))
+
+(deftm two-constant-latents-loop [b :- (Array double), count :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i count)
+      (recur (inc i)
+             (n/+ (n/* 0.5 acc)
+                  (n/+ (n/* (ra/aget b 0) (ra/aget b 0))
+                       (n/* 3.0 (ra/aget b 1)))))
+      acc)))
+
+(deftest active-literal-index-reads-in-carry-loops
+  (let [simple (rev/value+grad #'constant-latent-loop :wrt [0])
+        two (rev/value+grad #'two-constant-latents-loop :wrt [0])]
+    (doseq [count [0 1 5]]
+      (let [[value gradient dcount] (simple (double-array [2.5 9.0]) count)]
+        (is (= (* 2.5 count) value))
+        (is (= [(double count) 0.0] (vec gradient)))
+        (is (nil? dcount)))
+      (let [b (double-array [1.25 -0.4])
+            [value gradient] (two b count)
+            factor (* 2.0 (- 1.0 (Math/pow 0.5 count)))]
+        (is (< (Math/abs (- value (* factor (+ (* 1.25 1.25) (* 3.0 -0.4))))) 1e-12))
+        (is (= [(* factor 2.5) (* factor 3.0)] (vec gradient)))
+        (doseq [index [0 1]]
+          (let [plus (aclone b) minus (aclone b) h 1e-5]
+            (aset-double plus index (+ (aget b index) h))
+            (aset-double minus index (- (aget b index) h))
+            (is (< (Math/abs (- (aget ^doubles gradient index)
+                                (/ (- (two-constant-latents-loop plus count)
+                                      (two-constant-latents-loop minus count)) (* 2.0 h)))) 1e-8))))))
+    ;; No primal read exists on a zero-trip loop; do not hoist b[0] eagerly.
+    (let [[value gradient] (simple (double-array 0) 0)]
+      (is (= 0.0 value))
+      (is (= [] (vec gradient))))))
+
+(deftest literal-read-admission-is-sequential-and-scope-checked
+  (let [analyze (fn [body & options]
+                  (rev/call-with-shared-ad-gensym
+                   #(apply (var rev/analyze-par-map-body) body 'i options)))
+        body '(+ acc (+ (aget b 0) (+ (aget b 1) (aget b 0))))]
+    (is (empty? (:agets (analyze body))) "parallel map retains its original inline-read rule")
+    (is (= [['b 0] ['b 1]] (mapv (juxt :arr :idx) (:agets (analyze body true)))))
+    (doseq [scoped ['(+ acc (if (< i 1) (aget b 0) 0.0))
+                    '(+ acc (aget b offset))
+                    '(+ acc (let* [local 1.0] (+ local (aget b 0))))
+                    '(+ acc (loop* [j 0] (if (< j 1) (recur (inc j)) (aget b 0))))]]
+      (is (empty? (:agets (analyze scoped true))))
+      (is (contains? (:free-syms (analyze scoped true)) 'b)))
+    (let [tagged (with-meta body {:raster.type/tag 'double :line 42})]
+      (is (= (meta tagged) (meta (:body-result (analyze tagged true))))))))
+
 (deftm normal-density-sum [mu :- Double, sigma :- Double,
                            ys :- (Array double), count :- Long] :- Double
   (loop [i 0 sum 0.0]
