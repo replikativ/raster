@@ -108,3 +108,35 @@
     (doseq [profile? [false true]]
       (run-prepared-lease-case! :ze {:profile? profile?}))
     (ze-probe/gpu-skip! "recording root leases")))
+
+(defn- run-transfer-lease-case! [backend]
+  (let [namespace (if (= :ocl backend) 'raster.gpu.ocl-runtime 'raster.gpu.ze-runtime)
+        v #(ns-resolve namespace %)]
+    ((v 'ensure-init!))
+    (let [state @(v 'state) before (root/lease-count state)
+          buffer ((v 'make-buffer) 2 :float)
+          source (float-array [7 11]) destination (float-array 2)]
+      (try
+        (doseq [[direction host] [[:upload source] [:download destination]]]
+          (let [plan ((v 'plan-range) buffer host {:elements 2} direction)
+                token ((v 'submit-range-batch!) [[buffer plan]] direction)]
+            (try
+              (is (= (+ before (if (= :ocl backend) 2 1)) (root/lease-count state)))
+              (when (and (= :ocl backend) (= :download direction))
+                (is (= [0.0 0.0] (vec destination))))
+              ((v 'await-event!) token)
+              (finally ((v 'release-event!) token))))
+          (is (= (inc before) (root/lease-count state))))
+        (is (= [7.0 11.0] (vec destination)))
+        (finally (cleanup/release! (::cleanup/owner buffer))))
+      (is (= before (root/lease-count state))))))
+
+(deftest opencl-transfer-tokens-independently-pin-the-root
+  (if @ocl-probe/opencl-available?
+    (run-transfer-lease-case! :ocl)
+    (ocl-probe/opencl-skip! "transfer completion root leases")))
+
+(deftest level-zero-inline-transfers-do-not-fabricate-inflight-root-leases
+  (if @ze-probe/gpu-available?
+    (run-transfer-lease-case! :ze)
+    (ze-probe/gpu-skip! "inline transfer root lifetimes")))

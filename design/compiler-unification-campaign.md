@@ -2303,7 +2303,7 @@ tests / 84 assertions, and four buffer/view/prepared device tests / 16 assertion
 On both backends a prepared generated kernel survives base-registration retirement,
 executes correctly, and balances its independent pin. This does not establish arbitrary
 concurrent root reset: recordings/events, use admission and raw consumers remain next.
-Pivotal final review and seven exact-head CI gates are required before merging this slice.
+PR #1020 passed all seven exact-head CI gates and merged as `ebe849bc`.
 
 Recording follow-up: both `record-graph!` implementations construct through the canonical
 root-child owner. The OpenCL submission and optional profiling queue precede root release;
@@ -2317,12 +2317,38 @@ Acceptance so far: 182 focused tests / 1,898 assertions, seven actual boundary t
 84 assertions, and six buffer/view/prepared/recording device tests / 36 assertions pass.
 The latter replay ordinary and profiled graphs on OpenCL and ZE after retiring their base
 registrations, and verify independent root-pin balance through graph/prepared/buffer teardown.
-Final pivotal review and exact-head CI remain required. These pins do not automatically borrow
+PR #1021 passed all seven exact-head CI gates and merged as `427d238f`. These pins do not automatically borrow
 every child kernel or buffer: existing session ownership still controls those dependencies.
 Standalone asynchronous range transfers remain debt, especially OpenCL's old exception path
 that swallows drain/event-release failures before closing staging. Migrate that path to retained
 completion cleanup before enabling any live reset; synchronous-use and raw-allocation debt also
 remain. No throughput or complete distributed-runtime ownership claim follows from these gates.
+
+Standalone transfer follow-up: OpenCL transfers now share the submission resource plan
+(drain → event acquisition slots → staging Arena) and the canonical root-child transaction.
+Unknown enqueue/readback/drain/event destruction retains the exact composite owner, staging
+and root pin, without native retry. Successful cleanup releases events and staging before the
+root. Nonempty OpenCL completion tokens require an owner; the raw-handle/finally-close fallback
+is removed. ZE shared-allocation transfers remain inline and do not invent an in-flight lease.
+
+The session event table is the sole outer authority: its exact pending event owner and resident
+footprint are published before backend contact. Private slots retain returned tokens or adopted
+backend cleanup debt, eliminating a post-contact Atom publication. One cleanup DAG orders backend
+completion before independently owned host leases. Host ownership is armed only after the backend
+returns successfully, preserving the public caller-owns-on-failed-submission contract. Failed
+unknown submission keeps that pending event/footprint, so buffer aliases/free/session close cannot
+drop dependencies. Failed cleanup is not reported as a successful data operation. The backend
+submission contract adds a uniform optional third argument with `:adopt-cleanup!`; direct callers
+can still use two arguments. Public GPUEvent and retained-range APIs keep their signatures.
+
+Current acceptance: 182 focused ownership tests / 1,898 assertions and 48 affected range/content/
+fault/device tests / 519 assertions pass. New native fault tests cover unknown enqueue, NULL
+readback, drain/event-release failure, strict token ownership, caller host ownership, resident
+alias blocking, session close and pre-contact publication watch rejection. Actual transfer tests
+check OpenCL root-pin balance, staged download visibility and honest ZE inline completion; existing
+ordinary/profiled recording and prepared/buffer cases still pass. Pivotal final review and all
+seven exact-head CI gates remain required. Synchronous-use admission, raw allocation consumers and
+general live reset remain incomplete; these ownership tests do not establish performance.
 
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates

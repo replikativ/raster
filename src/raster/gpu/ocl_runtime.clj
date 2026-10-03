@@ -1621,7 +1621,7 @@
   (enqueue-bound! (:bound prepared) (:group-count prepared))
   (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
 
-(declare clear-submission!)
+(declare clear-submission! submission-plan)
 
 (defn- checked-event-handle [handle]
   (when (or (nil? handle) (.equals MemorySegment/NULL handle))
@@ -1682,63 +1682,64 @@
    awaited and released. Upload sources are copied into immutable staging before return; download
    destinations are populated only by await-event!, after device completion establishes host
    visibility."
-  [entries direction]
-  (doseq [[buffer _] entries] (assert-buffer-live! buffer))
-  (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
-        total-bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
-    (if (empty? active)
-      {:complete? true
-       :completion {:timing-source :host-monotonic
-                    :elapsed-ns 0 :bytes total-bytes :commands 0
-                    :direction direction :asynchronous? false}}
-      (let [queue (:transfer-queue @state)
-            arena (Arena/ofShared)
-            event-outs (.allocate arena (* 8 (count active)))
-            status-out (.allocate arena I32)
-            enqueued (volatile! 0)]
-        (try
-          (let [copies
-                (mapv
-                 (fn [[index [^OclBuffer buffer
-                              {:keys [buf-off host-off n-bytes host-seg]}]]]
-                   (let [n-bytes (long n-bytes)
-                         staging (.allocate arena n-bytes 64)
-                         event-out (.asSlice event-outs (* 8 index) 8)]
-                     (when (= :upload direction)
-                       (MemorySegment/copy ^MemorySegment host-seg (long host-off)
-                                           staging 0 n-bytes))
-                     (cl-call! (if (= :upload direction)
-                                 "clEnqueueWriteBuffer" "clEnqueueReadBuffer")
-                               (if (= :upload direction)
-                                 @h-clEnqueueWriteBuffer @h-clEnqueueReadBuffer)
-                               [queue (:cl-mem buffer) CL_FALSE (long buf-off) n-bytes
-                                staging (int 0) MemorySegment/NULL event-out])
-                     (vswap! enqueued inc)
-                     {:staging staging :host-seg host-seg :host-off (long host-off)
-                      :n-bytes n-bytes}))
-                 (map-indexed vector active))]
-            (cl-call! "clFlush" @h-clFlush [queue])
-            (let [events (mapv #(.get event-outs PTR (* 8 %)) (range (count active)))
-                  final-offset (* 8 (dec (count active)))]
-              {:transfer? true
-               :queue queue
-               :direction direction
-               :bytes total-bytes
-               :copies copies
-               :events events
-               :event (peek events)
-               :event-array (.asSlice event-outs final-offset 8)
-               :status-out status-out
-               :arena arena}))
-          (catch Exception error
-            ;; A failed enqueue can leave earlier nonblocking commands live. Keep their staging
-            ;; valid until the queue is drained, then release every event written so far.
-            (try (cl-call! "clFinish" @h-clFinish [queue]) (catch Exception _))
-            (doseq [index (range @enqueued)]
-              (try (release-native-event! (.get event-outs PTR (* 8 index)))
-                   (catch Exception _)))
-            (.close arena)
-            (throw error)))))))
+  ([entries direction] (submit-range-batch! entries direction {}))
+  ([entries direction {:keys [adopt-cleanup!]}]
+   (doseq [[buffer _] entries] (assert-buffer-live! buffer))
+   (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
+         total-bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
+     (if (empty? active)
+       {:complete? true
+        :completion {:timing-source :host-monotonic
+                     :elapsed-ns 0 :bytes total-bytes :commands 0
+                     :direction direction :asynchronous? false}}
+       (let [queue (:transfer-queue @state)
+             {:keys [resources arena-slot event-slots started? completed?]}
+             (submission-plan queue (count active))]
+         (root/construct-child! state resources
+                                (fn [_owner entry]
+                                  (when-not (identical? queue (:transfer-queue @(:projection entry)))
+                                    (throw (ex-info "Transfer queue changed its root generation"
+                                                    {:reason :runtime-generation-mismatch})))
+                                  (let [arena (cleanup/acquire-native! arena-slot #(Arena/ofShared))
+                                        event-outs (.allocate ^Arena arena (* 8 (count active)))
+                                        status-out (.allocate ^Arena arena I32)
+                                        copies
+                                        (mapv
+                                         (fn [[index [^OclBuffer buffer
+                                                      {:keys [buf-off host-off n-bytes host-seg]}]]]
+                                           (let [n-bytes (long n-bytes)
+                                                 staging (.allocate arena n-bytes 64)
+                                                 event-out (.asSlice event-outs (* 8 index) 8)]
+                                             (when (= :upload direction)
+                                               (MemorySegment/copy ^MemorySegment host-seg (long host-off)
+                                                                   staging 0 n-bytes))
+                                             (clojure.core/reset! started? true)
+                                             (cleanup/acquire-native! (nth event-slots index)
+                                                                      #(do (cl-call! (if (= :upload direction)
+                                                                                       "clEnqueueWriteBuffer" "clEnqueueReadBuffer")
+                                                                                     (if (= :upload direction)
+                                                                                       @h-clEnqueueWriteBuffer @h-clEnqueueReadBuffer)
+                                                                                     [queue (:cl-mem buffer) CL_FALSE (long buf-off) n-bytes
+                                                                                      staging (int 0) MemorySegment/NULL event-out])
+                                                                           (checked-event-handle (.get event-out PTR 0))))
+                                             {:staging staging :host-seg host-seg :host-off (long host-off)
+                                              :n-bytes n-bytes}))
+                                         (map-indexed vector active))]
+                                    (cl-call! "clFlush" @h-clFlush [queue])
+                                    (let [events (mapv #(.get event-outs PTR (* 8 %)) (range (count active)))
+                                          final-offset (* 8 (dec (count active)))]
+                                      {:transfer? true
+                                       :queue queue
+                                       :direction direction
+                                       :bytes total-bytes
+                                       :copies copies
+                                       :events events
+                                       :event (peek events)
+                                       :event-array (.asSlice event-outs final-offset 8)
+                                       :completed? completed?
+                                       :status-out status-out
+                                       :arena arena})))
+                                adopt-cleanup!))))))
 
 (defn- await-transfer!
   [{:keys [direction bytes copies events]}]
@@ -1790,26 +1791,29 @@
              (throw secondary))))
     (if-let [primary @failure] (throw primary) result)))
 
-(defn- reserve-submission [queue event-count]
+(defn- submission-plan [queue event-count]
   (let [arena-slot (cleanup/acquisition-slot)
         event-slots (mapv (fn [_] (cleanup/acquisition-slot)) (range event-count))
         started? (atom false) completed? (atom false)
         event-ids (set (map #(vector :event %) (range event-count)))
-        owner (cleanup/owner
-                (vec (concat
-                      [{:id :drain
-                        :release #(when (and @started? (not @completed?))
-                                    (cl-call! "clFinish" @h-clFinish [queue])
-                                    (clojure.core/reset! completed? true))}]
-                      (map-indexed
-                       (fn [index slot]
-                         {:id [:event index] :after #{:drain}
-                          :release #(cleanup/release-native! slot release-native-event!)}) event-slots)
-                      [{:id :arena :after (conj event-ids :drain)
-                        :release #(cleanup/release-native! arena-slot
-                                    (fn [^Arena arena] (.close arena)))}])))]
-    {::cleanup/owner owner :arena-slot arena-slot :event-slots event-slots
+        resources (vec (concat
+                        [{:id :drain
+                          :release #(when (and @started? (not @completed?))
+                                      (cl-call! "clFinish" @h-clFinish [queue])
+                                      (clojure.core/reset! completed? true))}]
+                        (map-indexed
+                         (fn [index slot]
+                           {:id [:event index] :after #{:drain}
+                            :release #(cleanup/release-native! slot release-native-event!)}) event-slots)
+                        [{:id :arena :after (conj event-ids :drain)
+                          :release #(cleanup/release-native! arena-slot
+                                                             (fn [^Arena arena] (.close arena)))}]))]
+    {:resources resources :arena-slot arena-slot :event-slots event-slots
      :started? started? :completed? completed?}))
+
+(defn- reserve-submission [queue event-count]
+  (let [plan (submission-plan queue event-count)]
+    (assoc (dissoc plan :resources) ::cleanup/owner (cleanup/owner (:resources plan)))))
 
 (defn submit-graph!
   "Submit an OpenCL graph without waiting. The in-order queue preserves the recorded order and
@@ -1870,8 +1874,8 @@
 
 (defn- token-owner! [token]
   (let [owner (::cleanup/owner token)]
-    (when (and (contains? token :submission-state) (nil? owner))
-      (throw (ex-info "Graph completion token has lost its cleanup owner"
+    (when (and (not (:complete? token)) (nil? owner))
+      (throw (ex-info "Completion token has lost its cleanup owner"
                       {:reason :missing-cleanup-owner})))
     owner))
 
@@ -1903,23 +1907,17 @@
 
 (defn release-event!
   "Release a runtime-private OpenCL completion token. The caller must establish completion."
-  [{:keys [complete? profile? transfer? events event ^Arena arena submission-state]
+  [{:keys [complete? profile? submission-state]
     :as token}]
   (token-owner! token)
   (when-not complete?
     ;; A profiled graph retains every event until read/reset consumes the sample. Ordinary
-    ;; graph tokens release their nested owner; transfer tokens await their separate migration.
+    ;; graph and transfer tokens release their canonical owner.
     (when-not profile?
-      (if-let [owner (::cleanup/owner token)]
-        (do (cleanup/release! owner)
-            (when (identical? owner (::cleanup/owner @submission-state))
-              (clojure.core/reset! submission-state nil)))
-        (try
-          (if transfer?
-            (doseq [native-event events] (release-native-event! native-event))
-            (release-native-event! event))
-          (finally
-            (.close arena))))))
+      (let [owner (::cleanup/owner token)]
+        (cleanup/release! owner)
+        (when (and submission-state (identical? owner (::cleanup/owner @submission-state)))
+          (clojure.core/reset! submission-state nil)))))
   nil)
 
 (defn replay-graph!

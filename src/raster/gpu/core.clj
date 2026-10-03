@@ -1545,25 +1545,63 @@
                             (if (= :upload direction) buffer host))
                           plans)
              submitted-ns (System/nanoTime)
-             backend-event ((rt-resolve device-id "submit-range-batch!")
-                            (mapv (fn [[buffer plan _]] [buffer plan]) plans)
-                            direction)
-             submit-return-ns (System/nanoTime)
              event-id (random-uuid)
-             event (->GPUEvent session-id event-id (execution/transfer-queue))]
-         (swap! sess assoc-in [:events event-id]
-                {:event event
-                 :kind :transfer
-                 :direction direction
-                 :status :pending
-                 :backend-event backend-event
-                 :submitted-ns submitted-ns
-                 :submit-return-ns submit-return-ns
-                 :retained-resources retained-resources
-                 :buffer-keys buffer-keys
-                 :allocation-ids allocation-ids
-                 :resident-buffers (:resident-buffers footprint)
-                 :value values})
+             event (->GPUEvent session-id event-id (execution/transfer-queue))
+             backend-state (volatile! nil)
+             completion (volatile! nil)
+             submit-return-ns (volatile! nil)
+             submission-error (volatile! nil)
+             host-owned? (volatile! false)
+             owner (cleanup/owner
+                    (into [{:id :backend-completion
+                            :release #(case (:kind @backend-state)
+                                        :token (let [token (:token @backend-state)
+                                                     result ((rt-resolve device-id "await-event!") token)]
+                                                 ((rt-resolve device-id "release-event!") token)
+                                                 (vreset! completion result))
+                                        :debt (cleanup/release! (:owner @backend-state))
+                                        nil nil)}]
+                          (map-indexed
+                           (fn [index resource]
+                             {:id [:retained-host index] :after #{:backend-completion}
+                              :release #(when @host-owned? (.close ^AutoCloseable resource))})
+                           retained-resources)))
+             entry {:event event ::cleanup/owner owner
+                    :kind :transfer
+                    :direction direction
+                    :status :pending
+                    :submitted-ns submitted-ns
+                    ::transfer-state {:backend backend-state :completion completion
+                                      :submit-return-ns submit-return-ns :error submission-error}
+                    :buffer-keys buffer-keys
+                    :allocation-ids allocation-ids
+                    :resident-buffers (:resident-buffers footprint)
+                    :value values}]
+         (try
+           (cleanup/build! owner
+                           (fn []
+               ;; Publish the exact footprint/owner before backend contact. Native authority
+               ;; then lives in private slots, not in another post-contact Atom publication.
+                             (swap! sess assoc-in [:events event-id] entry)
+                             (when-not (identical? entry (get-in @sess [:events event-id]))
+                               (throw (ex-info "Session rejected the reserved transfer event"
+                                               {:reason :transfer-event-publication-lost})))
+                             (let [token ((rt-resolve device-id "submit-range-batch!")
+                                          (mapv (fn [[buffer plan _]] [buffer plan]) plans) direction
+                                          {:adopt-cleanup! #(vreset! backend-state {:kind :debt :owner %})})]
+                               (vreset! backend-state {:kind :token :token token})
+                               (vreset! submit-return-ns (System/nanoTime))
+                 ;; A throwing backend submission leaves host leases with the caller.
+                               (vreset! host-owned? true)
+                               {}))
+             ;; The exact event entry is already the session's durable cleanup sink.
+                           (fn [_] nil))
+           (catch Throwable primary
+             (vreset! submission-error primary)
+             (when (and (empty? (cleanup/pending owner))
+                        (identical? entry (get-in @sess [:events event-id])))
+               (swap! sess update :events dissoc event-id))
+             (throw primary)))
          event)))))
 
 (defn submit-upload-ranges!
@@ -1745,29 +1783,41 @@
       (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
     (if (= :complete status)
       entry
+      (if-let [transfer-state (::transfer-state entry)]
+        (do
+          (cleanup/release! (::cleanup/owner entry))
+          (when-let [failure @(:error transfer-state)] (throw failure))
+          (let [result @(:completion transfer-state)
+                completed (assoc entry :status :complete
+                                 :measurement (merge (when (map? result) result)
+                                                     {:host-wall-ns (- (System/nanoTime) submitted-ns)
+                                                      :submit-host-ns (- @(:submit-return-ns transfer-state)
+                                                                         submitted-ns)}))]
+            (swap! sess assoc-in [:events (:id event)] completed)
+            completed))
       ;; A successful status query is not necessarily a host memory-synchronization point
       ;; (notably in OpenCL). Await always calls the backend wait before releasing the token.
-      (let [backend-completion ((rt-resolve device-id "await-event!") backend-event)
-            completed-ns (System/nanoTime)
-            measurement (when (= :transfer kind)
-                          (merge (when (map? backend-completion) backend-completion)
-                                 {:host-wall-ns (- completed-ns submitted-ns)
-                                  :submit-host-ns (- submit-return-ns submitted-ns)}))]
-        ((rt-resolve device-id "release-event!") backend-event)
-        (let [release-errors (close-retained-resources retained-resources)
-              completed (cond-> (assoc entry
-                                       :status :complete
-                                       :backend-event nil
-                                       :retained-resources [])
-                          measurement (assoc :measurement measurement)
-                          (seq release-errors) (assoc :retention-release-errors release-errors))]
+        (let [backend-completion ((rt-resolve device-id "await-event!") backend-event)
+              completed-ns (System/nanoTime)
+              measurement (when (= :transfer kind)
+                            (merge (when (map? backend-completion) backend-completion)
+                                   {:host-wall-ns (- completed-ns submitted-ns)
+                                    :submit-host-ns (- submit-return-ns submitted-ns)}))]
+          ((rt-resolve device-id "release-event!") backend-event)
+          (let [release-errors (close-retained-resources retained-resources)
+                completed (cond-> (assoc entry
+                                         :status :complete
+                                         :backend-event nil
+                                         :retained-resources [])
+                            measurement (assoc :measurement measurement)
+                            (seq release-errors) (assoc :retention-release-errors release-errors))]
           ;; Record completion before surfacing a lease-close failure: the native event has already
           ;; been consumed and must never be released a second time.
-          (swap! sess assoc-in [:events (:id event)] completed)
-          (when (seq release-errors)
-            (throw (ex-info "transfer completed but retained resource release failed"
-                            {:event event :errors release-errors} (first release-errors))))
-          completed)))))
+            (swap! sess assoc-in [:events (:id event)] completed)
+            (when (seq release-errors)
+              (throw (ex-info "transfer completed but retained resource release failed"
+                              {:event event :errors release-errors} (first release-errors))))
+            completed))))))
 
 (defn event-complete?
   "Return true when a GPUEvent has completed, without blocking. This is a status query, not a
@@ -1776,11 +1826,19 @@
   [sess event]
   (locking sess
     (let [{:keys [device-id closed?]} @sess
-          {:keys [status backend-event]} (resolve-event-entry sess event)]
+          {:keys [status backend-event] :as entry} (resolve-event-entry sess event)]
       (when closed?
         (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
       (or (= :complete status)
-          ((rt-resolve device-id "event-complete?") backend-event)))))
+          (if-let [transfer-state (::transfer-state entry)]
+            (do
+              (cleanup/assert-live! (::cleanup/owner entry))
+              (when-let [failure @(:error transfer-state)] (throw failure))
+              (when-not (= :token (:kind @(:backend transfer-state)))
+                (throw (ex-info "Transfer submission has not returned"
+                                {:reason :transfer-submission-in-progress})))
+              ((rt-resolve device-id "event-complete?") (:token @(:backend transfer-state))))
+            ((rt-resolve device-id "event-complete?") backend-event))))))
 
 (defn await-event!
   "Block until a GPUEvent completes and return the submission's value. For a KernelGraph this is
@@ -1812,7 +1870,13 @@
    buffers to be destroyed."
   [sess event]
   (locking sess
-    (await-event-under-lock! sess event)
+    (let [entry (resolve-event-entry sess event)
+          transfer-state (::transfer-state entry)]
+      (if (and transfer-state @(:error transfer-state))
+        ;; Failed submission did not produce a usable event. Close only its retained debt;
+        ;; never report the abandoned transfer as a successful data operation.
+        (cleanup/release! (::cleanup/owner entry))
+        (await-event-under-lock! sess event)))
     (swap! sess update :events dissoc (:id event)))
   nil)
 

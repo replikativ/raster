@@ -70,7 +70,7 @@
             "plan-range" (fn [_ host {:keys [elements] :as spec} direction]
                            {:host host :spec spec :direction direction
                             :n-bytes (* 4 elements)})
-            "submit-range-batch!" (fn [entries direction]
+            "submit-range-batch!" (fn [entries direction _options]
                                     (let [token {:entries entries :direction direction}]
                                       (swap! submitted conj token)
                                       token))
@@ -123,7 +123,7 @@
        (fn [_ name]
          (case name
            "plan-range" (fn [_ _ _ _] {:n-bytes 32})
-           "submit-range-batch!" (fn [_ _] :submitted)
+           "submit-range-batch!" (fn [_ _ _] :submitted)
            "event-complete?" (constantly true)
            "await-event!" (constantly {:bytes 32 :commands 1})
            "release-event!" (constantly nil)
@@ -178,7 +178,7 @@
         resolver (fn [_ name]
                    (case name
                      "plan-range" (fn [_ _ _ _] {:n-bytes 32})
-                     "submit-range-batch!" (fn [_ _] :transfer-token)
+                     "submit-range-batch!" (fn [_ _ _] :transfer-token)
                      "submit-graph!" (fn [_] :graph-token)
                      "await-event!" (constantly {:bytes 32 :commands 1})
                      "release-event!" (constantly nil)

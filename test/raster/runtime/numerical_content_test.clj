@@ -453,7 +453,7 @@
           (case name
             "plan-range" (fn [_ host spec direction]
                            {:host-segment host :spec spec :direction direction :n-bytes 8})
-            "submit-range-batch!" (fn [_ direction]
+            "submit-range-batch!" (fn [_ direction _options]
                                     (is (= :upload direction))
                                     backend-token)
             "await-event!" (fn [token]
