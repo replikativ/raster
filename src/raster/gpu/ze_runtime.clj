@@ -16,7 +16,7 @@
 
     ;; Module/kernel management
     (ze/load-module! spv-bytes)
-    (ze/create-kernel-fresh module \"kernel_name\") ; pair with destroy-kernel!
+    (ze/create-kernel-fresh module \"kernel_name\") ; owning value, not a raw handle
 
     ;; Memory
     (ze/alloc-shared n-bytes)
@@ -276,15 +276,6 @@
 (def ^:private h-zeModuleDestroy
   (delay (make-handle "zeModuleDestroy" (fd I32 PTR))))
 
-(def ^:private h-zeKernelDestroy
-  (delay (make-handle "zeKernelDestroy" (fd I32 PTR))))
-
-(def ^:private h-zeCommandListDestroy
-  (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
-
-(def ^:private h-zeCommandQueueDestroy
-  (delay (make-handle "zeCommandQueueDestroy" (fd I32 PTR))))
-
 ;; ================================================================
 ;; State
 ;; ================================================================
@@ -296,7 +287,7 @@
          :context nil      ;; MemorySegment (ze_context_handle_t)
          :cmd-list nil     ;; MemorySegment (ze_command_list_handle_t)
          :arena nil        ;; Arena for long-lived allocations
-         :modules {}}))    ;; hash -> module handle
+         :modules (atom {})})) ;; content key -> exact owning module generation
 
 ;; ================================================================
 ;; Invocation helper (uses invokeWithArguments for boxing compat)
@@ -384,7 +375,7 @@
                                       :cmd-list cmd-list
                                       :arena arena
                                       :device-id-hex (format "0x%04x" device-id-val)
-                                      :modules {}}))))))
+                                      :modules (atom {})}))))))
       nil)))
 
 (defn- ensure-init! []
@@ -631,45 +622,103 @@
   "-cl-fp32-correctly-rounded-divide-sqrt")
 
 (defn load-module!
-  "Load a SPIR-V or native module from bytes. Returns the module handle.
+  "Load a SPIR-V or native module from bytes. Returns an exact owning cache reference.
   Modules are cached by content hash and build flags.
   format: :spirv (default) or :native for pre-compiled ZEBIN. SPIR-V modules
   are built with `spirv-build-flags` unless `build-flags` says otherwise; the
   same bytes built with different flags are different modules."
-  (^MemorySegment [^bytes spv-bytes]
+  ([^bytes spv-bytes]
    (load-module! spv-bytes :spirv))
-  (^MemorySegment [^bytes spv-bytes format]
+  ([^bytes spv-bytes format]
    (load-module! spv-bytes format (when (= format :spirv) spirv-build-flags)))
-  (^MemorySegment [^bytes spv-bytes format build-flags]
-   (ensure-init!)
+  ([^bytes spv-bytes format build-flags]
+   ;; The digest and native compiler must consume the same immutable snapshot.
+   (let [payload (aclone spv-bytes)
+         fmt (case format
+               :spirv ZE_MODULE_FORMAT_IL_SPIRV
+               :native ZE_MODULE_FORMAT_NATIVE)
+         hash [format (bytes-digest payload) build-flags]]
+     (locking state
+       (ensure-init!)
+       (let [{:keys [arena context device modules]} @state]
+         (cleanup/with-registry-use modules
    ;; A 32-bit Arrays/hashCode key could hand one module's handle to another
    ;; module's bytes on a collision; the digest keys the exact bytes.
-   (let [hash [format (bytes-digest spv-bytes) build-flags]]
-     (if-let [cached (get-in @state [:modules hash])]
-       cached
-       (let [arena (:arena @state)
-             ctx (:context @state)
-             dev (:device @state)
-             ;; ze_module_desc_t layout (x86_64):
+           (if-let [cached (get @modules hash)]
+             (do
+               (cleanup/assert-live! (::cleanup/owner cached))
+               (when-not (identical? context (:context cached))
+                 (throw (ex-info "Module belongs to a retired Level Zero context"
+                                 {:reason :runtime-generation-mismatch})))
+               (when-not (:handle cached)
+                 (throw (ex-info "Module cache entry has no completed native acquisition"
+                                 {:reason :module-acquisition-incomplete})))
+               cached)
+             (let [slot (cleanup/acquisition-slot)
+                   _ (when (some #(= hash (:module-key %)) (vals @modules))
+                       (throw (ex-info "Module content has a retained unresolved generation"
+                                       {:reason :module-generation-retained})))
+                   borrowers (volatile! {})
+                   owner (cleanup/owner
+                          [{:id :module
+                            :release #(do
+                                        (when (seq @borrowers)
+                                          (throw (ex-info "Module still has kernel borrowers"
+                                                          {:reason :module-in-use
+                                                           :cleanup-retry-safe? true})))
+                                        (cleanup/release-native! slot
+                                                                 (fn [handle]
+                                                                   (when-not (and (identical? context (:context @state))
+                                                                                  (identical? modules (:modules @state)))
+                                                                     (throw (ex-info "Module belongs to a retired Level Zero context"
+                                                                                     {:reason :runtime-generation-mismatch})))
+                                                                   (ze-call! "zeModuleDestroy" @h-zeModuleDestroy [handle]))))}])
+                   reserved {:context context :slot slot :borrowers borrowers
+                             :module-key hash :cache modules
+                             ::cleanup/owner owner}]
+           ;; Publish authority before native contact. Failed/unknown acquisitions remain
+           ;; reachable in this exact cache entry; another load must not retry them.
+               (try (cleanup/build! owner
+                                    (fn []
+                                      (cleanup/publish-replacement! modules [hash] reserved
+                                                                    #(cleanup/release! (::cleanup/owner %)))
+                                      (cleanup/assert-registration-current! modules hash reserved)
+                                      (let [;; ze_module_desc_t layout (x86_64):
              ;; 0: stype(4) + 4: pad(4) + 8: pNext(8) + 16: format(4) + 20: pad(4)
              ;; 24: inputSize(8) + 32: pInputModule(8) + 40: pBuildFlags(8) + 48: pConstants(8)
-             mod-desc (.allocate arena 64)
-             fmt (case format
-                   :spirv  ZE_MODULE_FORMAT_IL_SPIRV
-                   :native ZE_MODULE_FORMAT_NATIVE)
-             _ (.set mod-desc I32 0 (int ZE_STRUCTURE_TYPE_MODULE_DESC))
-             _ (.set mod-desc I32 16 (int fmt))
-             _ (.set mod-desc I64 24 (long (alength spv-bytes)))
-             spv-seg (.allocateFrom arena ValueLayout/JAVA_BYTE spv-bytes)
-             _ (.set mod-desc PTR 32 spv-seg)
-             _ (when build-flags
-                 (.set mod-desc PTR 40 (.allocateFrom ^Arena arena ^String build-flags)))
-             mod-out (ptr-seg arena)
-             _ (ze-call! "zeModuleCreate" @h-zeModuleCreate
-                         [ctx dev mod-desc mod-out MemorySegment/NULL])
-             module (read-ptr mod-out)]
-         (swap! state assoc-in [:modules hash] module)
-         module)))))
+                                            mod-desc (.allocate arena 64)
+                                            _ (.set mod-desc I32 0 (int ZE_STRUCTURE_TYPE_MODULE_DESC))
+                                            _ (.set mod-desc I32 16 (int fmt))
+                                            _ (.set mod-desc I64 24 (long (alength payload)))
+                                            spv-seg (.allocateFrom arena ValueLayout/JAVA_BYTE payload)
+                                            _ (.set mod-desc PTR 32 spv-seg)
+                                            _ (when build-flags
+                                                (.set mod-desc PTR 40 (.allocateFrom ^Arena arena ^String build-flags)))
+                                            mod-out (ptr-seg arena)
+                                            module (cleanup/acquire-native! slot
+                                                                            #(do
+                                                                               (ze-call! "zeModuleCreate" @h-zeModuleCreate
+                                                                                         [context device mod-desc mod-out MemorySegment/NULL])
+                                                                               (let [handle (read-ptr mod-out)]
+                                                                                 (when (or (nil? handle) (.equals MemorySegment/NULL handle))
+                                                                                   (throw (ex-info "zeModuleCreate returned no module handle"
+                                                                                                   {:reason :invalid-native-module-handle})))
+                                                                                 handle)))
+                                            loaded (assoc reserved :handle module)]
+                                        (cleanup/publish-owned-update! modules [hash] reserved loaded)
+                                        loaded))
+                                    (fn [_] (cleanup/retain-owned-entry! modules reserved)))
+                    (catch Throwable primary
+                      (when (empty? (cleanup/pending owner))
+                        (try
+                          (cleanup/release-entries! modules
+                                                    (filterv (fn [[_ entry]] (identical? owner (::cleanup/owner entry)))
+                                                             (vec @modules))
+                                                    #(cleanup/release! (::cleanup/owner %)))
+                          (catch Throwable retirement-error
+                            (when-not (identical? primary retirement-error)
+                              (.addSuppressed primary retirement-error)))))
+                      (throw primary)))))))))))
 
 ;; ================================================================
 ;; Memory allocation
@@ -773,7 +822,7 @@
   Sets workgroup size and arguments, then dispatches.
   Synchronous (uses immediate command list with barrier).
 
-  kernel: registered kernel handle or owned handle from create-kernel-fresh
+  kernel: registered kernel handle or :handle borrowed from an owned fresh-kernel value
   group-count-x: number of workgroups in X dimension
   workgroup-size-x: threads per workgroup in X
   kernel-args: seq of kernel argument specs, each one of:
@@ -1657,23 +1706,71 @@
 ;; ================================================================
 
 (defn create-kernel-fresh
-  "Create a NEW, UNCACHED kernel handle. LZ kernel arguments are mutable state on
+  "Create a NEW owned kernel from the exact reference returned by load-module!.
+  LZ kernel arguments are mutable state on
   the kernel handle, snapshotted at append; a recorded graph with N launches of
   the same compiled kernel must give each launch its own handle or the last args
   win (the 127-matmul clobber). Pair with destroy-kernel! at teardown."
-  ^MemorySegment [^MemorySegment module ^String kernel-name]
-  (ensure-init!)
-  (let [arena (:arena @state)
-        kern-desc (.allocate arena 32)
-        _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
-        name-seg (.allocateFrom arena kernel-name)
-        _ (.set kern-desc PTR 24 name-seg)
-        kern-out (ptr-seg arena)
-        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])
-        kernel (read-ptr kern-out)]
-    (when (or (nil? kernel) (.equals MemorySegment/NULL kernel))
-      (throw (ex-info "zeKernelCreate returned no kernel handle" {:reason :invalid-native-kernel-handle})))
-    kernel))
+  [module ^String kernel-name]
+  (locking state
+    (ensure-init!)
+    (let [{:keys [arena context modules]} @state]
+      (cleanup/with-registry-use modules
+        (let [key (:module-key module)
+              entry (get @modules key)
+              _ (when-not (and (identical? modules (:cache module))
+                               (identical? module entry) (:handle module))
+                  (throw (ex-info "Kernel requires the exact live module cache reference"
+                                  {:reason :unowned-native-module})))
+              _ (cleanup/assert-live! (::cleanup/owner entry))
+              _ (when-not (identical? context (:context entry))
+                  (throw (ex-info "Module belongs to a retired Level Zero context"
+                                  {:reason :runtime-generation-mismatch})))
+              token (random-uuid)
+              slot (cleanup/acquisition-slot)
+              borrowers (:borrowers entry)
+              owner (cleanup/owner
+                     [{:id :kernel
+                       :release #(cleanup/release-native! slot
+                                                          (fn [kernel]
+                                                            (when-not (and (identical? context (:context @state))
+                                                                           (identical? modules (:modules @state)))
+                                                              (throw (ex-info "Kernel belongs to a retired Level Zero context"
+                                                                              {:reason :runtime-generation-mismatch})))
+                                                            (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel])))}
+                      {:id :module-borrow :after #{:kernel}
+                       :release #(vswap! borrowers dissoc token)}])
+              kern-desc (.allocate arena 32)
+              _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
+              name-seg (.allocateFrom arena kernel-name)
+              _ (.set kern-desc PTR 24 name-seg)
+              kern-out (ptr-seg arena)
+              _ (vswap! borrowers assoc token owner)]
+       ;; This pin is private, not watchable metadata. Unknown native acquisition keeps it:
+       ;; neither a module-cache teardown nor a new load may guess that no kernel exists.
+          (try (cleanup/build! owner
+                               #(let [kernel (cleanup/acquire-native! slot
+                                                                      (fn []
+                                                                        (cleanup/assert-registration-current! modules key entry)
+                                                                        (ze-call! "zeKernelCreate" @h-zeKernelCreate [(:handle module) kern-desc kern-out])
+                                                                        (let [kernel (read-ptr kern-out)]
+                                                                          (when (or (nil? kernel) (.equals MemorySegment/NULL kernel))
+                                                                            (throw (ex-info "zeKernelCreate returned no kernel handle"
+                                                                                            {:reason :invalid-native-kernel-handle})))
+                                                                          kernel)))]
+                                  (cleanup/assert-registration-current! modules key entry)
+                                  {:handle kernel :context context :module-owner (::cleanup/owner entry)})
+        ;; The private borrower table already retains this exact child owner on failure.
+                               (fn [_] (cleanup/retain-owned-entry! modules entry)))
+               (catch Throwable primary
+                 (when (seq (cleanup/pending (::cleanup/owner entry)))
+                   (try (cleanup/retain-owned-entry! modules entry)
+                        (catch Throwable retention-error
+                          (let [wrapper (ex-info "Kernel construction retains its module generation"
+                                                 {::cleanup/unresolved (::cleanup/owner entry)} primary)]
+                            (.addSuppressed wrapper retention-error)
+                            (throw wrapper)))))
+                 (throw primary))))))))
 
 (defn- recording-owner
   [event-count]
@@ -1707,9 +1804,26 @@
         handle))))
 
 (defn destroy-kernel!
-  "Destroy a kernel handle from create-kernel-fresh."
-  [^MemorySegment kernel]
-  (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel]))
+  "Release an owned fresh kernel. Raw handles carry no destruction authority."
+  [kernel]
+  (locking state
+    (cleanup/with-registry-use (:modules @state)
+      (if-let [owner (::cleanup/owner kernel)]
+        (cleanup/release! owner)
+        (throw (ex-info "Fresh kernel has no cleanup owner" {:reason :missing-cleanup-owner})))))
+  nil)
+
+(defn- close-module-cache!
+  "Release independent cache entries only after a pure all-borrowers preflight."
+  []
+  (locking state
+    (let [modules (:modules @state)]
+      (cleanup/with-registry-use modules
+        (when (some #(when-let [borrowers (:borrowers %)] (seq @borrowers)) (vals @modules))
+          (throw (ex-info "Module cache still has kernel borrowers"
+                          {:reason :module-in-use})))
+        (cleanup/release-entries! modules (vec @modules)
+                                  #(cleanup/release! (::cleanup/owner %)))))))
 
 ;; ================================================================
 ;; Kernel registry (pipeline integration)
@@ -2007,7 +2121,7 @@
                                 :spv-bytes spv-bytes
                                 :entry-name entry-name
                                 :module module
-                                :kernel-handle kernel-handle)]
+                                :kernel-handle (:handle kernel-handle))]
              (cleanup/publish-owned-update! kernel-registry [kernel-name] info updated)
              (assert-registration-live! updated)
              updated))
@@ -2398,58 +2512,59 @@
    1-3D geometry come exclusively from the call; no map/reduction convention is interpreted."
   ([call] (bind-kernel-call call {}))
   ([call {:keys [adopt-cleanup! async?]}]
-  (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
-        (kcall/binding-plan call)
-        registered (or (get @kernel-registry kernel-name)
-                       (throw (ex-info (str "Kernel not registered: " kernel-name)
-                                       {:kernel-name kernel-name
-                                        :registered (keys @kernel-registry)})))
-        _ (kcall/validate-registered! call registered)
-        pointer-values (mapv second pointer-pairs)
-        _ (doseq [[slot value] pointer-pairs]
-            (when-not (or (device-buffer? value) (instance? MemorySegment value))
-              (throw (ex-info "Level Zero KernelCall requires DeviceBuffer/MemorySegment pointers"
-                              {:kernel-name kernel-name :slot slot :value-type (type value)}))))
-        _ (kabi/validate-physical-pointer-dtypes!
-           abi (physical-pointer-dtypes pointer-values))
-        _ (kcall/validate-resident-output-capacities!
-           call plan registered
-           (fn [value slot]
-             (cond
-               (device-buffer? value) (:n-elements ^DeviceBuffer value)
-               (instance? MemorySegment value)
-               (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))))
+   (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
+         (kcall/binding-plan call)
+         registered (or (get @kernel-registry kernel-name)
+                        (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                        {:kernel-name kernel-name
+                                         :registered (keys @kernel-registry)})))
+         _ (kcall/validate-registered! call registered)
+         pointer-values (mapv second pointer-pairs)
+         _ (doseq [[slot value] pointer-pairs]
+             (when-not (or (device-buffer? value) (instance? MemorySegment value))
+               (throw (ex-info "Level Zero KernelCall requires DeviceBuffer/MemorySegment pointers"
+                               {:kernel-name kernel-name :slot slot :value-type (type value)}))))
+         _ (kabi/validate-physical-pointer-dtypes!
+            abi (physical-pointer-dtypes pointer-values))
+         _ (kcall/validate-resident-output-capacities!
+            call plan registered
+            (fn [value slot]
+              (cond
+                (device-buffer? value) (:n-elements ^DeviceBuffer value)
+                (instance? MemorySegment value)
+                (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-        {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
-        cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
-    (cleanup/construct!
-     :kernel #(create-kernel-fresh module entry-name)
-     (fn [kernel]
-       (when async?
-         (ze-call! "zeCommandListHostSynchronize" @h-zeCommandListHostSynchronize
-                   [cmd-list (long -1)]))
-       (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel]))
-     (fn [kernel-handle owner]
-       (let [native-args (mapv (fn [[slot value]]
-                                (if (= :scalar (:kind slot))
-                                  value
-                                  (if (device-buffer? value)
-                                    (:segment ^DeviceBuffer value)
-                                    value)))
-                              pairs)
-             bound (bind-kernel! kernel-handle workgroup-size native-args cmd-list)
-             ^MemorySegment gc (:gc-seg bound)]
-         (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
-           (.set gc I32 (long (* axis 4)) (int count)))
-         {:bound bound
-          ::cleanup/owner owner
+         {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
+         cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
+     (cleanup/construct!
+      :kernel #(create-kernel-fresh module entry-name)
+      (fn [kernel]
+        (when async?
+          (ze-call! "zeCommandListHostSynchronize" @h-zeCommandListHostSynchronize
+                    [cmd-list (long -1)]))
+        (destroy-kernel! kernel))
+      (fn [kernel owner]
+        (let [kernel-handle (:handle kernel)
+              native-args (mapv (fn [[slot value]]
+                                  (if (= :scalar (:kind slot))
+                                    value
+                                    (if (device-buffer? value)
+                                      (:segment ^DeviceBuffer value)
+                                      value)))
+                                pairs)
+              bound (bind-kernel! kernel-handle workgroup-size native-args cmd-list)
+              ^MemorySegment gc (:gc-seg bound)]
+          (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
+            (.set gc I32 (long (* axis 4)) (int count)))
+          {:bound bound
+           ::cleanup/owner owner
           ;; Geometry is already baked into gc-seg. record-graph! must not reinterpret X specially.
-          :group-count nil
-          :kernel-name kernel-name
-          :async? (boolean async?)
-          :kernel-call call
-          :binding-plan plan}))
-     adopt-cleanup!))))
+           :group-count nil
+           :kernel-name kernel-name
+           :async? (boolean async?)
+           :kernel-call call
+           :binding-plan plan}))
+      adopt-cleanup!))))
 
 (defn launch-registered-bound!
   "Dispatch a pre-bound kernel. A KernelCall has its complete geometry baked into :gc-seg;
@@ -2621,12 +2736,6 @@
       (await-event! event)
       (finally
         (release-event! event)))))
-
-(defn- destroy-handle!
-  [^MethodHandle mh ^MemorySegment seg]
-  (when (and seg (not (.equals MemorySegment/NULL seg)))
-    (try (.invokeWithArguments mh ^java.util.List (java.util.List/of (object-array [seg])))
-         (catch Exception _))))
 
 (defn destroy-prepared!
   "Destroy the DEDICATED kernel handle a prepared binding owns (create-kernel-fresh allocates one
@@ -3185,31 +3294,29 @@
 ;; ================================================================
 
 (defn shutdown!
-  "Release all Level Zero resources."
+  "Release cached modules only when registrations and dedicated kernel borrowers are closed.
+   Root-context/buffer ownership is not yet represented here; callers must close sessions first."
   []
-  (when (:initialized? @state)
-    ;; Free cached MemorySegments from kernel registry
-    (doseq [[_ info] @kernel-registry]
-      (doseq [[k v] info]
-        (when (instance? MemorySegment v)
-          (try (free! v) (catch Exception _)))))
-    (clojure.core/reset! kernel-registry {})
-    (clojure.core/reset! kernel-dispatch-registry {})
-    (doseq [[_ m] (:modules @state)]
-      (try (.invokeWithArguments ^MethodHandle @h-zeModuleDestroy
-                                 ^java.util.List (java.util.List/of (object-array [m])))
-           (catch Exception _)))
-    (when-let [^Arena arena (:arena @state)]
-      (.close arena))
-    (clojure.core/reset! state {:initialized? false :driver nil :device nil
-                                :context nil :cmd-list nil :arena nil
-                                :modules {}}))
+  (cleanup/with-registry-use kernel-registry
+    (locking state
+      (when (:initialized? @state)
+    ;; Never infer ownership from MemorySegment-shaped metadata or drop failed registrations.
+    ;; Registration retirement takes the registry lock before state; shutdown never reverses it.
+        (when (seq @kernel-registry)
+          (throw (ex-info "Close kernel arenas before Level Zero shutdown"
+                          {:reason :registrations-in-use})))
+        (close-module-cache!)
+        (clojure.core/reset! kernel-dispatch-registry {})
+        (when-let [^Arena arena (:arena @state)]
+          (.close arena))
+        (clojure.core/reset! state {:initialized? false :driver nil :device nil
+                                    :context nil :cmd-list nil :arena nil
+                                    :modules (atom {})}))))
   nil)
 
 (defn reset!
-  "Full GPU reset: shutdown + reinitialize. Use in the REPL when the GPU
-  state is corrupted or after switching simulation scales. Clears all
-  kernel handles, modules, and device buffers from the registry."
+  "Shutdown then reinitialize. Requires closed kernel arenas and dedicated kernels.
+   This does not yet certify recovery of live buffers, command lists or corrupted contexts."
   []
   (shutdown!)
   (init!)
