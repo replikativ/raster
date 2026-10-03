@@ -4,6 +4,29 @@
 
 (defn- error-of [f] (try (f) nil (catch Throwable e e)))
 
+(deftest registry-replacement-admission-precedes-teardown
+  (let [old {:id :old} registry (atom {:kernel old}) calls (atom 0)
+        destroy! (fn [_] (swap! calls inc))]
+    (doseq [[state path candidate callback]
+            [[{} [:kernel] {} destroy!]
+             [registry [] {} destroy!]
+             [registry (list :kernel) {} destroy!]
+             [registry [nil] {} destroy!]
+             [registry [:kernel] nil destroy!]
+             [registry [:kernel] {} nil]]]
+      (is (= :invalid-replacement-contract
+             (:reason (ex-data (error-of #(cleanup/publish-replacement!
+                                          state path candidate callback)))))))
+    (is (= :replacement-generation-unchanged
+           (:reason (ex-data (error-of #(cleanup/publish-replacement!
+                                        registry [:kernel] old destroy!))))))
+    (is (zero? @calls))
+    (is (identical? old (:kernel @registry))))
+  (let [registry (atom {:kernel false}) calls (atom []) candidate {:id :new}]
+    (is (identical? candidate
+                    (cleanup/publish-replacement! registry [:kernel] candidate #(swap! calls conj %))))
+    (is (= [false] @calls))))
+
 (deftest registry-replacement-preserves-reentrant-unrelated-generations
   (doseq [path [[:kernel] [:kernels :kernel]] phase [:retirement :publication]]
     (let [old {:id :old} candidate {:id :candidate} unrelated {:id :reentrant}
@@ -25,15 +48,17 @@
         (is (= [old] @retired))))))
 
 (deftest registry-replacement-preserves-primary-and-recovery-errors
-  (let [primary (ex-info "publication failed" {}) recovery (ex-info "recovery failed" {})
+  (doseq [already-suppressed? [false true]]
+   (let [primary (ex-info "publication failed" {}) recovery (ex-info "recovery failed" {})
         candidate {:id :candidate} registry (atom {:kernel {:id :old}})]
+    (when already-suppressed? (.addSuppressed primary recovery))
     (add-watch registry :throw
                (fn [_ _ _ after]
                  (throw (if (identical? candidate (:kernel after)) primary recovery))))
     (is (identical? primary
                     (error-of #(cleanup/publish-replacement! registry [:kernel] candidate (fn [_])))))
     (is (empty? @registry))
-    (is (= [recovery] (vec (.getSuppressed primary))))))
+    (is (= [recovery] (vec (.getSuppressed primary)))))))
 
 (deftest reserved-acquisitions-retain-unknown-outcomes-and-independent-resources
   (let [calls (atom []) list-slot (cleanup/acquisition-slot)

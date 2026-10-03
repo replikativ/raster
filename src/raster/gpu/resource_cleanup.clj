@@ -113,14 +113,19 @@
    old teardown remains registered as debt. Arbitrary validators can reject recovery mutations;
    these errors are suppressed on the primary. This is runtime authority, never compiler evidence."
   [registry path candidate destroy!]
-  (when-not (and (vector? path) (seq path) (fn? destroy!))
-    (throw (ex-info "Registry replacement requires a nonempty path and teardown callback"
+  (when-not (and (instance? clojure.lang.Atom registry)
+                 (vector? path) (seq path) (every? some? path)
+                 (some? candidate) (fn? destroy!))
+    (throw (ex-info "Registry replacement requires an atom, nonempty path, candidate and teardown callback"
                     {:reason :invalid-replacement-contract})))
   (locking registry
     (let [old (get-in @registry path)
           retired? (volatile! false)]
+      (when (identical? old candidate)
+        (throw (ex-info "Replacement must be a distinct registry generation"
+                        {:reason :replacement-generation-unchanged :path path})))
       (try
-        (when old (destroy! old))
+        (when (some? old) (destroy! old))
         (vreset! retired? true)
         (when-not (identical? old (get-in @registry path))
           (throw (ex-info "GPU binding changed during retirement"
@@ -147,7 +152,8 @@
                              (update-in state (pop path) dissoc (peek path)))
                            state))))
               (catch Throwable secondary
-                (when-not (identical? primary secondary)
+                (when-not (or (identical? primary secondary)
+                              (some #(identical? secondary %) (.getSuppressed primary)))
                   (.addSuppressed primary secondary)))))
           (throw primary))))))
 

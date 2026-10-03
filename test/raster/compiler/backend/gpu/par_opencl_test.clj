@@ -328,7 +328,7 @@
 ;; ================================================================
 
 (deftest opencl-pass-map-test
-  (testing "par/map! gets replaced with ze invoke-kernel marker"
+  (testing "par/map! gets replaced with the registered ABI invocation marker"
     (let [form '(let* [out (double-array n)]
                       (raster.par/map! out i n double (+ (aget a i) (aget b i)))
                       out)

@@ -2072,7 +2072,10 @@ calls use it directly; no adapter or second transaction remains. It checks the e
 after teardown and inside the publication CAS, and checks the exact candidate after atom watches
 return. An unrelated generation installed during teardown/publication is never overwritten or
 removed. Root and nested registry paths share the same recovery rule. This prerequisite passes
-105 tests / 1005 assertions across the affected publication, ownership and topology namespaces.
+106 tests / 1019 assertions across the affected publication, ownership and topology namespaces.
+Admission rejects nil candidates and the exact old generation before any teardown; recovery
+deduplicates secondary error identities. Publishing metadata for an identical registration must
+preserve its lifetime explicitly, not invoke the retiring replacement transaction.
 
 The rest of this vertical remains implementation work, not an achieved ownership claim:
 
@@ -2098,3 +2101,13 @@ must not be freed by an arena. Their canonical cache ownership and shutdown-befo
 are the immediately following runtime-root slice; the arena slice must not claim reset recovery
 or silently drop those debts. These two slices precede the still-open training/model and durable
 distributed acceptance items rather than replacing them.
+
+The unused ZE `create-kernel`/`invoke-kernel` pair and its global mutable-kernel cache are removed,
+along with the duplicate registry accessor and stale marker documentation. Source/test/dev/bench
+search plus read-only audits of pretrained-rstr, finetune-rstr, umap-rstr, evoc-rstr, city and
+spindel found no consumers of those two Raster functions. Registered ABI invocation, fresh bound
+kernels and the shared module cache remain. The observable change is removal of those legacy
+raw APIs; high-level `deftm`/prepared/Link semantics are unchanged. Adjacent emission and native
+binding checks pass (32 tests / 386 assertions), with the removed vars unmapped in the REPL.
+The old arena and global-module shutdown implementations still require the ownership migration
+above; dead-cache removal alone is not that proof.
