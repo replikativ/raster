@@ -1906,3 +1906,32 @@ because the public entry remains registered. Fault tests cover missing owners, p
 names, 3D launch projection, failed acquisition debt, replacement failure and launch/release ordering.
 Quantized replay tests observe actual intermediate uploads rather than conflating an allocation's
 one-time initialization source with hot-path transfers; CPU/device poison and replay oracles remain.
+
+#### Composite prepared-step ownership
+
+Descriptor-selected KernelArtifact and KernelGraph bindings now use the same checked composite
+resource owner as modern graph bindings. BoundExecutableStep is only the ordered-child container,
+not a teardown exception. Admission, recording and destruction require its live outer owner.
+The former per-child swallowed destruction/free errors and publish-before-old-destruction ordering
+are removed. A single outer construction accumulator receives every returned child binding,
+backend-adopted debt, graph-private temporary and owned descriptor sub-buffer. Rollback reuses a
+completed candidate's exact owner rather than wrapping its children in a second ownership plan.
+
+Descriptor-private temporary and owned OpenCL sub-buffer constructors reserve acquisition slots
+before native contact. Successful acquisition owners move atomically from conservative debt to
+their post-kernel dependency layer. A throwing constructor remains indeterminate; no retry or
+“nothing allocated” inference is allowed. Failed construction and failed replacement remain hidden
+prepared registrations when cleanup cannot finish. Root footprints pin borrowed session storage,
+and session close stops before root teardown if any prepared owner remains unresolved.
+
+The dependency order is adopted debt → kernels → owned views → temporaries. Descriptor-owned view
+owner/buffer vectors form matching ordered prefixes, with only a possible owner-only final tail if
+bookkeeping fails; other graph paths provide no private view owners. Do not introduce a mixed raw
+legacy prefix and migrated-owner suffix into this representation. Constructor tests cover first
+and second allocation/slice failures, root/session retention, successful multi-node teardown, and
+a later child-bind failure with unknown earlier child destruction. Conservative debt may retain
+otherwise independent private storage; it does not justify freeing possibly referenced storage.
+
+Scope remains explicit: public/root allocation constructors, modern graph external materialization,
+global registries, root/view/event owners and sticky linked/parallel close are separate follow-ups.
+This closes the descriptor-specific lifetime exception, not the entire memory-management campaign.

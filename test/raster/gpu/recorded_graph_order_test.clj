@@ -356,10 +356,10 @@
 
 (deftest one-semantic-phase-can-split-between-prologue-and-replay
   (let [sess (atom {:device-id :ocl:0
-                    :prepared {:phase (gpu/->BoundExecutableStep
+                    :prepared {:phase (owned-phase (gpu/->BoundExecutableStep
                                        [{:phase :constant-transform :const-prologue? true}
                                         {:phase :value-kernel}]
-                                       {} [])}
+                                       {} []))}
                     :graphs {} :closed? false})
         resolve-runtime (fn [_device-id name]
                           (case name
