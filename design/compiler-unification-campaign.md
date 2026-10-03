@@ -2372,6 +2372,13 @@ success: rollback retires the backend token but leaves host leases caller-owned,
 retired event debt, and preserves the exact primary error. No fallible publication or callback
 follows the private host-ownership handoff. The dedicated regression exercises this boundary.
 
+PR #1022 passed all seven exact-head CI gates and merged as `4fdcf4c1`. The affected ownership
+suite passes 182 tests / 1,898 assertions, and transfer/range/distributed/local-native lease
+acceptance passes 39 tests / 320 assertions. The existing tiny resident Gemma LoRA workload also
+passes 43 assertions: 25 Level Zero updates reduce loss from 2.800152 to 0.256915 while tracking
+the independent JVM trajectory. This is the existing model twin, not external real-weight
+training, throughput or live-reset evidence.
+
 Integration must retain the authoritative child cleanup as well as its root pin;
 a count or raw pointer alone is insufficient. Session construction currently creates
 only a kernel-arena identifier and must remain lazy (no GPU initialization merely to
@@ -2384,8 +2391,36 @@ not permanent external leases.
 
 Direct allocation debt found in the production inventory: `runtime/display.clj`
 resolves raw ZE `alloc-shared`; ZE SoA construction uses `alloc-shared`/`alloc-device`;
-the scan helper allocates raw block-sum/offset scratch. Migrate these to canonical
+the obsolete scan helper allocated raw block-sum/offset scratch. The retirement below removes
+that unreachable path rather than introducing another owner for it. Migrate the remaining
+display/SoA consumers to canonical
 owners or retire the paths, including their fault and view coverage, before changing
 the fail-closed live reset gate. Buffer/registration/session lock ordering must be
 reviewed against concurrent acquisition and teardown, not inferred from single-thread
 test success.
+
+### Retire backend-local scan runtime duplication — 2026-10-03
+
+The production scan path already lowers TypedSOAC to SegScan, then a verified KernelGraph /
+KernelDispatch behind the common executable ABI. The public `raster.par/scan`,
+`raster.par/scan-exclusive` and `raster.gpu/invoke-scan!` surfaces retain their contracts. Raw
+exclusive scan entering the source-shaped backend still fails closed with
+`:exclusive-scan-requires-typed-schedule`; it cannot select a backend-local algorithm.
+
+An independent reference/dispatch audit found no production, test, dev or benchmark caller,
+generated marker or dynamic selector for either backend's `invoke-registered-scan-exclusive-kernel`.
+The only ZE recursive-helper references were its definition/self-call and that obsolete entry.
+Both entries and private ZE `invoke-full-gpu-scan!` are removed (235 lines), including raw
+block-sum/offset allocation and finally-free behavior that could lose native acquisition debt or
+mask a primary error. This is a break for direct callers of those internal runtime Vars, not a
+change to supported source or session scan semantics. No raw allocation API is removed in this
+slice: display and GpuSoA still use those APIs and require separate ownership migration.
+
+Architectural ratchets reject these markers in program extraction and require the retired runtime
+Vars to be absent. Existing typed graph/ABI, raw-source rejection and compatibility-ledger tests
+remain the semantic oracles. The capped REPL passes 28 boundary/ledger tests / 150 assertions and
+17 selected typed route, JVM, staged/resident and actual OpenCL/Level Zero scan tests / 88 assertions.
+Persistent native namespaces are not reloaded: only the three deleted Vars were explicitly
+unmapped. Cold CI remains necessary to validate source loading; final review and all seven
+exact-head gates are required before merge. This retirement narrows ownership debt, not the
+original training, distributed or AMR completion requirements.
