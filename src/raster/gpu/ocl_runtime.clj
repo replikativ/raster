@@ -967,7 +967,7 @@
                       {:reason :runtime-generation-mismatch}))))
   info)
 
-(defn- reserve-registration [info]
+(defn- reserve-registration [info compiler-info]
   (let [kernel (cleanup/acquisition-slot) program (cleanup/acquisition-slot)
         staging (cleanup/acquisition-slot) context (volatile! nil)
         release! (fn [slot label handle]
@@ -985,7 +985,7 @@
                  :release #(cleanup/release-native! staging (fn [^Arena arena] (.close arena)))}])]
     (assoc info ::cleanup/owner owner
            ::registration {:kernel kernel :program program :staging staging :context context
-                           :cached (atom {})})))
+                           :cached (atom {}) :artifact compiler-info})))
 
 (defn close-kernel-arena!
   "Release exact arena registrations, retaining uncertain failures; never scan metadata pointers."
@@ -1010,11 +1010,12 @@
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
    (cleanup/assert-registry-mutable! kernel-registry)
-   (let [_ (when (some #(contains? kernel-info %) [:program :kernel-handle ::cleanup/owner ::registration])
+   (let [_ (when (some #(contains? kernel-info %) [:arena-id :program :kernel-handle ::cleanup/owner ::registration])
              (throw (ex-info "Registration cannot import native lifetime fields"
                              {:reason :invalid-kernel-registration})))
          _ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
-         info (cond-> kernel-info
+         compiler-info kernel-info
+         info (cond-> compiler-info
                 arena-id (assoc :arena-id arena-id))]
      (cleanup/with-registry-use kernel-registry
        (let [prior (get @kernel-registry kernel-name)
@@ -1028,8 +1029,11 @@
            (do (assert-registration-live! prior)
                (cleanup/retaining-registration!
                 kernel-registry prior
-                #(cleanup/publish-owned-update! kernel-registry [kernel-name] prior (merge prior info))) nil)
-           (let [candidate (reserve-registration info)]
+                #(cleanup/publish-owned-update!
+                  kernel-registry [kernel-name] prior
+                  (assoc (merge prior info) ::registration
+                         (assoc (::registration prior) :artifact compiler-info)))) nil)
+           (let [candidate (reserve-registration info compiler-info)]
              (cleanup/build! (registration-owner! candidate)
                              #(do (cleanup/publish-replacement!
                                    kernel-registry [kernel-name] candidate
@@ -1486,10 +1490,10 @@
 ;; ================================================================
 
 (defn kernel-registry-entry
-  "Public read of a registered kernel's info map (source, :array-params,
-  :scalar-params, dtype, ...). Same contract as ze-runtime."
+  "Return compiler registration metadata, never native handles or cleanup authority.
+   The resident compiler may retain/re-register this exact artifact without importing runtime state."
   [kernel-name]
-  (get @kernel-registry kernel-name))
+  (get-in @kernel-registry [kernel-name ::registration :artifact]))
 
 (defn- registered-1d-workgroup-size
   "Read the canonical artifact workgroup or the remaining plain registry entry. A 1-D binder must

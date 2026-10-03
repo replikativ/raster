@@ -1,6 +1,8 @@
 (ns raster.gpu.registry-cleanup-test
   "Fault injection through native registration/load/arena teardown, without a device."
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.gpu.storage-representation :as probe]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]
             [raster.gpu.resource-cleanup :as cleanup]
@@ -74,13 +76,45 @@
 (defn- spec [name] {:kernel-name name :source "source" :spv-bytes (byte-array [1 2])})
 (defn- releases [calls] (mapv second (filter #(= :release (first %)) @calls)))
 
+(deftest compiler-registry-read-preserves-artifacts-without-importing-runtime-authority
+  (doseq [backend [:ocl :ze]]
+    (with-backend backend {}
+      (fn [{:keys [register! load! stage! close! registry v]}]
+        (let [artifact (cond-> (probe/emit-artifact :float :opencl-portable)
+                         (= :ze backend) (assoc :spv-bytes (byte-array [1 2])))
+              name (:kernel-name artifact)
+              read! @(v 'kernel-registry-entry)]
+          (register! name artifact :arena)
+          (let [metadata (read! name)
+                owner (::cleanup/owner (get @registry name))]
+            (load! name)
+            (stage! name :input 16)
+            (is (identical? metadata (read! name)) "loading/staging cannot pollute compiler metadata")
+            (is (kart/kernel-artifact? metadata))
+            (is (= (select-keys artifact [:source :abi :arguments :launch :effects :attributes])
+                   (select-keys metadata [:source :abi :arguments :launch :effects :attributes])))
+            (is (not-any? #(contains? metadata %)
+                          [:arena-id :program :module :kernel-handle :entry-name ::cleanup/owner
+                           :raster.gpu.ocl-runtime/registration :raster.gpu.ze-runtime/registration
+                           :raster.gpu.ze-runtime/registration-payload-identity]))
+            (register! name metadata :arena)
+            (is (identical? owner (::cleanup/owner (get @registry name))))
+            (is (some? (:kernel-handle (get @registry name))))
+            (is (= :arena (:arena-id (get @registry name))))
+            (is (not-any? #(contains? (read! name) %)
+                          [:arena-id :program :module :kernel-handle :entry-name ::cleanup/owner
+                           :raster.gpu.ocl-runtime/registration :raster.gpu.ze-runtime/registration
+                           :raster.gpu.ze-runtime/registration-payload-identity])
+                "same-program refresh still exposes only admitted compiler metadata")
+            (close! :arena)))))))
+
 (deftest registration-rejects-imported-native-authority-before-contact
   (doseq [backend [:ocl :ze]]
     (with-backend backend {}
       (fn [{:keys [register! registry calls]}]
         (doseq [field (if (= :ocl backend)
-                        [:program :kernel-handle ::cleanup/owner :raster.gpu.ocl-runtime/registration]
-                        [:module :entry-name :kernel-handle ::cleanup/owner
+                        [:arena-id :program :kernel-handle ::cleanup/owner :raster.gpu.ocl-runtime/registration]
+                        [:arena-id :module :entry-name :kernel-handle ::cleanup/owner
                          :raster.gpu.ze-runtime/registration
                          :raster.gpu.ze-runtime/registration-payload-identity])]
           (is (= :invalid-kernel-registration
@@ -247,7 +281,7 @@
         (register! "probe" (spec "probe") :arena) (load! "probe")
         (let [info (get @registry "probe")
               owner (::cleanup/owner info)
-              replacement (@(v 'reserve-registration) (assoc (spec "replacement") :arena-id :replacement))
+              replacement (@(v 'reserve-registration) (assoc (spec "replacement") :arena-id :replacement) (spec "replacement"))
               registration (get info (if (= :ocl backend)
                                        :raster.gpu.ocl-runtime/registration
                                        :raster.gpu.ze-runtime/registration))
@@ -272,7 +306,7 @@
       (fn [{:keys [register! load! close! registry v]}]
         (register! "probe" (spec "probe") :arena) (load! "probe")
         (let [owner (::cleanup/owner (get @registry "probe"))
-              replacement (@(v 'reserve-registration) (assoc (spec "replacement") :arena-id :replacement))]
+              replacement (@(v 'reserve-registration) (assoc (spec "replacement") :arena-id :replacement) (spec "replacement"))]
           (add-watch registry :lose-parent
                      (fn [_ ref _ current]
                        (when (:refresh-marker (get current "probe"))
@@ -317,7 +351,7 @@
         (let [info (get @registry "probe")
               owner (::cleanup/owner info)
               staging (:staging (:raster.gpu.ze-runtime/registration info))
-              replacement (@(v 'reserve-registration) (assoc (spec "replacement") :arena-id :replacement))]
+              replacement (@(v 'reserve-registration) (assoc (spec "replacement") :arena-id :replacement) (spec "replacement"))]
           (add-watch staging :lose-parent
                      (fn [_ _ before after]
                        (when (< (count after) (count before))

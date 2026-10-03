@@ -27,11 +27,11 @@
         ;; Simulate lazy loading preserving registration-time payload provenance.
         (swap! registry update "unit" merge
                (dissoc (loaded) ::ze/registration-payload-identity ::cleanup/owner ::ze/registration))
-        (let [prior (ze/kernel-registry-entry "unit")
+        (let [prior (get @registry "unit")
               incoming (cond-> (assoc incoming :attributes {:strategy :new})
                          explicit? (assoc :spv-bytes (byte-array [1 2 3])))]
           (ze/register-kernel! "unit" incoming :unit-arena)
-          (let [entry (ze/kernel-registry-entry "unit")]
+          (let [entry (get @registry "unit")]
             (doseq [key [:module :kernel-handle :staging :spv-bytes]]
               (is (identical? (get prior key) (get entry key))))
             (is (= "canonical_entry" (:entry-name entry)))
@@ -48,7 +48,7 @@
       (ze/register-kernel! "unit"
                            (cond-> {:target :opencl-c :source "unit source" :attributes {}}
                              (not prior-explicit?) (assoc :spv-bytes (byte-array [1 2 3]))) :unit-arena)
-      (is (nil? (:kernel-handle (ze/kernel-registry-entry "unit")))))))
+      (is (nil? (:kernel-handle (get @ze/kernel-registry "unit")))))))
 
 (deftest explicit-registration-snapshots-caller-owned-payload
   (let [payload (byte-array [1 2 3])]
@@ -63,7 +63,7 @@
                  (dissoc (loaded) ::ze/registration-payload-identity)]]
     (with-redefs [ze/kernel-registry (atom {"unit" prior})]
       (ze/register-kernel! "unit" {:target :opencl-c :source "unit source" :attributes {}} :unit-arena)
-      (is (nil? (:kernel-handle (ze/kernel-registry-entry "unit")))))))
+      (is (nil? (:kernel-handle (get @ze/kernel-registry "unit")))))))
 
 (deftest changed-source-arena-or-precompiled-payload-does-not-reuse-a-loaded-kernel
   (doseq [[source arena payload] [["different source" :unit-arena nil]
@@ -72,8 +72,8 @@
     (with-redefs [ze/kernel-registry (atom {"unit" (loaded)})]
       (ze/register-kernel! "unit" (cond-> {:target :opencl-c :source source :attributes {}}
                                     payload (assoc :spv-bytes payload)) arena)
-      (is (nil? (:kernel-handle (ze/kernel-registry-entry "unit"))))
-      (is (nil? (:staging (ze/kernel-registry-entry "unit")))))))
+      (is (nil? (:kernel-handle (get @ze/kernel-registry "unit"))))
+      (is (nil? (:staging (get @ze/kernel-registry "unit")))))))
 
 (deftest unsupported-compilation-requirements-cannot-overwrite-live-registration
   (let [prior (loaded)]
@@ -83,4 +83,4 @@
                     "unit" {:target :opencl-c :source "unit source"
                             :attributes {:compilation {:language-standard "CL1.2" :extensions #{}}}}
                     :unit-arena)))
-      (is (identical? prior (ze/kernel-registry-entry "unit"))))))
+      (is (identical? prior (get @ze/kernel-registry "unit"))))))

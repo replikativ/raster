@@ -1756,7 +1756,7 @@
       (cleanup/assert-live! owner)))
   info)
 
-(defn- reserve-registration [info]
+(defn- reserve-registration [info compiler-info]
   (let [kernel (cleanup/acquisition-slot) context (volatile! nil)
         staging (atom {}) cached (atom {})
         owner (cleanup/owner
@@ -1771,7 +1771,7 @@
                  :release #(cleanup/release-entries! staging (vec @staging) cleanup/release!)}])]
     (assoc info ::cleanup/owner owner
            ::registration {:kernel kernel :context context :staging staging :cached cached
-                           :arrays (atom {})})))
+                           :arrays (atom {}) :artifact compiler-info})))
 
 (defn close-kernel-arena!
   "Release exact base-kernel/staging owners; modules are borrowed from the shared runtime cache."
@@ -1837,7 +1837,7 @@
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
    (cleanup/assert-registry-mutable! kernel-registry)
-   (let [_ (when (some #(contains? kernel-info %) [:module :entry-name :kernel-handle ::cleanup/owner ::registration
+   (let [_ (when (some #(contains? kernel-info %) [:arena-id :module :entry-name :kernel-handle ::cleanup/owner ::registration
                                                    ::registration-payload-identity])
              (throw (ex-info "Registration cannot import native lifetime fields"
                              {:reason :invalid-kernel-registration})))
@@ -1847,9 +1847,9 @@
                              {:reason :unsupported-compilation-contract :backend :ze
                               :compilation (kart/compilation kernel-info)})))
          payload (when-let [bytes (:spv-bytes kernel-info)] (aclone ^bytes bytes))
-         info (cond-> (assoc kernel-info ::registration-payload-identity
+         compiler-info (cond-> kernel-info payload (assoc :spv-bytes payload))
+         info (cond-> (assoc compiler-info ::registration-payload-identity
                              (when payload (bytes-digest payload)))
-                payload (assoc :spv-bytes payload)
                 arena-id (assoc :arena-id arena-id))]
      (cleanup/with-registry-use kernel-registry
        (let [prior (get @kernel-registry kernel-name)
@@ -1868,9 +1868,10 @@
                 kernel-registry prior
                 #(cleanup/publish-owned-update!
                   kernel-registry [kernel-name] prior
-                  (cond-> (merge prior info)
+                  (cond-> (assoc (merge prior info) ::registration
+                                 (assoc (::registration prior) :artifact compiler-info))
                     (:spv-bytes prior) (assoc :spv-bytes (:spv-bytes prior))))) nil)
-           (let [candidate (reserve-registration info)]
+           (let [candidate (reserve-registration info compiler-info)]
              (cleanup/build! (registration-owner! candidate)
                              #(do (cleanup/publish-replacement!
                                    kernel-registry [kernel-name] candidate
@@ -1880,10 +1881,10 @@
              nil)))))))
 
 (defn kernel-registry-entry
-  "Public read of a registered kernel's info map (source, :array-params, :scalar-params, dtype,
-   …). Used by the resident GPU-program binder to map kernel params → resident buffers."
+  "Return compiler registration metadata, never native handles or cleanup authority.
+   The resident compiler may retain/re-register this exact artifact without importing runtime state."
   [kernel-name]
-  (get @kernel-registry kernel-name))
+  (get-in @kernel-registry [kernel-name ::registration :artifact]))
 
 (defn register-kernel-dispatch!
   ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))

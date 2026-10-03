@@ -2142,3 +2142,39 @@ assertions). These are ownership checks, not performance or reset-recovery claim
 exact-head CI gates remain required before merge.
 Global cached-module/runtime shutdown ownership remains the immediately following slice; neither
 this checkpoint nor green ownership tests close the training/distributed campaign requirements.
+
+The first OpenCL CPU CI run exposed a production boundary leak: the resident compiler extracts
+artifacts via `kernel-registry-entry`, which was returning enriched runtime registrations. Those
+descriptors imported the new owner/registration fields and were correctly rejected on binding.
+The fix preserves the original admitted compiler artifact before runtime enrichment (and the
+cloned explicit ZE payload), separately from the owning registration. Public registry reads now
+return only that compiler artifact, never arena identity, loaded handles or cleanup authority.
+Backend loading/binding stays on private runtime entries. Caller-supplied `:arena-id` is rejected;
+arena selection belongs to the explicit registration argument/dynamic scope. Native-cache tests
+inspect private state to verify handle reuse rather than depending on this compiler API leaking
+handles. High-level compiler/Link semantics do not change. This is a boundary correction, not a
+relaxation of ownership admission. Both-backend resident block-transfer and OpenCL compiled
+composition/mixed-storage public compilation regressions pass locally after the correction; the
+full exact-head CI gates must be rerun.
+
+The next runtime-root survey confirms that arena ownership alone cannot justify safe shutdown.
+ZE still caches raw module handles, can race module/async-list creation, and never destroys its
+global immediate lists/context during shutdown. OCL reset still drops native authority. Root
+teardown must not scan private session children or force-close live consumers. Landing order:
+
+1. Canonical exact-generation ZE module cache, input-byte snapshots, acquisition/publication
+   rollback and checked destruction; keep modules borrowed by kernel registrations. Migrate raw
+   module/fresh-kernel benchmark consumers to existing Artifact/KernelCall execution boundaries.
+2. Reserve retained backend root construction owners before context/queue/list contact. Unknown
+   initialization outcome stays reachable; independent siblings close but context/Arena wait.
+3. Generation-qualified session/resource leases and balanced synchronous-use tokens. A live or
+   failed child pins the root. Shutdown preflight must decline without mutation/native contact
+   while leases remain, following session -> registry -> state -> child lock order.
+4. Cover or retire direct ownerless allocations/SoA/display/scan helpers, and adopt unreturned
+   OpenCL async-transfer cleanup debt. Do not infer ownership from exposed MemorySegments.
+5. Only after those gates replace shutdown/reset with retained root release and new-generation
+   initialization. Native fault, lease, concurrency and differential workload tests precede use.
+
+These are the runtime prerequisites of the existing training/distributed campaign, not a new
+planner or a substitute completion target. The module-cache slice does not enable eviction or
+claim safe global reset while outstanding kernel/buffer/event borrowers remain.
