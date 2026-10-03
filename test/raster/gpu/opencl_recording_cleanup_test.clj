@@ -5,7 +5,8 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.gpu.core :as gpu]
             [raster.gpu.ocl-runtime :as ocl]
-            [raster.gpu.resource-cleanup :as cleanup])
+            [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.runtime-root :as root])
   (:import [java.lang.foreign MemorySegment ValueLayout]
            [java.lang.invoke MethodHandles]))
 
@@ -16,14 +17,17 @@
         queue (MemorySegment/ofAddress 100)
         queue-result (if (:null-queue? options) MemorySegment/NULL queue)
         queue-create (MethodHandles/dropArguments
-                       (MethodHandles/constant MemorySegment queue-result) 0
-                       (into-array Class [MemorySegment MemorySegment Long/TYPE MemorySegment]))
-        calls (atom []) index (atom -1)]
+                      (MethodHandles/constant MemorySegment queue-result) 0
+                      (into-array Class [MemorySegment MemorySegment Long/TYPE MemorySegment]))
+        calls (atom []) index (atom -1)
+        state (atom {:initialized? false})
+        _ (root/initialize! state [] (fn [_] {:queue queue :context MemorySegment/NULL
+                                              :device MemorySegment/NULL}))]
     (with-redefs-fn
       {(v 'ensure-init!) (fn [] nil)
-       (v 'state) (atom {:queue queue :context MemorySegment/NULL :device MemorySegment/NULL})
+       (v 'state) state
        (v 'h-clCreateCommandQueue) (delay (if-let [error (:create-failure options)]
-                                         (throw error) queue-create))
+                                            (throw error) queue-create))
        (v 'h-clFinish) (delay :fake)
        (v 'h-clFlush) (delay :fake)
        (v 'h-clWaitForEvents) (delay :fake)
@@ -31,14 +35,14 @@
        (v 'h-clReleaseEvent) (delay :fake)
        (v 'h-clGetEventProfilingInfo) (delay :fake)
        (v 'cl-call!) (fn [label _ args]
-                      (swap! calls conj [label (first args)])
-                      (when-let [error (get (:failures options) label)] (throw error))
-                      (when (= label "clReleaseEvent")
-                        (when-let [error (get (:event-release-failures options)
-                                             (.address ^MemorySegment (first args)))]
-                          (throw error)))
-                      (when (= label "clGetEventProfilingInfo")
-                        (.set ^MemorySegment (nth args 3) ValueLayout/JAVA_LONG 0 (long 100))))
+                       (swap! calls conj [label (first args)])
+                       (when-let [error (get (:failures options) label)] (throw error))
+                       (when (= label "clReleaseEvent")
+                         (when-let [error (get (:event-release-failures options)
+                                               (.address ^MemorySegment (first args)))]
+                           (throw error)))
+                       (when (= label "clGetEventProfilingInfo")
+                         (.set ^MemorySegment (nth args 3) ValueLayout/JAVA_LONG 0 (long 100))))
        (v 'enqueue-bound!)
        (fn [_ _ event-out _]
          (let [i (swap! index inc)]
@@ -47,13 +51,37 @@
            (when-not (.equals MemorySegment/NULL event-out)
              (.set ^MemorySegment event-out ValueLayout/ADDRESS 0
                    (if (= (:null-event-index options) i) MemorySegment/NULL
-                     (MemorySegment/ofAddress (long (+ 200 i))))))))}
+                       (MemorySegment/ofAddress (long (+ 200 i))))))))}
       #(f calls))))
 
 (defn- recording [profile?]
   (ocl/record-graph! [{:bound {:wg 32} :group-count 1 :kernel-name "a"}
                       {:bound {:wg 32} :group-count 1 :kernel-name "b"}]
                      {:profile? profile?}))
+
+(deftest recording-root-pin-outlives-submission-and-retires-with-graph
+  (doseq [profile? [false true]]
+    (mocked-recording {}
+                      (fn [_]
+                        (let [state @(ns-resolve 'raster.gpu.ocl-runtime 'state)
+                              graph (recording profile?)]
+                          (is (= 1 (root/lease-count state)))
+                          (let [token (ocl/submit-graph! graph)]
+                            (ocl/await-event! token)
+                            (ocl/release-event! token)
+                            (is (= 1 (root/lease-count state))))
+                          (ocl/destroy-graph! graph)
+                          (is (zero? (root/lease-count state))))))))
+
+(deftest unknown-recording-drain-keeps-the-root-pinned
+  (mocked-recording {:failures {"clFinish" (ex-info "drain outcome unknown" {})}}
+                    (fn [_]
+                      (let [state @(ns-resolve 'raster.gpu.ocl-runtime 'state)
+                            graph (recording false)]
+                        (ocl/submit-graph! graph)
+                        (is (some? (error-of #(ocl/destroy-graph! graph))))
+                        (is (= [:submission :runtime-root-lease] (cleanup/pending (::cleanup/owner graph))))
+                        (is (= 1 (root/lease-count state)))))))
 
 (deftest partial-enqueue-is-drained-before-independent-event-release
   (doseq [profile? [false true] drain-fails? [false true]]
@@ -183,12 +211,13 @@
 (deftest queue-acquisition-errors-retain-an-explicit-owner
   (doseq [options [{:null-queue? true} {:create-failure (ex-info "create outcome unknown" {})}]]
     (mocked-recording options
-      (fn [calls]
-        (let [adopted (atom nil)
-              result (error-of #(ocl/record-graph! [] {:profile? true :adopt-cleanup! (fn [owner] (reset! adopted owner))}))]
-          (is (some? result))
-          (is (= [:queue] (cleanup/pending @adopted)))
-          (is (empty? @calls) "do not pass NULL/unknown handles to a native destructor"))))))
+                      (fn [calls]
+                        (let [adopted (atom nil)
+                              result (error-of #(ocl/record-graph! [] {:profile? true :adopt-cleanup! (fn [owner] (reset! adopted owner))}))]
+                          (is (some? result))
+                          (is (= [:queue :runtime-root-lease] (cleanup/pending @adopted)))
+                          (is (= 1 (root/lease-count @(ns-resolve 'raster.gpu.ocl-runtime 'state))))
+                          (is (empty? @calls) "do not pass NULL/unknown handles to a native destructor"))))))
 
 (deftest common-session-cannot-free-kernels-or-roots-after-unknown-submit-drain
   (let [primary (ex-info "flush failed" {}) drain (ex-info "completion unknown" {})
