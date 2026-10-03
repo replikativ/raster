@@ -773,7 +773,7 @@
   Sets workgroup size and arguments, then dispatches.
   Synchronous (uses immediate command list with barrier).
 
-  kernel: kernel handle from create-kernel
+  kernel: registered kernel handle or owned handle from create-kernel-fresh
   group-count-x: number of workgroups in X dimension
   workgroup-size-x: threads per workgroup in X
   kernel-args: seq of kernel argument specs, each one of:
