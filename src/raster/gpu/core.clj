@@ -303,7 +303,7 @@
                     (when runtime-graph
                       [{:id :recording :release #((rt-resolve-soft device-id "destroy-graph!") runtime-graph)}])
                     (map-indexed (fn [i prepared]
-                                   {:id [:kernel i] :after (or recording #{})
+                                   {:id [:kernel i] :after (into (or recording #{}) debt-ids)
                                     :release #((rt-resolve-soft device-id "destroy-prepared!") prepared)}) prepareds)
                     (map-indexed (fn [i buffer]
                                    {:id [:view i] :after dependencies
@@ -1684,7 +1684,8 @@
           ;; represented. Serial recording is therefore a safe implementation of that partial
           ;; order on today's single in-order compute queues; the logical plan retains the DAG.
            (when record?
-             (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true}
+             (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true
+                                                               :adopt-cleanup! #(adopt-cleanup! cleanup-debts %)}
                                                           profile? (assoc :profile? true)))))
            (let [entry (own-kernel-graph-entry device-id {:graph-call graph-call
                         :execution-plan execution-plan
@@ -1770,6 +1771,7 @@
                _ (vreset! prepareds [prepared])
                _ (vreset! runtime-graph
                           (record! [prepared] {:barriers? true
+                                               :adopt-cleanup! #(adopt-cleanup! cleanup-debts %)
                                                :profile? (boolean profile?)}))
                outputs
                (into {}

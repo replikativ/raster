@@ -1781,6 +1781,29 @@ production prepared maps likewise cannot fall through the compatibility destruct
 missing. A duplicate shadowed ZE fresh-kernel factory is removed. Numeric surface semantics and IR
 are unchanged; handle identity, close lifecycle and raw-backend exception handling become stricter.
 
+#### Level Zero recording acquisition ownership
+
+Regular Level Zero recordings reserve one cleanup plan before creating the queue, command list,
+profiling pool or timestamp events. A create/readback exception is indeterminate, not proof that
+no native allocation occurred: it retains the acquisition slot without guessing a handle to free.
+Successful acquisitions are private callback captures, not mutable graph-map fields. Command-list
+release precedes event release; all events precede pool release. An unsubmitted constructor's queue
+is independent and is still attempted after another resource fails. Never-created dependent slots
+may remain blocked plan entries; this does not assert those resources were allocated.
+
+Recording rollback uses the same explicit adoption sink as KernelCall construction. Prepared kernels
+also depend on adopted construction debts, preventing destruction while an unresolved recording may
+still reference them. Fault tests cover every create/append/close point, independent destruction,
+unknown-outcome exact-once behavior, and an append failure combined with failed list destruction.
+Live profiled/unprofiled graph replay remains numerically checked on both local backends. Shadowed
+older Level Zero record/replay/destroy definitions are removed. Direct backend users must establish
+submission completion before destroying a recording; common session teardown drains tracked events.
+
+OpenCL recording/per-replay profiling ownership is still the next required slice: partial enqueue
+must prove queue completion before releasing referenced kernels/views, and event arenas must survive
+unresolved event release. This slice does not close that gap or the remaining descriptor/root-owner
+consolidation, and does not establish performance under varying laptop power/background load.
+
 This is not complete native reclamation. Legacy descriptor bindings, backend recording/view/event
 partial constructors and destruction, asynchronous-event failure cleanup, root-buffer/arena failure
 retention, and linked-wrapper close remain acceptance work. In particular native graph destructors

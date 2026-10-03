@@ -6,9 +6,64 @@
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze])
-  (:import [java.lang.foreign MemorySegment]))
+  (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
 
 (defn- error-of [f] (try (f) nil (catch Throwable error error)))
+
+(deftest ze-recording-reserves-ownership-before-every-native-acquisition
+  (doseq [failure-point [nil "zeCommandQueueCreate" "zeCommandListCreate"
+                        "zeEventPoolCreate" "zeEventCreate"
+                        "zeCommandListAppendLaunchKernel" "zeCommandListAppendBarrier"
+                        "zeCommandListClose"]]
+    (with-open [arena (Arena/ofShared)]
+      (let [v #(ns-resolve 'raster.gpu.ze-runtime %)
+            primary (ex-info "injected recording failure" {})
+            calls (atom []) adopted (atom [])
+            create? #{"zeCommandQueueCreate" "zeCommandListCreate" "zeEventPoolCreate" "zeEventCreate"}
+            release? #{"zeCommandListDestroy" "zeEventDestroy" "zeEventPoolDestroy" "zeCommandQueueDestroy"}
+            redefs (merge
+                     {(v 'ensure-init!) (fn [] nil)
+                      (v 'state) (atom {:arena arena :context MemorySegment/NULL :device MemorySegment/NULL})
+                      (v 'ze-call!) (fn [label _ args]
+                                     (swap! calls conj label)
+                                     (when (= failure-point label) (throw primary))
+                                     (when (create? label)
+                                       (.set ^MemorySegment (last args) ValueLayout/ADDRESS 0
+                                             (MemorySegment/ofAddress (long (+ 100 (count @calls)))))))}
+                     (into {} (map (fn [name] [(v name) (delay :fake)])
+                                   '[h-zeCommandQueueCreate h-zeCommandListCreate h-zeEventPoolCreate
+                                     h-zeEventCreate h-zeCommandListAppendLaunchKernel
+                                     h-zeCommandListAppendBarrier h-zeCommandListClose
+                                     h-zeCommandListDestroy h-zeEventDestroy h-zeEventPoolDestroy
+                                     h-zeCommandQueueDestroy])))]
+        (with-redefs-fn redefs
+          (fn []
+            (let [result (try
+                           (ze/record-graph! [{:bound {:kernel MemorySegment/NULL
+                                                      :gc-seg (.allocate arena 12)}}]
+                                             {:profile? true :adopt-cleanup! #(swap! adopted conj %)})
+                           (catch Throwable error error))]
+              (if failure-point
+                (do
+                  (is (identical? primary result))
+                  (is (= (if (create? failure-point) 1 0) (count @adopted)))
+                  (when (not= failure-point "zeCommandQueueCreate")
+                    (is (some #{"zeCommandQueueDestroy"} @calls)))
+                  (doseq [owner @adopted]
+                    (let [before @calls]
+                      (is (identical? primary (error-of #(cleanup/release! owner))))
+                      (is (= before @calls)))))
+                (do
+                  (is (some? (::cleanup/owner result)))
+                  (ze/destroy-graph! result)
+                  (let [before @calls]
+                    (ze/destroy-graph! result)
+                    (is (= before @calls)))
+                  (is (= ["zeCommandListDestroy" "zeEventDestroy" "zeEventPoolDestroy"
+                          "zeCommandQueueDestroy"] (filterv release? @calls)))
+                  (is (= :missing-cleanup-owner
+                         (:reason (ex-data (error-of #(ze/destroy-graph!
+                                                      (dissoc result ::cleanup/owner))))))))))))))))
 
 (deftest both-production-binders-own-success-and-failed-native-acquisition
   (doseq [backend [:ze :ocl] fail-build? [false true] fail-release? [false true]]
@@ -59,3 +114,36 @@
                      (:reason (ex-data (error-of #(destroy! (dissoc prepared ::cleanup/owner)))))))))
           (is (= 1 @acquired))
           (is (= [[(if (= backend :ze) "zeKernelDestroy" "clReleaseKernel") handle]] @releases)))))))
+
+(deftest ze-recording-keeps-dependent-pool-and-attempts-independent-destruction
+  (doseq [failed-id [:list [:event 0] :pool :queue]]
+    (let [{:keys [slots owner]} ((ns-resolve 'raster.gpu.ze-runtime 'recording-owner) 2)
+          calls (atom []) failure (ex-info "destroy outcome unknown" {})
+          label->id {"zeCommandListDestroy" :list "zeEventPoolDestroy" :pool
+                     "zeCommandQueueDestroy" :queue}
+          resources {:list 1 [:event 0] 2 [:event 1] 3 :pool 4 :queue 5}
+          reverse-resources (into {} (map (fn [[k v]] [v k]) resources))]
+      (doseq [[id address] resources]
+        (cleanup/acquire-native! (get slots id) #(MemorySegment/ofAddress (long address))))
+      (with-redefs-fn
+        {(ns-resolve 'raster.gpu.ze-runtime 'ze-call!)
+         (fn [label _ args]
+           (let [id (if (= "zeEventDestroy" label)
+                      (reverse-resources (.address ^MemorySegment (first args)))
+                      (label->id label))]
+             (swap! calls conj id)
+             (when (= failed-id id) (throw failure))))}
+        (fn []
+          (is (identical? failure (error-of #(ze/destroy-graph! {::cleanup/owner owner}))))
+          (is (= (case failed-id
+                   :list [:list :queue]
+                   [:event 0] [:list [:event 0] [:event 1] :queue]
+                   [:list [:event 0] [:event 1] :pool :queue]) @calls))
+          (is (= (case failed-id
+                   :list [:list [:event 0] [:event 1] :pool]
+                   [:event 0] [[:event 0] :pool]
+                   :pool [:pool]
+                   :queue [:queue]) (cleanup/pending owner)))
+          (let [before @calls]
+            (is (identical? failure (error-of #(ze/destroy-graph! {::cleanup/owner owner}))))
+            (is (= before @calls))))))))
