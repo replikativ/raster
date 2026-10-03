@@ -1462,6 +1462,9 @@ native namespace is selected by the existing OpenCL CI gate; all six sources joi
 Optional Level Zero FP16/FP64 tests query the exact live device's core module flags; absent
 capabilities are reported, while query and compilation failures remain failures. Strict classifier
 admission rejects nonintegral/out-of-range observations before signed-byte normalization.
+The CI raw-skip debt ratchet caught an unaccounted optional-capability print site. It now uses the
+shared Level Zero skip reporter and ledger, with missing/true/unknown facts and non-live-device
+skip attempts rejected. The affected storage/CI suites pass 8 tests / 363 assertions.
 
 This is not a new cache, dtype registry, handwritten kernel or producer certificate. Pure probe
 observations grant no authority. Next: seal measured facts to the exact live execution owner and

@@ -45,7 +45,7 @@
   "test/raster/dl/einsum_contract_test.clj"
   {:count 2 :class :device-test :reason "Level Zero device gates predate the shared probe"}
   "test/raster/dl/gpu_grad_parity.clj"
-  {:count 3 :class :shared-gate :reason "Canonical honest Level Zero skip reporting"}
+  {:count 4 :class :shared-gate :reason "Canonical honest Level Zero device and explicitly absent module-capability reporting"}
   "test/raster/dl/gsdm_test.clj"
   {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
   "test/raster/dl/nn_test.clj"

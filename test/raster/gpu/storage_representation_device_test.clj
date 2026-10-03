@@ -7,6 +7,16 @@
             [raster.dl.gpu-grad-parity :as ze])
   (:import [java.lang.foreign MemorySegment]))
 
+(deftest optional-skips-require-explicit-live-absence
+  (with-redefs [ze/gpu-available? (delay true)]
+    (doseq [[capability facts] [[:fp16? {}] [:fp16? {:fp16? nil}]
+                               [:fp16? {:fp16? true}] [:unknown {:unknown false}]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (ze/gpu-capability-skip! "invalid synthetic skip" capability facts)))))
+  (with-redefs [ze/gpu-available? (delay false)]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (ze/gpu-capability-skip! "no live device" :fp64? {:fp64? false})))))
+
 (defn- check-storage! [target dt]
   (let [session (gpu/make-session target)
         output (byte-array (* 2 (dtype/bytes-of dt)))]
@@ -47,7 +57,6 @@
         (testing (str dt)
           (if (case dt :half (:fp16? caps) :double (:fp64? caps) true)
             (check-storage! :ze:0 dt)
-            (do
-              (println "[LEVEL ZERO CAPABILITY SKIP] storage representation" dt caps)
-              (is true "explicit optional module capability absent"))))))
+            (ze/gpu-capability-skip! (str "storage representation " dt)
+                                     (case dt :half :fp16? :double :fp64?) caps)))))
     (ze/gpu-skip! "typed storage representation probes")))
