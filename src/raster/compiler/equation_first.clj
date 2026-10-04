@@ -261,11 +261,14 @@
                      :alternative-emission (:stats subgroup))})))
 
 (defn- dispatch-contraction-emissions
-  "Admit register candidates per equation without rescheduling unrelated operations."
+  "Admit explicitly authorized contraction candidates without rescheduling unrelated equations."
   [function-id reference options]
-  (let [declines (atom {})
+  (let [mixed? (= :dispatch-mixed-matrix
+                   (get-in options [:schedule :typed-contraction :strategy]))
+        declines (atom {})
         measured-selectors (get-in options [:schedule :typed-contraction :measured-selectors] {})
         consumed (atom #{})
+        admitted (atom 0)
         new-kernels (atom [])
         equations
         (mapv
@@ -273,7 +276,9 @@
            (let [operation (first (:operations equation))]
              (if-not (emitted-equation/emitted-equation? operation)
                equation
-               (let [planned (program-c-family/emit-register-contraction-alternative
+               (let [planned ((if mixed?
+                                program-c-family/emit-mixed-contraction-alternative
+                                program-c-family/emit-register-contraction-alternative)
                               operation options)]
                  (if-not (:ok planned)
                    (do
@@ -285,8 +290,13 @@
                      equation)
                    (let [portable (assoc-in operation [:graph :attributes :strategy]
                                             :sequential-segments)
-                         register (:candidate planned)
-                         alternatives [portable register]
+                         candidate (:candidate planned)
+                         alternatives [portable candidate]
+                         candidate-strategy (kernel-dispatch/alternative-strategy (:graph candidate))
+                         numerical-policy (if mixed?
+                                            {:permitted-modes #{:exact :approximate-model}
+                                             :permitted-models [(:numerical-model planned)]}
+                                            {:permitted-modes #{:exact :reassociated}})
                          id (str function-id "/contraction-" (:id equation))
                          interface (mapv #(select-keys % [:kind :dtype :kernel-dtype :role
                                                          :aliasing :alignment])
@@ -302,21 +312,23 @@
                            {:id id
                             :alternatives (mapv :graph alternatives)
                             :default-strategy :sequential-segments
-                            :selector {:kind :fixed-strategy :strategy :register-tiled}
+                            :selector {:kind :fixed-strategy :strategy candidate-strategy}
                             :attributes
                             {:selection (if measured-selector
-                                          :supplied-selector :explicit-register-candidate)
-                             :numerical-mode :reassociated
+                                          :supplied-selector
+                                          (if mixed? :explicit-mixed-candidate :explicit-register-candidate))
+                             :numerical-mode (if mixed? :approximate-model :reassociated)
                              :tuning {:schedule-path [:typed-contraction :measured-selectors]
                                       :schedule-key id
-                                      :numerical-mode {:precision :f32
-                                                       :permitted-modes #{:exact :reassociated}}
+                                      :numerical-mode (assoc numerical-policy :precision
+                                                             (if mixed? :mixed-f16-f32 :f32))
                                       :layout {:external-interface interface}}}})
                            measured-selector (kernel-dispatch/with-selector measured-selector))
                          certified (equation-dispatch/make
                                     alternatives selection
-                                    {:permitted-modes #{:exact :reassociated}})]
-                     (swap! new-kernels into (map :operation (get-in register [:graph :nodes])))
+                                    numerical-policy)]
+                     (swap! admitted inc)
+                     (swap! new-kernels into (map :operation (get-in candidate [:graph :nodes])))
                      (when measured-selector (swap! consumed conj id))
                      (assoc equation :operations [certified])))))))
          (get-in reference [:program :equations]))
@@ -330,7 +342,7 @@
      :kernels kernels
      :stats (assoc (:stats reference)
                    :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
-                   :contraction-dispatches (count @new-kernels)
+                   :contraction-dispatches @admitted
                    :contraction-candidate-declines (get @declines :admission {})
                    :contraction-screen-declines (get @declines :screen {}))}))
 
@@ -362,9 +374,22 @@
          target-descriptor (validate-target-description!
                             target (or captured-target (hardware/descriptor-for target)))
          resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
+         _ (when (and (= :dispatch-mixed-matrix
+                         (get-in resolved-schedule [:typed-contraction :strategy]))
+                      (not= :mixed-f16-f32 (get-in options [:schedule :precision])))
+             (fail! :equation-first-matrix-consent
+                    "mixed matrix dispatch requires an explicit :schedule :precision :mixed-f16-f32"
+                    {:function (function-symbol resolved-var) :fallback :none}))
+         _ (when (and (= :dispatch-mixed-matrix
+                         (get-in resolved-schedule [:typed-contraction :strategy]))
+                      (or (not= :default (get-in resolved-schedule [:typed-contraction :matrix-tiles]))
+                          (seq (get-in resolved-schedule [:typed-contraction :split-factors]))))
+             (fail! :equation-first-matrix-candidate-space
+                    "public mixed matrix dispatch currently admits one full-K tile, not a tile space or split-K"
+                    {:function (function-symbol resolved-var) :fallback :none}))
          _ (when (and (seq (get-in resolved-schedule [:typed-contraction :measured-selectors]))
-                      (not= :dispatch-register-tiled
-                            (get-in resolved-schedule [:typed-contraction :strategy])))
+                      (not (contains? #{:dispatch-register-tiled :dispatch-mixed-matrix}
+                                      (get-in resolved-schedule [:typed-contraction :strategy]))))
              (fail! :equation-first-contraction-selector-unsupported
                     "equation-first compilation cannot yet consume measured contraction selectors"
                     {:function (function-symbol resolved-var) :target target
@@ -374,8 +399,8 @@
          (= :dispatch-reassociated
             (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
          dispatch-contractions?
-         (= :dispatch-register-tiled
-            (get-in resolved-schedule [:typed-contraction :strategy]))
+         (contains? #{:dispatch-register-tiled :dispatch-mixed-matrix}
+                    (get-in resolved-schedule [:typed-contraction :strategy]))
          reference-schedule
          (cond-> resolved-schedule
            dispatch-reassociated?

@@ -38,6 +38,16 @@ remain enforced by graph preflight before allocation. Explicit public dispatch c
 selection evidence and the Gemma training trajectory remain the next gates. Automatic defaults,
 split-K coverage, external training and distributed/multilevel acceptance are not completed here.
 
+The public opt-in is `:schedule {:precision :mixed-f16-f32 :typed-contraction
+{:strategy :dispatch-mixed-matrix}}`. Both keys must be explicitly requested; inherited mixed
+precision defaults do not grant consent. The existing equation dispatch owns one reconstructed
+mixed candidate and an exact portable fallback, shares measured-selector consumption, and keeps
+the full operational model in its numerical/tuning identity. Unsupported target/layout admission
+retains the exact path with explicit decline statistics. Unconsumed selectors, fallback pruning,
+tile-space expansion and split-K requests fail rather than being silently ignored. Automatic
+defaults and vendor matrix schedules remain unchanged. This is public compiler/lowering and
+artifact-roundtrip acceptance; native trajectory/performance acceptance is still pending.
+
 ### October 3 runtime/state integration update
 
 This update supersedes the producer-integration gaps below only for the specifically validated
