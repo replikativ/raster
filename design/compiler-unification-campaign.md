@@ -145,6 +145,13 @@ a permissive alpha-equivalence check. This remains reference reconstruction, not
 the candidate graph, emitted stage bodies or its complete-write/numerical law. Those checks must
 land before admitting public mixed-matrix equation dispatch.
 
+The following extraction moves existing matrix-body and scheduled-certificate construction into
+`mixed-matrix-body`, shared by stage emission and independent reference projection. Split-K and
+batched views, dimension parameter allocation, epilogues and fused input regions retain the same
+constructor path. Target emitters retain parameter spelling and artifact emission. This is still
+not whole-graph certification: layout and combine projection, terminal complete-write checks and
+graph-derived composed numerical policy remain required before public mixed-matrix admission.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.
