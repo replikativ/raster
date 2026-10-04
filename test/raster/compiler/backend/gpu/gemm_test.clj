@@ -78,15 +78,15 @@
       (doseq [[planner spec] cases
               :let [g (:graph (planner spec))
                     scalar-types (into {} (map (juxt :id :dtype) (:scalars g)))]
-              node (:nodes g)
-              :when (matrix-stage/matrix-stage? (:operation node))]
+              node (:nodes g)]
         (let [stage (:operation node)
-              certificate (mixed-body/schedule-matrix-stage stage scalar-types)]
+              certificate (mixed-body/schedule-for-node node g)]
           (is (= stage (:source certificate)))
-          (is (= certificate (mixed-body/schedule-matrix-stage stage scalar-types)))
+          (is (= certificate (mixed-body/schedule-for-node node g)))
           (is (= certificate (scheduled-body/validate! certificate)))
-          (is (not (contains? (mixed-body/matrix-stage-spec stage :matrix-contract scalar-types)
-                              :parameter-names))))))))
+          (when (matrix-stage/matrix-stage? stage)
+            (is (not (contains? (mixed-body/matrix-stage-spec stage :matrix-contract scalar-types)
+                                :parameter-names)))))))))
 
 (deftest opencl-backend-aliases-share-mixed-matrix-admission
   (let [desc {:device-type :gpu :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
@@ -477,11 +477,13 @@
         (is (= (:arguments refinement) (:arguments artifact)))
         (is (= (:effects refinement) (:effects artifact)))
         (is (= (scheduled-body/realized-launch refinement) (:launch artifact)))
-        (when (matrix-stage/matrix-stage? (:source refinement))
-          (is (= refinement
-                 (mixed-body/schedule-matrix-stage
-                  (:source refinement) (into {} (map (juxt :id :dtype) (:scalars graph)))))
-              "the whole matrix certificate can be reconstructed without target emission"))))
+        (when (not= :f32-scalar (executable/strategy graph))
+          (let [stages (graph/map-operations
+                        graph #(-> % :operation
+                                   (artifact/attribute :scheduled-kernel-body) :source))
+                stage-node (some #(when (= (:id node) (:id %)) %) (:nodes stages))]
+            (is (= refinement (mixed-body/schedule-for-node stage-node stages))
+                "every complete mixed graph certificate is reconstructed without emission")))))
     (let [layout-sources
           (for [graph (rest graphs)
                 node (:nodes graph)

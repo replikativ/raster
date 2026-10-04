@@ -149,8 +149,18 @@ The following extraction moves existing matrix-body and scheduled-certificate co
 `mixed-matrix-body`, shared by stage emission and independent reference projection. Split-K and
 batched views, dimension parameter allocation, epilogues and fused input regions retain the same
 constructor path. Target emitters retain parameter spelling and artifact emission. This is still
-not whole-graph certification: layout and combine projection, terminal complete-write checks and
-graph-derived composed numerical policy remain required before public mixed-matrix admission.
+not whole-graph certification. The following slice moves layout and canonical split-K combine
+certificates through the same pass and adds reference projection for every stage node. Production
+emission consumes these shared constructors; tests compare complete scheduled certificates, not
+only emitted labels or ABI shapes. Before using this projection as algorithm validation, require
+exact independent typed stage-graph reconstruction, including canonical range and slice geometry.
+Terminal complete-write checks and graph-derived composed numerical policy remain required before
+public mixed-matrix admission.
+
+Local native validation is currently unresolved: the matrix suite reports queue/upload failures,
+and an unchanged pre-extraction register-tiled baseline reproduces Level Zero queue error
+`0x7ffffffe` and OpenCL upload error `-5`. Hardware-free checks and CI are separate evidence;
+do not claim local device acceptance or mixed training progress from the extraction alone.
 
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
