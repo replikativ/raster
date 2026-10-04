@@ -22,6 +22,7 @@
             [raster.compiler.ir.matrix-stage :as matrix-stage]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
+            [raster.compiler.passes.parallel.mixed-matrix-body :as mixed-body]
             [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]))
 
 (deftest mixed-matrix-stage-planning-does-not-enter-target-emission
@@ -59,6 +60,33 @@
           (is (matrix-stage/matrix-stage? matrix))
           (is (= [:batch :m :n] (:result-shape matrix)))
           (is (= {:extent :batch :lhs row :rhs col} (:batching matrix))))))))
+
+(deftest mixed-matrix-body-projection-does-not-enter-target-emission
+  (let [base {:id :pure-body :a 'a :b 'b :c 'c :m :m :n :n :k :k
+              :tile (hardware/derive-gemm-tile {}) :vector-width 4 :requested-splits 8}
+        cases (concat
+               (for [variant [:nn :nt :tn :tt] split? [false true]]
+                 [mixed-schedule/plan (assoc base :variant variant :split-k? split?)])
+               (for [variant [:nn :nt] fusion [:fuse-lhs-cast? :fuse-tile-inputs?]]
+                 [mixed-schedule/plan (assoc base :variant variant fusion true)])
+               (for [variant [:nn :nt] row [false true] col [false true]]
+                 [mixed-schedule/plan-batched
+                  (assoc base :variant variant :batch :batch :batching {:row row :col col})]))
+        forbidden (fn [& _] (throw (ex-info "body projection entered a target emitter" {})))]
+    (with-redefs [kernel-body-target/emit-artifact forbidden
+                  gemm/emit-scheduled-stage-graph forbidden]
+      (doseq [[planner spec] cases
+              :let [g (:graph (planner spec))
+                    scalar-types (into {} (map (juxt :id :dtype) (:scalars g)))]
+              node (:nodes g)
+              :when (matrix-stage/matrix-stage? (:operation node))]
+        (let [stage (:operation node)
+              certificate (mixed-body/schedule-matrix-stage stage scalar-types)]
+          (is (= stage (:source certificate)))
+          (is (= certificate (mixed-body/schedule-matrix-stage stage scalar-types)))
+          (is (= certificate (scheduled-body/validate! certificate)))
+          (is (not (contains? (mixed-body/matrix-stage-spec stage :matrix-contract scalar-types)
+                              :parameter-names))))))))
 
 (deftest opencl-backend-aliases-share-mixed-matrix-admission
   (let [desc {:device-type :gpu :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
@@ -448,7 +476,12 @@
             (str (executable/strategy graph) " / " (:id node)))
         (is (= (:arguments refinement) (:arguments artifact)))
         (is (= (:effects refinement) (:effects artifact)))
-        (is (= (scheduled-body/realized-launch refinement) (:launch artifact)))))
+        (is (= (scheduled-body/realized-launch refinement) (:launch artifact)))
+        (when (matrix-stage/matrix-stage? (:source refinement))
+          (is (= refinement
+                 (mixed-body/schedule-matrix-stage
+                  (:source refinement) (into {} (map (juxt :id :dtype) (:scalars graph)))))
+              "the whole matrix certificate can be reconstructed without target emission"))))
     (let [layout-sources
           (for [graph (rest graphs)
                 node (:nodes graph)
