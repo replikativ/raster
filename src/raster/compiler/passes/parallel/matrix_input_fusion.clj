@@ -8,7 +8,8 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.layout-stage :as layout]
-            [raster.compiler.ir.matrix-stage :as matrix]))
+            [raster.compiler.ir.matrix-stage :as matrix]
+            [raster.compiler.passes.parallel.map-read-requirements :as read-requirements]))
 
 (defn- extent-product-factors [value]
   (if (instance? raster.compiler.ir.kernel_launch.Product value)
@@ -75,7 +76,10 @@
                    (= 1 (count (:input-shape cast)))
                    (same-extent? extent (first (:input-shape cast)))
                    (= :float (:dtype input-buffer)) (= :half (:dtype temp-buffer))
-                   (same-extent? extent (:elements input-buffer))
+                   ;; The source may be larger than the cast's logical prefix. The exact cast
+                   ;; range and private temporary still define the fused matrix read domain.
+                   (read-requirements/graph-capacity-covers?
+                    (:elements input-buffer) extent (:preconditions g))
                    (same-extent? extent (:elements temp-buffer))
                    (= [[input :read] [temporary :write]]
                       (mapv (juxt :buffer :access) (:uses producer)))

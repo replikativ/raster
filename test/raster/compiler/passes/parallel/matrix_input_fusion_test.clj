@@ -40,6 +40,21 @@
 
 (defn- fuse [g] (fusion/fuse-lhs-cast g [:test :cast] [:test :matrix]))
 
+(deftest cast-fusion-preserves-public-capacity-and-requires-domain-coverage
+  (doseq [capacity [416 832]]
+    (let [original (assoc-in (stage-graph) [:inputs 0 :elements] capacity)
+          candidate (fuse original)]
+      (is (some? candidate))
+      (is (= (graph/boundary-contract original) (graph/boundary-contract candidate)))))
+  (is (nil? (fuse (assoc-in (stage-graph) [:inputs 0 :elements] 415))))
+  (let [unknown (-> (stage-graph)
+                    (assoc-in [:inputs 0 :elements] 'capacity)
+                    (assoc :abi nil :arguments nil :scalars [(graph/scalar 'capacity :int)]))
+        guarded (assoc unknown :preconditions [{:expression 'capacity :op :>= :value 416}])]
+    (is (nil? (fuse unknown)))
+    (is (some? (fuse guarded)))
+    (is (= (graph/boundary-contract guarded) (graph/boundary-contract (fuse guarded))))))
+
 (defn- rhs-stage-graph []
   (let [cast (layout/make {:id [:test :cast-b] :operation :cast :input 'B :output 'B16
                            :input-shape [1024] :output-shape [1024]
@@ -110,7 +125,7 @@
                  (-> g (assoc-in [:nodes 0 :operation :input-shape] [448])
                      (assoc-in [:nodes 0 :operation :output-shape] [448]))
                  (assoc-in g [:temporaries 0 :elements] 448)
-                 (assoc-in g [:inputs 0 :elements] 448)
+                 (assoc-in g [:inputs 0 :elements] 415)
                  (assoc-in g [:inputs 0 :elements] nil)
                  (assoc-in g [:nodes 1 :operation :rhs] 'A16)
                  (assoc-in g [:nodes 1 :operation :epilogue] {:operands [{:sym 'A16}]})

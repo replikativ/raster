@@ -9,6 +9,16 @@
 
 (deftest graph-minimum-requires-structural-capacity-or-the-exact-checked-guard
   (is (requirements/graph-capacity-covers? 8 4 []))
+  (is (requirements/graph-capacity-covers? 832 (launch/product 13 32) []))
+  (is (requirements/graph-capacity-covers? (launch/product 26 32) 416 []))
+  (is (not (requirements/graph-capacity-covers? 415 (launch/product 13 32) [])))
+  (is (not (requirements/graph-capacity-covers? 832 (launch/product 'n 32) [])))
+  (is (not (requirements/graph-capacity-covers?
+            (launch/product Long/MAX_VALUE 2) (launch/product Long/MAX_VALUE 3) [])))
+  (is (requirements/graph-capacity-covers? 'capacity (launch/product 13 32)
+                                           [{:expression 'capacity :op :>= :value 416}]))
+  (is (not (requirements/graph-capacity-covers? 'capacity (launch/product 13 32)
+                                                [{:expression 'capacity :op :>= :value 415}])))
   (is (requirements/graph-capacity-covers? 'capacity 'n
                                            [{:expression 'capacity :op :>= :value 'n}]))
   (doseq [conditions [[]

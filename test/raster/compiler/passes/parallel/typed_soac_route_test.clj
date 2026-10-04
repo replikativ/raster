@@ -28,6 +28,7 @@
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
@@ -1474,6 +1475,14 @@
                    (:graph (mixed-validation/validate-reconstruction!
                             (-> form :equations first :algorithm)
                             (:source refinement) refinement))))
+            (let [source (:graph (equation-graph/make-for-equation form (first (:equations form))))
+                  candidate (assoc refinement :source source
+                                   :graph (merge (:graph refinement)
+                                                 (kernel-graph/boundary-contract source)))
+                  public-plan (mixed-validation/validate-reconstruction!
+                               (-> form :equations first :algorithm) source candidate)]
+              (is (= (kernel-graph/boundary-contract source)
+                     (kernel-graph/boundary-contract (:graph public-plan)))))
             (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
@@ -1568,6 +1577,7 @@
         split-graph (kdispatch/alternative dispatch :xmx-split-k)
         direct-refinement (get-in direct-graph [:attributes :scheduled-graph-refinement])
         split-refinement (get-in split-graph [:attributes :scheduled-graph-refinement])
+        public-source (:graph (equation-graph/make-for-equation form (first (:equations form))))
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
         select (fn [m n k]
                  (kdispatch/alternative-strategy
@@ -1607,6 +1617,41 @@
                                (:reason (ex-data exception)))))]
           (is (= (:graph refinement) (:graph planned)))
           (is (= (:graph planned) (:graph checked)))
+          (let [public-candidate (assoc refinement :source public-source
+                                        :graph (merge (:graph refinement)
+                                                      (kernel-graph/boundary-contract public-source)))
+                public-plan (mixed-validation/validate-reconstruction!
+                             algorithm public-source public-candidate)]
+            (is (= (kernel-graph/boundary-contract public-source)
+                   (kernel-graph/boundary-contract (:graph public-plan))))
+            (is (nil? (get-in public-plan [:graph :abi])))
+            (is (= (:scalars public-source) (get-in public-plan [:graph :scalars])))
+            (is (= (:temporaries (:graph planned)) (get-in public-plan [:graph :temporaries])))
+            (doseq [source [(assoc-in public-source [:inputs 0 :elements] 1)
+                            (assoc-in public-source [:inputs 0 :dtype] :double)
+                            (assoc-in public-source [:outputs 0 :elements] 1)
+                            (assoc-in public-source [:outputs 0 :role] :inout)]]
+              (try
+                (mixed-validation/validate-reconstruction!
+                 algorithm source (assoc public-candidate :source source
+                                         :graph (merge (:graph public-candidate)
+                                                       (kernel-graph/boundary-contract source))))
+                (is false "matching source/candidate boundaries cannot waive storage requirements")
+                (catch clojure.lang.ExceptionInfo exception
+                  (is (= :mixed-matrix-public-storage (:reason (ex-data exception)))))))
+            (let [source (-> public-source
+                             (assoc-in [:inputs 0 :elements] 'capacity)
+                             (update :scalars conj (kernel-graph/scalar 'capacity :int))
+                             (assoc :preconditions
+                                    [{:expression 'capacity :op :>=
+                                      :value (get-in public-source [:inputs 0 :elements])}]))
+                  guarded (mixed-validation/validate-reconstruction!
+                           algorithm source
+                           (assoc public-candidate :source source
+                                  :graph (merge (:graph public-candidate)
+                                                (kernel-graph/boundary-contract source))))]
+              (is (= (kernel-graph/boundary-contract source)
+                     (kernel-graph/boundary-contract (:graph guarded))))))
           (is (= (count (get-in refinement [:graph :nodes]))
                  (count (:stage-bodies checked))))
           (doseq [altered [(assoc-in refinement [:graph :attributes :unexpected] true)
