@@ -190,6 +190,16 @@ capacities are preserved and guarded when insufficient. These logical minima do 
 physical address projection, rearrange the callable ABI, prove epilogue/neutral reads or admit a
 mixed schedule. The mixed planner still needs to preserve this independently derived boundary.
 
+The mixed planner now preserves an independently supplied graph boundary verbatim, including
+inferred ABI, scalar order and capacity guards. Public input/output identities, storage roles and
+dtypes must match its locally derived matrix interface; every logical read/write extent must be
+covered by a capacity contract or explicit guard. Private layout/conversion/split buffers retain
+their logical stage extents. Extra public scalars needed solely by capacity guards are preserved.
+The compatibility/standalone interface construction remains a fallback, not authority for a
+public equation graph. Reconstruction tests use a fresh public equation graph and reject matching
+source/candidate undersized or wrong-dtype boundaries. This still does not admit public dispatch:
+terminal complete-write, emitted-body projection and composed numerical policy are next.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

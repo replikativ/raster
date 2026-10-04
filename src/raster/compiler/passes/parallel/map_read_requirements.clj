@@ -285,11 +285,20 @@
                                  (set (:inputs operation))
                                  (set (get-in operator [:attributes :resident-scalar-captures])))))))))
 
+(defn- static-extent
+  [expression]
+  (when (and (launch/expression? expression)
+             (empty? (launch/expression-references expression)))
+    (try (launch/resolve-expression {} expression)
+         (catch Exception _ nil))))
+
 (defn capacity-covers?
   "Whether a symbolic graph capacity structurally proves one certified minimum."
   [capacity required]
   (or (extent/equivalent? capacity required)
       (and (integer? capacity) (integer? required) (<= required capacity))
+      (let [capacity (static-extent capacity) required (static-extent required)]
+        (and (some? capacity) (some? required) (<= required capacity)))
       (and (= "raster.compiler.ir.kernel_launch.Maximum" (some-> capacity class .getName))
            (some #(capacity-covers? % required) (:values capacity)))))
 
@@ -298,7 +307,9 @@
   (some (fn [{:keys [expression op value]}]
           (and (= :>= op)
                (extent/equivalent? expression capacity)
-               (extent/equivalent? value required)))
+               (or (extent/equivalent? value required)
+                   (let [value (static-extent value) required (static-extent required)]
+                     (and (some? value) (some? required) (= value required))))))
         conditions))
 
 (defn graph-capacity-covers?

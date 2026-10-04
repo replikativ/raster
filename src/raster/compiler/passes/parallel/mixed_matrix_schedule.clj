@@ -5,6 +5,7 @@
    Target admission and artifact emission remain outside this pass. A structural refinement is
    retained producer evidence, not by itself an algorithm or complete-write proof."
   (:require [clojure.walk :as walk]
+            [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -20,6 +21,7 @@
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.matrix-input-fusion :as input-fusion]
+            [raster.compiler.passes.parallel.map-read-requirements :as read-requirements]
             [raster.compiler.passes.parallel.typed-contraction-context :as typed-context]))
 
 (defn ^:no-doc graph-buffer
@@ -40,6 +42,32 @@
 (defn ^:no-doc value-use
   [buffer access]
   (kgraph/->ValueUse buffer access))
+
+(defn- make-stage-graph
+  "Keep an independently supplied semantic boundary, checking its storage minima.
+   Logical matrix volumes size private stages, not a replacement callable interface."
+  [description source]
+  (if-not source
+    (kgraph/make description)
+    (let [boundary (kgraph/boundary-contract source)
+          expected (vec (concat (:inputs description) (:outputs description)))
+          actual (into {} (map (juxt :id identity))
+                       (concat (:inputs boundary) (:outputs boundary)))]
+      (when-not (and (= (set (map :id expected)) (set (keys actual)))
+                     (set/subset? (set (map :id (:scalars description)))
+                                  (set (map :id (:scalars boundary)))))
+        (throw (ex-info "matrix stage graph changed its semantic boundary identities"
+                        {:reason :mixed-matrix-public-boundary})))
+      (doseq [required expected
+              :let [id (:id required) provided (get actual id)]]
+        (when-not (and (= (select-keys required [:dtype :memory-space :role])
+                         (select-keys provided [:dtype :memory-space :role]))
+                       (read-requirements/graph-capacity-covers?
+                        (:elements provided) (:elements required) (:preconditions boundary)))
+          (throw (ex-info "semantic storage does not cover the matrix stage domain"
+                          {:reason :mixed-matrix-public-storage
+                           :value id :required required :provided provided}))))
+      (kgraph/make (merge description boundary)))))
 
 (defn ^:no-doc stage-node
   [id operation uses scalar-values dependencies]
@@ -237,7 +265,8 @@
            strategy source-operation source-graph external-interface]
     :as spec}]
   (let [{:keys [abi arguments effects]}
-        (or external-interface (assoc (public-outer-interface spec) :effects (effects spec)))
+        (or (when (:abi external-interface) external-interface)
+            (assoc (public-outer-interface spec) :effects (effects spec)))
         {:keys [a-elements b-elements c-elements]} (extents spec)
         epilogue-buffers (epilogue-buffer-specs epilogue)
         strategy (or strategy (if split-k? :xmx-split-k :xmx-direct))
@@ -303,7 +332,7 @@
                       transpose-b (conj (graph-buffer bt16 :half b-elements :temporary))
                       split-k? (conj (graph-buffer partials :float partial-elements :temporary)))]
     (let [stage-graph
-          (kgraph/make
+          (make-stage-graph
            {:inputs (ordered-public-buffers
                      (into [(graph-buffer a :float a-elements :input)
                             (graph-buffer b :float b-elements :input)]
@@ -320,7 +349,7 @@
                          :lowering :xmx-gemm-schedule}
             :attributes {:strategy strategy :variant variant :precision :mixed-f16-f32
                          :tile tile :vector-width vector-width
-                         :requested-splits requested-splits}})
+                         :requested-splits requested-splits}} source-graph)
           stage-graph
           (cond
             (:fuse-tile-inputs? spec)
@@ -356,7 +385,7 @@
       (throw (ex-info "batched matrix schedule is missing a required field"
                       {:reason :raster/bug :field field :spec spec}))))
   (let [{:keys [abi arguments effects]}
-        (or external-interface
+        (or (when (:abi external-interface) external-interface)
             (assoc (public-batched-outer-interface spec) :effects (effects spec)))
         a-elements (if (get batching :row true)
                      (klaunch/product batch m k)
@@ -390,7 +419,7 @@
                      (assoc b16 (layout/transpose-layout
                                  (layout/row-major [k n] :half))))})
         stage-graph
-        (kgraph/make
+        (make-stage-graph
          {:inputs (ordered-public-buffers
                    (into [(graph-buffer a :float a-elements :input)
                           (graph-buffer b :float b-elements :input)]
@@ -426,7 +455,7 @@
                        :result-transform? (boolean (seq epilogue))
                        :precision :mixed-f16-f32
                        :vector-width vector-width
-                       :tile tile}})
+                       :tile tile}} source-graph)
         stage-graph
         (or (some-> stage-graph
                     (input-fusion/fuse-lhs-cast convert-a-id contract-id)
