@@ -24,6 +24,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -1437,6 +1438,14 @@
               refinement (get-in graph [:attributes :scheduled-graph-refinement])]
           (is (some? graph))
           (is (= '[a z] (mapv :id (:inputs graph))))
+          (is (= (if batched? :batched-tile-casts :materialized)
+                 (get-in refinement [:schedule :input-fusion])))
+          (is (= (when batched? {:extent 'batch :lhs true :rhs false})
+                 (get-in refinement [:schedule :batching])))
+          (let [planned (mixed-schedule/reconstruct-refinement
+                         (-> form :equations first :algorithm) (:source refinement) refinement)]
+            (is (= (:graph refinement) (:graph planned)))
+            (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
 
@@ -1549,6 +1558,40 @@
     (is (= :mixed-f16-f32
            (get-in dispatch [:attributes :candidate-schedules :xmx-direct :precision])))
     (is (nil? (get-in dispatch [:attributes :matrix-graph-decline])))
+    (doseq [[strategy fusion] [[:xmx-direct :materialized]
+                              [:xmx-split-k :materialized]
+                              [:xmx-direct-dynamic-lhs :lhs-cast]
+                              [:xmx-direct-tile-inputs :tile-inputs]]]
+      (let [refinement (get-in (kdispatch/alternative dispatch strategy)
+                               [:attributes :scheduled-graph-refinement])]
+        (is (= fusion (get-in refinement [:schedule :input-fusion])))
+        (is (nil? (get-in refinement [:schedule :batching])))
+        (let [planned (mixed-schedule/reconstruct-refinement
+                       algorithm (:source refinement) refinement)
+              decline (fn [altered]
+                        (try (mixed-schedule/reconstruct-refinement
+                              algorithm (:source refinement) altered)
+                             :accepted
+                             (catch clojure.lang.ExceptionInfo exception
+                               (:reason (ex-data exception)))))]
+          (is (= (:graph refinement) (:graph planned)))
+          (is (= (:numerics refinement) (get-in planned [:refinement :numerics])))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (assoc-in refinement [:schedule :variant] :nt))))
+          (is (= :mixed-matrix-reconstruction-policy
+                 (decline (assoc-in refinement [:schedule :input-fusion] :unknown))))
+          (doseq [[field value] [[:version 2] [:batched? true] [:split-k? :yes]]]
+            (is (= :mixed-matrix-reconstruction-policy
+                   (decline (assoc-in refinement [:schedule field] value)))))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (assoc-in refinement [:schedule :batching]
+                                    {:extent 'batch :lhs true :rhs true}))))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (update refinement :schedule dissoc :variant))))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (assoc-in refinement [:numerics :rounding] :toward-zero))))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (assoc-in refinement [:schedule :unmodeled-choice] true)))))))
     (testing "logical effects come from TypedSOAC rather than any fallback artifact"
       (let [semantic-effects (get-in direct-refinement [:source :effects])]
         (is (= :typed-soac-contraction (:kind semantic-effects)))

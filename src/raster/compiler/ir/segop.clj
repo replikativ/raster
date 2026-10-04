@@ -263,9 +263,16 @@
   "Create an N-D SegSpace from an ordered [{:name sym :bound expr} ...] vector,
   OUTER→INNER (Futhark convention). Segmentation is positional: for a segmented
   reduce/map the INNERMOST dim is the reduced/mapped axis and all outer dims are
-  segments. A 1-D space is the degenerate single-dim case."
-  [dims-vec]
-  (->SegSpace (gensym "tid_") (vec dims-vec)))
+  segments. A 1-D space is the degenerate single-dim case. An optional compiler-owned
+  :flat-idx must be fresh against the dimensions and the complete supplied :scope;
+  ordinary source lowering retains fresh generated identities."
+  [dims-vec & {:keys [flat-idx scope]}]
+  (when (and (some? flat-idx)
+             (or (not (symbol? flat-idx)) (namespace flat-idx)
+                 (some #{flat-idx} (filter symbol? (tree-seq coll? seq [dims-vec scope])))))
+    (throw (ex-info "segmented flat identity is invalid or captures its scope"
+                    {:reason :seg-space-local-identity :flat-idx flat-idx})))
+  (->SegSpace (or flat-idx (gensym "tid_")) (vec dims-vec)))
 
 (defn make-seg-space
   "Create a SegSpace for a 1D problem."

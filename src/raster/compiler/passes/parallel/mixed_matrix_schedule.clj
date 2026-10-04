@@ -5,6 +5,7 @@
    Target admission and artifact emission remain outside this pass. A structural refinement is
    retained producer evidence, not by itself an algorithm or complete-write proof."
   (:require [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -18,7 +19,8 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
-            [raster.compiler.passes.parallel.matrix-input-fusion :as input-fusion]))
+            [raster.compiler.passes.parallel.matrix-input-fusion :as input-fusion]
+            [raster.compiler.passes.parallel.typed-contraction-context :as typed-context]))
 
 (defn ^:no-doc graph-buffer
   [id dtype elements role]
@@ -154,9 +156,11 @@
   ([stage-id scalar-types]
   (let [facts (contraction-facts/from-components
                {:out 'C :free-axes '[[i mn]] :contract-axes '[[s splits]] :dtype :float
+                :local-identities {:accumulator '__raster_split_combine_acc}
                 :body '(clojure.core/aget
                         partials (clojure.core/+ (clojure.core/* s mn) i))})
-        operation (contract-lower/contraction-facts->segred facts :id stage-id)
+        operation (contract-lower/contraction-facts->segred
+                   facts :id stage-id :flat-idx '__raster_split_combine_tid)
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'partials :float 'C :float}
@@ -189,7 +193,8 @@
 
 (defn- make-refinement
   [stage-graph source-operation source-graph
-   {:keys [strategy variant tile vector-width requested-splits split-k?] :as spec}]
+   {:keys [strategy variant tile vector-width requested-splits split-k? batch batching
+           fuse-tile-inputs? fuse-lhs-cast?] :as spec}]
   (when source-operation
     (when-not source-graph
       (throw (ex-info "typed mixed-precision scheduling requires its independent source graph"
@@ -203,10 +208,21 @@
       (graph-refinement/make
        {:source source-graph
         :graph stage-graph
-        :schedule {:kind :mixed-precision-contraction
+        :schedule {:kind :mixed-precision-contraction :version 1
                    :strategy strategy :variant variant :tile tile
                    :vector-width vector-width :split-k? (boolean split-k?)
-                   :requested-splits requested-splits}
+                   :requested-splits requested-splits
+                   :batched? (some? batch)
+                   ;; Reconstruction consumes explicit physical choices, never guesses
+                   ;; fusion or shared operands from a strategy label or emitted graph.
+                   :input-fusion (cond
+                                   (some? batch) :batched-tile-casts
+                                   fuse-tile-inputs? :tile-inputs
+                                   fuse-lhs-cast? :lhs-cast
+                                   :else :materialized)
+                   :batching (when (some? batch)
+                               {:extent batch :lhs (get batching :row true)
+                                :rhs (get batching :col true)})}
         :numerics (refinement-numerics spec split-k?)
         :provenance {:operation-id (:id source-operation)
                      :source-dialect :typed-soac}
@@ -422,3 +438,65 @@
                          :vector-width vector-width :batching batching)
         refinement (make-refinement stage-graph source-operation source-graph emit-spec)]
     {:graph stage-graph :refinement refinement}))
+
+(defn reconstruct-refinement
+  "Rebuild a mixed-matrix plan from a retained typed equation and independent source graph.
+
+   Only closed physical choices come from the refinement recipe. Operand identities, dimensions,
+   layout, batching, axis symbols and epilogue come from the typed algorithm. The source graph
+   must be freshly derived by the caller, not borrowed from the candidate witness.
+
+   Returns a reference plan, not validation authority: its graph and generated terminal bodies
+   still need comparison with the candidate. In particular, a matching boundary is not a
+   complete-write proof. Split-combine local identities are allocated by the collision-checked
+   contraction constructor, so repeated reference plans compare exactly."
+  [algorithm independent-source refinement]
+  (let [source (kgraph/validate! independent-source)
+        refinement (graph-refinement/validate-against! refinement source)
+        _ (when-not (= 1 (count (:nodes source)))
+            (throw (ex-info "mixed matrix reconstruction requires one semantic contraction"
+                            {:reason :mixed-matrix-reconstruction-source})))
+        operation (get-in source [:nodes 0 :operation])
+        {:keys [facts operation-id dtype]} (typed-context/validate! algorithm operation)
+        view (contraction-facts/dense-matrix-view facts)
+        _ (when-not (and (= :float (dtype/canon dtype)) (:ok view))
+            (throw (ex-info "typed equation does not admit the mixed matrix representation"
+                            {:reason :mixed-matrix-reconstruction-algorithm
+                             :dtype dtype :view view})))
+        _ (when (some #(= :inout (:kind %)) (:abi source))
+            (throw (ex-info "mixed matrix reconstruction requires a write-only result"
+                            {:reason :mixed-matrix-reconstruction-inout})))
+        recipe (:schedule refinement)
+        fusion (:input-fusion recipe)
+        _ (when-not (and (= :mixed-precision-contraction (:kind recipe))
+                          (= 1 (:version recipe))
+                          (= (:batched? view) (:batched? recipe))
+                          (boolean? (:split-k? recipe))
+                          (if (:batched? view)
+                            (and (= :batched-tile-casts fusion) (not (:split-k? recipe)))
+                            (and (contains? #{:materialized :lhs-cast :tile-inputs} fusion)
+                                 (or (not (:split-k? recipe)) (= :materialized fusion)))))
+            (throw (ex-info "mixed matrix recipe has an unsupported physical policy"
+                            {:reason :mixed-matrix-reconstruction-policy :recipe recipe})))
+        [m n k] (:dimensions view)
+        {:keys [row col]} (:bindings view)
+        spec (cond-> {:id [:typed-contraction operation-id]
+                      :a row :b col :c (:out facts) :m m :n n :k k
+                      :axis-symbols (vec (concat (map first (take-last 2 (:free-axes facts)))
+                                                (map first (:contract-axes facts))))
+                      :variant (:variant view) :epilogue (:epilogue view)
+                      :strategy (:strategy recipe) :tile (:tile recipe)
+                      :vector-width (:vector-width recipe)
+                      :split-k? (:split-k? recipe)
+                      :requested-splits (:requested-splits recipe)
+                      :source-operation operation :source-graph source
+                      :external-interface (select-keys source [:abi :arguments :effects])}
+               (= :lhs-cast fusion) (assoc :fuse-lhs-cast? true)
+               (= :tile-inputs fusion) (assoc :fuse-tile-inputs? true)
+               (:batched? view) (assoc :batch (:batch view) :batching (:batching view)))
+        planned ((if (:batched? view) plan-batched plan) spec)]
+    (when-not (and planned (= recipe (get-in planned [:refinement :schedule]))
+                   (= (:numerics refinement) (get-in planned [:refinement :numerics])))
+      (throw (ex-info "mixed matrix recipe or numerics disagree with typed reconstruction"
+                      {:reason :mixed-matrix-reconstruction-description})))
+    planned))

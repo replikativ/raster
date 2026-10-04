@@ -35,16 +35,9 @@
         (let [candidate (assoc spec :variant variant :split-k? split-k?)
               planned (:graph (mixed-schedule/plan candidate))]
           (is (= planned (graph/validate! planned)))
-          ;; Split combination allocates fresh scalar SSA names on each plan.
           (let [other (:graph (mixed-schedule/plan
                               (assoc candidate :target-dialect :not-an-emitter)))]
-            (is (graph/dataflow-equivalent? planned other))
-            (is (= (filterv #(or (matrix-stage/matrix-stage? %)
-                                 (layout-stage/layout-stage? %))
-                            (mapv :operation (:nodes planned)))
-                   (filterv #(or (matrix-stage/matrix-stage? %)
-                                 (layout-stage/layout-stage? %))
-                            (mapv :operation (:nodes other))))))
+            (is (= planned other)))
           (is (not-any? (comp artifact/kernel-artifact? :operation) (:nodes planned)))
           (is (= (if split-k? :split-k :full)
                  (some #(when (matrix-stage/matrix-stage? (:operation %))

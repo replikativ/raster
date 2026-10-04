@@ -3,6 +3,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.ir.contraction-facts :as facts]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]))
 
 (deftest semantic-projection-preserves-the-canonical-product-reduction
@@ -19,6 +20,22 @@
     (is (= #{'mn 'splits} (:scalars operation)))
     (is (= [{:name 'i :bound 'mn} {:name 's :bound 'splits}]
            (get-in operation [:space :dims])))))
+
+(deftest compiler-owned-flat-identities-preserve-scope
+  (let [f (facts/from-components
+           {:out 'C :free-axes '[[i mn]] :contract-axes '[[s splits]] :dtype :float
+            :body '(let [local 1.0] (+ local (aget partials (+ (* s mn) i))))})
+        project #(cl/contraction-facts->segred f :id :combine :flat-idx %)]
+    (is (= (project 'stage_tid) (project 'stage_tid)))
+    (is (= 'stage_tid (get-in (project 'stage_tid) [:space :flat-idx])))
+    (is (not= (get-in (cl/contraction-facts->segred f) [:space :flat-idx])
+              (get-in (cl/contraction-facts->segred f) [:space :flat-idx])))
+    (doseq [invalid ['i 'mn 's 'splits 'C 'partials 'local
+                     (first (reduction/accumulators (:reduction f)))
+                     42 false 'qualified/tid]]
+      (is (= :seg-space-local-identity
+             (try (project invalid) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
 (deftest contract-form-to-segred-nn
   (testing "matmul :nn form → segmented SegRed with free segments + reduced contract axis"

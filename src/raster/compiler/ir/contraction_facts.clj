@@ -80,14 +80,28 @@
       [flat-index flat-extent (walk/postwalk-replace substitutions body)])))
 
 (defn- canonical-reduction-facts
-  [out contract-axes body opts dtype]
+  [out free-axes contract-axes body opts dtype local-identities]
   (when (seq contract-axes)
     (let [stages (:stages opts)
           semantic-body (if (seq stages)
                           (contract-stages/flat-equivalent stages body)
                           body)
           [index extent flat-body] (flatten-contract-axes contract-axes semantic-body)
-          accumulator (gensym "contract_acc__")
+          declared-accumulator (:accumulator local-identities)
+          ;; Closed compiler-generated stages may retain a deterministic local identity.
+          ;; Reject collisions, including lexical binders, before introducing its scope.
+          symbols (when (some? declared-accumulator)
+                    (set (filter symbol? (tree-seq coll? seq
+                                                  [out free-axes contract-axes body opts
+                                                   index flat-body]))))
+          _ (when (and (some? declared-accumulator)
+                       (or (not (symbol? declared-accumulator))
+                           (namespace declared-accumulator)
+                           (contains? symbols declared-accumulator)))
+              (throw (ex-info "contraction accumulator identity is invalid or captures source scope"
+                              {:reason :contraction-local-identity
+                               :accumulator declared-accumulator})))
+          accumulator (or declared-accumulator (gensym "contract_acc__"))
           operator
           (reduction/scalar
            {:accumulator accumulator
@@ -156,9 +170,11 @@
    `form` is optional provenance owned only by the source compatibility entry. Typed semantic
    callers do not manufacture one: a target leaf that still consumes surface syntax must project
    it explicitly at that leaf boundary. Throws on malformed axes or an unverifiable physical
-   layout declaration."
-  [{:keys [out free-axes contract-axes body opts dtype form metadata]
-    :or {opts {} dtype :double}}]
+   layout declaration. Optional compiler-local `local-identities` may name the accumulator;
+   its name must be unqualified and absent from the complete source scope. Source callers
+   continue to allocate fresh binders by default."
+  [{:keys [out free-axes contract-axes body opts dtype form metadata local-identities]
+    :or {opts {} dtype :double local-identities {}}}]
   (let [_ (when-not (symbol? out)
             (throw (ex-info "contract output must be a symbol" {:reason :malformed-output
                                                                 :out out})))
@@ -166,6 +182,14 @@
             (throw (ex-info "contract free-axes must be a vector" {:reason :malformed-free-axes})))
         _ (when-not (vector? contract-axes)
             (throw (ex-info "contract contract-axes must be a vector" {:reason :malformed-contract-axes})))
+        _ (when-not (and (map? local-identities)
+                         (every? #{:accumulator} (keys local-identities))
+                         (or (empty? local-identities)
+                             (and (seq contract-axes)
+                                  (some? (:accumulator local-identities)))))
+            (throw (ex-info "contraction local identities require a declared reduction accumulator"
+                            {:reason :contraction-local-identity
+                             :local-identities local-identities})))
         declared (:maps opts)
         ;; `:decode` is the per-operand LOAD-LAMBDA, an expression in `x` (the raw load). This is
         ;; where a zero-point subtraction belongs — exact on the load path, needing no correction
@@ -182,7 +206,8 @@
                      (into {} (map-indexed (fn [n [a _]] [(keyword (str "contract" n)) a])) contract-axes))
         dims (merge (into {} (map-indexed (fn [n [_ e]] [(keyword (str "free" n)) e])) free-axes)
                     (into {} (map-indexed (fn [n [_ e]] [(keyword (str "contract" n)) e])) contract-axes))
-        normalized (canonical-reduction-facts out contract-axes body opts dtype)]
+        normalized (canonical-reduction-facts out free-axes contract-axes body opts dtype
+                                             local-identities)]
     (merge
      (cond-> {facts-tag true
               :out out
