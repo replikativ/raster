@@ -443,6 +443,33 @@
                   (-> declined :emitted :equations last :operations first))))
         (is (seq (get-in declined [:stats :emission :contraction-candidate-declines])))))))
 
+(deftm c-family-dynamic-mixed-matmul
+  [left :- (Array float) right :- (Array float)
+   m :- Integer n :- Integer k :- Integer] :- (Array float)
+  (let [output (float-array (* m n))]
+    (raster.par/contract output [[i m] [j n]] [[p k]]
+                         (raster.numeric/*
+                          (raster.arrays/aget left (+ (* i k) p))
+                          (raster.arrays/aget right (+ (* p n) j)))
+                         :init (float 0.0) :combine raster.numeric/+)
+    output))
+
+(deftest public-mixed-binding-falls-back-on-physical-shape-preconditions
+  (let [compilation (equation-first/compile
+                     #'c-family-dynamic-mixed-matmul
+                     {:target intel-matrix-target :dtype :float
+                      :schedule {:precision :mixed-f16-f32
+                                 :typed-contraction {:strategy :dispatch-mixed-matrix}}})
+        operation (-> compilation :emitted :equations last :operations first)]
+    (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (doseq [[k strategy] [[64 :xmx-direct-tile-inputs] [63 :sequential-segments]]]
+      (let [linked (equation-first/lower compilation
+                                         [(float-array (* 64 k)) (float-array (* k 64))
+                                          (int 64) (int 64) (int k)])
+            selected (-> linked :instances first :call :steps last :graph)]
+        (is (= strategy (executable/strategy selected)))
+        (is (= linked (link-plan/validate! linked)))))))
+
 (deftest explicit-matrix-schedule-emits-typed-equations-on-vendor-targets
   (let [source
         '(let* [step (raster.par/contract C [[i 128] [j 128]] [[k 64]]
