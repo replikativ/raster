@@ -1,8 +1,8 @@
-(ns raster.compiler.backend.gpu.matrix-body-plan-test
+(ns raster.compiler.passes.parallel.matrix-body-plan-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
-            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.passes.parallel.matrix-body-plan :as matrix-plan]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.layout :as layout]

@@ -7,7 +7,7 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-emitter]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.matrix-target-names :as target-names]
-            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]))
+            [raster.compiler.passes.parallel.matrix-body-plan :as matrix-plan]))
 
 (defn- fragment-dialect! [target]
   (case target
