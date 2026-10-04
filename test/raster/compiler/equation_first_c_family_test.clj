@@ -49,6 +49,7 @@
 (def ^:private hip-target :hip:equation-first-source-test)
 (def ^:private hip-matrix-target :hip:equation-first-matrix-test)
 (def ^:private ocl-target :ocl:equation-first-source-test)
+(def ^:private intel-matrix-target :ocl:equation-first-intel-matrix-test)
 
 (deftest equation-template-owns-static-proof-with-fresh-final-validation
   (compiled/clear-compilation-cache!)
@@ -343,6 +344,12 @@
                      :max-workgroup-size 1024
                      :shared-local-memory 65536
                      :total-eus 32}})
+    (hardware/register-target-device!
+     intel-matrix-target
+     {:type :ocl :vendor "Intel" :name "Synthetic Intel DPAS public dispatch"
+      :capabilities {:warp-size 16 :subgroup-sizes [16 32]
+                     :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                     :max-workgroup-size 1024 :shared-local-memory 131072 :total-eus 32}})
     (f)))
 
 (deftm c-family-dot
@@ -372,6 +379,96 @@
 
 (def ^:private register-tiled-schedule
   {:typed-contraction {:strategy :register-tiled}})
+
+(deftm c-family-mixed-matmul
+  [left :- (Array float) right :- (Array float)] :- (Array float)
+  (let [output (float-array 4096)]
+    (raster.par/contract output [[i 64] [j 64]] [[p 64]]
+                         (raster.numeric/*
+                          (raster.arrays/aget left (+ (* i 64) p))
+                          (raster.arrays/aget right (+ (* p 64) j)))
+                         :init (float 0.0) :combine raster.numeric/+)
+    output))
+
+(deftest public-mixed-matrix-dispatch-requires-explicit-consent
+  (let [options {:target intel-matrix-target :dtype :float
+                 :schedule {:precision :mixed-f16-f32
+                            :typed-contraction {:strategy :dispatch-mixed-matrix}}}
+        compilation (equation-first/compile #'c-family-mixed-matmul options)
+        operation (-> compilation :emitted :equations last :operations first)
+        arguments [(float-array 4096) (float-array 4096)]
+        linked (equation-first/lower compilation arguments)]
+    (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (is (= :sequential-segments (get-in operation [:dispatch :default-strategy])))
+    (is (= #{:exact :approximate-model}
+           (get-in operation [:numerical-policy :permitted-modes])))
+    (is (= 1 (count (get-in operation [:numerical-policy :permitted-models]))))
+    (is (= :xmx-direct-tile-inputs
+           (executable/strategy (-> linked :instances first :call :steps last :graph))))
+    (is (= 2 (count (:kernels compilation))))
+    (is (= 1 (get-in compilation [:stats :emission :contraction-dispatches])))
+    (let [identity {:semantic-request-fingerprint "mixed-public-request"
+                    :compiler-build-fingerprint "test-build"
+                    :source-dependency-fingerprint "mixed-matmul"
+                    :target-descriptor-fingerprint "synthetic-intel"}
+          restored (equation-artifact/open
+                    identity (equation-artifact/decode
+                              (equation-artifact/encode
+                               (equation-artifact/seal identity compilation))))]
+      (is (semantic-fingerprint/equivalent? compilation restored))
+      (is (= linked (equation-first/lower restored arguments))))
+    (is (= :equation-first-matrix-consent
+           (try (equation-first/compile
+                 #'c-family-mixed-matmul (update options :schedule dissoc :precision))
+                :accepted
+                (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception))))))
+    (doseq [[key requested] [[:matrix-tiles :finite] [:split-factors [2]]]]
+      (is (= :equation-first-matrix-candidate-space
+             (try (equation-first/compile
+                   #'c-family-mixed-matmul
+                   (assoc-in options [:schedule :typed-contraction key] requested))
+                  :accepted
+                  (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))))
+    (let [choice (:dispatch operation)
+          fallback (equation-first/compile
+                    #'c-family-mixed-matmul
+                    (assoc-in options [:schedule :typed-contraction :measured-selectors]
+                              {(:id choice) {:kind :fixed-strategy :strategy :sequential-segments}}))
+          fallback-link (equation-first/lower fallback [(float-array 4096) (float-array 4096)])]
+      (is (= :sequential-segments
+             (executable/strategy (-> fallback-link :instances first :call :steps last :graph)))))
+    (doseq [target [cuda-target hip-target ocl-target]]
+      (let [declined (equation-first/compile #'c-family-mixed-matmul (assoc options :target target))]
+        (is (not (equation-dispatch/emitted-equation-dispatch?
+                  (-> declined :emitted :equations last :operations first))))
+        (is (seq (get-in declined [:stats :emission :contraction-candidate-declines])))))))
+
+(deftm c-family-dynamic-mixed-matmul
+  [left :- (Array float) right :- (Array float)
+   m :- Integer n :- Integer k :- Integer] :- (Array float)
+  (let [output (float-array (* m n))]
+    (raster.par/contract output [[i m] [j n]] [[p k]]
+                         (raster.numeric/*
+                          (raster.arrays/aget left (+ (* i k) p))
+                          (raster.arrays/aget right (+ (* p n) j)))
+                         :init (float 0.0) :combine raster.numeric/+)
+    output))
+
+(deftest public-mixed-binding-falls-back-on-physical-shape-preconditions
+  (let [compilation (equation-first/compile
+                     #'c-family-dynamic-mixed-matmul
+                     {:target intel-matrix-target :dtype :float
+                      :schedule {:precision :mixed-f16-f32
+                                 :typed-contraction {:strategy :dispatch-mixed-matrix}}})
+        operation (-> compilation :emitted :equations last :operations first)]
+    (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (doseq [[k strategy] [[64 :xmx-direct-tile-inputs] [63 :sequential-segments]]]
+      (let [linked (equation-first/lower compilation
+                                         [(float-array (* 64 k)) (float-array (* k 64))
+                                          (int 64) (int 64) (int k)])
+            selected (-> linked :instances first :call :steps last :graph)]
+        (is (= strategy (executable/strategy selected)))
+        (is (= linked (link-plan/validate! linked)))))))
 
 (deftest explicit-matrix-schedule-emits-typed-equations-on-vendor-targets
   (let [source

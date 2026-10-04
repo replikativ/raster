@@ -104,7 +104,7 @@
 (def ^:private valid-segmented-reduction-strategies
   #{:auto :reference :subgroup-score-reuse :dispatch-reassociated})
 (def ^:private valid-typed-contraction-strategies
-  #{:auto :portable :register-tiled :matrix :dispatch-register-tiled})
+  #{:auto :portable :register-tiled :matrix :dispatch-register-tiled :dispatch-mixed-matrix})
 (def ^:private valid-matrix-tile-spaces #{:default :finite})
 
 (defn- valid-matrix-tile-space?
@@ -289,7 +289,8 @@
               "schedule: measured typed contraction selectors must map dispatch IDs to selector maps"
               {:measured-selectors typed-contraction-selectors})))
     (when (and (seq typed-contraction-selectors)
-               (not (contains? #{:auto :dispatch-register-tiled} typed-contraction-strategy)))
+               (not (contains? #{:auto :dispatch-register-tiled :dispatch-mixed-matrix}
+                               typed-contraction-strategy)))
       (throw (ex-info "schedule: measured typed contraction selectors require an emitting dispatch strategy"
                       {:strategy typed-contraction-strategy
                        :measured-selectors typed-contraction-selectors})))
