@@ -128,6 +128,14 @@ not replay events, timing, or new compiler certification authority.
 
 Continue in this order, reusing the existing typed mixed-matrix builder and graph refinement:
 
+The reconstruction prerequisite is a target-neutral `mixed-matrix-schedule` pass. The existing
+materialized, tile-input-fused, dynamic-LHS, split-K and batched NN/NT stage construction moves
+there rather than being copied into another emitter. Target emission consumes the planned graph;
+hardware admission and runtime selectors remain outside the pass. This extraction does not yet
+prove a refined graph's complete-write or bounded-error law, admit it to equation dispatch, or
+migrate the mixed Gemma gate. The next certification step must independently reconstruct from the
+retained equation/source boundary and verify the terminal writer, dependencies and emitted bodies.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.
