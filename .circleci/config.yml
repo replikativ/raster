@@ -46,7 +46,14 @@ jobs:
             - v2-dependencies-
       - run:
           name: Download dependencies
-          command: clojure -P -M:dev:test:build
+          # :build uses :deps, which replaces the project dependency set. Combining it
+          # with :test does not prepare the classpath that the parallel shards execute.
+          # Prepare each actual invocation before distributing the immutable workspace.
+          command: |
+            clojure -P -M
+            clojure -P -M:test:ci-timed
+            clojure -P -M:gpu-compile-fixtures
+            clojure -P -T:build
       - save_cache:
           paths:
             - ~/.m2
