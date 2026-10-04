@@ -1596,6 +1596,16 @@
         direct-refinement (get-in direct-graph [:attributes :scheduled-graph-refinement])
         split-refinement (get-in split-graph [:attributes :scheduled-graph-refinement])
         public-source (:graph (equation-graph/make-for-equation form (first (:equations form))))
+        reference (emitted-equation/make
+                   algorithm (:body (equation-graph/make-for-equation form (first (:equations form))))
+                   (assoc-in
+                    (segop-opencl/generate-kernel-graph
+                     public-source
+                     :target-descriptor descriptor
+                     :scalar-types {'m :int 'n :int 'k :int}
+                     :contraction-facts {(:id operation)
+                                         (:facts (contraction-context/validate! algorithm operation))})
+                    [:attributes :strategy] :portable-reference))
         strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))
         select (fn [m n k]
                  (kdispatch/alternative-strategy
@@ -1656,6 +1666,36 @@
                      (emitted-equation/contraction-write-domains checked))
                   "direct matrix stores cover the logical result; split-K requires a separate proof")
               (when-not (= strategy :xmx-split-k)
+                (let [model (:numerical-model (emitted-equation/validate-with-result-contracts checked))
+                      selection (kdispatch/make
+                                 {:id "explicit-mixed-operational-model"
+                                  :alternatives [(:graph reference) emitted]
+                                  :default-strategy :portable-reference
+                                  :selector {:kind :fixed-strategy
+                                             :strategy (kdispatch/alternative-strategy emitted)}})
+                      policy {:permitted-modes #{:exact :approximate-model}
+                              :permitted-models [model]}]
+                  (is (= :approximate-model (:mode model)))
+                  (is (= (count (:nodes emitted)) (count (:stages model))))
+                  (is (= model
+                         (:numerical-model
+                          (emitted-equation/validate-with-result-contracts
+                           (assoc checked :numerical-model (assoc model :version 2)))))
+                      "a caller-attached model cannot replace independent reconstruction")
+                  (is (equation-dispatch/emitted-equation-dispatch?
+                       (equation-dispatch/make [reference checked] selection policy)))
+                  (try
+                    (equation-dispatch/make [reference checked] selection
+                                           (assoc policy :permitted-models [(assoc model :version 2)]))
+                    (is false "permission for another model cannot authorize this candidate")
+                    (catch clojure.lang.ExceptionInfo exception
+                      (is (= :equation-dispatch-numerics (:reason (ex-data exception))))))
+                  (try
+                    (equation-dispatch/make [reference checked] selection
+                                           (dissoc policy :permitted-models))
+                    (is false "approximation mode alone is not model permission")
+                    (catch clojure.lang.ExceptionInfo exception
+                      (is (= :equation-dispatch-numerical-policy (:reason (ex-data exception)))))))
                 (let [selection (kdispatch/make
                                  {:id "mixed-coverage-is-not-numerical-permission"
                                   :alternatives [emitted]
