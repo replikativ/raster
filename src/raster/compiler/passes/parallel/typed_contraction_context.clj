@@ -3,8 +3,10 @@
   (:require [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
-            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
+            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
 
 (defn validate!
   "Validate that one scheduled SegRed is the physical schedule for its TypedSOAC equation.
@@ -64,3 +66,28 @@
      :facts facts
      :dtype equation-dtype
      :schedule schedule}))
+
+(defn validate-semantic!
+  "Check the exact canonical typed contraction law through its original semantic constructor.
+
+   Unlike validate!, this also compares reduction state, algebra and scope. Grid and schedule
+   remain physical policy, checked separately by schedule reconstruction. This admission is
+   deliberately restricted to lambda-local-free contractions: the existing segmented lowerer
+   does not yet retain arbitrary lambda locals as an ordered reduction region."
+  [program operation]
+  (let [{:keys [program equation dtype] :as context} (validate! program operation)
+        lambda (:lambda (soac-dialect/operation-parts equation))
+        _ (when (seq (:locals (soac-dialect/lambda-parts lambda)))
+            (throw (ex-info "canonical contraction semantic proof requires a closed scalar body"
+                            {:reason :typed-contraction-semantic-locals
+                             :operation (:id operation)})))
+        expected (:operation
+                  (soac-lower/project-typed-segmented-reduce
+                   program :dtype dtype :flat-idx (get-in operation [:space :flat-idx])))
+        semantic-view #(dissoc % :grid :schedule)]
+    (when-not (and expected
+                   (fingerprint/equivalent? (semantic-view expected) (semantic-view operation)))
+      (throw (ex-info "scheduled contraction changed its exact typed reduction semantics"
+                      {:reason :typed-contraction-semantic-operation
+                       :operation (:id operation)})))
+    context))

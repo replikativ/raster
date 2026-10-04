@@ -508,14 +508,10 @@
           0
           (conj (vec segment-axes) [reduced-index reduced-extent])))
 
-(defn lower-typed-segmented-reduce
-  "Lower one general TypedSOAC segmented reduction directly to SegRed.
-
-   Segment axes are parallel result dimensions and the ordinary `:index/:extent` pair is the
-   innermost reduced dimension. Stable tensor captures retain arbitrary index expressions, which
-   is the general representation used by contractions; ordinary element operands denote dense
-   row-major storage over the complete segment-plus-reduction space."
-  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
+(defn project-typed-segmented-reduce
+  "Construct the original typed segmented-reduction semantics without target planning.
+   Optional compiler-owned flat identity is checked against the complete typed scope."
+  [program & {:keys [dtype flat-idx] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-segmented-reduce-program? program)
       (throw (ex-info "typed segmented reduction lowering requires one segmented-reduce equation"
@@ -590,34 +586,57 @@
           scalars (set/union scalars transform-scalars)
           space (segop/make-seg-space-nd
                  (conj (mapv (fn [[index extent]] {:name index :bound extent}) segment-axes)
-                       {:name reduced-index :bound reduced-extent}))
+                       {:name reduced-index :bound reduced-extent})
+                 :flat-idx flat-idx :scope program)
           output-dtype (or (first (:dtypes attributes)) dtype :double)
           contraction? (= :raster.par/contract
                           (get-in attributes [:attributes :source-operation]))
-          planned-grid (when contraction?
-                         (phase-grid :reduce device-id reduced-extent output-dtype
-                                     target-descriptor))
-          contraction-schedule
-          (when contraction?
-            (let [workgroup-size (:block-size planned-grid)
-                  candidates (filterv #(<= % workgroup-size) [32 64 128 256 512 1024])]
-              (reduction/schedule
-               {:strategy :hardware-contraction-candidates
-                :workgroup-size workgroup-size
-                :stages [:segment-space :reduction :target-lowering]
-                :tuning-space {:families [:matrix :register-tiled :portable]
-                               :workgroup-size candidates}
-                :numerical-mode (select-keys (first (get-in operator [:algebra :components]))
-                                             [:order :reassociation :overflow])
-                :attributes {:source-operation :raster.par/contract
-                             :device device-id
-                             :selection :target-lowering}})))
           _ (doseq [input inputs]
               (when-not (= :tensor (:kind (get values input)))
                 (throw (ex-info "segmented reduction tensor input lacks an AbstractValue"
                                 {:reason :typed-soac-segmented-reduce-input
                                  :equation equation-id :input input
                                  :value (get values input)}))))]
+      {:equation-id equation-id :physical-results physical-results
+       :segment-axes segment-axes :reduced-index reduced-index :reduced-extent reduced-extent
+       :operator operator :inputs inputs :scalars scalars :space space
+       :output-dtype output-dtype :contraction? contraction?
+       :operation (when (seq segment-axes)
+                    (segop/->SegRed equation-id space
+                                   (segop/->SegLevel :thread :virtual)
+                                   operator nil inputs (set physical-results) scalars nil
+                                   (if contraction? :contraction :segmented)
+                                   nil output-dtype))})))
+
+(defn lower-typed-segmented-reduce
+  "Lower one general TypedSOAC segmented reduction directly to SegRed.
+
+   Segment axes are parallel result dimensions and the ordinary `:index/:extent` pair is the
+   innermost reduced dimension. Stable tensor captures retain arbitrary index expressions, which
+   is the general representation used by contractions; ordinary element operands denote dense
+   row-major storage over the complete segment-plus-reduction space."
+  [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]
+  (let [{:keys [equation-id physical-results segment-axes reduced-index reduced-extent
+                operator inputs scalars output-dtype contraction? operation]}
+        (project-typed-segmented-reduce program :dtype dtype)
+        planned-grid (when contraction?
+                       (phase-grid :reduce device-id reduced-extent output-dtype
+                                   target-descriptor))
+        contraction-schedule
+        (when contraction?
+          (let [workgroup-size (:block-size planned-grid)
+                candidates (filterv #(<= % workgroup-size) [32 64 128 256 512 1024])]
+            (reduction/schedule
+             {:strategy :hardware-contraction-candidates
+              :workgroup-size workgroup-size
+              :stages [:segment-space :reduction :target-lowering]
+              :tuning-space {:families [:matrix :register-tiled :portable]
+                             :workgroup-size candidates}
+              :numerical-mode (select-keys (first (get-in operator [:algebra :components]))
+                                           [:order :reassociation :overflow])
+              :attributes {:source-operation :raster.par/contract
+                           :device device-id
+                           :selection :target-lowering}})))]
       (if (empty? segment-axes)
         (lower-reduce-description
          {:id equation-id :sym (first physical-results)
@@ -625,11 +644,7 @@
           :inputs inputs :outputs (set physical-results) :scalars scalars
           :elem-type output-dtype}
          device-id :dtype output-dtype :target-descriptor target-descriptor)
-        [(segop/->SegRed equation-id space
-                       (segop/->SegLevel :thread :virtual)
-                       operator nil inputs (set physical-results) scalars planned-grid
-                       (if contraction? :contraction :segmented)
-                       contraction-schedule output-dtype)]))))
+        [(assoc operation :grid planned-grid :schedule contraction-schedule)])))
 
 (defn typed-product-reduce-program?
   "Whether a validated one-equation TypedSOAC program is a product reduction."

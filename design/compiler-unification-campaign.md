@@ -162,6 +162,16 @@ and an unchanged pre-extraction register-tiled baseline reproduces Level Zero qu
 `0x7ffffffe` and OpenCL upload error `-5`. Hardware-free checks and CI are separate evidence;
 do not claim local device acceptance or mixed training progress from the extraction alone.
 
+The source-law prerequisite shares the existing TypedSOAC segmented-reduction constructor between
+ordinary lowering and exact semantic rederivation. The stronger contraction query compares the
+reduction state, neutral values, recurrence, algebra, axes, scopes and retained semantic metadata;
+only grid and schedule remain separately checked physical policy. It does not accept the
+refinement's own source as independent evidence. Admission is deliberately restricted to canonical
+lambda-local-free contractions; retaining arbitrary ordered lambda locals in the general reduction
+region remains language-coverage work. This query is not yet wired into mixed dispatch admission:
+fresh semantic graph derivation, stage reconstruction, body/projection checks and complete-write /
+composed-numerics checks must be joined before that migration.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.
