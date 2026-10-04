@@ -6,6 +6,8 @@
    split-K combination. All mixed-precision scratch and derived scheduling scalars are private to
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
   (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.emitted-graph-interface :as emitted-interface]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
@@ -300,7 +302,11 @@
                       {:reason :gemm-emission-dataflow
                        :scheduled (kgraph/dataflow-contract stage-graph)
                        :emitted (kgraph/dataflow-contract emitted)})))
-    (kexec/validate! emitted)))
+    (kexec/validate!
+     (if (some? (:abi emitted))
+       emitted
+       (emitted-interface/finalize!
+        emitted (c-dialect/target (c-dialect/resolve! target-dialect)) scalar-types)))))
 
 (defn- xmx-graph
   [spec]

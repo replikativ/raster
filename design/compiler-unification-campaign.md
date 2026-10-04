@@ -198,7 +198,14 @@ their logical stage extents. Extra public scalars needed solely by capacity guar
 The compatibility/standalone interface construction remains a fallback, not authority for a
 public equation graph. Reconstruction tests use a fresh public equation graph and reject matching
 source/candidate undersized or wrong-dtype boundaries. This still does not admit public dispatch:
-terminal complete-write, emitted-body projection and composed numerical policy are next.
+terminal complete-write and composed numerical policy are next.
+
+EmittedParallelEquation now reconstructs mixed refinements from its independently derived public
+source graph and compares every artifact's scheduled-body certificate with the pure stage-body
+projection. Matching boundary or stage source alone cannot authorize a changed generated body.
+Artifact graphs with an inferred public ABI use the same ordered ABI finalizer as ordinary SegOp
+emission; compatibility graphs retain their explicit interface. This is artifact reconstruction,
+not complete-write coverage, numerical composition, target admission or performance evidence.
 
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only

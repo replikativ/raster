@@ -10,6 +10,7 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (defrecord EmittedParallelEquation [algorithm body refinement graph provenance attributes])
@@ -71,8 +72,13 @@
            {:actual (type emitted-equation)}))
   (let [{:keys [algorithm body refinement graph provenance attributes]} emitted-equation
         expected (expected-graph algorithm body)
-        refinement (when refinement (refinement/validate-against! refinement expected))
-        scheduled (if refinement (refinement/scheduled-graph refinement) expected)
+        mixed? (= :mixed-precision-contraction (get-in refinement [:schedule :kind]))
+        mixed (when mixed?
+                (mixed-validation/validate-reconstruction! algorithm expected refinement))
+        refinement (when refinement
+                     (if mixed? refinement (refinement/validate-against! refinement expected)))
+        scheduled (or (:graph mixed)
+                      (if refinement (refinement/scheduled-graph refinement) expected))
         ;; Executable validation already validates this exact graph before checking its ABI,
         ;; scalar dependencies and artifacts. Do not immediately repeat the graph proof.
         emitted (executable/validate! graph)]
@@ -85,13 +91,18 @@
              {:scheduled (graph/dataflow-contract scheduled)
               :emitted (graph/dataflow-contract emitted)}))
     (when-not (every? true?
-                      (map (fn [scheduled-node emitted-node]
+                      (map (fn [scheduled-node emitted-node generated-body]
                              (let [certificate (get-in emitted-node
                                                        [:operation :provenance
                                                         :scheduled-operation])]
                                (if (scheduled-body/scheduled-kernel-body? certificate)
                                  (do (scheduled-body/validate-against-node!
                                       certificate scheduled-node scheduled)
+                                     (when (and generated-body
+                                                (not (semantic-fingerprint/equivalent?
+                                                      generated-body certificate)))
+                                       (fail! :emitted-mixed-matrix-artifact-refinement
+                                              "mixed matrix artifact changed its exact generated stage body" {}))
                                      (when (and (swr/plan? algorithm)
                                                 (not (semantic-fingerprint/equivalent?
                                                       certificate
@@ -101,8 +112,12 @@
                                      (scheduled-body/validate-artifact-projection!
                                       certificate (:operation emitted-node))
                                      true)
-                                 (= (:operation scheduled-node) certificate))))
-                           (:nodes scheduled) (:nodes emitted)))
+                                 (if generated-body
+                                   (fail! :emitted-mixed-matrix-artifact-refinement
+                                          "mixed matrix artifact requires its generated scheduled-body certificate" {})
+                                   (= (:operation scheduled-node) certificate)))))
+                           (:nodes scheduled) (:nodes emitted)
+                           (or (:stage-bodies mixed) (repeat nil))))
       (fail! :emitted-parallel-equation-operation
              "target emission changed a scheduled equation operation certificate" {}))
     (doseq [[field value] [[:provenance provenance] [:attributes attributes]]]
@@ -110,7 +125,7 @@
         (fail! :emitted-parallel-equation-description
                "emitted equation descriptions must be maps"
                {:field field :value value})))
-    {:boundary emitted-equation :source-graph expected}))
+    {:boundary emitted-equation :source-graph expected :mixed-reconstruction mixed}))
 
 (defn validate!
   [emitted-equation]

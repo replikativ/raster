@@ -7,6 +7,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -1627,6 +1628,32 @@
             (is (nil? (get-in public-plan [:graph :abi])))
             (is (= (:scalars public-source) (get-in public-plan [:graph :scalars])))
             (is (= (:temporaries (:graph planned)) (get-in public-plan [:graph :temporaries])))
+            (let [body (:body (equation-graph/make-for-equation form (first (:equations form))))
+                  emitted (gpu-gemm/emit-scheduled-stage-graph
+                           (:graph public-plan) {:refinement (:refinement public-plan)})
+                  checked (emitted-equation/make
+                           algorithm body emitted {:refinement (:refinement public-plan)})]
+              (is (emitted-equation/emitted-equation? checked))
+              (is (nil? (emitted-equation/contraction-write-domains checked))
+                  "artifact reconstruction alone cannot authorize complete writes or dispatch")
+              (try
+                (emitted-equation/make
+                 algorithm body
+                 (assoc-in emitted [:nodes 0 :operation :provenance :scheduled-operation]
+                           (get-in public-plan [:graph :nodes 0 :operation]))
+                 {:refinement (:refinement public-plan)})
+                (is false "a raw stage cannot replace the generated mixed body certificate")
+                (catch clojure.lang.ExceptionInfo exception
+                  (is (= :emitted-mixed-matrix-artifact-refinement (:reason (ex-data exception))))))
+              (try
+                (emitted-equation/make
+                 algorithm body
+                 (assoc-in emitted [:nodes 0 :operation :provenance :scheduled-operation
+                                    :body :attributes :forged] true)
+                 {:refinement (:refinement public-plan)})
+                (is false "a retained matching stage source cannot authorize a changed body")
+                (catch clojure.lang.ExceptionInfo exception
+                  (is (= :emitted-mixed-matrix-artifact-refinement (:reason (ex-data exception)))))))
             (let [input (first (get-in planned [:graph :inputs]))
                   repeated (update (:graph planned) :inputs
                                    #(into [(assoc input :elements
