@@ -1306,6 +1306,30 @@
     (is (instance? raster.compiler.ir.segop.SegRed operation))
     (is (= :contraction (:phase operation)))
     (let [context (contraction-context/validate! algorithm operation)]
+      (is (= operation (:operation (contraction-context/validate-semantic! algorithm operation))))
+      (doseq [changed [(assoc-in operation [:reduction :step :results] [0.0])
+                       (assoc-in operation [:reduction :combine] {:foreign-combine true})
+                       (assoc-in operation [:reduction :components 0 :neutral] 1.0)
+                       (assoc-in operation [:reduction :algebra :components 0 :order] :foreign-order)
+                       (assoc-in operation [:reduction :attributes :foreign-policy] true)
+                       (assoc-in operation [:reduction :attributes :result-region]
+                                 {:foreign-result-transform true})
+                       (assoc-in operation [:level :virtualization] :foreign-level)
+                       (update operation :scalars conj 'unbound-scalar)
+                       (assoc operation :lambda '(+ 1.0 2.0))
+                       (update-in operation [:space :dims 0 :name]
+                                  #(with-meta % {:raster.type/tag 'double}))]]
+        (is (= :typed-contraction-semantic-operation
+               (try (contraction-context/validate-semantic! algorithm changed) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (is (= :seg-space-local-identity
+             (try (contraction-context/validate-semantic!
+                   algorithm (assoc-in operation [:space :flat-idx] 'A)) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (some? (contraction-context/validate-semantic!
+                  algorithm (assoc operation :grid {:physical-policy :deferred}))))
+      (is (some? (contraction-context/validate-semantic!
+                  algorithm (assoc-in operation [:schedule :tuning-space :physical-policy] true))))
       ;; Projection allocates a fresh reduction accumulator. Compare the retained physical
       ;; facts, not that locally bound identity from two independent projections.
       (is (= (dissoc (:facts context) :reduction)

@@ -10,6 +10,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-pass]
             [raster.compiler.passes.parallel.soac-lower :as lower]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
 
 (defn- tensor [dtype shape]
@@ -44,6 +45,20 @@
                :equations {'contract-equation (dialect/default-equation-facts
                                                 {:source :test})})]
     (dialect/make facts [equation] '[C])))
+
+(deftest segmented-semantic-projection-is-device-free-and-exact
+  (let [source (program)
+        operation (first (lower/lower-typed-segmented-reduce source :ze:0 :dtype :float))
+        forbidden (fn [& _] (throw (ex-info "semantic projection discovered target hardware" {})))]
+    (with-redefs [hardware/descriptor-for forbidden]
+      (let [projected (:operation (lower/project-typed-segmented-reduce
+                                  source :dtype :float
+                                  :flat-idx (get-in operation [:space :flat-idx])))]
+        (is (= operation projected))
+        (is (= projected (:operation (lower/project-typed-segmented-reduce
+                                      source :dtype :float
+                                      :flat-idx (get-in operation [:space :flat-idx])))))
+        (is (= (:reduction operation) (:reduction projected)))))))
 
 (deftest segmented-reduction-is-a-typed-functional-equation
   (let [program (program)
