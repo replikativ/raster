@@ -171,6 +171,13 @@
                                             (route/program-envelope typed) options))]
                       (:graph (equation-graph/make-for-equation
                                scheduled (first (:equations scheduled))))))]
+    (with-redefs [projection/segmented-reduce-core-write-requirements
+                  (fn [& _] (throw (ex-info "write proof invariant failed"
+                                          {:reason :write-proof-invariant})))]
+      (is (= :write-proof-invariant
+             (reason-of #(graph-for [['i 'm] ['j 'n]]
+                                    '(* (aget A (+ (* i k) l))
+                                        (aget B (+ (* l n) j))) {})))))
     (doseq [body ['(* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
                  '(* (aget A (+ (* i k) l)) (aget B (+ (* j k) l)))
                  '(* (aget A (+ (* l m) i)) (aget B (+ (* l n) j)))
@@ -189,6 +196,22 @@
       (is (= :kernel-precondition-failed
              (reason-of #(precondition/check! (:preconditions graph)
                                                (partial graph-call/resolve-integer values))))))
+    (let [graph (graph-for [['i 'm] ['j 'n]]
+                           '(* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
+                           {:values {'C (av/tensor {:dtype :float :shape ['m]})}})
+          output (first (filter #(= 'C (:id %)) (:outputs graph)))
+          values {'m {:type :long :value 3} 'n {:type :long :value 2}
+                  'k {:type :long :value 7}}
+          check #(precondition/check! (:preconditions graph)
+                                       (partial graph-call/resolve-integer
+                                                (assoc-in values ['n :value] %)))]
+      (is (= 'm (:elements output)) "preserve the declared allocation contract")
+      (is (some #(and (= 'm (:expression %)) (= :>= (:op %))
+                      (extent/equivalent? (:value %) (launch/product 'm 'n)))
+                (:preconditions graph)))
+      (is (= :kernel-precondition-failed (reason-of #(check 2))))
+      (is (true? (check 1)))
+      (is (true? (check 0))))
     (let [typed (frontend/form->program
                  '(let* [result (raster.par/contract C [[i m] [j n]] [[l k]]
                                                         (* (aget A (+ (* i k) l))
@@ -196,13 +219,32 @@
                     result) options)
           equation (first (soac/equations typed))]
       (is (some? (projection/segmented-reduce-core-read-requirements typed equation)))
+      (is (= #{'C} (set (keys (projection/segmented-reduce-core-write-requirements
+                               typed equation)))))
       (doseq [[facet value] [[:representation {:kind :quantized :scheme :q4-k}]
                              [:logical-layout {:order [0]}]
                              [:sharding {:axis 0}]]]
+        (is (nil? (projection/segmented-reduce-core-write-requirements
+                   (with-meta
+                     (list* (first typed)
+                            (reduce #(assoc-in %1 [:values %2 facet] value)
+                                    (soac/facts typed) ['C (first (nth equation 2))])
+                            (nnext typed)) (meta typed)) equation)))
         (is (nil? (projection/segmented-reduce-core-read-requirements
                    (with-meta
                      (list* (first typed) (assoc-in (soac/facts typed) [:values 'A facet] value)
                             (nnext typed)) (meta typed)) equation)))))))
+
+(deftest rank-zero-fold-write-domain-is-one-element
+  (let [typed (frontend/form->program
+               '(let* [result (raster.par/contract C [] [[l k]]
+                                                       (* (aget A l) (aget B l)))]
+                  result)
+               {:dtype :float :array-types {'A :float 'B :float 'C :float}
+                :scalar-types {'k :long}})]
+    (is (= {'C 1}
+           (projection/segmented-reduce-core-write-requirements
+            typed (first (soac/equations typed)))))))
 
 (deftest known-static-map-capacity-is-not-increased-by-a-read-requirement
   (let [options {:dtype :float :target-device :ocl:0 :array-types {'x :float}

@@ -300,6 +300,22 @@
                                   :else (launch/maximum prior minimum))))))
               {} reads))))
 
+(defn segmented-reduce-core-write-requirements
+  "Dense output-prefix minima from a canonical scalar segmented reduction.
+
+   This is the semantic write domain, not its declared allocation shape. Unsupported
+   physical layouts decline; no equality between shape aliases is assumed."
+  [program equation]
+  (let [{:keys [out free-axes]}
+        (segmented-reduce-contract-components program equation)
+        value (get-in (dialect/facts program) [:values out])]
+    (when (and (= :tensor (:kind value))
+               (dtype/known? (:dtype value))
+               (contraction-closure/plain-storage? value))
+      {out (if (seq free-axes)
+             (apply launch/product (map second free-axes))
+             1)})))
+
 (defn- source-bindings
   [locals substitutions]
   (vec
