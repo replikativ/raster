@@ -136,6 +136,15 @@ prove a refined graph's complete-write or bounded-error law, admit it to equatio
 migrate the mixed Gemma gate. The next certification step must independently reconstruct from the
 retained equation/source boundary and verify the terminal writer, dependencies and emitted bodies.
 
+The reconstruction prerequisite now retains a closed versioned physical recipe, including input
+fusion and batching decisions. Reference planning derives semantic operands, dimensions, layouts,
+epilogues and the public boundary from the retained typed algorithm and an independently supplied
+source graph. Split-K compiler-owned accumulator and flat work-item identities are capture-checked
+by their constructors, allowing exact complete-graph comparison without printed-form equality or
+a permissive alpha-equivalence check. This remains reference reconstruction, not certification of
+the candidate graph, emitted stage bodies or its complete-write/numerical law. Those checks must
+land before admitting public mixed-matrix equation dispatch.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

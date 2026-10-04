@@ -155,9 +155,11 @@
   ([stage-id scalar-types]
   (let [facts (contraction-facts/from-components
                {:out 'C :free-axes '[[i mn]] :contract-axes '[[s splits]] :dtype :float
+                :local-identities {:accumulator '__raster_split_combine_acc}
                 :body '(clojure.core/aget
                         partials (clojure.core/+ (clojure.core/* s mn) i))})
-        operation (contract-lower/contraction-facts->segred facts :id stage-id)
+        operation (contract-lower/contraction-facts->segred
+                   facts :id stage-id :flat-idx '__raster_split_combine_tid)
         planned (contraction-schedule/plan-portable-body
                  facts operation {}
                  {:array-types {'partials :float 'C :float}
@@ -205,10 +207,11 @@
       (graph-refinement/make
        {:source source-graph
         :graph stage-graph
-        :schedule {:kind :mixed-precision-contraction
+        :schedule {:kind :mixed-precision-contraction :version 1
                    :strategy strategy :variant variant :tile tile
                    :vector-width vector-width :split-k? (boolean split-k?)
                    :requested-splits requested-splits
+                   :batched? (some? batch)
                    ;; Reconstruction consumes explicit physical choices, never guesses
                    ;; fusion or shared operands from a strategy label or emitted graph.
                    :input-fusion (cond
@@ -217,8 +220,8 @@
                                    fuse-lhs-cast? :lhs-cast
                                    :else :materialized)
                    :batching (when (some? batch)
-                               {:row (get batching :row true)
-                                :col (get batching :col true)})}
+                               {:extent batch :lhs (get batching :row true)
+                                :rhs (get batching :col true)})}
         :numerics (refinement-numerics spec split-k?)
         :provenance {:operation-id (:id source-operation)
                      :source-dialect :typed-soac}
@@ -444,7 +447,8 @@
 
    Returns a reference plan, not validation authority: its graph and generated terminal bodies
    still need comparison with the candidate. In particular, a matching boundary is not a
-   complete-write proof and fresh split-combine lexical names require hygienic comparison."
+   complete-write proof. Split-combine local identities are allocated by the collision-checked
+   contraction constructor, so repeated reference plans compare exactly."
   [algorithm independent-source refinement]
   (let [source (kgraph/validate! independent-source)
         refinement (graph-refinement/validate-against! refinement source)
@@ -463,10 +467,14 @@
                             {:reason :mixed-matrix-reconstruction-inout})))
         recipe (:schedule refinement)
         fusion (:input-fusion recipe)
-        _ (when-not (and (boolean? (:split-k? recipe))
+        _ (when-not (and (= :mixed-precision-contraction (:kind recipe))
+                          (= 1 (:version recipe))
+                          (= (:batched? view) (:batched? recipe))
+                          (boolean? (:split-k? recipe))
                           (if (:batched? view)
                             (and (= :batched-tile-casts fusion) (not (:split-k? recipe)))
-                            (contains? #{:materialized :lhs-cast :tile-inputs} fusion)))
+                            (and (contains? #{:materialized :lhs-cast :tile-inputs} fusion)
+                                 (or (not (:split-k? recipe)) (= :materialized fusion)))))
             (throw (ex-info "mixed matrix recipe has an unsupported physical policy"
                             {:reason :mixed-matrix-reconstruction-policy :recipe recipe})))
         [m n k] (:dimensions view)

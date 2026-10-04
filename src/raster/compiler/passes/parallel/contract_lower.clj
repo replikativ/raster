@@ -29,8 +29,9 @@
 (defn contraction-facts->segred
   "Project verified contraction semantics into a segmented schedule without a surface form.
    The canonical ProductReduction, iteration axes, storage operands and dtype are retained.
-   Pure and device-free; target planning supplies a grid later."
-  [facts & {:keys [id grid] :or {id 0 grid nil}}]
+   Pure and device-free; target planning supplies a grid later. Optional compiler-owned
+   :flat-idx is capture-checked by the SegSpace constructor against the complete facts."
+  [facts & {:keys [id grid flat-idx] :or {id 0 grid nil}}]
   (let [_ (when-not (contraction-facts/facts? facts)
             (throw (ex-info "contract lowering requires verified contraction facts"
                             {:reason :contraction-facts-mismatch :facts facts})))
@@ -47,7 +48,8 @@
         free-dims (mapv (fn [[s b]] {:name s :bound b}) free-axes)
         red-dim   {:name k-sym :bound k-bound}
         ;; N-D space: free (segment) dims OUTER, contracted (reduced) dim INNERMOST.
-        space (segop/make-seg-space-nd (conj free-dims red-dim))
+        space (segop/make-seg-space-nd (conj free-dims red-dim)
+                                     :flat-idx flat-idx :scope facts)
         reduction (:reduction facts)
         arrays  (set (ir-par/collect-aget-arrays body))
         inputs  (disj arrays out)

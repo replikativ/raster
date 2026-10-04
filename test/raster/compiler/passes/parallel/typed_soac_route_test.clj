@@ -1440,11 +1440,11 @@
           (is (= '[a z] (mapv :id (:inputs graph))))
           (is (= (if batched? :batched-tile-casts :materialized)
                  (get-in refinement [:schedule :input-fusion])))
-          (is (= (when batched? {:row true :col false})
+          (is (= (when batched? {:extent 'batch :lhs true :rhs false})
                  (get-in refinement [:schedule :batching])))
           (let [planned (mixed-schedule/reconstruct-refinement
                          (-> form :equations first :algorithm) (:source refinement) refinement)]
-            (is (kernel-graph/dataflow-equivalent? (:graph refinement) (:graph planned)))
+            (is (= (:graph refinement) (:graph planned)))
             (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
@@ -1574,7 +1574,7 @@
                              :accepted
                              (catch clojure.lang.ExceptionInfo exception
                                (:reason (ex-data exception)))))]
-          (is (kernel-graph/dataflow-equivalent? (:graph refinement) (:graph planned)))
+          (is (= (:graph refinement) (:graph planned)))
           (is (= (:numerics refinement) (get-in planned [:refinement :numerics])))
           (is (= :mixed-matrix-reconstruction-description
                  (decline (assoc-in refinement [:schedule :variant] :nt))))

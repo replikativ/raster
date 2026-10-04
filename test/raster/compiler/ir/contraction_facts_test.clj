@@ -12,6 +12,30 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction :as reduction]))
 
+(deftest compiler-local-accumulator-identities-are-stable-and-capture-checked
+  (let [components {:out 'out :free-axes [['i 2]] :contract-axes [['j 3]]
+                    :dtype :float :body '(aget a (+ (* i 3) j))}
+        declared (assoc components :local-identities {:accumulator 'stage_acc})
+        reason (fn [input]
+                 (try (cf/from-components input) :accepted
+                      (catch clojure.lang.ExceptionInfo exception
+                        (:reason (ex-data exception)))))]
+    (is (= (cf/from-components declared) (cf/from-components declared)))
+    (is (= ['stage_acc] (reduction/accumulators (:reduction (cf/from-components declared)))))
+    (is (not= (reduction/accumulators (:reduction (cf/from-components components)))
+              (reduction/accumulators (:reduction (cf/from-components components)))))
+    (doseq [identity ['a 'out 'i 'j 42 false 'qualified/acc]]
+      (is (= :contraction-local-identity
+             (reason (assoc components :local-identities {:accumulator identity})))))
+    (is (= :contraction-local-identity
+           (reason (assoc declared :body '(let* [stage_acc 1.0]
+                                           (+ stage_acc (aget a (+ (* i 3) j))))))))
+    (is (= :contraction-local-identity
+           (reason (assoc declared :opts {:init 'stage_acc}))))
+    (doseq [identities [nil {:accumulator nil} {:index 'j}]]
+      (is (= :contraction-local-identity
+             (reason (assoc components :local-identities identities)))))))
+
 (deftest contraction-dependencies-include-stage-and-epilogue-storage
   (let [facts (cf/from-components
                {:out 'out :free-axes [['i 2]] :contract-axes [['blk 2] ['t 4]]
