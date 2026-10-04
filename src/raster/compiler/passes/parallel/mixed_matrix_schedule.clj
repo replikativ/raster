@@ -50,17 +50,16 @@
   (if-not source
     (kgraph/make description)
     (let [boundary (kgraph/boundary-contract source)
-          expected (into {} (map (juxt :id identity))
-                         (concat (:inputs description) (:outputs description)))
+          expected (vec (concat (:inputs description) (:outputs description)))
           actual (into {} (map (juxt :id identity))
                        (concat (:inputs boundary) (:outputs boundary)))]
-      (when-not (and (= (set (keys expected)) (set (keys actual)))
+      (when-not (and (= (set (map :id expected)) (set (keys actual)))
                      (set/subset? (set (map :id (:scalars description)))
                                   (set (map :id (:scalars boundary)))))
         (throw (ex-info "matrix stage graph changed its semantic boundary identities"
                         {:reason :mixed-matrix-public-boundary})))
-      (doseq [[id required] expected
-              :let [provided (get actual id)]]
+      (doseq [required expected
+              :let [id (:id required) provided (get actual id)]]
         (when-not (and (= (select-keys required [:dtype :memory-space :role])
                          (select-keys provided [:dtype :memory-space :role]))
                        (read-requirements/graph-capacity-covers?

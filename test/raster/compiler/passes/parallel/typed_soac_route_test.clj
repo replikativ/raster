@@ -1627,6 +1627,15 @@
             (is (nil? (get-in public-plan [:graph :abi])))
             (is (= (:scalars public-source) (get-in public-plan [:graph :scalars])))
             (is (= (:temporaries (:graph planned)) (get-in public-plan [:graph :temporaries])))
+            (let [input (first (get-in planned [:graph :inputs]))
+                  repeated (update (:graph planned) :inputs
+                                   #(into [(assoc input :elements
+                                                  (kernel-launch/product 2 (:elements input)))] %))]
+              (try
+                (#'mixed-schedule/make-stage-graph repeated public-source)
+                (is false "a later requirement for the same buffer cannot erase an earlier minimum")
+                (catch clojure.lang.ExceptionInfo exception
+                  (is (= :mixed-matrix-public-storage (:reason (ex-data exception)))))))
             (doseq [source [(assoc-in public-source [:inputs 0 :elements] 1)
                             (assoc-in public-source [:inputs 0 :dtype] :double)
                             (assoc-in public-source [:outputs 0 :elements] 1)
