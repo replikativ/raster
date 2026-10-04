@@ -455,20 +455,28 @@
     output))
 
 (deftest public-mixed-binding-falls-back-on-physical-shape-preconditions
-  (let [compilation (equation-first/compile
-                     #'c-family-dynamic-mixed-matmul
+  (doseq [[source shape-value width] [[#'c-family-dynamic-mixed-matmul int :int]
+                                     [#'contractions/dynamic-matmul long :long]]]
+   (let [compilation (equation-first/compile
+                     source
                      {:target intel-matrix-target :dtype :float
                       :schedule {:precision :mixed-f16-f32
                                  :typed-contraction {:strategy :dispatch-mixed-matrix}}})
         operation (-> compilation :emitted :equations last :operations first)]
     (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (doseq [candidate (:alternatives operation)]
+      (is (= #{[width width]}
+             (into #{} (comp (filter #(= :scalar (:kind %)))
+                            (map (juxt :dtype :kernel-dtype)))
+                   (executable/abi (:graph candidate))))
+          "schedule choice cannot change the declared integral public carrier"))
     (doseq [[k strategy] [[64 :xmx-direct-tile-inputs] [63 :sequential-segments]]]
       (let [linked (equation-first/lower compilation
                                          [(float-array (* 64 k)) (float-array (* k 64))
-                                          (int 64) (int 64) (int k)])
+                                          (shape-value 64) (shape-value 64) (shape-value k)])
             selected (-> linked :instances first :call :steps last :graph)]
         (is (= strategy (executable/strategy selected)))
-        (is (= linked (link-plan/validate! linked)))))))
+        (is (= linked (link-plan/validate! linked))))))))
 
 (deftest explicit-matrix-schedule-emits-typed-equations-on-vendor-targets
   (let [source

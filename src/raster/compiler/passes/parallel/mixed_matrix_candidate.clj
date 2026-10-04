@@ -34,7 +34,7 @@
 (defn plan
   "Plan a full-K candidate without replacing the independently derived public boundary.
 
-   The first public slice admits int dimensions and existing NN/NT tile-input fusion, or
+   The public slice admits uniform int or long dimensions and existing NN/NT tile-input fusion, or
    materialized NN/NT/TN/TT storage. Leading batches use the existing fused-slice schedule."
   [algorithm source descriptor {:keys [precision tile input-fusion]
                                 :or {input-fusion :tile-inputs}}]
@@ -59,7 +59,8 @@
           (and (= :tile-inputs input-fusion)
                (not (contains? #{:nn :nt} (:variant view))))
           {:ok false :reason :mixed-matrix-input-fusion-layout}
-          (not-every? #(= :int (launch/typed-expression-dtype % types)) dimensions)
+          (not (contains? #{#{:int} #{:long}}
+                          (set (map #(launch/typed-expression-dtype % types) dimensions))))
           {:ok false :reason :mixed-matrix-index-width}
           (some #(= :inout (:kind %)) (:abi source))
           {:ok false :reason :mixed-matrix-inout-result}

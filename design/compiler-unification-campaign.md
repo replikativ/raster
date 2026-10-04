@@ -48,6 +48,17 @@ tile-space expansion and split-K requests fail rather than being silently ignore
 defaults and vendor matrix schedules remain unchanged. This is public compiler/lowering and
 artifact-roundtrip acceptance; native trajectory/performance acceptance is still pending.
 
+Uniform Long shapes reuse the existing checked per-stage matrix specialization. The public
+graph's integral carrier follows its declared GraphScalar width rather than the first consuming
+node's physical width; exact and mixed alternatives therefore share one stable public ABI.
+Individual kernel parameters and their checked int/long conversions are unchanged. Direct
+physical range conditions are projected once by the existing owner and checked before node
+conversion/scratch sizing, making a valid public Long outside an int specialization an explicit
+schedule-admission failure. Invalid public representations remain caller errors; computed
+private expressions still require their own checked preflight. Mixed-width dimensions remain
+declined. This intentionally changes serialized declared-integral graph ABI; compiler/build
+identity must invalidate older artifacts, and no compatibility wrapper is introduced.
+
 ### October 3 runtime/state integration update
 
 This update supersedes the producer-integration gaps below only for the specifically validated

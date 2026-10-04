@@ -151,8 +151,8 @@
                     (some (fn [[slot argument]] (when (= 'n argument) slot))))]
       (is (= :long (:dtype slot))
           "the scheduled graph supplies the public logical dtype")
-      (is (= :int (:kernel-dtype slot))
-          "the target graph retains the physical scalar representation used by its nodes"))
+      (is (= :long (:kernel-dtype slot))
+          "the public graph carrier retains its declared width independently of node specialization"))
     (doseq [artifact [phase-one phase-two]
             :let [[slot argument] (last (map vector (:abi artifact) (:arguments artifact)))]]
       (is (= :int (:kernel-dtype slot))

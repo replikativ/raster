@@ -645,9 +645,16 @@
           (is (= (launch/typed-expression-dtype (:value binding) by-argument) (:dtype binding)))
           (is (= (if (= (:kernel-dtype binding) (:dtype binding)) :identity :checked-range)
                  (:conversion binding))))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
-                              (graph-call/temporary-specs graph
-                                                         (assoc-in values [:m :value] 2147483648))))))))
+        (let [error (try
+                      (graph-call/temporary-specs graph
+                                                 (assoc-in values [:m :value] 2147483648))
+                      nil
+                      (catch clojure.lang.ExceptionInfo error error))]
+          (is (some? error))
+          (is (= (if (= :long (first widths))
+                   :kernel-precondition-failed
+                   :kernel-scalar-range)
+                 (:reason (ex-data error)))))))))
 
 (deftest batched-matrix-stages-retain-the-public-long-environment
   (let [spec {:id :long-batch :a 'a :b 'b :c 'c :batch 'batch :m 'm :n 'n :k 'k
@@ -675,8 +682,12 @@
                         (precondition/compare-value?
                          op (launch/resolve-expression scalars expression) value))
                       (:cases selector)))))))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
-                          (graph-call/temporary-specs graph (assoc-in values ['batch :value] 2147483648))))))
+    (let [error (try
+                  (graph-call/temporary-specs graph (assoc-in values ['batch :value] 2147483648))
+                  nil
+                  (catch clojure.lang.ExceptionInfo error error))]
+      (is (some? error))
+      (is (= :kernel-precondition-failed (:reason (ex-data error)))))))
 
 (deftest long-layout-and-combine-extents-do-not-narrow-shape-products
   (let [interface (update (executable/common-view (dispatch/default-alternative (emitted :nn)))

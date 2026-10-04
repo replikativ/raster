@@ -132,17 +132,9 @@
             violation)))
   bindings)
 
-(defn direct-scalar-range-preconditions
-  "Project physical integer ranges for direct public scalar bindings into selector conditions.
-  This is deliberately partial: computed node arguments, allocation products and artifact
-  preconditions still require ordinary binding preflight. No expression is evaluated here."
+(defn- direct-scalar-range-preconditions*
   [graph]
-  ;; Executables also include single artifacts, but this projection requires a graph boundary.
-  ;; Preserve that narrower domain without repeating validation of a valid graph.
-  (when-not (kgraph/kernel-graph? graph)
-    (kgraph/validate! graph))
-  (let [graph (executable/validate! graph)
-        public (scalar-interface graph)
+  (let [public (scalar-interface graph)
         public-ids (set (map second public))
         bindings (concat public
                          (mapcat (fn [{:keys [operation]}]
@@ -157,6 +149,15 @@
                       :value (if (= :bound (:role slot)) (max 0 lower) lower)}
                      {:expression argument :op :<= :value upper}])))
               bindings)))))
+
+(defn direct-scalar-range-preconditions
+  "Project physical integer ranges for direct public scalar bindings into selector conditions.
+  This is deliberately partial: computed node arguments, allocation products and artifact
+  preconditions still require ordinary binding preflight. No expression is evaluated here."
+  [graph]
+  (when-not (kgraph/kernel-graph? graph)
+    (kgraph/validate! graph))
+  (direct-scalar-range-preconditions* (executable/validate! graph)))
 
 (defn- validate-scalar-values!
   [graph scalar-values]
@@ -250,6 +251,10 @@
         _ (validate-scalar-values! graph public-values)]
     (precondition/check! (:preconditions graph)
                          #(resolve-integer scalar-values %))
+    ;; A valid public long value can be outside a node's int specialization. This is a
+    ;; binding-dependent schedule decline, checked before conversion, not malformed caller ABI.
+    (precondition/check! (direct-scalar-range-preconditions* graph)
+                         #(scalar-number public-values %))
     (doseq [{:keys [operation]} (:nodes graph)]
       (let [artifact (kart/validate! operation)
             arguments (mapv (fn [slot compiler-value]

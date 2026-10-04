@@ -124,9 +124,14 @@
                                  ;; A graph is not a physical kernel. Each node preserves its
                                  ;; own checked conversion (e.g. long parameter versus int bound).
                                  physical-types (distinct (map :kernel-dtype slots))
-                                 kernel-dtype (if (= 1 (count physical-types))
-                                                (first physical-types)
-                                                (or (:dtype declared) (:dtype (first slots))))
+                                 ;; Integral graph carriers follow the declared public width,
+                                 ;; not whichever stage first consumes them. Node int/long
+                                 ;; specializations remain checked independently at preflight.
+                                 kernel-dtype (or (when (contains? #{:int :long} (:dtype declared))
+                                                   (:dtype declared))
+                                                  (if (= 1 (count physical-types))
+                                                    (first physical-types)
+                                                    (:dtype (first slots))))
                                  logical-dtype (or (:dtype declared)
                                                    (get scalar-types argument)
                                                    kernel-dtype)
@@ -171,4 +176,3 @@
         (assoc-in [:provenance :target-dialect] target-dialect)
         (assoc-in [:attributes :emitted?] true)
         kgraph/validate!)))
-
