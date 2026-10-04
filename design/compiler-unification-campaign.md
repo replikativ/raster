@@ -227,6 +227,16 @@ batch. The coverage fixtures also caught and corrected the shared transposed RHS
 logical shape: `K×N` plus the permutation describes physical `N×K`, rather than applying the
 transpose twice. This changes no surface semantics. Numerical permission remains separate.
 
+Mixed numerical permission now consumes an operational model derived from the independent
+reconstruction and matched to every emitted body, including fused conversions. It records stage
+storage/numerics, actual matrix instruction/tiling, traversal, batching and result transforms.
+Dispatch requires both `:approximate-model` permission and an exact canonical match in the
+ordered `:permitted-models` vector; the default remains the exact portable candidate. An attached
+candidate claim cannot replace rederivation. This is explicit precision-change consent, not a
+universal finite error bound: IEEE half overflow and target-defined instruction exceptional
+values remain visible. Existing refinement metadata's historical `:bounded-error` name does not
+assert a proven finite bound. Public schedule selection and target admission remain next.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

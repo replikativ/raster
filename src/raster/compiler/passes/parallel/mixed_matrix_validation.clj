@@ -2,7 +2,8 @@
   "Exact typed-law and stage reconstruction checks for mixed matrix schedules.
 
    The caller must independently derive the source graph. A narrow direct-matrix write-domain
-   projection is included; composed numerical error bounds and dispatch admission remain separate."
+   projection and closed operational numerical model are included. Finite error bounds,
+   caller permission and hardware/dispatch admission remain separate."
   (:require [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -44,6 +45,30 @@
                         (:body (last stage-bodies))) out)))
       {out (apply launch/product dimensions)})))
 
+(defn- operational-numerical-model
+  [planned stage-bodies]
+  {:kind :mixed-matrix-operational-model :version 1 :mode :approximate-model
+   ;; This records permitted operations, not a universal finite error bound: half overflow
+   ;; and target instruction exceptional values cannot be bounded for arbitrary inputs.
+   :contract (get-in planned [:refinement :numerics])
+   :exceptional-values {:operand-conversion :ieee
+                        :matrix-instruction :target-defined
+                        :scalar-result :target-scalar-contract}
+   :stages
+   (mapv (fn [certificate]
+           (cond-> {:numerics (:numerics certificate)
+                    :storage (mapv #(select-keys % [:kind :dtype :shape :role])
+                                   (get-in certificate [:body :parameters]))}
+             (matrix-stage/matrix-stage? (:source certificate))
+             (assoc :matrix
+                    {:schedule (get-in certificate [:body :schedule])
+                     :dimensions (get-in certificate [:body :attributes :dimension-values])
+                     :iteration-range (get-in certificate [:body :attributes :iteration-range])
+                     :batching (get-in certificate [:source :batching])
+                     :input-value-regions (get-in certificate [:source :input-value-regions])
+                     :result-transform (get-in certificate [:body :attributes :epilogue])})))
+         stage-bodies)})
+
 (defn validate-reconstruction!
   "Check the candidate against the retained algorithm and independently supplied source graph.
 
@@ -62,5 +87,6 @@
                       {:reason :mixed-matrix-reconstruction-graph})))
     (let [stage-bodies (mapv #(body/schedule-for-node % expected) (:nodes expected))]
       (assoc planned :stage-bodies stage-bodies
+             :numerical-model (operational-numerical-model planned stage-bodies)
              :complete-write-domains
              (full-k-write-domains algorithm source facts planned stage-bodies)))))

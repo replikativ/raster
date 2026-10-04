@@ -193,13 +193,14 @@
      :physical-results (physical-results-for-validated-boundary checked)}))
 
 (defn ^:no-doc validate-with-result-contracts
-  "Independently check one candidate and derive its storage and complete-write facts together.
+  "Independently check one candidate and derive storage, writes and any mixed operational model.
    The returned data cannot authorize a later validation; no checked source graph is retained."
   [emitted]
   (let [{:keys [boundary source-graph mixed-reconstruction]} (validation-report emitted)
         algorithm (:algorithm boundary)]
     {:boundary boundary
      :physical-results (physical-results-for-validated-boundary boundary)
+     :numerical-model (:numerical-model mixed-reconstruction)
      :complete-write-domains
      (if (swr/plan? algorithm)
        (complete-write-domains-for-validated-boundary boundary)

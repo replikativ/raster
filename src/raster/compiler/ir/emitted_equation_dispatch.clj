@@ -23,8 +23,10 @@
   (throw (ex-info message (assoc data :reason reason :ir :emitted-equation-dispatch))))
 
 (defn- numerical-mode
-  [candidate]
-  (if (swr/plan? (:algorithm candidate))
+  [candidate report]
+  (if-let [model (:numerical-model report)]
+    (:mode model)
+    (if (swr/plan? (:algorithm candidate))
     (get-in (last (get-in candidate [:body :equations])) [:operations 0 :numerics :mode])
     (let [certificate (get-in candidate [:graph :nodes 0 :operation :provenance
                                          :scheduled-operation])
@@ -37,13 +39,27 @@
         (fail! :equation-dispatch-numerics
                "contraction schedule did not retain its generated numerical mode"
                {:expected expected :actual actual}))
-      actual)))
+      actual))))
+
+(defn- validate-model-pair!
+  [mode report]
+  (let [model (:numerical-model report)]
+    (when-not (if model
+                (and (= :approximate-model mode)
+                     (= :approximate-model (:mode model))
+                     (= :mixed-matrix-operational-model (:kind model))
+                     (= 1 (:version model)))
+                (not= :approximate-model mode))
+      (fail! :equation-dispatch-numerics
+             "approximate numerical modes require a paired reconstructed operational model"
+             {:mode mode :model model}))))
 
 (defn- validation-report
   "Verify every schedule independently and require explicit permission for its numerical mode.
 
-   The reference/default must retain exact evaluation order. A caller may admit reassociation
-   only by naming it in :permitted-modes; the runtime selector cannot enlarge that permission."
+   The reference/default retains exact evaluation order. Reassociation requires :permitted-modes;
+   approximation additionally requires an exact operational model in the ordered :permitted-models
+   vector. The runtime selector cannot enlarge permission, and no universal finite bound is implied."
   [value]
   (when-not (emitted-equation-dispatch? value)
     (fail! :equation-dispatch-type "expected an EmittedEquationDispatch"
@@ -64,14 +80,20 @@
           _ (when-not (every? seq domains)
               (fail! :equation-dispatch-complete-write
                      "each candidate must independently prove its complete-write domain" {}))
-          modes (mapv numerical-mode alternatives)
+          modes (mapv numerical-mode alternatives candidate-reports)
           selection (dispatch/validate! selection)]
+      ;; Permission cannot compensate for a missing or incompatible reconstructed model.
+      (doseq [[mode report] (map vector modes candidate-reports)]
+        (validate-model-pair! mode report))
       (when-not (and (map? numerical-policy)
                      (set? allowed)
                      (contains? allowed :exact)
-                     (every? #{:exact :reassociated} allowed))
+                     (every? #{:exact :reassociated :approximate-model} allowed)
+                     (or (not (contains? allowed :approximate-model))
+                         (and (vector? (:permitted-models numerical-policy))
+                              (seq (:permitted-models numerical-policy)))))
         (fail! :equation-dispatch-numerical-policy
-               "dispatch requires an explicit exact/reassociated numerical permission set"
+               "dispatch requires explicit numerical permissions and models for approximate candidates"
                {:policy numerical-policy}))
       ;; Generated kernels may contain NaN literals. Clojure structural equality cannot compare
       ;; independently decoded copies of those graphs, even when their floating-point bits match.
@@ -99,6 +121,16 @@
         (fail! :equation-dispatch-numerics
                "candidate numerical mode is not authorized by the equation policy"
                {:modes modes :permitted-modes allowed}))
+      ;; Ordered models avoid Clojure set equality collapsing floating-point bit distinctions.
+      ;; These reports were independently reconstructed and matched to every actual artifact.
+      (doseq [report candidate-reports
+              :let [model (:numerical-model report)]
+              :when model]
+        (when-not (some #(semantic-fingerprint/equivalent? model %)
+                        (:permitted-models numerical-policy))
+          (fail! :equation-dispatch-numerics
+                 "candidate operational numerical model is not explicitly permitted"
+                 {:model model})))
       (let [default-graph (dispatch/default-alternative selection)
             default-index (first (keep-indexed
                                   (fn [index candidate]

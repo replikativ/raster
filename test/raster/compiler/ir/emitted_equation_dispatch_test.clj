@@ -51,6 +51,21 @@
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
 
+(deftest approximate-modes-require-paired-reconstructed-models
+  (let [check (ns-resolve 'raster.compiler.ir.emitted-equation-dispatch
+                         'validate-model-pair!)
+        model {:kind :mixed-matrix-operational-model :version 1
+               :mode :approximate-model}]
+    (doseq [mode [:exact :reassociated]]
+      (is (nil? (check mode {})))
+      (is (= :equation-dispatch-numerics
+             (reason #(check mode {:numerical-model model})))))
+    (is (nil? (check :approximate-model {:numerical-model model})))
+    (doseq [report [{} {:numerical-model (assoc model :mode :exact)}
+                       {:numerical-model (assoc model :version 2)}]]
+      (is (= :equation-dispatch-numerics
+             (reason #(check :approximate-model report)))))))
+
 (defn- contraction-candidates
   [reference-compilation]
   ;; Both emissions refine one retained semantic spine. Re-running the frontend produces fresh
