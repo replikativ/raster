@@ -170,7 +170,7 @@
 
    This stronger query is for dispatch certification, not a replacement for ordinary SOAC
    initialization analysis. It reconstructs from the retained algorithm and source graph;
-   Direct nonbatched mixed graphs share the generated matrix topology proof; split-K and other
+   Direct and full-K leading-batch mixed graphs share the generated matrix topology proof; split-K and other
    storage/schedule families still decline. Numerical and target admission remain separate."
   [emitted]
   (let [{:keys [boundary source-graph mixed-reconstruction]} (validation-report emitted)]

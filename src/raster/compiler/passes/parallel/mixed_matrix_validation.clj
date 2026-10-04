@@ -14,7 +14,7 @@
             [raster.compiler.passes.parallel.mixed-matrix-schedule :as schedule]
             [raster.compiler.passes.parallel.typed-contraction-context :as context]))
 
-(defn- direct-write-domains
+(defn- full-k-write-domains
   [algorithm source facts planned stage-bodies]
   (let [out (:out facts)
         value (get-in (soac/facts algorithm) [:values out])
@@ -29,7 +29,7 @@
         dimensions (mapv second (:free-axes facts))]
     (when (and (= :float (:dtype facts)) (= :float (:dtype value))
                (closure/plain-storage? value)
-               (= 2 (count dimensions))
+               (contains? #{2 3} (count dimensions))
                (= [out] (mapv :id (:outputs source)))
                (not-any? #(= out (:id %)) (:inputs source))
                (= [terminal] writers)
@@ -38,7 +38,10 @@
                (= out (:result operation))
                (= dimensions (:result-shape operation))
                (= dimensions
-                  (get (matrix-plan/dense-result-write-domain (:body (last stage-bodies))) out)))
+                  (get ((if (= 3 (count dimensions))
+                          matrix-plan/leading-batch-result-write-domain
+                          matrix-plan/dense-result-write-domain)
+                        (:body (last stage-bodies))) out)))
       {out (apply launch/product dimensions)})))
 
 (defn validate-reconstruction!
@@ -60,4 +63,4 @@
     (let [stage-bodies (mapv #(body/schedule-for-node % expected) (:nodes expected))]
       (assoc planned :stage-bodies stage-bodies
              :complete-write-domains
-             (direct-write-domains algorithm source facts planned stage-bodies)))))
+             (full-k-write-domains algorithm source facts planned stage-bodies)))))

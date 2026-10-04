@@ -475,31 +475,61 @@
                       :rhs (some-> rhs-storage :view :element-offset)
                       :result (some-> out-storage :view :element-offset)}}))
 
-(defn dense-result-write-domain
-  "Prove full dense result coverage for the direct 2D matrix schedule subset.
-
-   Analyze actual fragments, stores, coordinates and masks first. The explicit launch must
-   cover the complete M/N grid; a matching workgroup topology alone is insufficient. This v1
-   projection declines sliced K, batches, result views and non-FP32/write-only results. It
-   proves storage coverage, not arithmetic equivalence or hardware/numerical admission."
-  [kernel-body]
+(defn- full-k-result-partition
+  [plan]
   (let [{:keys [dimension-parameters dimension-values block-m block-n sg-m sg-n
-                ni subgroup group-z k-lower k-upper] :as plan} (analyze kernel-body)
+                ni subgroup k-lower k-upper]} plan
         {:keys [m n k]} dimension-parameters
         result (first (filter #(= :result (:role %)) (:parameters plan)))
-        geometry [block-m block-n sg-m sg-n]
-        output-shape (mapv dimension-values [m n])]
+        geometry [block-m block-n sg-m sg-n]]
     (when (and (= :output (:kind result)) (= :float (:dtype result))
                (every? #(contains? dimension-values %) [m n k])
-               (nil? group-z)
-               (not-any? #(= (:id result) (:buffer %)) (:views kernel-body))
                (every? #(and (integer? %) (pos? %)) geometry)
                (zero? (mod block-m sg-m)) (zero? (mod block-n sg-n))
                ;; The currently proved direct store distribution owns one column per lane.
                (= ni subgroup)
                (= 0 (mathematical-index k-lower))
-               (= k (mathematical-index k-upper))
-               (= [(launch/ceil-div (launch/runtime-value n) block-n)
-                   (launch/ceil-div (launch/runtime-value m) block-m)]
+               (= k (mathematical-index k-upper)))
+      {:result result :slice-shape [m n]
+       :logical-shape (mapv dimension-values [m n])
+       :groups [(launch/ceil-div (launch/runtime-value n) block-n)
+                (launch/ceil-div (launch/runtime-value m) block-m)]})))
+
+(defn dense-result-write-domain
+  "Prove full dense result coverage for the direct 2D matrix schedule subset.
+
+   Analyze actual fragments, stores, coordinates and masks first. Require the complete M/N
+   grid, full K, no result view and a write-only FP32 result. This proves storage coverage,
+   not arithmetic equivalence or hardware/numerical admission."
+  [kernel-body]
+  (let [plan (analyze kernel-body)
+        {:keys [result logical-shape groups]} (full-k-result-partition plan)]
+    (when (and result (nil? (:group-z plan))
+               (not-any? #(= (:id result) (:buffer %)) (:views kernel-body))
+               (= groups (get-in plan [:launch :group-count])))
+      {(:id result) logical-shape})))
+
+(defn leading-batch-result-write-domain
+  "Compose the proved full-K matrix slice partition over a verified leading batch view.
+
+   KernelBody validates the contiguous launch-bounded slice. Require its exact group-axis-2
+   offset, parent row-major result and 3D grid here; input sharing does not change coverage."
+  [kernel-body]
+  (let [plan (analyze kernel-body)
+        {:keys [result slice-shape logical-shape groups]} (full-k-result-partition plan)
+        z (:group-z plan)
+        result-views (filterv #(= (:id result) (:buffer %)) (:views kernel-body))
+        view (first result-views)
+        batch (first (:shape result))
+        z-bindings (filterv #(and (record-kind? "IndexBinding" %)
+                                 (= :group (:source %)) (= 2 (:axis %)))
+                           (:indices kernel-body))]
+    (when (and result z (= 1 (count z-bindings)) (= 1 (count result-views))
+               (= (:id view) (get-in kernel-body [:attributes :operation-buffers :out]))
+               (= (into [batch] slice-shape) (:shape result))
+               (= (layout/row-major (:shape result) :float) (:layout result))
+               (= slice-shape (:shape view))
+               (= (body/leading-slice-offset z slice-shape) (:element-offset view))
+               (= (conj groups (launch/runtime-value batch))
                   (get-in plan [:launch :group-count])))
-      {(:id result) output-shape})))
+      {(:id result) (into [batch] logical-shape)})))

@@ -8,6 +8,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.mixed-matrix-body :as mixed-body]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
 
 (defn- matrix-body
@@ -166,3 +167,45 @@
                          (assoc node field (if (= field :coordinates) [0 0] :tile-active)) node))
                      kernel)))
           "actual stores and masks must preserve the complete fragment partition"))))
+
+(deftest leading-batch-writes-compose-the-verified-slice-partition
+  (let [spec {:id :batch-write-domain :a 'a :b 'b :c 'c
+              :m 'm :n 'n :k 'k :batch 'batch :tile (hardware/derive-gemm-tile {})}
+        make-kernel (fn [batching transposed?]
+                      (mixed-body/scheduled-matrix-body
+                       (mixed-body/batched-matrix-spec
+                        (cond-> (assoc spec :batching batching)
+                          transposed? (assoc :input-layouts
+                                             {'b (assoc (layout/row-major '[K N] :half)
+                                                        :perm [1 0])})))))
+        kernel (make-kernel {:row true :col true} false)]
+    (doseq [batching [{:row true :col true} {:row false :col true} {:row true :col false}]
+            transposed? [false true]]
+      (is (= {'c '[batch m n]}
+             (matrix-plan/leading-batch-result-write-domain (make-kernel batching transposed?)))
+          "sharing or transposing inputs does not alter parent result coverage"))
+    (is (nil? (matrix-plan/dense-result-write-domain kernel))
+        "the ordinary 2D query cannot erase a leading batch")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (matrix-plan/leading-batch-result-write-domain
+                  (assoc-in kernel [:launch :group-count 2] 1)))
+        "the slice extent must agree with the complete group-z launch")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (matrix-plan/leading-batch-result-write-domain
+                  (update kernel :views
+                          (fn [views]
+                            (mapv #(if (= 'c (:buffer %))
+                                     (update % :element-offset
+                                             (fn [offset] (body/expression :add offset 1))) %)
+                                  views)))))
+        "a shifted result slice cannot borrow the contiguous partition proof")
+    (is (nil? (matrix-plan/leading-batch-result-write-domain
+               (update kernel :parameters
+                       (fn [parameters]
+                         (mapv #(if (= :result (:role %))
+                                  (assoc-in % [:layout :perm] [0 2 1]) %) parameters)))))
+        "the parent result must retain its proved row-major layout")
+    (let [split (mixed-body/scheduled-matrix-body
+                 (mixed-body/split-k-matrix-spec (assoc spec :kc :kc :splits :splits)))]
+      (is (nil? (matrix-plan/leading-batch-result-write-domain split))
+          "a reduction partition is not an independent full-K batch"))))
