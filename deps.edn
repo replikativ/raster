@@ -1,4 +1,7 @@
 {:paths ["src"]
+ ;; Use the official Apache endpoint after repeated repo1.maven.org HTTP 429s in CI.
+ ;; The repository id and artifact coordinates are unchanged; Clojars remains a default repo.
+ :mvn/repos {"central" {:url "https://repo.maven.apache.org/maven2/"}}
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/data.json {:mvn/version "2.5.1"}
         org.typedclojure/typed.clj.checker {:mvn/version "1.4.0"}
