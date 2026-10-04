@@ -1441,13 +1441,15 @@
         (is (= :none (:fallback (ex-data exception))))))))
 
 (deftest matrix-graphs-preserve-public-order-independent-of-operand-order
-  (doseq [batched? [false true]]
-    (let [contract (if batched?
-                     '(raster.par/contract C [[b batch] [i m] [j n]] [[l k]]
-                        (* (aget z (+ (* (+ (* b m) i) k) l))
-                           (aget a (+ (* l n) j))))
-                     '(raster.par/contract C [[i m] [j n]] [[l k]]
-                        (* (aget z (+ (* i k) l)) (aget a (+ (* l n) j)))))
+  (doseq [batched? [false true] transposed? [false true]]
+    (let [contract (list 'raster.par/contract 'C
+                         (if batched? '[[b batch] [i m] [j n]] '[[i m] [j n]])
+                         '[[l k]]
+                         (list '*
+                               (if batched? '(aget z (+ (* (+ (* b m) i) k) l))
+                                   '(aget z (+ (* i k) l)))
+                               (if transposed? '(aget a (+ (* j k) l))
+                                   '(aget a (+ (* l n) j)))))
           {:keys [form]} (pipeline/schedule-parallel-form
                           (list 'let* ['step contract] 'step)
                           {:target-device :ze:0 :dtype :float
@@ -1484,9 +1486,19 @@
                                                  (kernel-graph/boundary-contract source)))
                   public-plan (mixed-validation/validate-reconstruction!
                                (-> form :equations first :algorithm) source candidate)]
-              (is (= (when (and (not batched?) (= strategy :xmx-direct))
-                       {'C (kernel-launch/product 'm 'n)})
+              (is (= (when-not (= strategy :xmx-split-k)
+                       {'C (if batched? (kernel-launch/product 'batch 'm 'n)
+                               (kernel-launch/product 'm 'n))})
                      (:complete-write-domains public-plan)))
+              (when batched?
+                (let [emitted (gpu-gemm/emit-scheduled-stage-graph
+                               (:graph public-plan) {:refinement (:refinement public-plan)})
+                      body (:body (equation-graph/make-for-equation form (first (:equations form))))
+                      checked (emitted-equation/make
+                               (-> form :equations first :algorithm) body emitted
+                               {:refinement (:refinement public-plan)})]
+                  (is (= {'C (kernel-launch/product 'batch 'm 'n)}
+                         (emitted-equation/contraction-write-domains checked)))))
               (is (= (kernel-graph/boundary-contract source)
                      (kernel-graph/boundary-contract (:graph public-plan)))))
             (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))

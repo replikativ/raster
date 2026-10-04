@@ -220,6 +220,13 @@ Changed stores/masks/launches cannot borrow a matching stage source's proof. Spl
 batched result views, composed numerical permission and public mixed dispatch remain separate
 follow-ups. Static empty KernelBody storage still rejects under its existing shape contract.
 
+Full-K leading-batch results now compose the same per-slice store partition over the verified
+contiguous `[B,M,N]` parent/view contract and exact group-axis-2 launch. NN/NT and either shared
+input reuse this proof; split-K remains a reduction-composition follow-up, not an independent
+batch. The coverage fixtures also caught and corrected the shared transposed RHS's internal
+logical shape: `K×N` plus the permutation describes physical `N×K`, rather than applying the
+transpose twice. This changes no surface semantics. Numerical permission remains separate.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

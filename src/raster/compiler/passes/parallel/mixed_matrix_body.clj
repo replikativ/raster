@@ -108,7 +108,10 @@
         a-shape (if row-batched? [batch M K] [M K])
         b-shape (if col-batched?
                   (if col-transposed? [batch N K] [batch K N])
-                  (if col-transposed? [N K] [K N]))
+                  ;; The shared parameter retains its logical K/N shape; its permutation
+                  ;; already describes the physical N/K storage. Batched parents instead use
+                  ;; physical slice shape because the logical permutation lives on the view.
+                  [K N])
         buffer-views
         (cond-> [{:id c-view :buffer c
                   :element-offset (kbody/leading-slice-offset z [M N]) :shape [M N]}]
