@@ -93,6 +93,16 @@ Reusing the existing Gemma compilation, the large public plan lowers in 14.1 sec
 123 tensor calls, all 50 mixed selections and zero driver allocations. This is a local diagnostic
 observation under changing background/JIT conditions, not native or controlled performance data.
 
+The existing mixed Gemma trajectory fixture is being migrated to public lowering and replay,
+with donated adapters, shared constant weights and fixed-graph binding evidence. All 50 eligible
+dispatch equations must select mixed execution; filtering only already-mixed selections would
+hide fallback regressions. This remains in progress: pure public lowering exceeded a 590-second
+local check budget. Stack samples show repeated semantic fingerprint/source-ABI validation and
+equation reconstruction under `invocation-link/lower`'s buffer-by-equation boundary scans. The
+compile-only result above remains valid; lowering latency and native trajectory acceptance do
+not. Consolidate unchanged boundary inspection within one lowering invocation, preserving all
+runtime checks and exact-owner validation, before repeating the large integration check.
+
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
 the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule
