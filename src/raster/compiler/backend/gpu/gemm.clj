@@ -29,6 +29,7 @@
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]
+            [raster.compiler.passes.parallel.mixed-matrix-candidate :as mixed-candidate]
             [raster.compiler.passes.parallel.mixed-matrix-body :as mixed-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
 
@@ -454,19 +455,7 @@
    lowering rows over the same typed contraction; an arbitrary `:matrix` capability must never be
    emitted with Intel DPAS source."
   [desc requested-tile]
-  (let [{:keys [family m n k subgroup]} (:matrix desc)
-        backend (:backend desc)]
-    (when (and (contains? #{:ze :ocl :opencl} backend)
-               (= :dpas family) (= [8 16 16] [m n k])
-               (= 16 subgroup)
-               (contains? (hardware/supported-subgroup-sizes desc) (long subgroup)))
-      (let [tile (or requested-tile (hardware/gemm-tile-for desc))
-            workgroup-size (* (quot (:block-m tile) (:sg-m tile))
-                              (quot (:block-n tile) (:sg-n tile))
-                              subgroup)]
-        {:tile tile
-         :fill-workgroups (hardware/fill-workgroups desc workgroup-size)
-         :matrix (:matrix desc)}))))
+  (mixed-candidate/target-schedule desc requested-tile))
 
 (defn- validate-split-factors!
   [split-factors]

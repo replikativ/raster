@@ -66,7 +66,7 @@
   (contains? lowered-matrix-instructions
              (select-keys matrix [:family :m :n :k :subgroup])))
 
-(defn- tile-valid?
+(defn ^:no-doc matrix-tile-valid?
   [{:keys [block-m block-n block-k sg-m sg-n matrix num-stages]}]
   (let [{:keys [m n k subgroup]} matrix
         num-stages (or num-stages 3)]
@@ -465,7 +465,7 @@
        (not (lowered-matrix-instruction? matrix))
        (decline :matrix-instruction-not-lowered {:matrix matrix})
 
-       (not (tile-valid? tile))
+       (not (matrix-tile-valid? tile))
        (throw (ex-info "matrix schedule tile is not divisible or contains an invalid extent"
                        {:reason :raster/bug :tile tile}))
 
