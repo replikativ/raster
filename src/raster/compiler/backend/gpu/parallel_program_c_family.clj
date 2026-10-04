@@ -7,6 +7,7 @@
    KernelBody source dialect boundary."
   (:require [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
+            [raster.compiler.backend.gpu.gemm :as matrix-emission]
             [raster.compiler.backend.gpu.segop-opencl :as segop-emission]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -21,6 +22,7 @@
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.mixed-matrix-candidate :as mixed-candidate]
             [raster.compiler.passes.parallel.product-consumer-region :as product-consumer-region]
             [raster.compiler.passes.parallel.product-consumer-route :as product-consumer-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
@@ -85,6 +87,43 @@
                              (assoc-in [:attributes :strategy] :register-tiled))
                          {:provenance (:provenance reference)})]
           {:ok true :candidate candidate})))))
+
+(defn emit-mixed-contraction-alternative
+  "Emit one explicitly requested full-K mixed candidate from a certified public equation.
+
+   This does not select or authorize approximation. Dispatch admission must consent to the
+   independently reconstructed numerical model and retain the exact portable fallback."
+  [reference {:keys [target-descriptor target-dialect schedule]
+              :or {target-dialect :opencl-intel}}]
+  (cond
+    (not= :opencl-intel (:id (c-dialect/resolve! target-dialect)))
+    {:ok false :reason :mixed-matrix-target-dialect}
+    (not (emitted-equation/contraction-write-domains reference))
+    {:ok false :reason :not-single-plain-fp32-contraction}
+    :else
+    (let [algorithm (:algorithm reference)
+          source (equation-graph/make algorithm (:body reference))
+          planned (mixed-candidate/plan
+                   algorithm source target-descriptor
+                   (merge (select-keys schedule [:precision])
+                          (select-keys (:typed-contraction schedule) [:tile :input-fusion])))]
+      (if-not (:ok planned)
+        planned
+        (let [emitted (matrix-emission/emit-scheduled-stage-graph
+                       (:graph planned)
+                       {:target-dialect target-dialect
+                        :prefix (str (get-in reference [:graph :nodes 0 :operation :kernel-name])
+                                     "_mixed")
+                        :refinement (:refinement planned)})
+              candidate (emitted-equation/make
+                         algorithm (:body reference) emitted
+                         {:refinement (:refinement planned)
+                          :provenance (:provenance reference)})
+              report (emitted-equation/validate-with-result-contracts candidate)]
+          (if-not (seq (:complete-write-domains report))
+            {:ok false :reason :mixed-matrix-complete-write}
+            {:ok true :candidate candidate :numerical-model (:numerical-model report)
+             :target-schedule (:target-schedule planned)}))))))
 
 (defn- target-program-dialect
   [target-dialect]

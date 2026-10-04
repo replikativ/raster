@@ -28,6 +28,7 @@
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]
+            [raster.compiler.passes.parallel.mixed-matrix-candidate :as mixed-candidate]
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -1491,6 +1492,19 @@
                                (kernel-launch/product 'm 'n))})
                      (:complete-write-domains public-plan)))
               (when batched?
+                (let [descriptor {:backend :ze :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                                  :execution {:subgroup-sizes #{16} :max-workgroup-size 1024}
+                                  :grf-bytes-per-lane 256 :machine-lanes 8192}
+                      algorithm (-> form :equations first :algorithm)
+                      fused (mixed-candidate/plan algorithm source descriptor
+                                                  {:precision :mixed-f16-f32})]
+                  (is (:ok fused))
+                  (is (= :batched-tile-casts
+                         (get-in fused [:refinement :schedule :input-fusion])))
+                  (is (= :mixed-matrix-batched-fusion-policy
+                         (:reason (mixed-candidate/plan
+                                   algorithm source descriptor
+                                   {:precision :mixed-f16-f32 :input-fusion :materialized})))))
                 (let [emitted (gpu-gemm/emit-scheduled-stage-graph
                                (:graph public-plan) {:refinement (:refinement public-plan)})
                       body (:body (equation-graph/make-for-equation form (first (:equations form))))
@@ -1611,6 +1625,55 @@
                  (kdispatch/alternative-strategy
                   (kdispatch/select-alternative dispatch
                                                 [:a :b :c m n k])))]
+    (let [options {:target-descriptor descriptor :target-dialect :opencl-intel
+                   :schedule {:precision :mixed-f16-f32}}
+          planned (c-family/emit-mixed-contraction-alternative reference options)]
+      (is (:ok planned))
+      (is (= :approximate-model (get-in planned [:numerical-model :mode])))
+      (is (= (emitted-equation/contraction-write-domains reference)
+             (emitted-equation/contraction-write-domains (:candidate planned))))
+      (is (= (:arguments (:graph reference))
+             (get-in planned [:candidate :graph :arguments])))
+      (is (identical? (get-in planned [:candidate :graph])
+                      (kernel-graph-call/preflight! (get-in planned [:candidate :graph])
+                                                   {'m {:type :int :value 64}
+                                                    'n {:type :int :value 64}
+                                                    'k {:type :int :value 64}})))
+      (is (= :kernel-precondition-failed
+             (try (kernel-graph-call/preflight! (get-in planned [:candidate :graph])
+                                                {'m {:type :int :value 64}
+                                                 'n {:type :int :value 64}
+                                                 'k {:type :int :value 63}})
+                  :accepted
+                  (catch clojure.lang.ExceptionInfo exception
+                    (:reason (ex-data exception))))))
+      (is (= :mixed-precision-contraction
+             (get-in planned [:candidate :refinement :schedule :kind])))
+      (is (= :emitted-parallel-equation-dataflow
+             (try (emitted-equation/validate! (assoc (:candidate planned) :refinement nil))
+                  :accepted
+                  (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception))))))
+      (doseq [dialect [:cuda :hip :opencl-portable]]
+        (is (= :mixed-matrix-target-dialect
+               (:reason (c-family/emit-mixed-contraction-alternative
+                         reference (assoc options :target-dialect dialect))))))
+      (doseq [bad-tile [(assoc (hardware/gemm-tile-for descriptor) :sg-m 0)
+                       (assoc-in (hardware/gemm-tile-for descriptor) [:matrix :family] :mma)
+                       (assoc (hardware/gemm-tile-for descriptor) :block-m 65536)]]
+        (is (= :mixed-matrix-target-capability
+               (:reason (c-family/emit-mixed-contraction-alternative
+                         reference (assoc-in options [:schedule :typed-contraction :tile]
+                                             bad-tile))))))
+      (is (= :matrix-numerical-policy
+             (:reason (c-family/emit-mixed-contraction-alternative
+                       reference (assoc-in options [:schedule :precision] :f32)))))
+      (is (= :mixed-matrix-target-capability
+             (:reason (c-family/emit-mixed-contraction-alternative
+                       reference (assoc-in options [:target-descriptor :backend] :cuda)))))
+      (is (= :mixed-matrix-input-fusion-policy
+             (:reason (c-family/emit-mixed-contraction-alternative
+                       reference (assoc-in options [:schedule :typed-contraction :input-fusion]
+                                           :invented))))))
     (is (= [:regtiled :portable-segred :xmx-direct :xmx-split-k
             :xmx-direct-dynamic-lhs :xmx-direct-tile-inputs]
            strategies))

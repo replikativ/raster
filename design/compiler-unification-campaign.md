@@ -22,6 +22,22 @@ notes retain the wider campaign and its implementation history.
 
 ## Current eight-item checkpoint — 2026-10-02
 
+### October 4 public mixed-matrix admission slice
+
+The next equation-first candidate constructor derives a full-K mixed schedule from the retained
+typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
+the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule
+owner checks descriptor/instruction agreement, divisible positive geometry and normalized
+workgroup limits. The first row admits Intel DPAS with Intel OpenCL only, Int dimensions,
+materialized dense storage or NN/NT tile-input fusion, and fused leading-batch slices. Unsupported
+batched materialization, targets, layouts and precision policies return explicit declines.
+
+This constructor is not numerical permission or public runtime selection. Every emitted artifact
+still passes reconstruction, ordered ABI and complete-write checks, and physical scalar guards
+remain enforced by graph preflight before allocation. Explicit public dispatch consent, retained
+selection evidence and the Gemma training trajectory remain the next gates. Automatic defaults,
+split-K coverage, external training and distributed/multilevel acceptance are not completed here.
+
 ### October 3 runtime/state integration update
 
 This update supersedes the producer-integration gaps below only for the specifically validated
