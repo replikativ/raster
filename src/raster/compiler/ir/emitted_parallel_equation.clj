@@ -147,31 +147,34 @@
     (complete-write-domains-for-validated-boundary (validate! emitted))))
 
 (defn- contraction-write-domains-for-validated-boundary
-  [boundary source-graph]
-  (let [{:keys [algorithm refinement graph]} boundary]
-    (when (and (soac/program-form? algorithm)
-               (= 1 (count (soac/equations algorithm)))
-               (contains? '#{contract segmented-reduce}
-                          (soac/operation-kind (first (soac/equations algorithm))))
-               (nil? refinement) (= 1 (count (:nodes graph))))
-      (let [source source-graph
-            node (first (:nodes source))
-            certificate (get-in graph [:nodes 0 :operation :provenance :scheduled-operation])]
-        (when (and (= 1 (count (:nodes source)))
-                   (= :contraction (get-in node [:operation :phase]))
-                   (= :float (get-in node [:operation :dtype]))
-                   (scheduled-body/scheduled-kernel-body? certificate))
-          (contraction-schedule/complete-write-domain algorithm node source certificate))))))
+  [boundary source-graph mixed]
+  (if mixed
+    (:complete-write-domains mixed)
+    (let [{:keys [algorithm refinement graph]} boundary]
+      (when (and (soac/program-form? algorithm)
+                 (= 1 (count (soac/equations algorithm)))
+                 (contains? '#{contract segmented-reduce}
+                            (soac/operation-kind (first (soac/equations algorithm))))
+                 (nil? refinement) (= 1 (count (:nodes graph))))
+        (let [source source-graph
+              node (first (:nodes source))
+              certificate (get-in graph [:nodes 0 :operation :provenance :scheduled-operation])]
+          (when (and (= 1 (count (:nodes source)))
+                     (= :contraction (get-in node [:operation :phase]))
+                     (= :float (get-in node [:operation :dtype]))
+                     (scheduled-body/scheduled-kernel-body? certificate))
+            (contraction-schedule/complete-write-domain algorithm node source certificate)))))))
 
 (defn contraction-write-domains
-  "Candidate-specific coverage for a single plain FP32 contraction leaf.
+  "Candidate-specific coverage for plain FP32 contraction results.
 
    This stronger query is for dispatch certification, not a replacement for ordinary SOAC
    initialization analysis. It reconstructs from the retained algorithm and source graph;
-   compound/refined graphs, other storage representations and other schedule families decline."
+   Direct nonbatched mixed graphs share the generated matrix topology proof; split-K and other
+   storage/schedule families still decline. Numerical and target admission remain separate."
   [emitted]
-  (let [{:keys [boundary source-graph]} (validation-report emitted)]
-    (contraction-write-domains-for-validated-boundary boundary source-graph)))
+  (let [{:keys [boundary source-graph mixed-reconstruction]} (validation-report emitted)]
+    (contraction-write-domains-for-validated-boundary boundary source-graph mixed-reconstruction)))
 
 (defn- physical-results-for-validated-boundary
   [{:keys [algorithm body]}]
@@ -193,14 +196,14 @@
   "Independently check one candidate and derive its storage and complete-write facts together.
    The returned data cannot authorize a later validation; no checked source graph is retained."
   [emitted]
-  (let [{:keys [boundary source-graph]} (validation-report emitted)
+  (let [{:keys [boundary source-graph mixed-reconstruction]} (validation-report emitted)
         algorithm (:algorithm boundary)]
     {:boundary boundary
      :physical-results (physical-results-for-validated-boundary boundary)
      :complete-write-domains
      (if (swr/plan? algorithm)
        (complete-write-domains-for-validated-boundary boundary)
-       (contraction-write-domains-for-validated-boundary boundary source-graph))}))
+       (contraction-write-domains-for-validated-boundary boundary source-graph mixed-reconstruction))}))
 
 (defn physical-results
   "Project logical results to physical storage from the retained, validated semantic equation."

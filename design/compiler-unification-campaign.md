@@ -212,6 +212,14 @@ the GPU backend. All three target-emission consumers reuse that owner. This mech
 prepares complete-write validation to share the same fragment/store/mask analysis without a
 proof-to-backend dependency; it introduces no new accepted schedules or numerical claims.
 
+The first mixed complete-write projection is deliberately direct, nonbatched and full-K only.
+It reuses the shared matrix topology analyzer, checks the exact two-dimensional group count,
+and joins the generated terminal/unique writer to the authoritative plain FP32 result. Its
+domain is the retained free-axis product; public buffer overprovisioning does not enlarge it.
+Changed stores/masks/launches cannot borrow a matching stage source's proof. Split-K combination,
+batched result views, composed numerical permission and public mixed dispatch remain separate
+follow-ups. Static empty KernelBody storage still rejects under its existing shape contract.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

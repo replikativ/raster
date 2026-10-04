@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-route-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
@@ -8,6 +9,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -1482,6 +1484,9 @@
                                                  (kernel-graph/boundary-contract source)))
                   public-plan (mixed-validation/validate-reconstruction!
                                (-> form :equations first :algorithm) source candidate)]
+              (is (= (when (and (not batched?) (= strategy :xmx-direct))
+                       {'C (kernel-launch/product 'm 'n)})
+                     (:complete-write-domains public-plan)))
               (is (= (kernel-graph/boundary-contract source)
                      (kernel-graph/boundary-contract (:graph public-plan)))))
             (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))
@@ -1634,8 +1639,38 @@
                   checked (emitted-equation/make
                            algorithm body emitted {:refinement (:refinement public-plan)})]
               (is (emitted-equation/emitted-equation? checked))
-              (is (nil? (emitted-equation/contraction-write-domains checked))
-                  "artifact reconstruction alone cannot authorize complete writes or dispatch")
+              (is (= (when-not (= strategy :xmx-split-k)
+                       {'C (kernel-launch/product 'm 'n)})
+                     (emitted-equation/contraction-write-domains checked))
+                  "direct matrix stores cover the logical result; split-K requires a separate proof")
+              (when-not (= strategy :xmx-split-k)
+                (let [selection (kdispatch/make
+                                 {:id "mixed-coverage-is-not-numerical-permission"
+                                  :alternatives [emitted]
+                                  :default-strategy (kdispatch/alternative-strategy emitted)
+                                  :selector {:kind :fixed-strategy
+                                             :strategy (kdispatch/alternative-strategy emitted)}})]
+                  (try
+                    (equation-dispatch/make [checked] selection
+                                           {:permitted-modes #{:exact :reassociated}})
+                    (is false "complete stores do not authorize mixed arithmetic")
+                    (catch clojure.lang.ExceptionInfo exception
+                      (is (= :equation-dispatch-numerics (:reason (ex-data exception))))))))
+              (let [matrix-index (first (keep-indexed
+                                        (fn [index node]
+                                          (when (matrix-stage/matrix-stage? (:operation node)) index))
+                                        (get-in public-plan [:graph :nodes])))
+                    forged (update-in emitted
+                                      [:nodes matrix-index :operation :provenance
+                                       :scheduled-operation :body]
+                                      #(walk/postwalk
+                                        (fn [node]
+                                          (if (instance? raster.compiler.ir.kernel_body.TileStore node)
+                                            (assoc node :coordinates [0 0]) node)) %))]
+                (is (thrown? clojure.lang.ExceptionInfo
+                             (emitted-equation/contraction-write-domains
+                              (assoc checked :graph forged)))
+                    "a real changed store cannot borrow the unchanged stage's coverage"))
               (try
                 (emitted-equation/make
                  algorithm body
@@ -1675,6 +1710,21 @@
                 (is false "matching source/candidate boundaries cannot waive storage requirements")
                 (catch clojure.lang.ExceptionInfo exception
                   (is (= :mixed-matrix-public-storage (:reason (ex-data exception)))))))
+            (let [source (-> public-source
+                             (assoc-in [:outputs 0 :elements] 'output-capacity)
+                             (update :scalars conj (kernel-graph/scalar 'output-capacity :int))
+                             (assoc :preconditions
+                                    [{:expression 'output-capacity :op :>=
+                                      :value (get-in public-source [:outputs 0 :elements])}]))
+                  guarded (mixed-validation/validate-reconstruction!
+                           algorithm source
+                           (assoc public-candidate :source source
+                                  :graph (merge (:graph public-candidate)
+                                                (kernel-graph/boundary-contract source))))]
+              (is (= (when-not (= strategy :xmx-split-k)
+                       {'C (kernel-launch/product 'm 'n)})
+                     (:complete-write-domains guarded))
+                  "a guarded output capacity cannot enlarge the logical write domain"))
             (let [source (-> public-source
                              (assoc-in [:inputs 0 :elements] 'capacity)
                              (update :scalars conj (kernel-graph/scalar 'capacity :int))

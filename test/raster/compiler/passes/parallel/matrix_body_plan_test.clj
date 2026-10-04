@@ -7,6 +7,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]))
 
 (defn- matrix-body
@@ -118,3 +119,50 @@
       (catch clojure.lang.ExceptionInfo exception
         (is (= :kernel-body-opencl-unimplemented (:reason (ex-data exception))))
         (is (= :mma (get-in (ex-data exception) [:instruction :family])))))))
+
+(deftest direct-matrix-write-coverage-checks-the-complete-launch-and-storage
+  (let [make-kernel (fn [dimensions]
+                      (schedule/matrix-body
+                       {:id :matrix-write-domain :row 'a :col 'b :out 'c
+                        :dimensions dimensions :result-dtype :float
+                        :tile (hardware/derive-gemm-tile {})}))
+        kernel (make-kernel '[m n k])]
+    (is (thrown? clojure.lang.ExceptionInfo (make-kernel [0 0 0]))
+        "static empty storage remains outside the existing KernelBody contract")
+    (doseq [dimensions [[65 79 64] '[m n k]]]
+      (is (= {'c (subvec (vec dimensions) 0 2)}
+             (matrix-plan/dense-result-write-domain (make-kernel dimensions)))
+          "partial tiles retain logical coverage, not rounded buffer capacity"))
+    (doseq [counts [[1 1]
+                    (vec (reverse (get-in kernel [:launch :group-count])))
+                    [(launch/ceil-div (launch/runtime-value 'N) 256)
+                     (second (get-in kernel [:launch :group-count]))]]]
+      (is (nil? (matrix-plan/dense-result-write-domain
+                 (assoc-in kernel [:launch :group-count] counts)))
+          "workgroup topology alone does not prove the complete grid"))
+    (let [result (first (filter #(= :result (:role %)) (:parameters kernel)))
+          view (body/->BufferView 'c-view 'c (body/index-cast 0 :long :exact)
+                                 (:shape result) (:layout result))]
+      (is (thrown? clojure.lang.ExceptionInfo (matrix-plan/dense-result-write-domain
+                 (-> kernel
+                     (assoc :views [view])
+                     (assoc-in [:attributes :operation-buffers :out] 'c-view)
+                     (update :operations
+                             #(walk/postwalk (fn [node]
+                                               (if (instance? raster.compiler.ir.kernel_body.TileStore node)
+                                                 (assoc node :buffer 'c-view) node)) %)))))
+          "even zero-offset result views are outside this proof"))
+    (is (thrown? clojure.lang.ExceptionInfo (matrix-plan/dense-result-write-domain
+               (update kernel :parameters
+                       (fn [parameters]
+                         (mapv #(if (= :result (:role %)) (assoc % :kind :inout) %) parameters)))))
+        "read/write result permissions are not a write-only proof")
+    (doseq [field [:coordinates :mask]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (matrix-plan/dense-result-write-domain
+                    (walk/postwalk
+                     (fn [node]
+                       (if (instance? raster.compiler.ir.kernel_body.TileStore node)
+                         (assoc node field (if (= field :coordinates) [0 0] :tile-active)) node))
+                     kernel)))
+          "actual stores and masks must preserve the complete fragment partition"))))
