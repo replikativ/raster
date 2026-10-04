@@ -11,6 +11,8 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn contraction-binding
@@ -272,6 +274,31 @@
   [program equation]
   (contraction-facts/surface-form
    (segmented-reduce-contract-components program equation)))
+
+(defn segmented-reduce-core-read-requirements
+  "Logical core-read minima from verified dense operand maps of a retained scalar fold.
+
+   Unsupported maps decline the whole optional projection. This does not certify physical
+   addresses, neutral/result-transform reads, allocation capacity or reassociation."
+  [program equation]
+  (let [facts (contraction-facts/from-components
+               (segmented-reduce-contract-components program equation))
+        reads (contraction-facts/dense-operand-read-maps facts)
+        values (:values (dialect/facts program))]
+    (when (and reads
+               (every? (fn [{:keys [sym]}]
+                         (let [value (get values sym)]
+                           (and (= :tensor (:kind value))
+                                (dtype/known? (:dtype value))
+                                (contraction-closure/plain-storage? value)))) reads))
+      (reduce (fn [requirements {:keys [sym map]}]
+                (let [minimum (apply launch/product (axis-map/shape map))]
+                  (update requirements sym
+                          (fn [prior]
+                            (cond (nil? prior) minimum
+                                  (= prior minimum) prior
+                                  :else (launch/maximum prior minimum))))))
+              {} reads))))
 
 (defn- source-bindings
   [locals substitutions]

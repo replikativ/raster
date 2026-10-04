@@ -5,6 +5,8 @@
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
@@ -14,6 +16,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.dl.nn :as nn]))
 
 (def ^:private indexed-reduction-source
@@ -154,6 +157,52 @@
                    [:address-projection :kind])))
     (is (= :kernel-precondition-failed (reason-of #(check 2))))
     (is (true? (check 4)))))
+
+(deftest scalar-fold-graphs-derive-core-read-minima-without-matrix-scheduling
+  (let [options {:dtype :float :target-device :ocl:0
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'n :long 'k :long 'batch :long}}
+        graph-for (fn [axes body extra-options]
+                    (let [source (list 'let* ['result (list 'raster.par/contract 'C axes [['l 'k]] body)]
+                                       'result)
+                          options (merge options extra-options)
+                          typed (frontend/form->program source options)
+                          scheduled (:form (segop-lower/segop-lower-pass
+                                            (route/program-envelope typed) options))]
+                      (:graph (equation-graph/make-for-equation
+                               scheduled (first (:equations scheduled))))))]
+    (doseq [body ['(* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
+                 '(* (aget A (+ (* i k) l)) (aget B (+ (* j k) l)))
+                 '(* (aget A (+ (* l m) i)) (aget B (+ (* l n) j)))
+                 '(* (aget A (+ (* l m) i)) (aget B (+ (* j k) l)))]]
+      (let [graph (graph-for [['i 'm] ['j 'n]] body {})
+            extents (into {} (map (juxt :id :elements)) (:inputs graph))]
+        (is (extent/equivalent? (launch/product 'm 'k) (extents 'A)))
+        (is (extent/equivalent? (launch/product 'n 'k) (extents 'B)))
+        (is (nil? (:abi graph)) "target-neutral read minima must not invent a callable ABI")))
+    (let [graph (graph-for [['i 'm] ['j 'n]]
+                           '(* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
+                           {:values {'A (av/tensor {:dtype :float :shape [2]})}})
+          values {'m {:type :long :value 3} 'n {:type :long :value 5}
+                  'k {:type :long :value 7}}]
+      (is (= 2 (:elements (first (filter #(= 'A (:id %)) (:inputs graph))))))
+      (is (= :kernel-precondition-failed
+             (reason-of #(precondition/check! (:preconditions graph)
+                                               (partial graph-call/resolve-integer values))))))
+    (let [typed (frontend/form->program
+                 '(let* [result (raster.par/contract C [[i m] [j n]] [[l k]]
+                                                        (* (aget A (+ (* i k) l))
+                                                           (aget B (+ (* l n) j))))]
+                    result) options)
+          equation (first (soac/equations typed))]
+      (is (some? (projection/segmented-reduce-core-read-requirements typed equation)))
+      (doseq [[facet value] [[:representation {:kind :quantized :scheme :q4-k}]
+                             [:logical-layout {:order [0]}]
+                             [:sharding {:axis 0}]]]
+        (is (nil? (projection/segmented-reduce-core-read-requirements
+                   (with-meta
+                     (list* (first typed) (assoc-in (soac/facts typed) [:values 'A facet] value)
+                            (nnext typed)) (meta typed)) equation)))))))
 
 (deftest known-static-map-capacity-is-not-increased-by-a-read-requirement
   (let [options {:dtype :float :target-device :ocl:0 :array-types {'x :float}

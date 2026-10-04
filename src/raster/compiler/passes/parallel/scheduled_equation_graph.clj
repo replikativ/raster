@@ -19,6 +19,7 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
+            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
 
 (defn- fail!
@@ -367,16 +368,26 @@
 
 (defn- contraction-read-requirements
   "Project independent typed operand maps, including stage and epilogue operands."
-  [equations]
+  [algorithm equations]
   (reduce
    (fn [requirements equation]
      (let [{:keys [kind attributes arrays captures]} (soac/operation-parts equation)]
-       (if (= 'contract kind)
+       (cond
+         (= 'contract kind)
          (let [bindings (contraction-closure/bindings attributes arrays captures)]
            (reduce (fn [result {:keys [parameter elements]}]
                      (update result (get bindings parameter) (fnil conj []) elements))
                    requirements (contraction-closure/storage-requirements attributes)))
-         requirements)))
+
+         (= 'segmented-reduce kind)
+         (let [reads (try
+                       (typed-projection/segmented-reduce-core-read-requirements algorithm equation)
+                       ;; Optional logical-domain refinement, never physical address admission.
+                       (catch clojure.lang.ExceptionInfo _ nil))]
+           (reduce-kv (fn [result id minimum]
+                        (update result id (fnil conj []) minimum)) requirements (or reads {})))
+
+         :else requirements)))
    {} equations))
 
 (defn- algorithm-boundary?
@@ -574,7 +585,7 @@
                             (into {} (map (fn [[id extent]] [id [extent]])) derived)))
               requirements)))
           (merge-with into
-                      (contraction-read-requirements retained-equations)
+                      (contraction-read-requirements algorithm retained-equations)
                       (product-read-requirements values operations derived-scalars)
                       (reduce (fn [requirements reads]
                                 (merge-with into requirements

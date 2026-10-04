@@ -36,6 +36,46 @@
       (is (= :contraction-local-identity
              (reason (assoc components :local-identities identities)))))))
 
+(deftest dense-operand-read-maps-retain-all-core-reads
+  (let [facts (fn [body]
+                (cf/from-components
+                 {:out 'out :free-axes [['batch 2] ['i 3] ['j 5]]
+                  :contract-axes [['k 7]] :dtype :float :body body}))
+        volumes (fn [body]
+                  (mapv (fn [{:keys [sym map]}] [sym (am/n-elements map)])
+                        (cf/dense-operand-read-maps (facts body))))]
+    (doseq [[body expected]
+            [['(* (aget a (+ (* i 7) k)) (aget b (+ (* k 5) j))) [['a 21] ['b 35]]]
+             ['(* (aget a (+ (* i 7) k)) (aget b (+ (* j 7) k))) [['a 21] ['b 35]]]
+             ['(* (aget a (+ (* k 3) i)) (aget b (+ (* k 5) j))) [['a 21] ['b 35]]]
+             ['(* (aget a (+ (* k 3) i)) (aget b (+ (* j 7) k))) [['a 21] ['b 35]]]
+             ['(* (aget a (+ (* (+ (* batch 3) i) 7) k)) (aget c (+ (* k 5) j)))
+              [['a 42] ['c 35]]]
+             ['(+ (aget a i) (aget a (+ (* i 7) k))) [['a 3] ['a 21]]]
+             ['(aget a k) [['a 7]]]]]
+      (is (= expected (volumes body))))
+    (doseq [body ['(aget a (+ 1 k))
+                  '(aget a (aget indices k))
+                  '(+ (aget a k) (aget a (+ 1 k)))]]
+      (is (nil? (cf/dense-operand-read-maps (facts body)))))
+    (is (nil? (cf/dense-operand-read-maps
+               (cf/from-components
+                {:out 'out :free-axes [['a0 2] ['a1 2] ['a2 2] ['a3 2] ['a4 2] ['a5 2]]
+                 :contract-axes [['k 7]] :dtype :float :body '(aget a k)}))))
+    (is (nil? (cf/dense-operand-read-maps
+               (cf/from-components
+                {:out 'out :free-axes [['i 3]] :contract-axes [['k 7]]
+                 :dtype :float :body '(aget a k)
+                 :opts {:maps {'a (am/of-axes [['k 9]])}}})))
+        "a single-axis declared extent cannot be proved by index equality")
+    (is (nil? (cf/dense-operand-read-maps
+               (cf/from-components
+                {:out 'out :free-axes [['i 1]] :contract-axes [['k 7]]
+                 :dtype :float :body '(aget a (+ i i))
+                 :opts {:maps {'a (am/of-axes [['i 1] ['i 1]])}}})))
+        "a repeated declared axis is not an independent iteration domain")
+    (is (thrown? clojure.lang.ExceptionInfo (cf/dense-operand-read-maps {})))))
+
 (deftest contraction-dependencies-include-stage-and-epilogue-storage
   (let [facts (cf/from-components
                {:out 'out :free-axes [['i 2]] :contract-axes [['blk 2] ['t 4]]

@@ -181,6 +181,15 @@ The remaining boundary integration must preserve the independently rederived pub
 capacity expressions, scalar order, preconditions and optional inferred ABI, rather than impose
 the compatibility descriptor's logical operand extents and explicit argument order.
 
+The public graph's missing ordinary-fold read minima are addressed through the existing verified
+operand AxisMaps, not a GEMM-specific recognizer or a second recurrence decomposition. Core reads
+retain every distinct map, including repeated accesses to one buffer; unsupported shifted/gather
+reads decline this optional query. Undeclared-map search is bounded. The graph owner's existing
+contract remains: unresolved storage gets a proved minimum checked at binding, while known storage
+capacities are preserved and guarded when insufficient. These logical minima do not authorize
+physical address projection, rearrange the callable ABI, prove epilogue/neutral reads or admit a
+mixed schedule. The mixed planner still needs to preserve this independently derived boundary.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.
