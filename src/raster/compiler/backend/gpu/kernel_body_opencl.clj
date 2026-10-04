@@ -8,7 +8,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
-            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.passes.parallel.matrix-body-plan :as matrix-plan]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.scalar-range :as scalar-range]

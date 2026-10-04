@@ -1,4 +1,4 @@
-(ns raster.compiler.backend.gpu.matrix-body-plan
+(ns raster.compiler.passes.parallel.matrix-body-plan
   "Target-neutral analysis of verified scheduled matrix KernelBody values.
 
   This boundary derives the structural emission plan by walking explicit indices, fragments,

@@ -207,6 +207,11 @@ Artifact graphs with an inferred public ABI use the same ordered ABI finalizer a
 emission; compatibility graphs retain their explicit interface. This is artifact reconstruction,
 not complete-write coverage, numerical composition, target admission or performance evidence.
 
+The existing target-neutral matrix topology analyzer now belongs to the scheduling passes, not
+the GPU backend. All three target-emission consumers reuse that owner. This mechanical move
+prepares complete-write validation to share the same fragment/store/mask analysis without a
+proof-to-backend dependency; it introduces no new accepted schedules or numerical claims.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

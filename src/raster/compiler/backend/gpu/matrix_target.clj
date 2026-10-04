@@ -10,7 +10,7 @@
             [raster.compiler.backend.gpu.matrix-target-names :as target-names]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
-            [raster.compiler.backend.gpu.matrix-body-plan :as matrix-plan]
+            [raster.compiler.passes.parallel.matrix-body-plan :as matrix-plan]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.kernel-body :as kernel-body]))
 
