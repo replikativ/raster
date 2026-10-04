@@ -11,6 +11,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-pass]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
 
 (defn- tensor [dtype shape]
@@ -59,6 +60,17 @@
                                       source :dtype :float
                                       :flat-idx (get-in operation [:space :flat-idx])))))
         (is (= (:reduction operation) (:reduction projected)))))))
+
+(deftest semantic-projection-retains-core-shadowing-shape-operands
+  (let [source (dialect/remap-values (program) {'m 'seq 'n 'count 'k 'first})]
+    (binding [util/*shadowing-locals* #{}]
+      (let [projected (:operation (lower/project-typed-segmented-reduce source))]
+        (is (= '#{seq count first} (:scalars projected)))
+        (is (= '[[i seq] [j count] [l first]]
+               (mapv (juxt :name :bound) (get-in projected [:space :dims]))))
+        (binding [util/*shadowing-locals* '#{seq count first}]
+          (is (= projected (:operation (lower/project-typed-segmented-reduce
+                                        source :flat-idx (get-in projected [:space :flat-idx]))))))))))
 
 (deftest segmented-reduction-is-a-typed-functional-equation
   (let [program (program)
