@@ -1887,10 +1887,12 @@
        binding (fresh sym) and the body rewritten to reference it, so it joins the
        array-input scatter machinery instead of being mistaken for a free scalar
        (which would reduce → `No promotion rule for + with Double and double[]`).
-  Only agets indexed BY THE MAP INDEX scatter; other indexing stays inline."
-  [body-expr idx-sym]
+  Inline reads use the map index by default. Sequential scan may additionally admit literal
+  indices in unconditional scalar expressions; its backward loop scatter-adds at those indices.
+  This permission must not reach parallel map/reduce, where repeated destinations can race."
+  ([body-expr idx-sym] (analyze-par-map-body body-expr idx-sym false))
+  ([body-expr idx-sym literal-index-reads?]
   (let [agets (atom [])
-        scalar-bindings (atom [])
         ;; Extract let* bindings if present
         [bindings body-result0]
         (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
@@ -1898,28 +1900,42 @@
           [[] body-expr])]
     ;; (1) let*-bound agets
     (doseq [[sym init] bindings]
-      (if (gradient-bearing-array-read? init)
-        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
-        (swap! scalar-bindings conj [sym init])))
-    ;; (2) lift inline (aget arr idx-sym) reads to synthetic aget bindings (dedup by
-    ;; array — idx is fixed = the map index — so a repeated read shares one sym)
+      (when (gradient-bearing-array-read? init)
+        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})))
+    ;; (2) lift admitted inline reads, deduplicating by array AND original index.
+    ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
-          lift (fn lift [form]
+          lift (fn lift [expr scoped? locals]
                  (cond
-                   (and (gradient-bearing-array-read? form)
-                        (= idx-sym (nth form 2)))
-                   (let [arr (nth form 1)
-                         k (if (symbol? arr) arr form)]
+                   (and (gradient-bearing-array-read? expr)
+                        (or (= idx-sym (nth expr 2))
+                            (and literal-index-reads? (not scoped?)
+                                 (not (contains? locals (nth expr 1)))
+                                 (integer? (nth expr 2)))))
+                   (let [arr (nth expr 1) index (nth expr 2)
+                         k [arr index]]
                      (or (get @seen k)
                          (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
                            (swap! seen assoc k s)
-                           (swap! agets conj {:sym s :arr arr :idx idx-sym})
+                           (swap! agets conj {:sym s :arr arr :idx index})
                            s)))
-                   (seq? form) (apply list (map lift form))
-                   (vector? form) (mapv lift form)
-                   :else form))
-          body-result (lift body-result0)
-          scalar-bindings* (mapv (fn [[s init]] [s (lift init)]) @scalar-bindings)]
+                   (seq? expr)
+                   (let [{:keys [kind liftable?]} (form/form-info expr)
+                         nested-scope? (or scoped? (= :binding kind) (not liftable?))]
+                     (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr)))
+                   (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
+                   :else expr))
+          ;; These top-level bindings were stripped above. A lifted read is replayed
+          ;; before scalar bindings, so it must not capture their aliases/shadows.
+          body-result (lift body-result0 false (set (map first bindings)))
+          scalar-bindings* (:bindings
+                            (reduce (fn [{:keys [locals bindings]} [s init]]
+                                      {:locals (conj locals s)
+                                       :bindings (if (gradient-bearing-array-read? init)
+                                                   bindings
+                                                   (conj bindings [s (lift init false locals)]))})
+                                    {:locals #{} :bindings []}
+                                    bindings))]
       (let [aget-syms (set (map :sym @agets))
             bound-syms (set (cons idx-sym (concat (map first scalar-bindings*) aget-syms)))
             free-syms (util/free-syms body-result bound-syms)
@@ -1932,7 +1948,7 @@
          :scalar-bindings scalar-bindings*
          :body-result body-result
          ;; Remove arrays that are aget'd (they're inputs, not scalars)
-         :free-syms (disj all-free idx-sym)}))))
+         :free-syms (disj all-free idx-sym)})))))
 
 (defn- gen-reverse-par-map
   "Generate reverse-mode AD code for a raster.par/map! form.
@@ -2491,11 +2507,12 @@
         body-expr (if (untemplated-scan-call? body-expr)
                     (lower-composites body-expr)
                     body-expr)
-        ;; Same body analysis as par/map!: let*-bound agets + inline agets at
-        ;; the scan index join the scatter path. acc-sym lands in :free-syms
+        ;; Sequential scatter permits unconditional literal-index reads as well as
+        ;; scan-index reads. Parallel map/reduce retain their narrower admission.
+        ;; acc-sym lands in :free-syms
         ;; but is never an active param, so it cannot leak into active-free.
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-map-body body-expr idx-sym)
+        (analyze-par-map-body body-expr idx-sym true)
 
         read-arrs (vec (distinct (map :arr agets)))
         active-free (filterv (fn [p] (contains? free-syms p)) active-params)
@@ -2506,11 +2523,10 @@
         _ (doseq [p active-free]
             (when (= :array (:kind (tangent/tangent-kind (:raster.type/tag (meta p)))))
               (throw (ex-info
-                      (str "par/scan AD: active array `" p "` is referenced in the "
-                           "scan body outside an `(aget " p " <idx>)` read. Only "
-                           "aget reads have a scatter gradient path — bind the "
-                           "needed element to a let sym inside the body.")
-                      {:array p :body body-expr}))))
+                      (str "par/scan AD: active array `" p "` has no closed scatter read. "
+                           "Inline reads must use the scan index or an unconditional integer "
+                           "literal; guarded or data-dependent reads need an indexed residual.")
+                      {:reason :par-scan-untracked-array-read :array p :body body-expr}))))
         ;; Fail loud: a compound init that DEPENDS on active params would
         ;; reconstruct the value correctly but silently drop δinit (the final
         ;; carry only wires to a SYMBOL). Bind it outside the scan first.
