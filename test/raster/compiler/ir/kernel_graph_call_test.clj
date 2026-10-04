@@ -94,7 +94,7 @@
                   (update :scalars #(mapv (fn [scalar] (assoc scalar :dtype :long)) %))
                   (update :abi #(mapv (fn [slot]
                                        (if (= :scalar (:kind slot))
-                                         (assoc slot :dtype :long) slot)) %))
+                                         (assoc slot :dtype :long :kernel-dtype :long) slot)) %))
                   (update :nodes
                           #(mapv (fn [node]
                                    (update-in node [:operation :abi]
@@ -103,8 +103,14 @@
                                                         (if (= :scalar (:kind slot))
                                                           (assoc slot :dtype :long) slot)) slots)))) %)))]
     (is (= graph (graph-call/preflight! graph {'n {:type :long :value 1025}})))
-    (is (= graph (graph-call/preflight! graph {'n {:type :int :value 1025}}))
-        "the common executable binder may supply the public slot's physical representation")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"wrong ABI dtype"
+                          (graph-call/preflight! graph {'n {:type :int :value 1025}}))
+        "a declared long public carrier is independent of its narrower node parameters")
+    (is (= :kernel-precondition-failed
+           (try (graph-call/preflight! graph {'n {:type :long :value 2147483648}})
+                :accepted
+                (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))
+        "a legal public value outside a direct node specialization is an admission decline")
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"wrong ABI dtype"
                           (graph-call/preflight! graph {'n {:type :float :value 1025.0}})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical ABI range"
