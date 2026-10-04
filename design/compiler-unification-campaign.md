@@ -172,6 +172,15 @@ region remains language-coverage work. This query is not yet wired into mixed di
 fresh semantic graph derivation, stage reconstruction, body/projection checks and complete-write /
 composed-numerics checks must be joined before that migration.
 
+Mixed-matrix reconstruction validation now joins the exact typed reduction-law query with
+complete stage-graph reconstruction and ordered stage-body projection. Semantic fingerprints
+retain type metadata that ordinary collection equality ignores. A matching candidate/source pair
+with a changed reduction neutral is rejected against the retained algorithm. This is deliberately
+not complete-write or composed-error certification, and is not wired into public admission yet.
+The remaining boundary integration must preserve the independently rederived public graph's
+capacity expressions, scalar order, preconditions and optional inferred ABI, rather than impose
+the compatibility descriptor's logical operand extents and explicit argument order.
+
 1. Extend equation dispatch and complete-write validation to consume independently validated
    mixed graph refinements. Preserve the graph's explicit bounded-error contract; inspecting only
    the first packing kernel is not a numerical proof. Output ABI is not a complete-write proof.

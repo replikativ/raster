@@ -25,6 +25,7 @@
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]
+            [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -1469,6 +1470,10 @@
           (let [planned (mixed-schedule/reconstruct-refinement
                          (-> form :equations first :algorithm) (:source refinement) refinement)]
             (is (= (:graph refinement) (:graph planned)))
+            (is (= (:graph planned)
+                   (:graph (mixed-validation/validate-reconstruction!
+                            (-> form :equations first :algorithm)
+                            (:source refinement) refinement))))
             (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))
           (is (= (kernel-graph/boundary-contract (:source refinement))
                  (kernel-graph/boundary-contract (:graph refinement)))))))))
@@ -1592,6 +1597,8 @@
         (is (nil? (get-in refinement [:schedule :batching])))
         (let [planned (mixed-schedule/reconstruct-refinement
                        algorithm (:source refinement) refinement)
+              checked (mixed-validation/validate-reconstruction!
+                       algorithm (:source refinement) refinement)
               decline (fn [altered]
                         (try (mixed-schedule/reconstruct-refinement
                               algorithm (:source refinement) altered)
@@ -1599,6 +1606,25 @@
                              (catch clojure.lang.ExceptionInfo exception
                                (:reason (ex-data exception)))))]
           (is (= (:graph refinement) (:graph planned)))
+          (is (= (:graph planned) (:graph checked)))
+          (is (= (count (get-in refinement [:graph :nodes]))
+                 (count (:stage-bodies checked))))
+          (doseq [altered [(assoc-in refinement [:graph :attributes :unexpected] true)
+                           (update-in refinement [:graph :nodes 0 :operation]
+                                      #(with-meta % (assoc (meta %) :dtype :double)))]]
+            (try
+              (mixed-validation/validate-reconstruction! algorithm (:source refinement) altered)
+              (is false "stage mutations, including semantic metadata, must be rejected")
+              (catch clojure.lang.ExceptionInfo exception
+                (is (= :mixed-matrix-reconstruction-graph (:reason (ex-data exception)))))))
+          (let [altered-source (assoc-in (:source refinement)
+                                         [:nodes 0 :operation :reduction :components 0 :neutral] 1.0)]
+            (try
+              (mixed-validation/validate-reconstruction!
+               algorithm altered-source (assoc refinement :source altered-source))
+              (is false "agreement of candidate and source cannot replace the typed law")
+              (catch clojure.lang.ExceptionInfo exception
+                (is (= :typed-contraction-semantic-operation (:reason (ex-data exception)))))))
           (is (= (:numerics refinement) (get-in planned [:refinement :numerics])))
           (is (= :mixed-matrix-reconstruction-description
                  (decline (assoc-in refinement [:schedule :variant] :nt))))
@@ -2025,6 +2051,9 @@
                          (:inputs (:source refinement)))]
         (is (= expected-a (get-in inputs ['A :elements])) (name variant))
         (is (= expected-b (get-in inputs ['B :elements])) (name variant))
+        (is (= (:graph refinement)
+               (:graph (mixed-validation/validate-reconstruction!
+                        algorithm (:source refinement) refinement))) (name variant))
         (is (= (kernel-graph/boundary-contract (:source refinement))
                (kernel-graph/boundary-contract
                 (graph-refinement/scheduled-graph refinement)))
