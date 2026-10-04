@@ -5,6 +5,7 @@
    Target admission and artifact emission remain outside this pass. A structural refinement is
    retained producer evidence, not by itself an algorithm or complete-write proof."
   (:require [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
@@ -458,7 +459,7 @@
         operation (get-in source [:nodes 0 :operation])
         {:keys [facts operation-id dtype]} (typed-context/validate! algorithm operation)
         view (contraction-facts/dense-matrix-view facts)
-        _ (when-not (and (= :float dtype) (:ok view))
+        _ (when-not (and (= :float (dtype/canon dtype)) (:ok view))
             (throw (ex-info "typed equation does not admit the mixed matrix representation"
                             {:reason :mixed-matrix-reconstruction-algorithm
                              :dtype dtype :view view})))

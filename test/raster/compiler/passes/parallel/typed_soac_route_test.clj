@@ -1580,6 +1580,14 @@
                  (decline (assoc-in refinement [:schedule :variant] :nt))))
           (is (= :mixed-matrix-reconstruction-policy
                  (decline (assoc-in refinement [:schedule :input-fusion] :unknown))))
+          (doseq [[field value] [[:version 2] [:batched? true] [:split-k? :yes]]]
+            (is (= :mixed-matrix-reconstruction-policy
+                   (decline (assoc-in refinement [:schedule field] value)))))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (assoc-in refinement [:schedule :batching]
+                                    {:extent 'batch :lhs true :rhs true}))))
+          (is (= :mixed-matrix-reconstruction-description
+                 (decline (update refinement :schedule dissoc :variant))))
           (is (= :mixed-matrix-reconstruction-description
                  (decline (assoc-in refinement [:numerics :rounding] :toward-zero))))
           (is (= :mixed-matrix-reconstruction-description
