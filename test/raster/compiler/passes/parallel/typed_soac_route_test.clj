@@ -1639,6 +1639,15 @@
               (try
                 (emitted-equation/make
                  algorithm body
+                 (assoc-in emitted [:nodes 0 :operation :provenance :scheduled-operation]
+                           (get-in public-plan [:graph :nodes 0 :operation]))
+                 {:refinement (:refinement public-plan)})
+                (is false "a raw stage cannot replace the generated mixed body certificate")
+                (catch clojure.lang.ExceptionInfo exception
+                  (is (= :emitted-mixed-matrix-artifact-refinement (:reason (ex-data exception))))))
+              (try
+                (emitted-equation/make
+                 algorithm body
                  (assoc-in emitted [:nodes 0 :operation :provenance :scheduled-operation
                                     :body :attributes :forged] true)
                  {:refinement (:refinement public-plan)})

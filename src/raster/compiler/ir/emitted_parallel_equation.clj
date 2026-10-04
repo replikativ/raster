@@ -112,7 +112,10 @@
                                      (scheduled-body/validate-artifact-projection!
                                       certificate (:operation emitted-node))
                                      true)
-                                 (= (:operation scheduled-node) certificate))))
+                                 (if generated-body
+                                   (fail! :emitted-mixed-matrix-artifact-refinement
+                                          "mixed matrix artifact requires its generated scheduled-body certificate" {})
+                                   (= (:operation scheduled-node) certificate)))))
                            (:nodes scheduled) (:nodes emitted)
                            (or (:stage-bodies mixed) (repeat nil))))
       (fail! :emitted-parallel-equation-operation
