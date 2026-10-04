@@ -391,6 +391,31 @@
             (first (filter #(am/index-matches? % (:idx operand)) candidates)))))))
 
 ;; ── leaf layout requirements as DATA ────────────────────────────────────────────────
+(defn dense-operand-read-maps
+  "Project every core operand read through its verified dense permutation/broadcast map.
+
+   Returns ordered {:sym :map} entries, retaining repeated reads, or nil if any read is unknown.
+   Undeclared-map inference is bounded to six axes; verified declarations need no search.
+   These maps establish logical read domains, not allocation capacity, neutral/epilogue reads,
+   or a certificate that a physical schedule executes those domains."
+  [facts]
+  (when-not (facts? facts)
+    (throw (ex-info "operand read maps require verified contraction facts"
+                    {:reason :raster/bug :facts facts})))
+  (let [domain (into {} (concat (:free-axes facts) (:contract-axes facts)))
+        searchable? (<= (+ (count (:free-axes facts)) (count (:contract-axes facts))) 6)
+        reads (mapv (fn [operand]
+                      (when-let [amap (or (:map operand)
+                                          (when searchable? (operand-axis-map facts operand)))]
+                        (let [pairs (vec (mapcat identity (:groups amap)))
+                              ids (mapv first pairs)]
+                          (when (and (seq pairs) (= (count ids) (count (set ids)))
+                                     (every? #(and (contains? domain (first %))
+                                                   (= (second %) (get domain (first %)))) pairs))
+                            {:sym (:sym operand) :map amap}))))
+                    (:operands facts))]
+    (when (and (seq reads) (every? some? reads)) reads)))
+
 (def leaf-layouts
   "Each tensorize leaf's required operand layout, as ROLE → the axis roles that index it,
    outer→inner. `:nn` and `:nt` are not concepts here — they are two different data rows:
