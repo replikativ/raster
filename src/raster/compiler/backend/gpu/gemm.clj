@@ -9,7 +9,6 @@
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.kernel-body-target :as kernel-body-target]
             [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
-            [raster.compiler.backend.gpu.layout-transform :as layout-emitter]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.intel-block-io :as block-io]
@@ -48,27 +47,11 @@
     (mixed-schedule/stage-node id artifact uses (mapv :value (:scalar-bindings scheduled)) dependencies)))
 
 (defn- emit-scheduled-body-artifact
-  [{:keys [kernel-name source body arguments effects legality numerics phase target-dialect
-           parameter-names provenance attributes scalar-types]
-    :or {target-dialect :opencl-intel effects {:kind :tensor-contraction-stage}
-         provenance {} attributes {}}}]
-  (let [uses (scheduled-body/derive-uses body arguments)
-        scheduled
-        (scheduled-body/make
-         {:source source
-          :body body
-          :arguments arguments
-          :scalar-bindings (scheduled-body/derive-scalar-bindings body arguments scalar-types)
-          :effects (assoc effects :uses uses)
-          :legality legality
-          :numerics numerics
-          :provenance (merge {:semantic-op :contraction
-                              :lowering :gemm-graph :phase phase}
-                             provenance)
-          :attributes (merge {:strategy phase} attributes)})]
-    (kernel-body-target/emit-artifact
-     (c-emit/c-symbol kernel-name) scheduled target-dialect
-     {:parameter-names parameter-names})))
+  [{:keys [kernel-name target-dialect parameter-names]
+    :or {target-dialect :opencl-intel} :as spec}]
+  (kernel-body-target/emit-artifact
+   (c-emit/c-symbol kernel-name) (mixed-body/make-schedule spec) target-dialect
+   {:parameter-names parameter-names}))
 
 (defn- scalar-contraction-facts
   [variant]
@@ -145,73 +128,18 @@
 
 (defn- convert-artifact
   [kernel-name stage phase target-dialect scalar-types]
-  (let [{stage-id :id in :input out :output input-shape :input-shape policy :policy}
-        (layout-stage/validate! stage)
-        elements (first input-shape)
-        vector-width (:vector-width policy)
-        _ (when-not (and (= :float (:input-dtype stage)) (= :half (:output-dtype stage))
-                         (= :nearest-even (:rounding policy)) (= :ieee (:overflow policy)))
-            (throw (ex-info "GEMM cast emitter does not implement the scheduled representation"
-                            {:reason :gemm-stage-emission-unsupported :stage stage-id
-                             :input-dtype (:input-dtype stage)
-                             :output-dtype (:output-dtype stage) :policy policy})))
-        _ (when-not (and (integer? vector-width) (pos? vector-width))
-            (throw (ex-info "scheduled layout cast does not close its emission choices"
-                            {:reason :gemm-stage-emission-open :stage stage-id
-                             :missing :vector-width})))
-        kernel-name (c-emit/c-symbol kernel-name)
-        kernel-body
-        (layout-emitter/cast-body
-         {:id stage-id :input in :output out
-          :source-dtype :float :destination-dtype :half :vector-width vector-width
-          :extent-dtype (klaunch/typed-expression-dtype elements scalar-types)
-          :rounding :nearest-even :overflow :ieee})]
-    (emit-scheduled-body-artifact
-     {:kernel-name kernel-name
-      :source stage
-      :body kernel-body :arguments [in out elements]
-      :scalar-types scalar-types
-      :effects {:kind :layout-transform-stage}
-      :legality {:kind :dense-affine-cast :vector-width vector-width}
-      :numerics {:mode :bounded-error :policy :f32-to-f16-storage
-                 :rounding :nearest-even :accumulator-dtype :half
-                 :error-model {:kind :ieee-f16-conversion :overflow :ieee}}
-      :phase phase
-      :target-dialect target-dialect
-      :attributes {:vector-width vector-width :from :float :to :half
-                   :rounding :nearest-even :overflow :ieee
-                   :cacheable-transform? true}
-      :parameter-names {in "input" out "output" :layout-elements "n"}})))
+  (kernel-body-target/emit-artifact
+   (c-emit/c-symbol kernel-name) (mixed-body/schedule-cast stage phase scalar-types)
+   target-dialect
+   {:parameter-names {(:input stage) "input" (:output stage) "output" :layout-elements "n"}}))
 
 (defn- transpose-artifact
   [kernel-name stage phase target-dialect scalar-types]
-  (let [{stage-id :id in :input out :output
-         [rows cols] :input-shape} (layout-stage/validate! stage)
-        _ (when-not (and (= :half (:input-dtype stage)) (= :half (:output-dtype stage))
-                         (= [1 0] (get-in stage [:policy :permutation])))
-            (throw (ex-info "GEMM transpose emitter does not implement the scheduled representation"
-                            {:reason :gemm-stage-emission-unsupported :stage stage-id
-                             :input-dtype (:input-dtype stage)
-                             :output-dtype (:output-dtype stage) :policy (:policy stage)})))
-        kernel-name (c-emit/c-symbol kernel-name)
-        kernel-body
-        (layout-emitter/transpose-body
-         {:id stage-id :input in :output out :element-dtype :half
-          :row-extent-dtype (klaunch/typed-expression-dtype rows scalar-types)
-          :column-extent-dtype (klaunch/typed-expression-dtype cols scalar-types)})]
-    (emit-scheduled-body-artifact
-     {:kernel-name kernel-name
-      :source stage
-      :body kernel-body :arguments [in out rows cols]
-      :scalar-types scalar-types
-      :effects {:kind :layout-transform-stage}
-      :legality {:kind :bijective-affine-permutation :permutation [1 0]}
-      :numerics {:mode :exact :policy :bit-preserving-permutation}
-      :phase phase
-      :target-dialect target-dialect
-      :attributes {:layout :transpose :dtype :half :cacheable-transform? true}
-      :parameter-names {in "input" out "output"
-                        :layout-rows "rows" :layout-cols "cols"}})))
+  (kernel-body-target/emit-artifact
+   (c-emit/c-symbol kernel-name) (mixed-body/schedule-transpose stage phase scalar-types)
+   target-dialect
+   {:parameter-names {(:input stage) "input" (:output stage) "output"
+                      :layout-rows "rows" :layout-cols "cols"}}))
 
 
 
@@ -301,23 +229,11 @@
 
 (defn- combine-artifact
   [kernel-name operation partials c mn splits target-dialect scalar-types]
-  (let [{body :body} (mixed-schedule/split-k-combine-plan
-                    (:id operation)
-                    {'mn (klaunch/typed-expression-dtype mn scalar-types)
-                     'splits (klaunch/typed-expression-dtype splits scalar-types)})]
-    (emit-scheduled-body-artifact
-     {:kernel-name kernel-name :source operation :body body
-      :arguments [partials c mn splits mn]
-      :scalar-types scalar-types
-      :effects {:kind :tensor-contraction-stage}
-      :legality {:kind :portable-contraction :purpose :split-k-combine}
-      :numerics {:mode :reassociated :policy :sequential-segment-fold
-                 :rounding :nearest-even :accumulator-dtype :float}
-      :phase :split-k-combine
-      :target-dialect target-dialect
-      :attributes {:accumulator-dtype :float :semantic-op :contraction}
-      :parameter-names {'partials "partials" 'C "C"
-                        'mn "mn" 'splits "splits" '_nseg "_nseg"}})))
+  (kernel-body-target/emit-artifact
+   (c-emit/c-symbol kernel-name)
+   (mixed-body/schedule-combine operation partials c mn splits scalar-types)
+   target-dialect
+   {:parameter-names {'partials "partials" 'C "C" 'mn "mn" 'splits "splits" '_nseg "_nseg"}}))
 
 (defn split-factor-strategy
   "Stable strategy identity for one explicit split-K candidate."
@@ -327,23 +243,6 @@
                     {:split-factor factor})))
   (keyword (str "xmx-split-k-" factor)))
 
-(defn- split-combine-values
-  [operation]
-  (let [operation (if (segop/seg-red? operation)
-                    operation
-                    (throw (ex-info "split combine emission requires a SegRed stage"
-                                    {:reason :gemm-stage-lowering :operation operation})))
-        partials (segop/operation-inputs operation)
-        outputs (segop/operation-outputs operation)
-        dimensions (get-in operation [:space :dims])
-        mn (get-in dimensions [0 :bound])
-        splits (get-in dimensions [1 :bound])]
-    (when-not (and (= 1 (count partials)) (= 1 (count outputs))
-                   (some? mn) (some? splits))
-      (throw (ex-info "split combine stage does not close its storage and reduction geometry"
-                      {:reason :gemm-stage-emission-open :stage (:id operation)
-                       :inputs partials :outputs outputs :mn mn :splits splits})))
-    {:partials (first partials) :output (first outputs) :mn mn :splits splits}))
 
 (defn- emit-stage-artifact
   [target-dialect prefix scalar-types {:keys [operation] :as node}]
@@ -361,7 +260,7 @@
                      :matrix-contract target-dialect scalar-types)
 
       (segop/seg-red? operation)
-      (let [{:keys [partials output mn splits]} (split-combine-values operation)]
+      (let [{:keys [partials output mn splits]} (mixed-body/split-combine-values operation)]
         (combine-artifact (str prefix "_" (name phase)) operation
                           partials output mn splits target-dialect scalar-types))
 
