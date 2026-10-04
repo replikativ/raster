@@ -4,7 +4,8 @@
   This boundary derives the structural emission plan by walking explicit indices, fragments,
   masks and operations.  Instruction-family legality belongs to the target emitter."
   (:require [raster.compiler.core.layout :as layout]
-            [raster.compiler.ir.kernel-body :as body]))
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (defn- record-kind? [simple-name value]
   (= (str "raster.compiler.ir.kernel_body." simple-name)
@@ -473,3 +474,32 @@
      :buffer-offsets {:lhs (some-> lhs-storage :view :element-offset)
                       :rhs (some-> rhs-storage :view :element-offset)
                       :result (some-> out-storage :view :element-offset)}}))
+
+(defn dense-result-write-domain
+  "Prove full dense result coverage for the direct 2D matrix schedule subset.
+
+   Analyze actual fragments, stores, coordinates and masks first. The explicit launch must
+   cover the complete M/N grid; a matching workgroup topology alone is insufficient. This v1
+   projection declines sliced K, batches, result views and non-FP32/write-only results. It
+   proves storage coverage, not arithmetic equivalence or hardware/numerical admission."
+  [kernel-body]
+  (let [{:keys [dimension-parameters dimension-values block-m block-n sg-m sg-n
+                ni subgroup group-z k-lower k-upper] :as plan} (analyze kernel-body)
+        {:keys [m n k]} dimension-parameters
+        result (first (filter #(= :result (:role %)) (:parameters plan)))
+        geometry [block-m block-n sg-m sg-n]
+        output-shape (mapv dimension-values [m n])]
+    (when (and (= :output (:kind result)) (= :float (:dtype result))
+               (every? #(contains? dimension-values %) [m n k])
+               (nil? group-z)
+               (not-any? #(= (:id result) (:buffer %)) (:views kernel-body))
+               (every? #(and (integer? %) (pos? %)) geometry)
+               (zero? (mod block-m sg-m)) (zero? (mod block-n sg-n))
+               ;; The currently proved direct store distribution owns one column per lane.
+               (= ni subgroup)
+               (= 0 (mathematical-index k-lower))
+               (= k (mathematical-index k-upper))
+               (= [(launch/ceil-div (launch/runtime-value n) block-n)
+                   (launch/ceil-div (launch/runtime-value m) block-m)]
+                  (get-in plan [:launch :group-count])))
+      {(:id result) output-shape})))

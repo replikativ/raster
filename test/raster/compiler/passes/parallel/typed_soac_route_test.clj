@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-route-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
@@ -1482,6 +1483,9 @@
                                                  (kernel-graph/boundary-contract source)))
                   public-plan (mixed-validation/validate-reconstruction!
                                (-> form :equations first :algorithm) source candidate)]
+              (is (= (when (and (not batched?) (= strategy :xmx-direct))
+                       {'C (kernel-launch/product 'm 'n)})
+                     (:complete-write-domains public-plan)))
               (is (= (kernel-graph/boundary-contract source)
                      (kernel-graph/boundary-contract (:graph public-plan)))))
             (is (= (:numerics refinement) (get-in planned [:refinement :numerics]))))
@@ -1634,8 +1638,25 @@
                   checked (emitted-equation/make
                            algorithm body emitted {:refinement (:refinement public-plan)})]
               (is (emitted-equation/emitted-equation? checked))
-              (is (nil? (emitted-equation/contraction-write-domains checked))
-                  "artifact reconstruction alone cannot authorize complete writes or dispatch")
+              (is (= (when-not (= strategy :xmx-split-k)
+                       {'C (kernel-launch/product 'm 'n)})
+                     (emitted-equation/contraction-write-domains checked))
+                  "direct matrix stores cover the logical result; split-K requires a separate proof")
+              (let [matrix-index (first (keep-indexed
+                                        (fn [index node]
+                                          (when (matrix-stage/matrix-stage? (:operation node)) index))
+                                        (get-in public-plan [:graph :nodes])))
+                    forged (update-in emitted
+                                      [:nodes matrix-index :operation :provenance
+                                       :scheduled-operation :body]
+                                      #(walk/postwalk
+                                        (fn [node]
+                                          (if (instance? raster.compiler.ir.kernel_body.TileStore node)
+                                            (assoc node :coordinates [0 0]) node)) %))]
+                (is (thrown? clojure.lang.ExceptionInfo
+                             (emitted-equation/contraction-write-domains
+                              (assoc checked :graph forged)))
+                    "a real changed store cannot borrow the unchanged stage's coverage"))
               (try
                 (emitted-equation/make
                  algorithm body
