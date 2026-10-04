@@ -9,6 +9,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -1642,6 +1643,19 @@
                        {'C (kernel-launch/product 'm 'n)})
                      (emitted-equation/contraction-write-domains checked))
                   "direct matrix stores cover the logical result; split-K requires a separate proof")
+              (when-not (= strategy :xmx-split-k)
+                (let [selection (kdispatch/make
+                                 {:id "mixed-coverage-is-not-numerical-permission"
+                                  :alternatives [emitted]
+                                  :default-strategy (kdispatch/alternative-strategy emitted)
+                                  :selector {:kind :fixed-strategy
+                                             :strategy (kdispatch/alternative-strategy emitted)}})]
+                  (try
+                    (equation-dispatch/make [checked] selection
+                                           {:permitted-modes #{:exact :reassociated}})
+                    (is false "complete stores do not authorize mixed arithmetic")
+                    (catch clojure.lang.ExceptionInfo exception
+                      (is (= :equation-dispatch-numerics (:reason (ex-data exception))))))))
               (let [matrix-index (first (keep-indexed
                                         (fn [index node]
                                           (when (matrix-stage/matrix-stage? (:operation node)) index))
@@ -1696,6 +1710,21 @@
                 (is false "matching source/candidate boundaries cannot waive storage requirements")
                 (catch clojure.lang.ExceptionInfo exception
                   (is (= :mixed-matrix-public-storage (:reason (ex-data exception)))))))
+            (let [source (-> public-source
+                             (assoc-in [:outputs 0 :elements] 'output-capacity)
+                             (update :scalars conj (kernel-graph/scalar 'output-capacity :int))
+                             (assoc :preconditions
+                                    [{:expression 'output-capacity :op :>=
+                                      :value (get-in public-source [:outputs 0 :elements])}]))
+                  guarded (mixed-validation/validate-reconstruction!
+                           algorithm source
+                           (assoc public-candidate :source source
+                                  :graph (merge (:graph public-candidate)
+                                                (kernel-graph/boundary-contract source))))]
+              (is (= (when-not (= strategy :xmx-split-k)
+                       {'C (kernel-launch/product 'm 'n)})
+                     (:complete-write-domains guarded))
+                  "a guarded output capacity cannot enlarge the logical write domain"))
             (let [source (-> public-source
                              (assoc-in [:inputs 0 :elements] 'capacity)
                              (update :scalars conj (kernel-graph/scalar 'capacity :int))
