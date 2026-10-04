@@ -410,7 +410,8 @@
                         (let [pairs (vec (mapcat identity (:groups amap)))
                               ids (mapv first pairs)]
                           (when (and (seq pairs) (= (count ids) (count (set ids)))
-                                     (every? #(= (second %) (get domain (first %))) pairs))
+                                     (every? #(and (contains? domain (first %))
+                                                   (= (second %) (get domain (first %)))) pairs))
                             {:sym (:sym operand) :map amap}))))
                     (:operands facts))]
     (when (and (seq reads) (every? some? reads)) reads)))

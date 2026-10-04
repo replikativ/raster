@@ -74,6 +74,12 @@
                  :dtype :float :body '(aget a (+ i i))
                  :opts {:maps {'a (am/of-axes [['i 1] ['i 1]])}}})))
         "a repeated declared axis is not an independent iteration domain")
+    (is (nil? (cf/dense-operand-read-maps
+               (cf/from-components
+                {:out 'out :free-axes [['i 3]] :contract-axes [['k 7]]
+                 :dtype :float :body '(aget a foreign)
+                 :opts {:maps {'a (am/of-axes [['foreign nil]])}}})))
+        "a missing axis cannot match a nil declared extent")
     (is (thrown? clojure.lang.ExceptionInfo (cf/dense-operand-read-maps {})))))
 
 (deftest contraction-dependencies-include-stage-and-epilogue-storage
