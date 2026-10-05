@@ -143,6 +143,10 @@
   (cond
     (nil? a) b
     (nil? b) a
+    ;; two doubles: the common case of a scalar adjoint, added directly — the
+    ;; generic `numeric/+` below dispatches at runtime, which dominated the
+    ;; cost of every scalar accumulation in a backward pass
+    (and (instance? Double a) (instance? Double b)) (clojure.core/+ (double a) (double b))
     ;; scalar + array: broadcast scalar into array element-wise add
     (and (number? a) (.isArray (class b)))
     (let [n (long (arrays/alength b))
@@ -4317,6 +4321,40 @@
   [f-var]
   (:admissible? (forward-coverage f-var)))
 
+(def ^:private ^:dynamic *compiling-value+grad?*
+  "True while a value+grad wrapper is being compiled: a value+grad made in
+  that extent keeps the evaluated runtime body (no nested compilation)."
+  false)
+
+(defn- compiled-value+grad-fn
+  "The runtime value+grad of `f-var` compiled by the full pipeline: a private
+  wrapper deftm with `f`'s own parameters and annotations that binds the
+  value+grad call and returns its elements — the pipeline inlines the
+  AD-transformed body there and devirtualizes it, as for a value+grad inside
+  any compiled deftm — then compile-aot. nil when the pipeline cannot compile
+  it (the caller keeps the evaluated runtime body)."
+  [f-var wrt]
+  (when-not *compiling-value+grad?*
+    (binding [*compiling-value+grad?* true]
+      (try
+        (let [resolved (resolve-deftm-var f-var)
+              m (meta resolved)
+              params (:raster.core/deftm-params m)
+              anns (:raster.core/deftm-annotations m)
+              source-ns (some-> (:raster.core/deftm-source-ns m) the-ns)
+              target (symbol f-var)]
+          (when (and source-ns (seq params) (= (count params) (count anns)))
+            (let [wrapper (gensym (str (name target) "--value+grad-"))
+                  slots (vec (repeatedly (inc (count params)) #(gensym "vg")))
+                  form `(raster.core/deftm ~(with-meta wrapper {:private true})
+                          [~@(mapcat (fn [p a] [p :- a]) params anns)]
+                          (let [~slots ((raster.ad.reverse/value+grad (var ~target) ~@(when (some? wrt) [:wrt wrt]))
+                                        ~@params)]
+                            ~slots))]
+              (binding [*ns* source-ns] (eval form))
+              ((requiring-resolve 'raster.compiler.pipeline/compile-aot) (ns-resolve source-ns wrapper)))))
+        (catch Throwable _ nil)))))
+
 (defn ^:no-doc prepare-value+grad
   "Prepare the existing typed reverse-gradient program without compiling a runtime wrapper.
    Both runtime construction and compiler inlining consume this retained program/slot boundary."
@@ -4351,6 +4389,13 @@
     :wrt   - distinct zero-based parameter indices to differentiate in reverse
              mode; other gradient slots are nil (e.g. :wrt [0 3 4] keeps an
              observation array at index 1 constant)
+    :compile? - reverse mode: build the runtime function with the full
+             compile-aot pipeline (inlined, devirtualized backward pass — orders
+             of magnitude faster on scalar-heavy loops) instead of evaluating
+             the AD-transformed body. Pipeline semantics apply: dead checked
+             reads may be eliminated and float arithmetic follows the compiled
+             dtype. Falls back to the evaluated body when the pipeline cannot
+             compile `f`; `(:raster.ad.reverse/compiled? (meta vg))` says which.
 
   Usage:
     ;; Runtime
@@ -4362,12 +4407,13 @@
         (axpy! W W (- lr) d_W)
         loss))"
   ([f-var] (value+grad f-var :mode :reverse))
-  ([f-var & {:keys [mode wrt] :or {mode :reverse}}]
+  ([f-var & {:keys [mode wrt compile?] :or {mode :reverse}}]
    (case mode
      :reverse
      (let [bgw (prepare-value+grad f-var wrt)
            {:keys [walked-body params tags source-ns]} bgw
-           runtime-fn (make-runtime-value+grad-fn walked-body params)
+           compiled-fn (when compile? (compiled-value+grad-fn f-var wrt))
+           runtime-fn (or compiled-fn (make-runtime-value+grad-fn walked-body params))
            ;; Qualify symbols in walked body for inlining from other namespaces
            inline-ns inf/qualify-body-symbols
            param-set (set params)
@@ -4376,6 +4422,7 @@
        (let [result-fn (fn [& args] (apply runtime-fn args))]
          (with-meta result-fn
            {::value+grad true
+            ::compiled? (some? compiled-fn)
             :raster.core/deftm true
             :raster.core/deftm-walked-body qualified-wb
             :raster.core/deftm-params params

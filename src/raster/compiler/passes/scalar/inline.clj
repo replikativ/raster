@@ -405,7 +405,7 @@
 (defn- ad-constructor-options
   [options]
   (when-not (and (even? (count options))
-                 (every? #{:wrt :mode} (take-nth 2 options)))
+                 (every? #{:wrt :mode :compile?} (take-nth 2 options)))
     (throw (ex-info "compiled AD requires static :wrt/:mode keyword options"
                     {:reason :ad-inline-options :options options})))
   (let [options-map (apply hash-map options)
