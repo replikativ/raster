@@ -24,6 +24,20 @@ notes retain the wider campaign and its implementation history.
 
 ### October 4 public mixed-matrix admission slice
 
+The public schedule and uniform Int/Long graph-carrier slices are now in review. The
+hardware-free Gemma training compile is the next integration gate, before migrating its existing
+mixed-precision device trajectory off the descriptor fixture. It exposed a reconstruction-context
+gap: declared shape operands named like core functions (for example `seq`) disappeared from
+standalone scalar-dependency analysis. The pure semantic constructor now derives its lexical
+context from retained TypedSOAC values, just as production lowering does. Core-shadowing shape
+regressions and the wider TypedSOAC route suite pass; exact source-law comparison is unchanged.
+
+The same Gemma compile subsequently exposes an unresolved storage relation: the matrix axis
+uses a retained scalar alias (`nqh`), while its output capacity expands to `nq * hd`. Do not assert
+these equal from their spelling or relax capacity validation. The next slice must retain or
+independently reconstruct the checked scalar definition across the schedule/storage boundary.
+Public mixed training acceptance, native numerical trajectories and performance remain open.
+
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
 the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule

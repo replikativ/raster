@@ -516,6 +516,12 @@
     (when-not (typed-segmented-reduce-program? program)
       (throw (ex-info "typed segmented reduction lowering requires one segmented-reduce equation"
                       {:reason :typed-soac-segmented-reduce-subset :program program})))
+    ;; Reconstruction is also called outside the production lowering's dynamic
+    ;; context. Declared typed values remain lexical operands even when named
+    ;; like core functions; derive that context from the retained program itself.
+    (binding [util/*shadowing-locals*
+              (into util/*shadowing-locals*
+                    (filter symbol? (keys (:values (soac-dialect/facts program)))))]
     (let [equation (first (soac-dialect/equations program))
           [_ equation-id results operation] equation
           [_ attributes arrays captures lambda] operation
@@ -606,7 +612,7 @@
                                    (segop/->SegLevel :thread :virtual)
                                    operator nil inputs (set physical-results) scalars nil
                                    (if contraction? :contraction :segmented)
-                                   nil output-dtype))})))
+                                   nil output-dtype))}))))
 
 (defn lower-typed-segmented-reduce
   "Lower one general TypedSOAC segmented reduction directly to SegRed.
