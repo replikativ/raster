@@ -46,6 +46,38 @@ proof data; after the fix the full scalar emitter suite passes 24 tests / 352 as
 This is traversal deduplication with unchanged helper/emission coverage, not a measured compiler
 speedup. Scalar-expression discovery and independent KernelBody validation remain unchanged.
 
+### External two-layer resident loss-seed/VJP acceptance
+
+A clean local finetune snapshot at `9e9ba5d62f3822f056e01c37231d7eaa7c84947c` supplies unchanged
+`gblock-fwd!`, `gblock-vjp-step!` and the original monolithic `ref-loss2` oracle. Only numerical
+declarations and pure data/argument helpers are loaded; the retired session adapter is excluded.
+The dirty sibling checkout is untouched. This is an isolated adapter probe, not full package
+migration or upstream evidence: that local finetune repository has no configured remote.
+
+Public composition orders two forwards, existing `mse-grad`, then two VJP/update programs in
+reverse order. Its numerical call counts are `[60 60 1 157 157]`; 28 donated adapter owners share
+live state with the corresponding forward borrowers. Activation fanout, loss seed and chained
+input cotangents are internal connections, and their five consumer inputs are absent from the
+public refresh interface. Frozen weights/norms and the initial input use ordinary shares.
+The external reduced-width configuration and original random-data seeds are retained. The
+resident loss seed is computed before either update, not supplied from the host.
+
+Two consecutive Level Zero replays compare loss, all 28 recovered adapter gradients (`lr=1`)
+and the final input cotangent against the original CPU `value+grad(ref-loss2)` at each pre-step
+state. Host downloads are exclusively oracle reads, not component-to-component bridges.
+
+| Replay | GPU / CPU loss | Absolute loss error | Worst relative dx error | Largest adapter worst-relative error |
+|---|---|---:|---:|---:|
+| 0 | 4.602434635 / 4.602435112 | 4.77e-7 | 4.10e-4 | 1.85e-3 |
+| 1 | 4.237384319 / 4.237384319 | 0 | 1.65e-3 | 2.32e-3 |
+
+The next forward therefore observes updated resident adapters, not the captured initial host
+arrays. The existing external `2e-2` worst-relative and loss tolerances are unchanged; previous
+output handles invalidate on replay. Cold preparation was 238 seconds in the capped REPL,
+including compilation and composition; this is a preparation-cost debt, not device throughput.
+OpenCL execution of this new complete loss-seed chain, a committed reproducible acceptance
+runner, real-weight/head training and the canonical external adapter migration remain open.
+
 ## Consolidation diagnostic — 2026-10-01
 
 The existing public equation-first GEMM canary executed `[32 32 32]`, strict FP32,
