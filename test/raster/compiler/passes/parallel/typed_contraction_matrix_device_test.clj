@@ -20,6 +20,52 @@
             [raster.gpu.value :as value]
             [raster.perf.production-canary :as canary]))
 
+(defn- sequential-fp32-projection
+  "Independent ordered oracle: round each multiply and add, not only the store."
+  [layout ^floats left ^floats right m k n]
+  (float-array
+    (for [i (range m) j (range n)]
+      (loop [p 0 acc (float 0.0)]
+        (if (= p k)
+          acc
+          (let [li (if (= layout :tn) (+ (* p m) i) (+ (* i k) p))
+                ri (if (= layout :nt) (+ (* j k) p) (+ (* p n) j))
+                term (float (* (double (aget left li)) (double (aget right ri))))]
+            (recur (inc p) (float (+ (double acc) (double term))))))))))
+
+(deftest public-portable-blas-projections-retain-sequential-fp32-evaluation
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "same-operand FP32 projection on " device))
+      (doseq [[layout source] [[:nn #'contractions/projected-nn]
+                              [:nt #'contractions/projected-nt]
+                              [:tn #'contractions/projected-tn]]
+              [input-kind k] [[:smooth 3] [:smooth 17] [:smooth 640] [:cancellation 3]]]
+        (let [m 2 n 3
+              left (float-array
+                     (if (= input-kind :cancellation)
+                       (map #(nth [1.0e8 1.0 -1.0e8]
+                                  (if (= layout :tn) (quot % m) (mod % k)))
+                            (range (* m k)))
+                       (map #(Math/sin (* 0.73 %)) (range (* m k)))))
+              right (float-array
+                      (if (= input-kind :cancellation)
+                        (repeat (* k n) 1.0)
+                        (map #(Math/cos (* 0.51 %)) (range (* k n)))))
+              expected (sequential-fp32-projection layout left right m k n)
+              prepared (compiled/lower source [left right m k n]
+                         {:compiler :equation-first :target device :dtype :float
+                          :schedule {:precision :f32-scalar}})
+              live (compiled/instantiate! prepared)]
+          (try
+            (let [actual (value/->host (:result (live {})))]
+              (is (instance? (Class/forName "[F") actual))
+              (is (java.util.Arrays/equals ^floats expected ^floats actual)
+                  (str device " " layout " " input-kind " " [m k n]
+                       "; CPU BLAS association is deliberately not this oracle")))
+            (finally (compiled/close! live))))))))
+
 (deftest fixed-register-tile-replays-through-the-public-equation-api
   (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]

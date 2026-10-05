@@ -1911,9 +1911,11 @@
                           relative gradient noise (f16 mantissa, cosine similarity to the
                           f32 grads still 1.000) and buys ~3x on the GEMM kernels.
      :f32-scalar        — keep float contractions on exact f32 schedules (read f32 residents
-                          directly, with no narrowing/layout graph). Exact f32 grads
-                          (~1e-6-level parity) — the exactness escape hatch (grad tests,
-                          FD gates, anything that must bit-track the CPU reference).
+                          directly, with no narrowing/layout graph). Exactness is relative
+                          to the retained typed evaluation order, not bitwise agreement
+                          with CPU BLAS (which may use blocked/FMA accumulation). This
+                          excludes f16 input loss; full-gradient parity remains a separate
+                          numerical acceptance gate, especially near cancellation.
    Both policies are validated for BACKWARD/value+grad programs, not just forward:
    see raster.dl.gemma-train-resident-test/gemma-lora-mixed-precision-backward-trajectory
    (25 on-device SGD steps under each policy, trajectories agree) and the measured
