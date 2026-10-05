@@ -2868,3 +2868,31 @@ gradient already differs before SGD. On identical captured operands, the final A
 contraction and preceding low-rank contraction match explicit sequential FP32 evaluation;
 the normalized input also matches the CPU exactly. These checks narrow the investigation
 to upstream cotangents, but do not establish full training acceptance or SOTA performance.
+
+### Typed JVM loop carriers and lexical scope — 2026-10-06
+
+The real-weight investigation exposed a JVM precision inconsistency, not a new GPU
+schedule requirement. Ordinary lazy-JIT `sum-kv-heads` accumulated Float inputs in
+Double, whereas the typed GPU/AOT path used Float. The cancellation probe
+`[1e8, 1, -1e8]` returned 1 on the former path and 0 on the latter. Recurrence
+analysis lacked the loop's own binding environment and the element type of expanded
+`clojure.core/aget` reads. Both are now retained; dependent carry widths propagate
+to a fixed point, and Long/Float joins use the existing Double promotion rule.
+
+General structural let inference, recurrence scanning and loop seeding share a
+source-ordered lexical binding environment. Unknown locals explicitly shadow outer
+types rather than inheriting them, including lets inside recurrence expressions.
+Array load emission and inference share their retained operand-type translation;
+bare `aget` names are not treated as canonical intrinsics without source context.
+Numeric recurrence branch joins do not change general boxed-if emission.
+
+The numerical surface consequence is intentional: affected ordinary Float loops
+now honor their declared per-add Float precision. Explicit Double loops and genuine
+recurrence widening remain supported. This does not change AD rules, GPU reduction
+association, BLAS arithmetic policy or acceptance tolerances. The independent review
+found no remaining blockers; affected JVM suites pass 79 tests / 270 assertions in
+the capped REPL. Warm emitter reloads required fresh anonymous class names in that
+diagnostic process; no production counter/cache policy was changed. Cold CI is still
+required. Rebuild the real-checkpoint CPU oracle before comparing again: previously
+compiled ordinary functions retain the old arithmetic. The external real-weight
+gate remains held, and the eight-item campaign remains incomplete.
