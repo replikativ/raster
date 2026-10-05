@@ -75,8 +75,25 @@ The next forward therefore observes updated resident adapters, not the captured 
 arrays. The existing external `2e-2` worst-relative and loss tolerances are unchanged; previous
 output handles invalidate on replay. Cold preparation was 238 seconds in the capped REPL,
 including compilation and composition; this is a preparation-cost debt, not device throughput.
-OpenCL execution of this new complete loss-seed chain, a committed reproducible acceptance
-runner, real-weight/head training and the canonical external adapter migration remain open.
+The same full chain also executes on OpenCL with identical reported errors across both
+replays. Preparation took 230 seconds and binding 86 seconds under shared background load;
+these are observational costs, not a controlled performance comparison.
+
+The opt-in runner lives in `test/raster/acceptance/finetune_chain.clj`. In an isolated JVM,
+with a clean trusted checkout containing the pinned Git object, run:
+
+```sh
+clojure -J-Xmx1800m -J-Xss8m -M:dev -m raster.acceptance.finetune-chain \
+  '{:source-root "/path/to/finetune-rstr" :targets [:ocl:0 :ze:0]}'
+```
+
+It compares source files against the exact pinned object with Git replacement objects disabled,
+disables reader evaluation, preserves source line metadata, rejects existing external namespaces,
+and retains the original numerical and oracle definitions. Array lengths are checked before the
+external relative-error helper, which otherwise truncates comparisons. Ordinary CI runs only
+the hardware-independent loader/option/shape checks (7 tests / 20 assertions); it does not need
+the external checkout or treat native acceptance as a conditional pass.
+Real-weight/head training and the canonical external adapter migration remain open.
 
 ## Consolidation diagnostic — 2026-10-01
 
