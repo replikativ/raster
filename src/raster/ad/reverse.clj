@@ -4429,7 +4429,8 @@
                                         ~@params)]
                             ~slots))]
               (binding [*ns* source-ns] (eval form))
-              ((requiring-resolve 'raster.compiler.pipeline/compile-aot) (ns-resolve source-ns wrapper)))))
+              ((requiring-resolve 'raster.compiler.pipeline/compile-aot) (ns-resolve source-ns wrapper)
+                                                                          :reentrant? true))))
         (catch Throwable _ nil)))))
 
 (defn ^:no-doc prepare-value+grad
@@ -4471,7 +4472,9 @@
              of magnitude faster on scalar-heavy loops) instead of evaluating
              the AD-transformed body. Pipeline semantics apply: dead checked
              reads may be eliminated and float arithmetic follows the compiled
-             dtype. Falls back to the evaluated body when the pipeline cannot
+             dtype. The compiled function is reentrant (compile-aot
+             :reentrant?): it may be called concurrently and with any shapes.
+             Falls back to the evaluated body when the pipeline cannot
              compile `f`; `(:raster.ad.reverse/compiled? (meta vg))` says which.
 
   Usage:

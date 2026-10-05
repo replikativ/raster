@@ -1393,8 +1393,15 @@
     :target-device   - device-id for backend selection (e.g. :cuda:0 or :ze:0)
     :target          - :c routes to the native CPU-C backend (one fused C function
                        per deftm via Panama FFM, no per-op JVM dispatch). Bypasses
-                       the bytecode/GPU path."
-  [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?]
+                       the bytecode/GPU path.
+    :reentrant?      - allocate every buffer inside each call instead of hoisting
+                       it into the returned fn. Hoisted buffers are allocated once,
+                       at the first call's sizes, and shared by later calls: the
+                       default suits one caller with fixed shapes (a training
+                       loop); a reentrant fn may be called concurrently, with any
+                       shapes, and returns arrays no later call writes."
+  [f-var & {:keys [inline? simd? dtype target-device target preserve-declared-array-storage?
+                   reentrant?]
             :or {inline? true simd? true}}]
   (if (= target :c)
     ;; Native CPU-C backend: emit the whole fused body as one C function (no
@@ -1403,11 +1410,13 @@
      f-var (or dtype :double))
     (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
                      :target-device target-device
-                     :preserve-declared-array-storage? preserve-declared-array-storage?)))
+                     :preserve-declared-array-storage? preserve-declared-array-storage?
+                     :reentrant? reentrant?)))
 
 (defn- compile-aot-jvm
   "JVM/GPU compile-aot: bytecode (SIMD) or GPU (target-device) backend."
-  [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?]
+  [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?
+                   reentrant?]
             :or {inline? true simd? true}}]
   (let [;; Use the classloader that defined the target function's defrecord types.
         ;; Creating a child DCL causes class identity issues: defrecord classes
@@ -1478,7 +1487,7 @@
                                         (first walked-body)
                                         (list* 'do walked-body))
                              form (run-passes raw-form forward-passes opts)
-                             hoist-opts (cond-> {:dtype effective-dtype}
+                             hoist-opts (cond-> {:dtype effective-dtype :reentrant? reentrant?}
                                           param-env (assoc :param-env param-env)
                                           return-tag (assoc :return-tag return-tag)
                                           ;; Thread the deftm's defining namespace so the bytecode

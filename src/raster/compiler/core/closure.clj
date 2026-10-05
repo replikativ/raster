@@ -166,7 +166,10 @@
                              (.startsWith (str %) "Q_"))
                    tagged-syms (filter pred (map first rewritten-pairs))]
                (println "  [post-rewrite-alloc] " (count rewritten-pairs) "pairs total, K/V/Q-pattern:" (vec tagged-syms))))
-         safe-pairs (vec (filter #(hoist/hoist-safe-pair? params-set %) rewritten-pairs))
+         ;; A reentrant fn keeps every allocation in the call (see compile-aot).
+         safe-pairs (if (:reentrant? opts)
+                      []
+                      (vec (filter #(hoist/hoist-safe-pair? params-set %) rewritten-pairs)))
          safe-syms-set (set (map first safe-pairs))
          inner-pairs (vec (remove (fn [[sym _]] (contains? safe-syms-set sym)) rewritten-pairs))
          _ (when (System/getProperty "raster.debug.hoist")
