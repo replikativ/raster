@@ -59,19 +59,13 @@
     :inout :read-write
     :scalar nil))
 
-(defn derive-uses
-  "Derive the canonical ordered external memory uses from body parameters and arguments.
-
-   Reusing a compiler value in several read-only positions is harmless and collapses to one use.
-   A repeated binding involving a write is not an alias proof and is rejected here. In-place
-   access is represented by one `:inout` parameter, not split input/output parameters."
+(defn- uses-from-checked-body
   [kernel-body arguments]
-  (let [kernel-body (body/validate! kernel-body)]
-    (when-not (and (vector? arguments) (= (count (:parameters kernel-body)) (count arguments)))
-      (fail! :scheduled-kernel-body-arguments
-             "scheduled body arguments must align one-to-one with KernelBody parameters"
-             {:parameters (mapv :id (:parameters kernel-body)) :arguments arguments}))
-    (reduce
+  (when-not (and (vector? arguments) (= (count (:parameters kernel-body)) (count arguments)))
+    (fail! :scheduled-kernel-body-arguments
+           "scheduled body arguments must align one-to-one with KernelBody parameters"
+           {:parameters (mapv :id (:parameters kernel-body)) :arguments arguments}))
+  (reduce
      (fn [uses [parameter argument]]
        (if-let [access (parameter-access (:kind parameter))]
          (if-let [prior (some #(when (= argument (:value %)) %) uses)]
@@ -82,16 +76,18 @@
                     {:argument argument :prior prior :parameter parameter :access access}))
            (conj uses {:value argument :access access}))
          uses))
-     [] (map vector (:parameters kernel-body) arguments))))
+     [] (map vector (:parameters kernel-body) arguments)))
 
-(defn derive-scalar-bindings
-  "Derive ordered scalar bindings before target projection. With a typed graph environment,
-   logical expression widths come from that environment and any Long→int specialization is
-   explicitly checked-range. Without one, retain the body's declared identity bindings."
-  ([kernel-body arguments] (derive-scalar-bindings kernel-body arguments nil))
-  ([kernel-body arguments scalar-types]
-  (let [kernel-body (body/validate! kernel-body)]
-    (mapv (fn [[parameter argument]]
+(defn derive-uses
+  "Derive canonical ordered external memory uses after independently checking the body.
+   Repeated read-only bindings collapse; repeated bindings involving writes are rejected.
+   In-place access is represented by one :inout parameter, not split input/output parameters."
+  [kernel-body arguments]
+  (uses-from-checked-body (body/validate! kernel-body) arguments))
+
+(defn- scalar-bindings-from-checked-body
+  [kernel-body arguments scalar-types]
+  (mapv (fn [[parameter argument]]
             (let [physical (:dtype parameter)
                   logical (if (nil? scalar-types) physical
                             (if (contains? #{:int :long} physical)
@@ -106,11 +102,19 @@
               {:parameter (:id parameter) :value argument :dtype logical
                :kernel-dtype physical :conversion conversion}))
           (filter (fn [[parameter _]] (= :scalar (:kind parameter)))
-                  (map vector (:parameters kernel-body) arguments))))))
+                  (map vector (:parameters kernel-body) arguments))))
+
+(defn derive-scalar-bindings
+  "Derive ordered scalar bindings after independently checking the body. With a typed graph
+   environment, logical widths come from that environment and Long→int is checked-range.
+   Without one, retain the body's declared identity bindings."
+  ([kernel-body arguments] (derive-scalar-bindings kernel-body arguments nil))
+  ([kernel-body arguments scalar-types]
+   (scalar-bindings-from-checked-body (body/validate! kernel-body) arguments scalar-types)))
 
 (defn- validate-scalar-bindings!
   [kernel-body arguments scalar-bindings]
-  (let [expected (derive-scalar-bindings kernel-body arguments)
+  (let [expected (scalar-bindings-from-checked-body kernel-body arguments nil)
         valid-binding?
         (fn [identity-binding actual]
           (let [logical-dtype (some-> (:dtype actual) dtype/canon)
@@ -142,12 +146,9 @@
   [launch-spec]
   (concat (:workgroup-size launch-spec) (:group-count launch-spec)))
 
-(defn realized-launch
-  "Return the checked semantic launch after substituting ordered compiler arguments."
-  [scheduled]
-  (let [{kernel-body :body arguments :arguments} scheduled
-        kernel-body (body/validate! kernel-body)
-        parameters (:parameters kernel-body)
+(defn- launch-from-checked-body
+  [kernel-body arguments]
+  (let [parameters (:parameters kernel-body)
         substitutions (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
                             (map vector parameters arguments))
         scalar-parameters (filterv #(= :scalar (:kind %)) parameters)
@@ -167,6 +168,11 @@
     ;; proves structural substitution while `validate-against-node!` closes that context.
     (launch/rebind-spec body-launch substitutions)))
 
+(defn realized-launch
+  "Return the semantic launch after independently checking the body and substituting arguments."
+  [scheduled]
+  (launch-from-checked-body (body/validate! (:body scheduled)) (:arguments scheduled)))
+
 (defn validate!
   [scheduled]
   (when-not (scheduled-kernel-body? scheduled)
@@ -176,7 +182,9 @@
                 preconditions]
          kernel-body :body} scheduled
         kernel-body (body/validate! kernel-body)
-        expected-uses (derive-uses kernel-body arguments)]
+        ;; These private projections consume only the exact body checked in this invocation.
+        ;; Public helper entry points still validate independently; no authority escapes here.
+        expected-uses (uses-from-checked-body kernel-body arguments)]
     (when (nil? source)
       (fail! :scheduled-kernel-body-source
              "scheduled kernel body requires its exact source operation" {}))
@@ -214,7 +222,7 @@
              {:legality legality}))
     (numerics/validate! numerics {:reason :scheduled-kernel-body-numerics
                                   :ir :scheduled-kernel-body})
-    (realized-launch scheduled)
+    (launch-from-checked-body kernel-body arguments)
     (doseq [[field value] [[:legality legality] [:numerics numerics]
                            [:provenance provenance] [:attributes attributes]]]
       (when-not (map? value)

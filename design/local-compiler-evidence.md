@@ -1239,3 +1239,14 @@ per preparation, while reusing only source-free certified structure.
 The partial-patch heat evolution acceptance was also rechecked on both available local OpenCL
 and Level Zero: 2 tests / 36 assertions pass. This does not add subcycling, reflux, production
 regridding control or an external AMR accuracy comparison.
+
+### Invocation-local scheduled-body validation — 2026-10-06
+
+An instrumented regression found four validations of the identical KernelBody within one
+ScheduledKernelBody validation. Private synchronous projections now consume the exact body
+already checked in that invocation, reducing this count to one. Each public helper still
+validates independently, including after body mutation; no cache, reusable proof token or
+trust flag is introduced. Argument, alias, scalar conversion, effect, numerical and launch
+checks remain in place. The affected scheduled-body, emitted-equation and OpenCL emitter
+suites pass 46 tests / 503 assertions in the capped warm REPL. This measures removed duplicate
+validation, not end-to-end compilation speedup or training numerical acceptance.

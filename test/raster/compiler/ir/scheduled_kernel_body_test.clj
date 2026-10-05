@@ -51,6 +51,33 @@
                               {:expression (launch/product 'n 'next-n) :op :<= :value 42}])
        (dissoc :scalar-bindings))))
 
+(deftest each-public-schedule-entry-checks-its-body-once
+  (let [value (conditioned-fixture)
+        check-body body/validate!
+        calls (atom 0)
+        entries [(fn [value] (scheduled/validate! value))
+                 (fn [value] (scheduled/derive-uses (:body value) (:arguments value)))
+                 (fn [value] (scheduled/derive-scalar-bindings (:body value) (:arguments value)))
+                 (fn [value] (scheduled/derive-scalar-bindings
+                              (:body value) (:arguments value) {'rows :int}))
+                 scheduled/realized-launch]]
+    (with-redefs [body/validate! (fn [kernel-body]
+                                  (is (identical? (:body value) kernel-body))
+                                  (swap! calls inc)
+                                  (check-body kernel-body))]
+      (doseq [entry entries]
+        (reset! calls 0)
+        (entry value)
+        (is (= 1 @calls) "one independently checked body per public call")))
+    (let [bad (assoc-in value [:body :parameters 0 :dtype] :unknown)]
+      (with-redefs [body/validate! (fn [kernel-body]
+                                    (swap! calls inc)
+                                    (check-body kernel-body))]
+        (doseq [entry entries]
+          (reset! calls 0)
+          (is (thrown? clojure.lang.ExceptionInfo (entry bad)))
+          (is (= 1 @calls) "modified bodies are freshly checked, never trusted"))))))
+
 (deftest scheduled-preconditions-use-physical-integral-scalar-identities
   (let [value (conditioned-fixture)]
     (is (= value (scheduled/validate! value)))
