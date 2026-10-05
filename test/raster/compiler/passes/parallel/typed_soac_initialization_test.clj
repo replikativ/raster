@@ -192,6 +192,7 @@
 (deftest linker-overwrite-proof-uses-typed-domain-not-only-write-permission
   (let [compiled (equation-first/compile #'fixed-capacity-prefix {:target :cuda:0 :dtype :float})
         emitted (last (get-in compiled [:emitted :equations]))
+        boundaries (#'invocation-link/equation-boundaries {:equations [emitted]})
         algorithm (:algorithm (first (:operations emitted)))
         equation (last (dialect/equations algorithm))
         destination (first (dialect/physical-results algorithm equation))
@@ -201,11 +202,11 @@
                                        [8 9 #{}] [16 8 #{}] [4 4 #{destination}]]]
       (is (= expected
              (#'invocation-link/write-before-read-inputs
-              {:equations [emitted]}
+              boundaries
               {:program-buffers {destination {:id :storage :shape [capacity]}}}
               {domain {:type :long :value extent}}))))
     (is (empty? (#'invocation-link/write-before-read-inputs
-                 {:equations [emitted]}
+                 boundaries
                  {:program-buffers {destination {:id :storage :shape [8]}}} {}))
         "an unavailable extent cannot prove complete coverage")
     (let [operation (first (:operations emitted))
