@@ -4139,18 +4139,38 @@
                                (every? some? inferred-types)
                                (apply = inferred-types)
                                (primitive? (first inferred-types)))
-            result-type (if uniform-prim? (first inferred-types) :ref)]
+            result-type (if uniform-prim? (first inferred-types) :ref)
+            emit-result (fn [t]
+                          (cond
+                            (diverge? t) nil
+                            (= t :void)
+                            (if (= result-type :ref)
+                              (.aconst_null code)
+                              (throw (ex-info "case branch does not produce its predicted value"
+                                              {:reason :case-result-type :expected result-type})))
+                            (not= t result-type)
+                            (if (or (and (= result-type :ref) (primitive? t))
+                                    (and (primitive? result-type)
+                                         (or (= t :ref)
+                                             (and (primitive? t)
+                                                  (or (not= result-type :bool)
+                                                      (contains? #{:int :bool} t))))))
+                              (emit-coerce code t result-type)
+                              (throw (ex-info "case branch cannot produce its predicted stack type"
+                                              {:reason :case-result-type
+                                               :actual t :expected result-type})))))]
         (doseq [[[_ [test-val result-expr]] label] (map vector sorted-entries case-labels)]
           (.labelBinding code label)
           (let [t (emit-form code result-expr locals ctx)]
-            (when (and (not uniform-prim?) (primitive? t))
-              (emit-box-to-ref code t))
+            ;; Prediction selects the merge type, not the actual stack shape.
+            ;; A loop may still emit a boxed primitive; reconcile every reaching
+            ;; branch (including the default) with the chosen merge type.
+            (emit-result t)
             (when-not (diverge? t)
               (.goto_ code after-label))))
         (.labelBinding code default-label)
         (let [t (emit-form code default-expr locals ctx)]
-          (when (and (not uniform-prim?) (primitive? t))
-            (emit-box-to-ref code t))
+          (emit-result t)
           (when-not (diverge? t)
             (.goto_ code after-label)))
         (.labelBinding code after-label)

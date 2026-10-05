@@ -29,6 +29,42 @@
   (loop [a (float 1.0e8) b (float 0.0) i 0]
     (if (< i 2) (recur (+ a step) (+ b a) (inc i)) b)))
 
+(deftm case-loop-result [src :- (Array double) count :- Long tag :- Long] :- Double
+  (case (int tag)
+    0 (let [answer (loop [i 0 sum 0.0]
+                     (if (< i count)
+                       (recur (inc i) (+ sum (clojure.core/aget src i)))
+                       sum))]
+        answer)
+    1 9.0
+    (loop [i 0 sum 0.0]
+      (if (< i count)
+        (recur (inc i) (+ sum (clojure.core/aget src i)))
+        sum))))
+
+(deftest case-reconciles-boxed-loop-branches-with-its-primitive-merge
+  (let [compiled (pipeline/compile-aot #'case-loop-result)]
+    (doseq [[input expected] [[(double-array [1 2 3]) 6.0] [(double-array 0) 0.0]]
+            tag [0 1 2]]
+      (let [answer (if (= tag 1) 9.0 expected)]
+        (is (== answer (case-loop-result input (count input) tag)))
+        (is (== answer (compiled input (count input) tag)))))))
+
+(deftest case-rejects-a-corrupt-boolean-result-prediction-before-verification
+  (let [branch (with-meta '(let* [] 1.5) {:raster.type/tag 'boolean})
+        body (list 'case* 0 0 0 branch {0 [0 branch]} :compact :int)
+        reason (try
+                 (bytecode/compile-specialized-class!
+                   (str "raster.test.CorruptCase" (gensym))
+                   [{:name 'corrupt :params [] :walked-body [body]
+                     :source-ns *ns* :return-tag 'boolean :element-type 'double}])
+                 nil
+                 (catch Exception error
+                   (loop [cause error]
+                     (or (:reason (ex-data cause))
+                         (when-let [nested (ex-cause cause)] (recur nested))))))]
+    (is (= :case-result-type reason))))
+
 (deftest mapped-float-carry-retains-per-add-rounding
   (let [input (float-array [1.0e8 4.0 1.0 2.0 -1.0e8 -1.0])
         ordinary (grouped-carry input 1 3 2)

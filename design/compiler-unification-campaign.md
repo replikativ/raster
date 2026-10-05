@@ -2896,3 +2896,20 @@ diagnostic process; no production counter/cache policy was changed. Cold CI is s
 required. Rebuild the real-checkpoint CPU oracle before comparing again: previously
 compiled ordinary functions retain the old arithmetic. The external real-weight
 gate remains held, and the eight-item campaign remains incomplete.
+
+Cold CI then exposed three `matrix-norm` verifier errors: improved lexical inference
+made `case*` predict a uniform primitive result, but a loop arm still emitted a boxed
+value. Case emission now reconciles each actual reaching branch, including its default,
+with the chosen stack merge type. Unsupported coercions and void-to-primitive predictions
+fail before verification instead of silently claiming a conversion. Named/default loop
+arms, empty/nonempty inputs and a deliberately corrupt Boolean prediction are covered.
+The final affected JVM plus dense-linear-algebra run passes 95 tests / 312 assertions;
+the replacement exact-head cold CI run remains required before merge.
+
+A fresh capped process rebuilding the pinned real-checkpoint oracle still declines:
+loss error is 0.009375, input-gradient relative error 0.005526, and 11/28 adapter
+coordinate-relative checks exceed the unchanged 0.02 threshold (maximum 1.06532).
+The loop precision discrepancy is therefore fixed independently of the remaining
+training mismatch. Continue identical-operand BLAS/sequential-FP32/public-GPU
+triangulation and attention-cotangent isolation; do not silently change the oracle,
+relax tolerance or promote schedules on this evidence.
