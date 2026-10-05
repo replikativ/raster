@@ -162,6 +162,10 @@
       result)
     :else (numeric/+ a b)))
 
+;; Typed only when both adjoints share a tag: a known tag rules out nil, and
+;; mixed scalar/array operands broadcast to the array, so no single arg decides.
+(op/register-result-type! 'raster.ad.reverse/grad-acc :common-arg-tag)
+
 (defn aget-grad
   "Gradient of array element read: y = arr[i].
   Returns a zero array of same size as arr, with dy at position i.
@@ -171,6 +175,10 @@
         g (arrays/alloc-like arr n)]
     (arrays/aset g (int i) dy)
     g))
+
+;; The cotangent buffer has the primal array's type; without this facet every
+;; downstream read of it is an untyped (reflective) aget.
+(op/register-result-type! 'raster.ad.reverse/aget-grad :same-as-first-arg)
 
 ;; ================================================================
 ;; Normalization: flatten form for uniform AD processing
@@ -296,6 +304,12 @@
         ;; Comparison: returns a boolean, never active
         (or (comparison-op? (op/semantic-op init-expr))
             (op/comparison-kind (op/semantic-op init-expr))) false
+
+        ;; An array's length is an integer shape, never a gradient carrier
+        (or (contains? '#{alength clojure.core/alength raster.arrays/alength}
+                       (op/semantic-op init-expr))
+            (and (= '.invk head) (symbol? (second init-expr))
+                 (.startsWith (name (second init-expr)) "alength_m_"))) false
 
         ;; The predicate is discrete; activity comes from either lexical arm.
         (= 'if head)
@@ -1876,6 +1890,42 @@
 ;; Par map reverse-mode AD (preserves parallel structure)
 ;; ================================================================
 
+(defn- replayable-gather-index?
+  "A sequential scan may scatter at a data-dependent index when the backward
+  iteration can recompute that index exactly: a pure expression of the scan
+  index and loop-invariant values, reading only constant arrays. Body locals
+  are excluded because lifted reads are replayed before the scalar bindings."
+  [index idx-sym locals]
+  (let [free (util/free-syms index)]
+    (and (seq? index)
+         (contains? free idx-sym)
+         (not-any? locals free)
+         (not-any? gradient-bearing-array-read? (tree-seq coll? seq index))
+         (= :pure (effects/analyze-effect index)))))
+
+(defn- scan-read-lifter
+  "Returns (fn lift [expr scoped? locals]) that replaces each admitted active
+  array read with (on-read arr index). Reads at the map index are admitted
+  everywhere; sequential scans additionally admit unconditional reads at an
+  integer literal or a replayable gather index. Parallel map/reduce must not
+  receive the sequential permission: repeated destinations would race."
+  [idx-sym sequential? on-read]
+  (fn lift [expr scoped? locals]
+    (cond
+      (and (gradient-bearing-array-read? expr)
+           (or (= idx-sym (nth expr 2))
+               (and sequential? (not scoped?)
+                    (not (contains? locals (nth expr 1)))
+                    (or (integer? (nth expr 2))
+                        (replayable-gather-index? (nth expr 2) idx-sym locals)))))
+      (on-read (nth expr 1) (nth expr 2))
+      (seq? expr)
+      (let [{:keys [kind liftable?]} (form/form-info expr)
+            nested-scope? (or scoped? (= :binding kind) (not liftable?))]
+        (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr)))
+      (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
+      :else expr)))
+
 (defn- analyze-par-map-body
   "Analyze a par/map! body for aget references and free scalars.
   Returns {:agets [{:sym :arr :idx} ...], :scalar-bindings [[sym init] ...],
@@ -1892,8 +1942,8 @@
        array-input scatter machinery instead of being mistaken for a free scalar
        (which would reduce → `No promotion rule for + with Double and double[]`).
   Inline reads use the map index by default. Sequential scan may additionally admit literal
-  indices in unconditional scalar expressions; its backward loop scatter-adds at those indices.
-  This permission must not reach parallel map/reduce, where repeated destinations can race."
+  or replayable gather indices in unconditional scalar expressions (see scan-read-lifter);
+  its backward loop scatter-adds at those indices."
   ([body-expr idx-sym] (analyze-par-map-body body-expr idx-sym false))
   ([body-expr idx-sym literal-index-reads?]
   (let [agets (atom [])
@@ -1909,26 +1959,15 @@
     ;; (2) lift admitted inline reads, deduplicating by array AND original index.
     ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
-          lift (fn lift [expr scoped? locals]
-                 (cond
-                   (and (gradient-bearing-array-read? expr)
-                        (or (= idx-sym (nth expr 2))
-                            (and literal-index-reads? (not scoped?)
-                                 (not (contains? locals (nth expr 1)))
-                                 (integer? (nth expr 2)))))
-                   (let [arr (nth expr 1) index (nth expr 2)
-                         k [arr index]]
-                     (or (get @seen k)
-                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
-                           (swap! seen assoc k s)
-                           (swap! agets conj {:sym s :arr arr :idx index})
-                           s)))
-                   (seq? expr)
-                   (let [{:keys [kind liftable?]} (form/form-info expr)
-                         nested-scope? (or scoped? (= :binding kind) (not liftable?))]
-                     (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr)))
-                   (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
-                   :else expr))
+          lift (scan-read-lifter
+                idx-sym literal-index-reads?
+                (fn [arr index]
+                  (let [k [arr index]]
+                    (or (get @seen k)
+                        (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
+                          (swap! seen assoc k s)
+                          (swap! agets conj {:sym s :arr arr :idx index})
+                          s)))))
           ;; These top-level bindings were stripped above. A lifted read is replayed
           ;; before scalar bindings, so it must not capture their aliases/shadows.
           body-result (lift body-result0 false (set (map first bindings)))
@@ -2576,8 +2615,11 @@
         d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
         n-bwd-sym (ad-gensym "n_bwd")
         d-carry-sym (ad-gensym "d_carry")
-        grads-sym (ad-gensym "grads")
         n-agets (count agets)
+        ;; Splice the step's gradient program into the backward iteration so
+        ;; its typed scalar adjoints reach the accumulators and scatters
+        ;; directly, without a per-step gradient vector.
+        [_ step-bindings step-grads] scalar-transform
 
         shadow-allocs (vec (mapcat (fn [d-arr-sym arr-sym]
                                      [d-arr-sym (list 'raster.arrays/zeros-like arr-sym
@@ -2596,8 +2638,8 @@
               ;; Re-bind the body's array reads at their ORIGINAL indices.
               (mapcat (fn [{:keys [sym arr idx]}] [sym (list 'aget arr idx)]) agets)
               [total-sym (list 'raster.ad.reverse/grad-acc
-                               (list 'aget d-out-sym idx-sym) d-carry-sym)
-               grads-sym scalar-transform]
+                               (list 'aget d-out-sym idx-sym) d-carry-sym)]
+              step-bindings
               ;; Scatter-ADD each read's cotangent at the read's own index
               ;; (read-modify-write: correct for repeated reads of one array
               ;; and for shifted indices like (aget x (- idx 1))).
@@ -2607,23 +2649,28 @@
                            (list 'aset d-arr idx
                                  (list 'raster.ad.reverse/grad-acc
                                        (list 'aget d-arr idx)
-                                       (list 'nth grads-sym (clojure.core/+ 1 k))))]))
+                                       (nth step-grads (clojure.core/+ 1 k))))]))
                       (range) agets)))
 
         bwd-recur-args
         (list* (list 'clojure.core/- idx-sym 1)
                ;; the carry cotangent chains: δacc_{i-1} = grads[∂body/∂acc]
-               (list 'nth grads-sym 0)
+               (nth step-grads 0)
                (map-indexed (fn [i d-s]
                               (list 'raster.ad.reverse/grad-acc d-s
-                                    (list 'nth grads-sym
-                                          (clojure.core/+ 1 n-agets i))))
+                                    (nth step-grads (clojure.core/+ 1 n-agets i))))
                             d-scalar-syms))
 
         bwd-loop-init
         (vec (concat [idx-sym (list 'clojure.core/- n-bwd-sym 1)
                       d-carry-sym 0.0]
-                     (mapcat (fn [s] [s nil]) d-scalar-syms)))
+                     ;; Typed zeros keep scalar accumulators primitive.
+                     (mapcat (fn [s p]
+                               [s (if (= :scalar (:kind (tangent/tangent-kind
+                                                         (:raster.type/tag (meta p)))))
+                                    (param-zero-expr p)
+                                    nil)])
+                             d-scalar-syms active-free)))
 
         ;; Loop value: [d_read_arr_0 ... d_scalar_0 ... d_init-carry]
         bwd-return (conj (vec (concat d-read-arr-syms d-scalar-syms)) d-carry-sym)
@@ -3076,6 +3123,9 @@
          (= 2 (count expr))) :double
     (instance? Double expr) :double
     (instance? Float expr) :float
+    ;; a scoped step's value is its body tail
+    (and (seq? expr) (contains? #{'let 'let*} (first expr)) (< 2 (count expr)))
+    (recur (last expr))
     (or (symbol? expr) (seq? expr))
     (let [{:keys [kind dtype]} (tangent/tangent-kind
                                 (or (:raster.type/tag (meta expr))
@@ -3137,6 +3187,36 @@
   through to the pre-canonicalization paths, exactly as before."
   [dtype body]
   (every? #(= dtype %) (patterns/read-array-elem-types body)))
+
+(defn- active-reads-match-dtype?
+  "Every active array read anywhere in `expr` (including let* binding inits,
+  which read-array-elem-types does not descend into) has element dtype
+  `dtype`; its cotangent scatters into a shadow of that array. Unstamped
+  arrays contribute no evidence, as in read-array-elem-types."
+  [dtype expr]
+  (every? (fn [read]
+            (case (:raster.type/tag (meta (second read)))
+              floats (= dtype :float)
+              doubles (= dtype :double)
+              (nil Object) true
+              false))
+          (filter gradient-bearing-array-read? (tree-seq coll? seq expr))))
+
+(defn- scan-prelude-reads-replayable?
+  "True when every active array read in a carry-loop let prelude is one the
+  par/scan pullback can replay and scatter into (scan-read-lifter)."
+  [bindings index-sym]
+  (let [lift (scan-read-lifter index-sym true (fn [_ _] '_read))]
+    (:ok? (reduce (fn [{:keys [locals]} [sym init]]
+                    (let [ok? (if (gradient-bearing-array-read? init)
+                                (= '_read (lift init false locals))
+                                (not-any? gradient-bearing-array-read?
+                                          (tree-seq coll? seq (lift init false locals))))]
+                      (if ok?
+                        {:ok? true :locals (conj locals sym)}
+                        (reduced {:ok? false}))))
+                  {:ok? true :locals #{}}
+                  bindings))))
 
 (defn- carry-loop->scan
   "Rewrite a carry loop into its canonical par/scan form, or nil when the
@@ -3205,16 +3285,13 @@
                   (not (patterns/contains-sym? bound-expr acc-sym))
                   (every? (fn [[_ init]] (= :pure (effects/analyze-effect init)))
                           bindings)
-                  ;; The scan pullback reconstructs the step, but this narrow
-                  ;; lift has no scatter residual for an active array read in
-                  ;; the let prelude. Keep such loops on their existing AD path.
-                  (every? (fn [read]
-                            (contains? *constant-gradient-arrays* (second read)))
-                          (filter #(and (seq? %) (op/aget-op? (first %)))
-                                  (mapcat (fn [[_ init]] (tree-seq coll? seq init))
-                                          bindings)))
+                  ;; The scan pullback replays the prelude's active array reads
+                  ;; and scatter-adds their cotangents. Reads it cannot replay
+                  ;; keep the loop on its existing AD path.
+                  (scan-prelude-reads-replayable? bindings index-sym)
                   (some? dtype)
-                  (carry-dtype-consistent? dtype scoped-update-expr))
+                  (carry-dtype-consistent? dtype scoped-update-expr)
+                  (active-reads-match-dtype? dtype scoped-update-expr))
          (emit-carry-scan {:out nil
                            :dtype dtype
                            :cast (case dtype :float 'float :double 'double)

@@ -177,10 +177,19 @@
                    (let* [y (* 2.0 i)]
                      (recur (inc i) (+ sum y)))
                    sum)))))
+  ;; An active read the scan pullback can replay (step index or a gather
+  ;; through it) is scattered there; any other index keeps the loop path.
+  (is (some? (with-bindings {(var rev/*constant-gradient-arrays*) '#{idx}}
+                ((var rev/carry-loop->scan)
+                 '(loop* [i 0 sum 0.0]
+                    (if (< i count)
+                      (let* [y (aget ys (aget idx i))]
+                        (recur (inc i) (+ sum y)))
+                      sum))))))
   (is (nil? ((var rev/carry-loop->scan)
              '(loop* [i 0 sum 0.0]
                 (if (< i count)
-                  (let* [y (aget ys i)]
+                  (let* [y (aget ys offset)]
                     (recur (inc i) (+ sum y)))
                   sum)))))
   (is (nil? ((var rev/carry-loop->scan)
