@@ -68,6 +68,15 @@ host callbacks and final LinkPlan obligations remain fresh. No proof is attached
 and callbacks do not inherit the projection scope. Native Gemma trajectory acceptance and
 the original external training/distributed/multilevel campaign gates remain open.
 
+The first post-consolidation large check compiles in 118 seconds and lowers in 51 seconds,
+again retaining 123 tensor calls and all 50 intended mixed selections without driver allocation.
+An inclusive repeat takes 42 seconds: boundary queries fall from 905 to 290, KernelBody
+validations from 70,122 to 20,883, and call construction from 32 seconds to 2 seconds. Timing
+conditions are not controlled; call counts, unlike wall-time ratios, directly identify removed
+duplicate work. Remaining boundary queries account for 18 seconds and justify auditing the
+existing complete-write consumers next, before adding any further retained facts or changing
+native/default schedules. No native trajectory or end-to-end training speedup is established.
+
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
 the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule

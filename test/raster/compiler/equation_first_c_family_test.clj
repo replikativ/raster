@@ -157,15 +157,16 @@
           [key entry] (first @(var-get #'compiled/compilation-template-cache))
           compilation @(:value entry)
           evidence (#'compiled/owned-emitted-validation {:key key :entry entry} compilation)
-          original emitted-equation/physical-results
+          original emitted-equation/validate-with-physical-results
           projections (atom 0)]
-      (with-redefs [emitted-equation/physical-results
+      (with-redefs [emitted-equation/validate-with-physical-results
                     (fn [boundary] (swap! projections inc) (original boundary))]
         (let [fresh (equation-first/lower compilation args)
               independent-count @projections
               retained (:plan (equation-first/lower compilation args (fn [plan] {:plan plan})
                                                     evidence))]
-          (is (= 1 independent-count) "ordinary lowering independently derives storage projection")
+          (is (= 1 independent-count)
+              "ordinary lowering independently proves the boundary and derives storage together")
           (is (= independent-count @projections) "owned projection avoids only static re-derivation")
           (is (= (:values fresh) (:values retained)))
           (is (= (:outputs fresh) (:outputs retained)))
