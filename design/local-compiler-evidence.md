@@ -1,5 +1,51 @@
 # Local compiler evidence — 2026-09-27
 
+## Public training and resident GEMM checkpoint — 2026-10-06
+
+PR #1054 (`e57ba203`) migrates the existing mixed Gemma fixture onto public equation-first
+lowering, instantiation, replay and close, removing its descriptor/session helpers. The local
+small FP32 fixture passes 43 assertions with matching independent CPU/GPU trajectories. The
+25-step mixed fixture passes 35 assertions: all 50 eligible contractions select mixed matrix
+execution (21 NT, 15 NN, 14 TN), planned and bound graphs agree, and preparation allocates no
+driver buffers. FP32 loss decreases from 2.281172 to 1.261994; mixed ends at 1.262064, within
+the existing per-step relative tolerance. The combined two tests have no failures/errors.
+This is small-block training acceptance, not external real-weight training or throughput.
+All seven exact-head CI gates passed before #1054 and its proof-consolidation prerequisite #1057
+were squash-merged. Focused proof-consolidation checks pass 77 tests / 620 assertions.
+
+The existing `raster.perf.production-canary/equation-gemm!` then checks `[64 64 64]` with
+explicit portable and register-tiled FP32 schedules on both local backends. Every run passes
+its independent exact dyadic oracle before and after measurement and emits one kernel.
+Each uses a 300 ms device-event measurement budget; compile, bind, transfers and validation
+are outside the samples. Environment label: `local-arc-shared-load-power-save`; source tree
+was the reviewed `a436a891` tree, identical to the rebased #1054 tree.
+
+| Backend | Requested schedule | Median ns | CV | Stationary heuristic | Samples |
+|---|---|---:|---:|---|---:|
+| OpenCL | portable | 48,333 | 0.102 | no | 2,920 |
+| OpenCL | register-tiled | 29,687 | 0.061 | yes | 7,164 |
+| Level Zero | portable | 54,271 | 0.033 | yes | 5,581 |
+| Level Zero | register-tiled | 33,125 | 0.039 | yes | 10,000 |
+
+These are separate short runs on one shared-load device, not alternating-round measurements,
+an external BLAS baseline or general performance acceptance. In particular, the OpenCL portable
+series does not support a stationary comparison. No baseline or schedule default is promoted.
+Reproduce with the existing canary, holding shape, numerical policy and environment fixed;
+keep raw chronological samples and use the matched-round comparison protocol for promotion.
+External package migration, real-weight chained training, larger shape ladders and competitive
+cross-system measurements remain required by campaign items 3–5.
+
+The next unchanged external two-layer forward/loss-seed/VJP graph prepares through public
+composition in a clean `9e9ba5d` finetune snapshot. A cold thread sample inside emission exposes
+wrapping-collective helper discovery traversing all nested record collections, including retained
+proof/source attributes. Discovery now reuses the existing executable-region walker and receives
+operation roots once, rather than recursively revisiting an already flattened list. Both If arms,
+ForLoop, PipelinedFor, Guard and both While regions are covered; collectives are not legal inside
+ScalarExpr operands or matrix store scalar regions. The before-fix regression reaches irrelevant
+proof data; after the fix the full scalar emitter suite passes 24 tests / 352 assertions.
+This is traversal deduplication with unchanged helper/emission coverage, not a measured compiler
+speedup. Scalar-expression discovery and independent KernelBody validation remain unchanged.
+
 ## Consolidation diagnostic — 2026-10-01
 
 The existing public equation-first GEMM canary executed `[32 32 32]`, strict FP32,
