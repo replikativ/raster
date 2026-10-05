@@ -1,8 +1,29 @@
 (ns raster.compiler.fixtures.contractions
   (:require [raster.core :refer [deftm]]
             [raster.arrays]
+            [raster.linalg.blas :as blas]
             [raster.numeric]
             [raster.par]))
+
+;; Projection fixtures keep the BLAS source boundary distinct from an explicitly
+;; ordered fold. Their CPU implementations are not bitwise FP32 fold oracles.
+(deftm projected-nn [a :- (Array float) b :- (Array float)
+                     m :- Long k :- Long n :- Long] :- (Array float)
+  (let [c (float-array (* m n))]
+    (blas/dgemm! a b c m k n (float 1.0) (float 0.0))
+    c))
+
+(deftm projected-nt [a :- (Array float) b :- (Array float)
+                     m :- Long k :- Long n :- Long] :- (Array float)
+  (let [c (float-array (* m n))]
+    (blas/dgemm-nt! a b c m k n (float 1.0) (float 0.0))
+    c))
+
+(deftm projected-tn [a :- (Array float) b :- (Array float)
+                     m :- Long k :- Long n :- Long] :- (Array float)
+  (let [c (float-array (* m n))]
+    (blas/dgemm-tn! a b c m k n (float 1.0) (float 0.0))
+    c))
 
 (deftm fixed-matmul
   "Ragged NN contraction shared by source and device schedule oracles."

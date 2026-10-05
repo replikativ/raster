@@ -2913,3 +2913,29 @@ The loop precision discrepancy is therefore fixed independently of the remaining
 training mismatch. Continue identical-operand BLAS/sequential-FP32/public-GPU
 triangulation and attention-cotangent isolation; do not silently change the oracle,
 relax tolerance or promote schedules on this evidence.
+
+### Same-operand contraction numerical evidence — 2026-10-06
+
+NN, NT and TN BLAS projections now have a bounded public-device regression against
+an independent sequential FP32 oracle, rounding every product and addition. It covers
+reduction widths 3, 17 and 640 with nondyadic inputs, plus `[1e8, 1, -1e8]`
+cancellation in each physical layout. The affected public matrix replay selection
+passes 4 tests / 78 assertions on local OpenCL and Level Zero, with no native skips.
+This checks the current portable evaluation order, not CPU BLAS bitwise equivalence
+or an optimized matrix-family throughput claim.
+
+A separate same-operand CPU/OpenCL diagnostic uses threaded MKL (thread environment
+variables unset). GPU output matches explicit sequential FP32 exactly in all nine
+smooth-input cases; MKL differs by up to 9.06e-6 absolute. The pipeline documentation
+therefore no longer promises that `:f32-scalar` bit-tracks CPU BLAS. Exactness refers
+to the retained typed evaluation order, and excluding FP16 does not guarantee a
+full-gradient coordinate-relative bound near cancellation.
+
+Remaining design obligation: state the arithmetic permission of projected BLAS
+operations at their existing semantic boundary and preserve it through TypedSOAC,
+scheduling, executable/tuning identity and reference selection. Ordered source folds,
+abstract BLAS products and explicitly reassociated schedules must not silently share
+an exactness claim. Do not introduce a second registry or weaken the real-checkpoint
+gate to paper over this distinction. Continue same-input attention pullback isolation
+before deciding whether that gate exposes a miscompile or an inadequate arithmetic
+equivalence specification. External full-model training acceptance is still open.
