@@ -53,3 +53,33 @@
   (is (nil? (rev/grad-acc nil nil)))
   (is (== 2.0 (rev/grad-acc nil 2.0)))
   (is (= [3.0 4.0] (vec (rev/grad-acc 1.0 (double-array [2.0 3.0]))))))
+
+(deftm scaled-sum [x :- (Array double), k :- Double] :- Double
+  (let [n (alength x) tmp (double-array n)]
+    (dotimes [i n] (aset tmp i (* k (aget x i))))
+    (loop [i 0 acc 0.0] (if (< i n) (recur (inc i) (+ acc (aget tmp i))) acc))))
+
+(defn- concurrent-results
+  "Each of four threads calls f on its own args many times; returns the
+  distinct results each thread saw."
+  [f arg-lists]
+  (let [runs (doall (for [args arg-lists]
+                      (future (into #{} (repeatedly 2000 #(let [r (apply f args)]
+                                                            (if (sequential? r)
+                                                              (mapv (fn [v] (if (number? v) v (vec v))) r)
+                                                              r)))))))]
+    (mapv deref runs)))
+
+(deftest reentrant-compiled-functions-allocate-per-call
+  (let [f (pipeline/compile-aot #'scaled-sum :reentrant? true)
+        arg-lists (for [k (range 4)] [(double-array (range (+ 100 k))) (double (inc k))])]
+    (is (= (mapv #(hash-set (apply scaled-sum %)) arg-lists)
+           (concurrent-results f arg-lists))
+        "concurrent calls with different shapes each see their own result")))
+
+(deftest compiled-value+grad-is-reentrant
+  (let [vg (rev/value+grad #'logistic-lp :wrt [0 1 2] :compile? true)
+        arg-lists (for [k (range 4)] [(* 0.1 k) (- 0.2 (* 0.1 k)) 0.3 xs ys (- cnt (* 10 k))])
+        expected (mapv #(let [r (apply vg %)] (hash-set (vec (take 4 r)))) arg-lists)]
+    (is (= expected (mapv (fn [s] (into #{} (map #(vec (take 4 %))) s))
+                          (concurrent-results vg arg-lists))))))
