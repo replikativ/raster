@@ -201,21 +201,28 @@
               (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
             (soac-complete-write? equation id capacity scalars buffers storage))))))
 
+(defn- equation-boundaries
+  "Inspect each immutable operation boundary once within this lowering invocation.
+   This retains no validation authority across calls and never selects a runtime alternative."
+  [parallel-program]
+  (into []
+        (keep (fn [equation]
+                (when-let [operation (first (:operations equation))]
+                  {:operation operation :graph (equation-dispatch/boundary-graph operation)})))
+        (:equations parallel-program)))
+
 (defn- write-before-read-inputs
-  [parallel-program materialized scalars]
+  [boundaries materialized scalars]
   (let [program-buffers (:program-buffers materialized)
         buffers (into {} (map (fn [[id buffer]] [id (:id buffer)])) program-buffers)
         storage (into {} (map (fn [[_ buffer]] [(:id buffer) buffer])) program-buffers)]
   (into #{}
         (keep (fn [id]
                 (let [[access operation]
-                      (some (fn [equation]
-                              (when-let [operation (first (:operations equation))]
-                                (when-let [access (graph-buffer-access
-                                                   (equation-dispatch/boundary-graph operation)
-                                                   id)]
-                                  [access operation])))
-                            (:equations parallel-program))]
+                      (some (fn [{:keys [operation graph]}]
+                              (when-let [access (graph-buffer-access graph id)]
+                                [access operation]))
+                            boundaries)]
                   (when (and (= :write access)
                              (complete-write? operation id
                                               (reduce *' 1 (:shape (get program-buffers id)))
@@ -229,17 +236,15 @@
    partials replaced by workgroup storage). The invocation plan intentionally predates scheduling,
    so it can still materialize that binding. Only graph-boundary arrays, host array operands,
    outputs, and buffers needed to resolve their `(extent x)` shapes survive into the LinkPlan."
-  [parallel-program]
+  [parallel-program boundaries]
   (let [values (:values parallel-program)
         array-value? #(seq (:shape (get values %)))
         graph-values
         (into #{}
-              (mapcat (fn [equation]
-                        (when-let [operation (first (:operations equation))]
-                          (let [kernel-graph (equation-dispatch/boundary-graph operation)]
-                            (concat (map :id (:inputs kernel-graph))
-                                    (map :id (:outputs kernel-graph)))))))
-              (:equations parallel-program))
+              (mapcat (fn [{:keys [graph]}]
+                        (concat (map :id (:inputs graph))
+                                (map :id (:outputs graph)))))
+              boundaries)
         host-values
         (into #{}
               (comp (filter #(true? (get-in % [:attributes :host-only])))
@@ -404,9 +409,10 @@
                     :program-inputs (:inputs parallel-program)}))
         scalars (:program-scalars materialized)
         shape-scalars (merge (invocation-shape-scalars materialized) scalars)
-        overwrite-inputs (write-before-read-inputs parallel-program
+        boundaries (equation-boundaries parallel-program)
+        overwrite-inputs (write-before-read-inputs boundaries
                                                    materialized shape-scalars)
-        required-buffers (required-materialized-buffers parallel-program)
+        required-buffers (required-materialized-buffers parallel-program boundaries)
         initial (add-materialized-inputs {:buffers {} :loop-scratch {} :storage {}}
                                          materialized (:values parallel-program)
                                          overwrite-inputs required-buffers)
@@ -439,13 +445,10 @@
         (into #{}
               (filter
                (fn [compiler-value]
-                 (some (fn [equation]
-                         (when-let [operation (first (:operations equation))]
-                           (contains? #{:write :read-write}
-                                      (graph-buffer-access
-                                       (equation-dispatch/boundary-graph operation)
-                                                           compiler-value))))
-                       (:equations parallel-program))))
+                 (some (fn [{:keys [graph]}]
+                         (contains? #{:write :read-write}
+                                    (graph-buffer-access graph compiler-value)))
+                       boundaries)))
               (keys (:buffers call)))
         written-tokens
         (into #{} (keep #(get-in realized [:buffers %])) written-program-values)

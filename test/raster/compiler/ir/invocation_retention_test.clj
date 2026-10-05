@@ -1,7 +1,39 @@
 (ns raster.compiler.ir.invocation-retention-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.invocation-link :as invocation]))
+
+(deftest invocation-boundary-inspection-is-shared-only-within-one-lowering
+  ;; Isolated scan mechanics. Public equation-first integration tests still certify
+  ;; real graphs and materialized invocations; these maps are not proof artifacts.
+  (let [read-operation {:id :read}
+        write-operation {:id :write}
+        graphs {:read {:inputs [{:id 'A :role :input}]}
+                :write {:outputs [{:id 'A :role :output} {:id 'B :role :output}]}}
+        program {:equations [{:operations [read-operation]}
+                             {:operations []}
+                             {:operations [write-operation]}]
+                 :values {'A {:shape [4]} 'B {:shape [4]}}
+                 :outputs ['B]}
+        inspected (atom [])
+        materialized {:program-buffers {'A {:id :a :shape [4]}
+                                       'B {:id :b :shape [4]}}}]
+    (with-redefs [equation-dispatch/boundary-graph
+                  (fn [operation]
+                    (swap! inspected conj (:id operation))
+                    (get graphs (:id operation)))
+                  invocation/complete-write? (fn [& _] true)]
+      (let [boundaries (#'invocation/equation-boundaries program)]
+        (is (= [:read :write] @inspected))
+        (is (identical? read-operation (:operation (first boundaries))))
+        (is (= #{'A 'B} (#'invocation/required-materialized-buffers program boundaries)))
+        (is (= #{'B} (#'invocation/write-before-read-inputs boundaries materialized {}))
+            "first-read order must not turn A into an overwrite input")
+        (is (= [:read :write] @inspected) "buffer scans must not reconstruct boundaries"))
+      (#'invocation/equation-boundaries program)
+      (is (= [:read :write :read :write] @inspected)
+          "a subsequent lowering must inspect fresh boundaries"))))
 
 (defn- fixture []
   {:plan {:instances [{:id :program}] :outputs []}
