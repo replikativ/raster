@@ -259,10 +259,9 @@
         (fn [operation]
           (cond
             (emitted-equation/emitted-equation? operation)
-            (let [{:keys [boundary physical-results]}
-                  (emitted-equation/validate-with-physical-results operation)]
-              (.put projections operation {:boundary boundary :physical-results physical-results
-                                           :candidates [boundary]})
+            (let [projection (emitted-equation/validate-with-physical-results operation)
+                  boundary (:boundary projection)]
+              (.put projections operation (assoc projection :candidates [boundary]))
               [boundary])
             (equation-dispatch/emitted-equation-dispatch? operation)
             (let [projection (equation-dispatch/validate-with-boundary operation)]

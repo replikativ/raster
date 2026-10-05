@@ -20,6 +20,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-control :as control]))
 
@@ -191,15 +192,24 @@
               equations)))))
 
 (defn- complete-write?
-  [operation id capacity scalars buffers storage]
-  (if (equation-dispatch/emitted-equation-dispatch? operation)
-    (when-let [extent (get (equation-dispatch/complete-write-domains operation) id)]
-      (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
-    (let [equation (equation-dispatch/boundary-equation operation)]
-      (when (emitted-equation/emitted-equation? equation)
-        (or (when-let [extent (get (emitted-equation/complete-write-domains equation) id)]
-              (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
-            (soac-complete-write? equation id capacity scalars buffers storage))))))
+  ([operation id capacity scalars buffers storage]
+   (complete-write? operation id capacity scalars buffers storage nil))
+  ([operation id capacity scalars buffers storage projection]
+   (if (equation-dispatch/emitted-equation-dispatch? operation)
+     (when-let [extent (get (if projection (:complete-write-domains projection)
+                               (equation-dispatch/complete-write-domains operation)) id)]
+       (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
+     (let [equation (if projection (:boundary projection)
+                       (equation-dispatch/boundary-equation operation))]
+       (when (emitted-equation/emitted-equation? equation)
+         ;; Preserve the existing admission boundary: ordinary SOAC first-touch coverage stays
+         ;; alias-aware below. A certified plain contraction domain alone does not promote it.
+         (or (when-let [extent (get (if projection
+                                       (when (swr/plan? (:algorithm equation))
+                                         (:complete-write-domains projection))
+                                       (emitted-equation/complete-write-domains equation)) id)]
+               (= capacity (launch/resolve-expression #(scalar-number scalars % id) extent)))
+             (soac-complete-write? equation id capacity scalars buffers storage)))))))
 
 (defn- equation-boundaries
   "Inspect each immutable operation boundary once within this lowering invocation.
@@ -209,11 +219,12 @@
   (into []
         (keep (fn [equation]
                 (when-let [operation (first (:operations equation))]
-                  {:operation operation
-                   :graph (if (and projections (not (emitted-loop/emitted-loop? operation)))
-                            (:graph (:boundary (emitted-program/operation-projection
-                                                projections operation)))
-                            (equation-dispatch/boundary-graph operation))})))
+                  (let [projection (when (and projections
+                                              (not (emitted-loop/emitted-loop? operation)))
+                                     (emitted-program/operation-projection projections operation))]
+                    {:operation operation :projection projection
+                     :graph (if projection (:graph (:boundary projection))
+                                (equation-dispatch/boundary-graph operation))}))))
         (:equations parallel-program))))
 
 (defn- write-before-read-inputs
@@ -223,15 +234,15 @@
         storage (into {} (map (fn [[_ buffer]] [(:id buffer) buffer])) program-buffers)]
   (into #{}
         (keep (fn [id]
-                (let [[access operation]
-                      (some (fn [{:keys [operation graph]}]
+                (let [[access operation projection]
+                      (some (fn [{:keys [operation graph projection]}]
                               (when-let [access (graph-buffer-access graph id)]
-                                [access operation]))
+                                [access operation projection]))
                             boundaries)]
                   (when (and (= :write access)
                              (complete-write? operation id
                                               (reduce *' 1 (:shape (get program-buffers id)))
-                                              scalars buffers storage)) id))))
+                                              scalars buffers storage projection)) id))))
         (keys program-buffers))))
 
 (defn- required-materialized-buffers

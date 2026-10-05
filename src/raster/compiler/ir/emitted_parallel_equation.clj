@@ -184,13 +184,14 @@
               (map :destination (get-in equation [:attributes :result-storage]))))
     (soac/physical-result-map algorithm)))
 
+(declare validate-with-result-contracts)
+
 (defn ^:no-doc validate-with-physical-results
   "Validate an equation and return its exact boundary with the derived storage projection.
    This report is data, not authority to accept a later call without checking its bindings."
   [emitted]
-  (let [checked (validate! emitted)]
-    {:boundary checked
-     :physical-results (physical-results-for-validated-boundary checked)}))
+  (select-keys (validate-with-result-contracts emitted)
+               [:boundary :physical-results :complete-write-domains]))
 
 (defn ^:no-doc validate-with-result-contracts
   "Independently check one candidate and derive storage, writes and any mixed operational model.

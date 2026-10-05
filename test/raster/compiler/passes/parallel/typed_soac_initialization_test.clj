@@ -5,6 +5,7 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.extent-proof :as extent-proof]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -193,18 +194,26 @@
   (let [compiled (equation-first/compile #'fixed-capacity-prefix {:target :cuda:0 :dtype :float})
         emitted (last (get-in compiled [:emitted :equations]))
         boundaries (#'invocation-link/equation-boundaries {:equations [emitted]})
+        evidence (emitted-program/validate-with-physical-results! (:emitted compiled))
+        retained-boundaries (#'invocation-link/equation-boundaries
+                             {:equations [emitted]} (:projections evidence))
         algorithm (:algorithm (first (:operations emitted)))
         equation (last (dialect/equations algorithm))
         destination (first (dialect/physical-results algorithm equation))
         domain (first (dialect/dense-functional-result-shape algorithm equation
                                                            (first (nth equation 2))))]
-    (doseq [[capacity extent expected] [[8 4 #{}] [8 8 #{destination}]
+    (doseq [boundary-set [boundaries retained-boundaries]
+            [capacity extent expected] [[8 4 #{}] [8 8 #{destination}]
                                        [8 9 #{}] [16 8 #{}] [4 4 #{destination}]]]
       (is (= expected
              (#'invocation-link/write-before-read-inputs
-              boundaries
+              boundary-set
               {:program-buffers {destination {:id :storage :shape [capacity]}}}
               {domain {:type :long :value extent}}))))
+    (is (nil? (:complete-write-domains
+               (emitted-program/operation-projection (:projections evidence)
+                                                    (first (:operations emitted)))))
+        "ordinary maps still require fresh semantic coverage rather than a static full-write label")
     (is (empty? (#'invocation-link/write-before-read-inputs
                  boundaries
                  {:program-buffers {destination {:id :storage :shape [8]}}} {}))

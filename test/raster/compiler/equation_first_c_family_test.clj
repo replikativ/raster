@@ -1549,9 +1549,9 @@
                                           (assoc (:buffers call) result :unrelated-result)
                                           (:scalar-values call) {} nil %)
             checked-step program-call/validate-equation-call!
-            checked-boundary emitted-equation/validate!
+            checked-boundary emitted-equation/validate-with-result-contracts
             checks (atom 0)
-            forged (with-redefs [emitted-equation/validate!
+            forged (with-redefs [emitted-equation/validate-with-result-contracts
                                  (fn [boundary]
                                    (swap! checks inc)
                                    (checked-boundary boundary))]
@@ -1561,12 +1561,12 @@
             reason (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
         (is (= 1 @checks)
             "constructor shares the exact program-boundary projection with equation preparation")
-        (with-redefs [emitted-equation/validate!
+        (with-redefs [emitted-equation/validate-with-result-contracts
                       (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
           (program-call/validate! forged))
         (is (= 2 @checks) "later public validation independently rechecks the boundary")
         (reset! checks 0)
-        (with-redefs [emitted-equation/validate!
+        (with-redefs [emitted-equation/validate-with-result-contracts
                       (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
           (program-call/make (:program call) (:buffers call) (:scalar-values call) {} nil))
         (is (= 1 @checks) "empty result views do not cause extra schedule rederivation")
@@ -1583,7 +1583,7 @@
               equivalent? semantic-fingerprint/equivalent?
               equivalence-checks (atom 0)]
           (reset! checks 0)
-          (with-redefs [emitted-equation/validate!
+          (with-redefs [emitted-equation/validate-with-result-contracts
                         (fn [boundary] (swap! checks inc) (checked-boundary boundary))]
             (program-call/validate-equation-call! step))
           (is (= 1 @checks) "public step validation independently rederives its boundary once")
