@@ -78,6 +78,7 @@
 (def ^:private dbl-box-cd  (ClassDesc/ofDescriptor "Ljava/lang/Double;"))
 (def ^:private bool-box-cd (ClassDesc/ofDescriptor "Ljava/lang/Boolean;"))
 (def ^:private ifn-cd (ClassDesc/ofDescriptor "Lclojure/lang/IFn;"))
+(def ^:private iseq-cd (ClassDesc/ofDescriptor "Lclojure/lang/ISeq;"))
 (def ^:private var-cd (ClassDesc/ofDescriptor "Lclojure/lang/Var;"))
 (def ^:private rt-cd  (ClassDesc/ofDescriptor "Lclojure/lang/RT;"))
 
@@ -2603,6 +2604,34 @@
           (let [bc-info (compile-and-cache-deftm! v)]
             (emit-deftm-invokestatic code bc-info args locals ctx)))))))
 
+(defn- emit-boxed-ifn-call
+  "Consume an IFn already on the stack, evaluating each argument once in source order.
+   IFn has positional invoke overloads only through twenty arguments; wider calls use
+   its existing applyTo contract, including typed wrappers with wide compute_static methods."
+  [code args locals ctx]
+  (if (<= (count args) 20)
+    (do
+      (doseq [arg args]
+        (let [t (emit-form code arg locals ctx)]
+          (when (primitive? t) (emit-box-to-ref code t))))
+      (.invokeinterface code ifn-cd "invoke"
+                        (MethodTypeDesc/of obj-cd
+                                           (into-array ClassDesc (repeat (count args) obj-cd)))))
+    (do
+      (.ldc code (int (count args)))
+      (.anewarray code obj-cd)
+      (doseq [[index arg] (map-indexed vector args)]
+        (.dup code)
+        (.ldc code (int index))
+        (let [t (emit-form code arg locals ctx)]
+          (when (primitive? t) (emit-box-to-ref code t)))
+        (.aastore code))
+      (.invokestatic code rt-cd "seq"
+                     (MethodTypeDesc/of iseq-cd (into-array ClassDesc [obj-cd])))
+      (.invokeinterface code ifn-cd "applyTo"
+                        (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd])))))
+  :ref)
+
 (defn- emit-fn-call
   "Emit bytecode for function calls (Java static, deftm, sibling, var, local IFn)."
   [code head head-name args locals ctx]
@@ -2788,13 +2817,7 @@
           (emit-var-constant! code (str (.name (.ns ^clojure.lang.Var v))) (str (.sym ^clojure.lang.Var v)))
           (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
           (.checkcast code ifn-cd)
-          (doseq [a args]
-            (let [t (emit-form code a locals ctx)]
-              (when (primitive? t) (emit-box-to-ref code t))))
-          (let [n (count args)
-                invoke-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc (repeat n obj-cd)))]
-            (.invokeinterface code ifn-cd "invoke" invoke-mt))
-          :ref)
+          (emit-boxed-ifn-call code args locals ctx))
 
     ;; ---- Local variable as IFn (including Fn-typed params) ----
     ;; Uses boxed IFn.invoke to handle both typed ftm and plain defn callers.
@@ -2803,13 +2826,7 @@
         (let [{:keys [slot]} (get locals head)]
           (.aload code slot)
           (.checkcast code ifn-cd)
-          (doseq [a args]
-            (let [t (emit-form code a locals ctx)]
-              (when (primitive? t) (emit-box-to-ref code t))))
-          (let [n (count args)
-                invoke-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc (repeat n obj-cd)))]
-            (.invokeinterface code ifn-cd "invoke" invoke-mt))
-          :ref)
+          (emit-boxed-ifn-call code args locals ctx))
 
     ;; ---- Expression in call position: ((f x) y z) ----
     ;; The head is a sub-expression that evaluates to an IFn.
@@ -2818,13 +2835,7 @@
         (let [ht (emit-form code head locals ctx)]
           (when (primitive? ht) (emit-box-to-ref code ht))
           (.checkcast code ifn-cd)
-          (doseq [a args]
-            (let [t (emit-form code a locals ctx)]
-              (when (primitive? t) (emit-box-to-ref code t))))
-          (let [n (count args)
-                invoke-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc (repeat n obj-cd)))]
-            (.invokeinterface code ifn-cd "invoke" invoke-mt))
-          :ref))))
+          (emit-boxed-ifn-call code args locals ctx)))))
 
 ;; ================================================================
 ;; emit-form — the core bytecode emitter

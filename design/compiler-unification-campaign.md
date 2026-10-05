@@ -2845,3 +2845,26 @@ on OpenCL and Level Zero. Deleted source and test Vars were explicitly unmapped 
 native records; cold CI remains required. Exact-head independent review and all seven CI gates
 remain mandatory before merge. The eight-item campaign, including external training acceptance,
 distributed execution and multilevel/AMR validation, is not complete.
+
+### Wide boxed JVM calls — 2026-10-06
+
+Real-checkpoint training isolation exposed a separate JVM boundary defect: a dynamic
+38-argument VJP call emitted a nonexistent `IFn.invoke` overload. Positional `IFn.invoke`
+ends at twenty arguments. The three boxed `emit-fn-call` paths (current Var root, local
+function and expression head) now share one emitter: up to twenty arguments retain
+positional invocation; wider calls build an argument array and use `RT.seq`/`IFn.applyTo`.
+The head and each argument are evaluated once, in source order. Typed static calls and
+surface arity semantics are unchanged; this is not new GPU variadic support.
+
+Regressions cover 20/21/38 arguments in all three paths, current Var-root replacement,
+mixed primitive boxing, effect order, and a real compiled 38-argument typed callee's
+`applyTo`. The capped REPL passes 39 JVM tests / 102 assertions and the combined wide-call
+and compiled-AD tests pass 8 tests / 30 assertions. Independent review found no blockers;
+cold CI remains required. Other guarded interop/wrapper fallback emitters remain separate
+debt, not a claim that every boxed call path has been consolidated.
+
+The real-weight acceptance gate remains held at its original tolerance. Its raw Ak
+gradient already differs before SGD. On identical captured operands, the final Ak
+contraction and preceding low-rank contraction match explicit sequential FP32 evaluation;
+the normalized input also matches the CPU exactly. These checks narrow the investigation
+to upstream cotangents, but do not establish full training acceptance or SOTA performance.
