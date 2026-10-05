@@ -77,6 +77,22 @@ duplicate work. Remaining boundary queries account for 18 seconds and justify au
 existing complete-write consumers next, before adding any further retained facts or changing
 native/default schedules. No native trajectory or end-to-end training speedup is established.
 
+The symbolic-write follow-up retains only already proved domains in that same operation report,
+not a resolved complete-write flag. Invocation initialization and final LinkPlan effect analysis
+resolve current scalar extents, capacities and views afresh. Ordinary SOAC/contractions keep
+their prior semantic, alias-aware coverage path even when a report contains a stronger certified
+contraction extent; sharing evidence does not promote another initialization-coverage family.
+Protected SWR and dispatch admission retain their existing rules. Public LinkPlan validation
+reconstructs independently, while retained validation checks the exact program seal before each
+operation projection. Source-order, partial/prefix writes and structured loops are unchanged.
+Fresh-versus-retained effect witnesses, varied capacities/extents, alias rejection and callback
+isolation remain the oracles. Equal copied operations can be independently checked as equations,
+but cannot substitute for a whole program's exact owned step; whole-call constructors should use
+the owning program rather than manually replacing a step. No new cache or certificate is added.
+Reusing the existing Gemma compilation, the large public plan lowers in 14.1 seconds and retains
+123 tensor calls, all 50 mixed selections and zero driver allocations. This is a local diagnostic
+observation under changing background/JIT conditions, not native or controlled performance data.
+
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
 the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule

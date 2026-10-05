@@ -12,6 +12,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -149,6 +150,19 @@
       (is (= (emitted-equation/physical-results (first alternatives))
              (:physical-results projection)))
       (is (= (vec (reverse alternatives)) (:candidates projection)))
+      (is (= (equation-dispatch/complete-write-domains reversed)
+             (:complete-write-domains projection))
+          "retained extents are jointly proved symbolic domains, not runtime completeness")
+      (let [plain (first alternatives)
+            projection (emitted-equation/validate-with-physical-results plain)
+            input (:id (first (get-in plain [:graph :inputs])))
+            prove (fn [input-storage]
+                    (#'invocation-link/complete-write?
+                     plain 'output 35 {} {'output :destination input input-storage} {} projection))]
+        (is (seq (:complete-write-domains projection)))
+        (is (true? (boolean (prove :independent))))
+        (is (false? (boolean (prove :destination)))
+            "a retained contraction extent must not bypass ordinary SOAC's fresh alias check"))
       (doseq [changed [(assoc reversed :numerical-policy {:permitted-modes #{:exact}})
                        (assoc-in reversed [:dispatch :default-strategy] :register-tiled)
                        (assoc reversed :alternatives [(second alternatives)])]]
@@ -165,6 +179,8 @@
             original equation-dispatch/validate-with-boundary
             original-candidate emitted-equation/validate-with-result-contracts
             call (-> linked :instances first :call)
+            baseline-effects (:step-facts (:effect-evidence
+                                          (link-plan/validate-with-effect-evidence! linked)))
             host-results (into {} (keep #(when (program-call/evaluated-host-equation? %)
                                           [(:id (:equation %)) (:results %)])) (:steps call))]
         (with-redefs [equation-dispatch/validate-with-boundary
@@ -185,9 +201,32 @@
             (program-call/validate-with-retained-program! retained evidence)
             (is (= 1 @calls) "retained concrete validation does not reconstruct static candidates")
             (is (= 2 @candidate-checks) "candidate-level reconstruction is not hidden elsewhere")
+            (let [projection (emitted-program/operation-projection (:projections evidence) certified)]
+              (doseq [[capacity expected] [[34 false] [35 true] [36 false]]]
+                (is (= expected
+                       (#'invocation-link/complete-write? certified 'output capacity {} {} {}
+                                                        projection))
+                    "complete-write admission resolves current capacity, not a retained boolean")))
+            (let [effects (link-plan/validate-with-effect-evidence! linked evidence)]
+              (is (= baseline-effects (:step-facts (:effect-evidence effects)))
+                  "independent and retained paths derive identical fresh effect facts"))
+            (is (= 2 @candidate-checks)
+                "retained invocation coverage and final LinkPlan proofs do not reconstruct candidates")
             (program-call/validate! retained)
             (is (= 2 @calls) "later public validation independently reconstructs every candidate")
-            (is (= 4 @candidate-checks) "later public proof independently reconstructs both candidates")))))
+            (is (= 4 @candidate-checks) "later public proof independently reconstructs both candidates")
+            (let [copied (assoc-in retained
+                                   [:steps (dec (count (:steps retained))) :equation :operations 0]
+                                   (with-meta certified {:copy true}))]
+              (is (program-call/emitted-equation-call?
+                   (program-call/validate-equation-call! (last (:steps copied))))
+                  "independent equation validation reconstructs an equal copied operation")
+              (is (= :emitted-parallel-program-operation-projection
+                     (reason #(program-call/validate! copied)))
+                  "whole-program validation requires the step's exact owning operation too")
+              (is (= :emitted-parallel-program-operation-projection
+                     (reason #(program-call/validate-with-retained-program! copied evidence)))
+                  "an equal copied step remains independently valid, but inherits no owner's proof"))))))
     (is (= :register-tiled
            (executable/strategy (-> linked :instances first :call :steps last :graph))))
     (let [outputs (filter #(= :output (:role %)) (vals (:nodes linked)))]

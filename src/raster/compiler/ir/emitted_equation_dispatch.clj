@@ -152,7 +152,8 @@
    This report grants no reusable authority; the enclosing program validator seals its own
    exact-owner evidence. Runtime admission still chooses the executable independently."
   [value]
-  (select-keys (validation-report value) [:boundary :physical-results :candidates]))
+  (select-keys (validation-report value)
+               [:boundary :physical-results :candidates :complete-write-domains]))
 
 (defn validate!
   "Validate every candidate, its numerical permission, and the common full-write domain."

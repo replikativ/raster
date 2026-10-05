@@ -20,6 +20,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
@@ -1012,9 +1013,21 @@
                        :inout :read-write)})))
       external)}))
 
-(defn- program-complete-writes [nodes values instance step call-scalars]
-  (let [operation (first (get-in step [:equation :operations]))
-        operation (equation-dispatch/boundary-equation operation)
+(defn- program-operation-projection [call step]
+  (let [program (:program call)
+        operation (first (get-in step [:equation :operations]))
+        evidence (when *retained-program-validations*
+                   (.get ^java.util.IdentityHashMap *retained-program-validations* program))]
+    (if evidence
+      (let [checked (emitted-program/checked-retained-validation! program evidence)]
+        (emitted-program/operation-projection (:projections checked) operation))
+      ;; Independent public validation never imports an owner's static report. Inspect this
+      ;; exact step once, then share only its freshly reconstructed boundary within this phase.
+      (emitted-equation/validate-with-result-contracts
+       (equation-dispatch/boundary-equation operation)))))
+
+(defn- program-complete-writes [nodes values instance step call-scalars projection]
+  (let [operation (:boundary projection)
         algorithm (:algorithm operation)
         scalars (merge (program-extent-values nodes values instance (:buffers step))
                        call-scalars (:scalar-values step))
@@ -1030,7 +1043,9 @@
                           (when (= (resolve-dimension extent)
                                    (reduce *' 1 (get-in node [:view :shape])))
                             (:id node)))))
-                (emitted-equation/complete-write-domains operation))
+                ;; Retain the prior protected-plan admission. Ordinary SOAC coverage remains
+                ;; semantic below; sharing a report must not promote a new coverage family.
+                (when (swr/plan? algorithm) (:complete-write-domains projection)))
           (mapcat (fn [equation]
                     (mapcat (fn [[result physical]]
                               (let [base (when (contains? (:buffers step) physical)
@@ -1055,9 +1070,10 @@
         (cond
           (program-call/evaluated-host-equation? step) []
           (program-call/emitted-equation-call? step)
-          (let [complete (program-complete-writes nodes values id step (:scalar-values call))
-                operation (first (get-in step [:equation :operations]))
-                operation (equation-dispatch/boundary-equation operation)
+          (let [projection (program-operation-projection call step)
+                complete (program-complete-writes nodes values id step (:scalar-values call)
+                                                  projection)
+                operation (:boundary projection)
                 algorithm (:algorithm operation)
                 equation (when (soac/program-form? algorithm)
                            (first (soac/equations algorithm)))

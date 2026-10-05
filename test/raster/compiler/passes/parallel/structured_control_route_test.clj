@@ -926,8 +926,8 @@
         step (first (filter program-call/emitted-equation-call? (:steps call)))
         boundary (first (get-in step [:equation :operations]))
         validations (atom 0)
-        original emitted-equation/validate!]
-    (with-redefs [emitted-equation/validate!
+        original emitted-equation/validate-with-result-contracts]
+    (with-redefs [emitted-equation/validate-with-result-contracts
                   (fn [equation]
                     (when (identical? boundary equation) (swap! validations inc))
                     (original equation))]
@@ -1178,12 +1178,12 @@
         projections (atom 0)
         validations (atom 0)
         original emitted-equation/validate-with-physical-results
-        original-validation emitted-equation/validate!]
+        original-validation emitted-equation/validate-with-result-contracts]
     (with-redefs [emitted-equation/validate-with-physical-results
                   (fn [equation]
                     (when (identical? boundary equation) (swap! projections inc))
                     (original equation))
-                  emitted-equation/validate!
+                  emitted-equation/validate-with-result-contracts
                   (fn [equation]
                     (when (identical? boundary equation) (swap! validations inc))
                     (original-validation equation))]
