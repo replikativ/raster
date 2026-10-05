@@ -93,6 +93,33 @@ Reusing the existing Gemma compilation, the large public plan lowers in 14.1 sec
 123 tensor calls, all 50 mixed selections and zero driver allocations. This is a local diagnostic
 observation under changing background/JIT conditions, not native or controlled performance data.
 
+The existing mixed Gemma trajectory fixture is being migrated to public lowering and replay,
+with donated adapters, shared constant weights and fixed-graph binding evidence. All 50 eligible
+dispatch equations must select mixed execution; filtering only already-mixed selections would
+hide fallback regressions. The initial pure public lowering exceeded a 590-second local check
+budget; stack samples showed repeated semantic fingerprint/source-ABI validation and equation
+reconstruction under `invocation-link/lower`'s buffer-by-equation boundary scans. After consolidating
+those scans within one invocation, a fresh capped REPL compiled in 182 seconds and lowered in
+157 seconds under varying background load. The resulting plan has 123 tensor calls and selects
+all 50 mixed `:xmx-direct` dispatches (21 NT, 15 NN, 14 TN), with zero driver allocations.
+This establishes public planning and selection on the synthetic Intel descriptor, not a matched
+performance comparison or native training acceptance. Lowering remains too expensive; profile
+the remaining repeated validation before extending the existing exact-owner evidence. Runtime
+admission, independent public validation and native 25-step numerical acceptance remain required.
+
+The subsequent native recheck passes the tiny public register-tiled replay on OpenCL and
+Level Zero (six assertions), followed by a small Level Zero `:xmx-direct` matrix case with
+relative L1 error `1.5e-8`. The migrated public mixed Gemma fixture then passes its complete
+25-step trajectory: 35 assertions, zero failures/errors, all 50 mixed dispatch selections
+(21 NT, 15 NN, 14 TN), zero planning allocations, and planned-versus-bound graph agreement.
+FP32 loss decreases from 2.281172 to 1.261994; mixed loss ends at 1.262064. Every step remains
+within the existing `5e-3` relative trajectory tolerance. This supersedes the unresolved local
+native acceptance for this small fixture, not the historical queue errors or other workloads.
+The capped reusable REPL completes the check in 248 seconds including compilation, planning,
+binding, replay and host loss evaluation; this aggregate is not kernel timing or a performance
+comparison. Full-model training and matched performance acceptance remain open. The fixture now
+uses public equation-first lowering/replay rather than the resident descriptor lifecycle.
+
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
 the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule

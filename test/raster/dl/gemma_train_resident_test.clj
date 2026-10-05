@@ -15,13 +15,13 @@
    directly-bound call), the 14 LoRA adapter grads are nth'd out of the result
    vector, and raster.dl.optim/sgd-step! folds `p := p - lr*dp` in place per adapter
    — all ordinary deftm/par ops, so the whole fwd+bwd+update extracts as ONE
-   resident program via compile-gpu-program. The primal loss (nth vg 0) is unused
+   resident program through the public equation-first lifecycle. The primal loss (nth vg 0) is unused
    and DCE'd; loss is monitored host-side from the downloaded adapter state (the
    adapters are tiny). Adapters bind :state (resident, updated on-device, never
    re-uploaded); frozen weights / norms / data bind :constant.
 
    GATES:
-     • the train step extracts FULLY RESIDENT under :gemm-precision :f32-scalar
+     • the train step extracts FULLY RESIDENT under :schedule {:precision :f32-scalar}
        (exact-f32 grads — the training GEMM policy);
      • 25 on-device steps: loss decreases, adapters changed on-device;
      • a CPU-interpreted reference loop (same value+grad + sgd-step!, same lr/data)
@@ -35,15 +35,11 @@
             [raster.numeric :as n]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
-            [raster.compiler.pipeline :as pl]
-            [raster.compiler.ir.kernel-dispatch :as dispatch]
+            [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
-            [raster.gpu.value :as value]
-            [raster.gpu.link :as link]
-            [raster.gpu.descriptor-fixture :as fixture]))
+            [raster.gpu.value :as value]))
 
 ;; ── the twin block (concrete float, LoRA delta inline) ──────────────────────────
 
@@ -299,7 +295,7 @@
 
 ;; ═════════════════════════════════════════════════════════════════════════════════
 ;; MIXED-PRECISION BACKWARD (S2a): the SAME resident train step (value+grad + SGD) under
-;; :gemm-precision :mixed-f16-f32 — f16 GEMM inputs, f32 accumulate/output — must train the
+;; :schedule {:precision :mixed-f16-f32} — f16 GEMM inputs, f32 accumulate/output — must train the
 ;; adapters along the SAME loss trajectory as the exact :f32-scalar policy.
 ;;
 ;; This is the gate for running the VJP/backward program in mixed precision (the forward
@@ -321,56 +317,47 @@
   "Small block whose projection, LoRA and attention axes reach the current matrix schedules."
   {:seq 32 :d 64 :nq 2 :nkv 1 :hd 32 :dff 64 :r 32 :eps 1.0e-6 :theta 10000.0})
 
-(defn- matrix-schedule-selections
-  "Observe real scalar dispatch selection, rather than duplicating target pitch predicates.
-   Runtime buffer/alias admission remains separately enforced when the trajectory is bound."
-  [prog args]
-  (into []
-        (keep
-         (fn [[step-index step]]
-           (let [schedules (get-in step [:dispatch :attributes :candidate-schedules])]
-             (when (some #(= :matrix (:family %)) (vals schedules))
-               (let [choice (:dispatch step)
-                     runtime-arguments
-                     (mapv (fn [{:keys [kind sym type value-fn]}]
-                             (if (= :scalar kind)
-                               {:type type :value (value-fn args)} sym))
-                           (:argument-specs step))
-                     selected (dispatch/select-alternative choice runtime-arguments)
-                     strategy (executable/strategy selected)
-                     schedule (get schedules strategy)]
-                 {:step-index step-index
-                  :variant (:variant schedule)
-                  :family (:family schedule)
-                  :strategy strategy
-                  :precision (:precision (executable/attributes selected))})))))
-        (map-indexed vector (:steps prog))))
+(defn- planned-equation-calls
+  "Observe fixed graph choices made by public lowering, not requested alternatives."
+  [prepared]
+  (vec (mapcat (fn [instance]
+                 (filter :graph (get-in instance [:call :steps])))
+               (:instances (compiled/plan prepared)))))
 
 (defn- run-trajectory!
-  "n-steps of the resident train step under `prog`'s GEMM policy in a fresh session.
-   Returns host losses [loss(state_0) … loss(state_n)] and the bound phase execution reports."
-  [prog cfg st0 lr n-steps]
+  "Replay a public compiled artifact with donated adapters and constant weights.
+   Returns losses, selected graph descriptions and actual binding reports."
+  [cfg st0 lr n-steps schedule]
   (let [st (clone-adapters st0)
         args (train-args cfg st lr)
-        sess (gpu/make-session :ze:0)]
+        prepared (compiled/lower #'gblk-train-step args
+                                 {:compiler :equation-first :target :ze:0 :dtype :float
+                                  :inline? true :schedule schedule :donate adapter-syms
+                                  :constants (vec (remove (set adapter-syms) (keys st)))})
+        calls (planned-equation-calls prepared)
+        graphs (mapv :graph calls)
+        dispatch-graphs (mapv :graph
+                              (filter #(equation-dispatch/emitted-equation-dispatch?
+                                        (first (get-in % [:equation :operations]))) calls))
+        planned (mapv executable/description graphs)]
+    (is (zero? (get-in (compiled/plan prepared) [:attributes :driver-allocations]))
+        "public lowering must not allocate device storage")
+    (let [program (compiled/instantiate! prepared)]
     (try
-      (let [program
-            (fixture/instantiate!
-             sess prog args
-             (merge (zipmap adapter-syms (repeat :state))
-                    (zipmap '[x input-ln q-norm k-norm post-attn
-                              pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
-                            (repeat :constant))))]
-        (loop [k 0 losses [(host-loss cfg st)]]
-          (if (= k n-steps)
-            {:losses losses :execution-info (link/execution-info (:executable program))}
-            (do (fixture/run! program args)
-                (recur (inc k)
-                       (conj losses
-                             (host-loss cfg (reduce (fn [m s]
-                                                      (assoc m s (fixture/download program s)))
-                                                    st adapter-syms))))))))
-      (finally (gpu/close-session! sess)))))
+      (loop [k 0 losses [(host-loss cfg st)]]
+        (if (= k n-steps)
+          {:losses losses :planned planned
+           :dispatch-selected (mapv executable/description dispatch-graphs)
+           :matrix-variants (mapv #(get-in % [:attributes :variant])
+                                  dispatch-graphs)
+           :execution-info (compiled/execution-info program)}
+          (let [outputs (program {})
+                state (reduce (fn [m s]
+                                (assoc m s (value/->host
+                                            (get outputs (keyword (str (name s) "'"))))))
+                              st adapter-syms)]
+            (recur (inc k) (conj losses (host-loss cfg state))))))
+      (finally (compiled/close! program))))))
 
 (deftest gemma-lora-mixed-precision-backward-trajectory
   (if-not @gp/gpu-available?
@@ -379,35 +366,27 @@
           lr 0.02
           n-steps 25
           st0 (init-state cfg)
-          args (train-args cfg st0 lr)
-          p32 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
-                                      :on-non-resident :nil :gemm-precision :f32-scalar)
-          p16 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
-                                      :on-non-resident :nil
-                                      :gemm-precision :mixed-f16-f32)]
-      (is (some? p32) "train-step must extract fully resident")
-      (is (some? p16) "mixed train-step must extract fully resident")
-      (when (and p32 p16)
-        (let [dims (matrix-schedule-selections p16 args)]
+          {l32 :losses} (run-trajectory! cfg st0 lr n-steps {:precision :f32-scalar})
+          {l16 :losses planned :planned variants :matrix-variants bound :execution-info
+           dispatched :dispatch-selected}
+          (run-trajectory! cfg st0 lr n-steps
+                           {:precision :mixed-f16-f32
+                            :typed-contraction {:strategy :dispatch-mixed-matrix
+                                                :input-fusion :materialized}})]
           (testing "analytic dispatch selects mixed-precision matrix schedules throughout training"
-            (println "  [mixed-precision bwd]" (count dims) "gemm steps, variants:"
-                     (frequencies (map :variant dims)))
-            (is (seq dims) "the assertion must observe real typed matrix candidates")
-            (is (every? #(and (= :matrix (:family %))
-                             (= :mixed-f16-f32 (:precision %))) dims)
-                (str "mixed training must analytically select matrix execution, not merely enumerate it: "
-                     (pr-str dims))))
-          (let [{l32 :losses} (run-trajectory! p32 cfg st0 lr n-steps)
-                {l16 :losses bound :execution-info} (run-trajectory! p16 cfg st0 lr n-steps)]
+            (println "  [mixed-precision bwd]" (count dispatched) "selected dispatch graphs, variants:"
+                     (frequencies variants))
+            (is (= 50 (count dispatched)) "retain every eligible contraction in this fixed fixture")
+            (is (every? #(and (= :xmx-direct (:strategy %))
+                             (= :mixed-f16-f32 (:precision %))) dispatched)
+                "every eligible dispatch must select mixed execution, not only a surviving subset")
+            (is (every? (set variants) [:nn :nt :tn])
+                "forward and transposed backward projections must select mixed execution"))
             (testing "the replayed training program bound every selected mixed matrix schedule"
-              ;; This fixture lowers one descriptor instance. Link reports exactly one entry per
-              ;; descriptor step, in order, including nil evidence for unsupported/manual phases.
-              (is (= (count (:steps p16)) (count bound)))
-              (is (= (mapv #(select-keys % [:strategy :precision]) dims)
-                     (mapv (fn [{:keys [step-index]}]
-                             (select-keys (get-in bound [step-index :executable])
-                                          [:strategy :precision]))
-                           dims))))
+              (is (= (count planned) (count bound)))
+              (is (= planned
+                     (mapv #(dissoc (:executable %) :selection :admission) bound)))
+              (is (every? #(= :fixed (get-in % [:executable :selection])) bound)))
             (println "  [mixed-precision bwd] f32-scalar loss:"
                      (mapv #(format "%.6f" %) (take 3 l32)) "…"
                      (mapv #(format "%.6f" %) (take-last 2 l32)))
@@ -423,4 +402,4 @@
               ;; different optimization path at this lr).
               (doseq [[k a b] (map vector (range) l32 l16)]
                 (is (< (/ (Math/abs (- a b)) (max 1.0e-9 (Math/abs a))) 5.0e-3)
-                    (format "step %d: f32 %.6f vs f16 %.6f" k a b))))))))))
+                    (format "step %d: f32 %.6f vs f16 %.6f" k a b)))))))
