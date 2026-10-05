@@ -819,6 +819,8 @@
                          :policy :certified-workgroup-tree
                          :rounding :implementation-defined
                          :accumulator-dtype (dtype/canon (:dtype segred))}
+                  (:source-arithmetic segred)
+                  (assoc :source-arithmetic (:source-arithmetic segred))
                   result-region
                   (assoc :result-transform
                          {:kind :typed-scalar-region

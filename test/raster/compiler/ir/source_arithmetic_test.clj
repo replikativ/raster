@@ -8,8 +8,10 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.passes.parallel.contract-lower :as lower]
             [raster.compiler.passes.parallel.contraction-schedule :as schedule]
+            [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-contraction-context :as context]))
 
@@ -77,6 +79,12 @@
            (get-in refinement [:numerics :source-arithmetic])
            (get-in emitted [:provenance :scheduled-operation :numerics :source-arithmetic])))
     (is (= emitted (scheduled/validate-artifact-projection! refinement emitted)))
+    (let [mixed (mixed-schedule/plan
+                 {:id :source-arithmetic-mixed :a 'A :b 'B :c 'C :m 2 :n 4 :k 3
+                  :variant :nn :vector-width 4 :requested-splits 8
+                  :tile (hardware/derive-gemm-tile {})
+                  :source-operation (:operation node) :source-graph graph})]
+      (is (= contract (get-in mixed [:refinement :numerics :source-arithmetic]))))
     (is (thrown? clojure.lang.ExceptionInfo
                  (scheduled/validate-artifact-projection!
                   refinement

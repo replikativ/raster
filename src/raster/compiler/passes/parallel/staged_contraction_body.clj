@@ -102,6 +102,7 @@
         :legality {:kind :staged-packed :stage-legality legality :packed-plan plan
                    :storage-elements sizes :output-elements (long n)}
         :numerics {:mode :reassociated :policy :staged-int32-float
+                   :source-arithmetic (:source-arithmetic source)
                    :accumulator-dtype :float :rounding :nearest-even}}))))
 
 (defn schedule-for-node

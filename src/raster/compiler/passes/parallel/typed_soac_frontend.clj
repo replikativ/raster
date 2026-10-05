@@ -2557,6 +2557,15 @@
                    (-> (select-keys source [:out :free-axes :contract-axes :body :opts :source-arithmetic])
                        (assoc :body body)
                        (assoc :dtype (first core-types))
+                       ;; This closure is another contextual specialization boundary: retained
+                       ;; uniform stages may have been built before operand storage resolved.
+                       ;; Reinstantiate only BLAS provenance from the checked homogeneous core
+                       ;; dtypes; ordinary mixed/staged SSA keeps its component semantics.
+                       (update :source-arithmetic
+                               (fn [arithmetic]
+                                 (if (= :abstract-blas-product (:kind arithmetic))
+                                   (numerics/blas-source-arithmetic (first core-types))
+                                   arithmetic)))
                        (assoc-in [:opts :operands] operands)))
             {:keys [reads scalars]} (contraction-facts/dependencies facts)
             attributes {:contraction facts

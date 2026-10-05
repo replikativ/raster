@@ -2964,6 +2964,19 @@ hardware-free test covers the full semantic-to-artifact chain and rejects certif
 Affected public portable/register replay passes 4 tests / 78 assertions on local OpenCL and
 Level Zero, with no skips. Full cold CI remains the merge gate.
 
+Cold emitter-fixture CI identified an omitted facet in the staged packed/scalar candidate
+constructors. Both now explicitly retain the same source facet before their graph rebinding;
+the shared scheduled validator remains strict rather than hiding the omission with a default.
+The same audit found split-K combine and parent mixed-matrix refinement propagation. The combine
+retains its own ordered-SSA facet; physical cast/transpose/matrix stages do not acquire the parent
+BLAS contract. Attention JVP additionally specializes an already staged closure after homogeneous
+operand dtypes resolve: BLAS provenance is re-instantiated at that existing boundary, while
+ordinary staged component semantics and the constructor mismatch guard remain unchanged.
+Its focused suite passes 5 tests / 21 assertions. The exact public emitter-fixture path emits
+157 artifacts each for synthetic CUDA and HIP; compiler-toolchain CI is still required.
+The reviewed replacement also passes 53 GEMM/staged tests / 1338 assertions and 34 source-facet/
+GEMM tests / 1243 assertions, including explicit local split-K and parent refinement provenance.
+
 This is provenance, not a new equivalence theorem or schedule admission rule. Follow up with
 restrictive refinement checks and reference-selection policy, preserving existing explicit
 reassociation/mixed-precision consent. Before provenance could ever grant permission, distinguish

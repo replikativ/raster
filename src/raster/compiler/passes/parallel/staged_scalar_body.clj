@@ -163,4 +163,5 @@
       :effects {:kind :staged-contraction :uses (scheduled/derive-uses kernel arguments)}
       :legality {:kind :staged-scalar :storage-elements sizes :output-elements output-elements}
       :numerics {:mode :reassociated :policy :explicit-stage-accumulators
+                 :source-arithmetic (:source-arithmetic source)
                  :accumulator-dtype out-type :rounding :nearest-even}})))
