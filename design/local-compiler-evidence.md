@@ -35,6 +35,17 @@ keep raw chronological samples and use the matched-round comparison protocol for
 External package migration, real-weight chained training, larger shape ladders and competitive
 cross-system measurements remain required by campaign items 3–5.
 
+The next unchanged external two-layer forward/loss-seed/VJP graph prepares through public
+composition in a clean `9e9ba5d` finetune snapshot. A cold thread sample inside emission exposes
+wrapping-collective helper discovery traversing all nested record collections, including retained
+proof/source attributes. Discovery now reuses the existing executable-region walker and receives
+operation roots once, rather than recursively revisiting an already flattened list. Both If arms,
+ForLoop, PipelinedFor, Guard and both While regions are covered; collectives are not legal inside
+ScalarExpr operands or matrix store scalar regions. The before-fix regression reaches irrelevant
+proof data; after the fix the full scalar emitter suite passes 24 tests / 352 assertions.
+This is traversal deduplication with unchanged helper/emission coverage, not a measured compiler
+speedup. Scalar-expression discovery and independent KernelBody validation remain unchanged.
+
 ## Consolidation diagnostic — 2026-10-01
 
 The existing public equation-first GEMM canary executed `[32 32 32]`, strict FP32,

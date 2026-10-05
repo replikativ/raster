@@ -434,7 +434,9 @@
 
 (defn- wrapping-collective-requirements
   [operations]
-  (->> (tree-seq coll? seq operations)
+  ;; Requirement discovery follows executable regions, not arbitrary retained source/proof
+  ;; collections. Reuse the scalar emission walk so every admitted child location is covered.
+  (->> (scalar-body-operations operations)
        (keep (fn [operation]
                (when (and (record-kind? "Collective" operation)
                           (= :reduce (:kind operation))
@@ -1660,7 +1662,7 @@
                      (keep (fn [type]
                              (c-dialect/wrapping-signed-helper-source
                               *scalar-dialect* type))
-                           (wrapping-collective-requirements operations)))
+                           (wrapping-collective-requirements (:operations kernel-body))))
               (when (and (c-dialect/opencl? *scalar-dialect*)
                          (str/includes? operation-source "atomic_add_float("))
                 ce/opencl-atomic-add-float-helper)

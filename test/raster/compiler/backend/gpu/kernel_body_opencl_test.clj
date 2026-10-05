@@ -118,6 +118,40 @@
 
 (declare command-available? compile-c-family-source)
 
+(deftest wrapping-collective-discovery-follows-only-executable-regions
+  (let [collective (first (:operations (wrapping-collective-body)))
+        regions [(body/->IfRegion true [collective] [] [])
+                 (body/->IfRegion true [] [collective] [])
+                 (body/map->ForLoop {:operations [collective]})
+                 (body/map->PipelinedFor {:operations [collective]})
+                 (body/->Guard nil [collective])
+                 (body/->WhileLoop [] [collective] [] [] {})
+                 (body/->WhileLoop [] [] [collective] [] {})]
+        irrelevant-proof (lazy-seq
+                          (throw (AssertionError. "inspected non-executable proof data")))]
+    ;; This tests discovery, not region legality. Region admission is checked separately by
+    ;; KernelBody validation; the helper must neither omit a legal child location nor walk
+    ;; retained source/proof collections as though they were executable operations.
+    (doseq [region regions]
+      (is (= [:int] (#'opencl/wrapping-collective-requirements [region]))))
+    (is (= [:int]
+           (#'opencl/wrapping-collective-requirements
+            [(body/map->ForLoop {:operations [collective]
+                                :attributes {:source-proof irrelevant-proof}})])))))
+
+(deftest wrapping-collective-discovery-receives-operation-roots-once
+  (let [kernel (scalar-kernel-body)
+        discover @#'opencl/wrapping-collective-requirements
+        calls (atom 0)]
+    (with-redefs-fn {#'opencl/wrapping-collective-requirements
+                    (fn [operations]
+                      (swap! calls inc)
+                      (is (identical? (:operations kernel) operations)
+                          "do not recursively rediscover children from an already flattened walk")
+                      (discover operations))}
+      #(opencl/emit-scalar-module "root_collective_discovery" kernel {}))
+    (is (= 1 @calls))))
+
 (deftest scalar-while-loop-has-one-target-neutral-c-family-lowering
   (let [kernel (fixtures/scalar-while-body)]
     (is (body/kernel-body? (body/validate! kernel)))
