@@ -1115,6 +1115,8 @@
                              tag passes through ('float → 'float)
      :same-as-first-arg    — the first arg's tag, unchanged
      :first-typed-arg      — the first non-nil arg tag (nil-safe accumulators)
+     :common-arg-tag       — the tag every arg shares; nil if any arg is
+                             untyped or the tags differ
      [:arg n]              — the tag of the (0-based) nth arg
    or a fixed result tag symbol (e.g. 'long)."
   [op-sym rule]
@@ -1140,6 +1142,8 @@
                                            (when (contains? element-tags t) t)))
       (= :same-as-first-arg rule)    (first arg-tags)
       (= :first-typed-arg rule)      (some identity arg-tags)
+      (= :common-arg-tag rule)       (let [[t & more] arg-tags]
+                                       (when (and t (every? #{t} more)) t))
       (and (vector? rule)
            (= :arg (first rule)))    (nth arg-tags (second rule) nil)
       ;; a fixed result tag symbol
