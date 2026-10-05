@@ -623,7 +623,20 @@
          capacity-preconditions
          (->> (concat (mapcat (comp seq :requirements) read-capacity-certificates)
                       (mapcat (fn [[id requirements]] (map #(vector id %) requirements))
-                              read-requirements))
+                              read-requirements)
+                      ;; A declared result shape is allocation capacity, not proof that
+                      ;; it covers the canonical reduction's dense written prefix.
+                      (mapcat (fn [equation]
+                                (when (= 'segmented-reduce (soac/operation-kind equation))
+                                  (try
+                                    (seq (typed-projection/segmented-reduce-core-write-requirements
+                                          algorithm equation))
+                                    (catch clojure.lang.ExceptionInfo error
+                                      (if (= :typed-soac-contract-projection
+                                             (:reason (ex-data error)))
+                                        nil
+                                        (throw error))))))
+                              retained-equations))
               (keep (fn [[id required]]
                       (let [capacity (get-in buffer-specs [id :elements])]
                         (when-not (map-reads/capacity-covers? capacity required)

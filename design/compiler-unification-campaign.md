@@ -34,9 +34,19 @@ regressions and the wider TypedSOAC route suite pass; exact source-law compariso
 
 The same Gemma compile subsequently exposes an unresolved storage relation: the matrix axis
 uses a retained scalar alias (`nqh`), while its output capacity expands to `nq * hd`. Do not assert
-these equal from their spelling or relax capacity validation. The next slice must retain or
-independently reconstruct the checked scalar definition across the schedule/storage boundary.
+these equal from their spelling or relax capacity validation. The follow-up derives the dense
+output-prefix minimum from the canonical reduction axes and enforces a checked allocation-capacity
+guard at the independently reconstructed graph boundary. This proves storage safety without
+asserting that independently supplied scalar values are equal. Unsupported physical layouts and
+noncanonical folds remain outside this projection; declared capacities are not replaced.
 Public mixed training acceptance, native numerical trajectories and performance remain open.
+
+With the output-prefix guard, the hardware-free Gemma training compilation succeeds: 189
+scheduled equations, 123 emitted tensor equations, 66 host scalar equations and 50 contraction
+dispatches, with no candidate declines or legacy fallback. The other 73 emitted equations are
+not single plain FP32 contractions; this is not evidence that every operation is matrix-tiled.
+This measurement uses the synthetic Intel descriptor and establishes compilation only, not
+native dispatch selection, training parity or throughput.
 
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
