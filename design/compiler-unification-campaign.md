@@ -96,12 +96,16 @@ observation under changing background/JIT conditions, not native or controlled p
 The existing mixed Gemma trajectory fixture is being migrated to public lowering and replay,
 with donated adapters, shared constant weights and fixed-graph binding evidence. All 50 eligible
 dispatch equations must select mixed execution; filtering only already-mixed selections would
-hide fallback regressions. This remains in progress: pure public lowering exceeded a 590-second
-local check budget. Stack samples show repeated semantic fingerprint/source-ABI validation and
-equation reconstruction under `invocation-link/lower`'s buffer-by-equation boundary scans. The
-compile-only result above remains valid; lowering latency and native trajectory acceptance do
-not. Consolidate unchanged boundary inspection within one lowering invocation, preserving all
-runtime checks and exact-owner validation, before repeating the large integration check.
+hide fallback regressions. The initial pure public lowering exceeded a 590-second local check
+budget; stack samples showed repeated semantic fingerprint/source-ABI validation and equation
+reconstruction under `invocation-link/lower`'s buffer-by-equation boundary scans. After consolidating
+those scans within one invocation, a fresh capped REPL compiled in 182 seconds and lowered in
+157 seconds under varying background load. The resulting plan has 123 tensor calls and selects
+all 50 mixed `:xmx-direct` dispatches (21 NT, 15 NN, 14 TN), with zero driver allocations.
+This establishes public planning and selection on the synthetic Intel descriptor, not a matched
+performance comparison or native training acceptance. Lowering remains too expensive; profile
+the remaining repeated validation before extending the existing exact-owner evidence. Runtime
+admission, independent public validation and native 25-step numerical acceptance remain required.
 
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
