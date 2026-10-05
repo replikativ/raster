@@ -225,6 +225,14 @@
 
 (declare infer-arg-stack-type-structural)
 
+(defn- array-read-stack-type
+  "Translate a retained array operand type to its JVM load result type."
+  [arr locals]
+  (let [tag (or (:tag (meta arr)) (:raster.type/tag (meta arr))
+                (when (symbol? arr) (:hint (get locals arr))))]
+    ({'doubles :double 'floats :float 'longs :long 'ints :int
+      'bytes :int 'shorts :int 'objects :ref} tag)))
+
 (defn- infer-arg-stack-type
   "Infer the stack type of a form WITHOUT emitting bytecode.
   Used to select the correct overloaded method (e.g. Math.abs(int) vs Math.abs(double))."
@@ -258,10 +266,27 @@
          (infer-arg-stack-type-structural form h locals))))
     :else nil))
 
+(defn- lexical-binding-types
+  "Extend lexical scope in binding order; unknown locals still shadow outer types."
+  [locals bindings]
+  (reduce (fn [ls [sym init]]
+            (let [tag (or (:tag (meta sym)) (:raster.type/tag (meta sym))
+                          (when (symbol? init) (:hint (get ls init))))
+                  t (or (get {'double :double 'long :long 'int :int 'float :float
+                              'boolean :bool 'byte :int 'short :int} tag)
+                        (infer-arg-stack-type init ls))]
+              (assoc ls sym (cond-> {:type (or t :ref)} tag (assoc :hint tag)))))
+          locals (partition 2 bindings)))
+
 (defn- infer-arg-stack-type-structural
   "Structural fallback of infer-arg-stack-type for UNTAGGED seq forms."
   [form h locals]
   (cond
+    ;; Only the explicit closed-core intrinsic is authority here. A bare `aget`
+    ;; may be a local or source-namespace function; this helper has no source
+    ;; context and must not resolve it using the caller's ambient namespace.
+    (= 'clojure.core/aget h)
+    (array-read-stack-type (second form) locals)
         ;; Cast expressions
     (= (name h) "double") :double
     (= (name h) "long")   :long
@@ -306,7 +331,7 @@
         ;; let/let* → type of last body form
     (contains? #{"let" "let*"} (name h))
     (when-let [last-form (last (nnext form))]
-      (infer-arg-stack-type last-form locals))
+      (infer-arg-stack-type last-form (lexical-binding-types locals (second form))))
         ;; loop/loop* → type of the non-recur branch (a nested reduction used
         ;; as a recur arg is common — without this rule it fell to nil and the
         ;; caller guessed :double, mistyping all-integer tile kernels)
@@ -1896,14 +1921,12 @@
         (.checkcast code (class-desc-of arr-cls))))
     (let [t (emit-form code idx locals ctx)]
       (when (not= t :int) (emit-coerce code t :int)))
-    (case arr-tag
-      doubles (do (.daload code) :double)
-      floats  (do (.faload code) :float)
-      longs   (do (.laload code) :long)
-      ints    (do (.iaload code) :int)
-      bytes   (do (.baload code) :int)
-      shorts  (do (.saload code) :int)
-      objects (do (.aaload code) :ref)
+    (case (array-read-stack-type arr locals)
+      :double (do (.daload code) :double)
+      :float  (do (.faload code) :float)
+      :long   (do (.laload code) :long)
+      :int    (do (case arr-tag bytes (.baload code) shorts (.saload code) (.iaload code)) :int)
+      :ref    (do (.aaload code) :ref)
       (do (when arr-tag
             (binding [*out* *err*]
               (println "WARNING: emit-aget-intrinsic: unrecognized arr-tag" (pr-str arr-tag)
@@ -3801,21 +3824,43 @@
       (> (rank recur-t) (rank init-t)) recur-t
       :else init-t)))
 
+(defn- loop-recur-value-type
+  "A recurrence may join different numeric branch widths even when the emitted
+   if is boxed. Preserve that numeric join without changing general if emission."
+  [form locals]
+  (cond
+    (and (seq? form) (contains? #{'let 'let*} (first form)))
+    (loop-recur-value-type (last (drop 2 form))
+                           (lexical-binding-types locals (second form)))
+
+    (and (seq? form) (= 'do (first form)))
+    (loop-recur-value-type (last (rest form)) locals)
+
+    (and (seq? form) (= 'if (first form)) (= 4 (count form)))
+    (let [a (loop-recur-value-type (nth form 2) locals)
+          b (loop-recur-value-type (nth form 3) locals)]
+      (cond
+        (= a b) a
+        (and (contains? #{:int :long :float :double} a)
+             (contains? #{:int :long :float :double} b))
+        (widen-loop-type a b)))
+
+    :else (infer-arg-stack-type form locals)))
+
 (defn- loop-recur-arg-types
   "Infer, for each of the n loop vars, the widest stack type its recur values
   produce — without emitting. Scans only recur forms that target THIS loop
   (skips nested loop*/fn* which retarget recur). Used to widen loop-var slots."
   [body n locals]
   (let [acc (atom (vec (repeat n nil)))
-        rank {:int 0 :long 1 :float 2 :double 3}
         widest (fn [a b] (cond (nil? a) b (nil? b) a
-                               (>= (get rank a -1) (get rank b -1)) a :else b))]
+                               :else (widen-loop-type a b)))]
     (letfn [(scan [form ls]
               (cond
                 (and (seq? form) (= 'recur (first form)))
                 (doseq [[i a] (map-indexed vector (rest form))]
                   (when (< i n)
-                    (swap! acc update i widest (infer-arg-stack-type a ls))))
+                    (swap! acc update i widest (loop-recur-value-type a ls))))
                 (and (seq? form) (symbol? (first form))
                      (contains? #{"loop*" "fn*"} (name (first form)))) nil
                 ;; let/let*: extend the env with binding types (stamp first,
@@ -3824,20 +3869,33 @@
                 (and (seq? form) (symbol? (first form))
                      (contains? #{"let" "let*"} (name (first form))))
                 (let [[_ bindings & bbody] form
-                      ls' (reduce (fn [m [sym init]]
-                                    (if-let [t (or (some->> (:raster.type/tag (meta sym))
-                                                            (get {'double :double 'long :long
-                                                                  'int :int 'float :float}))
-                                                   (infer-arg-stack-type init m))]
-                                      (assoc m sym {:type t})
-                                      m))
-                                  ls (partition 2 bindings))]
+                      ls' (lexical-binding-types ls bindings)]
                   (run! #(scan % ls') bbody))
                 (seq? form) (run! #(scan % ls) (rest form))
                 (vector? form) (run! #(scan % ls) form)
                 :else nil))]
       (run! #(scan % locals) body))
     @acc))
+
+(defn- loop-recur-types-in-scope
+  "Compute recurrence widths in the loop's own scope, propagating dependent
+   carry widening to a fixed point in the finite numeric stack-type lattice."
+  [pairs body locals]
+  (let [seed (lexical-binding-types locals (mapcat identity pairs))]
+    (loop [ls seed]
+      (let [types (loop-recur-arg-types body (count pairs) ls)
+            widened (reduce (fn [env [[sym _] rt]]
+                              (if-let [t (:type (get env sym))]
+                                (assoc-in env [sym :type] (widen-loop-type t rt))
+                                env))
+                            ls (map vector pairs types))]
+        (if (= ls widened)
+          (mapv (fn [[sym _] rt]
+                  (let [t (:type (get widened sym))]
+                    (if (contains? #{:int :long :float :double} t)
+                      (widen-loop-type t rt) rt)))
+                pairs types)
+          (recur widened))))))
 
 (defn- emit-loop*
   "Emit bytecode for (loop* [bindings] body...)."
@@ -3847,7 +3905,11 @@
         loop-label (.newLabel code)
         ;; Type each loop var as LUB(init, recur values) so a long-recurring
         ;; counter isn't pinned to int (which blocks vectorization).
-        recur-types (loop-recur-arg-types body (count pairs) locals)
+        ;; Recurrence expressions see this loop's bindings, not merely the outer
+        ;; scope. Expanded scalar arithmetic may lack a result stamp; omitting
+        ;; its Float accumulator made that expression guess Double and silently
+        ;; widened otherwise typed Float carries in the lazy-JIT path.
+        recur-types (loop-recur-types-in-scope pairs body locals)
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
                        (let [t (emit-form code init locs (dissoc ctx :void-context))
@@ -4077,18 +4139,38 @@
                                (every? some? inferred-types)
                                (apply = inferred-types)
                                (primitive? (first inferred-types)))
-            result-type (if uniform-prim? (first inferred-types) :ref)]
+            result-type (if uniform-prim? (first inferred-types) :ref)
+            emit-result (fn [t]
+                          (cond
+                            (diverge? t) nil
+                            (= t :void)
+                            (if (= result-type :ref)
+                              (.aconst_null code)
+                              (throw (ex-info "case branch does not produce its predicted value"
+                                              {:reason :case-result-type :expected result-type})))
+                            (not= t result-type)
+                            (if (or (and (= result-type :ref) (primitive? t))
+                                    (and (primitive? result-type)
+                                         (or (= t :ref)
+                                             (and (primitive? t)
+                                                  (or (not= result-type :bool)
+                                                      (contains? #{:int :bool} t))))))
+                              (emit-coerce code t result-type)
+                              (throw (ex-info "case branch cannot produce its predicted stack type"
+                                              {:reason :case-result-type
+                                               :actual t :expected result-type})))))]
         (doseq [[[_ [test-val result-expr]] label] (map vector sorted-entries case-labels)]
           (.labelBinding code label)
           (let [t (emit-form code result-expr locals ctx)]
-            (when (and (not uniform-prim?) (primitive? t))
-              (emit-box-to-ref code t))
+            ;; Prediction selects the merge type, not the actual stack shape.
+            ;; A loop may still emit a boxed primitive; reconcile every reaching
+            ;; branch (including the default) with the chosen merge type.
+            (emit-result t)
             (when-not (diverge? t)
               (.goto_ code after-label))))
         (.labelBinding code default-label)
         (let [t (emit-form code default-expr locals ctx)]
-          (when (and (not uniform-prim?) (primitive? t))
-            (emit-box-to-ref code t))
+          (emit-result t)
           (when-not (diverge? t)
             (.goto_ code after-label)))
         (.labelBinding code after-label)
