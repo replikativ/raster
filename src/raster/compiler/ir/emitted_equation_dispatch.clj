@@ -141,8 +141,18 @@
         (when-not (= :exact (nth modes default-index))
           (fail! :equation-dispatch-default-numerics
                  "the safe fallback must retain exact evaluation order"
-                 {:default-strategy (:default-strategy selection)})))
-      {:value value :complete-write-domains (first domains)})))
+                 {:default-strategy (:default-strategy selection)}))
+        {:value value :complete-write-domains (first domains)
+         :boundary (nth alternatives default-index)
+         :physical-results (:physical-results (first candidate-reports))
+         :candidates alternatives}))))
+
+(defn ^:no-doc validate-with-boundary
+  "Independently check all candidates and return their common storage and exact fallback.
+   This report grants no reusable authority; the enclosing program validator seals its own
+   exact-owner evidence. Runtime admission still chooses the executable independently."
+  [value]
+  (select-keys (validation-report value) [:boundary :physical-results :candidates]))
 
 (defn validate!
   "Validate every candidate, its numerical permission, and the common full-write domain."
@@ -166,10 +176,7 @@
 (defn default-equation
   "Return the exact fallback equation for boundary inspection, not runtime execution."
   [value]
-  (let [value (validate! value)
-        default (dispatch/default-alternative (:dispatch value))]
-    (some #(when (semantic-fingerprint/equivalent? default (:graph %)) %)
-          (:alternatives value))))
+  (:boundary (validation-report value)))
 
 (defn boundary-equation
   "Return the exact equation for shared storage/ABI inspection.

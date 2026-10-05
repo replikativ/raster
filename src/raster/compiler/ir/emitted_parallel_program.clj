@@ -248,20 +248,39 @@
   evidence)
 
 (defn ^:no-doc validate-with-physical-results!
-  "Independently validate a program and retain read-only plain equation projections.
+  "Independently validate a program and retain read-only exact-operation projections.
    Evidence is sealed to this exact immutable program and evidence object; retained-validation?
    checks ownership before internal reuse. Public validators still independently check programs.
-   Dispatch and structured-loop validation are unchanged and supply no projection here."
+   Dispatch reports retain the certified fallback, not a runtime selection. Structured loops
+   remain independently validated and have no projection in this map."
   [parallel-program]
   (let [projections (java.util.IdentityHashMap.)
         candidates-for
         (fn [operation]
-          (if (emitted-equation/emitted-equation? operation)
+          (cond
+            (emitted-equation/emitted-equation? operation)
             (let [{:keys [boundary physical-results]}
                   (emitted-equation/validate-with-physical-results operation)]
-              (.put projections boundary physical-results)
+              (.put projections operation {:boundary boundary :physical-results physical-results
+                                           :candidates [boundary]})
               [boundary])
-            (equation-candidates operation)))
+            (equation-dispatch/emitted-equation-dispatch? operation)
+            (let [projection (equation-dispatch/validate-with-boundary operation)]
+              (.put projections operation projection)
+              (:candidates projection))
+            :else (equation-candidates operation)))
         checked (validate-program! parallel-program candidates-for)]
     (seal-validation-evidence
      checked {:program checked :projections (java.util.Collections/unmodifiableMap projections)})))
+
+(defn ^:no-doc operation-projection
+  "Read one exact operation from an already checked enclosing program's projection map.
+   This accessor is not an evidence validator. Its synchronous consumers must first check the
+   exact program owner; a missing projection is an invariant failure, never permission to reuse
+   another operation's facts or silently reconstruct a different boundary."
+  [projections operation]
+  (when-not (.containsKey ^java.util.Map projections operation)
+    (throw (ex-info "validated program has no projection for this exact operation"
+                    {:reason :emitted-parallel-program-operation-projection
+                     :ir :emitted-parallel-program})))
+  (.get ^java.util.Map projections operation))

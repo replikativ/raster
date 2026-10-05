@@ -994,7 +994,9 @@
                 source-program (with-meta evidence {seal-key (fn [& _] token)})))
           "arbitrary metadata callbacks cannot replace the validator's owner check"))
     (is (.containsKey ^java.util.Map projections boundary))
-    (is (= (emitted-equation/physical-results boundary) (.get ^java.util.Map projections boundary)))
+    (is (identical? boundary (:boundary (.get ^java.util.Map projections boundary))))
+    (is (= (emitted-equation/physical-results boundary)
+           (:physical-results (.get ^java.util.Map projections boundary))))
     (is (thrown? UnsupportedOperationException (.put ^java.util.Map projections boundary {})))
     (is (thrown? UnsupportedOperationException (.clear ^java.util.Map projections)))
     (is (thrown? UnsupportedOperationException
@@ -1219,7 +1221,8 @@
     (.put inherited boundary {:unverified :projection})
     (with-bindings {context-var inherited}
       (is (identical? call (program-call/validate! call))))
-    (is (= (emitted-equation/physical-results boundary) (.get inherited boundary))
+    (is (= (emitted-equation/physical-results boundary)
+           (:physical-results (.get inherited boundary)))
         "public validation does not borrow an enclosing projection")
     (let [failed-context (java.util.IdentityHashMap.)]
       (with-bindings {context-var failed-context}
@@ -1237,22 +1240,32 @@
         project-context (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
                                     '*validated-boundary-projections*)
         projections (atom [])
-        original emitted-equation/physical-results]
+        original emitted-equation/validate-with-physical-results
+        checked (assoc (original boundary) :candidates [boundary])
+        context (doto (java.util.IdentityHashMap.) (.put boundary checked))]
     (is (= boundary copied))
     (is (not (identical? boundary copied)))
-    (with-redefs [emitted-equation/physical-results
+    (with-redefs [emitted-equation/validate-with-physical-results
                   (fn [equation]
                     (swap! projections conj equation)
                     (original equation))]
-      (with-bindings {project-context (java.util.IdentityHashMap.)}
+      (with-bindings {project-context context}
         (program-call/validate-equation-call! step)
-        (program-call/validate-equation-call!
-         (assoc-in step [:equation :operations 0] copied))
-        (is (= 2 (count @projections)) "equal copies cannot reuse identity proof")
-        (is (thrown? clojure.lang.ExceptionInfo
-                     (program-call/validate-equation-call!
-                      (assoc-in step [:equation :operations 0] changed))))
-        (is (= 3 (count @projections)) "changed bodies are independently checked")))))
+        (doseq [operation [copied changed]]
+          (is (= :emitted-parallel-program-operation-projection
+                 (:reason (ex-data
+                           (try (program-call/validate-equation-call!
+                                 (assoc-in step [:equation :operations 0] operation))
+                                (catch clojure.lang.ExceptionInfo error error)))))
+              "an exact-owner scope cannot silently substitute a copied/changed operation"))
+        (is (empty? @projections) "missing scoped identities fail before reconstruction"))
+      (program-call/validate-equation-call!
+       (assoc-in step [:equation :operations 0] copied))
+      (is (= 1 (count @projections)) "independent validation accepts and rechecks an equal copy")
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (program-call/validate-equation-call!
+                    (assoc-in step [:equation :operations 0] changed))))
+      (is (= 2 (count @projections)) "independent validation checks changed bodies afresh"))))
 
 (deftest emitted-program-buffer-remapping-is-total-and-alias-stable
   (let [{:keys [call]} (prepared-mixed-call 3)

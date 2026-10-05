@@ -116,15 +116,12 @@
 (defn- validate-equation-call-against-boundary!
   ;; Only synchronous callers below supply the exact boundary and storage projection just
   ;; produced by emitted-equation validation. No proof escapes into the call record.
-  [call emitted physical]
+  [call emitted physical candidates]
   (when-not (emitted-equation-call? call)
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
   (let [{equation :equation call-graph :graph buffers :buffers
          scalar-values :scalar-values outputs :outputs} call
-        operation (first (:operations equation))
-        expected-graphs (if (equation-dispatch/emitted-equation-dispatch? operation)
-                          (mapv :graph (equation-dispatch/candidates operation))
-                          [(:graph emitted)])
+        expected-graphs (mapv :graph candidates)
         graph call-graph
         runtime-arguments
         (mapv (fn [slot argument]
@@ -160,25 +157,23 @@
 
 (def ^:dynamic ^:private *validated-boundary-projections* nil)
 
-(defn- checked-physical-results [boundary]
-  (if (and *validated-boundary-projections*
-           (.containsKey ^java.util.IdentityHashMap *validated-boundary-projections* boundary))
-    (.get ^java.util.IdentityHashMap *validated-boundary-projections* boundary)
-    (let [physical (emitted-equation/physical-results boundary)]
-      (when *validated-boundary-projections*
-        (.put ^java.util.IdentityHashMap *validated-boundary-projections* boundary physical))
-      physical)))
+(defn- checked-operation-projection [operation]
+  (if *validated-boundary-projections*
+    (emitted-program/operation-projection *validated-boundary-projections* operation)
+    (if (equation-dispatch/emitted-equation-dispatch? operation)
+      (equation-dispatch/validate-with-boundary operation)
+      (let [projection (emitted-equation/validate-with-physical-results operation)]
+        (assoc projection :candidates [(:boundary projection)])))))
 
 (defn validate-equation-call!
   [call]
   (when-not (emitted-equation-call? call)
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
-  (let [boundary (equation-dispatch/boundary-equation
-                  (first (:operations (:equation call))))
+  (let [{:keys [boundary physical-results candidates]}
+        (checked-operation-projection (first (:operations (:equation call))))]
         ;; Independent outside checked construction. Inside it, only the exact already-checked
         ;; immutable boundary's projection may be reused; every call/binding check still runs.
-        physical (checked-physical-results boundary)]
-    (validate-equation-call-against-boundary! call boundary physical)))
+    (validate-equation-call-against-boundary! call boundary physical-results candidates)))
 
 (defn- validate-result-views!
   [equation boundary physical result-views]
@@ -200,13 +195,11 @@
 (defn- prepare-equation-bindings
   [equation values buffers scalars result-views projections]
   (let [operation (first (:operations equation))
-        emitted (equation-dispatch/boundary-equation operation)
-        ;; The enclosing program supplied only exact plain-boundary facts it just checked.
-        ;; Dispatch boundaries still derive their own projection. No constructor context is
-        ;; bound around the host-evaluator callback that precedes this preparation phase.
-        result-storage (if (.containsKey ^java.util.Map projections emitted)
-                         (.get ^java.util.Map projections emitted)
-                         (emitted-equation/physical-results emitted))
+        projection (emitted-program/operation-projection projections operation)
+        emitted (:boundary projection)
+        ;; The enclosing program supplied exact-operation facts it just checked. No constructor
+        ;; context is bound around the host-evaluator callback preceding this preparation phase.
+        result-storage (:physical-results projection)
         common-graph (:graph emitted)
         result-views (validate-result-views! equation emitted result-storage
                                            (select-keys result-views (:results equation)))
@@ -253,11 +246,12 @@
     {:bindings (assoc bindings :outputs (select-keys buffers (:results equation)))
      :buffers buffers :boundary emitted :common-graph common-graph
      :runtime-arguments runtime-arguments :result-storage result-storage
+     :candidates (:candidates projection)
      :result-views result-views}))
 
 (defn- prepare-equation-call
   [equation values buffers scalars result-views projections]
-  (let [{:keys [bindings buffers boundary common-graph runtime-arguments result-storage result-views]}
+  (let [{:keys [bindings buffers boundary common-graph runtime-arguments result-storage result-views candidates]}
         (prepare-equation-bindings equation values buffers scalars result-views projections)
         operation (first (:operations equation))
         graph (if (equation-dispatch/emitted-equation-dispatch? operation)
@@ -271,7 +265,7 @@
             (assoc (->EmittedEquationCall equation graph (:buffers bindings)
                                          (:scalar-values bindings) outputs)
                    :result-views result-views)
-            boundary result-storage)
+            boundary result-storage candidates)
      :buffers buffers}))
 
 (defn- evaluate-host-equations

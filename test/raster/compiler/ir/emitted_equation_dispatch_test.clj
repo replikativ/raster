@@ -11,6 +11,7 @@
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -136,6 +137,57 @@
     (check-candidate-proof-reuse! (first alternatives) certified
                                  emitted-equation/contraction-write-domains)
     (is (= program (emitted-program/validate! program)))
+    (let [reversed (equation-dispatch/make (vec (reverse alternatives))
+                                         (contraction-selection (vec (reverse alternatives)))
+                                         policy)
+          reversed-program (update program :equations
+                                   #(update % (dec (count %)) assoc :operations [reversed]))
+          evidence (emitted-program/validate-with-physical-results! reversed-program)
+          projection (emitted-program/operation-projection (:projections evidence) reversed)]
+      (is (identical? (first alternatives) (:boundary projection))
+          "the certified exact fallback need not be the first alternative")
+      (is (= (emitted-equation/physical-results (first alternatives))
+             (:physical-results projection)))
+      (is (= (vec (reverse alternatives)) (:candidates projection)))
+      (doseq [changed [(assoc reversed :numerical-policy {:permitted-modes #{:exact}})
+                       (assoc-in reversed [:dispatch :default-strategy] :register-tiled)
+                       (assoc reversed :alternatives [(second alternatives)])]]
+        (let [changed-program (update reversed-program :equations
+                                      #(update % (dec (count %)) assoc :operations [changed]))]
+          (is (= :emitted-parallel-program-retained-validation
+                 (reason #(emitted-program/checked-retained-validation!
+                           changed-program evidence))))))
+      (is (= :emitted-parallel-program-operation-projection
+             (reason #(emitted-program/operation-projection
+                       (:projections evidence) (with-meta reversed {:copy true})))))
+      (let [calls (atom 0)
+            candidate-checks (atom 0)
+            original equation-dispatch/validate-with-boundary
+            original-candidate emitted-equation/validate-with-result-contracts
+            call (-> linked :instances first :call)
+            host-results (into {} (keep #(when (program-call/evaluated-host-equation? %)
+                                          [(:id (:equation %)) (:results %)])) (:steps call))]
+        (with-redefs [equation-dispatch/validate-with-boundary
+                      (fn [operation] (swap! calls inc) (original operation))
+                      emitted-equation/validate-with-result-contracts
+                      (fn [candidate]
+                        (swap! candidate-checks inc)
+                        (original-candidate candidate))]
+          (let [evidence (emitted-program/validate-with-physical-results! program)
+                boundaries (#'invocation-link/equation-boundaries program (:projections evidence))
+                retained (program-call/make program (:buffers call) (:scalar-values call) {}
+                                            (fn [equation _] (get host-results (:id equation)))
+                                            {} evidence)]
+            (is (= 1 @calls) "one program proof supplies all synchronous dispatch projections")
+            (is (= 2 @candidate-checks) "each candidate is independently reconstructed once")
+            (is (some #(identical? certified (:operation %)) boundaries))
+            (is (= (:graph (last (:steps call))) (:graph (last (:steps retained)))))
+            (program-call/validate-with-retained-program! retained evidence)
+            (is (= 1 @calls) "retained concrete validation does not reconstruct static candidates")
+            (is (= 2 @candidate-checks) "candidate-level reconstruction is not hidden elsewhere")
+            (program-call/validate! retained)
+            (is (= 2 @calls) "later public validation independently reconstructs every candidate")
+            (is (= 4 @candidate-checks) "later public proof independently reconstructs both candidates")))))
     (is (= :register-tiled
            (executable/strategy (-> linked :instances first :call :steps last :graph))))
     (let [outputs (filter #(= :output (:role %)) (vals (:nodes linked)))]
