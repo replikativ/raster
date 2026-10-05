@@ -1205,11 +1205,11 @@
   "BLAS source spellings projected into the typed contraction algebra.  Layout states
    operand indexing; `:batched?` adds a free logical axis rather than a new operation kind.
    After projection, verified contraction facts and AxisMaps are the scheduling authority."
-  {'raster.linalg.blas/dgemm! {:layout :nn}
-   'raster.linalg.blas/dgemm-nt! {:layout :nt}
-   'raster.linalg.blas/dgemm-tn! {:layout :tn}
-   'raster.linalg.blas/batched-gemm-nn! {:layout :nn :batched? true}
-   'raster.linalg.blas/batched-gemm-nt! {:layout :nt :batched? true}})
+  {'raster.linalg.blas/dgemm! {:layout :nn :source-arithmetic :abstract-blas-product}
+   'raster.linalg.blas/dgemm-nt! {:layout :nt :source-arithmetic :abstract-blas-product}
+   'raster.linalg.blas/dgemm-tn! {:layout :tn :source-arithmetic :abstract-blas-product}
+   'raster.linalg.blas/batched-gemm-nn! {:layout :nn :batched? true :source-arithmetic :abstract-blas-product}
+   'raster.linalg.blas/batched-gemm-nt! {:layout :nt :batched? true :source-arithmetic :abstract-blas-product}})
 
 (defn- gemm-converted-literal
   [result-dtype value]

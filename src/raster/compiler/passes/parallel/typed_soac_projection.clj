@@ -11,6 +11,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]))
@@ -267,6 +268,7 @@
                   (not= (:result-storage-dtype attributes) contraction-dtype))
              (assoc :out-dtype (:result-storage-dtype attributes)))
      :dtype contraction-dtype
+     :source-arithmetic (get attributes :source-arithmetic numerics/retained-source-arithmetic)
      :metadata {:raster.type/elem-type contraction-dtype}}))
 
 (defn segmented-reduce-contract-form

@@ -2939,3 +2939,35 @@ an exactness claim. Do not introduce a second registry or weaken the real-checkp
 gate to paper over this distinction. Continue same-input attention pullback isolation
 before deciding whether that gate exposes a miscompile or an inadequate arithmetic
 equivalence specification. External full-model training acceptance is still open.
+
+### Source-arithmetic provenance through the existing contraction spine — 2026-10-06
+
+The existing BLAS projection table now marks abstract product provenance. The concrete
+Float/Double contract is constructed only after contextual specialization resolves the
+contraction dtype; raw overloaded method spelling and stale call tags are not a second dtype
+oracle. Ordinary and staged contractions retain their typed SSA semantics without fabricating
+one global precision for a mixed-component fold. The closed descriptive schema distinguishes
+operand identity conversion, the product-reduction precision floor, implementation-dependent
+association/rounding inside that product, and the unchanged typed result transform.
+
+The facet is explicit in TypedSOAC, projected contraction facts, both SegRed lowering paths,
+scheduled numerics and the existing emitted certificate. A changed or omitted scheduled facet
+rejects, as does a BLAS compatibility assertion on a source lacking that provenance. Existing
+semantic identity therefore changes; old contraction cache artifacts rebuild. No new IR,
+operation registry, schedule permission, selector or reference tolerance was introduced. Missing
+facets in older typed equations conservatively project to retained SSA, never inferred BLAS.
+
+Focused frontend/source tests pass 120 tests / 646 assertions; affected contraction, dialect
+and certificate suites pass 84 tests / 636 assertions in the capped warm REPL. Review found
+and corrected premature dtype resolution and lost producer-local provenance. The joined
+hardware-free test covers the full semantic-to-artifact chain and rejects certificate mutation.
+Affected public portable/register replay passes 4 tests / 78 assertions on local OpenCL and
+Level Zero, with no skips. Full cold CI remains the merge gate.
+
+This is provenance, not a new equivalence theorem or schedule admission rule. Follow up with
+restrictive refinement checks and reference-selection policy, preserving existing explicit
+reassociation/mixed-precision consent. Before provenance could ever grant permission, distinguish
+recognized compiler BLAS origins from user-supplied metadata assertions; the marker currently
+authenticates neither. Initial numerical compatibility evidence remains alpha=1/beta=0; nontrivial
+BLAS alpha/beta rounding is not proved by the product facet. The real-checkpoint gate (#1060)
+remains held with unchanged tolerances and the original eight-item campaign remains incomplete.

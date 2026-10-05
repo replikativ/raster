@@ -98,6 +98,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-closure :as contraction]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scan :as scan-ir]))
 
 (defn value-id?
@@ -276,6 +277,8 @@
 (defn reduce-attributes?
   [value]
   (and (map-attributes? value)
+       (or (not (contains? value :source-arithmetic))
+           (numerics/source-arithmetic? (:source-arithmetic value)))
        (vector? (:accumulators value))
        (seq (:accumulators value))
        (every? symbol? (:accumulators value))
@@ -288,6 +291,8 @@
           (count (:dtypes value))
           (count (:algebra value)))
        (every? keyword? (:dtypes value))
+       (or (not= :abstract-blas-product (get-in value [:source-arithmetic :kind]))
+           (= (:dtypes value) [(get-in value [:source-arithmetic :operands :dtype])]))
        (every? map? (:algebra value))
        (or (nil? (:result-storage-dtype value))
            (let [stored (:result-storage-dtype value)]

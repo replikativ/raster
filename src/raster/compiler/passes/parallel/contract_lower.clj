@@ -65,7 +65,7 @@
         ;; otherwise valid producer-local GEMM canonicalization.
         scalars (set/difference (set/union bound-syms (util/free-syms body))
                                 arrays axis-indices #{out})]
-    (segop/->SegRed id space
+    (assoc (segop/->SegRed id space
                     (segop/->SegLevel :thread :virtual)
                     reduction
                     nil                 ; map-lambda: nil (product is in the combine)
@@ -75,7 +75,8 @@
                     grid
                     :segmented
                     nil
-                    dtype)))
+                    dtype)
+           :source-arithmetic (:source-arithmetic facts))))
 
 (defn contract-form->segred
   "Source compatibility entry: parse once, then use the source-free semantic projection."

@@ -25,6 +25,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -2553,7 +2554,7 @@
                      (assoc (meta (:body source)) :tag tag :raster.type/tag tag))
                    (:body source))
             facts (contraction-facts/from-components
-                   (-> (select-keys source [:out :free-axes :contract-axes :body :opts])
+                   (-> (select-keys source [:out :free-axes :contract-axes :body :opts :source-arithmetic])
                        (assoc :body body)
                        (assoc :dtype (first core-types))
                        (assoc-in [:opts :operands] operands)))
@@ -3154,6 +3155,7 @@
            :product product :inputs arrays :outputs #{out}
            :scalars (set/union scalars epilogue-scalar-ids)
            :result-transform result-transform
+           :source-arithmetic (:source-arithmetic facts)
            :output-dtype output-dtype
            :effect-only? true :host-binding symbol
            ;; Contract is effectful at the source spelling because it writes `out`, but its
@@ -3323,7 +3325,7 @@
   [ordinal scalar-types expression]
   (let [source-operation (when (and (seq? expression) (= '.invk (first expression)))
                            (:raster.op/original (meta expression)))
-        {:keys [layout batched?] :as projection}
+        {:keys [layout batched? source-arithmetic] :as projection}
         (get descriptor/blas-gemm-projections source-operation)
         variant layout
         arguments (when variant (vec (drop 2 expression)))
@@ -3466,6 +3468,8 @@
                      epilogue (concat [:epilogue epilogue])
                      true (->> (apply list)))
           (cond-> {:raster.op/original (:raster.op/original (meta expression))}
+            (= :abstract-blas-product source-arithmetic)
+            (assoc :raster.source/arithmetic source-arithmetic)
             elem-type (assoc :raster.type/elem-type elem-type))))
       expression)))
 
@@ -5042,7 +5046,7 @@
 
 (defn- segmented-reduce-equation
   [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
-           result-transform output-dtype]}]
+           result-transform output-dtype source-arithmetic]}]
   (let [component (first (:components product))
         expressions (:results (reduction/fold-region product))
         arrays (if (empty? segment-axes)
@@ -5070,6 +5074,7 @@
                  :identities [(:neutral component)]
                  :dtypes [(:dtype component)]
                  :result-storage-dtype output-dtype
+                 :source-arithmetic (or source-arithmetic numerics/retained-source-arithmetic)
                  :algebra [algebra]
                  :result-transform result-transform}
                 arrays captures

@@ -577,7 +577,8 @@
                       :effects {:kind :pure-contraction
                                 :uses (scheduled-body/derive-uses kernel-body arguments)}
                       :legality {:kind :ordered-portable-contraction}
-                      :numerics {:mode :exact :policy :same-typed-ssa-evaluation-order}
+                      :numerics {:mode :exact :policy :same-typed-ssa-evaluation-order
+                                 :source-arithmetic (:source-arithmetic contract-facts)}
                       :attributes {:strategy (get-in kernel-body [:schedule :strategy])
                                    :out-elems (get-in kernel-body [:attributes :launch-segment-count])}})]
       (scheduled-body/validate-against-node! scheduled node graph))))
@@ -627,6 +628,7 @@
                           :legality {:kind :register-tiled-contraction
                                      :tile (:tile lowered) :variant (:variant lowered)}
                           :numerics {:mode :reassociated :policy :ordered-k-target-contraction
+                                     :source-arithmetic (:source-arithmetic contract-facts)
                                      :accumulator-dtype :float :rounding :implementation-defined}
                           :attributes {:strategy :register-tiled :precision :f32
                                        :variant (:variant lowered)
@@ -674,6 +676,7 @@
                                      :tile (:tile planned)
                                      :instruction (get-in planned [:tile :matrix])}
                           :numerics {:mode :reassociated :policy :tiled-contraction
+                                     :source-arithmetic (:source-arithmetic contract-facts)
                                      :rounding :nearest-even :accumulator-dtype :float}
                           :attributes {:strategy :matrix
                                        :out-elems (apply * (map second

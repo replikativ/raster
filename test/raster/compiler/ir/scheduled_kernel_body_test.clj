@@ -7,6 +7,7 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]))
 
 (defn- scalar-body []
@@ -38,6 +39,26 @@
 (defn- reason-of [thunk]
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))
+
+(deftest source-arithmetic-cannot-be-dropped-or-forged-in-a-scheduled-certificate
+  (let [contract (numerics/blas-source-arithmetic :float)
+        value (-> (fixture)
+                  (assoc :source {:id :source :source-arithmetic contract})
+                  (assoc-in [:numerics :source-arithmetic] contract))]
+    (is (= value (scheduled/validate! value)))
+    (is (= :scheduled-kernel-body-source-arithmetic
+           (reason-of #(scheduled/validate!
+                        (update value :numerics dissoc :source-arithmetic)))))
+    (is (= :scheduled-kernel-body-source-arithmetic
+           (reason-of #(scheduled/validate!
+                        (assoc-in value [:numerics :source-arithmetic]
+                                  numerics/retained-source-arithmetic)))))
+    (is (= :scheduled-kernel-body-source-arithmetic
+           (reason-of #(scheduled/validate! (assoc value :source {:id :legacy-source})))))
+    (is (= :source-arithmetic
+           (reason-of #(scheduled/validate!
+                        (assoc-in value [:numerics :source-arithmetic :operands :conversion]
+                                  :narrow)))))))
 
 (defn- conditioned-fixture []
   (scheduled/make

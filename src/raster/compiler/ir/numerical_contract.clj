@@ -14,6 +14,38 @@
 (def cast-overflow-policies
   #{:wrap :saturate :trap :exact :ieee})
 
+(def retained-source-arithmetic {:kind :retained-typed-ssa})
+
+(defn blas-source-arithmetic
+  "Describe a resolved BLAS product, not permission for a numerical refinement.
+   Operand conversion and the typed result transform are outside the implementation-defined
+   association/rounding of the product reduction. The overload's element dtype fixes the floor."
+  [element-dtype]
+  (when-not (contains? #{:float :double} element-dtype)
+    (throw (ex-info "BLAS source arithmetic requires a resolved Float or Double overload"
+                    {:reason :source-arithmetic :dtype element-dtype})))
+  {:kind :abstract-blas-product
+   :operands {:dtype element-dtype :conversion :identity}
+   :accumulation {:scope :reduction-intermediates :minimum-dtype element-dtype
+                  :source-order :implementation-defined
+                  :rounding-points :implementation-defined}
+   :result-transform :retained-typed-ssa})
+
+(defn source-arithmetic?
+  "Closed descriptive source schema. It never grants schedule or mixed-precision consent."
+  [value]
+  (or (= retained-source-arithmetic value)
+      (and (map? value)
+           (contains? #{:float :double} (get-in value [:operands :dtype]))
+           (= value (blas-source-arithmetic (get-in value [:operands :dtype]))))))
+
+(defn validate-source-arithmetic!
+  [value]
+  (when-not (source-arithmetic? value)
+    (throw (ex-info "invalid source arithmetic contract"
+                    {:reason :source-arithmetic :value value})))
+  value)
+
 (defn rounding-policy?
   [value]
   (contains? rounding-policies value))
@@ -84,4 +116,6 @@
                 (not (result-transform? (:result-transform contract))))
        (fail! "numerical result transform requires a checked typed scalar-region policy"
               {:value (:result-transform contract)}))
+     (when (contains? contract :source-arithmetic)
+       (validate-source-arithmetic! (:source-arithmetic contract)))
      contract)))
