@@ -89,3 +89,19 @@
     (is (= :external-training-options
            (try (acceptance/run! options) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest explicit-cases-reject-invalid-dimensions-before-preparation
+  (let [valid {:cfg {:bs 1 :seq 2 :d 3} :weights [{} {}] :adapters [{} {}]
+               :input (float-array 6) :target (float-array 6) :replay-count 1}]
+    (doseq [bad [(assoc valid :replay-count 0)
+                 (assoc-in valid [:cfg :bs] 2)
+                 (assoc-in valid [:cfg :seq] nil)
+                 (assoc valid :cfg {:bs 1 :seq -2 :d -3})
+                 (assoc valid :cfg {:bs 1 :seq Long/MAX_VALUE :d Long/MAX_VALUE})
+                 (assoc valid :weights '({} {}))
+                 (assoc valid :adapters [nil nil])
+                 (assoc valid :weights [{}])
+                 (assoc valid :target (float-array 5))]]
+      (is (= :external-training-case
+             (try (acceptance/run-loaded! {} :ocl:0 bad) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
