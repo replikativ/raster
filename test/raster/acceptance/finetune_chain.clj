@@ -98,6 +98,16 @@
                      :actual (count actual) :expected (count expected)})))
   ((oracle 'worst-rel) actual expected))
 
+(defn- difference-summary [actual expected]
+  (let [[maximum reference-maximum error-squared reference-squared]
+        (reduce (fn [[maximum reference-maximum error-squared reference-squared] [a b]]
+                  (let [a (double a) b (double b) error (- a b)]
+                    [(max maximum (Math/abs error)) (max reference-maximum (Math/abs b))
+                     (+ error-squared (* error error)) (+ reference-squared (* b b))]))
+                [0.0 0.0 0.0 0.0] (map vector actual expected))]
+    {:max-absolute maximum :reference-max reference-maximum
+     :error-l2 (Math/sqrt error-squared) :reference-l2 (Math/sqrt reference-squared)}))
+
 (defn- prepare-chain [train target-device cfg weights adapters input target]
   (let [n (* (:seq cfg) (:d cfg))
         options {:compiler :equation-first :target target-device :dtype :float :inline? true}
@@ -226,7 +236,17 @@
                             (or (nil? previous) (not (value/live? (:prediction previous)))))
                (throw (ex-info "external chain differs from the monolithic CPU AD oracle"
                                {:reason :external-training-parity :iteration iteration
-                                :loss-error loss-error :dx-error dx-error :adapter-errors errors})))
+                                :predicted-loss predicted-loss :reference-loss reference-loss
+                                :loss-error loss-error :dx-error dx-error :adapter-errors errors
+                                :adapter-diagnostics
+                                (vec (for [layer [0 1]
+                                           [index key] (map-indexed vector @(train 'adapter-keys))
+                                           :when (not (< (nth errors (+ (* layer 14) index)) 2.0e-2))]
+                                       (assoc (difference-summary
+                                               ((recovered layer) key)
+                                               (nth vg (+ 2 (* layer 27)
+                                                          (get @(oracle 'adapter-pos) key))))
+                                              :layer layer :adapter key)))})))
              (recur (inc iteration) updated outputs
                     (conj results {:loss predicted-loss :reference-loss reference-loss
                                    :loss-error loss-error :dx-error dx-error

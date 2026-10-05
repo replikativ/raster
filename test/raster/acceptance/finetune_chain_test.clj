@@ -105,3 +105,10 @@
       (is (= :external-training-case
              (try (acceptance/run-loaded! {} :ocl:0 bad) nil
                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest mismatch-diagnostics-retain-error-magnitude-without-changing-admission
+  (let [summary (#'acceptance/difference-summary (float-array [1 4]) (float-array [1 2]))]
+    (is (= 2.0 (:max-absolute summary)))
+    (is (= 2.0 (:reference-max summary)))
+    (is (= 2.0 (:error-l2 summary)))
+    (is (= (Math/sqrt 5.0) (:reference-l2 summary)))))

@@ -192,6 +192,32 @@ the hardware-independent loader/option/shape checks (7 tests / 20 assertions); i
 the external checkout or treat native acceptance as a conditional pass.
 Real-weight/head training and the canonical external adapter migration remain open.
 
+### Real-weight two-layer gradient checkpoint — 2026-10-06
+
+The explicit-case follow-up retains the original two-update gate and CPU AD oracle. The actual
+Gemma checkpoint supplies token embeddings `[2, 651]` and layers 0/1 at width 640, 4/1 query/KV
+heads, head dimension 256, FFN width 2048 and adapter rank 16. The unmodified selective
+SafeTensors reader is checked against pretrained snapshot
+`f4c2bb476884c36b5e12a8fa934eb2ddf4ca2ead`; sibling changes are untouched. Checkpoint SHA-256:
+`700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab`.
+
+One OpenCL `lr=1` pre-update gradient check **fails the unchanged adapter worst-relative
+threshold**; it is not a sustained training recipe. Loss is 17921.2765625 versus CPU
+17921.2671875 (absolute error 0.009375), and input-gradient worst-relative error is 0.00549613;
+both satisfy their original checks. Eleven of 28 adapter comparisons exceed 0.02, with a
+maximum worst-element error of 1.06533 for layer-1 Ak. Its absolute maximum error is
+0.000329494, reference maximum 11.4944, and relative L2 error about 0.0000438196. Other failing
+adapter relative L2 errors are approximately 1e-6–4e-6. This suggests near-zero cancellation,
+but does not establish correctness or justify replacing the original thresholds. Independent
+finite differences and further numerical-policy checks are required before accepting this case.
+Mismatch diagnostics now retain absolute and norm magnitudes without changing admission.
+Focused case/diagnostic host checks pass 9 tests / 33 assertions.
+Independent CPU central differences at two representative coordinates support the AD values:
+layer-0 Ad[13693] is -6512.442 versus -6514.074/-6517.174 at steps 0.001/0.0005;
+layer-1 Ak[3600] is -11.494379 versus -11.210937/-11.484375 at steps 0.02/0.01.
+These finite differences also show FP32 loss quantization/step sensitivity. They do not resolve
+near-zero coordinates or turn the failed native gate into a pass.
+
 ## Consolidation diagnostic — 2026-10-01
 
 The existing public equation-first GEMM canary executed `[32 32 32]`, strict FP32,
