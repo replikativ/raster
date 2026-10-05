@@ -204,12 +204,17 @@
 (defn- equation-boundaries
   "Inspect each immutable operation boundary once within this lowering invocation.
    This retains no validation authority across calls and never selects a runtime alternative."
-  [parallel-program]
+  ([parallel-program] (equation-boundaries parallel-program nil))
+  ([parallel-program projections]
   (into []
         (keep (fn [equation]
                 (when-let [operation (first (:operations equation))]
-                  {:operation operation :graph (equation-dispatch/boundary-graph operation)})))
-        (:equations parallel-program)))
+                  {:operation operation
+                   :graph (if (and projections (not (emitted-loop/emitted-loop? operation)))
+                            (:graph (:boundary (emitted-program/operation-projection
+                                                projections operation)))
+                            (equation-dispatch/boundary-graph operation))})))
+        (:equations parallel-program))))
 
 (defn- write-before-read-inputs
   [boundaries materialized scalars]
@@ -342,13 +347,13 @@
     (lower-loop-storage state invocation-id equation scalars)
 
     :else
-    (let [emitted (equation-dispatch/boundary-equation (first (:operations equation)))
-          ;; Retained projections were validated for this exact immutable boundary. Missing
-          ;; entries (including dispatch boundaries) retain the independent public path.
-          physical (if (and physical-projections
-                            (.containsKey ^java.util.Map physical-projections emitted))
-                     (.get ^java.util.Map physical-projections emitted)
-                     (emitted-equation/physical-results emitted))]
+    (let [operation (first (:operations equation))
+          projection (when physical-projections
+                       (emitted-program/operation-projection physical-projections operation))
+          emitted (if projection (:boundary projection)
+                      (equation-dispatch/boundary-equation operation))
+          physical (if projection (:physical-results projection)
+                       (emitted-equation/physical-results emitted))]
       (reduce
        (fn [state result]
          (let [physical-id (get physical result)
@@ -390,10 +395,14 @@
    (lower materialized parallel-program target evaluate-host project nil))
   ([materialized parallel-program target evaluate-host project retained-validation]
   (let [materialized (materialization/validate! materialized)
-        parallel-program (if retained-validation
-                           (:program (emitted-program/checked-retained-validation!
-                                      parallel-program retained-validation))
-                           (emitted-program/validate! parallel-program))
+        ;; Without a retained owner, independently prove this exact program once for this
+        ;; synchronous lowering. The same sealed report feeds the storage/call/final phases;
+        ;; it is never published as authority on the returned plan or bound around callbacks.
+        retained-validation (if retained-validation
+                              (emitted-program/checked-retained-validation!
+                               parallel-program retained-validation)
+                              (emitted-program/validate-with-physical-results! parallel-program))
+        parallel-program (:program retained-validation)
         _ (when-let [providers (seq (get-in parallel-program
                                            [:attributes :native-initialization-providers]))]
             (fail! :invocation-link-native-initialization
@@ -409,7 +418,7 @@
                     :program-inputs (:inputs parallel-program)}))
         scalars (:program-scalars materialized)
         shape-scalars (merge (invocation-shape-scalars materialized) scalars)
-        boundaries (equation-boundaries parallel-program)
+        boundaries (equation-boundaries parallel-program (:projections retained-validation))
         overwrite-inputs (write-before-read-inputs boundaries
                                                    materialized shape-scalars)
         required-buffers (required-materialized-buffers parallel-program boundaries)

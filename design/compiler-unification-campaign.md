@@ -48,6 +48,26 @@ not single plain FP32 contractions; this is not evidence that every operation is
 This measurement uses the synthetic Intel descriptor and establishes compilation only, not
 native dispatch selection, training parity or throughput.
 
+### October 5 invocation-local dispatch proof consolidation
+
+The per-invocation boundary scan completes pure Gemma planning in 157 seconds after a
+182-second fresh compile under variable background load: 123 tensor calls, all 50 mixed
+`xmx-direct` selections (21 NT, 15 NN, 14 TN), and zero driver allocations. An inclusive
+profile on the same compilation takes 136 seconds and records 905 boundary-equation queries
+accounting for 68 seconds; nested timings are not additive and these are not matched benchmarks.
+
+The next bounded consolidation extends the existing sealed program evidence, not the cache or
+certificate hierarchy. One read-only operation-identity map retains the independently checked
+fallback equation, common physical results and certified candidates. Every dispatch candidate,
+numerical permission/model, common storage and exact fallback is checked during that proof.
+Storage lowering and synchronous call construction reuse only those exact immutable facts.
+Absent external evidence, lowering derives fresh invocation-local evidence itself. Copied or
+modified owners/evidence reject; a missing scoped operation projection fails closed. Public
+validation remains independent; runtime admission, scalar/range checks, result views, aliases,
+host callbacks and final LinkPlan obligations remain fresh. No proof is attached to the plan,
+and callbacks do not inherit the projection scope. Native Gemma trajectory acceptance and
+the original external training/distributed/multilevel campaign gates remain open.
+
 The next equation-first candidate constructor derives a full-K mixed schedule from the retained
 typed algorithm and freshly reconstructed public graph. A pure planner owns target admission;
 the existing matrix emitter consumes the resulting stage bodies. The shared target-schedule
