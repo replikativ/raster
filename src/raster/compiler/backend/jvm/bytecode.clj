@@ -17,7 +17,8 @@
            (java.lang.classfile.attribute SourceFileAttribute)
            (java.lang.constant ClassDesc MethodTypeDesc
                                DynamicCallSiteDesc DirectMethodHandleDesc$Kind
-                               MethodHandleDesc ConstantDesc)))
+                               MethodHandleDesc ConstantDesc
+                               DynamicConstantDesc ConstantDescs)))
 
 ;; ================================================================
 ;; ClassFile with Clojure-aware class hierarchy resolver
@@ -107,6 +108,25 @@
 
 (def ^:private string-cd  (ClassDesc/ofDescriptor "Ljava/lang/String;"))
 (def ^:private mhlookup-cd (ClassDesc/ofDescriptor "Ljava/lang/invoke/MethodHandles$Lookup;"))
+
+;; A Var as a dynamic constant: resolved once per call site by RT.var(ns, name)
+;; (ConstantBootstraps.invoke), instead of interning the namespace and symbol
+;; on every execution. The Var's root is still read at each use, so a
+;; redefinition (`def` keeps the Var) is seen as before.
+(def ^:private rt-var-handle
+  (MethodHandleDesc/ofMethod DirectMethodHandleDesc$Kind/STATIC
+                             (ClassDesc/ofDescriptor "Lclojure/lang/RT;") "var"
+                             (MethodTypeDesc/of (ClassDesc/ofDescriptor "Lclojure/lang/Var;")
+                                                (into-array ClassDesc [(ClassDesc/ofDescriptor "Ljava/lang/String;")
+                                                                       (ClassDesc/ofDescriptor "Ljava/lang/String;")]))))
+
+(defn- emit-var-constant!
+  "Push the Var `ns-name`/`sym-name` (a dynamic constant of the class)."
+  [code ^String ns-name ^String sym-name]
+  (.ldc code ^ConstantDesc
+        (DynamicConstantDesc/ofNamed ConstantDescs/BSM_INVOKE "_"
+                                     (ClassDesc/ofDescriptor "Lclojure/lang/Var;")
+                                     (into-array ConstantDesc [rt-var-handle ns-name sym-name]))))
 (def ^:private methodtype-cd (ClassDesc/ofDescriptor "Ljava/lang/invoke/MethodType;"))
 (def ^:private callsite-cd (ClassDesc/ofDescriptor "Ljava/lang/invoke/CallSite;"))
 (def ^:private bootstrap-cd (ClassDesc/of "raster.runtime.Bootstrap"))
@@ -2765,9 +2785,7 @@
                     (when-let [ns-sym (namespace head)]
                       (when-let [ns-obj (find-ns (symbol ns-sym))]
                         (ns-resolve ns-obj (symbol (name head))))))]
-          (.ldc code (str (.name (.ns ^clojure.lang.Var v))))
-          (.ldc code (str (.sym ^clojure.lang.Var v)))
-          (.invokestatic code rt-cd "var" (MethodTypeDesc/of var-cd (into-array ClassDesc [(ClassDesc/ofDescriptor "Ljava/lang/String;") (ClassDesc/ofDescriptor "Ljava/lang/String;")])))
+          (emit-var-constant! code (str (.name (.ns ^clojure.lang.Var v))) (str (.sym ^clojure.lang.Var v)))
           (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
           (.checkcast code ifn-cd)
           (doseq [a args]
@@ -3681,13 +3699,7 @@
             (instance? Float root)   (do (.ldc code (float root)) :float)
             (instance? Integer root) (do (.ldc code (int root)) :int)
             :else
-            (do (.ldc code (str (.name (.ns ^clojure.lang.Var v))))
-                (.ldc code (str (.sym ^clojure.lang.Var v)))
-                (.invokestatic code rt-cd "var"
-                               (MethodTypeDesc/of var-cd
-                                                  (into-array ClassDesc
-                                                              [(ClassDesc/ofDescriptor "Ljava/lang/String;")
-                                                               (ClassDesc/ofDescriptor "Ljava/lang/String;")])))
+            (do (emit-var-constant! code (str (.name (.ns ^clojure.lang.Var v))) (str (.sym ^clojure.lang.Var v)))
                 (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
                 :ref)))
         (if (class? v)
@@ -4401,12 +4413,7 @@
               (let [sym (first args)
                     v   (ns-resolve (or (:source-ns ctx) *ns*) sym)]
                 (if (and v (var? v))
-                  (do (.ldc code (str (.name (.ns ^clojure.lang.Var v))))
-                      (.ldc code (str (.sym ^clojure.lang.Var v)))
-                      (.invokestatic code rt-cd "var"
-                                     (MethodTypeDesc/of var-cd
-                                                        (into-array ClassDesc [(ClassDesc/ofDescriptor "Ljava/lang/String;")
-                                                                               (ClassDesc/ofDescriptor "Ljava/lang/String;")])))
+                  (do (emit-var-constant! code (str (.name (.ns ^clojure.lang.Var v))) (str (.sym ^clojure.lang.Var v)))
                       :ref)
                   (throw (ex-info (str "Cannot resolve var: " sym)
                                   {:symbol sym}))))
@@ -5301,10 +5308,7 @@
                                                        (.areturn code))
                                 ;; Boxed fallback
                                                      (.labelBinding code boxed-label)
-                                                     (.ldc code (or fallback-ns (str (ns-name source-ns))))
-                                                     (.ldc code (or fallback-name (str class-name)))
-                                                     (.invokestatic code rt-cd "var"
-                                                                    (MethodTypeDesc/of var-cd (into-array ClassDesc [string-cd string-cd])))
+                                                     (emit-var-constant! code (or fallback-ns (str (ns-name source-ns))) (or fallback-name (str class-name)))
                                                      (.invokevirtual code var-cd "getRawRoot"
                                                                      (MethodTypeDesc/of obj-cd no-cd))
                                                      (.checkcast code ifn-cd)
