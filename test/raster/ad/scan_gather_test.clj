@@ -54,7 +54,10 @@
 
 (deftest gather-read-in-a-carry-loop-matches-finite-differences
   (testing "evaluated" (check-gradient (rev/value+grad #'varying-intercepts :wrt [0 1 2 3])))
-  (testing "compiled" (check-gradient (rev/value+grad #'varying-intercepts :wrt [0 1 2 3] :compile? true))))
+  (testing "compiled"
+    (let [vg (rev/value+grad #'varying-intercepts :wrt [0 1 2 3] :compile? true)]
+      (is (::rev/compiled? (meta vg)) (str (::rev/compile-failure (meta vg))))
+      (check-gradient vg))))
 
 (deftest gather-read-takes-the-scan-pullback
   (let [{:keys [walked-body]} (#'rev/build-grad-walked-body #'varying-intercepts [0 1 2 3])
