@@ -251,7 +251,9 @@
                    :batching (when (some? batch)
                                {:extent batch :lhs (get batching :row true)
                                 :rhs (get batching :col true)})}
-        :numerics (refinement-numerics spec split-k?)
+        :numerics (cond-> (refinement-numerics spec split-k?)
+                    (:source-arithmetic source-operation)
+                    (assoc :source-arithmetic (:source-arithmetic source-operation)))
         :provenance {:operation-id (:id source-operation)
                      :source-dialect :typed-soac}
         :attributes {:compiler-stage :gemm-graph-schedule}}))))

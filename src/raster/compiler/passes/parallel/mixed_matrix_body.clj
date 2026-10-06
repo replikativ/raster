@@ -265,7 +265,9 @@
           :scalar-bindings (scheduled-body/derive-scalar-bindings body arguments scalar-types)
           :effects (assoc effects :uses uses)
           :legality legality
-          :numerics numerics
+          :numerics (cond-> numerics
+                      (:source-arithmetic source)
+                      (assoc :source-arithmetic (:source-arithmetic source)))
           :provenance (merge {:semantic-op :contraction
                               :lowering :gemm-graph :phase phase}
                              provenance)

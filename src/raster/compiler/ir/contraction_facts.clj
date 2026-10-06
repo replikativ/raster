@@ -29,6 +29,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as contract-stages]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.reduction :as reduction]))
 
 (def ^:private facts-tag ::facts)
@@ -157,12 +158,12 @@
 
 (defn surface-form
   "Spell contraction components in the temporary `raster.par/contract` target vocabulary."
-  [{:keys [out free-axes contract-axes body opts metadata]}]
+  [{:keys [out free-axes contract-axes body opts metadata source-arithmetic]}]
   (with-meta
     (apply list
            (concat ['raster.par/contract out free-axes contract-axes body]
                    (mapcat identity opts)))
-    metadata))
+    (cond-> metadata source-arithmetic (assoc :raster.source/arithmetic source-arithmetic))))
 
 (defn from-components
   "Construct the sole verified contraction-facts value from explicit semantic components.
@@ -173,9 +174,16 @@
    layout declaration. Optional compiler-local `local-identities` may name the accumulator;
    its name must be unqualified and absent from the complete source scope. Source callers
    continue to allocate fresh binders by default."
-  [{:keys [out free-axes contract-axes body opts dtype form metadata local-identities]
+  [{:keys [out free-axes contract-axes body opts dtype form metadata local-identities source-arithmetic]
     :or {opts {} dtype :double local-identities {}}}]
-  (let [_ (when-not (symbol? out)
+  (let [source-arithmetic (numerics/validate-source-arithmetic!
+                           (or source-arithmetic numerics/retained-source-arithmetic))
+        _ (when (and (= :abstract-blas-product (:kind source-arithmetic))
+                     (not= dtype (get-in source-arithmetic [:operands :dtype])))
+            (throw (ex-info "BLAS source arithmetic must match the resolved contraction dtype"
+                            {:reason :source-arithmetic :dtype dtype
+                             :source-arithmetic source-arithmetic})))
+        _ (when-not (symbol? out)
             (throw (ex-info "contract output must be a symbol" {:reason :malformed-output
                                                                 :out out})))
         _ (when-not (vector? free-axes)
@@ -216,6 +224,7 @@
               :n-free (count free-axes)
               :n-contract (count contract-axes)
               :body body
+              :source-arithmetic source-arithmetic
               :operands terms
       ;; Compatibility projections. New semantic and schedule passes consume :reduction; leaf
       ;; gates still read these until the contraction KernelBody vertical is complete.
@@ -241,14 +250,22 @@
     (throw (ex-info "contraction-facts: not a par/contract form" {:reason :not-a-contract-form
                                                                   :form form})))
   (let [[_ out free-axes contract-axes body] form
-        opts (form-opts form)]
+        opts (form-opts form)
+        ;; Contextual specialization resolves storage before this boundary. A raw overloaded
+        ;; call tag is provenance, not a second dtype oracle (Double-spelled BLAS may specialize
+        ;; to Float arrays). Only now concretize its arithmetic floor.
+        resolved-dtype (or (when-not (contains? opts :out-dtype) destination-dtype) dtype)
+        source-arithmetic (:raster.source/arithmetic (meta form))
+        source-arithmetic (if (= :abstract-blas-product source-arithmetic)
+                            (numerics/blas-source-arithmetic resolved-dtype)
+                            source-arithmetic)]
     (from-components {:out out :free-axes free-axes :contract-axes contract-axes
                       :body body :opts opts
+                      :source-arithmetic source-arithmetic
                       ;; With no explicit result conversion, the declared destination fixes the
                       ;; scalar reduction dtype. With :out-dtype, it names storage only; `dtype`
                       ;; remains the numeric source/accumulator policy.
-                      :dtype (or (when-not (contains? opts :out-dtype) destination-dtype)
-                                 dtype)
+                      :dtype resolved-dtype
                       :form form})))
 
 (defn dependencies
@@ -321,7 +338,7 @@
       (if (and (contains? '#{+ clojure.core/+ raster.numeric/+} combine)
                (:ok (contract-stages/stages-legal? stages (:contract-axes source))))
         (from-components
-         (-> (select-keys source [:out :free-axes :contract-axes :body :opts :dtype])
+         (-> (select-keys source [:out :free-axes :contract-axes :body :opts :dtype :source-arithmetic])
              ;; Stage legality proved the identity is zero; spell that zero at integral width
              ;; instead of carrying the surface default 0.0 into an integral KernelBody literal.
              (assoc-in [:opts :stages] (cond-> stages

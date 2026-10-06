@@ -23,6 +23,7 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
@@ -608,11 +609,14 @@
        :operator operator :inputs inputs :scalars scalars :space space
        :output-dtype output-dtype :contraction? contraction?
        :operation (when (seq segment-axes)
-                    (segop/->SegRed equation-id space
+                    (cond-> (segop/->SegRed equation-id space
                                    (segop/->SegLevel :thread :virtual)
                                    operator nil inputs (set physical-results) scalars nil
                                    (if contraction? :contraction :segmented)
-                                   nil output-dtype))}))))
+                                   nil output-dtype)
+                      contraction?
+                      (assoc :source-arithmetic (get attributes :source-arithmetic
+                                                   numerics/retained-source-arithmetic))))}))))
 
 (defn lower-typed-segmented-reduce
   "Lower one general TypedSOAC segmented reduction directly to SegRed.

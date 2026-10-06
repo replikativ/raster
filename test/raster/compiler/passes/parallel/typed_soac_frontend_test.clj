@@ -9,6 +9,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
@@ -1908,11 +1909,41 @@
     (is (= '[[rstr_gemm_i_1 m] [rstr_gemm_j_1 n]] (:segment-axes attributes)))
     (is (= 'k (:extent attributes)))
     (is (= [:float] (:dtypes attributes)))
+    (is (= (numerics/blas-source-arithmetic :float) (:source-arithmetic attributes)))
+    (is (= (:source-arithmetic attributes)
+           (:source-arithmetic (projection/segmented-reduce-contract-components program equation))))
     (is (= '(clojure.core/+ (clojure.core/* rstr_gemm_j_1 %capture2) rstr_gemm_l_1)
            (-> body-results first (nth 2) (nth 2) (nth 2)))
         "the nt variant reads B as [n,k]: B[j*k + l]")
     (is (= [{:destination 'C :access :write :host-return :buffer}]
            (get-in (dialect/facts program) [:equations 1 :attributes :result-storage])))))
+
+(deftest blas-source-arithmetic-follows-layout-and-resolved-specialization
+  (doseq [op ['raster.linalg.blas/dgemm!
+              'raster.linalg.blas/dgemm-nt!
+              'raster.linalg.blas/dgemm-tn!]
+          [element-dtype tag alloc] [[:float 'floats 'clojure.core/float-array]
+                                     [:double 'doubles 'clojure.core/double-array]]]
+    (let [call (with-meta (list '.invk 'resolved-gemm-impl 'A 'B 'C 'm 'k 'n 1.0 0.0)
+                 {:raster.op/original op :raster.type/tag tag :tag tag})
+          source (list 'let* ['C (list alloc '(clojure.core/* m n)) 'r call] 'r)
+          options {:dtype element-dtype :array-types {'A element-dtype 'B element-dtype}
+                   :scalar-types {'m :long 'k :long 'n :long}}
+          program (frontend/form->program (frontend/normalize-source source options) options)
+          equation (first (filter #(= 'segmented-reduce (dialect/operation-kind %))
+                                  (dialect/equations program)))
+          attributes (:attributes (dialect/operation-parts equation))
+          expected (numerics/blas-source-arithmetic element-dtype)]
+      (is (= expected (:source-arithmetic attributes)))
+      (is (= expected (:source-arithmetic
+                       (contraction-facts/from-components
+                        (projection/segmented-reduce-contract-components program equation)))))
+      (is (not (dialect/reduce-attributes?
+                (assoc-in attributes [:source-arithmetic :operands :conversion] :narrow))))
+      (is (not (dialect/reduce-attributes?
+                (assoc attributes :source-arithmetic
+                       (numerics/blas-source-arithmetic
+                        (if (= :float element-dtype) :double :float)))))))))
 
 (deftest a-typed-array-witness-in-gemm-alpha-remains-a-scalar-capture
   (let [alpha (with-meta (list 'raster.numeric/oftype 'A 'scale)
@@ -2532,7 +2563,9 @@
         transform (:result-transform attributes)]
     (is (= [:float] (:dtypes attributes)))
     (is (= :float (:result-dtype transform)))
-    (is (= [:float] (mapv :dtype (:operands transform))))))
+    (is (= [:float] (mapv :dtype (:operands transform))))
+    (is (= (numerics/blas-source-arithmetic :float) (:source-arithmetic attributes))
+        "the resolved specialization, not the raw Double call tag, fixes source precision")))
 
 (defn- effect-map-order
   "`:independent`/`:sequential` for an effect map; a proven unique offset write becomes a

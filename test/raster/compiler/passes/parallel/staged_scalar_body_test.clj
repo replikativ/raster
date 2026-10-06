@@ -87,6 +87,7 @@
                                 (fn [& _] (throw (Exception. "reparsed source")))]
                     (staged/lower source :scalar-types {'scale :float}))]
     (is (identical? source (:source scheduled)))
+    (is (= (:source-arithmetic source) (get-in scheduled [:numerics :source-arithmetic])))
     (is (= '[a b weights out scale] (:arguments scheduled)))
     (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]]
       (let [artifact (target/emit-artifact "three_stage_scalar" scheduled dialect)]

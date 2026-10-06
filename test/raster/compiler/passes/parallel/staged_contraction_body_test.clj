@@ -17,6 +17,7 @@
                     (staged/lower source))]
     (is (nil? (:form source)))
     (is (= source (:source scheduled)))
+    (is (= (:source-arithmetic source) (get-in scheduled [:numerics :source-arithmetic])))
     (is (= '[a b da db out 15] (:arguments scheduled)))
     (is (= [288 480 9 15 15] (mapv (comp first :shape) (butlast (get-in scheduled [:body :parameters])))))
     (is (= :reassociated (get-in scheduled [:numerics :mode])))

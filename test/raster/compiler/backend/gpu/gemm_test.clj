@@ -84,6 +84,8 @@
           (is (= stage (:source certificate)))
           (is (= certificate (mixed-body/schedule-for-node node g)))
           (is (= certificate (scheduled-body/validate! certificate)))
+          (when-let [source-arithmetic (:source-arithmetic stage)]
+            (is (= source-arithmetic (get-in certificate [:numerics :source-arithmetic]))))
           (when (matrix-stage/matrix-stage? stage)
             (is (not (contains? (mixed-body/matrix-stage-spec stage :matrix-contract scalar-types)
                                 :parameter-names)))))))))
