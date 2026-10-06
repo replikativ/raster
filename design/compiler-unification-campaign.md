@@ -1,5 +1,30 @@
 # Compiler unification campaign
 
+### October 6 contextual initializer precision follow-up
+
+Real-weight boundary isolation exposed a remaining JVM/GPU arithmetic discrepancy in attention
+scores: the GPU uses sequential FP32 products and sums, while the JVM's large-method helper
+extraction retained Float products but accidentally accumulated in Double. Small unsplit methods
+hid this defect because their typed Float calls rounded the accumulator on every iteration.
+A four-map cancellation fixture reproduces the split-path failure independently of checkpoint
+data: `[1e8, 1, -1e8]` incorrectly sums to one rather than zero.
+
+The JVM loop emitter now realizes the retained contextual Float seed before forming its slot
+type, only for a bare Double literal with both a Float binder stamp and Float recurrence width.
+This adds no inference registry or attention rule. Explicit Double/nonliteral initializers and
+genuinely wider recurrences remain unchanged. Canonical AD/SOAC forms are unchanged: an initial
+attempt to insert casts in shared walking broke Double-storage AD islands and GQA proof
+reconstruction in cold CI, so that broader change was withdrawn. Split/unsplit JVM tests, an
+actual causal-weight cancellation oracle, and public OpenCL/Level Zero replay check the narrower
+boundary; the affected AD and GQA cases are explicit non-regressions. Fresh checkpoint attention
+weights match the independent sequential FP32 reference; full real-weight gradient acceptance
+must be rerun and is not claimed by this correction. The original eight-item campaign stays open.
+
+The split regression also exposed a separate lexical dependency defect: naming its length
+parameter `count` can cause an extracted helper to read `clojure.core/count` instead. Keep that
+follow-up distinct from initializer precision and cover core-shadowing parameters at helper
+extraction; renaming a fixture to `cnt` isolates this slice, not a language restriction or fix.
+
 Current scalar AD consolidation: final parameter projection follows retained SSA alias bindings
 to carried source types, keeping unknown/dynamically absent cotangents nil-safe. This removes the
 cold projection-helper typedness gap without adding an intrinsic or adjoint registry. The

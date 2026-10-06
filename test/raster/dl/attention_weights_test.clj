@@ -19,6 +19,15 @@
     :capabilities {:total-eus 32 :subgroup-sizes [16] :max-workgroup-size 1024
                    :shared-local-memory 65536}}))
 
+(deftest causal-score-literal-seed-retains-float-rounding-after-helper-extraction
+  ;; Row 1's first dot is [1e8,1,-1e8]. Contextual Float accumulation
+  ;; cancels to zero, so its two causal weights are exactly equal. The
+  ;; former accidental Double carry kept the unit term and changed softmax.
+  (let [q (float-array [0 0 0 10000 1 10000])
+        k (float-array [10000 1 -10000 0 0 0])]
+    (is (= [1.0 0.0 0.5 0.5]
+           (vec (attn/batched-causal-attn-weights q k 1 2 3))))))
+
 (deftest gqa-decode-attention-weights-test
   ;; Moved from attention-test, whose namespace-wide BLAS fixture skipped this non-BLAS oracle.
   (let [n 5 hd 8

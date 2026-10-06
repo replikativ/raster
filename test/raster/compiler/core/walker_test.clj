@@ -14,6 +14,14 @@
   ([form] (walker/walk-body form {:type-env {}}))
   ([form flat-env] (walker/walk-body form {:type-env (te flat-env)})))
 
+(deftest contextual-loop-seed-retains-canonical-source-and-binding-type
+  (let [body (walker/walk-body '(loop* [seed 0.0 i 0]
+                               (if (< i 1) (recur (raster.numeric/+ seed x) (inc i)) seed))
+                             {:type-env (te {'x 'float}) :element-dtype :float})]
+    (is (= 'float (:raster.type/tag (meta (first (second body))))))
+    (is (= 0.0 (second (second body)))
+        "backend realization does not rewrite AD/SOAC source identities")))
+
 (deftest comparison-types-survive-and-macroexpansion
   (let [walked (wb '(and (>= i 0) (< i n)) {'i 'long 'n 'long})
         [_ bindings conditional] walked
