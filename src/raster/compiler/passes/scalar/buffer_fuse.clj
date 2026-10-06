@@ -5,18 +5,29 @@
             [raster.compiler.ir.form :as form]
             [raster.analysis.memory :as ma]))
 
+(defn- fresh-buffer-init?
+  "The binding allocates its own buffer: an array constructor or allocator, or
+  an op whose buffer facet allocates its result."
+  [init]
+  (when-let [head (util/call-head init)]
+    (or (descriptor/alloc-op? head)
+        (some-> (descriptor/resolve-buffer-semantics head) first :allocates?))))
+
 (defn- can-reuse-arg?
   "Check if arg-sym's buffer can be reused at binding-idx.
   Uses the pre-computed memory analysis which includes escape analysis
-  (closure capture and return escape) in addition to liveness checks."
-  [arg-sym binding-idx analysis]
+  (closure capture and return escape) in addition to liveness checks. Only a
+  buffer this let owns is reused: a parameter or any other borrowed array may
+  be held by the caller, whatever its local last use."
+  [arg-sym binding-idx analysis owned]
   (let [used-after (get-in analysis [:used-after binding-idx] #{})
         aliases (get-in analysis [:alias-state :aliases])
         arg-aliases (ma/transitive-closure #{arg-sym} aliases)
         ;; Find the binding that defines arg-sym and check its escape analysis
         arg-binding (first (filter #(= arg-sym (:binding-name %))
                                    (:bindings analysis)))]
-    (and (= arg-aliases #{arg-sym})
+    (and (contains? owned arg-sym)
+         (= arg-aliases #{arg-sym})
          (not (contains? used-after arg-sym))
          ;; Must not escape via return or closure capture
          (or (nil? arg-binding) (not (:escapes? arg-binding))))))
@@ -30,6 +41,7 @@
   (let [analysis (ma/analyze-sexp-let let-form)
         [_ bindings-vec & body-exprs] let-form
         pairs (vec (partition 2 bindings-vec))
+        owned (into #{} (keep (fn [[sym init]] (when (fresh-buffer-init? init) sym))) pairs)
         fused (atom 0)
         fresh-allocs (atom 0)
         unchanged (atom 0)
@@ -46,7 +58,7 @@
                     (if (and in-place-idx
                              (< in-place-idx (count args))
                              (symbol? (nth args in-place-idx))
-                             (can-reuse-arg? (nth args in-place-idx) idx analysis))
+                             (can-reuse-arg? (nth args in-place-idx) idx analysis owned))
                       (do (swap! fused inc)
                           [[sym ((:rewrite-fn entry) args (nth args in-place-idx))]])
                       (if-let [alloc-fn (:alloc-form entry)]
