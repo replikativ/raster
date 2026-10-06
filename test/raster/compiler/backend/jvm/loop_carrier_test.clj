@@ -6,6 +6,8 @@
             [raster.numeric :as n]
             [raster.par :as par]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.backend.jvm.split :as split]
+            [raster.compiler.passes.parallel.descriptors :as descriptors]
             [raster.compiler.pipeline :as pipeline]))
 
 (deftm grouped-carry
@@ -24,6 +26,62 @@
 (deftm widening-carry [x :- Double count :- Long] :- Double
   (loop [i 0 acc 0]
     (if (< i count) (recur (inc i) (+ acc x)) acc)))
+
+(deftm mapped-literal-carry
+  (All [T] [src :- (Array T) count :- Long] :- (Array T)
+    (let [out (alloc-like src 1)]
+      (par/map! out t 1 nil
+        (loop [i 0 acc 0.0]
+          (if (< i count)
+            (recur (inc i) (n/+ acc (n/* (aget src i) (aget src i))))
+            acc)))
+      out)))
+
+(deftm mapped-cancelling-literal-carry
+  (All [T] [src :- (Array T) count :- Long] :- (Array T)
+    (let [out (alloc-like src 1)]
+      (par/map! out t 1 nil
+        (loop [i 0 acc 0.0]
+          (if (< i count) (recur (inc i) (+ acc (aget src i))) acc)))
+      out)))
+
+(defmacro def-split-cancelling-carry [name seed]
+  ;; Repeated retained maps cross the real method-size threshold. This tests
+  ;; the helper-extraction optimizer, not only the small typed-call route.
+  (let [stage `(par/map! ~'out ~'t 1 nil
+                 (loop [~'i 0 ~'acc ~seed]
+                   (if (< ~'i ~'cnt)
+                     (recur (inc ~'i) (n/+ ~'acc (aget ~'src ~'i))) ~'acc)))]
+    `(deftm ~name
+       (~'All [~'T] [~'src ~':- (~'Array ~'T) ~'cnt ~':- ~'Long] ~':- (~'Array ~'T)
+         (let [~'out (alloc-like ~'src 1)]
+           ~stage ~stage ~stage ~stage ~'out)))))
+
+(def-split-cancelling-carry split-contextual-carry 0.0)
+(def-split-cancelling-carry split-explicit-double-carry (double 0.0))
+
+(deftest helper-extraction-preserves-contextual-and-explicit-seed-widths
+  (is (= [0.0] (vec (split-contextual-carry (float-array [1.0e8 1.0 -1.0e8]) 3))))
+  (is (= [1.0] (vec (split-contextual-carry (double-array [1.0e8 1.0 -1.0e8]) 3))))
+  (is (= [1.0] (vec (split-explicit-double-carry (float-array [1.0e8 1.0 -1.0e8]) 3))))
+  ;; Check the actual extraction predicate rather than requiring first-call
+  ;; compilation: this test also runs correctly in an already-warm REPL.
+  (let [[_ bindings & body] (first (pipeline/get-walked-body #'split-contextual-carry :float))
+        forms (concat (map second (partition 2 bindings)) body)]
+    (is (some descriptors/par-form? forms))
+    (is (> (reduce + (map split/estimate-form-size forms)) split/TARGET-SIZE))))
+
+(deftest mapped-bare-floating-initializer-realizes-the-contextual-element-type
+  (doseq [[dtype input expected] [[:float (float-array [1.0e8 1.0 -1.0e8]) 0.0]
+                                [:double (double-array [1.0e8 1.0 -1.0e8]) 1.0]]]
+    (is (= [expected] (vec (mapped-cancelling-literal-carry input 3))))
+    (is (= [expected] (vec ((pipeline/compile-aot #'mapped-cancelling-literal-carry
+                                                :dtype dtype) input 3)))))
+  ;; Like an attention score, each Float product/add rounds independently.
+  ;; A Double carry would retain nine unit terms and round to 100000008.
+  (let [input (float-array (cons 10000.0 (repeat 9 1.0)))]
+    (is (= [1.0e8] (vec (mapped-literal-carry input 10))))
+    (is (= [1.0e8] (vec ((pipeline/compile-aot #'mapped-literal-carry :dtype :float) input 10))))))
 
 (deftm coupled-carry [step :- Double] :- Double
   (loop [a (float 1.0e8) b (float 0.0) i 0]

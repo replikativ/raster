@@ -50,12 +50,26 @@
             (is (= [17.0 19.0] (subvec (vec (value/->host (:wsink' result))) n)))))
         (finally (compiled/close! artifact))))))
 
+(defn- run-causal-score-rounding [target]
+  (let [q (float-array [0 0 0 10000 1 10000])
+        k (float-array [10000 1 -10000 0 0 0])
+        expected [1.0 0.0 0.5 0.5]
+        host (vec (attention/batched-causal-attn-weights q k 1 2 3))
+        artifact (compiled/compile #'attention/batched-causal-attn-weights [q k 1 2 3]
+                   {:compiler :equation-first :target target :dtype :float
+                    :schedule {:precision :f32-scalar}})]
+    (try
+      (is (= expected host))
+      (dotimes [_ 2]
+        (is (= expected (vec (value/->host (:result (artifact {})))))))
+      (finally (compiled/close! artifact)))))
+
 (deftest level-zero-resident-alignment-matches-the-host
   (if @gp/gpu-available?
-    (run-case :ze:0)
+    (do (run-case :ze:0) (run-causal-score-rounding :ze:0))
     (gp/gpu-skip! "caller-owned ASR alignment on Level Zero")))
 
 (deftest opencl-resident-alignment-matches-the-host
   (if @opencl/opencl-available?
-    (run-case :ocl:0)
+    (do (run-case :ocl:0) (run-causal-score-rounding :ocl:0))
     (opencl/opencl-skip! "caller-owned ASR alignment on OpenCL")))

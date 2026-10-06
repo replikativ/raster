@@ -14,6 +14,27 @@
   ([form] (walker/walk-body form {:type-env {}}))
   ([form flat-env] (walker/walk-body form {:type-env (te flat-env)})))
 
+(deftest contextual-floating-initializers-have-an-explicit-value-representation
+  (doseq [head '[let* loop*]]
+    (let [source (list head '[seed 0.0] 'seed)
+          float-body (walker/walk-body source {:type-env {} :element-dtype :float})
+          double-body (walker/walk-body source {:type-env {} :element-dtype :double})]
+      (is (= 'float (:raster.type/tag (meta (first (second float-body))))))
+      (is (= '(float 0.0) (second (second float-body))))
+      (is (= 0.0 (second (second double-body))))))
+  (let [body (walker/walk-body '(loop* [seed (double 0.0)] seed)
+                              {:type-env {} :element-dtype :float})]
+    (is (= 'double (:raster.type/tag (meta (first (second body))))))
+    (is (= '(double 0.0) (second (second body)))))
+  (let [body (walker/walk-body
+               '(loop* [seed 0.1 i 0]
+                  (if (< i 1) (recur (raster.numeric/+ seed step) (inc i)) seed))
+               {:type-env (te {'step 'double}) :element-dtype :float})]
+    (is (= 'double (:raster.type/tag (meta (first (second body)))))
+        "a genuinely wider recurrence still widens the carrier")
+    (is (= '(float 0.1) (second (second body)))
+        "the contextual source seed rounds once before widening")))
+
 (deftest comparison-types-survive-and-macroexpansion
   (let [walked (wb '(and (>= i 0) (< i n)) {'i 'long 'n 'long})
         [_ bindings conditional] walked
