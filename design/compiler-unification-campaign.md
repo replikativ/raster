@@ -2984,3 +2984,20 @@ recognized compiler BLAS origins from user-supplied metadata assertions; the mar
 authenticates neither. Initial numerical compatibility evidence remains alpha=1/beta=0; nontrivial
 BLAS alpha/beta rounding is not proved by the product facet. The real-checkpoint gate (#1060)
 remains held with unchanged tolerances and the original eight-item campaign remains incomplete.
+
+### Declared product-accumulation floor — 2026-10-06
+
+The shared numerical validator now applies a reject-only check when a contract carries abstract
+BLAS source arithmetic and declares an accumulator dtype: a Float source permits Float/Double,
+and a Double source permits Double. All single and component declarations are checked, including
+when both fields appear. Naming an exact mode does not bypass a below-floor declaration. Ordered
+typed SSA with no global accumulator declaration remains unchanged; ordinary staged and mixed
+component folds do not acquire a fabricated BLAS floor. Existing mixed-matrix models still retain
+Float accumulation and separately attest their explicit operand conversion.
+
+This checks declared accumulator dtypes, not every instruction or operand conversion. Exact
+source/body certificates and paired operational models remain their proof boundaries. No new
+schedule permission, selector, error tolerance or numerical oracle is introduced. Independent
+review found no blocker; focused source/numerical/GEMM suites pass 49 tests / 1390 assertions.
+Native portable BLAS and explicitly mixed attention/projection checks
+pass 2 tests / 72 assertions on OpenCL and Level Zero. The real-checkpoint gate remains held.

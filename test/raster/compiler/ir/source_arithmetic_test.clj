@@ -52,6 +52,38 @@
                     (assoc components :source-arithmetic
                            (numerics/blas-source-arithmetic (if (= :float dtype) :double :float)))))))))
 
+(deftest declared-product-accumulation-cannot-lower-the-source-floor
+  (let [reassociated {:mode :reassociated :policy :test-product
+                      :rounding :implementation-defined}
+        component (fn [dtype] {:value 'acc :dtype dtype :rounding :nearest-even :policy :test})]
+    (doseq [[source-dtype accepted] [[:float [:float :double]] [:double [:double]]]
+            accumulator-dtype accepted]
+      (let [source (numerics/blas-source-arithmetic source-dtype)]
+        (doseq [contract [(assoc reassociated :source-arithmetic source
+                                 :accumulator-dtype accumulator-dtype)
+                         (assoc reassociated :source-arithmetic source
+                                 :accumulators [(component accumulator-dtype)])]]
+          (is (= contract (numerics/validate! contract))))))
+    (doseq [[source-dtype narrowed] [[:float :half] [:float :int] [:double :float]]]
+      (let [source (numerics/blas-source-arithmetic source-dtype)]
+        (doseq [contract [(assoc reassociated :source-arithmetic source :accumulator-dtype narrowed)
+                         (assoc reassociated :source-arithmetic source :accumulators [(component narrowed)])]]
+          (is (thrown? clojure.lang.ExceptionInfo (numerics/validate! contract))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (numerics/validate!
+                  (assoc reassociated :source-arithmetic (numerics/blas-source-arithmetic :float)
+                         :accumulator-dtype :float :accumulators [(component :half)]))))
+    ;; A mixed ordered fold is not a BLAS product. Its declared component types remain authoritative.
+    (let [contract (assoc reassociated :source-arithmetic numerics/retained-source-arithmetic
+                          :accumulators [(component :int) (assoc (component :float) :value 'outer)])]
+      (is (= contract (numerics/validate! contract))))
+    ;; Scope is accumulation, not an implicit permission to round the operands or select a family.
+    (let [exact {:mode :exact :policy :same-typed-ssa-evaluation-order
+                 :source-arithmetic (numerics/blas-source-arithmetic :float)}]
+      (is (= exact (numerics/validate! exact)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (numerics/validate! (assoc exact :accumulator-dtype :half)))))))
+
 (deftest source-arithmetic-is-retained-through-the-scheduled-artifact-certificate
   (let [product (with-meta
                   '(raster.par/contract C [[i 2] [j 4]] [[k 3]]

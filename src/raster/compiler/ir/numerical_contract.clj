@@ -46,6 +46,17 @@
                     {:reason :source-arithmetic :value value})))
   value)
 
+(defn- declared-accumulation-preserves-source-floor?
+  "A restrictive check on declared product accumulators, never an admission predicate.
+   Exact ordered schedules retain their component types in SSA rather than inventing a global
+   accumulator dtype. Approximate physical operand conversions have separate operational models."
+  [source contract]
+  (let [floor (get-in source [:accumulation :minimum-dtype])
+        accepted (case floor :float #{:float :double} :double #{:double})
+        declared (cond-> (mapv :dtype (:accumulators contract))
+                   (contains? contract :accumulator-dtype) (conj (:accumulator-dtype contract)))]
+    (or (empty? declared) (every? accepted declared))))
+
 (defn rounding-policy?
   [value]
   (contains? rounding-policies value))
@@ -117,5 +128,11 @@
        (fail! "numerical result transform requires a checked typed scalar-region policy"
               {:value (:result-transform contract)}))
      (when (contains? contract :source-arithmetic)
-       (validate-source-arithmetic! (:source-arithmetic contract)))
+       (let [source (validate-source-arithmetic! (:source-arithmetic contract))]
+         (when (and (= :abstract-blas-product (:kind source))
+                    (not (declared-accumulation-preserves-source-floor? source contract)))
+           (fail! "declared product accumulation is below the source arithmetic precision floor"
+                  {:source-arithmetic source
+                   :accumulator-dtype (:accumulator-dtype contract)
+                   :accumulators (:accumulators contract)}))))
      contract)))
