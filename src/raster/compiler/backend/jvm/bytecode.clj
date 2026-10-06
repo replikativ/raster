@@ -5140,11 +5140,9 @@
                                                (:tag (meta sym)))]
                                  :when tag]
                              [sym tag]))
-        ;; Bound set for free-syms: only let-binding names.
-        ;; fn-params are NOT included because extracted helpers need them
-        ;; as explicit params (they don't have access to the parent method's locals).
-        ;; clojure.core vars are excluded by free-syms itself (ns-resolve check).
-        let-bound (set (map first let-pairs))
+        ;; Parent locals remain free inputs of an extracted method. Retain
+        ;; their lexical identities even when they shadow global core names.
+        body-visible-locals (into (set fn-params) (map first let-pairs))
         ;; Infer tag for a symbol from fn-params, walker metadata, or let env
         tag-for-sym (fn [sym]
                       (let [idx (.indexOf (vec fn-params) sym)]
@@ -5155,27 +5153,31 @@
                               (:tag (meta sym))
                               'Object))))
         ;; Exclude primitive-constant vars — bytecoder constant-folds them to LDC
-        primitive-const? (fn [sym]
-                           (when-let [v (try (ns-resolve source-ns sym)
-                                             (catch Exception _ nil))]
-                             (when (var? v)
-                               (let [root (try (.getRawRoot ^clojure.lang.Var v)
+        primitive-const? (fn [sym visible-locals]
+                           (when-not (contains? visible-locals sym)
+                             (when-let [v (try (ns-resolve source-ns sym)
                                                (catch Exception _ nil))]
-                                 (or (instance? Double root)
-                                     (instance? Long root)
-                                     (instance? Integer root))))))
+                               (when (var? v)
+                                 (let [root (try (.getRawRoot ^clojure.lang.Var v)
+                                                 (catch Exception _ nil))]
+                                   (or (instance? Double root)
+                                       (instance? Long root)
+                                       (instance? Integer root)))))))
         helpers (atom [])
         helper-counter (atom 0)
-        extract-par (fn [form]
+        extract-par (fn [form visible-locals]
                       (let [info (par-desc form)]
                         (if info
                           ;; Extract par form as helper
                           (let [helper-name (symbol (str "par_" (swap! helper-counter inc)))
                                 ;; Empty bound set: helpers are separate methods, all
                                 ;; referenced symbols must be passed as params.
-                                ;; clojure.core vars excluded by free-syms ns-resolve.
-                                free (util/free-syms form #{})
-                                free (set (remove primitive-const? free))
+                                ;; Use the shared lexical dependency analysis:
+                                ;; true globals may be excluded, parent locals may not.
+                                free (binding [util/*shadowing-locals*
+                                               (into util/*shadowing-locals* visible-locals)]
+                                       (util/free-syms form #{}))
+                                free (set (remove #(primitive-const? % visible-locals) free))
                                 ordered-free (vec (concat
                                                    (filter free (vec fn-params))
                                                    (sort (remove (set fn-params) free))))
@@ -5215,11 +5217,13 @@
                           ;; Not a par form — keep as-is
                           form)))
         ;; Rewrite let-binding init expressions
-        rewritten-bindings (vec (mapcat (fn [[sym init]]
-                                          [sym (extract-par init)])
-                                        let-pairs))
+        rewritten-bindings
+        (first (reduce (fn [[bindings visible-locals] [sym init]]
+                         [(conj bindings sym (extract-par init visible-locals))
+                          (conj visible-locals sym)])
+                       [[] (set fn-params)] let-pairs))
         ;; Rewrite body forms
-        rewritten-body (mapv extract-par body-forms)]
+        rewritten-body (mapv #(extract-par % body-visible-locals) body-forms)]
     {:main-bindings rewritten-bindings
      :main-body rewritten-body
      :helpers @helpers}))

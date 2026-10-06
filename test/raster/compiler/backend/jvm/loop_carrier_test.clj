@@ -45,20 +45,65 @@
           (if (< i count) (recur (inc i) (+ acc (aget src i))) acc)))
       out)))
 
-(defmacro def-split-cancelling-carry [name seed]
+(defmacro def-split-cancelling-carry [name seed & [length-param]]
   ;; Repeated retained maps cross the real method-size threshold. This tests
   ;; the helper-extraction optimizer, not only the small typed-call route.
-  (let [stage `(par/map! ~'out ~'t 1 nil
+  (let [length-param (or length-param 'cnt)
+        stage `(par/map! ~'out ~'t 1 nil
                  (loop [~'i 0 ~'acc ~seed]
-                   (if (< ~'i ~'cnt)
+                   (if (< ~'i ~length-param)
                      (recur (inc ~'i) (n/+ ~'acc (aget ~'src ~'i))) ~'acc)))]
     `(deftm ~name
-       (~'All [~'T] [~'src ~':- (~'Array ~'T) ~'cnt ~':- ~'Long] ~':- (~'Array ~'T)
+       (~'All [~'T] [~'src ~':- (~'Array ~'T) ~length-param ~':- ~'Long] ~':- (~'Array ~'T)
          (let [~'out (alloc-like ~'src 1)]
            ~stage ~stage ~stage ~stage ~'out)))))
 
 (def-split-cancelling-carry split-contextual-carry 0.0)
 (def-split-cancelling-carry split-explicit-double-carry (double 0.0))
+
+(def ^:const helper-shadow-count 999)
+(def-split-cancelling-carry split-core-shadow-carry 0.0 count)
+(def-split-cancelling-carry split-constant-shadow-carry 0.0 helper-shadow-count)
+
+(deftest extracted-helper-captures-lexical-inputs-before-global-resolution
+  (doseq [f [split-core-shadow-carry split-constant-shadow-carry]]
+    (is (= [0.0] (vec (f (float-array [1.0e8 1.0 -1.0e8]) 3))))
+    (is (= [1.0] (vec (f (double-array [1.0e8 1.0 -1.0e8]) 3))))))
+
+(deftest extracted-helper-distinguishes-parent-local-from-actual-constant
+  (let [output (with-meta 'out {:raster.type/tag 'floats})
+        length (with-meta 'count {:raster.type/tag 'long})
+        bindings [output '(float-array cnt) length 'cnt]
+        outer '(raster.par/map! out i count nil
+                 (clojure.core/+ (clojure.core/aget src i) helper-shadow-count))
+        inner '(raster.par/map! out i cnt nil
+                 (let* [count 1] (clojure.core/aget src count)))
+        capture (fn [body]
+                  (set (:params (first (:helpers
+                                        (#'bytecode/split-body-into-helpers
+                                          [body] bindings ['src 'cnt] ['floats 'long]
+                                          (the-ns 'raster.compiler.backend.jvm.loop-carrier-test) 2))))))]
+    (is (= #{'src 'out 'count} (capture outer))
+        "parent let-bound count is captured, but the actual numeric constant is not")
+    (is (= #{'src 'out 'cnt} (capture inner))
+        "the nested count binder is not captured as a parent dependency")))
+
+(deftest extracted-initializers-see-only-prior-parent-bindings
+  (let [temporary (with-meta 'tmp {:raster.type/tag 'floats})
+        shadow (with-meta 'helper-shadow-count {:raster.type/tag 'long})
+        early '(raster.par/map! out i cnt nil
+                 (clojure.core/+ (clojure.core/aget src i) helper-shadow-count))
+        body '(raster.par/map! out i cnt nil
+                (clojure.core/+ (clojure.core/aget src i) helper-shadow-count))
+        result (#'bytecode/split-body-into-helpers
+                 [body] [temporary early shadow 3]
+                 ['src 'out 'cnt] ['floats 'floats 'long]
+                 (the-ns 'raster.compiler.backend.jvm.loop-carrier-test) 2)
+        captures (mapv #(set (:params %)) (:helpers result))]
+    (is (= #{'src 'out 'cnt} (first captures))
+        "the earlier initializer sees the true global constant")
+    (is (= #{'src 'out 'cnt 'helper-shadow-count} (second captures))
+        "the body sees the now-bound local, not the global constant")))
 
 (deftest helper-extraction-preserves-contextual-and-explicit-seed-widths
   (is (= [0.0] (vec (split-contextual-carry (float-array [1.0e8 1.0 -1.0e8]) 3))))
