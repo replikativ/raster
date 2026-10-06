@@ -746,13 +746,6 @@
                                   numeric-tag-rank)]))))))
             pairs))))
 
-(defn- narrow-fp-literal-form
-  "Realize contextual Float literal typing as a conversion in the walked form.
-   Binding initializers use it only after selecting that contextual type; call arguments
-   use it speculatively and retain it only for a clean concrete overload."
-  [x element-dtype]
-  (if (and (= element-dtype :float) (instance? Double x)) (list 'float x) x))
-
 (defmethod walk-form :let [form ctx]
   (let [[let-sym bindings & body] form
         [new-bindings new-ctx]
@@ -811,15 +804,6 @@
                          (inf/infer-binding-tag sym init rewritten-init type-env
                                                 {:source-ns (:source-ns ctx)
                                                  :element-dtype (:element-dtype ctx)}))
-                 ;; A type stamp alone cannot change a JVM Double constant's
-                 ;; stack representation. Materialize the already selected
-                 ;; contextual literal type before recurrence-width analysis.
-                 ;; Explicit casts and nonliteral initializers keep their types.
-                 rewritten-init (if (and (= tag 'float)
-                                         (inf/floating-literal-narrowed-tag
-                                           init (:element-dtype ctx)))
-                                  (narrow-fp-literal-form rewritten-init (:element-dtype ctx))
-                                  rewritten-init)
                  elem-tag (inf/infer-element-tag init tag type-env)
                  hint (inf/compute-binding-hint tag sym)
                  sym (stamp-type-meta sym (or hint tag) elem-tag)]
@@ -1406,6 +1390,14 @@
 ;; ================================================================
 ;; Branch: deftm call (devirtualization)
 ;; ================================================================
+
+(defn- narrow-fp-literal-form
+  "Wrap a bare Double literal in the element-dtype cast (0.044715 → (float …)) —
+   only for :float (the narrowing monomorphization; :double is identity). The
+   call-arg half of contextual literal typing, applied speculatively and kept
+   only when it yields a clean concrete overload."
+  [x element-dtype]
+  (if (and (= element-dtype :float) (instance? Double x)) (list 'float x) x))
 
 (defmethod walk-form :deftm-call [form ctx]
   (let [source-ns (:source-ns ctx)

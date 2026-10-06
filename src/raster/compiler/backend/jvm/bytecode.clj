@@ -3921,6 +3921,17 @@
                              stamp-t (some->> (:raster.type/tag (meta sym))
                                               (get {'double :double 'float :float
                                                     'long :long 'int :int}))
+                             ;; The walker contextually types a bare floating
+                             ;; seed as Float. A Double LDC must realize that
+                             ;; retained type before the slot LUB, including
+                             ;; helper chunks whose typed calls became arithmetic.
+                             ;; Never narrow explicit casts/nonliteral values or
+                             ;; a genuinely wider recurrence from a stamp alone.
+                             t (if (and (= t :double) (= stamp-t :float)
+                                        (instance? Double init)
+                                        (= rt :float))
+                                 (do (emit-coerce code :double :float) :float)
+                                 t)
                              t (if (and (= t :ref) stamp-t
                                         (or (nil? rt) (= rt stamp-t)
                                             (contains? #{:int :long :float :double} rt)))

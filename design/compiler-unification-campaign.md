@@ -9,15 +9,16 @@ hid this defect because their typed Float calls rounded the accumulator on every
 A four-map cancellation fixture reproduces the split-path failure independently of checkpoint
 data: `[1e8, 1, -1e8]` incorrectly sums to one rather than zero.
 
-The existing contextual literal policy now has a matching value representation. When a bare
-Double literal initializer has already been assigned the ambient Float type, the shared walker
-uses its existing literal conversion helper to retain `(float literal)` in the walked form.
-This adds no type registry or attention rule. Explicit Double and nonliteral initializers remain
-unchanged; genuinely wider recurrences still widen, after rounding the contextual source seed
-once. Split/unsplit JVM tests, an actual causal-weight cancellation oracle, and public OpenCL/
-Level Zero replay check this boundary. Fresh checkpoint attention weights now match the
-independent sequential FP32 reference; full real-weight gradient acceptance must be rerun and
-is not claimed by this local correction. The original eight-item campaign remains open.
+The JVM loop emitter now realizes the retained contextual Float seed before forming its slot
+type, only for a bare Double literal with both a Float binder stamp and Float recurrence width.
+This adds no inference registry or attention rule. Explicit Double/nonliteral initializers and
+genuinely wider recurrences remain unchanged. Canonical AD/SOAC forms are unchanged: an initial
+attempt to insert casts in shared walking broke Double-storage AD islands and GQA proof
+reconstruction in cold CI, so that broader change was withdrawn. Split/unsplit JVM tests, an
+actual causal-weight cancellation oracle, and public OpenCL/Level Zero replay check the narrower
+boundary; the affected AD and GQA cases are explicit non-regressions. Fresh checkpoint attention
+weights match the independent sequential FP32 reference; full real-weight gradient acceptance
+must be rerun and is not claimed by this correction. The original eight-item campaign stays open.
 
 The split regression also exposed a separate lexical dependency defect: naming its length
 parameter `count` can cause an extracted helper to read `clojure.core/count` instead. Keep that
