@@ -51,6 +51,25 @@
                (operation-kinds (:operations operation)))))
    operations))
 
+(deftest explicit-fused-register-products-use-canonical-typed-fma
+  (doseq [policy [:decomposed :fused]]
+    (let [kernel (:kernel-body (register-tiled/lower (contraction)
+                               {:tile small-tile :multiply-add policy}))
+          expressions (filter #(instance? raster.compiler.ir.kernel_body.ScalarExpr %)
+                              (tree-seq coll? seq kernel))
+          fmas (filter #(= :fma (:op %)) expressions)]
+      (is (= policy (get-in kernel [:schedule :multiply-add])))
+      (if (= policy :fused)
+        (do (is (= 4 (count fmas)))
+            (is (every? #(= :float (:result-type %)) fmas)))
+        (is (empty? fmas)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (let [source (body-emit/emit-scalar-kernel "register_fma" kernel
+                       {:target-dialect target})]
+          (is (= (= policy :fused) (boolean (re-find #" = fma\(" source))))))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (register-tiled/lower (contraction) {:tile small-tile :multiply-add :unknown}))))
+
 (deftest register-tile-does-not-discard-unmodeled-product-terms
   (doseq [expression ['(* 2.0 (* (aget A (+ (* i 5) k)) (aget B (+ (* k 2) j))))
                       '(+ 1.0 (* (aget A (+ (* i 5) k)) (aget B (+ (* k 2) j))))]]

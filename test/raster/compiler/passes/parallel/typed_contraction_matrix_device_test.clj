@@ -21,8 +21,10 @@
             [raster.perf.production-canary :as canary]))
 
 (defn- sequential-fp32-projection
-  "Independent ordered oracle: round each multiply and add, not only the store."
-  [layout ^floats left ^floats right m k n]
+  "Independent ordered oracle: two-round multiply/add or single-round Math/fma."
+  ([layout left right m k n]
+   (sequential-fp32-projection layout left right m k n :separate))
+  ([layout ^floats left ^floats right m k n multiply-add]
   (float-array
     (for [i (range m) j (range n)]
       (loop [p 0 acc (float 0.0)]
@@ -31,7 +33,43 @@
           (let [li (if (= layout :tn) (+ (* p m) i) (+ (* i k) p))
                 ri (if (= layout :nt) (+ (* j k) p) (+ (* p n) j))
                 term (float (* (double (aget left li)) (double (aget right ri))))]
-            (recur (inc p) (float (+ (double acc) (double term))))))))))
+            (recur (inc p)
+                   (if (= :fused multiply-add)
+                     (Math/fma (aget left li) (aget right ri) (float acc))
+                     (float (+ (double acc) (double term))))))))))))
+
+(deftest public-register-product-realizations-match-local-rounding-oracles
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "explicit FP32 FMA projection on " device))
+      (doseq [layout [:nn :nt] policy [:decomposed :fused :decomposed]]
+        (let [m 2 n 3 k 2
+              a (float-array [-1.0 1.0000001192092896 -1.0 1.0000001192092896])
+              b (float-array (if (= layout :nn)
+                               [1.0 1.0 1.0 0.9999998807907104 0.9999998807907104 0.9999998807907104]
+                               [1.0 0.9999998807907104 1.0 0.9999998807907104 1.0 0.9999998807907104]))
+              source (if (= layout :nn) #'contractions/projected-nn #'contractions/projected-nt)
+              expected (vec (sequential-fp32-projection layout a b m k n policy))
+              opposite (vec (sequential-fp32-projection layout a b m k n
+                             (if (= policy :fused) :decomposed :fused)))
+              prepared (compiled/lower source [a b m k n]
+                         {:compiler :equation-first :target device :dtype :float
+                          :schedule {:typed-contraction {:strategy :register-tiled
+                                                         :multiply-add policy}}})
+              live (compiled/instantiate! prepared)]
+          (try
+            (is (not= expected opposite) "the oracle distinguishes one-round FMA from two rounds")
+            (doseq [changed? [false true]]
+              (let [next-a (if changed?
+                             (float-array [-1.0 1.000000238418579 -1.0 1.000000238418579])
+                             a)
+                    reference (sequential-fp32-projection layout next-a b m k n policy)
+                    actual (value/->host (:result (live (if changed? {:a next-a} {}))))
+                    bits #(mapv (fn [v] (Float/floatToRawIntBits (float v))) %)]
+                (is (= (bits reference) (bits actual))
+                    (str device " " layout " " policy " changed=" changed?))))
+            (finally (compiled/close! live))))))))
 
 (deftest public-portable-blas-projections-retain-sequential-fp32-evaluation
   (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]

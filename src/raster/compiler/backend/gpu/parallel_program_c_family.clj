@@ -73,7 +73,9 @@
           facts (:facts (contraction-context/validate! algorithm (:operation node)))
           planned (contraction-schedule/plan-register-tiled-for-node
                    node source facts target-descriptor
-                   (assoc opts :precision (:precision schedule)))]
+                   (assoc opts :precision (:precision schedule)
+                               :multiply-add (get-in schedule [:typed-contraction :multiply-add]
+                                                     :decomposed)))]
       (if-not (:ok planned)
         planned
         (let [original (get-in reference [:graph :nodes 0 :operation])

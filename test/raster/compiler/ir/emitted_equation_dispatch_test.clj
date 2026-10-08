@@ -256,11 +256,11 @@
           forged (assoc-in candidate [:graph :nodes 0 :operation] replacement)
           forged-alternatives [(first alternatives) forged]]
       (is (= forged (emitted-equation/validate! forged)))
-      (is (= :equation-dispatch-numerics
+      (is (= :equation-dispatch-complete-write
              (reason #(equation-dispatch/make
                        forged-alternatives (contraction-selection forged-alternatives)
                        policy)))
-          "a register schedule cannot self-label as exact to evade numerical permission"))
+          "a forged exact label fails certificate rederivation before numerical permission"))
     ;; Re-emit a valid artifact with a truncated store body: projection and ABI remain valid,
     ;; but neither target emission nor a shared write label proves complete initialization.
     (let [candidate (first alternatives)

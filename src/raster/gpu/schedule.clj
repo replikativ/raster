@@ -72,6 +72,7 @@
     ;; Static typed contractions emit ABI-normalized schedule alternatives. Offline fixed-shape
     ;; tuning writes the validated selector here; recompilation consumes it without benchmarking.
     :typed-contraction {:strategy :auto
+                        :multiply-add :decomposed
                         ;; Compile only the analytic tile in the hot path. `:finite` materializes
                         ;; the descriptor-derived family; a non-empty vector selects an exact
                         ;; validated subset so an offline tuner can compile/measure bounded batches.
@@ -105,6 +106,8 @@
   #{:auto :reference :subgroup-score-reuse :dispatch-reassociated})
 (def ^:private valid-typed-contraction-strategies
   #{:auto :portable :register-tiled :matrix :dispatch-register-tiled :dispatch-mixed-matrix})
+(def ^:private typed-contraction-fields
+  #{:strategy :multiply-add :matrix-tiles :split-factors :measured-selectors :tile :input-fusion})
 (def ^:private valid-matrix-tile-spaces #{:default :finite})
 
 (defn- valid-matrix-tile-space?
@@ -230,6 +233,8 @@
         (get-in schedule [:segmented-weighted-reduction :measured-selectors] {})
         typed-contraction-strategy
         (get-in schedule [:typed-contraction :strategy] :auto)
+        multiply-add
+        (get-in schedule [:typed-contraction :multiply-add] :decomposed)
         matrix-tiles
         (get-in schedule [:typed-contraction :matrix-tiles] :default)
         split-factors
@@ -268,6 +273,21 @@
       (throw (ex-info "schedule: unknown typed contraction strategy"
                       {:strategy typed-contraction-strategy
                        :expected valid-typed-contraction-strategies})))
+    (when-not (and (map? (:typed-contraction schedule))
+                   (every? typed-contraction-fields (keys (:typed-contraction schedule))))
+      (throw (ex-info "schedule: unknown typed contraction fields"
+                      {:typed-contraction (:typed-contraction schedule)
+                       :allowed typed-contraction-fields})))
+    (when-not (contains? #{:decomposed :fused} multiply-add)
+      (throw (ex-info "schedule: typed contraction multiply-add must be :decomposed or :fused"
+                      {:multiply-add multiply-add})))
+    (when (and (= :fused multiply-add)
+               (not (and (= :mixed-f16-f32 prec)
+                         (contains? #{:register-tiled :dispatch-register-tiled}
+                                    typed-contraction-strategy))))
+      (throw (ex-info "schedule: fused multiply-add requires a permissive register-tiled schedule"
+                      {:multiply-add multiply-add :precision prec
+                       :strategy typed-contraction-strategy})))
     (when-not (valid-matrix-tile-space? matrix-tiles desc)
       (throw (ex-info "schedule: unknown typed contraction matrix tile space; expected :default, :finite, or a non-empty unique subset of the descriptor-derived family"
                       {:matrix-tiles matrix-tiles

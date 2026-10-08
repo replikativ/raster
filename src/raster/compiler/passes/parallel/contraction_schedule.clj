@@ -583,6 +583,15 @@
                                    :out-elems (get-in kernel-body [:attributes :launch-segment-count])}})]
       (scheduled-body/validate-against-node! scheduled node graph))))
 
+(defn- register-contraction-numerics
+  [contract-facts kernel-body]
+  {:mode :reassociated
+   :policy (if (= :fused (get-in kernel-body [:schedule :multiply-add]))
+             :ordered-k-fused-multiply-add
+             :ordered-k-decomposed-multiply-add)
+   :source-arithmetic (:source-arithmetic contract-facts)
+   :accumulator-dtype :float :rounding :implementation-defined})
+
 (defn plan-register-tiled-for-node
   "Admit an explicitly requested FP32 register tile through the common graph/body certificate.
 
@@ -590,7 +599,8 @@
    retain their positive, dense-capacity, and padded-coordinate obligations as checked scheduled
    preconditions. The permissive numerical policy allows target multiply/add contraction but never
    narrows storage to FP16."
-  [node graph contract-facts descriptor {:keys [precision] :as options}]
+  [node graph contract-facts descriptor {:keys [precision multiply-add] :as options
+                                        :or {multiply-add :decomposed}}]
   (let [dimensions (mapv second (concat (:free-axes contract-facts)
                                         (:contract-axes contract-facts)))]
     (cond
@@ -613,6 +623,7 @@
               graph-scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
               lowering-options (-> options
                                    (assoc :descriptor descriptor :operation-id (:id operation))
+                                   (assoc :multiply-add multiply-add)
                                    (update :scalar-types #(merge (or % {}) graph-scalar-types)))
               lowered (register-tiled/lower contract-facts lowering-options)
               kernel-body (:kernel-body lowered)
@@ -626,10 +637,9 @@
                           :effects {:kind :pure-contraction
                                     :uses (scheduled-body/derive-uses kernel-body arguments)}
                           :legality {:kind :register-tiled-contraction
-                                     :tile (:tile lowered) :variant (:variant lowered)}
-                          :numerics {:mode :reassociated :policy :ordered-k-target-contraction
-                                     :source-arithmetic (:source-arithmetic contract-facts)
-                                     :accumulator-dtype :float :rounding :implementation-defined}
+                                     :tile (:tile lowered) :variant (:variant lowered)
+                                     :multiply-add (get-in kernel-body [:schedule :multiply-add])}
+                          :numerics (register-contraction-numerics contract-facts kernel-body)
                           :attributes {:strategy :register-tiled :precision :f32
                                        :variant (:variant lowered)
                                        :out-elems (:output-count lowered)}})]
@@ -698,7 +708,9 @@
       :register-tiled
       (let [planned (plan-register-tiled-for-node
                      node graph contract-facts descriptor
-                     (assoc options :precision (:precision schedule)))]
+                     (assoc options :precision (:precision schedule)
+                                    :multiply-add (get-in schedule [:typed-contraction :multiply-add]
+                                                          :decomposed)))]
         (if (:ok planned)
           (:scheduled planned)
           (throw (ex-info "explicit register-tiled contraction schedule is not legal"
@@ -750,8 +762,10 @@
            (assoc options :workgroup-size (first (get-in kernel-body [:launch :workgroup-size]))))
 
           :register-tiled-contraction
-          (register-tiled/lower contract-facts
-                                (assoc options :tile (get-in scheduled [:legality :tile])))
+          (when (contains? #{:decomposed :fused} (get-in scheduled [:legality :multiply-add]))
+            (register-tiled/lower contract-facts
+                                  (assoc options :tile (get-in scheduled [:legality :tile])
+                                                 :multiply-add (get-in scheduled [:legality :multiply-add]))))
 
           nil)
         expected-arguments (mapv (fn [{:keys [id]}]
@@ -767,9 +781,13 @@
                            (not-any? #(= (:out contract-facts) (:id %)) (:inputs graph)))
         preconditions-valid?
         (or (not= :register-tiled-contraction (get-in scheduled [:legality :kind]))
-            (= (:preconditions scheduled)
-               (register-tiled/admission-preconditions (:dims expected) (:tile expected))))]
+            (and expected
+                 (= (:preconditions scheduled)
+                    (register-tiled/admission-preconditions (:dims expected) (:tile expected)))))]
     (when (and expected plain-output? preconditions-valid?
+               (or (not= :register-tiled-contraction (get-in scheduled [:legality :kind]))
+                   (= (:numerics scheduled)
+                      (register-contraction-numerics contract-facts (:kernel-body expected))))
                (= kernel-body (:kernel-body expected))
                (= (:arguments scheduled) expected-arguments)
                (= (:scalar-bindings scheduled)

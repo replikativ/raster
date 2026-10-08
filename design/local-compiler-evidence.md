@@ -1250,3 +1250,59 @@ trust flag is introduced. Argument, alias, scalar conversion, effect, numerical 
 checks remain in place. The affected scheduled-body, emitted-equation and OpenCL emitter
 suites pass 46 tests / 503 assertions in the capped warm REPL. This measures removed duplicate
 validation, not end-to-end compilation speedup or training numerical acceptance.
+
+### Real-checkpoint softmax precision experiment — 2026-10-08
+
+The held two-layer training gate used the unchanged finetune source/oracle at
+`9e9ba5d62f3822f056e01c37231d7eaa7c84947c`, the checkpoint SHA-256
+`700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab`,
+sequence length 2, batch 1, rank 16 and nonzero adapter B matrices. An isolated
+same-input attention diagnostic established that native Float exponential rounding
+can change softmax weights by one ULP; explicitly evaluating Double exp and casting
+back to Float eliminated that isolated discrepancy on the local OpenCL device.
+
+Applying this explicit precision boundary consistently to both denominator and
+numerator in the production materialized softmax did not close the original model
+gate. Predicted/reference losses were 17921.275/17921.271875, input-gradient worst
+relative error was 0.0040108606627614705, and 11 of 28 adapter gradients exceeded
+the unchanged 0.02 worst-relative threshold (maximum 1.1454261263845888).
+These are diagnostic results, not accepted training parity or a performance claim.
+
+The source-default experiment and its experiment-specific tests were removed:
+extra Double exponentials are not justified by an isolated match when the full
+gate still fails. The accepted explicit precision/target-library realization
+contracts remain intact. Next diagnosis must compare actual model intermediates
+and pullbacks at shared operands to distinguish inherited forward rounding from
+local derivative/lowering errors; no oracle rewrite or tolerance relaxation is
+authorized by this evidence. Temporary experiment scripts are not release tests.
+
+The subsequent unchanged layer-0 forward-stage diagnostic localized the first
+divergence to `linear-nb` inside the Q/K/V LoRA projections. Input RMS normalization
+matched exactly. Q/K normalization and RoPE also matched exactly on shared inputs;
+their end-to-end differences were inherited. Splitting Q projection showed local
+differences in all three matrix products, while residual addition matched exactly
+on shared operands. Base Q product maximum absolute difference from native BLAS
+was 0.0001068115234375.
+
+An independent dot reference over the same checkpoint operands established that
+the generated base Q product matched ordered Float multiply-then-add exactly
+(all 2048 outputs). Neither native BLAS nor ordered Float FMA matched that result.
+Against a Double accumulated, Float stored diagnostic, native BLAS maximum
+absolute error was 0.000030517578125 and generated GPU error was
+0.000091552734375. These checks distinguish arithmetic realization from a lost
+operand or wrong index in this isolated forward stage; they do not establish
+correctness of every backward stage, justify changing the training oracle, or
+close full-model gradient parity. Next work must isolate same-input matrix
+pullbacks and assess a declared numerical policy for native-BLAS boundaries.
+
+The public `linear-dx` and `linear-dW` helpers were then executed on the same
+checkpoint weights/normalized inputs with one identical deterministic synthetic
+cotangent, rather than an inherited full-model cotangent. Both generated helpers
+matched independent ordered Float multiply-then-add references exactly. Native
+BLAS differed (dx maximum absolute difference 0.0000022649765014648438;
+dW 0.000030517578125). For the two-row dW reduction, native BLAS matched the
+independent ordered Float FMA reference exactly, while the generated helper did
+not. This establishes a concrete contraction-realization difference in both
+forward and pullback, not a reason to turn on fusion implicitly under an exact
+source contract. It is still limited to these operands/helpers: full-model
+cotangent propagation and original gradient acceptance remain unverified.

@@ -323,7 +323,8 @@
      (:body planned) :target-dialect dialect :kernel-name-prefix "mixed_contraction")))
 
 (defn- register-tiled-contraction-source
-  [dialect]
+  ([dialect] (register-tiled-contraction-source dialect :decomposed))
+  ([dialect multiply-add]
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/*
                           (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
@@ -340,9 +341,9 @@
                         (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j)))
                 :opts {:epilogue epilogue}
                 :dtype :float})
-        kernel-body (:kernel-body (register-tiled-body/lower facts {}))]
+        kernel-body (:kernel-body (register-tiled-body/lower facts {:multiply-add multiply-add}))]
     (body-emit/emit-scalar-kernel
-     "register_tiled_contraction" kernel-body {:target-dialect dialect})))
+     "register_tiled_contraction" kernel-body {:target-dialect dialect}))))
 
 (defn- symbolic-register-tiled-contraction-source
   [dialect]
@@ -751,6 +752,8 @@
                             (cooperative-segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"
                           (register-tiled-contraction-source dialect))
+           (write-source! directory suffix "fused-register-tiled-contraction"
+                          (register-tiled-contraction-source dialect :fused))
            (write-source! directory suffix "symbolic-register-tiled-contraction"
                           (symbolic-register-tiled-contraction-source dialect))
            (write-source! directory suffix "layout-cast"
