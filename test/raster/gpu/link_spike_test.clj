@@ -377,6 +377,22 @@
       (is (= {:value-epoch 5} @(:execution-state executable)))
       (is (true? @replayed)))))
 
+(deftest linked-owned-allocation-roots-are-execution-qualified
+  (let [a (bview/allocation {:id :compiler-local :byte-size 16 :memory-space :device
+                           :device :ze:0 :alignment 64})
+        nodes [{:view (bview/view a {:dtype :float :shape [4]})}]
+        root-a [::gpu-link/allocation :execution-a :compiler-local]
+        root-b [::gpu-link/allocation :execution-b :compiler-local]
+        spec-a (#'gpu-link/allocation-spec nodes root-a)
+        spec-b (#'gpu-link/allocation-spec nodes root-b)]
+    (is (= :compiler-local (:id a)) "logical compiler allocation identity is unchanged")
+    (is (= root-a (get-in spec-a [3 :allocation-id])))
+    (is (= root-b (get-in spec-b [3 :allocation-id])))
+    (is (not= (get-in spec-a [3 :allocation-id]) (get-in spec-b [3 :allocation-id]))
+        "independently allocated native roots must not look like aliases to lifetime guards")
+    (is (= [:float 4 nil] (subvec spec-a 0 3)))
+    (is (= (dissoc (nth spec-a 3) :allocation-id) (dissoc (nth spec-b 3) :allocation-id)))))
+
 (deftest owned-runtime-allocation-preserves-the-certified-identity
   (let [session (atom {:device-id :ze:0 :session-id :session
                        :buffers {} :allocations {} :closed? false})
