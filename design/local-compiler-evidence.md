@@ -1435,3 +1435,22 @@ unchanged. Widening all matrix calls still fails 8 of 28 adapter checks (maximum
 is a GPU execution result or an accepted replacement oracle; no production
 widening follows from it. Better local dot accuracy alone is insufficient
 evidence that the complete numerical contract is met.
+
+Replacing only the CPU matrix helpers with ordered Float FMA also fails 15
+adapter checks (maximum 0.8192590523403551), with predicted loss 17921.278125,
+the same loss as the executed fused GPU chain. The unchanged nonlinear CPU
+path is retained in this simulation. Thus matrix realization alone can
+reproduce the acceptance failure pattern; this is not a proof that every GPU
+nonlinear operation or full cotangent agrees with its CPU counterpart.
+
+Captured actual layer-1 normalization calls give additional bounds. All six
+chunked RMSNorm forward calls match CPU exactly at shared inputs. All six
+backward input-gradient calls have small differences: maximum absolute error
+0.00006103515625 and maximum coordinate-relative error
+0.00004876049798283915 (these maxima come from different calls). Capture
+preserves the original CPU adapter gradients exactly. A proposed partial-state
+diagnostic based on evaluating the retained body, including a return-projected
+anonymous ftm, did not reproduce the original compiled CPU output exactly.
+Its partial states are therefore rejected as an oracle, not used to justify
+production changes. A valid partial-state comparison must first establish
+observational equivalence through the same specialization and emission path.
