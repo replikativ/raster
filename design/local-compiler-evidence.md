@@ -1392,3 +1392,46 @@ ordered FMA as a sufficient fix. The capability extension is independently
 validated; the fused policy is not promoted to a default or a training-parity
 claim. Actual shared-operand pullbacks and inherited cotangents still need
 localization against the monolithic CPU AD oracle.
+
+### Actual shared-cotangent pullbacks — 2026-10-09
+
+Two isolated real-checkpoint block VJPs were run with the native CPU forward
+input and native CPU output cotangent supplied identically to CPU and GPU.
+The original external backward declaration and explicit fused register schedule
+were used. This removes inter-layer input/cotangent drift but still recomputes
+each block's internal forward intermediates on its respective target. Layer 1
+still exceeds the adapter threshold for Ak and Bg; layer 0 exceeds it for Ak,
+Bk, Av, Bg, Au, Bu, Ad and Bd. Thus inter-layer drift is not the only cause.
+These are diagnostic comparisons, not a substitute acceptance oracle.
+
+Wrapping the existing Float matrix-pullback typed interfaces captured 42 calls
+from the CPU layer-1 VJP without changing any of its 14 adapter gradients
+(all coordinates bit-identical). Each adapter gradient is the direct result of
+one captured `linear-dW` call. On those exact actual-model operands, all 14
+generated fused TN products match both native BLAS and an independent ordered
+Float Math/fma dot reference exactly. Their reduction width is two, matching
+the unchanged sequence length. This rules out those isolated adapter-matrix
+products as the source of the observed layer-1 discrepancy; it does not prove
+other widths, the full forward recomputation, input cotangent propagation,
+nonlinear adjoints, or the final training gate. Next localization follows the
+actual cotangents upstream and checks input-gradient products at shared operands.
+
+All 21 captured layer-1 input-gradient matrix calls were also executed on
+identical operands. Generated fused NN products match ordered Float Math/fma
+exactly in every coordinate. Native BLAS uses different accumulation results;
+the largest observed same-input absolute difference is 0.00067138671875.
+Double-dot diagnostics improve some differences and worsen others; they are not
+an automatic justification for widening the production graph. The remaining
+full-block mismatch must be diagnosed through its recomputed intermediates and
+cotangent propagation, rather than attributing it to the isolated adapter-TN
+products or replacing the monolithic oracle with a convenient local one.
+
+A separate CPU-only arithmetic simulation replaced the three typed matrix
+helpers with independent Double-dot/Float-store implementations, leaving the
+model, AD rules, nonlinear operations and native-BLAS monolithic reference
+unchanged. Widening all matrix calls still fails 8 of 28 adapter checks (maximum
+1.1460127391180726). Widening only input-gradient products leaves two failures
+(layer-1 Ak 0.02482720148392874 and Ag 0.03098584773269312). Neither diagnostic
+is a GPU execution result or an accepted replacement oracle; no production
+widening follows from it. Better local dot accuracy alone is insufficient
+evidence that the complete numerical contract is met.
