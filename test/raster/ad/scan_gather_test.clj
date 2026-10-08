@@ -64,4 +64,28 @@
         heads (atom #{})]
     (walk/postwalk (fn [f] (when (seq? f) (swap! heads conj (first f))) f) walked-body)
     (is (not (contains? @heads 'java.util.ArrayList.)) "no closure tape")
-    (is (not (contains? @heads 'fn*)) "no per-iteration pullbacks")))
+    (is (not (contains? @heads 'fn*)) "no per-iteration pullbacks")
+    (is (not (contains? @heads 'raster.par/scan)) "an additive likelihood keeps no carry tape")))
+
+;; term + acc (accumulator on the right) and a product recurrence, which is not
+;; additive and keeps the scan's carry tape
+(deftm right-sum [w :- Double, xs :- (Array double), cnt :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i cnt)
+      (recur (inc i) (n/+ (n/* w (ra/aget xs i)) acc))
+      acc)))
+
+(deftm product-recurrence [w :- Double, xs :- (Array double), cnt :- Long] :- Double
+  (loop [i 0 acc 1.0]
+    (if (< i cnt)
+      (recur (inc i) (n/* acc (n/+ 1.0 (n/* w (ra/aget xs i)))))
+      acc)))
+
+(deftest additive-and-multiplicative-recurrences
+  (let [xs (double-array [0.5 -1.0 2.0])
+        fd (fn [f w] (/ (- (f (+ w 1e-6) xs 3) (f (- w 1e-6) xs 3)) 2e-6))]
+    (doseq [[f v] [[right-sum #'right-sum] [product-recurrence #'product-recurrence]]
+            compile? [false true]]
+      (let [[_ dw] ((rev/value+grad v :wrt [0] :compile? compile?) 0.3 xs 3)]
+        (testing [v compile?]
+          (is (< (Math/abs (- dw (fd f 0.3))) 1e-6)))))))
