@@ -43,6 +43,14 @@
                          (try (available)
                               (catch clojure.lang.ExceptionInfo e e))))))))
 
+(deftest ci-native-dependencies-are-functional
+  ;; This namespace has no optional-provider fixture: CI must not skip the
+  ;; tests merely because the packages it explicitly installs are unusable.
+  ;; Laptop and compiler-only jobs do not require an installed numerical stack.
+  (when (= "1" (System/getenv "RASTER_EXPECT_NATIVE_LIBRARIES"))
+    (is (boolean (blas/available?)) "CI requires functional LP64 BLAS")
+    (is (true? (lapack/available?)) "CI requires functional LP64 LAPACK")))
+
 (deftest configuration-downcall
   ;; Exercise the actual address-returning ABI using a native upcall stub,
   ;; without loading a BLAS provider or compiling a fixture library.

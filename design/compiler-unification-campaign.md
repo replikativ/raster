@@ -21,6 +21,9 @@ Hardware-free native stubs test the pointer-returning metadata ABI, absent symbo
 null metadata and incompatible build flags. This does not explain the reported C crash.
 Admission errors propagate through availability queries rather than being converted into
 whole-namespace skips. Ordinary missing-library discovery retains the existing optional behavior.
+The CI test job declares `RASTER_EXPECT_NATIVE_LIBRARIES=1`; an unconditional test
+namespace then requires functional BLAS and LAPACK, without forcing either onto laptop
+or compiler-only jobs. This preflight does not replace per-capability coverage accounting.
 
 Explicit consistent library selection, actual resolved-provider/version/thread metadata,
 ABI treatment for unknown/preloaded providers, and a pinned native reference environment
