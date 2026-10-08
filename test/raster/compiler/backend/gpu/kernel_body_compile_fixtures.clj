@@ -485,6 +485,9 @@
                  #'mixed-storage/double-reduction-float-result
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
       (:kernels (equation-first/compile
+                 #'mixed-storage/double-fold-float-storage
+                 (merge mixed-storage/policy {:target device-id :dtype :double})))
+      (:kernels (equation-first/compile
                  #'mixed-storage/mixed-scale-energy-gradient
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
       (:kernels (equation-first/compile

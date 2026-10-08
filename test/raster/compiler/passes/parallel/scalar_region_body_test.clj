@@ -20,6 +20,19 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest scalar-fold-converts-only-its-completed-result
+  (let [expression '(fold {:accumulator acc :index j :identity 0.0
+                          :lower 0 :extent 3 :dtype :double :association :ordered}
+                         (lambda [acc j] (region [] [(+ acc 1.0)])))
+        lowered ((:lower (lowerer)) expression :float {})
+        operations (:operations lowered)
+        loop (first operations)]
+    (is (= :float (:type lowered)))
+    (is (= :double (get-in loop [:iter-args 0 :binding :type])))
+    (is (= :double (get-in loop [:results 0 :type])))
+    (is (= :cast (get-in (last operations) [:expression :op])))
+    (is (= :float (get-in (last operations) [:result :type])))))
+
 (deftest static-numeric-constants-use-shared-evidence
   (let [lower (:lower (lowerer))
         result (lower 'java.lang.Float/NEGATIVE_INFINITY :float {})]

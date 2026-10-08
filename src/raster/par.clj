@@ -247,7 +247,9 @@
   only accelerator scheduling; it does not change the sequential host meaning.
 
   The result buffers are dense row-major tensors with shape
-  `[segment-bound ... map-extent]`. This is a general row-statistics primitive: softmax,
+  `[segment-bound ... map-extent]`. Completed results use the ordinary `raster.arrays/aset`
+  conversion contract (including Double to Float storage), not the fold carry dtype.
+  This is a general row-statistics primitive: softmax,
   normalization and ragged scientific reductions are applications, not compiler operations."
   [outputs segment-axes idx-sym map-extent folds map-results]
   (assert (and (vector? outputs) (seq outputs) (every? symbol? outputs))
@@ -279,7 +281,7 @@
             `(~cast ~value)
             value))
         stores (mapv (fn [output result]
-                       `(clojure.core/aset ~output ~flat-index ~result))
+                       `(raster.arrays/aset ~output ~flat-index ~result))
                      outputs map-results)
         mapped `(dotimes [~idx-sym (int ~map-extent)] ~@stores)
         folded

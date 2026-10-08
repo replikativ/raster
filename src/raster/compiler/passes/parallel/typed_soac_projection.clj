@@ -393,8 +393,19 @@
         form (list 'raster.par/segmented-fold-map!
                    physical-results (:segment-axes attributes)
                    (:index attributes) (:extent attributes) source-folds
-                   (mapv #(util/subst-syms substitutions %)
-                         (:body-results map-region)))]
+                   ;; Result storage is independent of the fold carry. Spell the
+                   ;; retained per-output conversion explicitly: an untagged host
+                   ;; aset otherwise dispatches on the boxed value rather than
+                   ;; the validated destination representation.
+                   (mapv (fn [result result-dtype]
+                           (let [cast (dtype/scalar-tag-for-dtype result-dtype)
+                                 qualified-cast (symbol "clojure.core" (name cast))
+                                 result (util/subst-syms substitutions result)]
+                             (if (and (seq? result) (= 2 (count result))
+                                      (contains? #{cast qualified-cast} (first result)))
+                               result
+                               (list qualified-cast result))))
+                         (:body-results map-region) (:dtypes attributes)))]
     (with-meta form {:raster.type/elem-type (first (:dtypes attributes))})))
 
 (defn stencil-form
