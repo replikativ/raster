@@ -19,6 +19,8 @@
             [raster.compiler.backend.intrinsics :as in]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -244,8 +246,8 @@
   "SegMap → a C statement block (string) that writes the vectorized element-wise map
    into out-sym, plus a scalar tail. Returns {:includes :block} or nil if not
    vectorizable (caller keeps the scalar loop). Supports pure value-lets, i32→Float
-   widening and Float-storage→Double arithmetic loads; mixed arithmetic precision
-   still declines."
+   widening and Float-storage→Double arithmetic loads. Uniform Double arithmetic
+   can end in a declared Float store; intervening mixed arithmetic still declines."
   [segmap isa array-syms]
   (let [idx    (ss/seg-idx segmap)
         bound  (ss/seg-bound segmap)
@@ -254,22 +256,40 @@
         ;; conversion attributes have already been certified, and both the vector expression and
         ;; scalar tail must see the same projection.
         source (some-> (:lambda segmap) ss/clean-dead-bindings)
-        raw    (some-> source soac-dialect/scalar-converts->source)
-        ;; inline pure value-lets so a let*-bodied map (composed kernels: folded/scale
-        ;; bindings) is a single lane expression — no manual source inlining needed.
-        lambda (when raw (inline-lets (ss/normalize-invk raw)))
         out    (:out-sym segmap)
-        cast   (:cast-fn segmap)
-        elem   (vt-of (:dtype segmap))
+        source-cast (:cast-fn segmap)
+        terminal-conversion (conversion/canonical-parts source)
+        terminal-double-to-float?
+        (= {:source-dtype :double :target-dtype :float
+            :rounding :nearest-even :overflow :ieee}
+           (select-keys (:attributes terminal-conversion)
+                        [:source-dtype :target-dtype :rounding :overflow]))
+        double-source (if terminal-double-to-float? (:operand terminal-conversion) source)
+        storage-elem (vt-of (:dtype segmap))
+        same-precision? (ss/retained-floating-precision-compatible? source (:dtype segmap))
+        double-info (in/simd-type-info isa :f64)
+        ;; The lambda's retained operations determine arithmetic precision; the output
+        ;; dtype only determines storage. Do not erase intervening Float roundings.
+        double-to-float? (and (not same-precision?) (= :float (:dtype segmap))
+                              (or terminal-double-to-float?
+                                  (= 'float (descriptor/cast-result-tag source-cast)))
+                              (seq *array-types*)
+                              (:to-f32 double-info) (:to-f32-store double-info)
+                              (ss/retained-floating-precision-compatible? double-source :double))
+        ;; Move only a certified terminal narrowing to the store, never an interior cast.
+        compute-source (if double-to-float? double-source source)
+        raw (some-> compute-source soac-dialect/scalar-converts->source)
+        lambda (when raw (inline-lets (ss/normalize-invk raw)))
+        cast (if double-to-float? 'float source-cast)
+        elem   (cond same-precision? storage-elem double-to-float? :f64)
         ti     (in/simd-type-info isa elem)]
     (when (and idx bound out ti (seq? lambda)
                ;; Check before projecting conversions, while their declared source precision
                ;; is still present. Syntax admission below remains emitter-specific.
-               (ss/retained-floating-precision-compatible? source (:dtype segmap))
                (storage-loads-compatible? isa elem lambda idx true)
                (or (empty? *array-types*)
                    (= (get *array-types* out)
-                      (case elem :f64 :double :f32 :float :i32 :int nil)))
+                      (case storage-elem :f64 :double :f32 :float :i32 :int nil)))
                (ss/simd-able? lambda idx)
                (empty? (ss/value-position-arrays lambda idx)))
       (let [lanes (:lanes ti)
@@ -288,7 +308,9 @@
                 "  const int _n = " n-c ";\n"
                 "  int j = 0;\n"
                 "  for (; j + " lanes " <= _n; j += " lanes ") {\n"
-                "    " (:storeu ti) "(&" outc "[j], " vexpr ");\n"
+                "    " (if double-to-float? (:to-f32-store ti) (:storeu ti))
+                "(&" outc "[j], "
+                (if double-to-float? (str (:to-f32 ti) "(" vexpr ")") vexpr) ");\n"
                 "  }\n"
                 "  for (; j < _n; j++) " outc "[j] = " tail ";\n"
                 "}")})))))

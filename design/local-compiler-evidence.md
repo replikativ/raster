@@ -1647,3 +1647,20 @@ mixed-storage support. Native map/reduction tests cover changed
 inputs and lengths around vector boundaries; no model oracle or tolerance changes.
 This enables a genuine storage conversion but does not yet implement mixed
 arithmetic domains or Double-compute-to-Float-store quantized folds.
+
+### Uniform Double computation with a terminal Float store
+
+The native SIMD map now separates its arithmetic species from output storage.
+Retained uniform Double operations can use four-lane Double vectors and end in
+a four-Float store. A canonical terminal Double→Float conversion is moved only
+to that store when its declared nearest-even/IEEE policy matches the existing C
+conversion lowering; other policies and interior Float roundings decline. Fully
+retained input/output storage facts and both narrowing facet entries are required.
+There is no blanket permission to widen source arithmetic or infer missing types.
+
+Public deftm/native/JVM raw-bit checks use Double gains whose squared values
+distinguish Double arithmetic from early Float rounding, varied inputs, and lengths
+around four-lane boundaries. These checks use the ordinary native floating-point
+environment; they do not certify semantics under a modified host rounding mode.
+The Q4/Q8 x8 quant folds still require integer-width-aware vector conversion of
+their folded integer dots; this floating-only schedule does not close that debt.
