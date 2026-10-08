@@ -4,6 +4,17 @@
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
+(deftest retained-associative-certificates-are-independently-validated
+  (doseq [[dtype op init]
+          [[:float '+ 0.0] [:double '* 1.0]
+           [:int 'unchecked-add-int 0] [:long 'unchecked-multiply 1]
+           [:float 'min Float/POSITIVE_INFINITY] [:double 'max Double/NEGATIVE_INFINITY]]]
+    (let [certificate (scan/certify-reassociation
+                       {:acc 'acc :init init :lambda (list op 'acc 'element)} dtype)]
+      (is (identical? certificate (scan/validate! certificate)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (scan/validate! (assoc certificate :identity :forged)))))))
+
 (deftest rounded-or-failing-casts-do-not-prove-integer-identities
   (doseq [[dtype init] [[:int '(float 2147483647)]
                        [:long (list 'double Long/MAX_VALUE)]
