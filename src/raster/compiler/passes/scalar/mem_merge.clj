@@ -38,10 +38,14 @@
     (when (and op (descriptor/alloc-op? op))
       (let [head-name (name op)
             args (form/effective-args expr)]
-        (when (or (.contains ^String head-name "double-array")
-                  (.contains ^String head-name "float-array")
-                  (.contains ^String head-name "long-array")
-                  (.contains ^String head-name "int-array"))
+        ;; Only a size-only constructor is zero-initialized storage that merging
+        ;; may recreate: (double-array n v) and (double-array coll) carry contents.
+        (when (and (or (.contains ^String head-name "double-array")
+                       (.contains ^String head-name "float-array")
+                       (.contains ^String head-name "long-array")
+                       (.contains ^String head-name "int-array"))
+                   (= 1 (count args))
+                   (not (coll? (first args))))
           {:type (keyword head-name)
            :size (first args)
            :device :cpu})))))
@@ -374,10 +378,25 @@
                                     [sym (last expr)]
                                     :else nil))
                                 pairs))
-          returned-bufs (set (keep (fn [s]
-                                     (or (when (contains? alloc-syms-all s) s)
-                                         (get alias-map s)))
-                                   body-syms))
+          ;; A returned value may be an allocation reached through any chain of
+          ;; aliases: a binding's tail value or either branch. (Buffers handed
+          ;; to calls are excluded below as opaque uses.)
+          may-be (fn may-be [expr]
+                   (cond
+                     (symbol? expr) #{expr}
+                     (not (seq? expr)) #{}
+                     (= 'do (first expr)) (may-be (last expr))
+                     (#{'let* 'loop*} (first expr)) (may-be (last (nnext expr)))
+                     (= 'if (first expr)) (set/union (may-be (nth expr 2 nil)) (may-be (nth expr 3 nil)))
+                     :else #{}))
+          value-of (into {} (map (fn [[sym expr]] [sym (may-be expr)])) pairs)
+          returned-bufs (loop [seen #{} pending body-syms]
+                          (if (empty? pending)
+                            (set/intersection alloc-syms-all seen)
+                            (let [seen (set/union seen pending)]
+                              (recur seen (set/difference
+                                           (apply set/union #{} (map #(get value-of % #{}) pending))
+                                           seen)))))
           ;; Exclude buffers passed to opaque function calls.
           ;; Opaque calls may use (alength buf) internally, which would return
           ;; the wrong size if the buffer is shared with a different-sized one.

@@ -135,6 +135,14 @@
       (is (= 1 (:fresh-allocs (:stats result)))
           "Should have 1 fresh allocation"))))
 
+(deftest test-fuse-let-borrowed-arg-is-not-reused
+  (testing "A parameter's last local use does not make it the let's to overwrite"
+    (let [form '(let* [a (test/inplace-op input)]
+                      (test/scalar-op a))
+          result (buffer-fuse/fuse-let form)]
+      (is (= 0 (:fused (:stats result)))
+          "input is borrowed from the caller"))))
+
 (deftest test-fuse-let-used-after-prevents-reuse
   (testing "In-place arg still used after prevents reuse"
     ;; h is used in BOTH inplace-op AND scalar-op, so can't reuse

@@ -18,6 +18,10 @@
       (is (some? info))
       (is (= 'n (:size info)))))
 
+  (testing "Constructors with contents are not zero-initialized storage"
+    (is (nil? (#'mem-merge/alloc-info '(double-array n 1.0))))
+    (is (nil? (#'mem-merge/alloc-info '(double-array [1.0 2.0])))))
+
   (testing "Non-allocation returns nil"
     (is (nil? (#'mem-merge/alloc-info '(+ a b))))
     (is (nil? (#'mem-merge/alloc-info 42)))))
@@ -163,6 +167,18 @@
                      [(with-meta 'a {:raster.buffer/hoistable true}) '(double-array 10)
                       'b '(foo a)]
                      'b)
+          {:keys [stats]} (mem-merge/merge-memory-blocks form)]
+      (is (= 0 (:bytes-saved stats))))))
+
+(deftest returned-through-aliases-is-not-merged
+  (testing "A buffer returned through a chain of aliases keeps its exact size"
+    (let [form (list 'let*
+                     [(with-meta 'a {:raster.buffer/hoistable true}) '(double-array 20)
+                      'b '(foo a)
+                      (with-meta 'c {:raster.buffer/hoistable true}) '(double-array 10)
+                      'd 'c
+                      'e '(do (bar d) d)]
+                     'e)
           {:keys [stats]} (mem-merge/merge-memory-blocks form)]
       (is (= 0 (:bytes-saved stats))))))
 
