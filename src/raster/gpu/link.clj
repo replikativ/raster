@@ -95,7 +95,7 @@
   [::graph execution-id])
 
 (defn- allocation-spec
-  [nodes]
+  [nodes root-id]
   (let [view (:view (first nodes))
         allocation (:allocation view)
         dt (dtype/canon (:dtype view))
@@ -106,7 +106,7 @@
                       {:reason :link-allocation-size :allocation (:id allocation)
                        :byte-size bytes :dtype dt})))
     [dt (quot bytes element-bytes) nil
-     {:allocation-id (:id allocation)
+     {:allocation-id root-id
       :memory-space (:memory-space allocation)
       :coherence (:coherence allocation)
       :alignment (:alignment allocation)}]))
@@ -256,7 +256,11 @@
                      (into {}
                            (keep (fn [[allocation-id nodes]]
                                    (when (= :owned (get-in (first nodes) [:view :allocation :ownership]))
-                                     [(get key-by-allocation allocation-id) (allocation-spec nodes)])))
+                                     (let [key (get key-by-allocation allocation-id)]
+                                       ;; Two instantiations allocate distinct physical roots even
+                                       ;; when their compiler-local allocation names are equal.
+                                       ;; Borrowed/external storage retains its explicit identity.
+                                       [key (allocation-spec nodes key)]))))
                            groups)]
                  (when (seq owned-specs)
                    (timed-phase! timings :allocation #(gpu/alloc! session owned-specs))
