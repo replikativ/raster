@@ -1378,3 +1378,14 @@ dimensions including `[M,K,N]=[65,17,67]`, against an independent ordered Float
 oracle. The compile-fixture corpus also emits the TN body for portable OpenCL,
 CUDA and HIP; source generation is not vendor execution or throughput evidence.
 Full real-checkpoint acceptance remains a separate, unchanged gate.
+
+With TN admitted, the explicit fused-register diagnostic executed the unchanged
+two-layer model and reached its numerical gate rather than declining compilation.
+It still failed at iteration 0: predicted/reference loss
+17921.278125/17921.271875, input-gradient worst-relative error
+0.005268926908926802, and 15 of 28 adapter gradients above the unchanged 0.02
+threshold (maximum 0.7991052642515084). This rules out merely switching to
+ordered FMA as a sufficient fix. The capability extension is independently
+validated; the fused policy is not promoted to a default or a training-parity
+claim. Actual shared-operand pullbacks and inherited cotangents still need
+localization against the monolithic CPU AD oracle.
