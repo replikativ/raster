@@ -1374,9 +1374,12 @@ batched products and unsupported layouts remain outside this extension.
 Structural tests cover unequal physical dimensions and canonical staging for
 NT/TN (14 tests, 111 assertions). Public local OpenCL/Level Zero checks cover
 NN/NT/TN decomposed and fused rounding, changed-input replay, and NN/TN ragged
-dimensions including `[M,K,N]=[65,17,67]`, against an independent ordered Float
-oracle. The compile-fixture corpus also emits the TN body for portable OpenCL,
-CUDA and HIP; source generation is not vendor execution or throughput evidence.
+dimensions including `[M,K,N]=[65,17,67]` under fixed and dispatch-selected
+schedules, against an independent ordered Float oracle (2 tests, 102 assertions,
+no failures/errors). The compile-fixture corpus emits the TN body for portable
+OpenCL, CUDA and HIP. The TN fixture also compiles locally to `sm_80` PTX and
+`gfx1100` device assembly, with HIP contraction enabled. This is hardware-free
+compilation, not vendor execution or throughput evidence.
 Full real-checkpoint acceptance remains a separate, unchanged gate.
 
 With TN admitted, the explicit fused-register diagnostic executed the unchanged
