@@ -110,14 +110,14 @@
 (deftest invk-simplification-test
   (testing ".invk with _plus_ in name"
     (let [form '(.invk some_plus__m_double_double-impl x 0)]
-      ;; Should recognize as addition and simplify (+ x 0) => x
-      (is (= 'x (simp/simplify form)))))
+      ;; Impl spelling does not establish a signature or conversion contract.
+      (is (= form (simp/simplify form)))))
   (testing ".invk with _star_ in name"
     (let [form '(.invk some_star__m_double_double-impl x 1)]
-      (is (= 'x (simp/simplify form)))))
+      (is (= form (simp/simplify form)))))
   (testing ".invk constant fold"
     (let [form '(.invk _plus__m_double_double-impl 3.0 4.0)]
-      (is (= 7.0 (simp/simplify form))))))
+      (is (= form (simp/simplify form))))))
 
 ;; ================================================================
 ;; Math function simplification
@@ -191,7 +191,7 @@
   (testing "Walked .invk body with known params"
     (let [walked '(.invk _star__m_double_double-impl sigma (- y x))
           result (pe/pe walked {'sigma 10.0})]
-      (is (= '(raster.numeric/* 10.0 (- y x))
+      (is (= '(.invk _star__m_double_double-impl 10.0 (- y x))
              result)))))
 
 (deftest derivative-chain-cleanup-test

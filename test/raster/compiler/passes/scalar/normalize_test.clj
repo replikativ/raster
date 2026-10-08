@@ -1,1 +1,0 @@
-(ns raster.compiler.passes.scalar.normalize-test)

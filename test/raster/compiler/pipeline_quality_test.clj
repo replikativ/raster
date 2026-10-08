@@ -344,9 +344,9 @@
         (str "task #78: a LITERAL 1.0 f64 adjoint must NOT delete the -t/p "
              "negation in cross-entropy-backward-dp (gradient sign flip)"))))
 
-;; Direct invariant on pe-pass: a rewrite that changes a node's operator must not
-;; leave the surviving node claiming the parent's :raster.op/original.
-(deftest pe-drops-stale-op-original-on-rewrite-issue-78
+;; Typed calls retain both signatures and provenance; generic mul-by-one must
+;; not erase a conversion or reattribute the nested negation.
+(deftest pe-retains-typed-call-provenance-issue-78
   (let [node (with-meta
                (list '.invk 'raster.numeric/_star__m_double_double-impl
                      (with-meta (list '.invk 'raster.numeric/_minus__m_double-impl 'x)
@@ -354,8 +354,9 @@
                      1.0)
                {:raster.op/original 'raster.numeric/*})
         out (pe/pe-pass node {})]
-    (is (not= 'raster.numeric/* (:raster.op/original (meta out)))
-        "surviving (- x) must not inherit the *'s :raster.op/original after mul-by-one")))
+    (is (= node out))
+    (is (= 'raster.numeric/* (:raster.op/original (meta out))))
+    (is (= 'raster.numeric/- (:raster.op/original (meta (nth out 2)))))))
 
 ;; ================================================================
 ;; Cross-cutting gate (task #78): a .invk node's :raster.op/original must never

@@ -1521,3 +1521,29 @@ pins and tolerances with no pre-fix CPU classes. Loss remains 17921.2765625 vs
 17921.271875; input-gradient error is 0.006813176206858781. Twelve of 28 adapter
 checks still fail, with maximum 1.0649456537233917. This fixes a genuine compiler
 partitioning inconsistency but does not close the real-weight acceptance gate.
+
+### Shared scalar partial evaluation: typed operation boundaries
+
+The same conversion-erasure class exists outside JVM helper extraction. Shared
+scalar simplification and partial evaluation turned a retained Float addition
+of Float 1e8 and Double 1 into Double 100000001; a nested cancelling Float
+program changed from zero to one. Direct invocation of the original selected
+typed methods supplies an independent executable semantic oracle.
+
+These passes now preserve `.invk` nodes and their selected implementation/type
+metadata while simplifying arguments. Generic arithmetic identities and constant
+folds do not establish the selected operation's operand conversions, result
+rounding or IEEE behavior. Unknown calls are also preserved rather than guessed
+from mangled impl names. Direct untyped arithmetic retains its existing rules.
+Recursive and fixpoint entrypoints are checked as well as one-step helpers;
+regressions include mixed constants, intervening rounding, signed zero, infinity
+times zero, metadata and child constant propagation. This is not a new type or
+function registry, and it does not add a separate typed scalar evaluator.
+
+The retired recursive scalar normalizer has no active production consumer in the
+main scalar passes; its old private impl-name diagnostic still has a test caller.
+The SIMD backend has a distinct `normalize-invk` requiring its own proof and
+execution regression before a global no-erasure claim. Safe typed scalar
+optimizations should derive from existing declared signatures and canonical
+conversion/numeric authorities, not reintroduce generic rewriting through a
+different namespace. Compile-size and performance effects remain to be measured.

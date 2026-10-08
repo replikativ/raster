@@ -182,7 +182,7 @@ test/raster/compiler/passes/scalar/effects_test.clj	18
 test/raster/compiler/passes/scalar/host_abstract_value_test.clj	71
 test/raster/compiler/passes/scalar/inline_test.clj	99
 test/raster/compiler/passes/scalar/mem_merge_test.clj	91
-test/raster/compiler/passes/scalar/normalize_test.clj	6
+test/raster/compiler/passes/scalar/typed_arithmetic_simplification_test.clj	6
 test/raster/compiler/passes/scalar/peephole_test.clj	30
 test/raster/compiler/passes/scalar/resolve_alength_test.clj	14
 test/raster/compiler/passes/scalar/rewalk_test.clj	38
