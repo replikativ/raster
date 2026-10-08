@@ -134,6 +134,59 @@
                    (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
                    (clojure.core/aget b (long L)))})
 
+(deftest mixed-floating-storage-uses-converting-vector-loads
+  (when (clang-avx2?)
+    (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :double
+                     :out-sym 'y :cast-fn 'double
+                     :lambda '(+ (double (aget x i)) (double gain))}
+          {:keys [includes block]}
+          (binding [cs/*array-types* '{x :float y :double}
+                    ce/*emit-config* cpu/cpu-config ce/*scalar-type* "double"]
+            (cs/compile-segmap-c operation :avx2 '#{x y}))
+          native (cpu/load-kernel
+                  (cpu/compile-source!
+                   (str includes "void mixed(const float* x, double* y, double gain, int n){"
+                        block "}")) "mixed" 2 [:double :int])]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" block))
+      (doseq [n [3 4 5 9 17] gain [1.0e-9 -0.125]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array n)]
+          (native x y (double gain) (int n))
+          (is (= (mapv #(+ (double %) gain) x) (vec y))
+              (str "Float loads, Double arithmetic and scalar tail agree, n=" n)))))
+    (let [{:keys [includes helpers block]}
+          (binding [cs/*array-types* '{x :float}]
+            (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x}))
+          native (cpu/load-kernel
+                  (cpu/compile-source!
+                   (str includes helpers "void mixed_ssq(const float* x, double* out, int n){"
+                        "double acc;" block "out[0]=acc;}")) "mixed_ssq" 2 [:int])]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" block))
+      (doseq [n [3 4 5 17 33]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array 1)
+              expected (reduce + 0.0 (map #(* (double %) (double %)) x))]
+          (native x y (int n))
+          (is (< (Math/abs (- expected (aget y 0))) (* 1e-14 (max 1.0 expected)))
+              (str "Double products remain Double in reduction tail, n=" n)))))))
+
+(deftest unsupported-storage-widths-decline-before-vector-emission
+  (doseq [storage [:byte :long :double]]
+    (binding [cs/*array-types* {'a storage 'out :float}]
+      (is (nil? (cs/compile-segmap-c
+                 {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                  :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
+                 :avx2 '#{a out})))))
+  (doseq [storage [:byte :long :int]]
+    (binding [cs/*array-types* {'x storage}]
+      (is (nil? (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x})))))
+  (binding [cs/*array-types* '{a :float out :double}]
+    (is (nil? (cs/compile-segmap-c
+               {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
+               :avx2 '#{a out})))
+        "store pointer width must match the declared output dtype"))
+
 (deftest segmap-elementwise-matches-scalar
   (testing "y[L]=a[L]*s+b[L] via compile-segmap-c == scalar, f64 and f32"
     (if-not (clang-avx2?)
