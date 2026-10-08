@@ -2,6 +2,12 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.distributed-plan :as distributed]
+            [raster.compiler.ir.link-plan :as link]
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.collective-combine :as arithmetic]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.ir.scan :as scan]))
 
 (defn- direct-refinement [n]
@@ -191,3 +197,146 @@
     (is (= :distributed-transfer-continuity
            (reason #(project (assoc-in refinement [:nodes 0 :route] [[:worker-0 :worker-1]])
                              cluster inputs costs))))))
+
+(defn- identity-local [id source result options]
+  (let [abstract (av/tensor {:dtype :float :shape [17]})
+        algorithm (soac/make
+                   (soac/default-program-facts
+                    {:values {'source abstract 'result abstract} :inputs '[source]
+                     :equations {'copy (soac/default-equation-facts)}})
+                   [(list '= 'copy '[result]
+                          (list 'map {:index 'i :extent 17} '[source] []
+                                (soac/lambda-form '[x] [] '[x])))] '[result])
+        scheduled (structured-route/schedule-program
+                   (assoc (typed-route/program-envelope algorithm) :dialect :typed-parallel)
+                   (assoc options :dtype :float))
+        emitted (get-in (c-family/emit-program scheduled (assoc options :dtype :float))
+                        [:program :equations 0 :operations 0])]
+    (link/make {:id id :target (:target-device options)
+                :nodes [(assoc source :role :input) (assoc result :role :output)]
+                :values (mapv (fn [node] (link/value {:id (:id node) :abstract abstract
+                                                     :leaves [{:name :value :node (:id node)}]})) [source result])
+                :instances [(link/graph-instance {:id :copy :graph (:graph emitted)
+                                                  :bindings {'source (:id source) 'result (:id result)}})]
+                :outputs [(:id result)]})))
+
+(defn realized-plan
+  "Small full-array all-reduce fixture. Input producers export initialized resident arrays;
+   this is a collective oracle, not a differentiated training or fabric-performance claim."
+  [n options]
+  (let [[refinement cluster inputs costs] (projection-inputs n)
+        projected (distributed/project-refinement refinement cluster inputs costs)
+        facts (distributed/refinement-facts refinement)
+        target (:target-device options)
+        input-index (zipmap (keys inputs) (range n))
+        nodes (into {} (map (fn [[ssa _]]
+                              [ssa (link/node
+                                    {:id ssa :device target :dtype :float :shape [17] :role :input})])) (:values facts))
+        exported (into {} (for [[worker ssa] (:outputs refinement)
+                                :when (= :copy (:kind (first (filter #(= ssa (:id %)) (:nodes refinement)))))]
+                            [ssa [worker :retain]]))
+        combines (into {} (for [{:keys [id kind left right]} (:nodes refinement) :when (= :combine kind)]
+                            [id (arithmetic/bind-local
+                                 (get-in refinement [:operation :reduction]) 17 options
+                                 {:id id :nodes {:left (get nodes left) :right (get nodes right)
+                                                 :result (get nodes id)}})]))
+        locals (merge (into {} (for [[ssa producer] inputs]
+                                [(:id producer)
+                                 (identity-local (:id producer)
+                                                 (link/node {:id [ssa :source] :device target :dtype :float :shape [17]
+                                                             :source (float-array
+                                                                      (map #(+ 1 (get input-index ssa) (* 0.25 %))
+                                                                           (range 17)))})
+                                                 (get nodes ssa) options)]))
+                      (update-vals combines :link-plan)
+                      (into {} (for [[ssa id] exported]
+                                 [id (identity-local id (get nodes ssa)
+                                                     (link/node {:id [ssa :retained] :device target
+                                                                 :dtype :float :shape [17]}) options)])))
+        storage (into {} (for [[ssa _] (:values facts)]
+                          [ssa {:step (or (:id (get inputs ssa))
+                                          (when (contains? combines ssa) ssa)
+                                          (some (fn [{:keys [id left right]}]
+                                                  (when (or (= ssa left) (= ssa right)) id)) (:nodes refinement))
+                                          (get exported ssa))
+                                :local-value ssa}]))
+        retain-steps (mapv (fn [[ssa id]]
+                            (distributed/compute-step
+                             {:id id :device (get-in facts [:values ssa :device])
+                              :duration-ns 1 :dependencies [ssa]})) exported)
+        steps (into (into (vec (vals inputs)) (:steps projected)) retain-steps)
+        step-map (into {} (map (juxt :id identity)) steps)
+        region {:offsets [0] :shape [17]}]
+    (distributed/plan
+     {:id :realized-all-reduce :mesh (distributed/mesh [{:name :workers :size n}]
+                                                     (get-in refinement [:group :devices]))
+      :topology cluster
+      :values (merge (:values projected)
+                     (into {} (for [[step local] locals [ssa value] (:values local)
+                                    :when (not (contains? (:values projected) ssa))]
+                                [ssa (assoc (:abstract value) :sharding
+                                            {:kind :replicated :devices [(:device (get step-map step))]})])))
+      :shards (merge (:shards projected)
+                     (into {} (for [[step local] locals [ssa _] (:values local)
+                                    :when (not (contains? (:values projected) ssa))]
+                                [ssa [(distributed/shard {:id ssa :value ssa :device (:device (get step-map step))
+                                                          :offsets [0] :shape [17] :ownership :replica})]])))
+      :collective-groups {:workers (:group refinement)}
+      :device-plans
+      (into {} (for [worker (get-in refinement [:group :devices])
+                     :let [owned (filter #(= worker (:device (get step-map (key %)))) locals)]]
+                 [worker {:target target
+                          :entries (into {} (map (fn [[id local]] [id {:link-plan local}])) owned)
+                          :steps (into {} (map (fn [[id local]]
+                                                [id {:entry id :bindings
+                                                     (into {} (map (fn [ssa] [ssa {:value ssa :shard ssa}]))
+                                                           (keys (:values local)))}])) owned)}]))
+      :copy-bindings (into {} (for [{:keys [id kind input]} (:nodes refinement) :when (= :copy kind)]
+                               [id {:source (assoc (get storage input) :region region)
+                                    :target (assoc (get storage id) :region region)}]))
+      :refinements {:all-reduce {:refinement refinement :input-producers inputs :combine-costs costs
+                                :storage storage :combines (update-vals combines :emitted)}}
+      :steps steps :outputs (mapv #(or (get exported %) %) (:completions projected))})))
+
+(defn- realization-options []
+  {:target-device :ocl:analytic
+   :target-descriptor {:device-id :ocl:analytic :device-type :gpu :backend :ocl
+                       :subgroup-dialect :opencl-portable :max-workgroup-size 256}})
+
+(deftest realization-binds-complete-contribution-arithmetic-and-storage-to-its-certificate
+  (doseq [n [2 3]]
+    (let [plan (realized-plan n (realization-options))
+          certified (distributed/certify plan)]
+      (is (= (:refinements plan) (get-in certified [:certificate :refinements])))
+      (is (= certified (distributed/verify! certified)))
+      (is (= (count (:steps plan)) (count (:actions (distributed/check-readiness plan)))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (distributed/verify!
+                    (assoc-in certified [:plan :refinements :all-reduce :refinement :numerical :policy]
+                              :another-valid-policy)))))))
+
+(deftest realization-rejects-logical-physical-and-arithmetic-drift
+  (let [plan (realized-plan 2 (realization-options))]
+    (doseq [bad [(assoc-in plan [:refinements :all-reduce :storage [:worker-1 :received]]
+                          {:step [:worker-0 :produce] :local-value [:worker-0 :input]})
+                 (assoc-in plan [:copy-bindings [:worker-1 :received] :target :region :shape] [16])
+                 (assoc-in plan [:refinements :all-reduce :refinement :numerical :rounding] :toward-zero)
+                 (assoc-in plan [:collective-groups :workers] (distributed/collective-group :workers [:worker-0 :other]))
+                 (assoc-in plan [:refinements :all-reduce :combines [:worker-1 :combined]]
+                           (arithmetic/emit (scan/certify-reassociation
+                                             {:acc 'acc :init 1.0 :lambda '(* acc element)} :float)
+                                            17 (realization-options)))]]
+      (is (thrown? clojure.lang.ExceptionInfo (distributed/validate! bad))))))
+
+(deftest unrelated-enclosing-calls-cannot-mutate-contribution-ssa-storage
+  (let [plan (realized-plan 2 (realization-options))
+        original [:worker-0 :produce]
+        mutated (-> plan
+                    (assoc-in [:device-plans :worker-0 :steps :overwrite]
+                              (get-in plan [:device-plans :worker-0 :steps original]))
+                    (update :steps conj
+                            (distributed/compute-step
+                             {:id :overwrite :device :worker-0 :duration-ns 1
+                              :dependencies (mapv :id (:steps plan))})))]
+    (is (= :distributed-refinement-immutable
+           (reason #(distributed/validate! mutated))))))
