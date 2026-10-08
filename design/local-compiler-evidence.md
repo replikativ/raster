@@ -1575,7 +1575,9 @@ retained Double arithmetic but 0.9000001 with early Float rounding. Tests compar
 raw Float bits for the JVM source, native scalar and SIMD-requested compilation,
 with changed scales and the same compiled functions.
 
-The precision guard therefore declines this mixed-precision fold. The integer
+The precision guard therefore declines this mixed-precision fold; the Q8 x8
+sibling uses the same Double-compute/Float-store structure and shares this debt.
+The integer
 dot override remains, and the separate homogeneous Float integer-widening SIMD
 execution regression remains required. This is an explicit performance debt,
 not evidence of performance parity: restore vectorization through typed

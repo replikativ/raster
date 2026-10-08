@@ -236,9 +236,9 @@
           (let [xsb (double (ra/aget xs b))
                 fold (* 8 (long (ra/aget xsum b)))
                 wbaseL (+ sbase (* (long b) 8))]     ; wsi affine base (binary +, L-free)
-            ;; the 8-column fold as a par/map! → SegMap → CPU-C AVX2 widening fold
-            ;; (out8 int → cvtepi32_ps, folded into the float acc8 register accumulator):
-            ;;   acc8[L] += (xsb * wsi[wbaseL+L]) * (float)(out8[L] - fold)
+            ;; Double scale/product arithmetic, rounded into Float acc8 after each block.
+            ;; Float storage does not permit an all-Float SIMD fold. The integer-dot
+            ;; override survives; explicit mixed-precision vector lowering remains needed.
             (raster.par/map! acc8 L 8 float
               (let [folded (- (long (ra/aget out8 L)) fold)
                     scale (* xsb (double (ra/aget wsi (+ wbaseL L))))]
@@ -355,8 +355,8 @@
   GROUP slices. Weight must be the interleaved repack-stream layout (wqi/wsi). The tile-
   tensorize candidate measured against the hand kernel. defn: device/runtime glue."
   []
-  ;; :simd? true → the column fold lowers to the AVX2 widening block (out8 int →
-  ;; cvtepi32_ps → float acc8 register accumulator) instead of a scalar clang-autovec loop.
+  ;; SIMD is requested, not guaranteed: retained Double fold arithmetic currently
+  ;; declines the all-Float schedule. Clang may optimize the faithful scalar loop.
   (let [cfn ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
              #'qmatmul-q4-x8! :float :simd? true)]
     (fn [xq xs xsum wqi wsi in out]
@@ -376,7 +376,9 @@
   "Like make-x8-c-gemv but writes into a CALLER-supplied y (in-place), matching the
   (fn [xq xs xsum wqi wsi y in out]) shape — the drop-in replacement for the hand
   stream kernel in raster.quant.op/qlinear-i8! (SAME out%8 / interleaved-layout
-  contract, matching perf, bit-exact). Compiles qmatmul-q4-x8! :simd? true once,
+  contract). Retains Double fold arithmetic with per-block Float stores; performance
+  parity needs remeasurement after precision-preserving vector lowering. Compiles
+  qmatmul-q4-x8! :simd? true once,
   pool-drives over disjoint column-group slices into y."
   []
   (let [cfn ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
