@@ -1461,3 +1461,12 @@ reported OpenBLAS batch-extension environment. Provider selection is metadata,
 not a numerical proof; the captured dot comparisons above supply the functional
 evidence for these operands. Do not conflate this accumulation-order finding
 with the independent OpenBLAS interleaved-batch crash.
+
+A bounded CPU-only partitioned-FMA ladder was also checked before adding a
+production reduction policy. Strided 4/8/16-chain products each fail 9 adapter
+checks; contiguous 4/8/16-chain products fail 10/9/13 respectively. Tiny
+reductions (including the two-row adapter products) retain one FMA chain.
+The model, nonlinear CPU operations and native monolithic oracle are unchanged.
+These finite candidates do not establish that all blocked policies fail, but
+none supplies evidence for a numerical fix or a new production default. Keep
+parallel-reduction performance work separate from unchanged model acceptance.
