@@ -28,12 +28,14 @@
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.paged-kv-append :as paged-append]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.collective-combine :as collective-combine]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.carried-effect-loop-fixture :as carried-fixture]
@@ -655,6 +657,16 @@
     (spit file source)
     (.getAbsolutePath file)))
 
+(defn- collective-combine-artifact [operator identity dialect descriptor]
+  (let [algebra (scan/certify-reassociation
+                 {:acc 'acc :init identity :lambda (list operator 'acc 'element)} :float)
+        device (keyword (str (name dialect) ":collective-compile-gate"))
+        emitted (collective-combine/emit
+                 algebra 37 {:target-device device :target-dialect dialect
+                             :target-descriptor (assoc descriptor :device-id device)})]
+    (collective-combine/validate! algebra 37 emitted)
+    (get-in emitted [:graph :nodes 0 :operation])))
+
 (defn emit-target!
   [root target]
   (let [{:keys [suffix descriptor]} (get targets target)
@@ -688,6 +700,10 @@
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
         public-artifacts (equation-first-artifacts target descriptor)]
     (into [(write-artifact! directory suffix "reference-attention" reference)
+           (write-artifact! directory suffix "typed-collective-sum"
+                            (collective-combine-artifact '+ 0.0 dialect descriptor))
+           (write-artifact! directory suffix "typed-collective-product"
+                            (collective-combine-artifact '* 1.0 dialect descriptor))
            (write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"
