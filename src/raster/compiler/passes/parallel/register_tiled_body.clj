@@ -282,9 +282,9 @@
                         "register-tiled schedule requires a verified dense matrix product"
                         matrix-view)))
         variant (:variant matrix-view)
-        _ (when-not (contains? #{:nn :nt} variant)
+        _ (when-not (contains? #{:nn :nt :tn} variant)
             (decline! :dense-row-major-operands
-                      "register-tiled schedule currently requires dense A(i,k) with B(k,j) or B(j,k) operands"
+                      "register-tiled schedule requires a verified NN, NT or TN dense matrix product"
                       matrix-view))
         {:keys [row col]} (:bindings matrix-view)
         [[i M] [j N]] free-axes
@@ -316,8 +316,8 @@
         ;; and allowed that value to disagree with the dimension arguments.
         runtime-scalars symbolic-dimensions
         runtime-scalar-values symbolic-dimensions
-        row-shape [M K]
-        col-shape (case variant :nn [K N] :nt [N K])
+        row-shape (case variant :tn [K M] (:nn :nt) [M K])
+        col-shape (case variant (:nn :tn) [K N] :nt [N K])
         out-shape [M N]
         row-layout (layout/row-major row-shape dtype)
         col-layout (layout/row-major col-shape dtype)
@@ -373,16 +373,20 @@
          (body/->IndexCompute block-col (mul group-col block-n))]
         row-stage-index 'register-a-index
         col-stage-index 'register-b-index
-        row-stage-row #(div % block-k)
-        row-stage-col #(modulo % block-k)
-        ;; Traverse the physical RHS tile in its contiguous dimension, then transpose only the
-        ;; workgroup store for NT. The shared tile therefore remains canonical [K,N], so the
-        ;; multiply loop and its register microtile are independent of external storage layout.
+        ;; Traverse each operand in physical contiguous order. Only its staging store is
+        ;; transposed for TN/NT, keeping the shared tiles canonical [M,K] and [K,N]. Neither
+        ;; the multiply loop nor its microtile depends on the external transpose convention.
+        row-stage-row (case variant
+                        :tn #(modulo % block-m)
+                        (:nn :nt) #(div % block-k))
+        row-stage-col (case variant
+                        :tn #(div % block-m)
+                        (:nn :nt) #(modulo % block-k))
         col-stage-k (case variant
-                      :nn #(div % block-n)
+                      (:nn :tn) #(div % block-n)
                       :nt #(modulo % block-k))
         col-stage-n (case variant
-                      :nn #(modulo % block-n)
+                      (:nn :tn) #(modulo % block-n)
                       :nt #(div % block-k))
         k-block 'register-k-block
         k-coordinate (fn [offset]
@@ -478,8 +482,11 @@
           :row-coordinate row-stage-row :col-coordinate row-stage-col
           :source-coordinates
           (fn [index]
-            [(add block-row (row-stage-row index))
-             (k-coordinate (row-stage-col index))])
+            (let [row-position (add block-row (row-stage-row index))
+                  k-position (k-coordinate (row-stage-col index))]
+              (case variant
+                :tn [k-position row-position]
+                (:nn :nt) [row-position k-position])))
           :valid-mask row-valid-mask})
         stage-col
         (staging-loop
@@ -494,7 +501,7 @@
                   k-position (k-coordinate k-offset)
                   n-position (add block-col n-offset)]
               (case variant
-                :nn [k-position n-position]
+                (:nn :tn) [k-position n-position]
                 :nt [n-position k-position])))
           :valid-mask col-valid-mask})
         outer-loop

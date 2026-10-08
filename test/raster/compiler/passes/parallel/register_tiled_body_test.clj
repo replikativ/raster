@@ -83,28 +83,36 @@
       (is (some? error) "a matrix schedule must not silently drop scalar work")
       (is (= :body-has-unmodeled-terms (:missing-rule (ex-data error)))))))
 
-(deftest transposed-rhs-stages-in-physical-order-into-the-canonical-tile
-  (let [proof (facts/from-components
+(deftest transposed-operands-stage-in-physical-order-into-canonical-tiles
+  (doseq [[variant expression parameter-index stage-index flat tile-width allocation-shape physical-shape]
+          [[:nt '(* (aget A (+ (* i 5) k)) (aget B (+ (* j 5) k)))
+            1 1 'register-b-index 2 [2 4] [7 5]]
+           [:tn '(* (aget A (+ (* k 3) i)) (aget B (+ (* k 7) j)))
+            0 0 'register-a-index 4 [4 2] [5 3]]]]
+   (let [proof (facts/from-components
                {:out 'C :free-axes [['i 3] ['j 7]] :contract-axes [['k 5]]
-                :body '(* (aget A (+ (* i 5) k)) (aget B (+ (* j 5) k)))
+                :body expression
                 :opts {:init (float 0.0)} :dtype :float})
         kernel (:kernel-body (register-tiled/lower proof {:tile small-tile}))
         outer (first (:operations kernel))
-        staging (second (:operations outer))
+        staging (nth (:operations outer) stage-index)
         [load store] (:operations staging)
-        flat 'register-b-index
-        k (body/expression :mod flat 2)
-        n (body/expression :floor-div flat 2)]
-    (is (= :nt (get-in kernel [:schedule :variant])))
-    (is (= [7 5] (:shape (second (:parameters kernel)))))
-    (is (= 'B (:buffer load)))
-    (is (= [(body/expression :add 'register-block-col n)
-            (body/expression :add 'register-k-block k)] (:coordinates load)))
-    (is (= [k n] (:coordinates store)))
-    (is (= [2 4] (:shape (second (:allocations kernel)))))
+        contiguous (body/expression :mod flat tile-width)
+        strided (body/expression :floor-div flat tile-width)]
+    (is (= variant (get-in kernel [:schedule :variant])))
+    (is (= physical-shape (:shape (nth (:parameters kernel) parameter-index))))
+    (is (= (if (= variant :nt) 'B 'A) (:buffer load)))
+    (is (= (if (= variant :nt)
+             [(body/expression :add 'register-block-col strided)
+              (body/expression :add 'register-k-block contiguous)]
+             [(body/expression :add 'register-k-block strided)
+              (body/expression :add 'register-block-row contiguous)])
+           (:coordinates load)))
+    (is (= [contiguous strided] (:coordinates store)))
+    (is (= allocation-shape (:shape (nth (:allocations kernel) parameter-index))))
     (doseq [target [:opencl-portable :cuda :hip]]
       (is (string? (body-emit/emit-scalar-kernel
-                    "nt_register_tile" kernel {:target-dialect target}))))))
+                    "transposed_register_tile" kernel {:target-dialect target})))))))
 
 (deftest checked-zero-identities-reach-the-register-tiled-body
   (doseq [init '[0.0 (float 0.0) (double (float 0))]]

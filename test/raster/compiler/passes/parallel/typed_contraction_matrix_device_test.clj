@@ -43,13 +43,20 @@
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
     (if-not @available?
       (skip! (str "explicit FP32 FMA projection on " device))
-      (doseq [layout [:nn :nt] policy [:decomposed :fused :decomposed]]
+      (doseq [layout [:nn :nt :tn] policy [:decomposed :fused :decomposed]]
         (let [m 2 n 3 k 2
-              a (float-array [-1.0 1.0000001192092896 -1.0 1.0000001192092896])
+              activation (fn [last-value]
+                           (float-array (if (= layout :tn)
+                                          [-1.0 -1.0 last-value last-value]
+                                          [-1.0 last-value -1.0 last-value])))
+              a (activation 1.0000001192092896)
               b (float-array (if (= layout :nn)
                                [1.0 1.0 1.0 0.9999998807907104 0.9999998807907104 0.9999998807907104]
                                [1.0 0.9999998807907104 1.0 0.9999998807907104 1.0 0.9999998807907104]))
-              source (if (= layout :nn) #'contractions/projected-nn #'contractions/projected-nt)
+              source (case layout
+                       :nn #'contractions/projected-nn
+                       :nt #'contractions/projected-nt
+                       :tn #'contractions/projected-tn)
               expected (vec (sequential-fp32-projection layout a b m k n policy))
               opposite (vec (sequential-fp32-projection layout a b m k n
                              (if (= policy :fused) :decomposed :fused)))
@@ -62,7 +69,7 @@
             (is (not= expected opposite) "the oracle distinguishes one-round FMA from two rounds")
             (doseq [changed? [false true]]
               (let [next-a (if changed?
-                             (float-array [-1.0 1.000000238418579 -1.0 1.000000238418579])
+                             (activation 1.000000238418579)
                              a)
                     reference (sequential-fp32-projection layout next-a b m k n policy)
                     actual (value/->host (:result (live (if changed? {:a next-a} {}))))
@@ -182,23 +189,35 @@
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
     (if-not @available?
       (skip! (str "equation-first dynamic register tile on " device))
-      (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]]
+      (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]
+              layout [:nn :tn]
+              strategy [:register-tiled :dispatch-register-tiled]]
         (let [left (float-array (map #(/ (- (mod % 17) 8) 4.0)
                                      (range (* batch in-f))))
               right (float-array (map #(/ (- (mod % 13) 6) 8.0)
                                       (range (* out-f in-f))))
-              arguments [left right batch out-f in-f]
-              expected (vec (apply contractions/dynamic-matmul arguments))
+              source (case layout
+                       :nn #'contractions/projected-nn
+                       :tn #'contractions/projected-tn)
+              arguments [left right batch in-f out-f]
               prepared (compiled/lower
-                        #'contractions/dynamic-matmul arguments
+                        source arguments
                         {:compiler :equation-first :target device :dtype :float
-                         :schedule {:typed-contraction {:strategy :register-tiled}}})
+                         :schedule {:typed-contraction {:strategy strategy}}})
               live (compiled/instantiate! prepared)]
           (try
             ;; Dyadic values keep these sums exact in FP32, even with target FMA.
-            (dotimes [_ 2]
-              (is (= expected (vec (value/->host (:result (live {})))))
-                  (str device " " [batch in-f out-f])))
+            (doseq [changed? [false true]]
+              (let [next-left (if changed?
+                                (float-array (map #(+ (double %) 0.25) left))
+                                left)
+                    expected (sequential-fp32-projection
+                               layout next-left right batch in-f out-f)]
+                (is (java.util.Arrays/equals
+                      ^floats expected
+                      ^floats (value/->host (:result (live (if changed? {:a next-left} {})))))
+                    (str device " " layout " " strategy " " [batch in-f out-f]
+                         " changed=" changed?))))
             (finally (compiled/close! live))))))))
 
 (deftest shared-transposed-weights-use-the-generated-register-schedule

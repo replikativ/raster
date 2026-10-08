@@ -325,6 +325,8 @@
 (defn- register-tiled-contraction-source
   ([dialect] (register-tiled-contraction-source dialect :decomposed))
   ([dialect multiply-add]
+   (register-tiled-contraction-source dialect multiply-add :nn))
+  ([dialect multiply-add layout]
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/*
                           (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
@@ -336,9 +338,13 @@
                {:out 'C
                 :free-axes [['i 64] ['j 64]]
                 :contract-axes [['k 32]]
-                :body '(raster.numeric/*
-                        (clojure.core/aget A (clojure.core/+ (clojure.core/* i 32) k))
-                        (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j)))
+                :body (case layout
+                        :nn '(raster.numeric/*
+                              (clojure.core/aget A (clojure.core/+ (clojure.core/* i 32) k))
+                              (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j)))
+                        :tn '(raster.numeric/*
+                              (clojure.core/aget A (clojure.core/+ (clojure.core/* k 64) i))
+                              (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j))))
                 :opts {:epilogue epilogue}
                 :dtype :float})
         kernel-body (:kernel-body (register-tiled-body/lower facts {:multiply-add multiply-add}))]
@@ -754,6 +760,8 @@
                           (register-tiled-contraction-source dialect))
            (write-source! directory suffix "fused-register-tiled-contraction"
                           (register-tiled-contraction-source dialect :fused))
+           (write-source! directory suffix "transposed-left-register-tiled-contraction"
+                          (register-tiled-contraction-source dialect :decomposed :tn))
            (write-source! directory suffix "symbolic-register-tiled-contraction"
                           (symbolic-register-tiled-contraction-source dialect))
            (write-source! directory suffix "layout-cast"
