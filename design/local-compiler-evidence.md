@@ -38,8 +38,10 @@ The new shared Float/Double nested product/add and explicit-FMA fixtures compile
 both hardware-free vendor instruction checks. CUDA emits separate rounded multiplication
 for the decomposed cases and FMA for explicit cases. HIP emits separate multiplication/add
 even with `-ffp-contract=fast`, and explicit FMA remains fused. These checks are added to
-the existing vendor CI gates. The affected scalar/matrix source suites pass 34 tests / 468
-assertions before two additional matrix-helper assertions. The existing bit-sensitive public
+the existing vendor CI gates. Both multiplication and addition must be present for decomposed
+cases. Review removed a redundant global HIP contraction pragma: only Float/Double products
+are protected, avoiding unvalidated global changes to unrelated HIP arithmetic. The affected
+scalar/matrix source suites pass 34 tests / 474 assertions. The existing bit-sensitive public
 register replay oracle passes 1 test / 36 assertions on OpenCL and Level Zero, including
 changed inputs and both product policies.
 

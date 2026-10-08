@@ -69,12 +69,12 @@
                [:float :double])))
 
 (defn scalar-arithmetic-preamble
-  "Disable incidental contraction; explicit FMA and matrix instructions remain explicit.
-   CUDA products and AMD HIP products additionally protect their own rounding boundaries."
+  "OpenCL's module-level contraction control; explicit FMA and matrix instructions remain
+   explicit. CUDA and AMD HIP Float/Double products protect their boundaries individually."
   [dialect]
   (case (:id dialect)
     (:opencl-intel :opencl-portable) "#pragma OPENCL FP_CONTRACT OFF\n"
-    :hip "#pragma clang fp contract(off)\n"
+    :hip ""
     :cuda ""))
 
 (defn atomic-add-name

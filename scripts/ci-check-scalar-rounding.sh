@@ -14,6 +14,7 @@ for precision in f32 f64; do
         nvcc -ptx -arch=sm_80 -o "$assembly" "$source_root/cuda/${stem}.cu"
         fused_pattern="fma\\.rn\\.${precision}"
         product_pattern="mul\\.rn\\.${precision}"
+        add_pattern="add(\\.rn)?\\.${precision}"
         ;;
       hip)
         # Deliberately enable cross-statement contraction: the product fence, not an
@@ -22,6 +23,7 @@ for precision in f32 f64; do
           -o "$assembly" "$source_root/hip/${stem}.hip"
         fused_pattern="v_fma(c)?_${precision}"
         product_pattern="v_mul_${precision}"
+        add_pattern="v_(dual_)?add_${precision}"
         ;;
       *) echo "Unsupported scalar-rounding target: $target" >&2; exit 2 ;;
     esac
@@ -29,6 +31,7 @@ for precision in f32 f64; do
       grep -Eq "$fused_pattern" "$assembly"
     else
       grep -Eq "$product_pattern" "$assembly"
+      grep -Eq "$add_pattern" "$assembly"
       if grep -Eq "$fused_pattern" "$assembly"; then
         echo "ERROR: decomposed scalar arithmetic contracted: $target $precision" >&2
         exit 1

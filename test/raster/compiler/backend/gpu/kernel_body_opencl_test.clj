@@ -51,6 +51,8 @@
       (when (contains? #{:opencl-intel :opencl-portable} target)
         (is (str/starts-with? source "#pragma OPENCL FP_CONTRACT OFF\n")))
       (when (= :hip target)
+        (is (not (str/includes? source "#pragma clang fp contract"))
+            "protect only Float/Double products, not unrelated HIP arithmetic globally")
         (is (= (not fused?) (str/includes? source "__asm__(\"\" : \"+v\"(product))")))
         (is (not (str/includes? source "__fmul_rn(")))
         (when-not fused?
