@@ -33,6 +33,19 @@ the affected suites, including executed native C integer widening, pass 53 tests
 comparison operand domains remain unproven. This is not complete mixed-width SIMD
 lowering, a general numerical equivalence proof, or actual-weight training acceptance.
 
+A subsequent public Float-map probe comparing Double scalars `1.00000006` and
+`1.00000007` returned 1 in scalar code and the tail, but 2 in all 64 vector lanes.
+The two scalars collapse to one Float; a Boolean result stamp alone cannot certify
+the operand domain. Canonical SIMD calls now retain parameter tags from the selected
+declared interface, using existing function-info metadata and the shared interface
+index, not parsing implementation names or adding a registry. Compare-and-blend
+admission checks that signature as well as the operands. Missing typed signatures,
+arity mismatches and mismatched integer/floating comparison domains retain scalar
+execution. Untyped compatibility syntax remains explicitly outside that proof.
+Changed-input execution and positive/negative admission controls bring the affected
+suite to 55 tests / 218 assertions locally. Explicit mixed-species lowering and
+type-complete removal of untyped compatibility remain follow-ups.
+
 ## Scalar non-contraction investigation — 2026-10-08
 
 Separate ScalarCompute multiply/add nodes are not sufficient evidence of two machine-level

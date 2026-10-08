@@ -15,6 +15,7 @@
    - Decide phase decomposition (SegOp already decided)
    - Collect arrays/scalars (SegOp already has them)"
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.core.util :as util]
@@ -117,6 +118,14 @@
         (when-let [op (util/impl->op (second form))]
           (get op->canonical op)))))
 
+(defn- selected-parameter-tags
+  [form]
+  (or (::parameter-tags (meta form))
+      (when (and (seq? form) (= '.invk (first form)))
+        (let [info (types/sym-fn-info (second form))]
+          (or (:param-tags info)
+              (:param-tags (get @types/fn-interface-by-name (:iface-name info))))))))
+
 (defn normalize-invk
   "Rewrite (.invk impl args...) and qualified raster.*/raster.math/* forms
    to canonical (op args...) for SIMD.
@@ -130,7 +139,8 @@
     (let [canonical (infer-canonical-op form)]
       (if canonical
         (with-meta (apply list canonical (map normalize-invk (drop 2 form)))
-          (meta form))
+          ;; A nil signature is still a selected call, not an untyped legacy op.
+          (assoc (meta form) ::parameter-tags (selected-parameter-tags form)))
         ;; Unknown op — still recurse into args
         (with-meta (apply list '.invk (second form) (map normalize-invk (drop 2 form)))
           (meta form))))
@@ -305,15 +315,29 @@
                       (descriptor/cast-result-tag (first expr))))
         conversion-dtypes (when (soac-dialect/scalar-convert-form? expr)
                             ((juxt :source-dtype :target-dtype)
-                             (:attributes (soac-dialect/scalar-convert-parts expr))))]
+                             (:attributes (soac-dialect/scalar-convert-parts expr))))
+        comparison? (some? (descriptor/comparison-kind (descriptor/semantic-op expr)))
+        parameter-tags (selected-parameter-tags expr)]
     (or (nil? elem-type)
-        (every? #(or (not (contains? #{:float :double} %)) (= elem-type %))
-                (concat [result-dtype cast-dtype] conversion-dtypes)))))
+        (and (every? #(or (not (contains? #{:float :double} %)) (= elem-type %))
+                     (concat [result-dtype cast-dtype] conversion-dtypes))
+             ;; A Boolean result does not state the comparison's operand domain.
+             ;; Selected interface parameters own the conversions before comparison.
+             ;; Unknown typed comparisons retain scalar execution, not guessed domains.
+             (or (not comparison?)
+                 (and (seq parameter-tags)
+                      (= (count parameter-tags) (count (descriptor/call-args expr)))
+                      (every? #(= elem-type (dtype/dtype-for-scalar-tag %)) parameter-tags))
+                 (and (nil? parameter-tags)
+                      (not (contains? (meta expr) ::parameter-tags))
+                      (nil? (:raster.type/tag (meta expr)))
+                      (not (and (seq? expr) (= '.invk (first expr))))))))))
 
 (defn retained-floating-precision-compatible?
   "Do retained floating computations/conversions agree with the active species?
    This is a precision obligation, not complete vector admission. It does not
-   infer missing types or comparison operand domains. Integer conversion support
+   infer missing types. Typed comparison domains use selected interface parameters;
+   missing comparison signatures retain scalar execution. Integer conversion support
    remains the emitter's responsibility (C SIMD supports widening that JVM SIMD
    does not)."
   [expr elem-type]
@@ -389,6 +413,7 @@
       (and (seq? cond-expr)
            (= 3 (count cond-expr))
            (contains? simd-compare-ops (first cond-expr))
+           (floating-node-precision-compatible? cond-expr *simd-element-type*)
            (simd-able? (nth cond-expr 1) idx-sym)
            (simd-able? (nth cond-expr 2) idx-sym)
            (simd-able? (nth expr 2) idx-sym)
