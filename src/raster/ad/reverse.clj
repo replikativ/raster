@@ -391,9 +391,11 @@
 
 ;; out[e] = src[index[e]] (strided: blocks of `stride`). The forward runs as
 ;; written; the pullback is its transpose, a scatter-add into d_src.
-(defmethod ad-record :par-gather [_ sym init-expr _activity]
+(defmethod ad-record :par-gather [_ sym init-expr activity]
   (let [[_ out src index n stride] init-expr]
     {:record {:type :par-gather :sym sym :written-arrs [out]
+              :result-alias out
+              :replays (when (get activity src false) (util/free-syms index))
               :out out :src src :index index :n n :stride stride
               :d-out-sym (ad-gensym "d_gather_out" (:raster.type/tag (meta out)))
               :d-src-sym (ad-gensym (str "d_" (if (symbol? src) (name src) "src"))
@@ -401,7 +403,7 @@
               :d-src-zero-sym (ad-gensym "d_src_zero" (:raster.type/tag (meta src)))}}))
 
 (defmethod ad-record :alias [_ sym init-expr _activity]
-  {:record {:type :alias :sym sym :source init-expr}})
+  {:record {:type :alias :sym sym :source init-expr :result-alias init-expr}})
 
 (defmethod ad-record :if [_ sym init-expr activity]
   (let [[_ branch then else] init-expr]
@@ -454,7 +456,7 @@
         ;; actual array. The result is then an alias of the buffer; its adjoint
         ;; (adj-env[sym]) is combined with adj-env[out-arr] in the backward.
         out-buf (first (:written-arrs pm-info))]
-    {:record pm-info
+    {:record (assoc pm-info :result-alias out-buf)
      ;; No per-element pullback means no tape: the original binding still
      ;; performs the map's writes.
      :fwd-patch (fn [bs]
@@ -482,7 +484,8 @@
   ;; no ArrayList, no separate residual stack (Griewank store-the-carry
   ;; checkpointing at every step; zero recompute depth).
   (let [active-set (vec (keys (filter val activity)))]
-    {:record (assoc (gen-reverse-par-scan init-expr active-set) :sym sym)}))
+    {:record (assoc (gen-reverse-par-scan init-expr active-set)
+                    :sym sym :result-alias (second init-expr))}))
 
 (defmethod ad-record :dotimes [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
@@ -491,7 +494,7 @@
         ;; Bind the result sym to the output buffer (populated by forward-code),
         ;; not nil — so a downstream consumer sees the array (see :par-map).
         out-buf (first (:written-arrs dt-info))]
-    {:record dt-info
+    {:record (cond-> dt-info (:forward-code dt-info) (assoc :result-alias out-buf))
      :fwd-patch (fn [bs]
                   (if-let [forward-code (:forward-code dt-info)]
                     (let [without-last (vec (drop-last 2 bs))]
@@ -571,14 +574,19 @@
 
 
 (defn- written-syms
-  "Arrays a binding writes: aset targets anywhere in its init, and the output
-  buffers of a SOAC record."
-  [init-expr record]
-  (into (set (:written-arrs record))
+  "Explicit aset targets anywhere in a binding's initializer."
+  [init-expr]
+  (into #{}
         (keep (fn [form]
                 (when (and (seq? form) (op/aset-op? (first form)) (symbol? (second form)))
                   (second form))))
         (tree-seq coll? seq init-expr)))
+
+(defn- index-replays
+  "Loop-invariant values reread to reconstruct a transposed read's index.
+   The forward read value itself can be taped while its index still needs replay."
+  [reads counter]
+  (reduce into #{} (map #(util/free-syms (:idx %) #{counter}) reads)))
 
 (defn- forward-pass
   "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
@@ -587,7 +595,7 @@
   the overwritten values."
   [norm-bindings active-params]
   (reduce
-   (fn [{:keys [activity fwd-bindings records replayed]} [sym init-expr]]
+   (fn [{:keys [activity fwd-bindings records replayed aliases]} [sym init-expr]]
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
            fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
@@ -602,19 +610,36 @@
            activity (if (and active? (seq (:written-arrs record)))
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
                       activity)
-           overwritten (seq (filter replayed (written-syms init-expr record)))]
+           representative #(get aliases % %)
+           current-replays (set (map representative (:replays record)))
+           source-writes (written-syms init-expr)
+           overwritten
+           (seq (distinct
+                 (concat
+                  (filter #(contains? replayed (representative %))
+                          (into source-writes (:written-arrs record)))
+                  ;; A step may overwrite its own scatter index before the
+                  ;; pullback. Check explicit source writes, not the normal
+                  ;; output writes declared by scan/map/gather records.
+                  (filter #(contains? current-replays (representative %))
+                          source-writes))))
+           ;; Even an inactive alias can write an earlier residual. Records
+           ;; describe result/output identity without another operation registry.
+           result-alias (or (:result-alias record) (when (symbol? init-expr) init-expr))
+           aliases (assoc aliases sym (if result-alias (representative result-alias) sym))]
        (when overwritten
          (throw (ex-info
                  (str "Reverse-mode AD: `" sym "` writes " (vec overwritten) ", which an "
-                      "earlier scan or reduction re-reads in its pullback. Write a fresh "
+                      "operation re-reads in its pullback. Write a fresh "
                       "array instead.")
                  {:reason :replayed-array-overwritten :sym sym :arrays (vec overwritten)})))
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)
-        :replayed (into replayed (:replays record))}))
+        :aliases aliases
+        :replayed (into replayed (map #(get aliases % %) (:replays record)))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
-    :fwd-bindings [] :records [] :replayed #{}}
+    :fwd-bindings [] :records [] :replayed #{} :aliases {}}
    (partition 2 norm-bindings)))
 
 (defn- array-zero-of-shape
@@ -1952,6 +1977,7 @@
     ;; The backward will be assembled by the caller (gen-reverse-let)
     ;; when it processes the :dotimes record in reverse
     {:type :dotimes
+     :replays (index-replays agets counter-sym)
      :forward-code forward-code
      :tape-sym tape-sym
      :d-out-sym d-out-sym
@@ -2253,6 +2279,7 @@
               d-scalar-syms))]
 
     {:type :par-map
+     :replays (when forward-code (index-replays agets idx-sym))
      :forward-code forward-code
      :tape-sym tape-sym
      :d-out-sym d-out-sym
@@ -2705,8 +2732,10 @@
 
     {:type :par-reduce
      :residual-kind (if typed-double? :double-carry :closure-tape)
-     ;; a primitive carry tape replays the step; closures keep their own values
-     :replays (when typed-double? (util/free-syms par-reduce-form))
+     ;; Closures save the read values, but the scatter still reconstructs
+     ;; destinations. Primitive carry replay additionally rereads the step.
+     :replays (into (index-replays agets idx-sym)
+                    (when typed-double? (util/free-syms par-reduce-form)))
      :forward-bindings forward-bindings
      :tape-sym tape-sym
      :d-acc-sym d-acc-sym

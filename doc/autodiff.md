@@ -39,6 +39,10 @@ An array read at the step index, at a literal, or at a gathered index such as
 `alpha[group[i]]` transposes to a scatter-add into the array's cotangent
 (`par/gather` likewise); other indexed reads are rejected. A pullback that
 reads an array again requires that the function does not overwrite it later.
+This includes index arrays reused by a transpose and writes through lexical
+aliases. Replay claims are operation-record dependencies, not a second set of
+AD rules. The current symbolic check does not establish physical disjointness
+of distinct caller arguments; callers must keep replayed storage unchanged.
 `(value+grad f :compile? true)` compiles the gradient with `compile-aot`.
 
 ```clojure
