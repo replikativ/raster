@@ -189,23 +189,34 @@
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
     (if-not @available?
       (skip! (str "equation-first dynamic register tile on " device))
-      (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]]
+      (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]
+              layout [:nn :tn]]
         (let [left (float-array (map #(/ (- (mod % 17) 8) 4.0)
                                      (range (* batch in-f))))
               right (float-array (map #(/ (- (mod % 13) 6) 8.0)
                                       (range (* out-f in-f))))
-              arguments [left right batch out-f in-f]
-              expected (vec (apply contractions/dynamic-matmul arguments))
+              source (case layout
+                       :nn #'contractions/projected-nn
+                       :tn #'contractions/projected-tn)
+              arguments [left right batch in-f out-f]
               prepared (compiled/lower
-                        #'contractions/dynamic-matmul arguments
+                        source arguments
                         {:compiler :equation-first :target device :dtype :float
                          :schedule {:typed-contraction {:strategy :register-tiled}}})
               live (compiled/instantiate! prepared)]
           (try
             ;; Dyadic values keep these sums exact in FP32, even with target FMA.
-            (dotimes [_ 2]
-              (is (= expected (vec (value/->host (:result (live {})))))
-                  (str device " " [batch in-f out-f])))
+            (doseq [changed? [false true]]
+              (let [next-left (if changed?
+                                (float-array (map #(+ (double %) 0.25) left))
+                                left)
+                    expected (sequential-fp32-projection
+                               layout next-left right batch in-f out-f)]
+                (is (java.util.Arrays/equals
+                      ^floats expected
+                      ^floats (value/->host (:result (live (if changed? {:a next-left} {})))))
+                    (str device " " layout " " [batch in-f out-f]
+                         " changed=" changed?))))
             (finally (compiled/close! live))))))))
 
 (deftest shared-transposed-weights-use-the-generated-register-schedule
