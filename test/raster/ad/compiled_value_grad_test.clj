@@ -70,8 +70,8 @@
                                                               r)))))))]
     (mapv deref runs)))
 
-(deftest reentrant-compiled-functions-allocate-per-call
-  (let [f (pipeline/compile-aot #'scaled-sum :reentrant? true)
+(deftest compiled-functions-allocate-per-call
+  (let [f (pipeline/compile-aot #'scaled-sum)
         arg-lists (for [k (range 4)] [(double-array (range (+ 100 k))) (double (inc k))])]
     (is (= (mapv #(hash-set (apply scaled-sum %)) arg-lists)
            (concurrent-results f arg-lists))
@@ -83,3 +83,30 @@
         expected (mapv #(let [r (apply vg %)] (hash-set (vec (take 4 r)))) arg-lists)]
     (is (= expected (mapv (fn [s] (into #{} (map #(vec (take 4 %))) s))
                           (concurrent-results vg arg-lists))))))
+
+(deftm scaled-copy [x :- (Array double), k :- Double] :- (Array double)
+  (let [n (alength x) out (double-array n)]
+    (dotimes [i n] (aset out i (* k (aget x i))))
+    out))
+
+(deftest returned-arrays-belong-to-the-caller
+  (let [f (pipeline/compile-aot #'scaled-copy)
+        a (f (double-array [1.0 2.0]) 2.0)
+        b (f (double-array [1.0 2.0 3.0]) 3.0)]
+    (is (= [2.0 4.0] (vec a)) "a later call neither overwrites nor resizes an earlier result")
+    (is (= [3.0 6.0 9.0] (vec b))))
+  (let [vg (rev/value+grad #'logistic-lp :wrt [0 1 2] :compile? true)
+        [_ g0] (vg 0.1 -0.2 0.3 xs ys cnt)
+        [_ g1] (vg 1.5 2.0 -1.0 xs ys cnt)]
+    (is (not= g0 g1))
+    (is (= g0 (second (vg 0.1 -0.2 0.3 xs ys cnt))))))
+
+(deftest concurrent-first-calls-of-a-fresh-function
+  (let [f (pipeline/compile-aot #'scaled-sum)
+        start (java.util.concurrent.CountDownLatch. 1)
+        runs (doall (for [k (range 8)]
+                      (future (.await start)
+                              (f (double-array (range (+ 10 k))) 1.0))))]
+    (.countDown start)
+    (is (= (mapv #(double (reduce + (range (+ 10 %)))) (range 8))
+           (mapv deref runs)))))

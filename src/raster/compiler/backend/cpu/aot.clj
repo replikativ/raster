@@ -684,7 +684,7 @@
 
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
-  [f-var dtype & {:keys [simd?] :or {simd? false}}]
+  [f-var dtype & {:keys [simd? reuse-buffers?] :or {simd? false}}]
   (let [{:keys [form parallel-program params param-env]}
         (fused-scalar-form f-var dtype :simd? simd?)
         form (recover-rectangular-maps form)
@@ -731,11 +731,10 @@
                                 (+ (count array-params) (count heap-buffers))
                                 scalar-ffm)
         buf-syms (mapv first heap-buffers)
-        ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
-        ;; backend uses) — keyed by the resolved size signature, so repeated
-        ;; same-shape calls (inference) don't re-allocate. Single-consumer: the
-        ;; returned buffer is overwritten on the next call.
-        cache (volatile! nil)]
+        ;; Buffers are allocated per call unless :reuse-buffers? (compile-aot's
+        ;; contract): then they are kept across calls, keyed by the resolved size
+        ;; signature, and the returned buffer is overwritten on the next call.
+        cache (when reuse-buffers? (volatile! nil))]
     (with-meta
       (fn [& args]
         (let [base-env (zipmap params args)
@@ -750,11 +749,12 @@
                               (assoc m sym v) m))
                           len-env scalar-bindings)
               sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) heap-buffers)
-              c @cache
+              c (some-> cache deref)
               buf-arrs (if (and c (= (:sizes c) sizes))
                          (:bufs c)
                          (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) heap-buffers sizes)]
-                           (vreset! cache {:sizes sizes :bufs b}) b))
+                           (some-> cache (vreset! {:sizes sizes :bufs b}))
+                           b))
               in-arrs  (map (comp base-env first) array-params)
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
               lengths  (map (fn [[_ ls]] (get env ls)) len-order)]

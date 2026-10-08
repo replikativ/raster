@@ -141,11 +141,15 @@
 ;; ================================================================
 
 (deftest hoisted-buffers-test
-  (testing "MLP train step has hoisted buffers (zero per-call allocations)"
-    (let [f (pipeline/compile-aot #'test-train-step :simd? false)
+  (testing "MLP train step reusing its buffers hoists them (zero per-call allocations)"
+    (let [_ (pipeline/compile-aot #'test-train-step :simd? false :reuse-buffers? true)
           diag (inspect/compiled-diagnostics #'test-train-step)]
       (is (>= (:hoisted-count diag) 2)
-          "Should have at least 2 hoisted buffers"))))
+          "Should have at least 2 hoisted buffers")))
+  (testing "by default every buffer belongs to its call"
+    (let [_ (pipeline/compile-aot #'test-train-step :simd? false)
+          diag (inspect/compiled-diagnostics #'test-train-step)]
+      (is (zero? (:hoisted-count diag))))))
 
 ;; ================================================================
 ;; Float type-flow — ensures float pipelines use FloatVector, not DoubleVector
