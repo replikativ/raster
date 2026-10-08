@@ -1275,3 +1275,34 @@ contracts remain intact. Next diagnosis must compare actual model intermediates
 and pullbacks at shared operands to distinguish inherited forward rounding from
 local derivative/lowering errors; no oracle rewrite or tolerance relaxation is
 authorized by this evidence. Temporary experiment scripts are not release tests.
+
+The subsequent unchanged layer-0 forward-stage diagnostic localized the first
+divergence to `linear-nb` inside the Q/K/V LoRA projections. Input RMS normalization
+matched exactly. Q/K normalization and RoPE also matched exactly on shared inputs;
+their end-to-end differences were inherited. Splitting Q projection showed local
+differences in all three matrix products, while residual addition matched exactly
+on shared operands. Base Q product maximum absolute difference from native BLAS
+was 0.0001068115234375.
+
+An independent dot reference over the same checkpoint operands established that
+the generated base Q product matched ordered Float multiply-then-add exactly
+(all 2048 outputs). Neither native BLAS nor ordered Float FMA matched that result.
+Against a Double accumulated, Float stored diagnostic, native BLAS maximum
+absolute error was 0.000030517578125 and generated GPU error was
+0.000091552734375. These checks distinguish arithmetic realization from a lost
+operand or wrong index in this isolated forward stage; they do not establish
+correctness of every backward stage, justify changing the training oracle, or
+close full-model gradient parity. Next work must isolate same-input matrix
+pullbacks and assess a declared numerical policy for native-BLAS boundaries.
+
+The public `linear-dx` and `linear-dW` helpers were then executed on the same
+checkpoint weights/normalized inputs with one identical deterministic synthetic
+cotangent, rather than an inherited full-model cotangent. Both generated helpers
+matched independent ordered Float multiply-then-add references exactly. Native
+BLAS differed (dx maximum absolute difference 0.0000022649765014648438;
+dW 0.000030517578125). For the two-row dW reduction, native BLAS matched the
+independent ordered Float FMA reference exactly, while the generated helper did
+not. This establishes a concrete contraction-realization difference in both
+forward and pullback, not a reason to turn on fusion implicitly under an exact
+source contract. It is still limited to these operands/helpers: full-model
+cotangent propagation and original gradient acceptance remain unverified.
