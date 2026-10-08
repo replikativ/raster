@@ -155,7 +155,12 @@
   ([op result-type arguments]
    (scalar-expression op result-type arguments {}))
   ([op result-type arguments options]
-   (->ScalarExpr op (vec arguments) result-type (or options {}))))
+   (let [options (or options {})
+         options (if (and (= :target-library (:kernel-body-math-realization (intrinsics/descriptor op)))
+                          (not (contains? options :math-realization)))
+                   (assoc options :math-realization numerics/target-library-math)
+                   options)]
+     (->ScalarExpr op (vec arguments) result-type options))))
 
 (defn cast-expression
   "Construct an explicit numerical conversion."
@@ -1279,6 +1284,7 @@
             integral? (contains? #{:byte :int :long} operand-type)
             overflow-op? (contains? #{:+ :- :*} canonical-op)
             arithmetic-overflow? (and integral? overflow-op?)
+            target-math? (= :target-library (:kernel-body-math-realization intrinsic))
             overflow-policy (:overflow options)
             proof (:proof options)
             derived-range (when arithmetic-overflow?
@@ -1307,7 +1313,13 @@
                            :operation canonical-op :operand-type operand-type
                            :derived-range derived-range :result-type result-type
                            :proof proof})))
-        (when (and (seq options) (not arithmetic-overflow?))
+        (when (and target-math?
+                   (not (and (= #{:math-realization} (set (keys options)))
+                             (numerics/target-library-math? (:math-realization options)))))
+          (throw (ex-info "target math requires its explicit implementation-defined realization"
+                          {:reason :kernel-body-math-realization
+                           :operation canonical-op :options options})))
+        (when (and (seq options) (not arithmetic-overflow?) (not target-math?))
           (throw (ex-info "overflow contracts are only defined for integral add, subtract, and multiply"
                           {:reason :kernel-body-intrinsic-overflow
                            :operation canonical-op :operand-type operand-type

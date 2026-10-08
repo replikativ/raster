@@ -2,6 +2,21 @@
 
 ### October 8 collective execution and precision-boundary follow-up
 
+The storage boundary fix is merged as #1095 after all seven required CI gates passed.
+The next isolated checkpoint diagnostic uses identical layer-0 Q/K/V and a synthetic cotangent,
+not a full-model replay. Raw causal scores and DW dots match the JVM exactly on local OpenCL;
+the D reduction matches exactly for both CPU and GPU supplied intermediates. Same-input softmax
+weights differ by at most one Float ULP. Selectively spelling exponential evaluation as
+`float(Math.exp(double(delta)))` restores exact agreement for this sixteen-weight diagnostic
+without changing Float max/sum carries, storage or the reference. This does not close the held
+adapter-gradient gate or prove universal libm bitwise equality.
+
+Native `:exp` realization is now stated separately from evaluation-order evidence in KernelBody.
+Its target-library accuracy is implementation-defined, not a correctly-rounded or bounded-error
+claim. Float calls remain Float; explicit Double calls followed by Float conversion retain that
+typed sequence. Other transcendental realization contracts and a user-selected reproducible
+algorithm remain follow-ups; do not globally widen math or introduce an attention-specific emitter.
+
 The contribution refinement, ordinary generated-combine bindings and complete realization
 certificate are merged (#1090–1094), with all required CI gates green. Two and three logical
 workers execute complete all-reduces on the local OpenCL and Level Zero devices. Fractional
