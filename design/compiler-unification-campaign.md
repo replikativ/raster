@@ -6,10 +6,14 @@
 from explicit FMA, transposed-left products use the shared register body, and JVM
 helper extraction retains typed calls and their operand conversions. #1101 extends
 that preservation to scalar simplification and partial evaluation; its follow-up
-checks retained operation precision during SIMD admission. An executed mixed-width
+checks retained operation precision during JVM scheduled SegMap admission with an
+active species. An executed mixed-width
 surface map exposed different rounding in vector lanes and the scalar tail; the
 correct scalar schedule is retained until mixed-species vector lowering exists.
 These are shared semantic fixes, not replacement model kernels or a new type registry.
+Stencil and C-SIMD callers without an active species, reduction-root precision and
+typed comparison domains still need separate admission evidence; this map fix does
+not certify those paths.
 
 The fresh unchanged real-weight two-layer training gate after #1100 passes loss and
 input-gradient checks but still fails 12 of 28 adapter-gradient checks. Real-model
