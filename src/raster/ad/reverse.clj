@@ -2303,6 +2303,8 @@
             (and (= :plus kind) (= acc-sym b) (not (reads-acc? a)))
             {:sign 1 :term a}))))))
 
+(declare ^:private untemplated-scan-call? lower-composites)
+
 (defn- gen-reverse-additive-reduce
   "Reverse mode for a reduction whose step adds a term independent of the
   accumulator: acc_n = init ± Σ term(i). The accumulator's cotangent is the
@@ -2315,8 +2317,19 @@
   the term's gradient cannot replay."
   [par-reduce-form active-params]
   (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
+        ;; as for a scan step: inline untemplated deftm calls before
+        ;; differentiating the term
+        step-expr (if (untemplated-scan-call? body-expr)
+                    (lower-composites body-expr)
+                    body-expr)
+        analyzed (analyze-par-map-body step-expr idx-sym true)
+        ;; ANF ends the step in `v = acc ± term; v`: the update is v's init
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-map-body body-expr idx-sym true)
+        (let [{:keys [scalar-bindings body-result]} analyzed
+              [last-sym last-init] (peek scalar-bindings)]
+          (if (and (symbol? body-result) (= body-result last-sym))
+            (assoc analyzed :scalar-bindings (pop scalar-bindings) :body-result last-init)
+            analyzed))
         {:keys [sign term]} (additive-step body-result acc-sym)
         active-free (filterv #(contains? free-syms %) active-params)]
     (when (and term
@@ -2431,6 +2444,10 @@
   the steps (see gen-reverse-par-reduce)."
   [par-reduce-form active-params]
   (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
+        ;; as for a scan step: inline untemplated deftm calls first
+        body-expr (if (untemplated-scan-call? body-expr)
+                    (lower-composites body-expr)
+                    body-expr)
         _ (when (and (seq? init-expr)
                      (some (set active-params)
                            (util/free-syms init-expr)))
