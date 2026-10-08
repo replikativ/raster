@@ -15,7 +15,9 @@
   first (optimized for the host CPU), falls back to OpenBLAS. Avoids conflicts
   with Neanderthal's bundled JNI OpenBLAS by checking loader lookup first.
   The bindings use LP64 integers; advertised ILP64 OpenBLAS builds are rejected
-  before numerical downcalls. Missing provider metadata is not an ABI proof."
+  before numerical downcalls. Missing provider metadata is not an ABI proof.
+  Set raster.openblas.path before first use to pin an OpenBLAS library, bypassing
+  MKL/preloaded discovery. A failed explicit pin never falls back."
   (:require [raster.core :refer [deftm]]
             [raster.ad.templates :as tmpl]
             [raster.linalg.native-library :as native-library]
@@ -38,13 +40,7 @@
    "/usr/lib/x86_64-linux-gnu/libmkl_intel_lp64.so"])
 
 (def ^:private openblas-paths
-  "Common OpenBLAS library paths by platform."
-  ["/usr/lib/x86_64-linux-gnu/libopenblas.so"  ;; Ubuntu/Debian
-   "/lib/x86_64-linux-gnu/libopenblas.so"       ;; Ubuntu (legacy)
-   "/usr/lib64/libopenblas.so"                  ;; Fedora/RHEL
-   "/usr/lib/libopenblas.so"                    ;; Arch
-   "/opt/homebrew/opt/openblas/lib/libopenblas.dylib"  ;; macOS ARM
-   "/usr/local/opt/openblas/lib/libopenblas.dylib"])   ;; macOS Intel
+  native-library/openblas-paths)
 
 (defn- try-load-lib
   "Attempt to load a shared library from a list of paths.
@@ -126,21 +122,22 @@
             [lib (if threaded? :mkl-threaded :mkl)]))))
     (catch Exception _ nil)))
 
-(defn- try-load-openblas []
-  (when-let [lib (try-load-lib openblas-paths)]
-    (when (.isPresent (.find lib "cblas_dgemm"))
-      [lib :openblas])))
+(defn- try-load-openblas [selected-path]
+  (when-let [lib (native-library/find-library "cblas_dgemm" openblas-paths selected-path)]
+    [lib :openblas]))
 
 (defn- find-blas []
   ;; First check if cblas symbols are already available (e.g. loaded by
   ;; Neanderthal's JNI OpenBLAS). This avoids loading a second library
   ;; which causes LAPACKE symbol conflicts.
-  (let [loader (SymbolLookup/loaderLookup)]
-    (if (.isPresent (.find loader "cblas_dgemm"))
-      [loader :preloaded]
-      ;; Try MKL first (with sequential threading), then OpenBLAS
-      (or (try-load-mkl)
-          (try-load-openblas)))))
+  (if-some [path (native-library/explicit-path)]
+    (try-load-openblas path)
+    (let [loader (SymbolLookup/loaderLookup)]
+      (if (.isPresent (.find loader "cblas_dgemm"))
+        [loader :preloaded]
+        ;; Try MKL first (with sequential threading), then OpenBLAS
+        (or (try-load-mkl)
+            (try-load-openblas nil))))))
 
 ;; Lazy — only loads library on first deref
 (def ^:private blas-state

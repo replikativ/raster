@@ -2,6 +2,17 @@
 
 ### October 8 native reference-environment admission
 
+Explicit selection now shares conventional paths and one resolver across BLAS/LAPACK.
+`raster.openblas.path` is read at first delayed selection rather than namespace load;
+the captured pin bypasses preloaded/MKL/default paths. A missing file, required symbol,
+or OpenBLAS build metadata rejects the pin instead of silently changing providers.
+This intentionally tightens LAPACK's former preferred-path semantics and makes BLAS
+honor the same setting. Pinned QR requires LAPACKE symbols in that selected library;
+it does not silently bind a separate LAPACKE library with unknown provider linkage.
+Without a pin, existing discovery order and metadata-absent compatibility remain.
+The pin is not a guarantee against dynamic-loader symbol interposition. Provider/status
+diagnostics and argument-range checks remain separate native admission work.
+
 An external CUDA developer reports 4,602 tests / 57,807 assertions at `f7cbf12`,
 with 16 failures and 45 errors. Their initial categories are missing BLAS/LAPACK
 (37 checks), exact floating-point differences (10), unsupported portable trapping
@@ -25,10 +36,10 @@ The CI test job declares `RASTER_EXPECT_NATIVE_LIBRARIES=1`; an unconditional te
 namespace then requires functional BLAS and LAPACK, without forcing either onto laptop
 or compiler-only jobs. This preflight does not replace per-capability coverage accounting.
 
-Explicit consistent library selection, actual resolved-provider/version/thread metadata,
+Actual resolved-provider/version/thread metadata,
 ABI treatment for unknown/preloaded providers, and a pinned native reference environment
-remain CI/compatibility debt. In particular, BLAS does not honor LAPACK's existing path
-property, and LAPACK's preferred path can silently fall back. Keep those improvements
+remain CI/compatibility debt. The shared pin resolves the former BLAS/LAPACK property
+discrepancy; it does not provide a complete reproducibility manifest. Keep the remaining work
 on items 1–2 without replacing the external training, distributed or PDE gates.
 
 ### October 8 resumed acceptance and AD review

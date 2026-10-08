@@ -9,7 +9,9 @@
   m>=n code path is used for tall matrices. Results are transposed back.
   For symmetric eigendecomposition, row-major = col-major, so no transpose.
 
-  Set raster.openblas.path system property to override the library location.
+  Set raster.openblas.path before first use to pin the library location.
+  The pinned OpenBLAS must provide the required Fortran/LAPACKE symbols;
+  missing symbols or build metadata fail instead of selecting another library.
   Bindings use LP64 integers; advertised ILP64 OpenBLAS builds are rejected.
 
   All public functions accept flat double[] in row-major order.
@@ -21,7 +23,7 @@
             [raster.math :as m]
             [raster.numeric :as n])
   (:import [java.lang.foreign
-            Arena FunctionDescriptor Linker Linker$Option
+            FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout]))
 
 ;; ================================================================
@@ -29,37 +31,18 @@
 ;; ================================================================
 
 (def ^:private lib-paths
-  (let [custom (System/getProperty "raster.openblas.path")
-        defaults ["/usr/lib/x86_64-linux-gnu/libopenblas.so"
-                  "/lib/x86_64-linux-gnu/libopenblas.so"
-                  "/usr/lib64/libopenblas.so"
-                  "/usr/lib/libopenblas.so"
-                  "/opt/homebrew/opt/openblas/lib/libopenblas.dylib"
-                  "/usr/local/opt/openblas/lib/libopenblas.dylib"]]
-    (if custom (into [custom] defaults) defaults)))
+  native-library/openblas-paths)
 
 (def ^:private lapacke-lib-paths
   ["/usr/lib/x86_64-linux-gnu/liblapacke.so"
    "/usr/lib64/liblapacke.so"
    "/usr/lib/liblapacke.so"])
 
-(defn- find-lib [^String symbol paths]
-  (let [loader (SymbolLookup/loaderLookup)]
-    (if (.isPresent (.find loader symbol))
-      loader
-      (some (fn [path]
-              (try
-                (let [lib (SymbolLookup/libraryLookup path (Arena/global))]
-                  (when (.isPresent (.find lib symbol))
-                    lib))
-                (catch Exception _ nil)))
-            paths))))
-
 (def ^:private openblas
-  (delay (native-library/require-lp64! (find-lib "dgesdd_" lib-paths))))
+  (delay (native-library/require-lp64! (native-library/find-library "dgesdd_" lib-paths))))
 (def ^:private lapacke
   (delay (native-library/require-lp64!
-          (find-lib "LAPACKE_dgeqrf" (concat lapacke-lib-paths lib-paths)))))
+          (native-library/find-library "LAPACKE_dgeqrf" (concat lapacke-lib-paths lib-paths)))))
 
 (defn- require-lapack! []
   (when-not @openblas
