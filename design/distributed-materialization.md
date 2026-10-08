@@ -418,3 +418,16 @@ not admit execution or assert measured costs. The next compiler projection must 
 semantic witness in its certificate and bind each local combine to generated arithmetic, every
 SSA identity to physical storage, and transfer-only outputs to retained resident values. Existing
 readiness and runtime checks remain mandatory; no second executor is introduced.
+
+`collective-combine/bind-local` binds the generated arithmetic to an ordinary LinkPlan using
+the enclosing compiler's explicit left/right/result LinkNodes. Exact dense typed extents are
+required; tensor rank is retained while the map traverses ordered flat cells. Operands become
+caller-input roles and the result is a fresh non-aliasing output without a startup initializer.
+The plan contains a direct GraphLinkInstance, not a synthetic resident descriptor.
+
+`validate-local!` independently checks both the emitted monoid schedule and its exact LinkPlan
+against the original storage-role request. A generally valid LinkPlan with swapped operands
+does not satisfy that request. OpenCL and Level Zero acceptance exercises changed-input replay,
+ranked tensors and immutable operands through the existing linked runtime. This supplies the
+local arithmetic binding boundary; the global compiler must still connect it to contribution
+SSA identities and retain the complete refinement in executable-plan evidence.
