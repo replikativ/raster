@@ -43,13 +43,20 @@
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
     (if-not @available?
       (skip! (str "explicit FP32 FMA projection on " device))
-      (doseq [layout [:nn :nt] policy [:decomposed :fused :decomposed]]
+      (doseq [layout [:nn :nt :tn] policy [:decomposed :fused :decomposed]]
         (let [m 2 n 3 k 2
-              a (float-array [-1.0 1.0000001192092896 -1.0 1.0000001192092896])
+              activation (fn [last-value]
+                           (float-array (if (= layout :tn)
+                                          [-1.0 -1.0 last-value last-value]
+                                          [-1.0 last-value -1.0 last-value])))
+              a (activation 1.0000001192092896)
               b (float-array (if (= layout :nn)
                                [1.0 1.0 1.0 0.9999998807907104 0.9999998807907104 0.9999998807907104]
                                [1.0 0.9999998807907104 1.0 0.9999998807907104 1.0 0.9999998807907104]))
-              source (if (= layout :nn) #'contractions/projected-nn #'contractions/projected-nt)
+              source (case layout
+                       :nn #'contractions/projected-nn
+                       :nt #'contractions/projected-nt
+                       :tn #'contractions/projected-tn)
               expected (vec (sequential-fp32-projection layout a b m k n policy))
               opposite (vec (sequential-fp32-projection layout a b m k n
                              (if (= policy :fused) :decomposed :fused)))
@@ -62,7 +69,7 @@
             (is (not= expected opposite) "the oracle distinguishes one-round FMA from two rounds")
             (doseq [changed? [false true]]
               (let [next-a (if changed?
-                             (float-array [-1.0 1.000000238418579 -1.0 1.000000238418579])
+                             (activation 1.000000238418579)
                              a)
                     reference (sequential-fp32-projection layout next-a b m k n policy)
                     actual (value/->host (:result (live (if changed? {:a next-a} {}))))
