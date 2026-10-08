@@ -171,7 +171,8 @@
 (deftest double-compute-float-store-requires-complete-narrowing-capability
   (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
                    :out-sym 'out :cast-fn 'float
-                   :lambda '(+ (double (aget a i)) (double gain))}
+                   :lambda (with-meta '(+ (double (aget a i)) (double gain))
+                             {:raster.type/tag 'double})}
         original intrinsics/simd-type-info]
     (binding [cs/*array-types* '{a :float out :float}]
       (is (some? (cs/compile-segmap-c operation :avx2 '#{a out})))
@@ -186,7 +187,7 @@
           "intervening Float rounding is not erased to make a uniform Double schedule"))))
 
 (deftest terminal-narrowing-preserves-declared-conversion-policy
-  (let [body '(+ (double (aget a i)) (double gain))
+  (let [body (with-meta '(+ (double (aget a i)) (double gain)) {:raster.type/tag 'double})
         operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float :out-sym 'out}
         attributes {:source-dtype :double :target-dtype :float
                     :rounding :nearest-even :overflow :ieee
@@ -207,6 +208,15 @@
                  nil
                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
             "a different conversion policy cannot acquire ordinary Float-store lowering")))))
+
+(deftest changing-arithmetic-species-requires-complete-operation-evidence
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float}
+        mixed '(+ (double (aget a i)) (* (aget b i) (aget c i)))]
+    (binding [cs/*array-types* '{a :float b :float c :float out :float}]
+      (doseq [expression [mixed (with-meta mixed {:raster.type/tag 'double})]]
+        (is (nil? (cs/compile-segmap-c (assoc operation :lambda expression) :avx2 '#{a b c out}))
+            "an unstamped inner product cannot be promoted to Double merely because its parent is Double")))))
 
 (deftest public-native-map-retains-storage-and-arithmetic-precision
   (when (clang-avx2?)

@@ -19,6 +19,7 @@
             [raster.compiler.backend.intrinsics :as in]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.util :as util]
@@ -81,6 +82,17 @@
 (defn- storage-loads-compatible? [isa elem expr idx int-widen?]
   (every? #(storage-load-compatible? isa elem (first %) int-widen?)
           (ss/collect-load-sites expr idx)))
+
+(defn- complete-double-operation-evidence? [expression]
+  (cond
+    ;; Storage and address calculations have their own admission obligations.
+    (and (seq? expression) (descriptor/aget-op? (descriptor/semantic-op expression))) true
+    (seq? expression)
+    (and (or (descriptor/cast-op? (first expression))
+             (= :double (dtype/dtype-for-scalar-tag (:raster.type/tag (meta expression)))))
+         (every? complete-double-operation-evidence? (rest expression)))
+    (coll? expression) (every? complete-double-operation-evidence? expression)
+    :else true))
 
 (defn- n-accumulators
   "Independent vector accumulators to hide FMA latency — the register-blocking policy
@@ -284,6 +296,8 @@
         elem   (cond same-precision? storage-elem double-to-float? :f64)
         ti     (in/simd-type-info isa elem)]
     (when (and idx bound out ti (seq? lambda)
+               ;; Compatibility with missing stamps is not proof for changing species.
+               (or (not double-to-float?) (complete-double-operation-evidence? lambda))
                ;; Check before projecting conversions, while their declared source precision
                ;; is still present. Syntax admission below remains emitter-specific.
                (storage-loads-compatible? isa elem lambda idx true)

@@ -1656,7 +1656,10 @@ a four-Float store. A canonical terminal Double→Float conversion is moved only
 to that store when its declared nearest-even/IEEE policy matches the existing C
 conversion lowering; other policies and interior Float roundings decline. Fully
 retained input/output storage facts and both narrowing facet entries are required.
-There is no blanket permission to widen source arithmetic or infer missing types.
+Every arithmetic operation in the species-changing route must retain Double
+result evidence. An unstamped inner Float product cannot be promoted just because
+its parent contains a Double cast. There is no blanket permission to widen source
+arithmetic or infer missing types.
 
 Public deftm/native/JVM raw-bit checks use Double gains whose squared values
 distinguish Double arithmetic from early Float rounding, varied inputs, and lengths
