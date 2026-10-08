@@ -73,3 +73,83 @@
           (is (= expected
                  (:reason (ex-data (try (native-library/openblas-config lookup)
                                        (catch clojure.lang.ExceptionInfo e e)))))))))))
+
+(defn- lookup-with-symbols [symbols]
+  (reify SymbolLookup
+    (find [_ name]
+      (if (contains? symbols name) (Optional/of MemorySegment/NULL) (Optional/empty)))))
+
+(deftest explicit-provider-never-falls-back
+  (let [calls (atom [])
+        symbols #{"cblas_dgemm" "dgesdd_" "LAPACKE_dgeqrf"}
+        lookup (lookup-with-symbols symbols)
+        load-var (ns-resolve 'raster.linalg.native-library 'load-library)
+        loader-var (ns-resolve 'raster.linalg.native-library 'loader-lookup)]
+    (with-redefs [native-library/explicit-path (constantly "/pinned/openblas.so")
+                  native-library/openblas-config (constantly "OpenBLAS 0.3.32 DYNAMIC_ARCH")]
+      (with-redefs-fn
+        {load-var (fn [path] (swap! calls conj path) lookup)
+         loader-var (fn [] (throw (AssertionError. "explicit pin queried preloaded libraries")))}
+        #(do
+           (doseq [symbol symbols]
+             (is (identical? lookup (native-library/find-library symbol ["/fallback.so"]))))
+           (is (= (repeat 3 "/pinned/openblas.so") @calls))
+           (is (= :explicit-native-symbol-unavailable
+                  (:reason (ex-data
+                             (try (native-library/find-library "absent" ["/fallback.so"])
+                                  (catch clojure.lang.ExceptionInfo e e)))))))))
+    (doseq [[configuration reason] [[nil :explicit-native-provider-unverified]
+                                    ["" :explicit-native-provider-unverified]
+                                    ["OpenBLAS 0.3.32 USE64BITINT" :native-integer-abi-mismatch]]]
+      (with-redefs [native-library/explicit-path (constantly "/pinned/openblas.so")
+                    native-library/openblas-config (constantly configuration)]
+        (with-redefs-fn {load-var (constantly lookup)}
+          #(is (= reason (:reason (ex-data
+                                    (try (native-library/find-library "cblas_dgemm" ["/fallback.so"])
+                                         (catch clojure.lang.ExceptionInfo e e)))))))))
+    (reset! calls [])
+    (with-redefs [native-library/explicit-path (constantly "/missing.so")]
+      (with-redefs-fn {load-var (fn [path] (swap! calls conj path)
+                                 (throw (IllegalArgumentException. "not found")))}
+        #(do
+           (is (= :explicit-native-library-unavailable
+                  (:reason (ex-data
+                             (try (native-library/find-library "cblas_dgemm" ["/fallback.so"])
+                                  (catch clojure.lang.ExceptionInfo e e))))))
+           (is (= ["/missing.so"] @calls)))))))
+
+(deftest default-discovery-keeps-preloaded-precedence
+  (let [lookup (lookup-with-symbols #{"cblas_dgemm"})]
+    (with-redefs [native-library/explicit-path (constantly nil)]
+      (with-redefs-fn
+        {(ns-resolve 'raster.linalg.native-library 'loader-lookup) (constantly lookup)
+         (ns-resolve 'raster.linalg.native-library 'load-library)
+         (fn [_] (throw (AssertionError. "preloaded provider should win")))}
+        #(is (identical? lookup (native-library/find-library "cblas_dgemm" ["/fallback.so"])))))))
+
+(deftest default-discovery-skips-unusable-candidates
+  (let [lookup (lookup-with-symbols #{"cblas_dgemm"})
+        empty-lookup (lookup-with-symbols #{}) calls (atom [])]
+    (with-redefs [native-library/explicit-path (constantly nil)]
+      (with-redefs-fn
+        {(ns-resolve 'raster.linalg.native-library 'loader-lookup) (constantly empty-lookup)
+         (ns-resolve 'raster.linalg.native-library 'load-library)
+         (fn [path] (swap! calls conj path)
+           (case path "missing" (throw (IllegalArgumentException. "not found"))
+                 "wrong-symbol" empty-lookup "valid" lookup))}
+        #(do
+           (is (identical? lookup (native-library/find-library "cblas_dgemm"
+                                                              ["missing" "wrong-symbol" "valid"])))
+           (is (= ["missing" "wrong-symbol" "valid"] @calls))
+           (is (nil? (native-library/find-library "absent" ["wrong-symbol"]))))))))
+
+(deftest explicit-provider-bypasses-mkl-preference
+  (let [lookup (lookup-with-symbols #{"cblas_dgemm"}) calls (atom [])]
+    (with-redefs [native-library/explicit-path (constantly "/pinned/openblas.so")
+                  native-library/find-library (fn [symbol _ path]
+                                               (swap! calls conj [symbol path]) lookup)]
+      (with-redefs-fn
+        {(ns-resolve 'raster.linalg.blas 'try-load-mkl)
+         (fn [] (throw (AssertionError. "explicit OpenBLAS must bypass MKL")))}
+        #(is (= [lookup :openblas] ((ns-resolve 'raster.linalg.blas 'find-blas)))))
+      (is (= [["cblas_dgemm" "/pinned/openblas.so"]] @calls)))))
