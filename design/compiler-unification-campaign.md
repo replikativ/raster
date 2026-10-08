@@ -535,7 +535,7 @@ do not infer a published release from a merge, or device performance from source
 | 5. Reusable training and external models | Direct equation-first AD/SGD and small resident Gemma/LoRA tests check state progress, numerical trajectories and admitted routes. Isolated committed external numerical sources have LoRA/QLoRA 30-step parity and two tiny Gemma forward/VJP/update replays against the JVM on OpenCL and Level Zero, including 14 explicitly shared mutable adapters across independently prepared programs (#950); no sibling checkout is changed. The mixed scalar-energy gradient preserves its Float tangent result through a Double reduction on both local backends. | External adapter migration, longer/real-weight training and preparation-cost acceptance remain. The inspected finetune checkout still uses retired `bind-program!`/`run-program!`; do not resurrect them. The direct terminal conversion is admitted, not arbitrary device-scalar placement or mixed epilogue arithmetic. Ranged/cross-executable mutable sharing and asynchronous lifetime proofs remain separate. |
 | 6. Hardware-free distributed simulation | `distributed_plan_test.clj` covers topology, dependency/resource overlap, directed routes, capacity gates, collectives, halos and certificate drift. | Calibrate against real execution and broaden workload projections without presenting analytic costs as measured performance. |
 | 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. | Real multi-device/fabric execution, overlap and distributed training collectives still need numerical validation. Co-location validates ownership/scheduling, not network performance. |
-| 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. The whole-domain heat oracle checks host refinement/convergence. The local continuation gate executes four generated fine-grid heat steps and restriction per replay on OpenCL and Level Zero, restores addressed coarse/fine bytes and matches uninterrupted evolution bit-for-bit while conserving mass (#926). Partial-patch evolution checks shared conservative coarse/fine face fluxes. #988/#989 add production hierarchy-to-connectivity and conservative layout transfer builders; fixtures retain independent small numerical oracles. Changed-layout mapped-byte restoration matches an uninterrupted 17-stage resident chain bit-for-bit on both local backends. PR #990 verifies declared target compatibility before leasing; affected state/native restart/lease/AMR tests pass 40 tests / 454 assertions. | Compiler-derived producer identity, device patch packing, scalable hierarchy validation, manifest publication/lineage realization, temporal interpolation/subcycling and flux-register/reflux acceptance remain. These production geometry/transfer contracts and bounded local acceptance cases do not establish an adaptive simulator, external AMR accuracy or a production store. |
+| 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. The whole-domain heat oracle checks host refinement/convergence. The local continuation gate executes four generated fine-grid heat steps and restriction per replay on OpenCL and Level Zero, restores addressed coarse/fine bytes and matches uninterrupted evolution bit-for-bit while conserving mass (#926). Partial-patch evolution checks shared conservative coarse/fine face fluxes. #988/#989 add production hierarchy-to-connectivity and conservative layout transfer builders; fixtures retain independent small numerical oracles. Changed-layout mapped-byte restoration matches an uninterrupted 17-stage resident chain bit-for-bit on both local backends. PR #990 verifies declared target compatibility before leasing; affected state/native restart/lease/AMR tests pass 40 tests / 454 assertions. #1032 adds a bounded two-level diffusion subcycle/reflux implementation and synchronized restart fixtures; the reconciliation below distinguishes it from the outer AMR planner. | Device patch packing, scalable hierarchy validation, durable publication/lineage realization and temporal AMR planner integration remain. Producer/source facts are now derived, but are not numerical correctness proofs. Multi-patch/adaptive/hyperbolic and mid-cycle restart acceptance remain; the bounded cases do not establish an adaptive simulator, external AMR accuracy or a production store. |
 
 Item 8 now also has a production 2D hierarchy projection in `raster.ode.amr-geometry`: rectangular,
 anisotropic, multilevel active rows retain patch provenance and match geometric sides into faces
@@ -545,14 +545,83 @@ constructor output and adds no certification or ownership authority. Production 
 remap now uses exact normalized geometry, an overlap sweep and the existing FP64 CSR operator;
 different finest lattices are covered by independent rational-overlap oracles. The affected
 transfer/native evolution/remap/restart suite passes 16 tests / 375 assertions. Device patch packing,
-scalable hierarchy validation, compiler-derived provenance/publication, subcycling/reflux and general-rank
-numerical providers remain open; the campaign is not complete.
+scalable hierarchy validation, durable publication/lineage and general-rank numerical providers
+remain open; the campaign is not complete. The reconciliation below supersedes historical
+blanket statements about missing producer identity and subcycling/reflux.
+
+### Item-8 reconciliation against implementation (2026-10-08)
+
+PR #1032 already supplies `raster.ode.amr-subcycle`: a two-level ratio-2 diffusion cycle
+with coarse prediction, temporal ghost interpolation, two fine steps, signed coarse/fine
+flux-register accumulation, conservative reflux and average-down. It uses existing typed
+finite-volume, CSR, gather/scatter and multilevel operations, not a domain-specific emitter.
+`amr_subcycle_test.clj` compares complete fields and registers with independent coordinate
+loops, including rectangular anisotropic geometry and incorrect-sign/frozen-boundary controls.
+`amr_subcycle_device_test.clj` contains OpenCL/Level Zero parity and synchronized restart
+checks, including rejection of a mismatched restart phase. Test presence is not fresh device
+execution evidence; report each backend's actual result and capability skip separately.
+
+The admitted numerical scope is one strictly interior fine patch, two levels, ratio 2,
+periodic boundaries and caller-supplied stable timestep/synchronized initial state. Projection,
+materialization and input preparation certify neither timestep stability nor initial coarse/fine
+synchronization; both remain caller obligations. Adaptation, multiple fine patches,
+additional levels, general-rank/hyperbolic providers and mid-cycle restart remain open.
+
+Producer identity is also no longer wholly absent: `resident_state.clj` captures completed
+program/storage/content facts from execution evidence and independently derives source-port
+bindings/program identity from the prepared executable supplied at restore;
+`build_manifest.clj` supplies packaged compiler identity. An unmanifested source checkout
+does not gain persistent-cache eligibility. These facts do not establish durable publication,
+distributed lineage realization or mathematical correctness of an arbitrary numerical operator.
+
+The actual planning gap is narrower but important: `AMRPlan` still has only prolongation and
+restriction operations and hierarchy-only/transfer-cycle modes. It does not retain the cycle's
+temporal interpolation, substep dependencies, register lifetime or reflux/average-down ordering.
+Integrate the existing numerical cycle into the compositional planning contracts before
+claiming end-to-end adaptive AMR scheduling. Do not implement another diffusion/reflux kernel
+vertical to compensate for this missing outer representation.
+
+Fresh focused host validation on `b853cc5a` plus this documentation reconciliation:
+`amr-subcycle-test`, `amr-geometry-test` and `amr-transfer-test` pass 14 tests / 1233
+assertions in the capped REPL. This does not refresh the device/restart measurements or
+close the real-checkpoint training gate.
+
+### External training publication readiness (2026-10-08)
+
+The local `../finetune-rstr` repository at `9e9ba5d` has no configured Git remote;
+the expected GitHub repository is not resolvable by the current account and the Clojars
+artifact API returns 404. Its README badges are not release evidence. Raster's public
+north-star names this workload, but that does not make its source available to collaborators.
+The local README/lora GPU file and decision-training subtree have uncommitted work;
+preserve that work and obtain a reviewed source snapshot rather than silently publishing it.
+
+The public `pretrained-rstr` repository supplies model loading/inference and numerical-memory
+orchestration. Its local source/test tree has no LoRA/QLoRA training implementation; the
+local-private-model roadmap lists a reproducible LoRA fixture as future work. Keep checkpoint
+loading there and adapters, objectives and training orchestration in finetune-rstr.
+
+Before presenting finetune-rstr as an installable training package:
+
+1. Migrate its existing head/layer/adapter programs from retired `bind-program!`/`run-program!`
+   to the public Compiled/LinkPlan contract; do not revive a compatibility runtime.
+2. Replace the old default Raster `0.2.287` dependency with a validated released version,
+   and make clean-clone tests independent of sibling checkouts and a local Valhalla JDK.
+3. Preserve the held real-checkpoint gradient gate and add an end-to-end adapter save/load
+   and inference replay fixture with unchanged base weights. Record numerical/performance
+   limits honestly; small synthetic parity is not real-model training acceptance.
+4. Review uncommitted sources, license, build/release setup and model-data handling before
+   separately authorizing GitHub/Clojars publication. No publication is implied by this ledger.
+
+CUDA work can continue against Raster's committed external-source acceptance fixtures and
+public pretrained-rstr while that migration proceeds. It must not require an unpublished
+sibling package to execute Raster's hardware-free compiler gates.
 
 The strict semantic restore boundary now checks the independently supplied target field/layout,
 logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
 verification also rejects opaque metadata and signed-zero drift. Affected state/native restart,
 lease and AMR checks pass 40 tests / 454 assertions. This matches declared contracts, not omitted
-application semantics or mathematical equivalence; production producer evidence remains open.
+application semantics or mathematical equivalence; durable provider/publication and distributed
+lineage acceptance remain open, despite the producer/source evidence now available.
 
 External source audit refreshed on 2026-09-30: authoritative pretrained-rstr main
 `98bad4d3517ec05a3c495f019c80d8c553db02af` declares Raster 0.2.922 and uses the public
