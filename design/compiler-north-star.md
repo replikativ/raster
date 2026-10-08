@@ -1506,6 +1506,18 @@ steps, parallel legs cannot claim the same directed link, and the certificate re
 semantic operation and its schedule. This makes ring/tree/native implementations replaceable while
 the dependency DAG and topology simulator account for their actual bytes and routes.
 
+Those communication-round schedules alone are analytical, not numerical all-reduce implementations.
+The first **landed and locally measured** arithmetic realization is a separately retained
+`CollectiveRefinement`: immutable contribution SSA, ancestry-preserving copies and generated binary
+combines. Every participant output contains each input contribution exactly once. Plan admission
+rederives the ordinary step DAG, checks full-region physical copies and the actual bound generated
+LinkPlans, and rejects unrelated writes to contribution storage. Its certificate retains the whole
+realization and explicit reassociation policy, with unchanged accumulation dtype and nearest-even
+rounding. Two- and three-worker OpenCL/Level Zero tests check complete sums against independent CPU
+answers on one physical GPU. This is numerical composition evidence, not measured network transport,
+scalability or a validated distributed transformer training step. Storage donation and general
+collective algorithms still require further proofs and workload acceptance.
+
 Axis-partitioned scientific values now use the same machinery for halo exchange. A
 semantic `HaloExchange` names the value, partition axis, halo width, and boundary policy. Scheduling
 derives adjacent owned shard faces, exact source rectangles, dtype-sized byte counts, and both
