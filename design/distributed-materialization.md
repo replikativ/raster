@@ -384,3 +384,24 @@ prove per-output complete, nonduplicated contribution ancestry, derive dependenc
 copy/combine bindings, and retain explicit numerical consent for the global evaluation tree.
 Local CPU/device comparisons and CUDA/HIP compile fixtures exercise generated binary arithmetic;
 they do not establish fabric performance or distributed reduction completion.
+
+### Semantic contribution refinement
+
+`collective-refinement` describes an immutable SSA DAG for a full-array all-reduce. It retains
+the collective operation, participant group, plain replicated tensor type and explicit shared
+numerical policy. There is exactly one input per participant. Copies preserve contribution
+ancestry; local binary combines require co-located inputs with disjoint ancestry. Every output
+must reside at its declared participant and contain every participant's contribution exactly
+once. Fan-out is legal: uniqueness is checked within each output's ancestry, not by globally
+consuming inputs once.
+
+`refinement-facts` independently reconstructs ancestry, evaluation expressions and producer
+dependencies from the closed nodes. Caller-supplied lineage or dependency assertions are not
+accepted. The first tree contract requires explicit reassociation with unchanged accumulation
+dtype; a monoid certificate alone is not a bitwise floating-point guarantee.
+
+This witness is not yet an executable DistributedPlan and does not unlock semantic-leg copy
+overrides. Its route declarations still need topology validation. The next projection must bind
+copies to checked physical regions, combines to generated local arithmetic, and completion to
+the whole arithmetic-and-broadcast DAG. Storage donation and transport capabilities remain
+separate, later refinements. No existing surface numerical semantics change.
