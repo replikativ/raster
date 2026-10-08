@@ -324,8 +324,10 @@
           (boolean (some #(get activity % false) (util/free-syms body #{_idx}))))
 
         (= 'raster.par/reduce head)
-        (let [[_ _acc _init _idx _bound body] init-expr]
-          (boolean (some #(get activity % false) (util/free-syms body #{_idx _acc}))))
+        (let [[_ _acc init _idx _bound body] init-expr]
+          (boolean (some #(get activity % false)
+                         (into (util/free-syms body #{_idx _acc})
+                               (util/free-syms init)))))
 
         (= 'raster.par/scan head)
         (let [[_ _out _acc init _idx _bound _cast body] init-expr]
@@ -446,9 +448,13 @@
         ;; (adj-env[sym]) is combined with adj-env[out-arr] in the backward.
         out-buf (first (:written-arrs pm-info))]
     {:record pm-info
+     ;; No per-element pullback means no tape: the original binding still
+     ;; performs the map's writes.
      :fwd-patch (fn [bs]
-                  (let [without-last (vec (drop-last 2 bs))]
-                    (vec (concat without-last [tape-sym (:forward-code pm-info) sym out-buf]))))}))
+                  (if-let [forward-code (:forward-code pm-info)]
+                    (let [without-last (vec (drop-last 2 bs))]
+                      (vec (concat without-last [tape-sym forward-code sym out-buf])))
+                    bs))}))
 
 (defmethod ad-record :par-reduce [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
@@ -480,8 +486,10 @@
         out-buf (first (:written-arrs dt-info))]
     {:record dt-info
      :fwd-patch (fn [bs]
-                  (let [without-last (vec (drop-last 2 bs))]
-                    (vec (concat without-last [tape-sym (:forward-code dt-info) sym out-buf]))))}))
+                  (if-let [forward-code (:forward-code dt-info)]
+                    (let [without-last (vec (drop-last 2 bs))]
+                      (vec (concat without-last [tape-sym forward-code sym out-buf])))
+                    bs))}))
 
 (def ^:private mangled-arg-stamp-tags
   "Dispatch tags from a devirtualized forward call's mangled name that are
@@ -1716,6 +1724,20 @@
   (let [{:keys [counter-sym bound-expr body]} (parse-dotimes-form dotimes-form)
         {:keys [scalar-bindings asets agets free-syms]} (analyze-dotimes-body body counter-sym)
 
+        ;; The backward reads d_out and writes input cotangents at the loop
+        ;; counter, and differentiates one store: decline anything else rather
+        ;; than transpose it to the wrong element.
+        _ (when (or (< 1 (count asets))
+                    (some #(not= counter-sym (:idx %)) asets)
+                    (some #(and (gradient-bearing-array-read? (list 'aget (:arr %) (:idx %)))
+                                (not= counter-sym (:idx %)))
+                          agets))
+            (throw (ex-info
+                    (str "dotimes AD: the loop must store once, at the counter `" counter-sym
+                         "`, and read active arrays at the counter. Use par/map! for "
+                         "elementwise maps or par/scan for indexed reads.")
+                    {:reason :dotimes-unsupported-access :asets asets
+                     :reads (mapv #(select-keys % [:arr :idx]) agets)})))
         ;; Determine which arrays are written and read
         written-arrs (vec (distinct (map :arr asets)))
         read-arrs (vec (distinct (map :arr agets)))
@@ -1806,6 +1828,7 @@
                                            (or (:raster.type/tag (meta arr))
                                                (lost-tag! :dotimes-read-arr (name arr)))))
                               read-arrs)
+        arr->d-sym (zipmap read-arrs d-read-arr-syms)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
                                          (or (:raster.type/tag (meta p))
@@ -1832,12 +1855,15 @@
                d-val-sym (list 'aget d-out-sym j-sym)
                grads-iter-sym (list iter-pb-sym d-val-sym)]
               ;; aset into shadow arrays for aget'd inputs
-              (mapcat (fn [i aget-info d-arr-sym]
-                        (let [scatter-sym (ad-gensym "_scatter")]
-                          [scatter-sym
+              ;; one contribution per read, accumulated into its array's shadow
+              (mapcat (fn [i {:keys [arr]}]
+                        (let [d-arr-sym (arr->d-sym arr)]
+                          [(ad-gensym "_scatter")
                            (list 'aset d-arr-sym j-sym
-                                 (list 'nth grads-iter-sym i))]))
-                      (range) agets d-read-arr-syms)))
+                                 (list 'raster.ad.reverse/grad-acc
+                                       (list 'aget d-arr-sym j-sym)
+                                       (list 'nth grads-iter-sym i)))]))
+                      (range) agets)))
 
         n-agets (count agets)
         bwd-recur-args
@@ -2012,6 +2038,17 @@
 
         ;; Determine which arrays are written and read
         written-arrs [out-sym]
+        ;; The backward map writes each read's cotangent at its own lane, so
+        ;; only reads at the map index transpose there; another index would
+        ;; need a conflict-free scatter.
+        _ (doseq [{:keys [arr idx]} agets]
+            (when-not (= idx-sym idx)
+              (throw (ex-info
+                      (str "par/map! AD: active array `" arr "` is read at `" (pr-str idx)
+                           "`, not at the map index `" idx-sym "`; its cotangent would need "
+                           "a scatter. Read it at the map index, or use par/scan or a gather "
+                           "for indexed reads.")
+                      {:reason :par-map-shifted-read :array arr :index idx}))))
         read-arrs (vec (distinct (map :arr agets)))
 
         ;; Active free symbols (scalars, not arrays, not counter)
@@ -2103,15 +2140,21 @@
         ;; (raster.par/map! d_arr bwd_i bound nil
         ;;   (let* [pb (aget tape bwd_i) dv (aget d_out bwd_i) grads (pb dv)]
         ;;     (nth grads aget-index)))
+        ;; Every read of an array contributes: sum its gradient slots (a slot's
+        ;; position is the read's position in agets).
         backward-maps
-        (vec (map-indexed
-              (fn [aget-idx [d-arr-sym _arr-sym]]
-                (let [bwd-body (list 'let* [iter-pb-sym (list 'aget tape-sym bwd-idx-sym)
+        (mapv (fn [d-arr-sym arr-sym]
+                (let [slots (keep-indexed (fn [k {:keys [arr]}] (when (= arr arr-sym) k)) agets)
+                      bwd-body (list 'let* [iter-pb-sym (list 'aget tape-sym bwd-idx-sym)
                                             d-val-sym (list 'aget d-out-sym bwd-idx-sym)
                                             grads-iter-sym (list iter-pb-sym d-val-sym)]
-                                     (list 'nth grads-iter-sym aget-idx))]
+                                     (reduce (fn [acc k]
+                                               (list 'raster.ad.reverse/grad-acc acc
+                                                     (list 'nth grads-iter-sym k)))
+                                             (list 'nth grads-iter-sym (first slots))
+                                             (rest slots)))]
                   [d-arr-sym (list 'raster.par/map! d-arr-sym bwd-idx-sym bound-expr nil bwd-body)]))
-              (map vector d-read-arr-syms read-arrs)))
+              d-read-arr-syms read-arrs)
 
         ;; Backward par/reduce for each scalar param:
         ;; (raster.par/reduce d_s_acc 0.0 bwd_i bound
@@ -4408,8 +4451,9 @@
   wrapper deftm with `f`'s own parameters and annotations that binds the
   value+grad call and returns its elements — the pipeline inlines the
   AD-transformed body there and devirtualizes it, as for a value+grad inside
-  any compiled deftm — then compile-aot. nil when the pipeline cannot compile
-  it (the caller keeps the evaluated runtime body)."
+  any compiled deftm — then compile-aot. Returns {:fn compiled} or, when the
+  pipeline cannot compile it (the caller keeps the evaluated runtime body),
+  {:failure reason}."
   [f-var wrt]
   (when-not *compiling-value+grad?*
     (binding [*compiling-value+grad?* true]
@@ -4420,7 +4464,8 @@
               anns (:raster.core/deftm-annotations m)
               source-ns (some-> (:raster.core/deftm-source-ns m) the-ns)
               target (symbol f-var)]
-          (when (and source-ns (seq params) (= (count params) (count anns)))
+          (if-not (and source-ns (seq params) (= (count params) (count anns)))
+            {:failure {:reason :missing-deftm-metadata :var f-var}}
             (let [wrapper (gensym (str (name target) "--value+grad-"))
                   slots (vec (repeatedly (inc (count params)) #(gensym "vg")))
                   form `(raster.core/deftm ~(with-meta wrapper {:private true})
@@ -4429,8 +4474,8 @@
                                         ~@params)]
                             ~slots))]
               (binding [*ns* source-ns] (eval form))
-              ((requiring-resolve 'raster.compiler.pipeline/compile-aot) (ns-resolve source-ns wrapper)))))
-        (catch Throwable _ nil)))))
+              {:fn ((requiring-resolve 'raster.compiler.pipeline/compile-aot) (ns-resolve source-ns wrapper))})))
+        (catch Throwable t {:failure t})))))
 
 (defn ^:no-doc prepare-value+grad
   "Prepare the existing typed reverse-gradient program without compiling a runtime wrapper.
@@ -4474,7 +4519,8 @@
              dtype. Like any compile-aot fn it may be called concurrently and
              with any shapes.
              Falls back to the evaluated body when the pipeline cannot
-             compile `f`; `(:raster.ad.reverse/compiled? (meta vg))` says which.
+             compile `f`; `(:raster.ad.reverse/compiled? (meta vg))` says which and
+             `(:raster.ad.reverse/compile-failure (meta vg))` why.
 
   Usage:
     ;; Runtime
@@ -4491,7 +4537,7 @@
      :reverse
      (let [bgw (prepare-value+grad f-var wrt)
            {:keys [walked-body params tags source-ns]} bgw
-           compiled-fn (when compile? (compiled-value+grad-fn f-var wrt))
+           {compiled-fn :fn compile-failure :failure} (when compile? (compiled-value+grad-fn f-var wrt))
            runtime-fn (or compiled-fn (make-runtime-value+grad-fn walked-body params))
            ;; Qualify symbols in walked body for inlining from other namespaces
            inline-ns inf/qualify-body-symbols
@@ -4500,12 +4546,14 @@
        ;; Return an IFn that also carries deftm metadata for the compiler
        (let [result-fn (fn [& args] (apply runtime-fn args))]
          (with-meta result-fn
-           {::value+grad true
-            ::compiled? (some? compiled-fn)
-            :raster.core/deftm true
-            :raster.core/deftm-walked-body qualified-wb
-            :raster.core/deftm-params params
-            :raster.core/deftm-tags tags})))
+           (cond-> {::value+grad true
+                    ::compiled? (some? compiled-fn)
+                    :raster.core/deftm true
+                    :raster.core/deftm-walked-body qualified-wb
+                    :raster.core/deftm-params params
+                    :raster.core/deftm-tags tags}
+             ;; why :compile? fell back to the evaluated body
+             compile-failure (assoc ::compile-failure compile-failure)))))
 
      :forward
      (do
