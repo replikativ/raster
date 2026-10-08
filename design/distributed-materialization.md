@@ -364,3 +364,23 @@ use a named `:mode` and `:policy`, with accumulator/rounding/error-model fields 
 the shared validator. Retained schedule records are revalidated at plan admission. This checks
 the declaration only; lowering must still bind generated combines and their evaluation tree to
 that policy and prove complete, nonduplicated contributions.
+
+### Compiler-generated local collective arithmetic
+
+`collective-combine/algorithm` projects a revalidated `AssociativeScan` into an ordinary
+functional TypedSOAC map: two dense immutable inputs and one fresh result, with an explicit
+typed scalar combine. It uses the existing monoid authority, not a collective operator registry.
+The certificate's original element expression is not evaluated again; this projection combines
+two already-produced contribution arrays.
+
+Emission uses `typed-soac-route/program-envelope`, the shared typed scheduler and C-family
+emitter. A matching device identity and frozen GPU descriptor are required; the existing target
+authority derives the source dialect. Validation binds the emitted equation back to the requested
+typed monoid, extent, scalar schedule and target snapshot. The private flattened-index binder may
+be fresh, but scalar computation, logical dimensions and launch grid cannot drift.
+
+These local maps are not an all-reduce implementation. The remaining distributed refinement must
+prove per-output complete, nonduplicated contribution ancestry, derive dependencies and physical
+copy/combine bindings, and retain explicit numerical consent for the global evaluation tree.
+Local CPU/device comparisons and CUDA/HIP compile fixtures exercise generated binary arithmetic;
+they do not establish fabric performance or distributed reduction completion.
