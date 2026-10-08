@@ -1250,3 +1250,28 @@ trust flag is introduced. Argument, alias, scalar conversion, effect, numerical 
 checks remain in place. The affected scheduled-body, emitted-equation and OpenCL emitter
 suites pass 46 tests / 503 assertions in the capped warm REPL. This measures removed duplicate
 validation, not end-to-end compilation speedup or training numerical acceptance.
+
+### Real-checkpoint softmax precision experiment — 2026-10-08
+
+The held two-layer training gate used the unchanged finetune source/oracle at
+`9e9ba5d62f3822f056e01c37231d7eaa7c84947c`, the checkpoint SHA-256
+`700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab`,
+sequence length 2, batch 1, rank 16 and nonzero adapter B matrices. An isolated
+same-input attention diagnostic established that native Float exponential rounding
+can change softmax weights by one ULP; explicitly evaluating Double exp and casting
+back to Float eliminated that isolated discrepancy on the local OpenCL device.
+
+Applying this explicit precision boundary consistently to both denominator and
+numerator in the production materialized softmax did not close the original model
+gate. Predicted/reference losses were 17921.275/17921.271875, input-gradient worst
+relative error was 0.0040108606627614705, and 11 of 28 adapter gradients exceeded
+the unchanged 0.02 worst-relative threshold (maximum 1.1454261263845888).
+These are diagnostic results, not accepted training parity or a performance claim.
+
+The source-default experiment and its experiment-specific tests were removed:
+extra Double exponentials are not justified by an isolated match when the full
+gate still fails. The accepted explicit precision/target-library realization
+contracts remain intact. Next diagnosis must compare actual model intermediates
+and pullbacks at shared operands to distinguish inherited forward rounding from
+local derivative/lowering errors; no oracle rewrite or tolerance relaxation is
+authorized by this evidence. Temporary experiment scripts are not release tests.
