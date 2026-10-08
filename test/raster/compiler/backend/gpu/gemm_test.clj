@@ -275,11 +275,11 @@
     (is (= [:m :n :k] (mapv :id dimensions))
         "the body retains graph ABI identities instead of a parallel M/N/K convention")
     (is (= :float (:dtype result)))
-    (is (= (:source contract) (-> oracle
+    (is (= (:source contract) (-> (str "#pragma OPENCL FP_CONTRACT OFF\n" oracle)
                                   (str/replace "int k =" "long k =")
                                   (str/replace "int pk =" "long pk =")
                                   (str/replace "C[row*N+col]" "C[(long)row*(long)N+(long)col]")))
-        "direct lowering preserves the oracle except for widened K and output arithmetic")))
+        "direct lowering preserves the oracle with noncontracting arithmetic and widened indices")))
 
 (deftest scheduled-matrix-preconditions-precede-target-requirements
   (let [graph (dispatch/alternative (emitted :nn) :xmx-direct)

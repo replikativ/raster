@@ -30,6 +30,53 @@
 (defn collective-association [dialect] (:association dialect))
 (defn opencl? [dialect] (= :opencl (family dialect)))
 
+(defn noncontracting-multiply-name
+  "Protect a scalar product's rounding boundary without changing explicit canonical FMA.
+   CUDA has a documented rounded intrinsic; AMD HIP uses a register-only compiler fence,
+   not its similarly named, contractible arithmetic helper."
+  [dialect element-dtype]
+  (case (:id dialect)
+    :cuda ({:float "__fmul_rn" :double "__dmul_rn"} (dtype/canon element-dtype))
+    :hip ({:float "rstr_mul_f32_noncontract" :double "rstr_mul_f64_noncontract"}
+          (dtype/canon element-dtype))
+    nil))
+
+(defn noncontracting-multiply-helper-source
+  "AMD's empty read/write VGPR asm leaves the product bits unchanged but makes the rounded
+   result opaque to later contraction. No memory clobber, volatile spill, or added arithmetic;
+   unused results may still be eliminated. Unsupported HIP platforms fail at compilation."
+  [dialect element-dtype]
+  (when (= :hip (:id dialect))
+    (when-let [helper (noncontracting-multiply-name dialect element-dtype)]
+      (let [ctype ({:float "float" :double "double"} (dtype/canon element-dtype))]
+        (str "#ifndef __HIP_PLATFORM_AMD__\n"
+             "#error Raster noncontracting scalar multiplication requires AMD HIP\n"
+             "#endif\n"
+             "inline " ctype " " helper "(" ctype " a, " ctype " b) {\n"
+             "  " ctype " product = a * b;\n"
+             "  __asm__(\"\" : \"+v\"(product));\n"
+             "  return product;\n"
+             "}\n")))))
+
+(defn scalar-arithmetic-helper-source
+  "Discover only emitted target-owned rounding helpers, also used by matrix scalar regions."
+  [dialect source]
+  (apply str
+         (keep (fn [type]
+                 (when-let [helper (noncontracting-multiply-name dialect type)]
+                   (when (str/includes? source (str helper "("))
+                     (noncontracting-multiply-helper-source dialect type))))
+               [:float :double])))
+
+(defn scalar-arithmetic-preamble
+  "OpenCL's module-level contraction control; explicit FMA and matrix instructions remain
+   explicit. CUDA and AMD HIP Float/Double products protect their boundaries individually."
+  [dialect]
+  (case (:id dialect)
+    (:opencl-intel :opencl-portable) "#pragma OPENCL FP_CONTRACT OFF\n"
+    :hip ""
+    :cuda ""))
+
 (defn atomic-add-name
   "Spell a target atomic addition after KernelBody has fixed the update algebra and dtype."
   [dialect element-dtype]
@@ -168,7 +215,8 @@
 (defn preamble
   [dialect {:keys [uses-half? uses-double? uses-subgroups?]}]
   (if (opencl? dialect)
-    (str (when uses-half? "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n")
+    (str (scalar-arithmetic-preamble dialect)
+         (when uses-half? "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n")
          (when uses-double? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
          ;; Materialize the source precision before narrowing. Intel's native optimizer can
          ;; otherwise replace double division followed by convert_float_rte with multiplication
@@ -192,7 +240,8 @@
          (case (:id dialect)
            :cuda "#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n"
            :hip (str "#include <hip/hip_runtime.h>\n"
-                     "#include <hip/hip_fp16.h>\n"))
+                     "#include <hip/hip_fp16.h>\n"
+                     (scalar-arithmetic-preamble dialect)))
          "\n")))
 
 (defn entry-prefix

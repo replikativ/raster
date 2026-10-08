@@ -235,13 +235,13 @@
         oracle (gemm-oracle/generate-dpas-contraction-kernel
                 (contract-lower/contract-form->segred form :dtype :half) 'C)
         normalize #(str/replace % #"dpas_contract_[0-9]+" "dpas_contract_N")]
-    (is (= (-> (:source oracle)
+    (is (= (-> (str "#pragma OPENCL FP_CONTRACT OFF\n" (:source oracle))
                (str/replace "int k =" "long k =")
                (str/replace "int pk =" "long pk =")
                (str/replace "C[row*N+col]" "C[(long)row*(long)N+(long)col]")
                normalize)
            (normalize (:source routed)))
-        "the schedule matches the oracle with explicitly widened K induction and lookahead")
+        "the schedule preserves the oracle with noncontracting arithmetic and widened K induction")
     (is (= (:tile oracle) (:tile routed)))
     (is (= (:workgroup oracle) (:wg routed)))
     (is (body/kernel-body? (:kernel-body routed)))))

@@ -1,5 +1,56 @@
 # Local compiler evidence — 2026-09-27
 
+## Scalar non-contraction investigation — 2026-10-08
+
+Separate ScalarCompute multiply/add nodes are not sufficient evidence of two machine-level
+roundings. The generated decomposed register-contraction fixture, compiled with the local
+`nvcc -ptx -arch=sm_80` defaults, contains 256 FMA instructions. Explicit fused realization
+remains a separate compiler policy; neither realization is accepted as a replacement for
+the unchanged real-weight training oracle.
+
+A small independent HIP compilation probe tests three operations over resident pointers:
+ordinary multiply followed by add, `__fmul_rn` followed by `__fadd_rn`, and explicit `fmaf`.
+The translation unit sets `#pragma clang fp contract(off)` after the HIP runtime header.
+With local HIP 5.7.31921-9999 / Ubuntu Clang 21.1.2, `--offload-arch=gfx1100
+--cuda-device-only -S -O2` produces separate `v_mul_f32_e64` and `v_dual_add_f32` for
+ordinary arithmetic, but `v_fmac_f32_e64` for both named-RN and explicit-fused cases.
+The installed HIP header defines the named multiplication as plain `x * y`; its previously
+parsed helper body retains LLVM `contract` flags despite the later pragma. Merely borrowing
+CUDA's intrinsic names would therefore not preserve the same contract on this HIP toolchain.
+
+Device LLVM output (`-S -emit-llvm`) also shows this distinction, both with defaults and
+with an explicit `-ffp-contract=fast`: ordinary arithmetic has unflagged `fmul`/`fadd`,
+whereas the named helpers retain `contract`. That local pragma behavior must not be promoted
+to a portable guarantee: [Clang documents that `fast` can override controlling pragmas](https://clang.llvm.org/docs/LanguageExtensions.html).
+[NVIDIA documents non-contraction for its rounded multiply](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_fmul_rn.html);
+[OpenCL provides its own FP_CONTRACT control](https://registry.khronos.org/OpenCL/specs/unified/refpages/man/html/FP_CONTRACT.html).
+
+The follow-up protects Float/Double scalar products in the shared target lowering: CUDA's
+rounded multiply and AMD HIP's empty read/write VGPR asm fence preserve the intermediate
+product; OpenCL uses FP_CONTRACT OFF. The HIP fence changes no product bits, has no memory
+clobber or volatile spill, and allows unused results to be eliminated. It requires AMD HIP,
+not a claim about other HIP platforms. Helper discovery is demand-driven and shared with
+matrix scalar epilogues. Explicit canonical FMA and matrix multiply-accumulate instructions
+remain explicit. Controls are entirely in the emitted source, already part of artifact/cache
+identity; there are no additional flags to lose or a second numerical-policy registry.
+
+The new shared Float/Double nested product/add and explicit-FMA fixtures compile through
+both hardware-free vendor instruction checks. CUDA emits separate rounded multiplication
+for the decomposed cases and FMA for explicit cases. HIP emits separate multiplication/add
+even with `-ffp-contract=fast`, and explicit FMA remains fused. These checks are added to
+the existing vendor CI gates. Both multiplication and addition must be present for decomposed
+cases. Review removed a redundant global HIP contraction pragma: only Float/Double products
+are protected, avoiding unvalidated global changes to unrelated HIP arithmetic. The affected
+scalar/matrix source suites pass 34 tests / 474 assertions. The existing bit-sensitive public
+register replay oracle passes 1 test / 36 assertions on OpenCL and Level Zero, including
+changed inputs and both product policies.
+
+This is bounded Float/Double product non-contraction evidence, not proof of all floating-point
+properties, CUDA/HIP execution, instruction throughput, or real-model training acceptance.
+Half scalar arithmetic, arbitrary fast-math reassociation/denormal settings, and target-library
+transcendental accuracy are not made exact by this change. The unchanged real-weight training
+gate still needs its matrix association and full cotangent differences localized.
+
 ## Public training and resident GEMM checkpoint — 2026-10-06
 
 PR #1054 (`e57ba203`) migrates the existing mixed Gemma fixture onto public equation-first

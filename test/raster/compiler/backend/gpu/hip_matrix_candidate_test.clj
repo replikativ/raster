@@ -32,6 +32,9 @@
     (is (re-find #"float alpha" source))
     (is (re-find #"\.x\[rstr_epilogue_element\] = .*alpha" source))
     (is (re-find #"fmax\(" source))
+    (is (re-find #"__device__ __forceinline__ float rstr_mul_f32_noncontract" source))
+    (is (re-find #"__asm__\(\"\" : \"\+v\"\(product\)\)" source)
+        "the shared typed scalar epilogue retains its product rounding boundary")
     (is (re-find #"!defined\(__gfx90a__\)" source))
     (is (not (re-find #"__shared__|nvcuda|wmma::fragment<wmma::" source)))
     (let [emitted (target/emit-matrix-kernel "mfma_candidate" body :hip)]
