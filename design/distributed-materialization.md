@@ -345,9 +345,9 @@ require ordinary generated pack/unpack compute, not a bounding-span copy. Region
 the existing BufferView algebra; halo and explicit copies share the physical copy checks.
 
 Explicit bindings cannot override any ScheduledHalo or ScheduledCollective leg. In particular,
-adding a physical binding does not make an analytic all-reduce executable. The future arithmetic
-lowering must emit separate scratch-copy and generated-combine steps and prove their relationship
-to the semantic operation and its numerical policy. Runtime transport remains a copy operation.
+adding a physical binding does not make an analytic all-reduce executable. Checked collective
+realizations instead bind ordinary scratch-copy and generated-combine steps to the semantic
+operation and its numerical policy. Runtime transport remains a copy operation.
 The current numerical fixture uses generated `acopy!`, a resident scratch-region transfer, then
 generated `axpy!`. Its independent output checks include both the copied region and untouched
 sentinels; co-located workers validate composition, not fabric performance or collective semantics.
@@ -379,9 +379,9 @@ authority derives the source dialect. Validation binds the emitted equation back
 typed monoid, extent, scalar schedule and target snapshot. The private flattened-index binder may
 be fresh, but scalar computation, logical dimensions and launch grid cannot drift.
 
-These local maps are not an all-reduce implementation. The remaining distributed refinement must
-prove per-output complete, nonduplicated contribution ancestry, derive dependencies and physical
-copy/combine bindings, and retain explicit numerical consent for the global evaluation tree.
+These local maps alone are not an all-reduce implementation. The checked distributed realization
+proves per-output complete, nonduplicated contribution ancestry, checks derived dependencies and
+physical copy/combine bindings, and retains numerical consent for the global evaluation tree.
 Local CPU/device comparisons and CUDA/HIP compile fixtures exercise generated binary arithmetic;
 they do not establish fabric performance or distributed reduction completion.
 
@@ -400,10 +400,10 @@ dependencies from the closed nodes. Caller-supplied lineage or dependency assert
 accepted. The first tree contract requires explicit reassociation with unchanged accumulation
 dtype; a monoid certificate alone is not a bitwise floating-point guarantee.
 
-This witness is not yet an executable DistributedPlan and does not unlock semantic-leg copy
-overrides. Its route declarations still need topology validation. The next projection must bind
-copies to checked physical regions, combines to generated local arithmetic, and completion to
-the whole arithmetic-and-broadcast DAG. Storage donation and transport capabilities remain
+This witness alone is not an executable DistributedPlan and does not unlock semantic-leg copy
+overrides. Projection validates routes against topology; checked realization binds copies to
+physical regions, combines to generated local arithmetic, and completion to the whole
+arithmetic-and-broadcast DAG. Storage donation and transport capabilities remain
 separate, later refinements. No existing surface numerical semantics change.
 
 `project-refinement` derives ordinary DistributedSteps and per-SSA tensor/shard declarations
@@ -414,9 +414,9 @@ supplied analytical estimates. Each output completion follows its actual produce
 arithmetic or a completed broadcast copy, rather than an unrelated last communication round.
 
 This structural projection can be simulated through the existing DistributedPlan model; it does
-not admit execution or assert measured costs. The next compiler projection must retain the
-semantic witness in its certificate and bind each local combine to generated arithmetic, every
-SSA identity to physical storage, and transfer-only outputs to retained resident values. Existing
+not admit execution or assert measured costs. Checked realization retains the semantic witness
+in its certificate and binds each local combine to generated arithmetic and every SSA identity
+to physical storage. Ordinary consumers can retain broadcast outputs as resident values. Existing
 readiness and runtime checks remain mandatory; no second executor is introduced.
 
 `collective-combine/bind-local` binds the generated arithmetic to an ordinary LinkPlan using
@@ -429,5 +429,44 @@ The plan contains a direct GraphLinkInstance, not a synthetic resident descripto
 against the original storage-role request. A generally valid LinkPlan with swapped operands
 does not satisfy that request. OpenCL and Level Zero acceptance exercises changed-input replay,
 ranked tensors and immutable operands through the existing linked runtime. This supplies the
-local arithmetic binding boundary; the global compiler must still connect it to contribution
-SSA identities and retain the complete refinement in executable-plan evidence.
+local arithmetic binding boundary; checked realization connects it to contribution SSA identities
+and retains the complete refinement in executable-plan evidence.
+
+### Checked collective realizations
+
+A DistributedPlan's optional `:refinements` map associates a semantic operation ID with a closed
+realization containing `:refinement`, `:input-producers`, `:combine-costs`, `:storage` and
+`:combines`. Storage maps every contribution SSA ID to `{:step step-id :local-value value-id}`;
+combines retain emitted equations, not a second copy of the bound LinkPlans.
+
+Admission rederives the projection and checks its owned steps, values and shards against the
+enclosing plan. Unrelated workflow entries are allowed, but projected node IDs cannot be shared
+between realizations. The participant group must match the declared group and mesh; the same
+operation cannot also be declared as a legacy ScheduledCollective.
+
+Every SSA version resolves through ordinary compute bindings to one dense, correctly typed
+physical LinkNode on its logical worker. Logical workers may be co-located on one physical
+device. This first contract requires the canonical LinkNode to be shared between bound entries,
+not merely independently named equal views. Copies bind exact whole-tensor regions. Each
+combine's actual bound LinkPlan is revalidated against its monoid and resolved operand/result
+roles, and the result must be a public output of that compute entry.
+
+The retained operation's `:value` names the semantic tensor family; actual storage is declared
+for its contribution SSA versions. No phantom allocation for the family name is introduced.
+Execution currently requires explicit reassociation, unchanged accumulation dtype and
+`:nearest-even` rounding. This is not a serial-order or bitwise floating-point guarantee.
+
+Shared readiness validation checks initialization, dependencies and physical races. In addition,
+only a contribution's declared producer may write its physical storage: unrelated enclosing
+calls cannot mutate it, even after its last consumer. Storage donation needs a later liveness
+proof. Input source objects are retained by identity, not certified as byte snapshots; callers
+must keep them stable through initialization.
+
+Certificates retain the complete realization. A valid change to its numerical policy or storage
+bindings invalidates previous evidence. Constructor defaults preserve analytical plans with an
+empty map; retained records and certificates from the previous schema must be rebuilt.
+
+Device acceptance uses two and three logical workers on both OpenCL and Level Zero, generated
+input producers and binary combines, resident copies and generated output consumers, checked
+against independent CPU sums. These co-located tests do not establish multi-host transport,
+fabric throughput, collective scalability or training convergence.

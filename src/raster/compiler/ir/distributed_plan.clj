@@ -12,12 +12,14 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
+            [raster.compiler.ir.buffer-view :as buffer-view]
             [raster.compiler.ir.distributed-compute :as compute]
             [raster.compiler.ir.distributed-readiness :as readiness]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerical-contract]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.passes.parallel.collective-combine :as collective-arithmetic]
             [raster.compiler.ir.validate :refer [fail! finite-number? non-negative-number?
                                                   positive-number? unique-by!]]))
 
@@ -46,10 +48,10 @@
             peak-memory-bytes attributes])
 (defrecord DistributedPlan
            [id mesh topology values shards collective-groups collectives
-            halos device-plans copy-bindings steps outputs attributes])
+            halos device-plans copy-bindings refinements steps outputs attributes])
 (defrecord DistributedPlanCertificate
            [plan-id mesh-shape shard-coverage collectives halos
-            route-costs cost-vector device-plans copy-bindings])
+            route-costs cost-vector device-plans copy-bindings refinements])
 (defrecord CertifiedDistributedPlan [plan certificate])
 
 (defn device-mesh? [value] (instance? DeviceMesh value))
@@ -1091,10 +1093,119 @@
              :distributed-plan-attributes {:attributes attributes})))
   plan)
 
+(defn- validate-refinements! [{:keys [refinements topology values shards steps copy-bindings
+                                    mesh collective-groups collectives]
+                             :as plan} bound]
+  (when-not (map? refinements)
+    (fail! "collective realizations must be an explicit map" :distributed-refinements {}))
+  (let [step-by-id (into {} (map (juxt :id identity)) steps)
+        claimed (volatile! #{})
+        ;; Exact-call memoization, not a global cache or a source-content snapshot.
+        actions (delay (:actions (readiness/check plan)))]
+    (doseq [[id {:keys [refinement input-producers combine-costs storage combines] :as realization}]
+            refinements]
+      (when-not (and (map? realization)
+                     (= #{:refinement :input-producers :combine-costs :storage :combines}
+                        (set (keys realization)))
+                     (= id (get-in refinement [:operation :id]))
+                     (= (:group refinement) (get collective-groups (get-in refinement [:group :id])))
+                     (set/subset? (set (get-in refinement [:group :devices])) (set (:devices mesh)))
+                     (not (some #(= id (get-in % [:operation :id])) collectives)))
+        (fail! "realization must retain its closed semantic projection request"
+               :distributed-refinement-realization {:id id}))
+      (let [projected (project-refinement refinement topology input-producers combine-costs)
+            facts (refinement-facts refinement)
+            combine-ids (into #{} (keep #(when (= :combine (:kind %)) (:id %))) (:nodes refinement))
+            projected-steps (concat (vals input-producers) (:steps projected))
+            node-ids (set (map :id (:steps projected)))]
+        (when-not (= :nearest-even (get-in refinement [:numerical :rounding]))
+          (fail! "generated collective arithmetic currently requires nearest-even rounding"
+                 :distributed-refinement-numerical {:id id}))
+        (when (seq (set/intersection @claimed node-ids))
+          (fail! "distinct collective realizations cannot share projected steps"
+                 :distributed-refinement-step-identities {:id id}))
+        (vswap! claimed into node-ids)
+        (when-not (and (every? #(= % (get step-by-id (:id %))) projected-steps)
+                       (every? (fn [[value abstract]] (= abstract (get values value))) (:values projected))
+                       (every? (fn [[value placements]] (= placements (get shards value))) (:shards projected)))
+          (fail! "realization projection differs from the actual distributed DAG or SSA storage declarations"
+                 :distributed-refinement-projection {:id id}))
+        (when-not (and (map? storage) (= (set (keys (:values facts))) (set (keys storage)))
+                       (= (count storage) (count (distinct (vals storage))))
+                       (map? combines) (= combine-ids (set (keys combines))))
+          (fail! "realization needs complete SSA storage and generated combine evidence"
+                 :distributed-refinement-storage {:id id}))
+        (let [nodes
+              (into {}
+                    (map (fn [[ssa {:keys [step local-value] :as endpoint}]]
+                           (let [entry (get bound step)
+                                 local (:link-plan entry)
+                                 value (get-in local [:values local-value])
+                                 leaves (:leaves value)
+                                 node (when (= 1 (count leaves))
+                                        (get-in local [:nodes (:node (first leaves))]))
+                                 binding (get-in entry [:values local-value])]
+                             (when-not (and (map? endpoint) (= #{:step :local-value} (set (keys endpoint)))
+                                            node (= ssa (:value binding)) (= ssa (:shard binding))
+                                            (= (get-in facts [:values ssa :device]) (:device (get step-by-id step)))
+                                            (= (get-in refinement [:value :shape]) (get-in node [:view :shape]))
+                                            (= (get-in refinement [:value :dtype]) (get-in node [:view :dtype]))
+                                            (buffer-view/contiguous? (:view node)))
+                               (fail! "SSA storage must name its exact dense bound local value on its worker"
+                                      :distributed-refinement-storage {:id id :ssa ssa :endpoint endpoint}))
+                             [ssa node]))) storage)
+              region {:offsets (vec (repeat (count (get-in refinement [:value :shape])) 0))
+                      :shape (get-in refinement [:value :shape])}
+              elements (reduce *' 1 (:shape region))]
+          (doseq [[ssa producer] input-producers]
+            (let [{:keys [step local-value]} (get storage ssa)]
+              (when-not (and (= step (:id producer))
+                             (contains? (set (link-plan/output-value-ids (get-in bound [step :link-plan]))) local-value))
+                (fail! "collective input must be a public value of its retained producer"
+                       :distributed-refinement-input-producers {:id id :ssa ssa}))))
+          (doseq [{:keys [id kind input left right] :as node} (:nodes refinement)]
+            (case kind
+              :copy
+              (when-not (= {:source (assoc (get storage input) :region region)
+                            :target (assoc (get storage id) :region region)} (get copy-bindings id))
+                (fail! "copy binding must realize the source and destination contribution SSA identities"
+                       :distributed-refinement-copy-binding {:node node}))
+              :combine
+              (let [local (get-in bound [id :link-plan])
+                    result-storage (get storage id)
+                    request {:id (:id local) :nodes {:left (get nodes left) :right (get nodes right)
+                                                     :result (get nodes id)}}]
+                (when-not (and (= id (:step result-storage))
+                               (contains? (set (link-plan/output-value-ids local)) (:local-value result-storage)))
+                  (fail! "combine result must be its actual compute step's public output"
+                         :distributed-refinement-combine-binding {:node node}))
+                (collective-arithmetic/validate-local!
+                 (get-in refinement [:operation :reduction]) elements request
+                 {:emitted (get combines id) :link-plan local}))))
+          ;; SSA ancestry is only a numerical proof if another entry cannot mutate its storage.
+          ;; The shared readiness authority supplies complete physical write scopes for all calls
+          ;; and transfers, as well as conditional initialization and actual DAG race checks.
+          (let [actions @actions]
+            (doseq [[ssa node] nodes
+                    :let [producer (or (get-in facts [:values ssa :producer])
+                                       (:id (get input-producers ssa)))]
+                    action actions
+                    write (:writes action)
+                    :when (and (not= producer (:id action))
+                               (buffer-view/overlaps? (:view node) write))]
+              (fail! "contribution SSA storage cannot be written outside its declared producer"
+                     :distributed-refinement-immutable
+                     {:id id :ssa ssa :producer producer :writer (:id action)}))))))))
+
+(defn- validated-compute-facts [plan]
+  (let [facts (compute/bindings (validate-structure! plan))]
+    (validate-refinements! plan (:bindings facts))
+    facts))
+
 (defn validate!
   "Validate distributed structure and local compute bindings without realizing resources."
   [plan]
-  (compute/bindings (validate-structure! plan))
+  (validated-compute-facts plan)
   plan)
 
 (defn compute-bindings
@@ -1112,7 +1223,7 @@
    outputs are retained under the producer entry's `:boundary-outputs`, without a synthetic
    global shard. Combining transfers are not admitted as copy-replica placements."
   [plan]
-  (compute/bindings (validate-structure! plan)))
+  (validated-compute-facts plan))
 
 (defn transfer-bindings
   "Validate and project every transfer to exact physical source/target BufferViews.
@@ -1121,7 +1232,7 @@
    storage. Returns a map keyed by transfer step ID. This does not authorize execution:
    initialization/freshness, shared allocation and transport capabilities remain obligations."
   [plan]
-  (compute/transfer-bindings (validate-structure! plan)))
+  (compute/transfer-bindings (validate! plan)))
 
 (defn check-readiness
   "Check conditional physical initialization, DAG effect ordering and replica/boundary freshness.
@@ -1129,16 +1240,16 @@
    bound compute and strict copy endpoints; no allocation or execution occurs. Source snapshots,
    resource ownership, runtime input gates and event completion remain runtime obligations."
   [plan]
-  (readiness/check (validate-structure! plan)))
+  (readiness/check (validate! plan)))
 
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
-           halos device-plans copy-bindings steps outputs attributes]
+           halos device-plans copy-bindings refinements steps outputs attributes]
     :or {values {} shards {} collective-groups {} collectives []
-         halos [] device-plans {} copy-bindings {} steps [] outputs [] attributes {}}}]
+         halos [] device-plans {} copy-bindings {} refinements {} steps [] outputs [] attributes {}}}]
   (validate!
    (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
-                      device-plans copy-bindings (vec steps) (vec outputs) attributes)))
+                      device-plans copy-bindings refinements (vec steps) (vec outputs) attributes)))
 
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
@@ -1271,7 +1382,8 @@
      ;; dependencies, so replacing an equally sized program invalidates the witness.
      ;; This is structural plan verification, not a digest of mutable buffer contents.
      (:device-plans plan)
-     (:copy-bindings plan))))
+     (:copy-bindings plan)
+     (:refinements plan))))
 
 (defn certify
   "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.
