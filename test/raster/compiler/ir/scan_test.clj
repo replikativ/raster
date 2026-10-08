@@ -13,7 +13,11 @@
                        {:acc 'acc :init init :lambda (list op 'acc 'element)} dtype)]
       (is (identical? certificate (scan/validate! certificate)))
       (is (thrown? clojure.lang.ExceptionInfo
-                   (scan/validate! (assoc certificate :identity :forged)))))))
+                   (scan/validate! (assoc certificate :identity :forged))))))
+  (let [certificate (scan/certify-reassociation
+                     {:acc 'acc :init 0.0
+                      :lambda '(raster.numeric/+ (float acc) (raster.numeric/* x y))} :float)]
+    (is (identical? certificate (scan/validate! certificate)))))
 
 (deftest rounded-or-failing-casts-do-not-prove-integer-identities
   (doseq [[dtype init] [[:int '(float 2147483647)]

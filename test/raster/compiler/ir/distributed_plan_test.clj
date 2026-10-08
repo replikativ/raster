@@ -324,7 +324,12 @@
       (is (thrown? clojure.lang.ExceptionInfo
                    (distributed/validate!
                     (assoc-in plan [:collectives 0 :operation :reduction :nan-policy]
-                              :forged-policy)))))))
+                              :forged-policy)))))
+    (testing "reconstruction does not silently authorize unknown retained leg fields"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (distributed/validate!
+                    (assoc-in plan [:collectives 0 :schedule :rounds 0 0 :unverified-policy]
+                              :extra)))))))
 
 (deftest collective-certificates-bind-broadcast-root
   (let [original (two-device-all-reduce)

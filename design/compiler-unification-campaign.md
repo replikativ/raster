@@ -636,8 +636,9 @@ Arithmetic execution must eventually transfer into explicit scratch and run a ge
 combine as an ordinary bound compute step. The analytic witness is not a collective numerical
 equivalence proof, a real-fabric measurement or completion of campaign items 6/7.
 
-Focused scan/distributed-plan/physical-binding/AMR-plan validation passes 70 tests / 368
-assertions in the capped REPL. Full cold CI and independent review remain merge requirements.
+Focused scan/distributed-plan/physical-binding/AMR-plan validation passes 70 tests / 370
+assertions in the capped REPL. Independent review found no blockers; its extra qualified-operator
+and retained-leg mutation checks are included. Full cold CI remains a merge requirement.
 
 The strict semantic restore boundary now checks the independently supplied target field/layout,
 logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
