@@ -16,6 +16,7 @@
             [raster.compiler.ir.distributed-readiness :as readiness]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.numerical-contract :as numerical-contract]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.validate :refer [fail! finite-number? non-negative-number?
                                                   positive-number? unique-by!]]))
@@ -228,6 +229,9 @@
   (->CollectiveOperation id kind group value reduction root attributes))
 
 (defn collective-schedule
+  "Construct an analytical communication schedule. An empty numerical mode is unspecified,
+   not execution consent. A declared mode uses the shared numerical-contract schema; validating
+   that declaration does not prove that communication legs implement the reduction."
   [{:keys [algorithm rounds numerical-mode attributes]
     :or {numerical-mode {} attributes {}}}]
   (let [rounds (mapv (fn [round] (mapv communication-leg round)) rounds)]
@@ -237,6 +241,10 @@
              :distributed-collective-schedule
              {:algorithm algorithm :rounds rounds :numerical-mode numerical-mode
               :attributes attributes}))
+    (when (seq numerical-mode)
+      (numerical-contract/validate! numerical-mode
+                                    {:reason :distributed-collective-numerical-contract
+                                     :ir :collective-schedule}))
     (doseq [[round-index round] (map-indexed vector rounds)]
       (let [link-ids (mapcat :route round)]
         (when-not (= (count link-ids) (count (distinct link-ids)))

@@ -326,7 +326,9 @@
       (doseq [[path replacement]
               [[[:operation :reduction]
                 (scan/certify {:acc 'acc :init 1.0 :lambda '(* acc element)} :float)]
-               [[:schedule :numerical-mode] {:rounding :toward-zero}]]]
+               [[:schedule :numerical-mode]
+                {:mode :reassociated :policy :parallel-tree
+                 :rounding :toward-zero :accumulator-dtype :float}]]]
         (let [changed (assoc-in plan (into [:collectives 0] path) replacement)]
           (is (distributed/distributed-plan? (distributed/validate! changed)))
           (is (= :distributed-certificate
@@ -362,6 +364,35 @@
                  {:id :unchecked :kind :all-reduce :group :data :value :weights})
                 (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-collective-reduction (:reason (ex-data error))))))
+
+(deftest collective-numerical-declarations-use-the-shared-contract
+  (let [base (:schedule (two-device-all-reduce))
+        valid [{:mode :exact :policy :retained-tree}
+               {:mode :reassociated :policy :parallel-tree
+                :rounding :nearest-even :accumulator-dtype :float}
+               {:mode :bounded-error :policy :measured-tree
+                :rounding :nearest-even :accumulator-dtype :float
+                :error-model {:kind :caller-bound}}]]
+    (is (= {} (:numerical-mode (distributed/collective-schedule base)))
+        "unspecified analytical policy must not silently become exact execution consent")
+    (doseq [contract valid]
+      (is (= contract (:numerical-mode
+                        (distributed/collective-schedule
+                         (assoc base :numerical-mode contract))))))
+    (doseq [contract [{:rounding :toward-zero}
+                     {:mode :exact}
+                     {:mode :unknown :policy :tree}
+                     {:mode :reassociated :policy :tree :accumulator-dtype :float}
+                     {:mode :reassociated :policy :tree :rounding :nearest-even
+                      :accumulator-dtype :f32}
+                     {:mode :bounded-error :policy :tree :rounding :nearest-even
+                      :accumulator-dtype :float}]]
+      (let [plan (assoc-in (collective-plan (two-device-all-reduce))
+                          [:collectives 0 :schedule :numerical-mode] contract)]
+        (is (= :distributed-collective-numerical-contract
+               (:reason (ex-data (try (distributed/validate! plan)
+                                     (catch clojure.lang.ExceptionInfo e e)))))
+            "retained records are revalidated, not trusted as policy evidence")))))
 
 (deftest parallel-collective-legs-cannot-oversubscribe-one-directed-link
   (let [error (try
