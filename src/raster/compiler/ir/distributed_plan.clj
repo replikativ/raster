@@ -750,9 +750,12 @@
     (when-not (and (map? input-producers) (= (set (keys inputs)) (set (keys input-producers)))
                    (every? (fn [[id producer]]
                              (and (distributed-step? producer) (= :compute (:kind producer))
+                                  (= producer (compute-step producer))
                                   (= (get inputs id) (:device producer))
                                   (some? (:id producer))
-                                  (positive-number? (:duration-ns producer)))) input-producers))
+                                  (positive-number? (:duration-ns producer))
+                                  (integer? (:peak-memory-bytes producer))
+                                  (not (neg? (:peak-memory-bytes producer))))) input-producers))
       (fail! "every collective input requires its retained same-device compute producer"
              :distributed-refinement-input-producers {}))
     (when-not (and (map? combine-costs) (= combine-ids (set (keys combine-costs)))

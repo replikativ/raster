@@ -169,6 +169,11 @@
     (is (= :distributed-refinement-input-producers
            (reason #(project refinement cluster
                              (assoc-in inputs [[:worker-1 :input] :device] :worker-0) costs))))
+    (doseq [[field value] [[:source :forged-transfer] [:unknown :extension]
+                          [:peak-memory-bytes -1]]]
+      (is (= :distributed-refinement-input-producers
+             (reason #(project refinement cluster
+                               (assoc-in inputs [[:worker-1 :input] field] value) costs)))))
     (is (= :distributed-refinement-step-identities
            (reason #(project refinement cluster
                              (assoc-in inputs [[:worker-1 :input] :id] [:worker-1 :received]) costs))))
