@@ -71,3 +71,40 @@
         [v dxs] ((rev/value+grad #'squared-dotimes :wrt [0]) xs 3)]
     (is (close? 14.0 v))
     (is (= [2.0 -4.0 6.0] (vec dxs)))))
+
+;; A pullback that re-reads an array needs the array's forward contents.
+(deftm sum-then-overwrite [w :- Double, xs :- (Array double), m :- Long] :- Double
+  (let [s (loop [i 0 acc 0.0] (if (< i m) (recur (inc i) (n/+ acc (n/* w (ra/aget xs i)))) acc))
+        _ (ra/aset xs 0 100.0)]
+    s))
+
+(deftm sum-then-write-fresh [w :- Double, xs :- (Array double), m :- Long] :- Double
+  (let [s (loop [i 0 acc 0.0] (if (< i m) (recur (inc i) (n/+ acc (n/* w (ra/aget xs i)))) acc))
+        ys (double-array m)
+        _ (ra/aset ys 0 100.0)]
+    (n/+ s (ra/aget ys 0))))
+
+(deftest a-replayed-array-is-not-overwritten
+  (is (= :replayed-array-overwritten
+         (:reason (ex-data (try ((rev/value+grad #'sum-then-overwrite :wrt [0]) 0.5 (double-array [1.0 2.0]) 2)
+                                (catch clojure.lang.ExceptionInfo e e))))))
+  (let [[v dw] ((rev/value+grad #'sum-then-write-fresh :wrt [0]) 0.5 (double-array [1.0 2.0]) 2)]
+    (is (close? 101.5 v))
+    (is (close? 3.0 dw))))
+
+;; par/gather's pullback is the scatter-add of its output cotangent.
+(deftm gathered-squares [alpha :- (Array double), group :- (Array int), m :- Long] :- Double
+  (let [g (double-array m)]
+    (par/gather g alpha group m)
+    (loop [i 0 s 0.0] (if (< i m) (recur (inc i) (n/+ s (n/* (ra/aget g i) (ra/aget g i)))) s))))
+
+(deftest a-gather-transposes-to-a-scatter-add
+  (doseq [compile? [false true]]
+    (let [alpha (double-array [1.0 -2.0 3.0])
+          group (int-array [0 2 2 1 0])
+          vg (rev/value+grad #'gathered-squares :wrt [0] :compile? compile?)
+          [v d-alpha] (vg alpha group 5)]
+      (testing compile?
+        (is (= compile? (boolean (::rev/compiled? (meta vg)))) (str (::rev/compile-failure (meta vg))))
+        (is (close? (+ 1.0 9.0 9.0 4.0 1.0) v))
+        (is (= [4.0 -4.0 12.0] (vec d-alpha)))))))

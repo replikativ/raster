@@ -365,6 +365,7 @@
     (and (seq? init-expr) (= 'raster.par/scan   (first init-expr))) :par-scan
     (and (seq? init-expr) (= 'dotimes           (first init-expr))) :dotimes
     (not active?)                                                   :inactive
+    (and (seq? init-expr) (= 'raster.par/gather (first init-expr))) :par-gather
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
     (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr))) :loop
@@ -393,6 +394,17 @@
   (fn [kind _sym _init-expr _activity] kind))
 
 (defmethod ad-record :inactive [_ _sym _init _activity] {:record nil})
+
+;; out[e] = src[index[e]] (strided: blocks of `stride`). The forward runs as
+;; written; the pullback is its transpose, a scatter-add into d_src.
+(defmethod ad-record :par-gather [_ sym init-expr _activity]
+  (let [[_ out src index n stride] init-expr]
+    {:record {:type :par-gather :sym sym :written-arrs [out]
+              :out out :src src :index index :n n :stride stride
+              :d-out-sym (ad-gensym "d_gather_out" (:raster.type/tag (meta out)))
+              :d-src-sym (ad-gensym (str "d_" (if (symbol? src) (name src) "src"))
+                                    (:raster.type/tag (meta src)))
+              :d-src-zero-sym (ad-gensym "d_src_zero" (:raster.type/tag (meta src)))}}))
 
 (defmethod ad-record :alias [_ sym init-expr _activity]
   {:record {:type :alias :sym sym :source init-expr}})
@@ -563,11 +575,34 @@
         (= 1 (count contribs)) (first contribs)
         :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b)) contribs)))
 
+(defn- replayed-syms
+  "Symbols a record's pullback reads again after the forward: a scan's carry
+  tape and the values its step reads, and those of a reduction that replays
+  its step. nil for records whose pullback keeps its own residuals."
+  [record init-expr]
+  (when (or (= :par-scan (:type record))
+            (and (= :par-reduce (:type record))
+                 (contains? #{:double-carry :none} (:residual-kind record))))
+    (into (set (:written-arrs record)) (util/free-syms init-expr))))
+
+(defn- written-syms
+  "Arrays a binding writes: aset targets anywhere in its init, and the output
+  buffers of a SOAC record."
+  [init-expr record]
+  (into (set (:written-arrs record))
+        (keep (fn [form]
+                (when (and (seq? form) (op/aset-op? (first form)) (symbol? (second form)))
+                  (second form))))
+        (tree-seq coll? seq init-expr)))
+
 (defn- forward-pass
-  "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings."
+  "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings.
+  An array a pullback replays must keep its forward contents until the
+  backward runs: a later write to it is rejected rather than differentiated at
+  the overwritten values."
   [norm-bindings active-params]
   (reduce
-   (fn [{:keys [activity fwd-bindings records]} [sym init-expr]]
+   (fn [{:keys [activity fwd-bindings records replayed]} [sym init-expr]]
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
            fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
@@ -581,12 +616,20 @@
            ;; buffer read silently drops the adjoint (zero gradients).
            activity (if (and active? (seq (:written-arrs record)))
                       (reduce #(assoc %1 %2 true) activity (:written-arrs record))
-                      activity)]
+                      activity)
+           overwritten (seq (filter replayed (written-syms init-expr record)))]
+       (when overwritten
+         (throw (ex-info
+                 (str "Reverse-mode AD: `" sym "` writes " (vec overwritten) ", which an "
+                      "earlier scan or reduction re-reads in its pullback. Write a fresh "
+                      "array instead.")
+                 {:reason :replayed-array-overwritten :sym sym :arrays (vec overwritten)})))
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
-        :records (if record (conj records record) records)}))
+        :records (if record (conj records record) records)
+        :replayed (into replayed (replayed-syms record init-expr))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
-    :fwd-bindings [] :records []}
+    :fwd-bindings [] :records [] :replayed #{}}
    (partition 2 norm-bindings)))
 
 (defn- array-zero-of-shape
@@ -796,6 +839,20 @@
               (get activity source false) (update source (fnil conj []) adj-sym))
    :rev-ctx rev-ctx})
 
+(defmethod emit-backward :par-gather
+  [{:keys [sym out src index n stride d-out-sym d-src-sym d-src-zero-sym]}
+   _adj-sym activity {:keys [adj-env rev-ctx]}]
+  (let [contribs (concat (get adj-env sym) (get adj-env out))]
+    (if (or (empty? contribs) (not (get activity src false)))
+      {:adj-env adj-env :rev-ctx rev-ctx}
+      {:rev-ctx (bindings-into rev-ctx
+                               [d-out-sym (sum-contribs contribs nil)
+                                d-src-zero-sym (list 'raster.arrays/zeros-like src
+                                                     (list 'raster.arrays/alength src))
+                                d-src-sym (apply list 'raster.par/scatter! d-src-zero-sym d-out-sym
+                                                 index n (when stride [stride]))])
+       :adj-env (update adj-env src (fnil conj []) d-src-sym)})))
+
 (defmethod emit-backward :par-map
   [{:keys [sym written-arrs read-arrs d-read-arr-syms d-scalar-syms active-free
            shadow-allocs backward-maps backward-reduces d-out-sym]}
@@ -913,7 +970,10 @@
   [records activity seed-adj-env]
   (reduce
    (fn [{:keys [adj-env rev-ctx]} {:keys [type sym] :as record}]
-     (let [array-type? (contains? #{:dotimes :par-map :par-reduce :par-scan} type)
+     (let [;; A record that writes arrays can receive cotangent through those
+           ;; buffers as well as through its result symbol, so its backward
+           ;; always runs; others run only when their result has a cotangent.
+           array-type? (boolean (seq (:written-arrs record)))
            adj-contribs (when-not array-type? (get adj-env sym))
            sym-tag (:raster.type/tag (meta sym))
            adj-sym (when-not array-type?
@@ -2810,6 +2870,7 @@
         ;; === Backward code ===
         out-array-tag (or (some-> out-sym meta :raster.type/tag)
                           (lost-tag! :carry-out-arr (some-> out-sym name)))
+        carry-tag (case out-array-tag doubles 'double floats 'float nil)
         d-out-sym (ad-gensym "d_out" out-array-tag)
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
@@ -2868,7 +2929,7 @@
 
         bwd-loop-init
         (vec (concat [idx-sym (list 'clojure.core/- n-bwd-sym 1)
-                      d-carry-sym 0.0]
+                      d-carry-sym (if carry-tag (tangent/zero-expr carry-tag nil) 0.0)]
                      ;; Typed zeros keep scalar accumulators primitive.
                      (mapcat (fn [s p]
                                [s (if (= :scalar (:kind (tangent/tangent-kind
