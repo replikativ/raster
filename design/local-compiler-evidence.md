@@ -1555,6 +1555,34 @@ pins and tolerances with no pre-fix CPU classes. Loss remains 17921.2765625 vs
 checks still fail, with maximum 1.0649456537233917. This fixes a genuine compiler
 partitioning inconsistency but does not close the real-weight acceptance gate.
 
+A subsequent cold run including retained scalar and SIMD precision fixes has
+the same loss pair, input-gradient error 0.0019965899080526235, and eleven of 28
+adapter checks failing (maximum 0.6251970207953054). An additional diagnostic
+using the public `:gemm-precision :f32-scalar` option produces the identical
+metrics. Thus this experiment does not attribute the remaining disagreement to
+default mixed-precision matrix selection. Source pins, checkpoint, adapter seeds,
+reference arithmetic and acceptance tolerances are unchanged. These are still
+failed model checks, not a training certificate.
+
+### Quantized native fold: retained arithmetic versus output storage
+
+The wider CI suite exposed an obsolete vectorization assertion in the Q4 x8
+test. Its source explicitly converts both scales and the accumulator to Double,
+then stores Float after each block. The old all-Float AVX2 lowering instead rounds
+the scale product early. A one-block independent fixture distinguishes them:
+Float scales 1.0000001 and 0.3, folded integer dot 3, produce 0.90000015 with
+retained Double arithmetic but 0.9000001 with early Float rounding. Tests compare
+raw Float bits for the JVM source, native scalar and SIMD-requested compilation,
+with changed scales and the same compiled functions.
+
+The precision guard therefore declines this mixed-precision fold. The integer
+dot override remains, and the separate homogeneous Float integer-widening SIMD
+execution regression remains required. This is an explicit performance debt,
+not evidence of performance parity: restore vectorization through typed
+Float-load → Double-compute → Float-store conversions, preserving lane counts,
+integer widths and rounding boundaries. Do not change the kernel's arithmetic or
+remove the precision guard merely to recover the previous intrinsic spelling.
+
 ### Shared scalar partial evaluation: typed operation boundaries
 
 The same conversion-erasure class exists outside JVM helper extraction. Shared

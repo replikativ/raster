@@ -17,9 +17,19 @@ admission remains emitter-specific; canonical conversion precision is checked be
 source projection. Typed comparison domains and missing operation stamps still need
 separate evidence, and mixed-species vector execution remains unimplemented.
 
+The C-SIMD guard also exposes a quant-fold performance residual: Q4 x8 explicitly
+computes Double scale products into Float storage, while its old vector assertion
+required an all-Float implementation. Bit-sensitive changed-input JVM/native tests
+now retain the source precision. The integer-dot override and homogeneous Float
+widening tests remain; mixed-precision load/compute/store vector schedules are still
+needed to recover the fold optimization without narrowing arithmetic.
+
 The fresh unchanged real-weight two-layer training gate after #1100 passes loss and
 input-gradient checks but still fails 12 of 28 adapter-gradient checks. Real-model
-acceptance therefore remains open; neither these narrow regressions nor synthetic
+After the subsequent retained-precision fixes, a cold unchanged run fails eleven
+of 28 adapter checks; a public strict-FP32 matrix-policy diagnostic produces the
+identical metrics. This rules out that policy switch as a remedy for this case.
+Acceptance therefore remains open; neither these narrow regressions nor synthetic
 training acceptance closes campaign item 5. Continue precision-boundary consolidation
 and identical-input matrix/VJP localization without loosening the pinned oracle.
 CUDA/HIP runtime performance and multi-host execution likewise remain separate from
