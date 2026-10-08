@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.collective-combine-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.collective-combine :as combine]))
@@ -77,3 +78,48 @@
     (is (= :collective-combine-extent
            (:reason (ex-data (try (combine/algorithm (algebra '+ 0.0 :float) elements)
                                  (catch clojure.lang.ExceptionInfo e e))))))))
+
+(defn- local-request [device shape]
+  {:id :local-combine
+   :nodes (into {} (map (fn [role]
+                         [role (link/node {:id [role :storage] :device device :dtype :float
+                                           :shape shape})])) [:left :right :result])})
+
+(deftest generated-combines-bind-to-the-ordinary-link-plan-boundary
+  (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]
+          shape [[17] [2 3]]]
+    (let [options (target-options dialect)
+          request (local-request (:target-device options) shape)
+          elements (reduce * shape)
+          cert (algebra '+ 0.0 :float)
+          linked (combine/bind-local cert elements options request)
+          plan (:link-plan linked)]
+      (is (= linked (combine/validate-local! cert elements request linked)))
+      (is (= :graph-link-instance
+             (when (link/graph-link-instance? (first (:instances plan))) :graph-link-instance)))
+      (is (= [:result :storage] (first (link/output-value-ids plan))))
+      (is (= shape (get-in plan [:values [:result :storage] :abstract :shape])))
+      (is (= #{[:left :storage] [:right :storage]} (:requires (link/initialization-contract plan))))
+      (is (= #{[:result :storage]} (:produces (link/initialization-contract plan)))))))
+
+(deftest local-binding-rejects-storage-and-interface-forgeries
+  (let [options (target-options :opencl-portable)
+        cert (algebra '+ 0.0 :float)
+        request (local-request (:target-device options) [17])
+        linked (combine/bind-local cert 17 options request)]
+    (doseq [bad [(assoc request :unknown true)
+                 (assoc-in request [:nodes :result] (get-in request [:nodes :left]))
+                 (assoc-in request [:nodes :result :source] (float-array 17))
+                 (assoc-in request [:nodes :left]
+                           (link/node {:id :wrong-width :device (:target-device options)
+                                       :dtype :float :shape [18]}))]]
+      (is (thrown? clojure.lang.ExceptionInfo (combine/bind-local cert 17 options bad))))
+    (let [plan (:link-plan linked)
+          swapped (assoc-in plan [:instances 0 :bindings]
+                            {'left [:right :storage] 'right [:left :storage]
+                             'result [:result :storage]})]
+      (is (= swapped (link/validate! swapped)) "generic memory validation cannot know semantic roles")
+      (is (= :collective-combine-local-plan
+             (:reason (ex-data (try (combine/validate-local! cert 17 request
+                                                             (assoc linked :link-plan swapped))
+                                   (catch clojure.lang.ExceptionInfo e e)))))))))

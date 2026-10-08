@@ -5,7 +5,10 @@
    refinement still owns contribution ancestry, placement, copies and numerical reassociation.
    Scheduling, target emission and executable validation use the existing compiler boundaries."
   (:require [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
@@ -101,3 +104,59 @@
         (throw (ex-info "combine schedule differs from the declared typed scalar algorithm"
                         {:reason :collective-combine-schedule}))))
     emitted))
+
+(defn- local-plan [algebra elements emitted {:keys [id nodes] :as request}]
+  (when-not (and (map? request) (= #{:id :nodes} (set (keys request))) (some? id)
+                 (map? nodes) (= #{:left :right :result} (set (keys nodes)))
+                 (every? link/link-node? (vals nodes))
+                 (= 3 (count (distinct (map :id (vals nodes))))))
+    (throw (ex-info "local combine needs a closed three-node storage contract"
+                    {:reason :collective-combine-storage})))
+  (doseq [[role node] nodes]
+    (link/validate-node! node)
+    (when-not (and (= (:dtype algebra) (dtype/canon (get-in node [:view :dtype])))
+                   (view/contiguous? (:view node))
+                   (= elements (reduce *' 1 (get-in node [:view :shape])))
+                   (or (not= :result role) (nil? (:source node))))
+      (throw (ex-info "combine storage requires exact dense typed extents and a fresh output"
+                      {:reason :collective-combine-storage :role role :node (:id node)}))))
+  (doseq [input [:left :right]]
+    (when (view/overlaps? (get-in nodes [input :view]) (get-in nodes [:result :view]))
+      (throw (ex-info "combine output cannot alias an immutable operand"
+                      {:reason :collective-combine-storage :operand input}))))
+  (link/make
+   {:id id :target (get-in emitted [:attributes :collective-target :target-device])
+    :nodes (mapv (fn [[role node]]
+                   (assoc node :role (if (= :result role) :output :input))) nodes)
+    :values (mapv (fn [[_ node]]
+                    (link/value {:id (:id node)
+                                 :abstract (av/tensor {:dtype (:dtype algebra)
+                                                       :shape (get-in node [:view :shape])})
+                                 :leaves [{:name :value :node (:id node)}]})) nodes)
+    :instances [(link/graph-instance
+                 {:id :combine :graph (:graph emitted)
+                  :bindings (into {} (map (fn [[role node]] [(symbol (name role)) (:id node)])) nodes)})]
+    :outputs [(:id (:result nodes))]}))
+
+(defn bind-local
+  "Emit a certified combine and bind its immutable operands/fresh result to ordinary LinkNodes.
+   Storage identity and shape come from the enclosing compiler, not from ABI-name discovery.
+   Dense tensors may retain their rank: the generated map addresses their ordered flat cells.
+   Returns existing compiler boundaries; no allocation, upload or new runtime convention."
+  [algebra elements options request]
+  (let [emitted (validate! algebra elements (emit algebra elements options))]
+    {:emitted emitted :link-plan (local-plan algebra elements emitted request)}))
+
+(defn validate-local!
+  "Independently bind an emitted combine and LinkPlan to the requested semantic storage roles.
+   The caller must supply its original storage request, not infer roles from the candidate plan."
+  [algebra elements request {:keys [emitted link-plan] :as linked}]
+  (when-not (and (map? linked) (= #{:emitted :link-plan} (set (keys linked))))
+    (throw (ex-info "expected closed emitted-combine and local-plan boundaries"
+                    {:reason :collective-combine-local-plan})))
+  (validate! algebra elements emitted)
+  (link/validate! link-plan)
+  (when-not (= (local-plan algebra elements emitted request) link-plan)
+    (throw (ex-info "combine LinkPlan differs from the semantic storage request"
+                    {:reason :collective-combine-local-plan})))
+  linked)
