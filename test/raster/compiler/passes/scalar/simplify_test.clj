@@ -139,14 +139,14 @@
 ;; ================================================================
 
 (deftest invk-normalization-test
-  (testing ".invk with :raster.op/original metadata is simplified"
+  (testing ".invk metadata is not permission to erase the selected signature"
     (let [form (with-meta '(.invk impl__plus x 0)
                  {:raster.op/original 'raster.numeric/+})]
-      (is (= 'x (simp/simplify-1 form)))))
+      (is (= form (simp/simplify-1 form)))))
 
-  (testing ".invk with mangled _star_ name is simplified"
+  (testing "unknown .invk cannot be inferred from a mangled name"
     (let [form '(.invk some_star__m_double_double-impl x 1)]
-      (is (= 'x (simp/simplify-1 form)))))
+      (is (= form (simp/simplify-1 form)))))
 
   (testing ".invk non-arithmetic form passes through unchanged"
     (let [form '(.invk some_custom_fn x y)]

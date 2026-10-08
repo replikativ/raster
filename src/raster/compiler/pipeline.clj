@@ -27,7 +27,6 @@
             [raster.compiler.passes.scalar.cse :as cse]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.buffer-fuse :as buffer-fuse]
-            [raster.compiler.passes.scalar.normalize :as normalize]
             [raster.compiler.passes.scalar.rewalk :as rewalk]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -450,14 +449,13 @@
 (declare record-fixpoint-census!)
 
 (defn- pass-fixpoint
-  "Fixpoint pass: expand → normalize → rewalk → PE+CSE until stable.
+  "Fixpoint pass: expand → conditional rewalk → PE+CSE until stable.
 
   Handles composable AD operators (value+grad, grad) whose inlined bodies
   contain undevirtualized backward-pass calls. Each iteration:
   1. Expand (inline deftm/value+grad calls)
-  2. Normalize (canonicalize scalar ops)
-  3. Rewalk (devirtualize arithmetic back to .invk)
-  4. PE+CSE (constant fold, eliminate redundancy)
+  2. Rewalk newly exposed undevirtualized calls, retaining selected typed calls
+  3. PE+CSE (propagate constants, eliminate redundancy without erasing .invk)
 
   Converges in 1 iteration for simple AD, N iterations for N-level nesting.
   Max 5 iterations to prevent divergence.
@@ -511,11 +509,9 @@
               needs-rewalk? (and (not= expanded current)
                                  (has-undevirtualized-calls? expanded))
               rewalked (if needs-rewalk?
-                         ;; Skip full normalize — PE handles .invk normalization
-                         ;; internally (normalize-1 + simplify-1). A full recursive
-                         ;; normalize here strips typed metadata from .invk calls
-                         ;; inside nested structures (dotimes, par bodies, loop*)
-                         ;; that the walker can't re-reach.
+                         ;; Retain selected typed-call boundaries. Generic
+                         ;; operator normalization loses operand conversions
+                         ;; and rounding, including inside nested loops/maps.
                          (let [rw-result (rewalk/pe-rewalk expanded opts)]
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]

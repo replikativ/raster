@@ -17,7 +17,6 @@
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.core.util :as util]
-            [raster.compiler.passes.scalar.normalize :as normalize]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
 
@@ -253,11 +252,9 @@
   the form, `:raster.op/original` is DROPPED — a simplification can change the
   surviving node's operator (e.g. `(* (- x) 1.0)` → `(- x)`), and propagating the
   parent's `:raster.op/original` onto the survivor stamps it with a head-op that
-  contradicts its actual head. `normalize` trusts `:raster.op/original` as ground
-  truth and would then rewrite the head (`- → *`), collapsing `(* x) → x` and
-  silently deleting the negation — the task #78 gradient sign-flip. `normalize`
-  already recovers the correct op from the `.invk` impl name when the tag is
-  absent, so dropping it on a changed node is safe. Type tags are preserved."
+  contradicts its actual head. This provenance cleanup applies to rewritten
+  ordinary forms. Typed `.invk` nodes retain their boundary and metadata rather
+  than recovering operator semantics from impl spelling. Type tags are preserved."
   [form result changed?]
   (if-let [m (meta form)]
     (if (instance? clojure.lang.IMeta result)
@@ -374,24 +371,15 @@
         (= head 'try)
         form ;; Conservative: don't PE inside try/catch
 
-        ;; .invk — PE the args, then try simplify. If simplification doesn't
-        ;; change anything, preserve the .invk form (with its typed interface
-        ;; metadata) instead of returning a bare dispatch call. Normalizing to
-        ;; bare ops is only useful when algebraic rules can actually simplify.
+        ;; .invk — PE arguments, preserving the selected signature's conversion
+        ;; and rounding boundary. Generic identities/constant folding do not
+        ;; describe this typed operation, even if its original operator is known.
         (= head '.invk)
         (let [impl (second form)
               pe-args (map #(pe-pass % const-env) (nnext form))
               invk-form (apply list '.invk impl pe-args)
-              invk-form (if-let [m (meta form)] (with-meta invk-form m) invk-form)
-              normalized (normalize/normalize-1 invk-form)
-              simplified (simp/simplify-1 normalized)]
-          (if (= simplified normalized)
-            ;; Simplification didn't help — keep the .invk form with metadata
-            invk-form
-            ;; Simplification reduced something — reattach meta, but drop the now-
-            ;; possibly-stale :raster.op/original (the rewrite may have changed the
-            ;; node's operator — see reattach-meta / task #78).
-            (reattach-meta form simplified true)))
+              invk-form (if-let [m (meta form)] (with-meta invk-form m) invk-form)]
+          invk-form)
 
         ;; new — PE the constructor args
         (= head 'new)

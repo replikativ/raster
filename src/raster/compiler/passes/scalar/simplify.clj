@@ -2,14 +2,14 @@
   "Pattern-based algebraic simplification.
 
   This is the canonical scalar simplifier namespace. It handles both raw
-  arithmetic forms and devirtualized walked forms, including mangled deftm
-  names and .invk calls, and iterates bottom-up to a fixed point."
+  arithmetic forms and iterates bottom-up to a fixed point. Typed .invk
+  boundaries are retained; generic algebra may simplify their children but
+  cannot erase selected operand conversions or result rounding."
   (:require [pattern :refer [rule rule-list simplifier]]
             [pattern.nanopass.dialect :refer [=> dialects]]
             [raster.compiler.ir.dialects]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.passes.scalar.effects :as effects]
-            [raster.compiler.passes.scalar.normalize :as normalize]))
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 ;; ================================================================
 ;; Operator recognition predicates — delegate to op-descriptor
@@ -116,11 +116,12 @@
   "Apply simplification rules to a single form.
   Handles both direct calls and .invk calls."
   [form]
-  (let [normalized (normalize/normalize-1 form)]
-    (if-not (seq? normalized)
-      normalized
-      (or (all-rules normalized)
-          normalized))))
+  ;; A typed call includes operand conversion and result rounding. Generic
+  ;; algebra is not authority to erase that signature-selected boundary.
+  ;; Bottom-up traversal still simplifies its children.
+  (if (or (not (seq? form)) (= '.invk (first form)))
+    form
+    (or (all-rules form) form)))
 
 (defn simplify-1
   "Apply one round of simplification rules to a single form.
