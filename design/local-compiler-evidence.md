@@ -1501,3 +1501,23 @@ relative 2.3887326823598837e-7). These diagnostics do not establish acceptance
 of the full real-model gradient gate or certify helper-call performance. The
 affected JVM loop and bytecode suites pass 50 tests / 139 assertions, including
 lazy and AOT changed-input checks across the actual extraction threshold.
+
+Cold CI exposed one test-metric assumption: the chunked Float RMSNorm backward
+was compared to a different reduction tree using error divided by the resulting
+dx coordinate. The maximum was 0.0010544952502931275 against 0.001 after restored
+Float rounding. Because dx subtracts two potentially large terms, that ratio
+can amplify harmless reassociation at cancellation coordinates. The test now
+uses an independent Double mathematical reference and the sum of the two term
+magnitudes as its backward-error scale, for both Float and Double schedules.
+The existing numerical bounds and finite-difference checks remain, and both
+schedules are checked against the independent reference as well as each other.
+Zero scales require exact agreement; no arbitrary absolute-error floor is added.
+No production normalization formula or pinned model acceptance metric changes.
+The three affected JVM/normalization namespaces pass 55 tests / 201 assertions
+in the fresh capped REPL, including the unchanged finite-difference checks.
+
+A fresh capped JVM reran the held real-weight harness at the original source
+pins and tolerances with no pre-fix CPU classes. Loss remains 17921.2765625 vs
+17921.271875; input-gradient error is 0.006813176206858781. Twelve of 28 adapter
+checks still fail, with maximum 1.0649456537233917. This fixes a genuine compiler
+partitioning inconsistency but does not close the real-weight acceptance gate.
