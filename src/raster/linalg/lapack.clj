@@ -10,12 +10,14 @@
   For symmetric eigendecomposition, row-major = col-major, so no transpose.
 
   Set raster.openblas.path system property to override the library location.
+  Bindings use LP64 integers; advertised ILP64 OpenBLAS builds are rejected.
 
   All public functions accept flat double[] in row-major order.
   All native calls use critical(true) for zero-copy heap array pinning."
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset]]
+            [raster.linalg.native-library :as native-library]
             [raster.math :as m]
             [raster.numeric :as n])
   (:import [java.lang.foreign
@@ -53,13 +55,11 @@
                 (catch Exception _ nil)))
             paths))))
 
-(def ^:private openblas (delay (find-lib "dgesdd_" lib-paths)))
-(def ^:private lapacke  (delay (find-lib "LAPACKE_dgeqrf" (concat lapacke-lib-paths lib-paths))))
-
-(defn available?
-  "Returns true if LAPACK (via OpenBLAS) is loaded and functional."
-  []
-  (boolean @openblas))
+(def ^:private openblas
+  (delay (native-library/require-lp64! (find-lib "dgesdd_" lib-paths))))
+(def ^:private lapacke
+  (delay (native-library/require-lp64!
+          (find-lib "LAPACKE_dgeqrf" (concat lapacke-lib-paths lib-paths)))))
 
 (defn- require-lapack! []
   (when-not @openblas
@@ -718,8 +718,10 @@
 ;; ================================================================
 
 (defn available?
-  "Check if OpenBLAS LAPACK is loaded and functional."
+  "Check if OpenBLAS LAPACK is loaded and functional.
+   Native library admission errors propagate; they are not missing-library skips."
   []
+  @openblas
   (try
     @_init
     (let [a (double-array [2 1 1 2])

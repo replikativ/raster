@@ -86,6 +86,8 @@ jobs:
   test:
     executor: clojure-java24
     parallelism: 16
+    environment:
+      RASTER_EXPECT_NATIVE_LIBRARIES: "1"
     steps:
       - attach_workspace:
           at: ~/

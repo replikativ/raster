@@ -13,9 +13,12 @@
 
   Library loading is lazy — BLAS is only loaded on first call. Tries Intel MKL
   first (optimized for the host CPU), falls back to OpenBLAS. Avoids conflicts
-  with Neanderthal's bundled JNI OpenBLAS by checking loader lookup first."
+  with Neanderthal's bundled JNI OpenBLAS by checking loader lookup first.
+  The bindings use LP64 integers; advertised ILP64 OpenBLAS builds are rejected
+  before numerical downcalls. Missing provider metadata is not an ABI proof."
   (:require [raster.core :refer [deftm]]
             [raster.ad.templates :as tmpl]
+            [raster.linalg.native-library :as native-library]
             [raster.compiler.core.op-descriptor :as descriptor])
   (:import [java.lang.foreign
             Arena FunctionDescriptor Linker Linker$Option
@@ -142,7 +145,8 @@
 ;; Lazy — only loads library on first deref
 (def ^:private blas-state
   "Delay returning [SymbolLookup, backend-keyword]."
-  (delay (find-blas)))
+  (delay (when-let [[library backend] (find-blas)]
+           [(native-library/require-lp64! library) backend])))
 
 (defn backend
   "Returns the active BLAS backend: :mkl, :openblas, :preloaded, or nil if unavailable."
@@ -994,8 +998,11 @@
 ;; ================================================================
 
 (defn available?
-  "Check if BLAS is loaded and functional. Returns backend keyword or false."
+  "Check if BLAS is loaded and functional. Returns backend keyword or false.
+   Native library admission errors propagate; they are not missing-library skips."
   []
+  ;; Force integer-ABI admission outside the optional numerical smoke check.
+  @blas-state
   (try
     (let [a (double-array [1 0 0 1])
           b (double-array [2 3])

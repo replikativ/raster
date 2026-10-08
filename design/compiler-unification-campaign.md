@@ -1,5 +1,36 @@
 # Compiler unification campaign
 
+### October 8 native reference-environment admission
+
+An external CUDA developer reports 4,602 tests / 57,807 assertions at `f7cbf12`,
+with 16 failures and 45 errors. Their initial categories are missing BLAS/LAPACK
+(37 checks), exact floating-point differences (10), unsupported portable trapping
+arithmetic (11), attention dispatch (two), and a missing Clang case subsequently
+resolved. These are reported baseline evidence, not reproduced diagnoses or a count
+of independent root causes. A standalone C batched-GEMM crash with OpenBLAS 0.3.32
+still requires the arguments, headers and linked-library integer ABI to be checked.
+CUDA compiler fixtures and two changed-input device checks with clean memory-sanitizer
+results are preliminary execution evidence, not completed runtime or performance gates.
+
+Both Panama numerical libraries declare 32-bit integer slots. A shared optional
+`openblas_get_config` probe now rejects advertised `USE64BITINT` libraries before
+BLAS or LAPACK numerical downcalls. The rejection is intentional: changing integer
+width requires different descriptors, not a tolerance adjustment. Unknown providers
+without metadata retain existing admission and are not certified LP64 by this check.
+Hardware-free native stubs test the pointer-returning metadata ABI, absent symbols,
+null metadata and incompatible build flags. This does not explain the reported C crash.
+Admission errors propagate through availability queries rather than being converted into
+whole-namespace skips. Ordinary missing-library discovery retains the existing optional behavior.
+The CI test job declares `RASTER_EXPECT_NATIVE_LIBRARIES=1`; an unconditional test
+namespace then requires functional BLAS and LAPACK, without forcing either onto laptop
+or compiler-only jobs. This preflight does not replace per-capability coverage accounting.
+
+Explicit consistent library selection, actual resolved-provider/version/thread metadata,
+ABI treatment for unknown/preloaded providers, and a pinned native reference environment
+remain CI/compatibility debt. In particular, BLAS does not honor LAPACK's existing path
+property, and LAPACK's preferred path can silently fall back. Keep those improvements
+on items 1–2 without replacing the external training, distributed or PDE gates.
+
 ### October 8 resumed acceptance and AD review
 
 The bounded JVM Float-seed correction (#1070) and position-sensitive helper capture (#1071)
