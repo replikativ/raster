@@ -356,3 +356,11 @@ Certificates retain the copy bindings alongside the existing local plans. Changi
 endpoint rectangle invalidates old evidence even when payload size and analytic cost are unchanged.
 Constructing plans through `plan` defaults to no explicit copies; retained record/certificate
 values from the previous schema must be rebuilt. Surface numerical function semantics are unchanged.
+
+Collective schedules use the shared `numerical-contract` schema when `:numerical-mode` is
+nonempty. An empty map remains an unspecified analytical policy, not consent to execute or
+reassociate floating-point arithmetic. A bare rounding map is no longer a valid declaration:
+use a named `:mode` and `:policy`, with accumulator/rounding/error-model fields as required by
+the shared validator. Retained schedule records are revalidated at plan admission. This checks
+the declaration only; lowering must still bind generated combines and their evaluation tree to
+that policy and prove complete, nonduplicated contributions.
