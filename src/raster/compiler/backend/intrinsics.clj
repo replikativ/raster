@@ -99,7 +99,10 @@
    :sin {:arity 1 :kind :fn :wasm :poly :c {:fn "sin"} :wgsl {:fn "sin"}}
    :cos {:arity 1 :kind :fn :wasm :poly :c {:fn "cos"} :wgsl {:fn "cos"}}
    :tan {:arity 1 :kind :fn :wasm :poly :c {:fn "tan"} :wgsl {:fn "tan"}}
-   :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}}
+   :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}
+         ;; KernelBody's C-family emitters call the typed target math library.
+         ;; The separate WASM facet above emits an inline polynomial instead.
+         :kernel-body-math-realization :target-library}
    :log {:arity 1 :kind :fn :wasm :poly :c {:fn "log"} :wgsl {:fn "log"}}
    :pow {:arity 2 :kind :fn :wasm :poly :c {:fn "pow"} :wgsl {:fn "pow"}}
    :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}

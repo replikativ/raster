@@ -5,6 +5,7 @@
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.core :refer [deftm]]
@@ -152,6 +153,23 @@
     (is (= (:payload-fingerprint envelope)
            (:payload-fingerprint (artifact/decode transport))))))
 
+(defn- compiler-record-round-trip [value]
+  (let [options {:profile :archival
+                 :registry (var-get #'artifact/compiler-record-registry)
+                 :on-unknown-record :error}]
+    (#'artifact/restore-sequences
+     (boring/decode
+      (boring/encode (#'artifact/prepare-sequences value) options)
+      options))))
+
+(deftest exponential-realization-round-trips-through-the-compiler-record-codec
+  (doseq [dt [:float :double]]
+    (let [expression (kernel-body/scalar-expression :exp dt [(kernel-body/literal 0.0 dt)])
+          restored (compiler-record-round-trip expression)]
+      (is (= expression restored))
+      (is (= {:kind :target-library :accuracy :implementation-defined}
+             (get-in restored [:options :math-realization]))))))
+
 (deftest scheduled-preconditions-round-trip-through-the-compiler-record-codec
   (let [original (get-in @compilation [:kernels 0 :provenance :scheduled-operation])
         parameter (first (filter #(and (= :scalar (:kind %))
@@ -160,13 +178,7 @@
         condition {:expression (:id parameter) :op :> :value 0}
         conditioned (scheduled-body/validate!
                      (assoc original :preconditions [condition]))
-        options {:profile :archival
-                 :registry (var-get #'artifact/compiler-record-registry)
-                 :on-unknown-record :error}
-        restored (#'artifact/restore-sequences
-                  (boring/decode
-                   (boring/encode (#'artifact/prepare-sequences conditioned) options)
-                   options))]
+        restored (compiler-record-round-trip conditioned)]
     (is (some? parameter) "the fixture must retain its integral launch bound")
     (is (= conditioned restored))
     (is (= [condition] (:preconditions restored)))

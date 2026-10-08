@@ -133,8 +133,18 @@ and HIP reduction phases through nvcc/hipcc in CI. Graph families that have not 
 portable KernelBody fail at this boundary instead of embedding OpenCL source in a CUDA/HIP
 program. Typed one-dimensional SegMap now shares one scalar-expression lowering with SegFoldMap:
 stable loads, retained dtypes, scalar SSA, branches, and horizontally fused stores emit from the
-same KernelBody to all three C-family targets. Canonical loop/recur scalar carries become ordered
-KernelBody `ForLoop` regions rather than being reassociated as reductions. This is sufficient for
+same KernelBody to all three C-family targets.
+
+KernelBody math realization is separate from evaluation-order attestation: the initial `exp`
+vertical records a typed target-library call with implementation-defined accuracy, not a
+correctly-rounded or JVM-bitwise guarantee. Float `exp` and explicit Double `exp` followed by a
+Float conversion remain distinct SSA programs. This C-family facet does not describe WASM's
+polynomial realization. Extend this evidence to other transcendentals and named reproducible
+algorithms before claiming a complete cross-target math contract; do not silently widen every
+Float operation to reproduce one host library.
+
+Canonical loop/recur scalar carries become ordered KernelBody `ForLoop` regions rather than being
+reassociated as reductions. This is sufficient for
 the public seven-stage GQA composition to emit entirely as CUDA/HIP and pass both vendor compilers;
 certified stencils and scans now lower their
 single- or three-phase schedule to target-neutral KernelBody scalar SSA, workgroup storage,

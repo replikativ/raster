@@ -10,6 +10,24 @@
             [raster.dl.gpu-grad-parity :as ze])
   (:import [java.lang.foreign MemorySegment]))
 
+(defn- check-declared-exponential! [target]
+  (let [input (float-array [-2.0899892 -0.98745203 0.98147774 -2.6305397])
+        executable (compiled/instantiate!
+                    (compiled/lower #'mixed/double-exponential-float-storage [input]
+                      {:compiler :equation-first :target target :dtype :float
+                       :preserve-declared-array-storage? true}))]
+    (try
+      (doseq [delta [0.0 0.125]]
+        (let [changed (float-array (map #(+ (double %) delta) input))
+              actual (value/->host
+                       (:result (compiled/invoke-compiled executable {:x changed})))
+              reference (float-array (map #(Math/exp (double %)) changed))]
+          (is (= (class changed) (class actual)))
+          (is (= (vec reference) (vec actual))
+              "a local target observation, not a universal libm bitwise theorem")
+          (is (= (vec (mixed/double-exponential-float-storage changed)) (vec actual)))))
+      (finally (compiled/close! executable)))))
+
 (defn- check-declared-local-storage! [target]
   (let [input (float-array [16777216.0 1.0 -16777216.0])
         prepared (compiled/lower #'mixed/double-fold-float-storage [input]
@@ -29,14 +47,16 @@
 
 (deftest declared-local-float-storage-with-double-fold-on-opencl
   (if @opencl/opencl-fp64-available?
-    (check-declared-local-storage! :ocl:0)
+    (do (check-declared-local-storage! :ocl:0)
+        (check-declared-exponential! :ocl:0))
     (opencl/opencl-skip! "declared local Float storage with Double fold" :fp64)))
 
 (deftest declared-local-float-storage-with-double-fold-on-level-zero
   (if @ze/gpu-available?
     (let [caps ((requiring-resolve 'raster.gpu.ze-runtime/module-capabilities))]
       (if (:fp64? caps)
-        (check-declared-local-storage! :ze:0)
+        (do (check-declared-local-storage! :ze:0)
+            (check-declared-exponential! :ze:0))
         (ze/gpu-capability-skip! "declared local Float storage with Double fold" :fp64? caps)))
     (ze/gpu-skip! "declared local Float storage with Double fold")))
 

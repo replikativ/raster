@@ -16,6 +16,15 @@
 
 (def retained-source-arithmetic {:kind :retained-typed-ssa})
 
+(def target-library-math
+  "A typed target math call, not a JVM-bitwise or correctly-rounded attestation.
+   Implementation-defined accuracy is descriptive evidence, never a bounded-error proof."
+  {:kind :target-library :accuracy :implementation-defined})
+
+(defn target-library-math?
+  [value]
+  (= target-library-math value))
+
 (defn blas-source-arithmetic
   "Describe a resolved BLAS product, not permission for a numerical refinement.
    Operand conversion and the typed result transform are outside the implementation-defined
@@ -95,6 +104,10 @@
 
 (defn validate!
   "Validate and return a numerical contract.
+
+   Exact evaluation order preserves the typed operations, not bitwise equivalence between
+   different target math libraries. Covered scalar math operations (currently exp) retain their
+   realization separately in KernelBody; unclassified transcendentals have no such attestation.
 
    `context` lets an owning IR preserve its public diagnostic identity while sharing this one
    contract."

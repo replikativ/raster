@@ -6,6 +6,13 @@
 
 (def policy {:preserve-declared-array-storage? true})
 
+(deftm double-exponential-float-storage
+  "Explicit Double transcendental evaluation followed by one Float storage conversion."
+  [x :- (Array float)] :- (Array float)
+  (let [out (arrays/zeros-like x (alength x))]
+    (par/map! out i (alength x) nil
+      (float (Math/exp (double (aget x i)))))))
+
 (deftm double-fold-float-storage
   [x :- (Array float)] :- (Array float)
   (let [out (arrays/zeros-like x 1)]
