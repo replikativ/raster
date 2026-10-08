@@ -144,6 +144,98 @@
     (is (close? 101.5 v))
     (is (close? 3.0 dw))))
 
+(deftm sum-then-overwrite-alias
+  [w :- Double, xs :- (Array double), m :- Long] :- Double
+  (let [ys xs zs ys
+        s (par/reduce acc 0.0 i m (n/+ acc (n/* w (ra/aget xs i))))
+        _ (ra/aset zs 0 100.0)]
+    s))
+
+(deftest replay-protection-follows-inactive-transitive-aliases
+  (is (= :replayed-array-overwritten
+         (:reason (ex-data
+                    (try ((rev/value+grad #'sum-then-overwrite-alias :wrt [0])
+                           0.5 (double-array [1.0 2.0]) 2)
+                         (catch clojure.lang.ExceptionInfo e e)))))))
+
+(deftm mapped-then-overwrite-output [w :- Double] :- Double
+  (let [out (double-array 1)
+        mapped (par/map! out i 1 double 2.0)
+        s (par/reduce acc 0.0 i 1 (n/+ acc (n/* w (ra/aget mapped i))))
+        _ (ra/aset out 0 100.0)]
+    s))
+
+(deftest operation-result-aliases-share-replay-storage
+  (is (= :replayed-array-overwritten
+         (:reason (ex-data
+                    (try ((rev/value+grad #'mapped-then-overwrite-output :wrt [0]) 0.5)
+                         (catch clojure.lang.ExceptionInfo e e)))))))
+
+(deftm gather-then-change-index
+  [xs :- (Array double), index :- (Array int)] :- Double
+  (let [out (double-array 1)
+        _ (par/gather out xs index 1)
+        changed index
+        _ (ra/aset changed 0 1)]
+    (n/* (ra/aget out 0) (ra/aget out 0))))
+
+(deftm mapped-then-change-index
+  [xs :- (Array double), index :- (Array int)] :- Double
+  (let [out (double-array 1)
+        _ (par/map! out i 1 double (ra/aget xs (ra/aget index i)))
+        _ (ra/aset index 0 1)]
+    (ra/aget out 0)))
+
+(deftm dotimes-then-change-index
+  [xs :- (Array double), index :- (Array int)] :- Double
+  (let [out (double-array 1)
+        _ (dotimes [i 1] (ra/aset out i (ra/aget xs (ra/aget index i))))
+        _ (ra/aset index 0 1)]
+    (ra/aget out 0)))
+
+(deftm dotimes-core-then-change-index
+  [xs :- (Array double), index :- (Array int)] :- Double
+  (let [out (double-array 1)
+        _ (dotimes [i 1] (let [v (aget xs (aget index i))] (aset out i v)))
+        _ (aset index 0 1)]
+    (aget out 0)))
+
+(deftm ordered-float-then-change-index
+  [xs :- (Array float), index :- (Array int)] :- Float
+  (let [s (par/reduce acc (float 1.0) i 1
+            (n/* acc (ra/aget xs (aget index i))))
+        _ (aset index 0 1)]
+    s))
+
+(deftm ordered-float-step-changes-index
+  [xs :- (Array float), index :- (Array int)] :- Float
+  (par/reduce acc (float 1.0) i 1
+    (let [v (ra/aget xs (aget index i))
+          _ (aset index i 1)]
+      (n/* acc v))))
+
+(deftest transposed-indices-retain-their-forward-storage
+  (doseq [[f xs] [[#'gather-then-change-index (double-array [2.0 7.0])]
+                  [#'mapped-then-change-index (double-array [2.0 7.0])]
+                  [#'dotimes-core-then-change-index (double-array [2.0 7.0])]
+                  [#'ordered-float-then-change-index (float-array [2.0 7.0])]
+                  [#'ordered-float-step-changes-index (float-array [2.0 7.0])]]]
+    (testing (str f)
+      (is (= :replayed-array-overwritten
+             (:reason (ex-data
+                        (try ((rev/value+grad f :wrt [0])
+                               xs (int-array [0]))
+                             (catch clojure.lang.ExceptionInfo e e)))))))))
+
+(deftest captured-dotimes-indices-do-not-need-replay-protection
+  ;; This form's inline call pullback captures its index during forward,
+  ;; unlike the separately analyzed read transposed above. Do not reject a
+  ;; safe mutation just because another representation needs index replay.
+  (let [[v dx] ((rev/value+grad #'dotimes-then-change-index :wrt [0])
+                (double-array [2.0 7.0]) (int-array [0]))]
+    (is (= 2.0 v))
+    (is (= [1.0 0.0] (vec dx)))))
+
 ;; par/gather's pullback is the scatter-add of its output cotangent.
 (deftm gathered-squares [alpha :- (Array double), group :- (Array int), m :- Long] :- Double
   (let [g (double-array m)]

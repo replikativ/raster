@@ -26,6 +26,19 @@ route's existing purity proof; impure steps retain their closure tape and execut
 This preserves support for effectful reductions rather than rejecting their additive shape.
 Storage-alias and gathered-index replay protection remain the next distinct slice.
 
+That slice derives direct storage representatives from ordinary aliases and each operation
+record's result/output identity. The shared forward pass checks writes against those representatives;
+gather, mapped and separately analyzed dotimes transposes declare their reread index dependencies.
+Ordered closure reductions also declare scatter-index dependencies even though their primal read
+values are taped. Explicit source writes inside the same operation are checked against its own
+replay claims; normal record-declared output writes are not mistaken for such source effects.
+Captured dotimes index values remain valid after source-index mutation, rather than inheriting
+another representation's replay restriction. Focused source/AD oracles cover transitive inactive
+aliases, map-result/output aliases, index mutation, captured indices and fresh-buffer writes.
+This is not a physical no-alias proof for distinct caller arguments or a general may-alias
+analysis of arbitrary conditional/opaque returned arrays. Keep those ownership obligations
+explicit in the remaining consolidation work; no numerical gate or residual representation changes.
+
 ### October 6 contextual initializer precision follow-up
 
 Real-weight boundary isolation exposed a remaining JVM/GPU arithmetic discrepancy in attention
