@@ -321,3 +321,38 @@ preserved expression order. Invariant attestations are subject to that model; th
 exact real-arithmetic conservation for arbitrary FP values. Callers must establish assumptions
 again after resident producers update input values; the structural certificate does not inspect
 device contents. Structural manifest fixtures in this acceptance are not durable publication tests.
+
+## Explicit copy regions and generated arithmetic
+
+`DistributedPlan` can bind an ordinary transfer to regions of existing local LinkValues:
+
+```clojure
+:copy-bindings
+{:move {:source {:step :producer :local-value :gradient
+                 :region {:offsets [2] :shape [3]}}
+        :target {:step :consumer :local-value :scratch
+                 :region {:offsets [4] :shape [3]}}}}
+```
+
+The endpoint step identifies a local entry's storage contract, not proof that that compute has
+already executed. The ordinary DAG and readiness analysis still prove initialization and order.
+The source must realize the transfer's global value and, in a padded domain, stay within its owned
+rectangle. Ghost copies need separate freshness evidence and are not admitted through this seam.
+The target can be scratch or other mutable local storage; no constant storage may be overwritten,
+including overlapping constant views in other bound entries. Both regions must be contiguous,
+non-overlapping, equally shaped and typed, and match the declared payload bytes. Strided regions
+require ordinary generated pack/unpack compute, not a bounding-span copy. Region validation uses
+the existing BufferView algebra; halo and explicit copies share the physical copy checks.
+
+Explicit bindings cannot override any ScheduledHalo or ScheduledCollective leg. In particular,
+adding a physical binding does not make an analytic all-reduce executable. The future arithmetic
+lowering must emit separate scratch-copy and generated-combine steps and prove their relationship
+to the semantic operation and its numerical policy. Runtime transport remains a copy operation.
+The current numerical fixture uses generated `acopy!`, a resident scratch-region transfer, then
+generated `axpy!`. Its independent output checks include both the copied region and untouched
+sentinels; co-located workers validate composition, not fabric performance or collective semantics.
+
+Certificates retain the copy bindings alongside the existing local plans. Changing a valid
+endpoint rectangle invalidates old evidence even when payload size and analytic cost are unchanged.
+Constructing plans through `plan` defaults to no explicit copies; retained record/certificate
+values from the previous schema must be rebuilt. Surface numerical function semantics are unchanged.

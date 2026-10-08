@@ -640,6 +640,25 @@ Focused scan/distributed-plan/physical-binding/AMR-plan validation passes 70 tes
 assertions in the capped REPL. Independent review found no blockers; its extra qualified-operator
 and retained-leg mutation checks are included. Full cold CI remains a merge requirement.
 
+### Distributed physical assignments before arithmetic lowering (2026-10-08)
+
+The next seam binds ordinary copies to exact existing local graph regions through
+`DistributedPlan.copy-bindings`; see [distributed-materialization.md](distributed-materialization.md).
+It reuses BufferView projection, shared copy extent/alias checks and the existing readiness/runtime
+authorities. Source storage must realize the transferred value and stay within its owned region;
+constant destinations, unproven ghost sources, malformed or strided endpoints and stale witnesses
+reject. Explicit copies cannot override semantic collective or halo legs. The assignment may
+target a different mutable logical value: it is a physical copy contract, not value-version or
+collective algebra equivalence evidence.
+
+Focused scan/distributed-plan/compute/AMR-plan tests pass 74 tests / 392 assertions. A generated
+`acopy!` → resident scratch copy → generated `axpy!` fixture passes on the actual Level Zero device.
+The complete affected numerical namespace passes 13 tests / 61 assertions after separately fixing
+independent owned LinkPlan instantiations' runtime root identity collision. That lifetime fix keeps
+compiler and explicitly borrowed identities unchanged; it does not relax root retention guards.
+Independent physical-copy review found no blockers. Exact-head cold CI remains required; semantic
+collective lowering, packing, real fabric/overlap and full-model training acceptance remain open.
+
 The strict semantic restore boundary now checks the independently supplied target field/layout,
 logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
 verification also rejects opaque metadata and signed-zero drift. Affected state/native restart,

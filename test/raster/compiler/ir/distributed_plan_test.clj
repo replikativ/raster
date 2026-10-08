@@ -303,6 +303,18 @@
                  (:steps collective))
     :outputs (:completions collective)}))
 
+(deftest explicit-copy-bindings-do-not-turn-collective-legs-into-copies
+  (let [plan (collective-plan (two-device-all-reduce))
+        leg (first (get-in plan [:collectives 0 :steps]))
+        endpoint {:step :gradient-0 :local-value :gradient
+                  :region {:offsets [0] :shape [16]}}]
+    (is (= :distributed-copy-binding
+           (:reason (ex-data
+                      (try (distributed/validate!
+                             (assoc plan :copy-bindings
+                                    {(:id leg) {:source endpoint :target endpoint}}))
+                           (catch clojure.lang.ExceptionInfo e e))))))))
+
 (deftest collective-certificates-bind-algebra-and-numerical-policy
   (let [plan (collective-plan (two-device-all-reduce))
         certified (distributed/certify plan)]

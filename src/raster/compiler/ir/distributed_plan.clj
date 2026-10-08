@@ -44,10 +44,10 @@
             peak-memory-bytes attributes])
 (defrecord DistributedPlan
            [id mesh topology values shards collective-groups collectives
-            halos device-plans steps outputs attributes])
+            halos device-plans copy-bindings steps outputs attributes])
 (defrecord DistributedPlanCertificate
            [plan-id mesh-shape shard-coverage collectives halos
-            route-costs cost-vector device-plans])
+            route-costs cost-vector device-plans copy-bindings])
 (defrecord CertifiedDistributedPlan [plan certificate])
 
 (defn device-mesh? [value] (instance? DeviceMesh value))
@@ -826,6 +826,32 @@
 
 (declare simulate)
 
+(defn- validate-copy-bindings! [{:keys [copy-bindings steps collectives halos]}]
+  (when-not (map? copy-bindings)
+    (fail! "explicit copy bindings must be a map" :distributed-copy-bindings {}))
+  (let [by-id (into {} (map (juxt :id identity)) steps)
+        semantic-steps (into #{} (map :id) (mapcat :steps (concat collectives halos)))]
+    (doseq [[id binding] copy-bindings]
+      (let [transfer (get by-id id)]
+        (when-not (and (= :transfer (:kind transfer))
+                       (not (contains? semantic-steps id))
+                       (map? binding) (= #{:source :target} (set (keys binding))))
+          (fail! "explicit copies require an ordinary transfer, not a semantic collective or halo"
+                 :distributed-copy-binding {:step id}))
+        (doseq [side [:source :target]
+                :let [{:keys [step local-value region] :as endpoint} (get binding side)
+                      owner (get by-id step)]]
+          (when-not (and (map? endpoint) (= #{:step :local-value :region} (set (keys endpoint)))
+                         (some? local-value) (= :compute (:kind owner))
+                         (= (:device owner) (get transfer side))
+                         (map? region) (= #{:offsets :shape} (set (keys region)))
+                         (vector? (:offsets region)) (vector? (:shape region))
+                         (seq (:shape region)) (= (count (:offsets region)) (count (:shape region)))
+                         (every? #(and (integer? %) (not (neg? %))) (:offsets region))
+                         (every? pos-int? (:shape region)))
+            (fail! "copy endpoint requires an exact local rectangle on its endpoint worker"
+                   :distributed-copy-endpoint {:step id :side side :endpoint endpoint})))))))
+
 (defn- validate-structure!
   "Validate and return a DistributedPlan without realizing any runtime resource."
   [plan]
@@ -861,6 +887,7 @@
     (validate-halos! topology values shards halos steps)
     (validate-device-plans! mesh device-plans)
     (validate-steps! mesh topology values steps outputs)
+    (validate-copy-bindings! plan)
     (when-not (map? attributes)
       (fail! "distributed plan attributes must be a map"
              :distributed-plan-attributes {:attributes attributes})))
@@ -891,8 +918,8 @@
 
 (defn transfer-bindings
   "Validate and project every transfer to exact physical source/target BufferViews.
-   Currently requires contiguous plain ScheduledHalo copies with bound owned sources and
-   replica destinations. Unsupported or absent endpoints fail rather than acquiring guessed
+   Supports contiguous plain ScheduledHalo copies and explicitly bound local graph regions.
+   Unsupported or absent endpoints fail rather than acquiring guessed
    storage. Returns a map keyed by transfer step ID. This does not authorize execution:
    initialization/freshness, shared allocation and transport capabilities remain obligations."
   [plan]
@@ -908,12 +935,12 @@
 
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
-           halos device-plans steps outputs attributes]
+           halos device-plans copy-bindings steps outputs attributes]
     :or {values {} shards {} collective-groups {} collectives []
-         halos [] device-plans {} steps [] outputs [] attributes {}}}]
+         halos [] device-plans {} copy-bindings {} steps [] outputs [] attributes {}}}]
   (validate!
    (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
-                      device-plans (vec steps) (vec outputs) attributes)))
+                      device-plans copy-bindings (vec steps) (vec outputs) attributes)))
 
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
@@ -1045,7 +1072,8 @@
      ;; validated local plan values, including artifacts, scalar bindings, views and event
      ;; dependencies, so replacing an equally sized program invalidates the witness.
      ;; This is structural plan verification, not a digest of mutable buffer contents.
-     (:device-plans plan))))
+     (:device-plans plan)
+     (:copy-bindings plan))))
 
 (defn certify
   "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.

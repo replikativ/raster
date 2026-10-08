@@ -359,12 +359,61 @@
              reason {:step step :candidates (count regions)}))
     (first views)))
 
+(defn- checked-copy-projection [{:keys [id bytes]} source target]
+  (let [from (:view source) to (:view target)]
+    (when-not (and (view/contiguous? from) (view/contiguous? to))
+      (fail! "strided copies require generated pack/unpack compute"
+             :distributed-transfer-layout {:step id}))
+    (when-not (and (= (:dtype from) (:dtype to)) (= (:shape from) (:shape to))
+                   (= bytes (:byte-length from) (:byte-length to)))
+      (fail! "copy endpoint extents disagree with the scheduled payload"
+             :distributed-transfer-extent {:step id :bytes bytes}))
+    (when (view/overlaps? from to)
+      (fail! "copy endpoints must not overlap physical storage"
+             :distributed-copy-alias {:step id}))
+    {:source source :target target :bytes bytes}))
+
+(defn- explicit-copy-endpoint [bound transfer side endpoint]
+  (let [{:keys [step local-value region]} endpoint
+        entry (get bound step)
+        plan (:link-plan entry)
+        local (get-in plan [:values local-value])
+        binding (get-in entry [:values local-value])]
+    (when-not (and entry local
+                   (or (= :target side) (and binding (= (:value transfer) (:value binding)))))
+      (fail! "copy endpoint must name a bound local value; source must realize the transferred value"
+             :distributed-copy-local-value
+             {:step (:id transfer) :side side :endpoint endpoint}))
+    (let [domain (or (get-in binding [:domain :view])
+                     (project-domain local (local-leaves plan local)
+                                     (get-in local [:abstract :shape])))
+          projected (view/rectangular-subview domain region)
+          owned (some #(when (= :owned (:kind %)) (:region %))
+                      (get-in binding [:domain :placements]))]
+      (when (and (= :source side) owned
+                 (not (every? true? (map (fn [offset extent start size]
+                                          (and (<= start offset)
+                                               (<= (+' offset extent) (+' start size))))
+                                        (:offsets region) (:shape region)
+                                        (:offsets owned) (:shape owned)))))
+        (fail! "explicit copy sources must stay inside the bound owned region"
+               :distributed-copy-owned-source {:step (:id transfer) :endpoint endpoint}))
+      (when (and (= :target side)
+                 (some (fn [[_ entry]]
+                         (some #(and (= :constant (:role %))
+                                     (view/overlaps? projected (:view %)))
+                               (vals (get-in entry [:link-plan :nodes])))) bound))
+        (fail! "copy cannot overwrite constant local storage"
+               :distributed-copy-constant {:step (:id transfer) :endpoint endpoint}))
+      {:device (get transfer side) :local-step step :local-value local-value :view projected})))
+
 (defn transfer-bindings
   "Strict physical endpoint projection after enclosing DistributedPlan structural validation.
-   Supports contiguous plain copy-halo regions only. Unlike the analytical planner, this fails
+   Supports contiguous copy-halo regions and explicit owned-source local graph copy regions.
+   Unlike the analytical planner, this fails
    on absent/ambiguous endpoints and unsupported transfer kinds. No allocation is performed;
    source initialization, freshness, and transport capability are NOT proven here."
-  [{:keys [steps shards halos] :as plan}]
+  [{:keys [steps shards halos copy-bindings] :as plan}]
   (let [bound (:bindings (bindings plan))
         step-by-id (into {} (map (juxt :id identity)) steps)
         halo-ids (into #{} (map :id) (mapcat :steps halos))
@@ -389,9 +438,14 @@
           (for [{:keys [id source target value bytes attributes] :as step} steps
                 :when (= :transfer (:kind step))]
             (do
-              (when-not (and (contains? halo-ids id) (= :copy (:destination-mode attributes)))
-                (fail! "physical transfer projection requires a scheduled copy halo"
+              (when-not (or (contains? copy-bindings id)
+                            (and (contains? halo-ids id) (= :copy (:destination-mode attributes))))
+                (fail! "physical transfer projection requires a scheduled copy halo or explicit copy binding"
                        :distributed-transfer-kind {:step id}))
+              (if-let [explicit (get copy-bindings id)]
+                (let [from (explicit-copy-endpoint bound step :source (:source explicit))
+                      to (explicit-copy-endpoint bound step :target (:target explicit))]
+                  [id (checked-copy-projection step from to)])
               (let [source-shard (:source-shard attributes)
                     candidate (get shard-by-id [value source-shard])
                     rectangle (:source-region attributes)
@@ -407,15 +461,7 @@
                          (get owned [source value source-shard]))
                     from (unique-endpoint-view! source-views :distributed-transfer-source id)
                     to (unique-endpoint-view! (get replicas [target id]) :distributed-transfer-target id)]
-                (when-not (and (view/contiguous? from) (view/contiguous? to))
-                  (fail! "strided halo endpoints require a certified pack/unpack lowering"
-                         :distributed-transfer-layout {:step id}))
-                (when-not (and (= (:dtype from) (:dtype to))
-                               (= (:shape from) (:shape to))
-                               (= bytes (:byte-length from) (:byte-length to)))
-                  (fail! "transfer endpoint extents disagree with scheduled payload"
-                         :distributed-transfer-extent {:step id :bytes bytes}))
-                [id {:source {:device source :value value :shard source-shard :view from}
-                     :target {:device target :value value :shard (:target-shard attributes)
-                              :replica id :view to}
-                     :bytes bytes}]))))))
+                [id (checked-copy-projection
+                      step {:device source :value value :shard source-shard :view from}
+                      {:device target :value value :shard (:target-shard attributes)
+                       :replica id :view to})])))))))

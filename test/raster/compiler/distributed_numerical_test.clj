@@ -40,6 +40,83 @@
 (def ^:private compiled-copy
   (delay (equation/compile #'arrays/acopy! {:target :ze:0 :dtype :double})))
 
+(def ^:private compiled-combine
+  (delay (equation/compile #'numeric/axpy! {:target :ze:0 :dtype :double})))
+
+(defn- explicit-copy-combine-plan []
+  (let [seed (double-array (range 9))
+        source-out (double-array (repeat 9 -999.0))
+        own (double-array (map #(+ 100.0 %) (range 9)))
+        scratch (double-array (repeat 9 -50.0))
+        output (double-array 9)
+        place (fn [worker local]
+                (update local :nodes
+                        #(update-vals % (fn [node]
+                                          (update-in node [:view :allocation :id]
+                                                     (fn [id] [worker id]))))))
+        source (place :worker-0 (equation/lower @compiled-copy [seed 0 source-out 0 9]))
+        target (place :worker-1 (equation/lower @compiled-combine [output own 1.0 scratch]))
+        local-value (fn [local host]
+                      (first (for [[id v] (:values local)
+                                   :when (some #(identical? host (get-in local [:nodes (:node %) :source]))
+                                               (:leaves v))] id)))
+        source-value (local-value source source-out)
+        scratch-value (local-value target scratch)
+        locals {:worker-0 source :worker-1 target}
+        globals (into {} (for [[worker local] locals [id v] (:values local)]
+                           [[worker id] (assoc (:abstract v)
+                                               :sharding {:kind :replicated :devices [worker]})]))
+        shards (into {} (for [[[worker id] global] globals]
+                          [[worker id] [(distributed/shard
+                                         {:id [worker id] :value [worker id] :device worker
+                                          :offsets [0] :shape (:shape global) :ownership :replica})]]))]
+    (distributed/plan
+      {:id :generated-copy-combine
+       :mesh (distributed/mesh [{:name :workers :size 2}] [:worker-0 :worker-1])
+       :topology (distributed/topology
+                   (mapv #(distributed/device {:id % :memory-capacity-bytes 1048576}) (keys locals))
+                   [(distributed/link {:id :forward :source :worker-0 :target :worker-1
+                                       :bandwidth-bytes-s 1.0e9 :latency-ns 1})])
+       :values globals :shards shards
+       :device-plans (into {} (for [[worker local] locals]
+                               [worker {:target :ze:0 :entries {:kernel {:link-plan local}}
+                                        :steps {worker {:entry :kernel
+                                                        :bindings (into {} (for [id (keys (:values local))]
+                                                                             [id {:value [worker id]
+                                                                                  :shard [worker id]}]))}}}]))
+       :copy-bindings {:move {:source {:step :worker-0 :local-value source-value
+                                      :region {:offsets [2] :shape [3]}}
+                             :target {:step :worker-1 :local-value scratch-value
+                                      :region {:offsets [4] :shape [3]}}}}
+       :steps [(distributed/compute-step {:id :worker-0 :device :worker-0 :duration-ns 1})
+               (distributed/transfer-step {:id :move :source :worker-0 :target :worker-1
+                                           :value [:worker-0 source-value] :route [:forward]
+                                           :bytes 24 :dependencies [:worker-0]})
+               (distributed/compute-step {:id :worker-1 :device :worker-1 :duration-ns 1
+                                          :dependencies [:move]})]
+       :outputs [:worker-1]})))
+
+(deftest explicit-scratch-copy-feeds-an-ordinary-generated-combine
+  (let [plan (explicit-copy-combine-plan)
+        ready (distributed/check-readiness plan)
+        expected [50.0 51.0 52.0 53.0 106.0 108.0 110.0 57.0 58.0]]
+    (is (= [:compute :transfer :compute] (mapv :kind (:actions ready))))
+    (is (= 0 (get-in plan [:device-plans :worker-1 :entries :kernel :link-plan
+                          :attributes :driver-allocations])))
+    (is (not= expected (vec (numeric/axpy! (double-array 9)
+                                          (double-array (map #(+ 100.0 %) (range 9)))
+                                          1.0 (double-array (repeat 9 -50.0)))))
+        "omitting the copy changes the independent numerical oracle")
+    (if-not @gp/gpu-available?
+      (gp/gpu-skip! "explicit-scratch-copy-generated-combine")
+      (with-open [executable (gpu-distributed/instantiate!
+                              plan {:transport :resident-copy :device-capacities {:ze:0 1048576}})]
+        (gpu-distributed/run! executable)
+        (let [resident (first (vals (get (gpu-distributed/output-values executable) :worker-1)))
+              actual (double-array 9)]
+          (gpu/download-range! (get (:sessions executable) :ze:0) resident actual {:elements 9})
+          (is (= expected (vec actual))))))))
+
 (defn- problem []
   (let [shards [(distributed/shard {:id :left :value :u :device :worker-0
                                    :offsets [0 0] :shape [2 width]})
