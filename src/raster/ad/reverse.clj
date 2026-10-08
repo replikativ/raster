@@ -2353,6 +2353,11 @@
         {:keys [sign term]} (additive-step body-result acc-sym)
         active-free (filterv #(contains? free-syms %) active-params)]
     (when (and term
+               ;; The backward evaluates the prelude and term again. Additive
+               ;; shape alone does not permit replaying writes or fresh draws;
+               ;; use the same purity proof as the ordered carry replay route.
+               (every? (comp replay-pure-reduce-expr? second) scalar-bindings)
+               (replay-pure-reduce-expr? body-result)
                (not-any? (fn [[_ init]] (contains? (util/free-syms init) acc-sym))
                          scalar-bindings)
                ;; an active array outside the admitted reads would be a free scalar

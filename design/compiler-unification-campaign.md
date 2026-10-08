@@ -1,5 +1,31 @@
 # Compiler unification campaign
 
+### October 8 resumed acceptance and AD review
+
+The bounded JVM Float-seed correction (#1070) and position-sensitive helper capture (#1071)
+are squash-merged after all seven registered CI gates passed. The unchanged real-checkpoint
+gate after #1070 still declined: loss and input-gradient checks passed, but 12 of 28 adapter
+checks exceeded the original componentwise threshold. Same-input raw gradients and a secondary
+sequential-FP32 matrix diagnostic isolated an arithmetic-realization contribution without closing
+the residual or replacing the pinned CPU oracle. The external training PR remains held.
+
+Upstream #1072–1077 subsequently changed allocation defaults, buffer ownership, additive
+reduction AD and gathered-read transposes. Recheck current main before carrying forward the old
+numerical diagnosis. A code review flags two distinct replay obligations for focused reproduction:
+additive replay must satisfy the existing purity proof rather than repeat effectful preludes;
+storage replay/overwrite checks must follow aliases and include gathered index dependencies.
+Symbolic aliases alone cannot prove distinct caller-provided arrays physically disjoint.
+These correctness checks belong to the existing consolidation campaign, not a new compiler or
+another AD rule registry. The distributed, multilevel/PDE and broader workload gates remain open.
+
+The current-main checkpoint recheck reproduces the same failed numerical gate, without changing
+the source pins or tolerances. Independent deterministic probes confirm the replay concerns:
+an alias write changes a scalar gradient from 3 to 102, and an effectful additive prelude executes
+twice (gradient 12 and scratch 6 instead of 3 and 3). Additive replay now reuses the ordered
+route's existing purity proof; impure steps retain their closure tape and execute effects once.
+This preserves support for effectful reductions rather than rejecting their additive shape.
+Storage-alias and gathered-index replay protection remain the next distinct slice.
+
 ### October 6 contextual initializer precision follow-up
 
 Real-weight boundary isolation exposed a remaining JVM/GPU arithmetic discrepancy in attention
