@@ -11,6 +11,27 @@
 
 (defn- close? [a b] (< (Math/abs (- (double a) (double b))) 1e-9))
 
+;; Additive shape does not license replaying an effectful step. The ordered
+;; closure tape must retain each forward read instead of executing its write
+;; again in backward.
+(deftm effectful-additive-step
+  [w :- Double, scratch :- (Array double), m :- Long] :- Double
+  (par/reduce acc 0.0 i m
+    (let [r (ra/aget scratch 0)
+          _ (ra/aset scratch 0 (n/+ r 1.0))]
+      (n/+ acc (n/* w r)))))
+
+(deftest additive-effects-execute-only-in-forward
+  (doseq [m [0 1 3]]
+    (let [scratch (double-array [0.0])
+          [value dw] ((rev/value+grad #'effectful-additive-step :wrt [0]) 2.0 scratch m)
+          sum (/ (* m (dec m)) 2.0)]
+      (testing m
+        (is (close? (* 2.0 sum) value))
+        ;; A zero-trip closure tape produces the existing absent/zero tangent.
+        (if (zero? m) (is (nil? dw)) (is (close? sum dw)))
+        (is (= [(double m)] (vec scratch)))))))
+
 ;; A map with nothing to differentiate still fills its output.
 (deftm constant-fill-plus [x :- Double, m :- Long] :- Double
   (let [out (double-array m)]
