@@ -1562,8 +1562,10 @@ regressions include mixed constants, intervening rounding, signed zero, infinity
 times zero, metadata and child constant propagation. This is not a new type or
 function registry, and it does not add a separate typed scalar evaluator.
 
-The retired recursive scalar normalizer has no active production consumer in the
-main scalar passes; its old private impl-name diagnostic still has a test caller.
+The unused recursive scalar normalizer is deleted after checking production and
+test references. Its sole test dependency now uses the existing shared implementation-name
+decoder strictly as a provenance diagnostic, not as an arithmetic lowering rule.
+The positive and deliberately corrupted-call controls preserve that regression.
 The SIMD backend has a distinct `normalize-invk` requiring its own proof and
 execution regression before a global no-erasure claim. Safe typed scalar
 optimizations should derive from existing declared signatures and canonical
