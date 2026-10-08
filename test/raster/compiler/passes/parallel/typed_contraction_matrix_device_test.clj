@@ -190,7 +190,8 @@
     (if-not @available?
       (skip! (str "equation-first dynamic register tile on " device))
       (doseq [[batch in-f out-f] [[1 3 2] [3 5 7] [65 17 67]]
-              layout [:nn :tn]]
+              layout [:nn :tn]
+              strategy [:register-tiled :dispatch-register-tiled]]
         (let [left (float-array (map #(/ (- (mod % 17) 8) 4.0)
                                      (range (* batch in-f))))
               right (float-array (map #(/ (- (mod % 13) 6) 8.0)
@@ -202,7 +203,7 @@
               prepared (compiled/lower
                         source arguments
                         {:compiler :equation-first :target device :dtype :float
-                         :schedule {:typed-contraction {:strategy :register-tiled}}})
+                         :schedule {:typed-contraction {:strategy strategy}}})
               live (compiled/instantiate! prepared)]
           (try
             ;; Dyadic values keep these sums exact in FP32, even with target FMA.
@@ -215,7 +216,7 @@
                 (is (java.util.Arrays/equals
                       ^floats expected
                       ^floats (value/->host (:result (live (if changed? {:a next-left} {})))))
-                    (str device " " layout " " [batch in-f out-f]
+                    (str device " " layout " " strategy " " [batch in-f out-f]
                          " changed=" changed?))))
             (finally (compiled/close! live))))))))
 
