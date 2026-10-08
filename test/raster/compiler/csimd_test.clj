@@ -8,6 +8,7 @@
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.backend.jvm.segop-simd :as ss]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.reduction :as reduction]
@@ -186,6 +187,23 @@
                 :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
                :avx2 '#{a out})))
         "store pointer width must match the declared output dtype"))
+
+(deftest partial-storage-environments-fail-closed
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :double
+                   :out-sym 'y :cast-fn 'double :lambda '(double (aget x i))}]
+    (doseq [environment ['{y :double} '{x :float} '{other :double}]]
+      (binding [cs/*array-types* environment]
+        (is (nil? (cs/compile-segmap-c operation :avx2 '#{x y}))
+            "a partial retained environment cannot guess a missing input or output width")))
+    (binding [cs/*array-types* '{other :double}]
+      (is (nil? (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x}))
+          "reductions also require every accessed storage fact"))
+    (let [original intrinsics/simd-type-info]
+      (binding [cs/*array-types* '{x :float y :double}]
+        (with-redefs [intrinsics/simd-type-info
+                      (fn [isa elem] (dissoc (original isa elem) :from-f32-load))]
+          (is (nil? (cs/compile-segmap-c operation :avx2 '#{x y}))
+              "converting loads require both load and conversion facet entries"))))))
 
 (deftest segmap-elementwise-matches-scalar
   (testing "y[L]=a[L]*s+b[L] via compile-segmap-c == scalar, f64 and f32"

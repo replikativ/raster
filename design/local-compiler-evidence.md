@@ -1640,8 +1640,10 @@ products explicitly widen each Float operand before multiplication.
 Unsupported known byte/long storage, narrowing loads, and conflicting output
 storage decline before vector emission. Existing i32-to-Float map widening remains
 supported; it is not permission to reinterpret byte or Long arrays as i32 arrays.
-Absent storage entries retain the legacy direct-emitter interface, not a proof
-of arbitrary mixed-storage support. Native map/reduction tests cover changed
+Only an entirely empty storage environment retains the legacy direct-emitter
+interface; partial environments require every accessed/output storage fact and
+fail closed if propagation omitted one. This is not a proof of arbitrary
+mixed-storage support. Native map/reduction tests cover changed
 inputs and lengths around vector boundaries; no model oracle or tolerance changes.
 This enables a genuine storage conversion but does not yet implement mixed
 arithmetic domains or Double-compute-to-Float-store quantized folds.

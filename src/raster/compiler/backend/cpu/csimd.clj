@@ -62,15 +62,17 @@
 
 (def ^:dynamic *array-types*
   "Retained array storage element types supplied by AOT binding. Storage width is
-   independent of arithmetic precision; absent entries retain legacy emitter tests."
+   independent of arithmetic precision. Only an entirely empty environment retains
+   the legacy direct-emitter interface; partial environments fail closed."
   {})
 
 (defn- storage-load-compatible? [isa elem arr int-widen?]
   (let [storage (get *array-types* arr)]
-    (or (nil? storage)
+    (or (empty? *array-types*)
         (= storage (case elem :f64 :double :f32 :float :i32 :int nil))
         (and (= elem :f64) (= storage :float)
-             (:from-f32 (in/simd-type-info isa elem)))
+             (:from-f32 (in/simd-type-info isa elem))
+             (:from-f32-load (in/simd-type-info isa elem)))
         ;; Existing eight-lane i32 widening into Float arithmetic.
         (and int-widen? (= elem :f32) (= storage :int)))))
 
@@ -265,7 +267,7 @@
                ;; is still present. Syntax admission below remains emitter-specific.
                (ss/retained-floating-precision-compatible? source (:dtype segmap))
                (storage-loads-compatible? isa elem lambda idx true)
-               (or (nil? (get *array-types* out))
+               (or (empty? *array-types*)
                    (= (get *array-types* out)
                       (case elem :f64 :double :f32 :float :i32 :int nil)))
                (ss/simd-able? lambda idx)
