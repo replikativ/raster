@@ -119,3 +119,75 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (distributed/refinement-facts
                   (assoc-in refinement [:operation :reduction :combine] '*))))))
+
+(defn- projection-inputs [n]
+  (let [refinement (direct-refinement n)
+        devices (get-in refinement [:group :devices])
+        links (distinct (mapcat :route (filter #(= :copy (:kind %)) (:nodes refinement))))]
+    [refinement
+     (distributed/topology
+      (mapv #(distributed/device {:id % :memory-capacity-bytes 1048576}) devices)
+      (mapv (fn [[source target :as id]]
+              (distributed/link {:id id :source source :target target
+                                 :bandwidth-bytes-s 1.0e9 :latency-ns 1})) links))
+     (into {} (map (fn [[id worker]]
+                     [id (distributed/compute-step {:id [worker :produce] :device worker
+                                                    :duration-ns 1})])) (:inputs refinement))
+     (into {} (keep #(when (= :combine (:kind %))
+                      [(:id %) {:duration-ns 2 :peak-memory-bytes 204}])) (:nodes refinement))]))
+
+(deftest topology-projection-preserves-arithmetic-dependencies-and-broadcast-completion
+  (doseq [n [2 3 4 7]]
+    (let [[refinement cluster inputs costs] (projection-inputs n)
+          projected (distributed/project-refinement refinement cluster inputs costs)
+          first-copy (first (:steps projected))
+          final-combine [(keyword (str "worker-" (dec n))) :combined]
+          plan (distributed/plan
+                {:id :projected-tree
+                 :mesh (distributed/mesh [{:name :workers :size n}]
+                                         (get-in refinement [:group :devices]))
+                 :topology cluster :values (:values projected) :shards (:shards projected)
+                 :steps (into (mapv inputs (keys (:inputs refinement))) (:steps projected))
+                 :outputs (:completions projected)})]
+      (is (= [[:worker-1 :produce]] (:dependencies first-copy)))
+      (is (= 68 (:bytes first-copy)))
+      (is (= :compute (:kind (second (:steps projected)))))
+      (is (= [[:worker-0 :produce] [:worker-1 :received]]
+             (:dependencies (second (:steps projected)))))
+      (is (= final-combine (first (:completions projected))))
+      (is (= [final-combine] (:dependencies (last (:steps projected)))))
+      (is (= (set (keys (:values (distributed/refinement-facts refinement))))
+             (set (keys (:values projected)))))
+      (is (= plan (distributed/validate! plan)))
+      (is (pos? (:makespan-ns (distributed/simulate plan)))))))
+
+(deftest projection-rejects-route-cost-and-producer-forgeries
+  (let [[refinement cluster inputs costs] (projection-inputs 3)
+        project #(distributed/project-refinement %1 %2 %3 %4)]
+    (is (= :distributed-refinement-input-producers
+           (reason #(project refinement cluster (dissoc inputs [:worker-1 :input]) costs))))
+    (is (= :distributed-refinement-input-producers
+           (reason #(project refinement cluster
+                             (assoc-in inputs [[:worker-1 :input] :device] :worker-0) costs))))
+    (doseq [[field value] [[:source :forged-transfer] [:unknown :extension]
+                          [:peak-memory-bytes -1]]]
+      (is (= :distributed-refinement-input-producers
+             (reason #(project refinement cluster
+                               (assoc-in inputs [[:worker-1 :input] field] value) costs)))))
+    (is (= :distributed-refinement-step-identities
+           (reason #(project refinement cluster
+                             (assoc-in inputs [[:worker-1 :input] :id] [:worker-1 :received]) costs))))
+    (is (= :distributed-refinement-combine-costs
+           (reason #(project refinement cluster inputs {}))))
+    (is (= :distributed-refinement-combine-costs
+           (reason #(project refinement cluster inputs
+                             (assoc-in costs [[:worker-1 :combined] :duration-ns] 0)))))
+    (is (= :distributed-refinement-bytes
+           (reason #(project (assoc-in refinement [:value :shape]
+                                      [Integer/MAX_VALUE Integer/MAX_VALUE])
+                             cluster inputs costs))))
+    (is (= :distributed-transfer-link
+           (reason #(project (assoc-in refinement [:nodes 0 :route] [:missing]) cluster inputs costs))))
+    (is (= :distributed-transfer-continuity
+           (reason #(project (assoc-in refinement [:nodes 0 :route] [[:worker-0 :worker-1]])
+                             cluster inputs costs))))))

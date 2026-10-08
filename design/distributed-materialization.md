@@ -405,3 +405,16 @@ overrides. Its route declarations still need topology validation. The next proje
 copies to checked physical regions, combines to generated local arithmetic, and completion to
 the whole arithmetic-and-broadcast DAG. Storage donation and transport capabilities remain
 separate, later refinements. No existing surface numerical semantics change.
+
+`project-refinement` derives ordinary DistributedSteps and per-SSA tensor/shard declarations
+from that witness. Input dependencies name retained same-worker compute producers. Copy bytes
+come from the complete typed tensor extent, with checked representability; routes use the same
+directional topology validation as other transfers. Combine resource costs must be explicitly
+supplied analytical estimates. Each output completion follows its actual producer: root
+arithmetic or a completed broadcast copy, rather than an unrelated last communication round.
+
+This structural projection can be simulated through the existing DistributedPlan model; it does
+not admit execution or assert measured costs. The next compiler projection must retain the
+semantic witness in its certificate and bind each local combine to generated arithmetic, every
+SSA identity to physical storage, and transfer-only outputs to retained resident values. Existing
+readiness and runtime checks remain mandatory; no second executor is introduced.
