@@ -5,7 +5,7 @@
             [raster.linalg.lapack :as lapack])
   (:import [java.lang.foreign Arena FunctionDescriptor Linker MemoryLayout
             MemorySegment SymbolLookup ValueLayout]
-           [java.lang.invoke MethodHandles]
+           [java.lang.invoke MethodHandles MethodType]
            [java.util Optional]))
 
 (deftest integer-abi-admission
@@ -146,10 +146,64 @@
 (deftest explicit-provider-bypasses-mkl-preference
   (let [lookup (lookup-with-symbols #{"cblas_dgemm"}) calls (atom [])]
     (with-redefs [native-library/explicit-path (constantly "/pinned/openblas.so")
-                  native-library/find-library (fn [symbol _ path]
-                                               (swap! calls conj [symbol path]) lookup)]
+                  native-library/select-library (fn [symbol _ path]
+                                                  (swap! calls conj [symbol path])
+                                                  {:lookup lookup :source :explicit :path path})]
       (with-redefs-fn
         {(ns-resolve 'raster.linalg.blas 'try-load-mkl)
          (fn [] (throw (AssertionError. "explicit OpenBLAS must bypass MKL")))}
-        #(is (= [lookup :openblas] ((ns-resolve 'raster.linalg.blas 'find-blas)))))
+        #(let [[library backend evidence] ((ns-resolve 'raster.linalg.blas 'find-blas))]
+           (is (= [lookup :openblas] [library backend]))
+           (is (= {:source :explicit :path "/pinned/openblas.so"} evidence))))
       (is (= [["cblas_dgemm" "/pinned/openblas.so"]] @calls)))))
+
+(deftest retained-selection-evidence
+  (let [lookup (lookup-with-symbols #{"cblas_dgemm"})]
+    (with-redefs [native-library/openblas-config (constantly "OpenBLAS 0.3.32 DYNAMIC_ARCH")]
+      (let [selection (native-library/selected-library lookup :searched "/selected.so" "cblas_dgemm")]
+        (is (identical? lookup (:lookup selection)))
+        (is (= {:status :selected :source :searched :path "/selected.so"
+                :required-symbol "cblas_dgemm" :advertised-openblas-integer-abi :lp64
+                :configuration "OpenBLAS 0.3.32 DYNAMIC_ARCH" :abi-evidence :openblas-build-config}
+               (native-library/selection-status (constantly selection))))))
+    (with-redefs [native-library/openblas-config (constantly nil)]
+      (let [info (native-library/selection-status
+                   #(native-library/selected-library lookup :preloaded nil "cblas_dgemm"))]
+        (is (= :unknown (:advertised-openblas-integer-abi info)))
+        (is (not (contains? info :path)))
+        (is (not (contains? info :configuration)))))))
+
+(deftest selection-status-distinguishes-absence-and-failure
+  (is (= {:status :absent} (native-library/selection-status (constantly nil))))
+  (let [data {:reason :native-integer-abi-mismatch :expected :lp64 :actual :ilp64}]
+    (is (= (assoc data :status :rejected :message "bad ABI")
+           (native-library/selection-status #(throw (ex-info "bad ABI" data))))))
+  (is (= {:status :error :error-class "java.lang.IllegalStateException" :message "discovery failed"}
+         (native-library/selection-status #(throw (IllegalStateException. "discovery failed"))))))
+
+(deftest public-info-reports-retained-provider-not-current-property
+  (let [info {:status :selected :source :explicit :path "/original.so"
+              :advertised-openblas-integer-abi :lp64 :configuration "OpenBLAS test" :backend :openblas}]
+    (with-redefs [native-library/explicit-path (constantly "/changed.so")]
+      (with-redefs-fn {(ns-resolve 'raster.linalg.blas 'blas-state) (delay [(Object.) :openblas info])}
+        #(is (= info (blas/library-info))))))
+  (let [fortran {:status :selected :lookup (Object.) :source :searched :advertised-openblas-integer-abi :unknown}
+        rejected {:reason :explicit-native-symbol-unavailable :symbol "LAPACKE_dgeqrf"}]
+    (with-redefs-fn {(ns-resolve 'raster.linalg.lapack 'openblas) (delay fortran)
+                    (ns-resolve 'raster.linalg.lapack 'lapacke) (delay (throw (ex-info "missing QR" rejected)))
+                    #'lapack/set-num-threads! (fn [_] (throw (AssertionError. "diagnostics must not configure threads")))
+                    #'lapack/dsyevd! (fn [& _] (throw (AssertionError. "diagnostics must not run a solver")))}
+      #(is (= {:fortran (dissoc fortran :lookup)
+               :lapacke (assoc rejected :status :rejected :message "missing QR")}
+              (lapack/library-info))))))
+
+(deftest lp64-integer-arguments-do-not-wrap
+  (doseq [value [2147483648 -2147483649]]
+    (is (thrown? ArithmeticException ((ns-resolve 'raster.linalg.lapack 'int-seg) value))))
+  ;; A harmless zero-argument handle replaces native GEMM. Overflow must throw
+  ;; before invocation; a wrapped value would instead reach a wrong-arity call.
+  (let [handle (MethodHandles/empty (MethodType/methodType Void/TYPE))]
+    (with-redefs-fn {(ns-resolve 'raster.linalg.blas 'dgemm-mh) (delay handle)}
+      #(is (thrown? ArithmeticException
+                    (blas/dgemm! (double-array 1) (double-array 1) (double-array 1)
+                                 2147483648 1 1 1.0 0.0))))))

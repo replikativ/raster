@@ -39,13 +39,20 @@
    "/usr/lib/liblapacke.so"])
 
 (def ^:private openblas
-  (delay (native-library/require-lp64! (native-library/find-library "dgesdd_" lib-paths))))
+  (delay (native-library/select-library "dgesdd_" lib-paths)))
 (def ^:private lapacke
-  (delay (native-library/require-lp64!
-          (native-library/find-library "LAPACKE_dgeqrf" (concat lapacke-lib-paths lib-paths)))))
+  (delay (native-library/select-library "LAPACKE_dgeqrf" (concat lapacke-lib-paths lib-paths))))
+
+(defn library-info
+  "Report Fortran LAPACK and LAPACKE selection independently, without running
+   a solver or changing thread settings. Each lazily selected capability can
+   be absent/rejected even when the other is selected. Paths are loader inputs."
+  []
+  {:fortran (native-library/selection-status #(deref openblas))
+   :lapacke (native-library/selection-status #(deref lapacke))})
 
 (defn- require-lapack! []
-  (when-not @openblas
+  (when-not (:lookup @openblas)
     (throw (ex-info "No LAPACK library found. Install OpenBLAS (apt-get install libopenblas-dev)."
                     {:searched lib-paths}))))
 
@@ -125,10 +132,10 @@
                    (into-array Linker$Option [])))
 
 (def ^:private set-threads-mh
-  (delay (make-handle-noncritical @openblas "openblas_set_num_threads" set-threads-fd)))
+  (delay (make-handle-noncritical (:lookup @openblas) "openblas_set_num_threads" set-threads-fd)))
 
 (def ^:private get-threads-mh
-  (delay (make-handle-noncritical @openblas "openblas_get_num_threads" get-threads-fd)))
+  (delay (make-handle-noncritical (:lookup @openblas) "openblas_get_num_threads" get-threads-fd)))
 
 (defn get-num-threads
   "Get current OpenBLAS thread count."
@@ -175,7 +182,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/ADDRESS
                 ValueLayout/ADDRESS ValueLayout/ADDRESS])))
 
-(def ^:private dgesdd-mh (delay (make-handle @openblas "dgesdd_" dgesdd-fd)))
+(def ^:private dgesdd-mh (delay (make-handle (:lookup @openblas) "dgesdd_" dgesdd-fd)))
 
 (deftm dgesdd!
   "Thin SVD via divide-and-conquer. A is [m,n] row-major, overwritten.
@@ -284,7 +291,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/ADDRESS
                 ValueLayout/ADDRESS ValueLayout/ADDRESS])))
 
-(def ^:private dsyevd-mh (delay (make-handle @openblas "dsyevd_" dsyevd-fd)))
+(def ^:private dsyevd-mh (delay (make-handle (:lookup @openblas) "dsyevd_" dsyevd-fd)))
 
 (deftm dsyevd!
   "Symmetric eigendecomposition. A is [n,n] row-major symmetric,
@@ -336,7 +343,7 @@
                [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
                 ValueLayout/ADDRESS  ValueLayout/JAVA_INT ValueLayout/ADDRESS])))
 
-(def ^:private dgeqrf-mh (delay (make-handle @lapacke "LAPACKE_dgeqrf" dgeqrf-fd)))
+(def ^:private dgeqrf-mh (delay (make-handle (:lookup @lapacke) "LAPACKE_dgeqrf" dgeqrf-fd)))
 
 (deftm dgeqrf!
   "QR factorization via LAPACKE (row-major). A[m,n] overwritten with
@@ -355,7 +362,7 @@
                 ValueLayout/JAVA_INT ValueLayout/ADDRESS  ValueLayout/JAVA_INT
                 ValueLayout/ADDRESS])))
 
-(def ^:private dorgqr-mh (delay (make-handle @lapacke "LAPACKE_dorgqr" dorgqr-fd)))
+(def ^:private dorgqr-mh (delay (make-handle (:lookup @lapacke) "LAPACKE_dorgqr" dorgqr-fd)))
 
 (deftm dorgqr!
   "Generate thin Q[m,n] from Householder reflectors via LAPACKE (row-major)."
@@ -386,7 +393,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; B, LDB
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgesv-mh (delay (make-handle @openblas "dgesv_" dgesv-fd)))
+(def ^:private dgesv-mh (delay (make-handle (:lookup @openblas) "dgesv_" dgesv-fd)))
 
 (deftm dgesv!
   "Solve Ax=B via LU factorization. A[n,n] and B[n,nrhs] row-major,
@@ -423,7 +430,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; A, LDA
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dpotrf-mh (delay (make-handle @openblas "dpotrf_" dpotrf-fd)))
+(def ^:private dpotrf-mh (delay (make-handle (:lookup @openblas) "dpotrf_" dpotrf-fd)))
 
 (deftm dpotrf!
   "Cholesky factorization of symmetric positive definite matrix.
@@ -455,7 +462,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; B, LDB
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dpotrs-mh (delay (make-handle @openblas "dpotrs_" dpotrs-fd)))
+(def ^:private dpotrs-mh (delay (make-handle (:lookup @openblas) "dpotrs_" dpotrs-fd)))
 
 (deftm dpotrs!
   "Solve Ax=B using Cholesky factor L (from dpotrf!).
@@ -531,7 +538,7 @@
                 ValueLayout/ADDRESS                      ;; IPIV
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgetrf-mh (delay (make-handle @openblas "dgetrf_" dgetrf-fd)))
+(def ^:private dgetrf-mh (delay (make-handle (:lookup @openblas) "dgetrf_" dgetrf-fd)))
 
 (deftm dgetrf!
   "LU factorization with partial pivoting. A[m,n] row-major,
@@ -569,7 +576,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; B, LDB
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgetrs-mh (delay (make-handle @openblas "dgetrs_" dgetrs-fd)))
+(def ^:private dgetrs-mh (delay (make-handle (:lookup @openblas) "dgetrs_" dgetrs-fd)))
 
 (deftm dgetrs!
   "Solve Ax=B using LU factors (from dgetrf!).
@@ -611,7 +618,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; WORK, LWORK
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgetri-mh (delay (make-handle @openblas "dgetri_" dgetri-fd)))
+(def ^:private dgetri-mh (delay (make-handle (:lookup @openblas) "dgetri_" dgetri-fd)))
 
 (deftm dgetri!
   "Compute matrix inverse from LU factors (from dgetrf!).
@@ -659,7 +666,7 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; WORK, LWORK
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgels-mh (delay (make-handle @openblas "dgels_" dgels-fd)))
+(def ^:private dgels-mh (delay (make-handle (:lookup @openblas) "dgels_" dgels-fd)))
 
 (deftm dgels!
   "Least squares solve via QR/LQ. A[m,n] row-major, B[max(m,n),nrhs].

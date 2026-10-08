@@ -44,11 +44,11 @@
 
 (defn- try-load-lib
   "Attempt to load a shared library from a list of paths.
-  Returns SymbolLookup or nil."
+  Returns [SymbolLookup, selected path] or nil."
   [paths]
   (some (fn [path]
           (try
-            (SymbolLookup/libraryLookup path (Arena/global))
+            [(SymbolLookup/libraryLookup path (Arena/global)) path]
             (catch Exception _ nil)))
         paths))
 
@@ -117,14 +117,17 @@
                       (some dlopen-global mkl-paths)))]
       (when ok
         ;; Get a SymbolLookup handle for the already-loaded library
-        (when-let [lib (try-load-lib mkl-paths)]
+        (when-let [[lib path] (try-load-lib mkl-paths)]
           (when (.isPresent (.find lib "cblas_dgemm"))
-            [lib (if threaded? :mkl-threaded :mkl)]))))
+            [lib (if threaded? :mkl-threaded :mkl)
+             {:status :selected :source :mkl-components :path path
+              :required-symbol "cblas_dgemm" :declared-interface :lp64}]))))
     (catch Exception _ nil)))
 
 (defn- try-load-openblas [selected-path]
-  (when-let [lib (native-library/find-library "cblas_dgemm" openblas-paths selected-path)]
-    [lib :openblas]))
+  (let [selected (native-library/select-library "cblas_dgemm" openblas-paths selected-path)]
+    (when-let [lib (:lookup selected)]
+      [lib :openblas (dissoc selected :lookup)])))
 
 (defn- find-blas []
   ;; First check if cblas symbols are already available (e.g. loaded by
@@ -134,21 +137,36 @@
     (try-load-openblas path)
     (let [loader (SymbolLookup/loaderLookup)]
       (if (.isPresent (.find loader "cblas_dgemm"))
-        [loader :preloaded]
+        [loader :preloaded {:status :selected :source :preloaded
+                           :required-symbol "cblas_dgemm"}]
         ;; Try MKL first (with sequential threading), then OpenBLAS
         (or (try-load-mkl)
             (try-load-openblas nil))))))
 
 ;; Lazy — only loads library on first deref
 (def ^:private blas-state
-  "Delay returning [SymbolLookup, backend-keyword]."
-  (delay (when-let [[library backend] (find-blas)]
-           [(native-library/require-lp64! library) backend])))
+  "Delay retaining [SymbolLookup, backend-keyword, selection evidence]."
+  (delay (when-let [[library backend evidence] (find-blas)]
+           ;; Existing OpenBLAS selection already contains checked build facts.
+           ;; Component/preloaded selection needs the same metadata admission.
+           (let [details (if (contains? evidence :advertised-openblas-integer-abi)
+                           evidence
+                           (dissoc (native-library/selected-library
+                                    library (:source evidence) (:path evidence) "cblas_dgemm")
+                                   :lookup))]
+             [library backend (merge details evidence {:backend backend})]))))
 
 (defn backend
   "Returns the active BLAS backend: :mkl, :openblas, :preloaded, or nil if unavailable."
   []
   (second @blas-state))
+
+(defn library-info
+  "Return retained provider-selection facts or structured absence/rejection.
+   No GEMM smoke test is run. Selection is not functional/performance evidence;
+   :path is the requested loader path, not a binary hash or interposition proof."
+  []
+  (native-library/selection-status #(nth @blas-state 2 nil)))
 
 (defn- require-blas! []
   (when-not @blas-state
