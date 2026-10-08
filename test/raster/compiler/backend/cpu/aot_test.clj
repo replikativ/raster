@@ -97,6 +97,19 @@
           (is (= (seq rq) (seq cq)) "int8 quantized output bit-exact")
           (is (= (seq rs) (seq cs)) "double per-block scales bit-exact"))))))
 
+(deftest cpu-c-results-belong-to-the-caller
+  (when (clang-available?)
+    (let [x (double-array (map #(clojure.core/- (/ (double %) 10.0) 0.8) (range 16)))]
+      (testing "by default each call returns its own buffer"
+        (let [cfn (aot/compile-aot-c #'toi8-k :double)
+              a (cfn x 16)
+              b (cfn (double-array 16) 16)]
+          (is (not (identical? a b)))
+          (is (= (seq (toi8-k x 16)) (seq a)) "an earlier result survives a later call")))
+      (testing ":reuse-buffers? keeps one buffer per size across calls"
+        (let [cfn (aot/compile-aot-c #'toi8-k :double :reuse-buffers? true)]
+          (is (identical? (cfn x 16) (cfn x 16))))))))
+
 ;; ---- composed deftms must fuse into ONE C function (the rms-norm ∘ quant case) ----
 
 (deftm rmsnorm-k [x :- (Array double) w :- (Array double) n :- Long eps :- Double] :- (Array double)
