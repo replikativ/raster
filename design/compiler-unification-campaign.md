@@ -25,6 +25,15 @@ parameter `count` can cause an extracted helper to read `clojure.core/count` ins
 follow-up distinct from initializer precision and cover core-shadowing parameters at helper
 extraction; renaming a fixture to `cnt` isolates this slice, not a language restriction or fix.
 
+The helper-capture follow-up uses the existing shared lexical free-symbol analysis with visible
+parent locals declared, rather than allowing global core resolution to erase parameters. It also
+prevents a numeric global constant from replacing a same-named local parameter. Visibility is
+position-sensitive: each extracted `let` initializer sees only parameters and prior binders;
+the body sees all completed bindings. True globals remain eligible for the existing constant
+projection, and nested binders stay owned by the canonical scope analysis. Core-name/constant
+shadowing, nested shadowing and early-global/later-local regressions cover this JVM boundary.
+This does not introduce a new scanner, change surface signatures or close arbitrary-loop AD.
+
 Current scalar AD consolidation: final parameter projection follows retained SSA alias bindings
 to carried source types, keeping unknown/dynamically absent cotangents nil-safe. This removes the
 cold projection-helper typedness gap without adding an intrinsic or adjoint registry. The
