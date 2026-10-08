@@ -17,10 +17,21 @@ remain admitted. The executable regression uses two lengths and changed scalar
 inputs, with an independent Double-then-Float reference; admission controls cover
 both narrowing and widening boundaries. This does not establish real-model training
 acceptance or complete mixed-width vector support.
-The JVM stencil and C-SIMD callers that omit the active species, reduction-root
-operation precision, and typed comparison operand domains remain follow-ups. A
+At that checkpoint, JVM stencil and C-SIMD callers without an active species,
+reduction-root operation precision, and typed comparison domains remained follow-ups. A
 public native-C execution of this fixture also returns the correct result, but does
 not establish that its vector admission applied this guard.
+
+The follow-up separates retained floating precision obligations from emitter syntax
+admission. Stencil now carries the active species, while C map and reduction schedules
+use the same precision predicate without losing their supported integer-widening path.
+C map checks canonical conversion facts before projecting them back into source casts.
+Both reduction emitters check the complete retained recurrence, not only the extracted
+element. Positive and negative hardware-free admission controls cover these consumers;
+the affected suites, including executed native C integer widening, pass 53 tests and
+207 assertions locally. Missing result stamps are not inferred, and Boolean-result
+comparison operand domains remain unproven. This is not complete mixed-width SIMD
+lowering, a general numerical equivalence proof, or actual-weight training acceptance.
 
 ## Scalar non-contraction investigation — 2026-10-08
 
@@ -1543,6 +1554,36 @@ pins and tolerances with no pre-fix CPU classes. Loss remains 17921.2765625 vs
 17921.271875; input-gradient error is 0.006813176206858781. Twelve of 28 adapter
 checks still fail, with maximum 1.0649456537233917. This fixes a genuine compiler
 partitioning inconsistency but does not close the real-weight acceptance gate.
+
+A subsequent cold run including retained scalar and SIMD precision fixes has
+the same loss pair, input-gradient error 0.0019965899080526235, and eleven of 28
+adapter checks failing (maximum 0.6251970207953054). An additional diagnostic
+using the public `:gemm-precision :f32-scalar` option produces the identical
+metrics. Thus this experiment does not attribute the remaining disagreement to
+default mixed-precision matrix selection. Source pins, checkpoint, adapter seeds,
+reference arithmetic and acceptance tolerances are unchanged. These are still
+failed model checks, not a training certificate.
+
+### Quantized native fold: retained arithmetic versus output storage
+
+The wider CI suite exposed an obsolete vectorization assertion in the Q4 x8
+test. Its source explicitly converts both scales and the accumulator to Double,
+then stores Float after each block. The old all-Float AVX2 lowering instead rounds
+the scale product early. A one-block independent fixture distinguishes them:
+Float scales 1.0000001 and 0.3, folded integer dot 3, produce 0.90000015 with
+retained Double arithmetic but 0.9000001 with early Float rounding. Tests compare
+raw Float bits for the JVM source, native scalar and SIMD-requested compilation,
+with changed scales and the same compiled functions.
+
+The precision guard therefore declines this mixed-precision fold; the Q8 x8
+sibling uses the same Double-compute/Float-store structure and shares this debt.
+The integer
+dot override remains, and the separate homogeneous Float integer-widening SIMD
+execution regression remains required. This is an explicit performance debt,
+not evidence of performance parity: restore vectorization through typed
+Float-load → Double-compute → Float-store conversions, preserving lane counts,
+integer widths and rounding boundaries. Do not change the kernel's arithmetic or
+remove the precision guard merely to recover the previous intrinsic spelling.
 
 ### Shared scalar partial evaluation: typed operation boundaries
 

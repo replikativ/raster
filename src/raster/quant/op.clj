@@ -32,11 +32,10 @@
             [raster.compiler.backend.cpu.quant :as cq]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
-;; One host-best Q4_0 stream-gemv kernel, compiled once. This is now the COMPOSABLE
-;; qmatmul-q4-x8! lowered via compile-aot-c :simd? true (the csimd int→float widening
-;; column fold) — bit-exact and perf-matched to the retired hand-string kernel
-;; (compile-qmatmul-stream), from composable deftm source. Same out%8 / interleaved
-;; repack-stream layout contract.
+;; Composable Q4_0/Q8_0 stream GEMVs, compiled once with SIMD requested. The integer
+;; dot override remains; the Double scale fold into Float storage declines an
+;; all-Float vector schedule. Mixed-precision vectorization and renewed performance
+;; measurements remain necessary. Same out%8 / interleaved repack-stream contract.
 (def ^:private kq4 (delay ((requiring-resolve 'raster.quant.kernels/make-x8-c-gemv-into!))))
 (def ^:private kq8 (delay ((requiring-resolve 'raster.quant.kernels/make-x8-q8-c-gemv-into!))))
 

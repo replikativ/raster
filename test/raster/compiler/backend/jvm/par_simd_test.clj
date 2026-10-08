@@ -10,6 +10,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.materialize :as materialize]))
@@ -50,6 +51,26 @@
         "a narrowing cast does not license early narrowing of its computation")
     (is (not (segop-simd/simd-able? (list 'double narrow) 'i :double))
         "a widening cast does not license erasing inner Float rounding")))
+
+(deftest stencil-admission-keeps-the-active-species
+  (let [stencil {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                 :out-sym 'out :inputs '#{a} :cast-fn 'float
+                 :radius 1 :boundary :dirichlet}
+        body (fn [tag] (with-meta '(+ (aget a i) gain) {:raster.type/tag tag}))]
+    (is (some? (par-simd/compile-segstencil (assoc stencil :lambda (body 'float)))))
+    (is (nil? (par-simd/compile-segstencil (assoc stencil :lambda (body 'double)))))))
+
+(deftest reduction-admission-checks-the-root-operation
+  (let [operation (fn [tag]
+                    {:space {:dims [{:name 'i :bound 'n}]} :dtype :float :inputs '#{x}
+                     :reduction
+                     (reduction/scalar
+                      {:accumulator 'acc :neutral (float 0) :dtype :float
+                       :result 'out :index 'i
+                       :step-result (with-meta '(+ acc (aget x i))
+                                      {:raster.type/tag tag})})})]
+    (is (some? (segop-simd/compile-segred (operation 'float))))
+    (is (nil? (segop-simd/compile-segred (operation 'double))))))
 
 (deftest simd-able-simple-ops
   (testing "Simple arithmetic ops are SIMD-able"

@@ -48,7 +48,6 @@
 (def ^:private simd-ternary-ops descriptor/simd-ternary-ops)
 (def ^:private simd-type-info segop-simd/simd-type-info)
 (def ^:private aget-form? segop-simd/aget-form?)
-(defn- simd-able-expr? [expr idx] (segop-simd/simd-able? expr idx))
 
 ;; Integer index/offset/bound arithmetic must emit as clojure.core primitives —
 ;; bare symbols resolve to raster.numeric in the kernel ns and box per iteration.
@@ -169,7 +168,7 @@
         {:keys [species-expr from-array broadcast cast-fn]} (get simd-type-info elem-type)]
     (when (and out idx bound body (= radius 1) (= :dirichlet boundary))
       ;; Collect arrays and scalars from body
-      (when (simd-able-expr? body idx)
+      (when (segop-simd/simd-able? body idx elem-type)
         (let [arr-syms (collect-array-loads body idx)
               scalar-syms (collect-scalars body idx)
               species-sym (gensym "species__")
