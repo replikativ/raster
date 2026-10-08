@@ -184,5 +184,9 @@
     (decline! target (empty? (:compilation helpers)) :helper-compilation-unsupported
               {:compilation (:compilation helpers)})
     (str (:header dialect)
-         (c-dialect/helper-source (c-dialect/resolve! target) (:source helpers))
+         (c-dialect/scalar-arithmetic-preamble (c-dialect/resolve! target))
+         (c-dialect/helper-source
+          (c-dialect/resolve! target)
+          (str (c-dialect/scalar-arithmetic-helper-source (c-dialect/resolve! target) source)
+               (:source helpers)))
          "\n" source)))

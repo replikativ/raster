@@ -6,6 +6,27 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
+(defn scalar-product-body
+  "Dynamic nested product/add or explicit FMA, shared by emission and instruction gates."
+  [type fused?]
+  (body/make
+   {:id [:scalar-product type fused?]
+    :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :a)
+                 (body/->KernelParameter 'b :scalar type [] nil nil :b)
+                 (body/->KernelParameter 'c :scalar type [] nil nil :c)
+                 (body/->KernelParameter 'out :output type [1] :global
+                                         (layout/row-major [1] type) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'result type)
+                  (if fused?
+                    (body/scalar-expression :fma type ['a 'b 'c])
+                    (body/scalar-expression :+ type
+                      [(body/scalar-expression :* type ['a 'b]) 'c])))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn trapping-integral-cast-body
   "Checked signed narrowing fixture shared by emitter tests and hardware-free target CI."
   [source-type result-type]

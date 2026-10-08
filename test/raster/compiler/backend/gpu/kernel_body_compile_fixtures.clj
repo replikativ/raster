@@ -920,6 +920,15 @@
                (:source (matrix-target/emit-matrix-kernel
                          "mma_verified_contract"
                          (verified-direct-matrix-body :mma) :cuda)))])
+           (for [[type label] [[:float "f32"] [:double "f64"]]
+                 fused? [false true]]
+             (write-source! directory suffix
+                            (str "scalar-product-" label "-"
+                                 (if fused? "fused" "decomposed"))
+                            (body-emit/emit-scalar-kernel
+                             "scalar_product"
+                             (body-fixtures/scalar-product-body type fused?)
+                             {:target-dialect dialect})))
            (map (fn [dt]
                   (write-artifact! directory suffix (str "storage-probe-" (name dt))
                                    (storage-probe/emit-artifact dt dialect)))

@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
@@ -17,6 +18,45 @@
       (is (= ["" 7] (#'opencl/emit-scalar-operations [] 7 2)))
       (is (= ["2:7:a;2:8:b;2:9:c;" 10]
              (#'opencl/emit-scalar-operations ["a" "b" "c"] 7 2))))))
+
+(deftest scalar-product-target-spelling-preserves-explicit-fma
+  (let [emit (fn [target op type]
+               (binding [opencl/*scalar-dialect* (dialect/resolve! target)]
+                 (#'opencl/emit-intrinsic-expression
+                  (body/scalar-expression op type
+                    (if (= :fma op)
+                      [(body/literal 1.0 type) (body/literal 2.0 type)
+                       (body/literal 3.0 type)]
+                      [(body/literal 1.0 type) (body/literal 2.0 type)]))
+                  {:names {} :types {}})))]
+    (doseq [[type spelling] [[:float "__fmul_rn("] [:double "__dmul_rn("]]]
+      (is (str/starts-with? (emit :cuda :* type) spelling))
+      (is (str/starts-with? (emit :hip :* type)
+                           (dialect/noncontracting-multiply-name (dialect/resolve! :hip) type)))
+      (doseq [target [:opencl-intel :opencl-portable]]
+        (is (str/includes? (emit target :* type) " * "))))
+    (doseq [target [:opencl-intel :opencl-portable :cuda :hip]
+            type [:float :double]]
+      (is (str/starts-with? (emit target :fma type) "fma(")))))
+
+(deftest scalar-product-controls-are-self-contained-and-demand-driven
+  (doseq [target [:opencl-intel :opencl-portable :cuda :hip]
+          type [:float :double]
+          fused? [false true]]
+    (let [module (opencl/emit-scalar-module
+                  "scalar_product" (fixtures/scalar-product-body type fused?)
+                  {:target-dialect target})
+          source (:source module)]
+      (is (empty? (:compilation module)) "no external flag requirement is discarded")
+      (when (contains? #{:opencl-intel :opencl-portable} target)
+        (is (str/starts-with? source "#pragma OPENCL FP_CONTRACT OFF\n")))
+      (when (= :hip target)
+        (is (= (not fused?) (str/includes? source "__asm__(\"\" : \"+v\"(product))")))
+        (is (not (str/includes? source "__fmul_rn(")))
+        (when-not fused?
+          (is (str/includes? source "requires AMD HIP"))
+          (is (not (str/includes? source "volatile"))
+              "the register boundary must not become a volatile memory spill"))))))
 
 (defn- scalar-kernel-body []
   (let [group 'query-row

@@ -25,12 +25,29 @@ to a portable guarantee: [Clang documents that `fast` can override controlling p
 [NVIDIA documents non-contraction for its rounded multiply](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_fmul_rn.html);
 [OpenCL provides its own FP_CONTRACT control](https://registry.khronos.org/OpenCL/specs/unified/refpages/man/html/FP_CONTRACT.html).
 
-These are compiler-output checks, not CUDA/HIP execution or performance acceptance. The
-next lowering must preserve explicit FMA while enforcing non-contraction for decomposed
-scalar arithmetic, retain any required compilation controls through artifact/cache identity,
-and refuse unsupported consumers. It must not introduce an independent numerical registry
-or silently rely on arbitrary caller flags. Local OpenCL/Level Zero bit-sensitive checks
-and vendor instruction checks are required before claiming that boundary complete.
+The follow-up protects Float/Double scalar products in the shared target lowering: CUDA's
+rounded multiply and AMD HIP's empty read/write VGPR asm fence preserve the intermediate
+product; OpenCL uses FP_CONTRACT OFF. The HIP fence changes no product bits, has no memory
+clobber or volatile spill, and allows unused results to be eliminated. It requires AMD HIP,
+not a claim about other HIP platforms. Helper discovery is demand-driven and shared with
+matrix scalar epilogues. Explicit canonical FMA and matrix multiply-accumulate instructions
+remain explicit. Controls are entirely in the emitted source, already part of artifact/cache
+identity; there are no additional flags to lose or a second numerical-policy registry.
+
+The new shared Float/Double nested product/add and explicit-FMA fixtures compile through
+both hardware-free vendor instruction checks. CUDA emits separate rounded multiplication
+for the decomposed cases and FMA for explicit cases. HIP emits separate multiplication/add
+even with `-ffp-contract=fast`, and explicit FMA remains fused. These checks are added to
+the existing vendor CI gates. The affected scalar/matrix source suites pass 34 tests / 468
+assertions before two additional matrix-helper assertions. The existing bit-sensitive public
+register replay oracle passes 1 test / 36 assertions on OpenCL and Level Zero, including
+changed inputs and both product policies.
+
+This is bounded Float/Double product non-contraction evidence, not proof of all floating-point
+properties, CUDA/HIP execution, instruction throughput, or real-model training acceptance.
+Half scalar arithmetic, arbitrary fast-math reassociation/denormal settings, and target-library
+transcendental accuracy are not made exact by this change. The unchanged real-weight training
+gate still needs its matrix association and full cotangent differences localized.
 
 ## Public training and resident GEMM checkpoint — 2026-10-06
 
