@@ -303,6 +303,15 @@
   ([expr idx-sym elem-type]
    (binding [*simd-element-type* (or elem-type *simd-element-type*)]
     (cond
+    ;; Canonicalizing a typed call preserves its result stamp, not permission to
+    ;; evaluate it at the destination species. In particular (float <f64 term>)
+    ;; must compute the term in f64 before narrowing. Mixed-species arithmetic
+    ;; needs an explicit lane-shape schedule; retain scalar execution meanwhile.
+    (and (seq? expr) *simd-element-type*
+         (let [result-dtype (dtype/dtype-for-scalar-tag (:raster.type/tag (meta expr)))]
+           (and (contains? #{:float :double} result-dtype)
+                (not= *simd-element-type* result-dtype))))
+    false
     (number? expr) true
     (symbol? expr) true
     (some? (aget-form? expr idx-sym)) true

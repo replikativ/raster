@@ -1,5 +1,24 @@
 # Compiler unification campaign
 
+### October 9 typed arithmetic consolidation checkpoint
+
+#1098–#1100 are merged: C-family scalar product boundaries are protected separately
+from explicit FMA, transposed-left products use the shared register body, and JVM
+helper extraction retains typed calls and their operand conversions. #1101 extends
+that preservation to scalar simplification and partial evaluation; its follow-up
+checks retained operation precision during SIMD admission. An executed mixed-width
+surface map exposed different rounding in vector lanes and the scalar tail; the
+correct scalar schedule is retained until mixed-species vector lowering exists.
+These are shared semantic fixes, not replacement model kernels or a new type registry.
+
+The fresh unchanged real-weight two-layer training gate after #1100 passes loss and
+input-gradient checks but still fails 12 of 28 adapter-gradient checks. Real-model
+acceptance therefore remains open; neither these narrow regressions nor synthetic
+training acceptance closes campaign item 5. Continue precision-boundary consolidation
+and identical-input matrix/VJP localization without loosening the pinned oracle.
+CUDA/HIP runtime performance and multi-host execution likewise remain separate from
+hardware-free vendor compilation and local logical-worker acceptance.
+
 ### October 8 collective execution and precision-boundary follow-up
 
 The storage boundary fix is merged as #1095 after all seven required CI gates passed.

@@ -2,6 +2,9 @@
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.string]
             [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
+            [raster.numeric :as numeric]
+            [raster.compiler.pipeline :as pipeline]
             [raster.par :as par]
             [raster.compiler.ir.par :as ir.par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
@@ -14,6 +17,39 @@
 ;; ================================================================
 ;; Body analysis tests (segop-simd)
 ;; ================================================================
+
+(deftm mixed-precision-square-map
+  [src :- (Array float) gain :- Double] :- (Array float)
+  (let [out (arrays/alloc-like src (arrays/alength src))]
+    (par/map! out i (arrays/alength src) float
+      (numeric/+ (arrays/aget src i) (float (numeric/* gain gain))))
+    out))
+
+(deftest simd-keeps-double-computation-before-float-narrowing
+  (let [scalar (pipeline/compile-aot #'mixed-precision-square-map :simd? false)
+        vectorized (pipeline/compile-aot #'mixed-precision-square-map :simd? true)]
+    ;; Non-multiple lengths exercise vector lanes and the original scalar tail.
+    ;; Changed inputs rule out a fixture-specific constant or cached result.
+    (doseq [length [65 129] gain [1.00000006 1.00000018]]
+      (let [input (float-array (repeat length 0.0))
+            expected (float (* (double gain) (double gain)))
+            reference (scalar input gain)
+            actual (vectorized input gain)]
+        (is (every? #(= (Float/floatToRawIntBits expected)
+                       (Float/floatToRawIntBits (float %))) reference))
+        (is (= (vec reference) (vec actual)))))))
+
+(deftest simd-admission-respects-retained-operation-precision
+  (let [typed (fn [tag form] (with-meta form {:raster.type/tag tag}))
+        wide (typed 'double '(* gain gain))
+        narrow (typed 'float '(+ (aget src i) gain))]
+    (is (segop-simd/simd-able? narrow 'i :float)
+        "homogeneous typed arithmetic keeps the vector fast path")
+    (is (segop-simd/simd-able? wide 'i :double))
+    (is (not (segop-simd/simd-able? (list 'float wide) 'i :float))
+        "a narrowing cast does not license early narrowing of its computation")
+    (is (not (segop-simd/simd-able? (list 'double narrow) 'i :double))
+        "a widening cast does not license erasing inner Float rounding")))
 
 (deftest simd-able-simple-ops
   (testing "Simple arithmetic ops are SIMD-able"
