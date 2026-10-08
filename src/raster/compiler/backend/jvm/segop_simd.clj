@@ -296,6 +296,31 @@
   "Active Vector species element dtype while a scheduled SegOp is admitted."
   nil)
 
+(defn- floating-node-precision-compatible?
+  [expr elem-type]
+  (let [result-dtype (when (seq? expr)
+                       (dtype/dtype-for-scalar-tag (:raster.type/tag (meta expr))))
+        cast-dtype (when (seq? expr)
+                     (dtype/dtype-for-scalar-tag
+                      (descriptor/cast-result-tag (first expr))))
+        conversion-dtypes (when (soac-dialect/scalar-convert-form? expr)
+                            ((juxt :source-dtype :target-dtype)
+                             (:attributes (soac-dialect/scalar-convert-parts expr))))]
+    (or (nil? elem-type)
+        (every? #(or (not (contains? #{:float :double} %)) (= elem-type %))
+                (concat [result-dtype cast-dtype] conversion-dtypes)))))
+
+(defn retained-floating-precision-compatible?
+  "Do retained floating computations/conversions agree with the active species?
+   This is a precision obligation, not complete vector admission. It does not
+   infer missing types or comparison operand domains. Integer conversion support
+   remains the emitter's responsibility (C SIMD supports widening that JVM SIMD
+   does not)."
+  [expr elem-type]
+  (and (floating-node-precision-compatible? expr elem-type)
+       (or (not (coll? expr))
+           (every? #(retained-floating-precision-compatible? % elem-type) expr))))
+
 (defn simd-able?
   "Check if an expression can be fully compiled to SIMD ops."
   ([expr idx-sym]
@@ -307,10 +332,7 @@
     ;; evaluate it at the destination species. In particular (float <f64 term>)
     ;; must compute the term in f64 before narrowing. Mixed-species arithmetic
     ;; needs an explicit lane-shape schedule; retain scalar execution meanwhile.
-    (and (seq? expr) *simd-element-type*
-         (let [result-dtype (dtype/dtype-for-scalar-tag (:raster.type/tag (meta expr)))]
-           (and (contains? #{:float :double} result-dtype)
-                (not= *simd-element-type* result-dtype))))
+    (not (floating-node-precision-compatible? expr *simd-element-type*))
     false
     (number? expr) true
     (symbol? expr) true
@@ -1132,7 +1154,7 @@
                              (and (seq? a3) (= 'double (first a3)) (= acc (second a3))))))
                   ['+ '.add true]
                   :else [nil nil false])]
-            (when op
+            (when (and op (retained-floating-precision-compatible? lambda elem-type))
               (let [[acc-pos elem-raw]
                     (cond
                       fma? [:right (list '* (nth inner-body 1) (nth inner-body 2))]

@@ -17,10 +17,21 @@ remain admitted. The executable regression uses two lengths and changed scalar
 inputs, with an independent Double-then-Float reference; admission controls cover
 both narrowing and widening boundaries. This does not establish real-model training
 acceptance or complete mixed-width vector support.
-The JVM stencil and C-SIMD callers that omit the active species, reduction-root
-operation precision, and typed comparison operand domains remain follow-ups. A
+At that checkpoint, JVM stencil and C-SIMD callers without an active species,
+reduction-root operation precision, and typed comparison domains remained follow-ups. A
 public native-C execution of this fixture also returns the correct result, but does
 not establish that its vector admission applied this guard.
+
+The follow-up separates retained floating precision obligations from emitter syntax
+admission. Stencil now carries the active species, while C map and reduction schedules
+use the same precision predicate without losing their supported integer-widening path.
+C map checks canonical conversion facts before projecting them back into source casts.
+Both reduction emitters check the complete retained recurrence, not only the extracted
+element. Positive and negative hardware-free admission controls cover these consumers;
+the affected suites, including executed native C integer widening, pass 53 tests and
+207 assertions locally. Missing result stamps are not inferred, and Boolean-result
+comparison operand domains remain unproven. This is not complete mixed-width SIMD
+lowering, a general numerical equivalence proof, or actual-weight training acceptance.
 
 ## Scalar non-contraction investigation — 2026-10-08
 

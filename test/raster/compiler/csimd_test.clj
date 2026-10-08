@@ -10,7 +10,8 @@
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.jvm.segop-simd :as ss]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.reduction :as reduction]))
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn- numeric-invk [impl & arguments]
   (util/make-invk impl arguments))
@@ -55,6 +56,31 @@
   (let [out (first arrs)]
     (apply native (concat (rest arrs) [out (int n)]))
     (aget out 0)))
+
+(deftest c-vector-admission-keeps-retained-floating-precision
+  (let [body (fn [tag] (with-meta '(+ (aget a i) gain) {:raster.type/tag tag}))
+        operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float}]
+    (binding [ce/*emit-config* cpu/cpu-config ce/*scalar-type* "float"]
+      (is (some? (cs/compile-segmap-c (assoc operation :lambda (body 'float))
+                                     :avx2 '#{a out})))
+      (is (nil? (cs/compile-segmap-c (assoc operation :lambda (body 'double))
+                                    :avx2 '#{a out})))
+      (is (nil? (cs/compile-segmap-c
+                 (assoc operation :lambda
+                        (dialect/scalar-convert
+                         {:source-dtype :double :target-dtype :float
+                          :rounding :nearest-even :overflow :ieee
+                          :source-op 'clojure.core/float}
+                         '(+ (aget a i) gain)))
+                 :avx2 '#{a out}))
+          "conversion source precision is checked before source projection"))
+    (doseq [tag '[float double]]
+      (let [r (reduction/scalar
+               {:accumulator 'acc :neutral (float 0) :dtype :float :result 'out :index 'i
+                :step-result (with-meta '(+ acc (aget a i)) {:raster.type/tag tag})})]
+        (is (= (= tag 'float)
+               (some? (cs/compile-segred-c (assoc operation :reduction r) :avx2 '#{a}))))))))
 
 (deftest ssq-reduction-matches-scalar
   (testing "sum(x[i]^2) via compile-segred-c == scalar, f64 and f32"

@@ -11,9 +11,11 @@ active species. An executed mixed-width
 surface map exposed different rounding in vector lanes and the scalar tail; the
 correct scalar schedule is retained until mixed-species vector lowering exists.
 These are shared semantic fixes, not replacement model kernels or a new type registry.
-Stencil and C-SIMD callers without an active species, reduction-root precision and
-typed comparison domains still need separate admission evidence; this map fix does
-not certify those paths.
+The follow-up threads active-species precision obligations into stencil and C-SIMD
+consumers and checks complete reduction recurrences. C integer-widening syntax
+admission remains emitter-specific; canonical conversion precision is checked before
+source projection. Typed comparison domains and missing operation stamps still need
+separate evidence, and mixed-species vector execution remains unimplemented.
 
 The fresh unchanged real-weight two-layer training gate after #1100 passes loss and
 input-gradient checks but still fails 12 of 28 adapter-gradient checks. Real-model

@@ -108,6 +108,7 @@
                        (= (nth lambda 2) acc) (nth lambda 1)
                        :else nil)]
         (when (and (= op '+) elem
+                   (ss/retained-floating-precision-compatible? lambda (:dtype segred))
                    (ss/simd-able? elem idx)
                    (empty? (ss/value-position-arrays elem idx)))
           (let [factors (when (and (seq? elem) (= '* (first elem)) (= 3 (count elem))
@@ -234,15 +235,19 @@
         ;; Project them through their retained source spelling at this emitter boundary.  The
         ;; conversion attributes have already been certified, and both the vector expression and
         ;; scalar tail must see the same projection.
-        raw    (some-> (:lambda segmap) soac-dialect/scalar-converts->source)
+        source (some-> (:lambda segmap) ss/clean-dead-bindings)
+        raw    (some-> source soac-dialect/scalar-converts->source)
         ;; inline pure value-lets so a let*-bodied map (composed kernels: folded/scale
         ;; bindings) is a single lane expression — no manual source inlining needed.
-        lambda (when raw (inline-lets (ss/normalize-invk (ss/clean-dead-bindings raw))))
+        lambda (when raw (inline-lets (ss/normalize-invk raw)))
         out    (:out-sym segmap)
         cast   (:cast-fn segmap)
         elem   (vt-of (:dtype segmap))
         ti     (in/simd-type-info isa elem)]
     (when (and idx bound out ti (seq? lambda)
+               ;; Check before projecting conversions, while their declared source precision
+               ;; is still present. Syntax admission below remains emitter-specific.
+               (ss/retained-floating-precision-compatible? source (:dtype segmap))
                (ss/simd-able? lambda idx)
                (empty? (ss/value-position-arrays lambda idx)))
       (let [lanes (:lanes ti)
