@@ -224,13 +224,13 @@
   (when (and (not= :broadcast kind) root)
     (fail! "only broadcast collectives may carry a root device"
            :distributed-collective-root {:id id :kind kind :root root}))
+  (when reduction (scan/validate! reduction))
   (->CollectiveOperation id kind group value reduction root attributes))
 
 (defn collective-schedule
   [{:keys [algorithm rounds numerical-mode attributes]
     :or {numerical-mode {} attributes {}}}]
-  (let [rounds (mapv (fn [round] (mapv #(if (communication-leg? %)
-                                          % (communication-leg %)) round)) rounds)]
+  (let [rounds (mapv (fn [round] (mapv communication-leg round)) rounds)]
     (when-not (and (keyword? algorithm) (seq rounds) (every? seq rounds)
                    (map? numerical-mode) (map? attributes))
       (fail! "collective schedule requires an algorithm and non-empty communication rounds"
@@ -251,10 +251,8 @@
    Each round is a barrier: its legs may overlap, and the next round waits for all of them. The
    semantic CollectiveOperation is retained beside these cost/execution steps."
   [operation schedule dependencies]
-  (let [operation (if (collective-operation? operation) operation
-                      (collective-operation operation))
-        schedule (if (collective-schedule? schedule) schedule
-                     (collective-schedule schedule))
+  (let [operation (collective-operation operation)
+        schedule (collective-schedule schedule)
         dependencies (vec dependencies)
         {:keys [steps completions]}
         (reduce
@@ -297,6 +295,7 @@
   (when (and combine (not (scan/associative-scan? combine)))
     (fail! "accumulating halo exchange requires a certified associative reduction"
            :distributed-halo-combine {:id id :combine combine}))
+  (when combine (scan/validate! combine))
   (->HaloExchange id value axis width boundary combine attributes))
 
 (defn- halo-face
@@ -357,7 +356,7 @@
    rectangles, destination regions, byte counts and the round index are retained on each transfer
    step."
   [exchange abstract shards routes dependencies]
-  (let [exchange (if (halo-exchange? exchange) exchange (halo-exchange exchange))
+  (let [exchange (halo-exchange exchange)
         {:keys [id value axis width boundary combine]} exchange
         mode (if combine :combine :copy)
         sharding (:sharding abstract)
@@ -1028,13 +1027,14 @@
      (mapv (fn [{:keys [operation schedule steps completions]}]
              {:id (:id operation) :kind (:kind operation) :group (:group operation)
               :value (:value operation) :algorithm (:algorithm schedule)
+              :reduction (:reduction operation) :root (:root operation)
+              :numerical-mode (:numerical-mode schedule)
               :steps (mapv :id steps) :completions completions})
            (:collectives plan))
      (mapv (fn [{:keys [exchange steps completions]}]
              {:id (:id exchange) :value (:value exchange) :axis (:axis exchange)
               :width (:width exchange) :boundary (:boundary exchange)
-              :combine (some-> (:combine exchange)
-                               (select-keys [:combine :identity :dtype]))
+              :combine (:combine exchange)
               :rounds (inc (reduce max 0 (map #(get-in % [:attributes :round]) steps)))
               :steps (mapv :id steps) :completions completions
               :bytes (reduce + 0 (map :bytes steps))})

@@ -616,6 +616,30 @@ CUDA work can continue against Raster's committed external-source acceptance fix
 public pretrained-rstr while that migration proceeds. It must not require an unpublished
 sibling package to execute Raster's hardware-free compiler gates.
 
+### Distributed algebra witness consolidation (2026-10-08)
+
+Review found that the analytic collective witness retained routes/algorithm names but omitted
+the reduction algebra, broadcast root and numerical mode. Accumulating halo witnesses retained
+only combine/identity/dtype, dropping the algebra's numerical facets. Retained records also
+bypassed their constructors, so record identity could masquerade as validation after mutation.
+
+The existing associative scalar authority now independently rederives retained certificates.
+Distributed scheduling revalidates operations, schedules and communication legs even when they
+are records. Collective certificates retain the reduction/root/numerical mode, and halo
+certificates retain the complete associative certificate. Valid semantic changes require new
+distributed evidence; missing/forged algebra facts reject before certification. Old witnesses
+must be regenerated. This adds no operator registry, domain kernel emitter or runtime transport.
+
+The execution boundary remains narrower than the analytic planner: readiness accepts only copy
+halos, and refuses reducing collectives/accumulating halos before sessions or allocations.
+Arithmetic execution must eventually transfer into explicit scratch and run a generated typed
+combine as an ordinary bound compute step. The analytic witness is not a collective numerical
+equivalence proof, a real-fabric measurement or completion of campaign items 6/7.
+
+Focused scan/distributed-plan/physical-binding/AMR-plan validation passes 70 tests / 370
+assertions in the capped REPL. Independent review found no blockers; its extra qualified-operator
+and retained-leg mutation checks are included. Full cold CI remains a merge requirement.
+
 The strict semantic restore boundary now checks the independently supplied target field/layout,
 logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
 verification also rejects opaque metadata and signed-zero drift. Affected state/native restart,

@@ -105,6 +105,22 @@
   [reduction-op dtype]
   (certify* reduction-op dtype :reduction))
 
+(defn validate!
+  "Independently rederive a retained associative certificate; record identity is not proof.
+   The existing scalar algebra authority checks purity, typed identity and numerical facets."
+  [certificate]
+  (when-not (associative-scan? certificate)
+    (throw (ex-info "expected an associative scalar certificate"
+                    {:reason :associative-scan-certificate})))
+  (let [{:keys [acc init combine element dtype]} certificate
+        derived (certify-reassociation {:acc acc :init init
+                                       :lambda (list combine acc element)} dtype)]
+    (when-not (= derived certificate)
+      (throw (ex-info "associative scalar certificate differs from its rederived algebra"
+                      {:reason :associative-scan-certificate
+                       :expected derived :actual certificate})))
+    certificate))
+
 (defn compatible-certificate?
   "Whether two independently derived certificates prove the same typed monoid contract.
 
