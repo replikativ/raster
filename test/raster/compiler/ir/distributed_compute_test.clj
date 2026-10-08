@@ -134,6 +134,86 @@
 (defn- failure-reason [thunk]
   (:reason (ex-data (try (thunk) (catch clojure.lang.ExceptionInfo error error)))))
 
+(defn- explicit-copy-plan []
+  (let [source (assoc-in (local-link-plan) [:nodes :x-node :source] (float-array 6))
+        target (assoc-in (local-link-plan {:target :gpu-1}) [:nodes :x-node :source] (float-array 6))
+        copy (distributed/transfer-step
+               {:id :region-copy :source :gpu-0 :target :gpu-1 :route [:forward]
+                :value :y :bytes 12 :dependencies [:copy-0]})]
+    (distributed/plan
+      (assoc (plan-map)
+             :topology (distributed/topology
+                         (vals (:devices (topology)))
+                         [(distributed/link {:id :forward :source :gpu-0 :target :gpu-1
+                                             :bandwidth-bytes-s 1.0e9 :latency-ns 1})])
+             :device-plans
+             (assoc (device-plans source)
+                    :gpu-1 {:entries {:copy {:link-plan target}}
+                            :steps {:copy-1 {:entry :copy
+                                            :bindings {:local-x {:value :x :shard :x-1}
+                                                       :local-y {:value :y :shard :y-1}}}}})
+             :copy-bindings
+             {:region-copy {:source {:step :copy-0 :local-value :local-y
+                                    :region {:offsets [0 0] :shape [1 3]}}
+                            :target {:step :copy-1 :local-value :local-x
+                                     :region {:offsets [1 0] :shape [1 3]}}}}
+             :steps [(distributed/compute-step {:id :copy-0 :device :gpu-0 :duration-ns 1})
+                     copy
+                     (distributed/compute-step {:id :copy-1 :device :gpu-1 :duration-ns 1
+                                                :dependencies [:region-copy]})]
+             :outputs [:copy-1]))))
+
+(deftest explicit-copy-regions-reuse-local-storage-and-readiness
+  (let [plan (explicit-copy-plan)
+        projected (get (distributed/transfer-bindings plan) :region-copy)
+        ready (distributed/check-readiness plan)]
+    (is (= 12 (:bytes projected)))
+    (is (= 0 (get-in projected [:source :view :byte-offset])))
+    (is (= 12 (get-in projected [:target :view :byte-offset])))
+    (is (= [1 3] (get-in projected [:target :view :shape])))
+    (is (= [:copy-0 :region-copy :copy-1] (mapv :id (:actions ready))))
+    (is (= :distributed-readiness-race
+           (failure-reason #(distributed/check-readiness
+                              (assoc-in plan [:steps 1 :dependencies] [])))))
+    (is (= :distributed-readiness-race
+           (failure-reason #(distributed/check-readiness
+                              (assoc-in plan [:steps 2 :dependencies] [])))))
+    (is (= :distributed-certificate
+           (failure-reason #(distributed/verify!
+                              (assoc (distributed/certify plan) :plan
+                                     (assoc-in plan [:copy-bindings :region-copy :target :region :offsets]
+                                               [0 0]))))))))
+
+(deftest explicit-copy-regions-fail-closed-on-invalid-endpoints
+  (let [plan (explicit-copy-plan)]
+    (doseq [[changed reason]
+            [[(assoc plan :copy-bindings nil) :distributed-copy-bindings]
+             [(assoc plan :copy-bindings {:missing (get-in plan [:copy-bindings :region-copy])})
+              :distributed-copy-binding]
+             [(assoc-in plan [:copy-bindings :region-copy :target :extra] true)
+              :distributed-copy-endpoint]
+             [(assoc-in plan [:copy-bindings :region-copy :source :step] :copy-1)
+              :distributed-copy-endpoint]
+             [(assoc-in plan [:copy-bindings :region-copy :source :local-value] :missing)
+              :distributed-copy-local-value]
+             [(assoc-in plan [:copy-bindings :region-copy :source :local-value] :local-x)
+              :distributed-copy-local-value]
+             [(assoc-in plan [:copy-bindings :region-copy :target :local-value] :local-weights)
+              :distributed-copy-constant]
+             [(assoc-in plan [:copy-bindings :region-copy :target :region :offsets] [2 0])
+              :buffer-view-region]
+             [(assoc-in plan [:steps 1 :bytes] 8)
+              :distributed-transfer-extent]
+             [(assoc-in plan [:copy-bindings :region-copy :target :region] {:offsets [0 0] :shape [2 3]})
+              :distributed-transfer-extent]
+             [(-> plan
+                  (assoc-in [:copy-bindings :region-copy :source :region :shape] [2 1])
+                  (assoc-in [:copy-bindings :region-copy :target :region] {:offsets [0 0] :shape [2 1]})
+                  (assoc-in [:steps 1 :bytes] 8))
+              :distributed-transfer-layout]]]
+      (is (= reason (failure-reason #(distributed/transfer-bindings changed)))
+          (str "reject " reason)))))
+
 (defn- explicit-domain [shape]
   {:local-shape shape
    :placements [{:kind :owned :value :x :shard :x-0 :local-offsets [0 0]}]})
@@ -343,6 +423,26 @@
                                                                  :local-offsets [1 0]}]
                                                                (map (fn [s] {:kind :replica :transfer (:id s)}) incoming))}
                                    :local-y {:value :y :shard :y-1}}}}})))
+
+(deftest explicit-copies-cannot-replace-semantic-halos-or-read-unproven-ghosts
+  (let [plan (distributed/plan (fully-bound-periodic-plan))
+        endpoint {:source {:step :copy-0 :local-value :local-x
+                           :region {:offsets [0 0] :shape [1 2]}}
+                  :target {:step :analytical-only :local-value :local-x
+                           :region {:offsets [1 0] :shape [1 2]}}}
+        copy (distributed/transfer-step
+               {:id :raw-copy :source :gpu-0 :target :gpu-1 :route [:forward]
+                :value :x :bytes 8 :dependencies [:copy-0]})
+        steps (into (pop (:steps plan))
+                    [copy (assoc (peek (:steps plan)) :dependencies [:raw-copy])])]
+    (is (= :distributed-copy-binding
+           (failure-reason #(distributed/validate!
+                              (assoc plan :copy-bindings {(:id (first (:steps plan))) endpoint}))))
+        "explicit physical bindings cannot redefine a ScheduledHalo leg")
+    (is (= :distributed-copy-owned-source
+           (failure-reason #(distributed/transfer-bindings
+                              (assoc plan :steps steps :copy-bindings {:raw-copy endpoint}))))
+        "an owned shard reference is not evidence for copying its ghost storage")))
 
 (deftest copy-transfer-endpoints-come-from-owned-and-replica-views
   (let [plan (distributed/plan (fully-bound-periodic-plan))
