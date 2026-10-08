@@ -61,6 +61,46 @@
 (def-split-cancelling-carry split-contextual-carry 0.0)
 (def-split-cancelling-carry split-explicit-double-carry (double 0.0))
 
+(defmacro def-weighted-carry [name stages]
+  (let [stage `(par/map! ~'out ~'t 1 nil
+                 (loop [~'i 0 ~'acc 0.0]
+                   (if (< ~'i ~'cnt)
+                     (recur (inc ~'i)
+                            (n/+ ~'acc (n/* ~'gain (double (aget ~'src ~'i)))))
+                     ~'acc)))]
+    `(deftm ~name
+       [~'src ~':- (~'Array ~'float) ~'cnt ~':- ~'Long ~'gain ~':- ~'Double]
+       ~':- (~'Array ~'float)
+       (let [~'out (alloc-like ~'src 1)]
+         ~@(repeat stages stage)
+         ~'out))))
+
+(def-weighted-carry unsplit-weighted-carry 1)
+(def-weighted-carry split-weighted-carry 4)
+
+(deftest helper-extraction-preserves-typed-mixed-precision-operands
+  ;; The Double weighted term is converted at the retained Float addition,
+  ;; not after a Double reduction. Both method layouts must produce zero.
+  (let [input (float-array [1.0e8 1.0 -1.0e8])]
+    (doseq [[v f] [[#'unsplit-weighted-carry unsplit-weighted-carry]
+                   [#'split-weighted-carry split-weighted-carry]]]
+      (let [compiled (pipeline/compile-aot v)]
+        (doseq [gain [1.0 2.0]]
+          (is (= [0.0] (vec (f input 3 gain))))
+          (is (= [0.0] (vec (compiled input 3 gain))))))))
+  (let [[_ bindings & body] (first (pipeline/get-walked-body #'split-weighted-carry :float))
+        forms (concat (map second (partition 2 bindings)) body)]
+    (is (> (reduce + (map split/estimate-form-size forms)) split/TARGET-SIZE))
+    (let [extracted (#'bytecode/split-body-into-helpers
+                      body bindings ['src 'cnt 'gain] ['floats 'long 'double]
+                      (the-ns 'raster.compiler.backend.jvm.loop-carrier-test) 2)]
+      (is (= 4 (count (:helpers extracted))))
+      (is (every? #(some (fn [form]
+                          (and (seq? form) (= '.invk (first form))
+                               (= 'float (:raster.type/tag (meta form)))))
+                        (tree-seq coll? seq (:walked-body %)))
+                  (:helpers extracted))))))
+
 (def ^:const helper-shadow-count 999)
 (def-split-cancelling-carry split-core-shadow-carry 0.0 count)
 (def-split-cancelling-carry split-constant-shadow-carry 0.0 helper-shadow-count)

@@ -1470,3 +1470,34 @@ The model, nonlinear CPU operations and native monolithic oracle are unchanged.
 These finite candidates do not establish that all blocked policies fail, but
 none supplies evidence for a numerical fix or a new production default. Keep
 parallel-reduction performance work separate from unchanged model acceptance.
+
+### Mixed-precision JVM helper extraction: retained call boundaries
+
+A subsequent partial-state diagnostic used named `deftm` projections with the
+original Array-float return annotation and verified that its projected output
+was bit-identical to the original captured CPU normalization call. Its partial
+dot state differed from the GPU at 35 of 64 coordinates. An independent oracle
+identified the CPU realization as Float inner products with Double weighted
+terms and a Double carry; the GPU matched narrowing the weighted term before
+each Float addition. However, the original retained loop binder and addition
+were both stamped Float. This was not evidence for introducing a new GPU
+precision mode.
+
+The JVM helper-extraction path normalized typed `.invk` calls into generic
+arithmetic, discarding both result stamps and typed-call operand conversions.
+That changed a Float addition accepting a Double term into generic Double
+arithmetic. A cancelling weighted fold reproduced the difference independently
+of the model: the small method returned zero, but the extracted version returned
+one. Retaining the original typed calls fixes that regression without a new
+type registry or a model-specific lowering. The existing typed JVM call emitter
+remains responsible for conversions; helper partitioning is not permission to
+change numerical semantics.
+
+With fresh named projections after this change, the actual model's PSS, PC and
+k1 states match the GPU exactly, and PC matches the independent Float-carry
+oracle exactly. Downstream k2 still differs at one coordinate, and dx differs
+at 536 of 1280 coordinates (maximum absolute 0.001953125, maximum coordinate
+relative 2.3887326823598837e-7). These diagnostics do not establish acceptance
+of the full real-model gradient gate or certify helper-call performance. The
+affected JVM loop and bytecode suites pass 50 tests / 139 assertions, including
+lazy and AOT changed-input checks across the actual extraction threshold.
