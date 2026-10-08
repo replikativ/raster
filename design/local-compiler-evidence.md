@@ -1357,3 +1357,24 @@ not. This establishes a concrete contraction-realization difference in both
 forward and pullback, not a reason to turn on fusion implicitly under an exact
 source contract. It is still limited to these operands/helpers: full-model
 cotangent propagation and original gradient acceptance remain unverified.
+
+### Transposed-left register staging — 2026-10-08
+
+The unchanged real-checkpoint gate, when explicitly requesting the fused register
+schedule, declined at a backward `AᵀB` contraction before model execution. The
+register lowerer admitted NN and NT but not TN; the verified dense-matrix view
+already represented the missing orientation. This was an execution-capability
+gap, not evidence that changing arithmetic policy closes model-gradient parity.
+
+The shared register body now stages physical TN storage `[K,M]` in contiguous
+order into the existing canonical `[M,K]` workgroup tile. Its multiply loop,
+barriers, scalar ABI, product policy and output mapping are unchanged. TT,
+batched products and unsupported layouts remain outside this extension.
+
+Structural tests cover unequal physical dimensions and canonical staging for
+NT/TN (14 tests, 111 assertions). Public local OpenCL/Level Zero checks cover
+NN/NT/TN decomposed and fused rounding, changed-input replay, and NN/TN ragged
+dimensions including `[M,K,N]=[65,17,67]`, against an independent ordered Float
+oracle. The compile-fixture corpus also emits the TN body for portable OpenCL,
+CUDA and HIP; source generation is not vendor execution or throughput evidence.
+Full real-checkpoint acceptance remains a separate, unchanged gate.
