@@ -38,6 +38,7 @@
 (defrecord CollectiveOperation [id kind group value reduction root attributes])
 (defrecord CollectiveSchedule [algorithm rounds numerical-mode attributes])
 (defrecord ScheduledCollective [operation schedule dependencies steps completions])
+(defrecord CollectiveRefinement [operation group value numerical inputs nodes outputs])
 (defrecord HaloExchange [id value axis width boundary combine attributes])
 (defrecord ScheduledHalo [exchange routes dependencies steps completions])
 (defrecord DistributedStep
@@ -284,6 +285,119 @@
          {:steps [] :completions []}
          (map-indexed vector (:rounds schedule)))]
     (->ScheduledCollective operation schedule dependencies steps completions)))
+
+(defn refinement-facts
+  "Independently check a full-array all-reduce's immutable contribution DAG.
+
+   Inputs map fresh SSA identities to participants. Copy nodes preserve ancestry; local binary
+   combine nodes union disjoint ancestry. Every participant output must contain every input once.
+   Returned dependencies follow SSA producers, not caller assertions. This is an algorithm proof,
+   not physical binding or transport admission; topology, generated combines, buffer ranges and
+   readiness must still be checked when projecting it to an executable DistributedPlan."
+  [{:keys [operation group value numerical inputs nodes outputs] :as refinement}]
+  (when-not (and (instance? CollectiveRefinement refinement)
+                 (= #{:operation :group :value :numerical :inputs :nodes :outputs}
+                    (set (keys refinement))))
+    (fail! "expected a closed CollectiveRefinement"
+           :distributed-refinement-type {}))
+  (when-not (and (collective-operation? operation) (collective-group? group))
+    (fail! "refinement needs retained collective declarations"
+           :distributed-refinement-declarations {}))
+  (when-not (and (= operation (collective-operation operation))
+                 (= group (collective-group (:id group) (:devices group)))
+                 (= :all-reduce (:kind operation))
+                 (= (:group operation) (:id group)))
+    (fail! "refinement currently requires a complete all-reduce group"
+           :distributed-refinement-declarations {:operation (:id operation)}))
+  (abstract-value/validate! value)
+  (let [participants (set (:devices group))
+        algebra (:reduction operation)
+        dt (:dtype value)]
+    (when-not (and (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
+                   (every? pos-int? (:shape value))
+                   (= dt (:dtype algebra))
+                   (= :replicated (get-in value [:sharding :kind]))
+                   (= participants (set (get-in value [:sharding :devices]))))
+      (fail! "all-reduce refinement requires static plain tensors replicated over its group"
+             :distributed-refinement-value {:value value}))
+    (numerical-contract/validate! numerical {:reason :distributed-refinement-numerical
+                                            :ir :collective-refinement})
+    ;; A monoid certificate does not establish bitwise floating-point associativity. This first
+    ;; tree refinement requires explicit reassociation with unchanged accumulation dtype.
+    (when-not (and (= :reassociated (:mode numerical))
+                   (= dt (:accumulator-dtype numerical)))
+      (fail! "all-reduce tree requires explicit same-dtype reassociation policy"
+             :distributed-refinement-numerical {:numerical numerical :dtype dt}))
+    (when-not (and (map? inputs) (every? some? (keys inputs))
+                   (= (count inputs) (count participants))
+                   (= participants (set (vals inputs)))
+                   (vector? nodes) (map? outputs)
+                   (= participants (set (keys outputs))))
+      (fail! "refinement needs exactly one input and output per participant"
+             :distributed-refinement-boundary {:inputs inputs :outputs outputs}))
+    (let [initial (into {} (map (fn [[id device]]
+                                 [id {:device device :contributors #{device}
+                                      :expression [:input id] :producer nil}])) inputs)
+          {:keys [values dependencies]}
+          (reduce
+           (fn [{:keys [values dependencies]} {:keys [id kind input target route left right device]
+                                              :as node}]
+             (let [fields (case kind
+                            :copy #{:id :kind :input :target :route}
+                            :combine #{:id :kind :left :right :device}
+                            nil)
+                   operands (case kind :copy [input] :combine [left right] [])]
+               (when-not (and fields (= fields (set (keys node)))
+                              (some? id) (not (contains? values id))
+                              (every? #(contains? values %) operands))
+                 (fail! "refinement nodes need closed, fresh, earlier-only SSA definitions"
+                        :distributed-refinement-node {:node node}))
+               (let [facts
+                     (case kind
+                       :copy
+                       (let [source (get values input)]
+                         (when-not (and (contains? participants target)
+                                        (not= target (:device source))
+                                        (vector? route) (seq route) (every? some? route))
+                           (fail! "copy needs another participant and an explicit route"
+                                  :distributed-refinement-copy {:node node}))
+                         (assoc source :device target :producer id))
+                       :combine
+                       (let [lhs (get values left) rhs (get values right)]
+                         (when-not (and (= device (:device lhs) (:device rhs))
+                                        (empty? (set/intersection (:contributors lhs)
+                                                                  (:contributors rhs))))
+                           (fail! "local combine requires co-located, disjoint contributions"
+                                  :distributed-refinement-combine {:node node}))
+                         {:device device
+                          :contributors (set/union (:contributors lhs) (:contributors rhs))
+                          :expression [(:combine algebra) (:expression lhs) (:expression rhs)]
+                          :producer id}))]
+                 {:values (assoc values id facts)
+                  :dependencies (assoc dependencies id
+                                       (vec (distinct (keep #(get-in values [% :producer])
+                                                            operands))))})))
+           {:values initial :dependencies {}} nodes)]
+      (doseq [[device id] outputs]
+        (let [facts (get values id)]
+          (when-not (and (= device (:device facts)) (= participants (:contributors facts)))
+            (fail! "each all-reduce output must contain every participant exactly once"
+                   :distributed-refinement-output {:device device :output id :facts facts}))))
+      {:values values :dependencies dependencies
+       :outputs (into {} (map (fn [[device id]] [device (get values id)])) outputs)})))
+
+(defn collective-refinement
+  "Construct a checked semantic all-reduce contribution witness, without allocating or emitting.
+   Copies and combines retain distinct immutable SSA identities; storage donation is a later
+   liveness refinement. This witness is not yet an executable DistributedPlan."
+  [options]
+  (let [expected #{:operation :group :value :numerical :inputs :nodes :outputs}]
+    (when-not (and (map? options) (= expected (set (keys options))))
+      (fail! "collective refinement requires its closed semantic schema"
+             :distributed-refinement-type {}))
+    (let [refinement (map->CollectiveRefinement options)]
+      (refinement-facts refinement)
+      refinement)))
 
 (defn halo-exchange
   "Declare a semantic neighbor exchange along one partitioned axis.
