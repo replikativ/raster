@@ -54,14 +54,28 @@
   (check-lp64-config! (openblas-config library))
   library)
 
-(defn find-library
+(defn selected-library
+  "Retain selection facts with a lookup. The path is the libraryLookup input,
+   not a resolved binary identity; nil means the loader did not supply a path.
+   OpenBLAS metadata can come from a dependency: its advertised ABI is not a
+   certificate for an arbitrary wrapper's interface."
+  [library source path required-symbol]
+  (let [config (openblas-config library)]
+    (check-lp64-config! config)
+    (cond-> {:status :selected :lookup library :source source
+             :required-symbol required-symbol
+             :advertised-openblas-integer-abi (if (seq config) :lp64 :unknown)}
+      path (assoc :path path)
+      (seq config) (assoc :configuration config :abi-evidence :openblas-build-config))))
+
+(defn select-library
   "Resolve a required numerical symbol. An explicit OpenBLAS path is a pin:
    load or capability errors never fall back to preloaded/default providers.
    Read the property lazily, at the caller's first delayed library selection.
    The three-argument form uses an already captured path (nil means discovery).
    Default discovery preserves compatibility with metadata-absent providers."
   ([required-symbol paths]
-   (find-library required-symbol paths (explicit-path)))
+   (select-library required-symbol paths (explicit-path)))
   ([^String required-symbol paths selected-path]
    (if-some [path selected-path]
      (let [library (try (load-library path)
@@ -73,17 +87,36 @@
          (throw (ex-info "Explicit OpenBLAS lacks the required numerical symbol"
                          {:reason :explicit-native-symbol-unavailable
                           :path path :symbol required-symbol})))
-       (let [config (openblas-config library)]
-         (when-not (seq config)
+       (let [selected (selected-library library :explicit path required-symbol)]
+         (when (= :unknown (:advertised-openblas-integer-abi selected))
            (throw (ex-info "Explicit OpenBLAS has no build metadata for integer ABI admission"
                            {:reason :explicit-native-provider-unverified
                             :path path :symbol required-symbol})))
-         (check-lp64-config! config))
-       library)
+         selected))
      (let [loader (loader-lookup)]
        (if (.isPresent (.find ^SymbolLookup loader required-symbol))
-         loader
-         (some (fn [path]
-                 (when-let [library (try (load-library path) (catch Exception _ nil))]
-                   (when (.isPresent (.find ^SymbolLookup library required-symbol)) library)))
-               paths))))))
+         (selected-library loader :preloaded nil required-symbol)
+         (or (some (fn [path]
+                     (when-let [library (try (load-library path) (catch Exception _ nil))]
+                       (when (.isPresent (.find ^SymbolLookup library required-symbol))
+                         (selected-library library :searched path required-symbol))))
+                   paths)
+             {:status :absent :required-symbol required-symbol}))))))
+
+(defn find-library
+  "Compatibility projection of select-library's selected lookup."
+  ([required-symbol paths] (:lookup (select-library required-symbol paths)))
+  ([required-symbol paths selected-path]
+   (:lookup (select-library required-symbol paths selected-path))))
+
+(defn selection-status
+  "Read retained selection evidence without numerical smoke tests.
+   Omit the native lookup from the result. Rejections remain distinguishable
+   from absence and unexpected discovery errors; this grants no ABI authority."
+  [selection]
+  (try
+    (dissoc (or (selection) {:status :absent}) :lookup)
+    (catch clojure.lang.ExceptionInfo e
+      (assoc (ex-data e) :status :rejected :message (.getMessage e)))
+    (catch Exception e
+      {:status :error :error-class (.getName (class e)) :message (.getMessage e)})))

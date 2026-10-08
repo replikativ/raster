@@ -2,6 +2,23 @@
 
 ### October 8 native reference-environment admission
 
+`blas/library-info` and `lapack/library-info` now report retained selection facts,
+with no numerical smoke test or thread reconfiguration. Discovery retains its loader
+input path and optional OpenBLAS configuration once; public diagnostics omit the foreign
+lookup. Fortran LAPACK and LAPACKE report separately, including absent/rejected/error
+outcomes, rather than inferring QR capability from a Fortran smoke test. Selected means
+selected, not functional or fast. The requested loader path is not a binary hash, and
+dependency-exported OpenBLAS metadata only advertises that provider's ABI, not a wrapper's
+certified interface. MKL reports the LP64 interface filename as declared, not as an
+OpenBLAS build fact. No second compiler cache or numerical descriptor registry is added.
+
+Local retained evidence is threaded MKL for BLAS and OpenBLAS 0.3.30 (including
+`NO_LAPACKE`) for Fortran LAPACK; the separately loaded LAPACKE wrapper resolves the
+same dependency metadata. This differs from the external OpenBLAS 0.3.32 environment
+and is not a preferred-version claim or crash diagnosis. Integer overflow probes confirm
+existing core `int`, LAPACK `int-seg` and BLAS GEMM reject `INT_MAX + 1`; a hardware-free
+GEMM-handle regression preserves that contract instead of adding a redundant conversion layer.
+
 Explicit selection now shares conventional paths and one resolver across BLAS/LAPACK.
 `raster.openblas.path` is read at first delayed selection rather than namespace load;
 the captured pin bypasses preloaded/MKL/default paths. A missing file, required symbol,
@@ -36,8 +53,8 @@ The CI test job declares `RASTER_EXPECT_NATIVE_LIBRARIES=1`; an unconditional te
 namespace then requires functional BLAS and LAPACK, without forcing either onto laptop
 or compiler-only jobs. This preflight does not replace per-capability coverage accounting.
 
-Actual resolved-provider/version/thread metadata,
-ABI treatment for unknown/preloaded providers, and a pinned native reference environment
+Actual binary identity/version and live thread metadata,
+ABI treatment for unknown/preloaded providers/wrappers, and a pinned native reference environment
 remain CI/compatibility debt. The shared pin resolves the former BLAS/LAPACK property
 discrepancy; it does not provide a complete reproducibility manifest. Keep the remaining work
 on items 1–2 without replacing the external training, distributed or PDE gates.
