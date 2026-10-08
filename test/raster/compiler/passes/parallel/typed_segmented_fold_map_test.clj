@@ -214,6 +214,20 @@
     (is (< (Math/abs (- (aget out 2) 0.5)) 1.0e-6))
     (is (< (Math/abs (- (aget out 3) 0.5)) 1.0e-6))))
 
+(deftest fold-map-results-retain-distinct-destination-storage-types
+  (let [source '(let* [effect (raster.par/segmented-fold-map!
+                              [small wide] [[row 1]] j 1
+                              [[sum 0.0 :double 3 (+ sum (double (aget values j)))]]
+                              [sum sum])] effect)
+        program (frontend/form->program source {:dtype :double
+                                                :array-types {'values :float 'small :float 'wide :double}})
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)]
+    (is (= [:float :double] (get-in operation [:attributes :dtypes])))
+    (is (= :double (get-in operation [:folds 0 :attributes :dtype])))
+    (is (= :float (:dtype (get-in (dialect/facts program) [:values (first (nth equation 2))]))))
+    (is (= :double (:dtype (get-in (dialect/facts program) [:values (second (nth equation 2))]))))))
+
 (deftest dependent-folds-are-first-class-typed-soac
   (let [program (frontend/form->program
                  source {:dtype :float :array-types {'values :float 'out :float}

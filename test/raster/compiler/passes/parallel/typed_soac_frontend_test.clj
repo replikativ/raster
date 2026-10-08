@@ -20,6 +20,15 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest local-polymorphic-array-storage-honors-the-preservation-policy
+  (let [out (with-meta 'out {:raster.type/tag 'floats})
+        pairs [[out '(raster.arrays/zeros-like x 3)]]
+        infer #'frontend/binder-array-types]
+    (is (= :double (get (infer pairs {'x :float} :double false) 'out)))
+    (is (= :float (get (infer pairs {'x :float} :double true) 'out)))
+    (is (= :float (get (infer [[out '(float-array 3)]] {} :double false) 'out)))
+    (is (= :float (get (infer pairs {'out :float} :double false) 'out)))))
+
 (deftest retained-array-binding-declines-as-storage-not-missing-scalar-type
   (doseq [tag ['ints 'doubles]]
     (let [binder (with-meta 'field {:raster.type/tag tag})

@@ -892,7 +892,8 @@
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                  resident-uniform-input-loads?
-                                 scalar-types values abstract-machine segmented-plans?]
+                                 scalar-types values abstract-machine segmented-plans?
+                                 preserve-declared-array-storage?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
@@ -900,7 +901,8 @@
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
                                  :scalar-types scalar-types :values values
-                                 :segmented-plans? segmented-plans?}
+                                 :segmented-plans? segmented-plans?
+                                 :preserve-declared-array-storage? preserve-declared-array-storage?}
                projection (when segmented-plans?
                             (frontend/form->program-components form frontend-options))
                typed-input (or (:typed-program projection)

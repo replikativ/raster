@@ -1718,9 +1718,10 @@
    writing it would decline. Declared `array-types` take precedence.
 
    Explicit allocation element types remain physical storage facts. Only dtype-polymorphic
-   allocations follow the kernel policy. Parameter facts come from `derive-param-types`, whose
-   optional declared-storage policy is resolved before this frontend; declared facts win here."
-  [pairs array-types dtype]
+   allocations follow the kernel policy unless declared-storage preservation is requested.
+   That policy retains local resolved array tags as well as parameter facts from
+   `derive-param-types`; declared facts win here."
+  [pairs array-types dtype preserve-declared-array-storage?]
   (let [kernel-dtype (some-> dtype dtype/canon)
         default-read-types
         (when kernel-dtype
@@ -1729,7 +1730,8 @@
                 (reduce set/union #{}
                         (map (comp par/collect-aget-arrays second) pairs))))
         policy (fn [element]
-                 (if (and kernel-dtype (dtype/fp-dtype? kernel-dtype)
+                 (if (and (not preserve-declared-array-storage?)
+                          kernel-dtype (dtype/fp-dtype? kernel-dtype)
                           (contains? #{:float :double} element))
                    kernel-dtype
                    element))]
@@ -2992,7 +2994,10 @@
                                   descriptor/aget-ops descriptor/aset-ops
                                   #{'do 'let 'let* 'if 'double 'float 'int 'long})
           results (mapv #(effect-result-id id %) (range (count outputs)))
-          result-dtype (dtype/canon (or elem-type default-dtype :double))]
+          ;; Stores retain each destination's storage dtype independently of fold precision.
+          ;; A Double accumulator may produce a Float result, just as an ordinary typed map can.
+          result-dtypes (mapv #(dtype/canon (or (destination-dtype array-types %)
+                                               elem-type default-dtype :double)) outputs)]
       (when (and (seq outputs) (= (count outputs) (count map-results))
                  (every? symbol? outputs) (seq segment-axes) (seq normalized-folds)
                  (every? #(and (dtype/known? (:dtype %))
@@ -3001,7 +3006,7 @@
         {:kind :segmented-fold-map :id id :sym symbol
          :segment-axes segment-axes :index idx :extent map-extent
          :folds normalized-folds :map-results map-results
-         :results results :result-dtypes (vec (repeat (count outputs) result-dtype))
+         :results results :result-dtypes result-dtypes
          :inputs inputs :outputs output-set :scalars scalars
          :effect-only? true :host-binding symbol
          :result-storage (mapv (fn [output]
@@ -4626,12 +4631,12 @@
     (coverage-decline* source options)))
 
 (defn- coverage-decline*
-  [source {:keys [dtype array-types scalar-types values shape-equalities]
+  [source {:keys [dtype array-types scalar-types values shape-equalities preserve-declared-array-storage?]
            :or {dtype :double array-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings] source
           pairs (vec (partition 2 bindings))
-          array-types (binder-array-types pairs array-types dtype)
+          array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           descriptions (normalize-extents (source-descriptions pairs dtype array-types scalar-types)
                                           shape-equalities values)
           physical-outputs (physical-output-symbols descriptions)
@@ -5740,13 +5745,14 @@
           descriptions)))
 
 (defn- form->program*
-  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?]
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+                 preserve-declared-array-storage?]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
           [_ bindings & body] source
           pairs (vec (partition 2 bindings))
-          array-types (binder-array-types pairs array-types dtype)
+          array-types (binder-array-types pairs array-types dtype preserve-declared-array-storage?)
           descriptions (preserve-map-storage-inputs
                          (normalize-extents (source-descriptions pairs dtype array-types scalar-types
                                                                  segmented-plans?)

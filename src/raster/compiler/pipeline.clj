@@ -852,6 +852,7 @@
                               (:array-types opts)))
                       (:values opts))
         common {:dtype (:dtype opts)
+                :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                 :values values
                 :array-types (:array-types opts)
                 :scalar-types (:scalar-types opts)
@@ -868,6 +869,7 @@
                     :resident-initialization? (device/gpu-target? (:target-device opts))
                     :resident-uniform-input-loads? (device/gpu-target? (:target-device opts))
                     :segmented-plans? (true? (:segmented-plans? opts))
+                    :preserve-declared-array-storage? (:preserve-declared-array-storage? opts)
                     :scalar-types (:scalar-types opts)
                     :values values
                     :abstract-machine abstract-machine})

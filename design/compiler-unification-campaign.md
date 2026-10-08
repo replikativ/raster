@@ -1,5 +1,30 @@
 # Compiler unification campaign
 
+### October 8 collective execution and precision-boundary follow-up
+
+The contribution refinement, ordinary generated-combine bindings and complete realization
+certificate are merged (#1090–1094), with all required CI gates green. Two and three logical
+workers execute complete all-reduces on the local OpenCL and Level Zero devices. Fractional
+products and FP32/FP64 cancellation are checked against independently rounded evaluation trees;
+optional FP64 skips retain all FP32 cases. This closes the local numerical collective seam,
+not multi-host transport, distributed transformer training or performance acceptance.
+
+Training diagnosis exposed a separate declared-storage inconsistency: the preservation option
+reached parameter typing but was dropped before the TypedSOAC frontend, and resolved local
+polymorphic allocations still followed ambient precision. Retaining their array tags also exposes
+two existing restrictions: fold-map results assumed a single ambient storage dtype, and a canonical
+scalar Fold required its consumer precision to equal its carry precision. The follow-up forwards
+one existing policy, derives each destination's storage dtype and converts only completed Fold
+results through the shared scalar conversion authority. Default allocation policy is unchanged;
+the explicitly requested preservation option now applies to resolved locals as well as parameters.
+
+An isolated real-checkpoint attention probe executes Double computation with Float storage after
+these changes, with small nonzero differences from the existing CPU reference. The global `:dtype`
+still selects generic source overloads; this probe fixes the Float source overload explicitly.
+It is not a new independent precision-selection API and does not close the held real-model gate.
+The next acceptance work must distinguish source specialization, intermediate arithmetic and
+storage, without rewriting the pinned model or loosening its original gradient checks.
+
 ### October 8 native reference-environment admission
 
 `blas/library-info` and `lapack/library-info` now report retained selection facts,
