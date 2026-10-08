@@ -80,14 +80,8 @@
     (is (= 30 (evaluate expression)))
     (is (apply = (map :expression (vals (:outputs facts)))))))
 
-(deftest a-single-participant-needs-neither-a-copy-nor-a-combine
-  (let [refinement (direct-refinement 1)
-        facts (distributed/refinement-facts refinement)]
-    (is (empty? (:nodes refinement)))
-    (is (empty? (:dependencies facts)))
-    (is (= {:worker-0 {:device :worker-0 :contributors #{:worker-0}
-                       :expression [:input [:worker-0 :input]] :producer nil}}
-           (:outputs facts)))))
+(deftest refinement-preserves-the-shared-multi-participant-group-contract
+  (is (= :distributed-collective-group (reason #(direct-refinement 1)))))
 
 (deftest refinement-rejects-incomplete-duplicated-and-ill-scoped-contributions
   (let [refinement (direct-refinement 3)]
