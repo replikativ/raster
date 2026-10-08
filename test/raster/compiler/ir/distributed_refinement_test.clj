@@ -199,7 +199,8 @@
                              cluster inputs costs))))))
 
 (defn- identity-local [id source result options]
-  (let [abstract (av/tensor {:dtype :float :shape [17]})
+  (let [dtype (get-in result [:view :dtype])
+        abstract (av/tensor {:dtype dtype :shape [17]})
         algorithm (soac/make
                    (soac/default-program-facts
                     {:values {'source abstract 'result abstract} :inputs '[source]
@@ -209,8 +210,8 @@
                                 (soac/lambda-form '[x] [] '[x])))] '[result])
         scheduled (structured-route/schedule-program
                    (assoc (typed-route/program-envelope algorithm) :dialect :typed-parallel)
-                   (assoc options :dtype :float))
-        emitted (get-in (c-family/emit-program scheduled (assoc options :dtype :float))
+                   (assoc options :dtype dtype))
+        emitted (get-in (c-family/emit-program scheduled (assoc options :dtype dtype))
                         [:program :equations 0 :operations 0])]
     (link/make {:id id :target (:target-device options)
                 :nodes [(assoc source :role :input) (assoc result :role :output)]
@@ -223,15 +224,24 @@
 (defn realized-plan
   "Small full-array all-reduce fixture. Input producers export initialized resident arrays;
    this is a collective oracle, not a differentiated training or fabric-performance claim."
-  [n options]
+  ([n options] (realized-plan n options {}))
+  ([n options {:keys [algebra input-values]}]
   (let [[refinement cluster inputs costs] (projection-inputs n)
+        refinement (if algebra
+                     (-> refinement
+                         (assoc-in [:operation :reduction] algebra)
+                         (assoc-in [:value :dtype] (:dtype algebra))
+                         (assoc-in [:numerical :accumulator-dtype] (:dtype algebra)))
+                     refinement)
+        dtype (get-in refinement [:value :dtype])
+        typed-array (case dtype :float float-array :double double-array)
         projected (distributed/project-refinement refinement cluster inputs costs)
         facts (distributed/refinement-facts refinement)
         target (:target-device options)
-        input-index (zipmap (keys inputs) (range n))
+        input-index (zipmap (map #(vector % :input) (get-in refinement [:group :devices])) (range n))
         nodes (into {} (map (fn [[ssa _]]
                               [ssa (link/node
-                                    {:id ssa :device target :dtype :float :shape [17] :role :input})])) (:values facts))
+                                    {:id ssa :device target :dtype dtype :shape [17] :role :input})])) (:values facts))
         exported (into {} (for [[worker ssa] (:outputs refinement)
                                 :when (= :copy (:kind (first (filter #(= ssa (:id %)) (:nodes refinement)))))]
                             [ssa [worker :retain]]))
@@ -243,16 +253,17 @@
         locals (merge (into {} (for [[ssa producer] inputs]
                                 [(:id producer)
                                  (identity-local (:id producer)
-                                                 (link/node {:id [ssa :source] :device target :dtype :float :shape [17]
-                                                             :source (float-array
-                                                                      (map #(+ 1 (get input-index ssa) (* 0.25 %))
-                                                                           (range 17)))})
+                                                 (link/node {:id [ssa :source] :device target :dtype dtype :shape [17]
+                                                             :source (typed-array
+                                                                      (or (get input-values (get input-index ssa))
+                                                                          (map #(+ 1 (get input-index ssa) (* 0.25 %))
+                                                                               (range 17))))})
                                                  (get nodes ssa) options)]))
                       (update-vals combines :link-plan)
                       (into {} (for [[ssa id] exported]
                                  [id (identity-local id (get nodes ssa)
                                                      (link/node {:id [ssa :retained] :device target
-                                                                 :dtype :float :shape [17]}) options)])))
+                                                                 :dtype dtype :shape [17]}) options)])))
         storage (into {} (for [[ssa _] (:values facts)]
                           [ssa {:step (or (:id (get inputs ssa))
                                           (when (contains? combines ssa) ssa)
@@ -296,7 +307,7 @@
                                     :target (assoc (get storage id) :region region)}]))
       :refinements {:all-reduce {:refinement refinement :input-producers inputs :combine-costs costs
                                 :storage storage :combines (update-vals combines :emitted)}}
-      :steps steps :outputs (mapv #(or (get exported %) %) (:completions projected))})))
+      :steps steps :outputs (mapv #(or (get exported %) %) (:completions projected))}))))
 
 (defn- realization-options []
   {:target-device :ocl:analytic

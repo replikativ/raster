@@ -470,3 +470,9 @@ Device acceptance uses two and three logical workers on both OpenCL and Level Ze
 input producers and binary combines, resident copies and generated output consumers, checked
 against independent CPU sums. These co-located tests do not establish multi-host transport,
 fabric throughput, collective scalability or training convergence.
+
+The same fixture also checks FP32 products of non-exact fractions and FP32/FP64 cancellation.
+The independent oracle rounds input storage and every binary node of the declared tree. In the
+cancellation cases the exact real sum is one while the admitted left-associated floating tree
+returns zero; acceptance therefore checks the retained numerical policy, not an accidentally
+different high-precision reduction. The fixture remains an ordinary generated map/copy program.
