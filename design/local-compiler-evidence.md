@@ -1454,3 +1454,10 @@ anonymous ftm, did not reproduce the original compiled CPU output exactly.
 Its partial states are therefore rejected as an oracle, not used to justify
 production changes. A valid partial-state comparison must first establish
 observational equivalence through the same specialization and emission path.
+
+The native reference in this warm JVM is the selected MKL threaded LP64
+component provider (`libmkl_intel_lp64.so`), not the CUDA agent's separately
+reported OpenBLAS batch-extension environment. Provider selection is metadata,
+not a numerical proof; the captured dot comparisons above supply the functional
+evidence for these operands. Do not conflate this accumulation-order finding
+with the independent OpenBLAS interleaved-batch crash.
