@@ -11,7 +11,7 @@
             [raster.arrays :as arrays]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.pe :as pe]
-            [raster.compiler.passes.scalar.normalize :as normalize]
+            [raster.compiler.core.util :as util]
             [raster.tooling.inspect :as inspect]))
 
 (use-fixtures :once
@@ -361,26 +361,34 @@
 ;; ================================================================
 ;; Cross-cutting gate (task #78): a .invk node's :raster.op/original must never
 ;; contradict the op-family of its impl name. A violation is the pe/normalize
-;; provenance corruption that flipped #78's gradient sign — normalize trusts
-;; :raster.op/original, so a stale one silently rewrites the head.
+;; provenance corruption that flipped #78's gradient sign. Typed scalar passes
+;; now retain the call boundary; this diagnostic still checks operator provenance.
 ;; ================================================================
 
 (defn- op-original-violations
   "Seq of .invk nodes whose :raster.op/original contradicts the impl's op-family
-   (per normalize's canonical demangler)."
+   (using the shared implementation-name decoder for diagnostics only)."
   [form]
-  (let [demangle @#'normalize/direct-op-for-impl
-        v (atom [])]
+  (let [v (atom [])]
     ((fn walk [f]
        (when (coll? f)
          (when (and (seq? f) (= '.invk (first f)) (symbol? (second f)))
            (let [o (:raster.op/original (meta f))
-                 o2 (demangle (name (second f)))]
+                 o2 (util/impl->op (second f))]
              (when (and o o2 (not= o o2))
                (swap! v conj {:claimed o :impl-op o2 :impl (second f)}))))
          (doseq [x f] (walk x))))
      form)
     @v))
+
+(deftest shared-provenance-diagnostic-detects-corruption
+  (let [impl 'raster.numeric/_star__m_float_float-impl
+        node (with-meta (list '.invk impl 'x 'y)
+               {:raster.op/original 'raster.numeric/*})
+        corrupt (vary-meta node assoc :raster.op/original 'raster.numeric/-)]
+    (is (empty? (op-original-violations node)))
+    (is (= [{:claimed 'raster.numeric/- :impl-op 'raster.numeric/* :impl impl}]
+           (op-original-violations corrupt)))))
 
 (deftest op-original-agrees-with-head-invariant-issue-78
   (doseq [v [#'nn/predict-fn #'nn/loss-fn #'ce-bwd-literal-seed]]
