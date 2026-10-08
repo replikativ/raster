@@ -282,6 +282,7 @@
 
 ;; Forward declaration for circular dependency: gen-reverse-let <-> gen-reverse-dotimes/par
 (declare ^:private gen-reverse-dotimes)
+(declare ^:private replayable-gather-index?)
 (declare ^:private gen-reverse-par-map)
 (declare ^:private gen-reverse-par-reduce)
 (declare ^:private gen-reverse-ordered-reduce)
@@ -319,25 +320,11 @@
                          (set/union (util/free-syms then)
                                     (util/free-syms else)))))
 
-        ;; Par forms: active iff any free var in the body is active
-        (= 'raster.par/map! head)
-        (let [[_ _out _idx _bound _cast body] init-expr]
-          (boolean (some #(get activity % false) (util/free-syms body #{_idx}))))
-
-        (= 'raster.par/reduce head)
-        (let [[_ _acc init _idx _bound body] init-expr]
-          (boolean (some #(get activity % false)
-                         (into (util/free-syms body #{_idx _acc})
-                               (util/free-syms init)))))
-
-        (= 'raster.par/scan head)
-        (let [[_ _out _acc init _idx _bound _cast body] init-expr]
-          (boolean (some #(get activity % false)
-                         (into (util/free-syms body #{_idx _acc})
-                               (util/free-syms init)))))
-
-        ;; Loop: active iff any init or body references an active symbol
-        (contains? #{'loop 'loop*} head)
+        ;; A loop or a parallel SOAC is active iff a variable free in it is:
+        ;; the compiler's scope information supplies its binders (index,
+        ;; accumulator), so no form needs its own rule here.
+        (or (contains? '#{loop loop* dotimes} head)
+            (= :par (:kind (form/form-info init-expr))))
         (boolean (some #(get activity % false) (util/free-syms init-expr)))
 
         ;; Normal call / .invk: active iff any arg is active
@@ -347,6 +334,17 @@
 
     :else false))
 
+;; The SOAC heads reverse mode has rules for, by record kind. Each kind's rule is
+;; its ad-record and emit-backward methods; a record states the buffers it
+;; writes (:written-arrs) and the values its pullback reads again (:replays),
+;; and the engine derives dispatch and overwrite checks from those.
+(def ^:private soac-record-kinds
+  '{raster.par/map!   :par-map
+    raster.par/reduce :par-reduce
+    raster.par/scan   :par-scan
+    raster.par/gather :par-gather
+    dotimes           :dotimes})
+
 ;; ================================================================
 ;; Forward-pass record creation — one multimethod, kind-dispatched
 ;; (mirrors form/scope-info's :kind dispatch). A new differentiable SOAC is one
@@ -354,18 +352,14 @@
 ;; ================================================================
 
 (defn- ad-form-kind
-  "Classify a binding init into a reverse-record kind. The three array SOACs are
-  recognized BEFORE the activity gate (they manage their own activity via the
-  active-set); everything else is gated on `active?`. `sym` is the binding
+  "Classify a binding init into a reverse-record kind. SOACs (soac-record-kinds)
+  are recognized BEFORE the activity gate (they manage their own activity via
+  the active-set); everything else is gated on `active?`. `sym` is the binding
   symbol, used only for a fail-loud message on unsupported control-flow forms."
   [init-expr active? sym]
   (cond
-    (and (seq? init-expr) (= 'raster.par/map!   (first init-expr))) :par-map
-    (and (seq? init-expr) (= 'raster.par/reduce (first init-expr))) :par-reduce
-    (and (seq? init-expr) (= 'raster.par/scan   (first init-expr))) :par-scan
-    (and (seq? init-expr) (= 'dotimes           (first init-expr))) :dotimes
+    (and (seq? init-expr) (soac-record-kinds (first init-expr)))   (soac-record-kinds (first init-expr))
     (not active?)                                                   :inactive
-    (and (seq? init-expr) (= 'raster.par/gather (first init-expr))) :par-gather
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
     (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr))) :loop
@@ -575,15 +569,6 @@
         (= 1 (count contribs)) (first contribs)
         :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b)) contribs)))
 
-(defn- replayed-syms
-  "Symbols a record's pullback reads again after the forward: a scan's carry
-  tape and the values its step reads, and those of a reduction that replays
-  its step. nil for records whose pullback keeps its own residuals."
-  [record init-expr]
-  (when (or (= :par-scan (:type record))
-            (and (= :par-reduce (:type record))
-                 (contains? #{:double-carry :none} (:residual-kind record))))
-    (into (set (:written-arrs record)) (util/free-syms init-expr))))
 
 (defn- written-syms
   "Arrays a binding writes: aset targets anywhere in its init, and the output
@@ -627,7 +612,7 @@
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)
-        :replayed (into replayed (replayed-syms record init-expr))}))
+        :replayed (into replayed (:replays record))}))
    {:activity (into {} (map (fn [p] [p true]) active-params))
     :fwd-bindings [] :records [] :replayed #{}}
    (partition 2 norm-bindings)))
@@ -1785,18 +1770,24 @@
   (let [{:keys [counter-sym bound-expr body]} (parse-dotimes-form dotimes-form)
         {:keys [scalar-bindings asets agets free-syms]} (analyze-dotimes-body body counter-sym)
 
-        ;; The backward reads d_out and writes input cotangents at the loop
-        ;; counter, and differentiates one store: decline anything else rather
-        ;; than transpose it to the wrong element.
+        ;; The backward reads d_out at the loop counter and differentiates one
+        ;; store; it scatter-adds each read's cotangent at the read's index,
+        ;; recomputed per step (the counter, a literal or a gather such as
+        ;; alpha[group[i]]). Decline anything else rather than transpose it to
+        ;; the wrong element.
+        locals (set (map first scalar-bindings))
+        readable? (fn [{:keys [arr idx]}]
+                    (or (not (gradient-bearing-array-read? (list 'aget arr idx)))
+                        (= counter-sym idx)
+                        (integer? idx)
+                        (replayable-gather-index? idx counter-sym locals)))
         _ (when (or (< 1 (count asets))
                     (some #(not= counter-sym (:idx %)) asets)
-                    (some #(and (gradient-bearing-array-read? (list 'aget (:arr %) (:idx %)))
-                                (not= counter-sym (:idx %)))
-                          agets))
+                    (not-every? readable? agets))
             (throw (ex-info
                     (str "dotimes AD: the loop must store once, at the counter `" counter-sym
-                         "`, and read active arrays at the counter. Use par/map! for "
-                         "elementwise maps or par/scan for indexed reads.")
+                         "`, and read active arrays at the counter, a literal or a gather "
+                         "index the backward can recompute.")
                     {:reason :dotimes-unsupported-access :asets asets
                      :reads (mapv #(select-keys % [:arr :idx]) agets)})))
         ;; Determine which arrays are written and read
@@ -1917,12 +1908,13 @@
                grads-iter-sym (list iter-pb-sym d-val-sym)]
               ;; aset into shadow arrays for aget'd inputs
               ;; one contribution per read, accumulated into its array's shadow
-              (mapcat (fn [i {:keys [arr]}]
-                        (let [d-arr-sym (arr->d-sym arr)]
+              (mapcat (fn [i {:keys [arr idx]}]
+                        (let [d-arr-sym (arr->d-sym arr)
+                              at (util/subst-syms {counter-sym j-sym} idx)]
                           [(ad-gensym "_scatter")
-                           (list 'aset d-arr-sym j-sym
+                           (list 'aset d-arr-sym at
                                  (list 'raster.ad.reverse/grad-acc
-                                       (list 'aget d-arr-sym j-sym)
+                                       (list 'aget d-arr-sym at)
                                        (list 'nth grads-iter-sym i)))]))
                       (range) agets)))
 
@@ -2095,20 +2087,23 @@
   [par-map-form active-params]
   (let [[_ out-sym idx-sym bound-expr cast-fn body-expr] par-map-form
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-map-body body-expr idx-sym)
+        (analyze-par-map-body body-expr idx-sym true)
 
         ;; Determine which arrays are written and read
         written-arrs [out-sym]
-        ;; The backward map writes each read's cotangent at its own lane, so
-        ;; only reads at the map index transpose there; another index would
-        ;; need a conflict-free scatter.
-        _ (doseq [{:keys [arr idx]} agets]
-            (when-not (= idx-sym idx)
+        ;; A read at the map index transposes lane-wise in a backward map. A
+        ;; read at a literal or a gathered index (alpha[group[i]]) is a gather:
+        ;; lanes may share a destination, so its cotangent is accumulated with
+        ;; a scatter-add of per-lane values (an accumulator adjoint).
+        locals (set (map first scalar-bindings))
+        gather-read? (fn [{:keys [idx]}]
+                       (or (integer? idx) (replayable-gather-index? idx idx-sym locals)))
+        _ (doseq [{:keys [arr idx] :as read} agets]
+            (when-not (or (= idx-sym idx) (gather-read? read))
               (throw (ex-info
                       (str "par/map! AD: active array `" arr "` is read at `" (pr-str idx)
-                           "`, not at the map index `" idx-sym "`; its cotangent would need "
-                           "a scatter. Read it at the map index, or use par/scan or a gather "
-                           "for indexed reads.")
+                           "`, neither the map index `" idx-sym "` nor a gather index the "
+                           "backward can recompute.")
                       {:reason :par-map-shifted-read :array arr :index idx}))))
         read-arrs (vec (distinct (map :arr agets)))
 
@@ -2203,18 +2198,39 @@
         ;;     (nth grads aget-index)))
         ;; Every read of an array contributes: sum its gradient slots (a slot's
         ;; position is the read's position in agets).
+        lane-grad (fn [k-slots]
+                    (list 'let* [iter-pb-sym (list 'aget tape-sym bwd-idx-sym)
+                                 d-val-sym (list 'aget d-out-sym bwd-idx-sym)
+                                 grads-iter-sym (list iter-pb-sym d-val-sym)]
+                          (reduce (fn [acc k]
+                                    (list 'raster.ad.reverse/grad-acc acc
+                                          (list 'nth grads-iter-sym k)))
+                                  (list 'nth grads-iter-sym (first k-slots))
+                                  (rest k-slots))))
         backward-maps
         (mapv (fn [d-arr-sym arr-sym]
-                (let [slots (keep-indexed (fn [k {:keys [arr]}] (when (= arr arr-sym) k)) agets)
-                      bwd-body (list 'let* [iter-pb-sym (list 'aget tape-sym bwd-idx-sym)
-                                            d-val-sym (list 'aget d-out-sym bwd-idx-sym)
-                                            grads-iter-sym (list iter-pb-sym d-val-sym)]
-                                     (reduce (fn [acc k]
-                                               (list 'raster.ad.reverse/grad-acc acc
-                                                     (list 'nth grads-iter-sym k)))
-                                             (list 'nth grads-iter-sym (first slots))
-                                             (rest slots)))]
-                  [d-arr-sym (list 'raster.par/map! d-arr-sym bwd-idx-sym bound-expr nil bwd-body)]))
+                (let [reads (keep-indexed (fn [k read] (when (= arr-sym (:arr read)) [k read])) agets)
+                      lane-slots (keep (fn [[k {:keys [idx]}]] (when (= idx-sym idx) k)) reads)
+                      gathers (remove (fn [[_ {:keys [idx]}]] (= idx-sym idx)) reads)]
+                  (vec (concat
+                        ;; every lane read of the array, summed, overwrites its lane
+                        (when (seq lane-slots)
+                          [d-arr-sym (list 'raster.par/map! d-arr-sym bwd-idx-sym bound-expr nil
+                                           (lane-grad lane-slots))])
+                        ;; each gathered read: per-lane cotangents and indices, then
+                        ;; their scatter-add into the array's cotangent
+                        (mapcat (fn [[k {:keys [idx]}]]
+                                  (let [vals-sym (ad-gensym "gather_d" (:raster.type/tag (meta arr-sym)))
+                                        idxs-sym (ad-gensym "gather_idx" 'ints)]
+                                    [vals-sym (list 'raster.arrays/zeros-like arr-sym bound-expr)
+                                     vals-sym (list 'raster.par/map! vals-sym bwd-idx-sym bound-expr nil
+                                                    (lane-grad [k]))
+                                     idxs-sym (list 'clojure.core/int-array bound-expr)
+                                     idxs-sym (list 'raster.par/map! idxs-sym bwd-idx-sym bound-expr 'int
+                                                    (util/subst-syms {idx-sym bwd-idx-sym} idx))
+                                     d-arr-sym (list 'raster.par/scatter! d-arr-sym vals-sym idxs-sym
+                                                     bound-expr)]))
+                                gathers)))))
               d-read-arr-syms read-arrs)
 
         ;; Backward par/reduce for each scalar param:
@@ -2282,62 +2298,6 @@
              (every? replay-pure-reduce-expr? (rest expr)))))
     (vector? expr) (every? replay-pure-reduce-expr? expr)
     :else true))
-
-(defn- analyze-par-reduce-body
-  "Analyze a par/reduce body for aget references and free scalars.
-  Similar to analyze-par-map-body but for reduce body context — including
-  its INLINE-aget lift (source (2) there): a bare `(aget arr i)` sitting in
-  the body result (the shape the §15.2 loop canonicalization emits, since a
-  tail-accumulation loop body is one expression) is lifted to a synthetic
-  aget binding so it joins the array-input machinery. Without the lift, the
-  aget would be re-emitted inside the forward loop, which alpha-renames the
-  index (fi__N) — leaving the original index symbol free/unresolved."
-  [body-expr idx-sym acc-sym]
-  (let [agets (atom [])
-        scalar-bindings (atom [])
-        [bindings body-result0]
-        (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
-          [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
-          [[] body-expr])]
-    (doseq [[sym init] bindings]
-      (if (gradient-bearing-array-read? init)
-        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
-        (swap! scalar-bindings conj [sym init])))
-    ;; Lift inline (aget arr idx-sym) reads to synthetic aget bindings (dedup
-    ;; by array — idx is fixed = the reduce index, so a repeated read shares
-    ;; one sym; e.g. sum-of-squares reads xs[i] twice).
-    (let [seen (atom {})
-          lift (fn lift [form]
-                 (cond
-                   (and (gradient-bearing-array-read? form)
-                        (= idx-sym (nth form 2)))
-                   (let [arr (nth form 1)
-                         k (if (symbol? arr) arr form)]
-                     (or (get @seen k)
-                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
-                           (swap! seen assoc k s)
-                           (swap! agets conj {:sym s :arr arr :idx idx-sym})
-                           s)))
-                   (seq? form) (with-meta (apply list (map lift form)) (meta form))
-                   (vector? form) (mapv lift form)
-                   :else form))
-          body-result (lift body-result0)
-          scalar-bindings* (mapv (fn [[s init]] [s (lift init)]) @scalar-bindings)]
-      (let [aget-syms (set (map :sym @agets))
-            bound-syms (set (list* idx-sym acc-sym (concat (map first scalar-bindings*) aget-syms)))
-            free-syms (util/free-syms body-result bound-syms)
-            all-free (reduce into free-syms
-                             (map (fn [[_ init]]
-                                    (util/free-syms init bound-syms))
-                                  scalar-bindings*))]
-        {:agets @agets
-         :scalar-bindings scalar-bindings*
-         :body-result body-result
-         :free-syms (disj all-free idx-sym acc-sym)}))))
-
-;; ================================================================
-;; Additive reductions: acc ± term(i)
-;; ================================================================
 
 (defn- additive-step
   "{:sign ±1 :term t} when `expr` adds (or subtracts) a term to the
@@ -2451,6 +2411,8 @@
                               (vec (concat d-read-arr-syms d-scalar-syms [d-acc-sym])))))]
         {:type :par-reduce
          :residual-kind :none
+         ;; the backward evaluates each term again
+         :replays (util/free-syms par-reduce-form)
          ;; source-order forward: the loop par/reduce stands for
          :forward-bindings
          [reduce-result-sym
@@ -2516,7 +2478,7 @@
                     {:reason :par-reduce-active-compound-init
                      :init init-expr})))
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-reduce-body body-expr idx-sym acc-sym)
+        (analyze-par-map-body body-expr idx-sym true)
         typed-double? (and (every? (comp replay-pure-reduce-expr? second)
                                   scalar-bindings)
                            (replay-pure-reduce-expr? body-result)
@@ -2542,10 +2504,14 @@
                       "par/reduce AD: active arrays must be read through a recognized aget"
                       {:reason :par-reduce-untracked-array-read
                        :array p :body body-expr}))))
+        ;; the ordered backward is sequential: a read's cotangent scatter-adds at
+        ;; its index, recomputed per step (index, literal or gather)
+        locals (set (map first scalar-bindings))
         _ (doseq [{:keys [idx]} agets]
-            (when-not (= idx-sym idx)
+            (when-not (or (= idx-sym idx) (integer? idx)
+                          (replayable-gather-index? idx idx-sym locals))
               (throw (ex-info
-                      "par/reduce AD: shifted array reads require an indexed scatter residual"
+                      "par/reduce AD: an array read at an index the backward cannot recompute"
                       {:reason :par-reduce-shifted-read
                        :index idx :reduction-index idx-sym}))))
 
@@ -2683,13 +2649,14 @@
                  grads-iter-sym (list iter-pb-sym d-acc-chain-sym)])
               ;; aset into shadow arrays for aget'd inputs
               ;; acc is iter-active[0], aget-syms are [1..n-agets]
-              (mapcat (fn [i {:keys [arr]}]
+              (mapcat (fn [i {:keys [arr idx]}]
                         (let [scatter-sym (ad-gensym "_scatter")
-                              d-arr-sym (get arr->d-sym arr)]
+                              d-arr-sym (get arr->d-sym arr)
+                              at (util/subst-syms {idx-sym j-sym} idx)]
                           [scatter-sym
-                           (list 'aset d-arr-sym j-sym
+                           (list 'aset d-arr-sym at
                                  (list 'raster.ad.reverse/grad-acc
-                                       (list 'aget d-arr-sym j-sym)
+                                       (list 'aget d-arr-sym at)
                                        (list 'nth grads-iter-sym
                                              (clojure.core/+ 1 i))))]))
                       (range) agets)))
@@ -2733,6 +2700,8 @@
 
     {:type :par-reduce
      :residual-kind (if typed-double? :double-carry :closure-tape)
+     ;; a primitive carry tape replays the step; closures keep their own values
+     :replays (when typed-double? (util/free-syms par-reduce-form))
      :forward-bindings forward-bindings
      :tape-sym tape-sym
      :d-acc-sym d-acc-sym
@@ -2950,6 +2919,8 @@
     {:type :par-scan
      ;; no :forward-code / :tape-sym — the forward binding IS the tape build.
      :written-arrs [out-sym]
+     ;; the carry tape and every value the step reads are read again
+     :replays (conj (util/free-syms par-scan-form) out-sym)
      :read-arrs read-arrs
      :d-read-arr-syms d-read-arr-syms
      :d-scalar-syms d-scalar-syms
