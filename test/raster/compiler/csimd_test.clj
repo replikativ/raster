@@ -5,6 +5,9 @@
    #27 (the C analog of jvm/segop_simd), validated in isolation before the
    pipeline wiring. Guarded on clang + a machine that runs AVX2."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
+            [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.gpu.c-emit :as ce]
@@ -134,6 +137,26 @@
    :lambda '(.invk raster.numeric/_plus__m_double_double-impl
                    (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
                    (clojure.core/aget b (long L)))})
+
+(deftm mixed-storage-double-map!
+  [x :- (Array float), y :- (Array double), gain :- Double, cnt :- Long] :- (Array double)
+  (par/map! y i cnt double (+ (double (aget x i)) gain))
+  y)
+
+(deftest public-native-map-retains-storage-and-arithmetic-precision
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'mixed-storage-double-map! :double :simd? true)]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" (:c-source (meta native)))
+          "public typed source reaches the converting-load schedule")
+      (doseq [n [3 4 5 9 17] gain [1.0e-9 -0.125]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array n)
+              jvm (double-array n)
+              expected (mapv #(+ (double %) gain) x)]
+          (native x y (double gain) (long n))
+          (mixed-storage-double-map! x jvm (double gain) (long n))
+          (is (= expected (vec jvm) (vec y))
+              (str "public JVM/native changed-input parity, n=" n)))))))
 
 (deftest mixed-floating-storage-uses-converting-vector-loads
   (when (clang-avx2?)
