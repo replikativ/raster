@@ -729,6 +729,79 @@
         serialization (* (/ (double (:bytes transfer)) bottleneck) 1.0e9)]
     (long (Math/ceil (+ latency serialization)))))
 
+(defn project-refinement
+  "Derive ordinary copy/compute steps and SSA storage declarations from a checked refinement.
+
+   Input producers are retained compute steps, one per semantic input. Combine costs are explicit
+   analytical estimates, not target defaults. Copy routes use the existing topology authority.
+   The result is a structural projection, not execution admission: local generated arithmetic,
+   physical endpoints, readiness and enclosing-plan certificate binding remain obligations."
+  [refinement cluster input-producers combine-costs]
+  (let [facts (refinement-facts refinement)
+        inputs (:inputs refinement)
+        nodes (:nodes refinement)
+        combine-ids (into #{} (keep #(when (= :combine (:kind %)) (:id %))) nodes)
+        elements (reduce *' 1 (get-in refinement [:value :shape]))
+        bytes (*' elements (dtype/bytes-of (get-in refinement [:value :dtype])))]
+    (when-not (and (cluster-topology? cluster)
+                   (= cluster (topology (vals (:devices cluster)) (vals (:links cluster)))))
+      (fail! "collective projection requires a revalidated topology"
+             :distributed-refinement-topology {}))
+    (when-not (and (map? input-producers) (= (set (keys inputs)) (set (keys input-producers)))
+                   (every? (fn [[id producer]]
+                             (and (distributed-step? producer) (= :compute (:kind producer))
+                                  (= (get inputs id) (:device producer))
+                                  (some? (:id producer))
+                                  (positive-number? (:duration-ns producer)))) input-producers))
+      (fail! "every collective input requires its retained same-device compute producer"
+             :distributed-refinement-input-producers {}))
+    (when-not (and (map? combine-costs) (= combine-ids (set (keys combine-costs)))
+                   (every? (fn [cost]
+                             (and (map? cost) (= #{:duration-ns :peak-memory-bytes} (set (keys cost)))
+                                  (positive-number? (:duration-ns cost))
+                                  (integer? (:peak-memory-bytes cost))
+                                  (not (neg? (:peak-memory-bytes cost))))) (vals combine-costs)))
+      (fail! "every combine requires an explicit closed resource estimate"
+             :distributed-refinement-combine-costs {}))
+    (when (> bytes Long/MAX_VALUE)
+      (fail! "collective payload exceeds representable byte extents"
+             :distributed-refinement-bytes {:bytes bytes}))
+    (let [producer-ids (mapv :id (vals input-producers))
+          node-ids (mapv :id nodes)]
+      (when-not (= (count (concat producer-ids node-ids))
+                   (count (distinct (concat producer-ids node-ids))))
+        (fail! "collective producers and projected steps need distinct identities"
+               :distributed-refinement-step-identities {})))
+    (let [producer (fn [id] (or (get-in facts [:values id :producer])
+                               (:id (get input-producers id))))
+          values (into {} (map (fn [[id fact]]
+                                [id (assoc (:value refinement)
+                                           :sharding {:kind :replicated :devices [(:device fact)]})]))
+                       (:values facts))
+          shards (into {} (map (fn [[id value]]
+                                [id [(shard {:id id :value id
+                                             :device (get-in facts [:values id :device])
+                                             :offsets (vec (repeat (count (:shape value)) 0))
+                                             :shape (:shape value) :ownership :replica})]])) values)
+          steps
+          (mapv (fn [{:keys [id kind input target route left right device]}]
+                  (let [dependencies (vec (distinct (map producer
+                                                        (case kind :copy [input] :combine [left right]))))]
+                    (case kind
+                      :copy
+                      (let [step (transfer-step {:id id :source (get-in facts [:values input :device])
+                                                 :target target :route route :value input
+                                                 :bytes (long bytes) :dependencies dependencies})]
+                        (transfer-duration-ns cluster step)
+                        step)
+                      :combine
+                      (compute-step (merge {:id id :device device :dependencies dependencies}
+                                           (get combine-costs id)))))) nodes)]
+      {:refinement refinement :input-producers input-producers
+       :values values :shards shards :steps steps
+       :completions (mapv (fn [device] (producer (get-in refinement [:outputs device])))
+                          (get-in refinement [:group :devices]))})))
+
 (defn- validate-collectives!
   [mesh topology values groups collectives steps]
   (when-not (and (map? groups) (every? collective-group? (vals groups))
