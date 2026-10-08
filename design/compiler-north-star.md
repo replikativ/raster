@@ -1528,13 +1528,21 @@ user-selected identities. This composition is intentional: mesh semantics do not
 opaque transfer attributes, while storage placement and fabric resources do not leak into the
 hierarchy.
 
-This first AMR schema is not yet a claim of executable numerical operators or conservative,
-subcycled AMR execution. It is cell-centred, joins adjacent levels, and has explicit
-`:hierarchy-only` and complete-patch `:transfer-cycle` modes. A conservative
-hyperbolic/PDE vertical must next represent level time ratios, flux-register contributions,
-reflux ordering, and average-down dependencies, then validate mass/lake-at-rest and restart
-oracles on a non-trivial 2-D workload. Version 1 also deliberately requires the full proper-nesting
-margin to fit one parent patch; it has no physical-boundary exemption.
+The outer AMR schema is cell-centred, joins adjacent levels, and has explicit
+`:hierarchy-only` and complete-patch `:transfer-cycle` modes. Its operations describe
+prolongation/restriction, not a temporal AMR schedule. Separately, `raster.ode.amr-subcycle`
+already composes a two-level ratio-2 diffusion cycle from ordinary typed numerical operators:
+coarse prediction, time-interpolated ghost values, two fine steps, signed flux-register
+contributions, conservative reflux and average-down. Independent coordinate oracles cover
+rectangular anisotropic geometry; device fixtures cover synchronized mapped-byte restart.
+This bounded implementation admits one strictly interior fine patch and periodic boundaries;
+it is not a general adaptive or hyperbolic simulator, nor a lake-at-rest proof.
+
+The next planner integration must retain those temporal dependencies and register lifetimes
+in the outer plan without adding a separate AMR kernel emitter. Broader patch/level support,
+adaptation and mid-cycle restart require their own numerical and ownership acceptance.
+Version 1 also deliberately requires the full proper-nesting margin to fit one parent patch;
+it has no physical-boundary exemption.
 
 The first distributed target should be data-parallel training with explicit gradient all-reduce,
 followed by tensor/sequence sharding for a transformer block and a scientific halo-exchange case.
