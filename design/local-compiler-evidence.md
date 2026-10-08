@@ -1,5 +1,27 @@
 # Local compiler evidence — 2026-09-27
 
+## SIMD retained-operation precision — 2026-10-09
+
+A surface `deftm` mapping a Float array with a Double scalar and the expression
+`(+ (aget src i) (float (* gain gain)))` exposed a vector/scalar-tail disagreement.
+At `gain=1.00000006`, zero inputs produced `1.0000001` in scalar execution and
+the vector tail, but `1.0000002` in the vector lanes. The original walked multiply
+is stamped Double; canonical SIMD arithmetic retained that stamp but ignored it,
+broadcasting the operands into the Float species before multiplying.
+
+JVM scheduled SegMap admission with an active species now checks retained floating operation result stamps against the
+active species, using the existing dtype projection rather than reconstructing
+types from operator names. Mixed-width computations retain scalar execution until
+an explicit mixed-species lane-shape schedule exists. Homogeneous typed operations
+remain admitted. The executable regression uses two lengths and changed scalar
+inputs, with an independent Double-then-Float reference; admission controls cover
+both narrowing and widening boundaries. This does not establish real-model training
+acceptance or complete mixed-width vector support.
+The JVM stencil and C-SIMD callers that omit the active species, reduction-root
+operation precision, and typed comparison operand domains remain follow-ups. A
+public native-C execution of this fixture also returns the correct result, but does
+not establish that its vector admission applied this guard.
+
 ## Scalar non-contraction investigation — 2026-10-08
 
 Separate ScalarCompute multiply/add nodes are not sufficient evidence of two machine-level
