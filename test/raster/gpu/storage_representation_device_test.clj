@@ -2,9 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.storage-representation :as probe]
             [raster.compiler.core.dtype :as dtype]
-            [raster.core :refer [deftm]]
-            [raster.arrays :as arrays]
-            [raster.par :as par]
+            [raster.compiler.fixtures.mixed-storage :as mixed]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.value :as value]
             [raster.gpu.core :as gpu]
@@ -12,19 +10,9 @@
             [raster.dl.gpu-grad-parity :as ze])
   (:import [java.lang.foreign MemorySegment]))
 
-(deftm double-fold-float-storage
-  [x :- (Array float)] :- (Array float)
-  (let [out (arrays/zeros-like x 1)]
-    (par/map! out i 1 nil
-      (float
-       (loop [j 0 acc (double 0.0)]
-         (if (< j 3)
-           (recur (inc j) (+ acc (double (aget x j))))
-           acc))))))
-
 (defn- check-declared-local-storage! [target]
   (let [input (float-array [16777216.0 1.0 -16777216.0])
-        prepared (compiled/lower #'double-fold-float-storage [input]
+        prepared (compiled/lower #'mixed/double-fold-float-storage [input]
                                  {:compiler :equation-first :target target :dtype :double
                                   :preserve-declared-array-storage? true})
         executable (compiled/instantiate! prepared)]
@@ -34,7 +22,7 @@
         (let [outputs (compiled/invoke-compiled executable {:x input})
               actual (value/->host (:result outputs))]
           (is (= (class input) (class actual)))
-          (is (= (vec (double-fold-float-storage input)) (vec actual)))
+          (is (= (vec (mixed/double-fold-float-storage input)) (vec actual)))
           (is (= [(float middle)] (vec actual))
               "the Double carry must not round each step to the Float destination type")))
       (finally (compiled/close! executable)))))

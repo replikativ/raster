@@ -17,6 +17,10 @@ scalar Fold required its consumer precision to equal its carry precision. The fo
 one existing policy, derives each destination's storage dtype and converts only completed Fold
 results through the shared scalar conversion authority. Default allocation policy is unchanged;
 the explicitly requested preservation option now applies to resolved locals as well as parameters.
+Host fold-map projection spells the same per-destination completed-result conversions explicitly,
+including mixed Float/Double outputs. Its executed oracle compares the projected form with typed
+source execution; the shared mixed-storage fixture also enters CUDA/HIP compile gates. No fold
+carry is narrowed merely because its consumer uses narrower storage.
 
 An isolated real-checkpoint attention probe executes Double computation with Float storage after
 these changes, with small nonzero differences from the existing CPU reference. The global `:dtype`

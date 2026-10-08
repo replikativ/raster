@@ -226,7 +226,23 @@
     (is (= [:float :double] (get-in operation [:attributes :dtypes])))
     (is (= :double (get-in operation [:folds 0 :attributes :dtype])))
     (is (= :float (:dtype (get-in (dialect/facts program) [:values (first (nth equation 2))]))))
-    (is (= :double (:dtype (get-in (dialect/facts program) [:values (second (nth equation 2))]))))))
+    (is (= :double (:dtype (get-in (dialect/facts program) [:values (second (nth equation 2))]))))
+    (let [projected (projection/segmented-fold-map-form program equation)
+          run (eval (list 'fn '[values small wide] projected))
+          source-run (eval (list 'fn '[^floats values ^floats small ^doubles wide] source))
+          values (float-array [16777216.0 1.0 -16777216.0])
+          small (float-array 1)
+          wide (double-array 1)]
+      (run values small wide)
+      (is (= [1.0] (vec small)) "only the completed double carry is narrowed")
+      (is (= [1.0] (vec wide)) "the second output keeps its independent storage type")
+      (doseq [input [values (float-array [16777216.0 1.0 0.0])]]
+        (let [source-small (float-array 1)
+              source-wide (double-array 1)]
+          (source-run input source-small source-wide)
+          (run input small wide)
+          (is (= (vec source-small) (vec small)))
+          (is (= (vec source-wide) (vec wide))))))))
 
 (deftest dependent-folds-are-first-class-typed-soac
   (let [program (frontend/form->program
@@ -396,7 +412,7 @@
     (is (= '[sum maximum] (mapv first folds)))
     (is (some #{'sum} (tree-seq coll? seq (nth (second folds) 4)))
         "the second certified fold still consumes the first completed fold")
-    (is (= '[(clojure.core/float sum) maximum] results))))
+    (is (= '[(clojure.core/float sum) (clojure.core/float maximum)] results))))
 
 (deftest cooperative-maximum-materializes-its-typed-infinity-identity
   (let [operation (certified-maximum-operation)

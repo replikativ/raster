@@ -1,9 +1,20 @@
 (ns raster.compiler.fixtures.mixed-storage
   (:require [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
             [raster.par :as par]
             [raster.ad.reverse :as reverse]))
 
 (def policy {:preserve-declared-array-storage? true})
+
+(deftm double-fold-float-storage
+  [x :- (Array float)] :- (Array float)
+  (let [out (arrays/zeros-like x 1)]
+    (par/map! out i 1 nil
+      (float
+       (loop [j 0 acc (double 0.0)]
+         (if (< j 3)
+           (recur (inc j) (+ acc (double (aget x j))))
+           acc))))))
 
 (deftm mixed-scale
   [coefficient :- Double values :- (Array float)] :- (Array float)
