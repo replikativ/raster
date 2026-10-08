@@ -26,7 +26,20 @@ columns). It composes naturally through ODE solvers for sensitivity analysis.
 ## Reverse Mode
 
 Reverse-mode AD operates at the IR level: the compiler transforms the function
-body into primal + pullback closures. No runtime tape is allocated.
+body into a forward program and its pullback. Straight-line code keeps no tape;
+loops and data-parallel forms keep what their backward needs:
+
+- an additive reduction (`acc ± term(i)`) keeps nothing — the backward evaluates
+  each term's gradient again;
+- `par/scan` and other carried recurrences keep the carry (the scan's output is
+  its tape);
+- `par/map!`, `dotimes` and general reductions keep per-element pullbacks.
+
+An array read at the step index, at a literal, or at a gathered index such as
+`alpha[group[i]]` transposes to a scatter-add into the array's cotangent
+(`par/gather` likewise); other indexed reads are rejected. A pullback that
+reads an array again requires that the function does not overwrite it later.
+`(value+grad f :compile? true)` compiles the gradient with `compile-aot`.
 
 ```clojure
 ;; Gradient of a scalar function (reverse mode, efficient for many inputs)
