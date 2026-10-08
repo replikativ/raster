@@ -320,8 +320,13 @@
                              :numerical-mode (if mixed? :approximate-model :reassociated)
                              :tuning {:schedule-path [:typed-contraction :measured-selectors]
                                       :schedule-key id
-                                      :numerical-mode (assoc numerical-policy :precision
-                                                             (if mixed? :mixed-f16-f32 :f32))
+                                      :numerical-mode
+                                      (cond-> (assoc numerical-policy :precision
+                                                     (if mixed? :mixed-f16-f32 :f32))
+                                        (not mixed?)
+                                        (assoc :multiply-add
+                                               (get-in options [:schedule :typed-contraction :multiply-add]
+                                                       :decomposed)))
                                       :layout {:external-interface interface}}}})
                            measured-selector (kernel-dispatch/with-selector measured-selector))
                          certified (equation-dispatch/make

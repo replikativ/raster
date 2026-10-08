@@ -86,7 +86,7 @@
               :measured-selectors {}}
              (:segmented-weighted-reduction derived))))
     (testing "static typed contractions keep finite tile search out of the hot compile path"
-      (is (= {:strategy :auto :matrix-tiles :default :split-factors []
+      (is (= {:strategy :auto :multiply-add :decomposed :matrix-tiles :default :split-factors []
               :measured-selectors {}}
              (:typed-contraction derived))))
     (testing "GEMM dispatch policy is explicit, serializable schedule data"
@@ -99,6 +99,22 @@
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; T2 — the gate: rejects register double-buffering, passes the default (no device)
 ;; ════════════════════════════════════════════════════════════════════════════════
+
+(deftest fused-multiply-add-requires-explicit-register-schedule-consent
+  (let [derived (sched/derive-default arc-desc)]
+    (doseq [strategy [:register-tiled :dispatch-register-tiled]]
+      (let [resolved (sched/resolve derived
+                       {:typed-contraction {:strategy strategy :multiply-add :fused}})]
+        (is (true? (sched/feasible? resolved arc-desc)))))
+    (doseq [override [{:typed-contraction {:strategy :register-tiled :multiply-ad :fused}}
+                     {:typed-contraction {:multiply-add :unknown}}
+                     {:typed-contraction {:multiply-add :fused}}
+                     {:typed-contraction {:strategy :portable :multiply-add :fused}}
+                     {:typed-contraction {:strategy :matrix :multiply-add :fused}}
+                     {:precision :f32-scalar
+                      :typed-contraction {:strategy :register-tiled :multiply-add :fused}}]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sched/feasible? (sched/resolve derived override) arc-desc))))))
 
 (deftest t2-feasibility-gate
   (testing "the default mixed-f16-f32 GEMM (stage :none) is feasible at grf128 — 256 ≤ 256"

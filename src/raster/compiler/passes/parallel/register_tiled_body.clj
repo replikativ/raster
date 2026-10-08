@@ -219,13 +219,20 @@
   "Apply one cooperative register-tiled schedule to verified contraction facts.
 
    Literal and scalar-bound dimensions share the same tile body. Other symbolic expressions
-   decline until they can be projected to checked, typed scalar ABI values."
-  [contract-facts {:keys [tile descriptor operation-id scalar-types]}]
+   decline until they can be projected to checked, typed scalar ABI values.
+   :multiply-add selects decomposed typed operations (default) or explicit canonical :fma.
+   Decomposed SSA alone does not forbid contraction by a downstream vendor compiler."
+  [contract-facts {:keys [tile descriptor operation-id scalar-types multiply-add]
+                  :or {multiply-add :decomposed}}]
   (when-not (facts/facts? contract-facts)
     (throw (ex-info "register-tiled scheduling requires verified contraction facts"
                     {:reason :raster/bug :facts contract-facts})))
   (let [{:keys [dtype free-axes contract-axes epilogue out]} contract-facts
         dtype (dtype/canon dtype)
+        _ (when-not (contains? #{:decomposed :fused} multiply-add)
+            (decline! :multiply-add-policy
+                      "register-tiled multiply-add must be :decomposed or :fused"
+                      {:multiply-add multiply-add}))
         _ (when-not (dtype/known? dtype)
             (decline! :storage-dtype
                       "register-tiled schedule requires a known storage dtype"
@@ -435,14 +442,21 @@
              (let [product (identifier "register-product" mm nn)
                    next-accumulator (identifier "register-next" mm nn)
                    accumulator (identifier "register-inner-acc" mm nn)]
-               [(body/->ScalarCompute
-                 (body/value product dtype)
-                 (body/scalar-expression :* dtype
-                                         [(identifier "register-a" mm)
-                                          (identifier "register-b" nn)]))
-                (body/->ScalarCompute
-                 (body/value next-accumulator dtype)
-                 (body/scalar-expression :+ dtype [accumulator product]))]))
+               (if (= :fused multiply-add)
+                 [(body/->ScalarCompute
+                   (body/value next-accumulator dtype)
+                   (body/scalar-expression :fma dtype
+                                           [(identifier "register-a" mm)
+                                            (identifier "register-b" nn)
+                                            accumulator]))]
+                 [(body/->ScalarCompute
+                   (body/value product dtype)
+                   (body/scalar-expression :* dtype
+                                           [(identifier "register-a" mm)
+                                            (identifier "register-b" nn)]))
+                  (body/->ScalarCompute
+                   (body/value next-accumulator dtype)
+                   (body/scalar-expression :+ dtype [accumulator product]))])))
            (for [mm (range thread-m) nn (range thread-n)] [mm nn]))
           [(body/->Yield
             (vec (for [mm (range thread-m) nn (range thread-n)]
@@ -548,7 +562,8 @@
        :indices indices
        :masks masks
        :operations (into [outer-loop] stores)
-       :schedule (assoc tile :strategy :register-tiled :variant variant)
+       :schedule (assoc tile :strategy :register-tiled :variant variant
+                       :multiply-add multiply-add)
        :launch (launch/spec
                 {:workgroup-size [workgroup-by-col workgroup-by-row]
                  :group-count [(launch/ceil-div N block-n)

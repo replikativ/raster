@@ -542,15 +542,34 @@
         graph (:graph (equation-graph/make-for-equation scheduled equation))
         node (first (filter #(= operation (:operation %)) (:nodes graph)))
         facts (:facts (contraction-context/validate! (:algorithm equation) operation))]
-    {:node node :graph graph :facts facts
+    {:node node :graph graph :facts facts :algorithm (:algorithm equation)
      :descriptor (compiler-hardware/descriptor-for target)
      :options (select-keys (:options compilation) [:array-types :scalar-types])}))
 
+(deftest register-arithmetic-choice-closes-the-complete-write-proof
+  (let [{:keys [node graph facts descriptor options algorithm]} (fixed-contraction-site ocl-target)]
+    (doseq [policy [:decomposed :fused]]
+      (let [planned (contraction-schedule/plan-register-tiled-for-node
+                     node graph facts descriptor
+                     (assoc options :precision :mixed-f16-f32 :multiply-add policy))
+            certificate (:scheduled planned)
+            opposite (if (= policy :fused) :decomposed :fused)
+            proof #(contraction-schedule/complete-write-domain algorithm node graph %)]
+        (is (:ok planned))
+        (is (= policy (get-in certificate [:legality :multiply-add])))
+        (is (seq (proof certificate)))
+        (is (nil? (proof (update certificate :legality dissoc :multiply-add))))
+        (is (nil? (proof (assoc-in certificate [:legality :multiply-add] opposite))))
+        (is (nil? (proof (assoc-in certificate [:body :schedule :multiply-add] opposite))))
+        (is (nil? (proof (assoc-in certificate [:numerics :policy] :unproven-policy))))))))
+
 (deftest fixed-register-tile-retains-the-equation-graph-certificate
-  (doseq [target [ocl-target cuda-target hip-target]]
+  (doseq [target [ocl-target cuda-target hip-target] policy [:decomposed :fused]]
     (let [compilation (equation-first/compile
                        #'contractions/fixed-matmul
-                       {:target target :dtype :float :schedule register-tiled-schedule})]
+                       {:target target :dtype :float
+                        :schedule (assoc-in register-tiled-schedule
+                                            [:typed-contraction :multiply-add] policy)})]
       (let [identity {:semantic-request-fingerprint "fixed-tile-request"
                       :compiler-build-fingerprint "test-build"
                       :source-dependency-fingerprint "fixed-matmul"
@@ -566,16 +585,19 @@
       (let [artifact (first (:kernels compilation))
             certificate (get-in artifact [:provenance :scheduled-operation])]
         (is (= :register-tiled (get-in artifact [:attributes :strategy])))
-        (is (= :ordered-k-target-contraction (get-in certificate [:numerics :policy])))
+        (is (= (if (= policy :fused) :ordered-k-fused-multiply-add
+                                    :ordered-k-decomposed-multiply-add)
+               (get-in certificate [:numerics :policy])))
         (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
         (is (= 2 (count (get-in artifact [:launch :workgroup-size]))))))))
 
 (deftest public-contraction-dispatch-emits-both-certified-c-family-alternatives
-  (doseq [target [ocl-target cuda-target hip-target]]
+  (doseq [target [ocl-target cuda-target hip-target] policy [:decomposed :fused]]
     (let [compilation (equation-first/compile
                        #'contractions/fixed-matmul
                        {:target target :dtype :float
-                        :schedule {:typed-contraction {:strategy :dispatch-register-tiled}}})
+                        :schedule {:typed-contraction {:strategy :dispatch-register-tiled
+                                                       :multiply-add policy}}})
           operation (-> compilation :emitted :equations last :operations first)
           linked (equation-first/lower compilation [(float-array 15) (float-array 21)])]
       (is (equation-dispatch/emitted-equation-dispatch? operation))
@@ -583,11 +605,13 @@
       (is (= :register-tiled
              (executable/strategy (-> linked :instances first :call :steps last :graph))))
       (let [choice (:dispatch operation)
+            _ (is (= policy (get-in choice [:attributes :tuning :numerical-mode :multiply-add])))
             selected (equation-first/compile
                       #'contractions/fixed-matmul
                       {:target target :dtype :float
                        :schedule {:typed-contraction
                                   {:strategy :dispatch-register-tiled
+                                   :multiply-add policy
                                    :measured-selectors
                                    {(:id choice) {:kind :fixed-strategy
                                                   :strategy :sequential-segments}}}}})

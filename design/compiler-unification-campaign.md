@@ -3289,3 +3289,36 @@ schedule permission, selector, error tolerance or numerical oracle is introduced
 review found no blocker; focused source/numerical/GEMM suites pass 49 tests / 1390 assertions.
 Native portable BLAS and explicitly mixed attention/projection checks
 pass 2 tests / 72 assertions on OpenCL and Level Zero. The real-checkpoint gate remains held.
+
+### Explicit register-product realization — 2026-10-08
+
+The real-checkpoint diagnosis is recorded in `local-compiler-evidence.md`: generated
+forward matrix products and matrix pullbacks match ordered Float multiply/add
+references, while native BLAS uses different reduction/rounding realizations.
+This is not sufficient to close the unchanged model-gradient gate.
+
+The existing register-tiled schedule now exposes `:typed-contraction :multiply-add`
+as `:decomposed` (default) or `:fused`. The latter produces canonical typed `:fma`
+SSA without a new operator registry, emitter or model-specific compiler rule.
+Only explicitly permissive register-tiled/fused-register dispatch requests admit
+it; other strategies and restrictive precision reject the request. The resolved
+schedule, body, legality, numerical certificate, tuning metadata and exact
+complete-write rederivation retain the choice. Unknown nested schedule fields
+fail closed, including misspelled arithmetic choices.
+
+`Decomposed` describes the typed IR, not proof that a vendor compiler will refrain
+from contraction. Numerical rounding remains implementation-defined. Explicit
+FMA is currently a C-family capability; the existing WASM polynomial facet is not
+a single-round FMA implementation. Before cross-target exact rounding can be
+claimed, introduce checked target non-contraction controls or explicit rounded
+operations and verify the resulting device/compiler instructions. This is a
+correctness follow-up, not permission to weaken an ordered source reduction.
+
+Bit-sensitive NN/NT projection checks on local OpenCL and Level Zero compare raw
+Float bits against independent ordered oracles, replace inputs and compile
+decomposed/fused/decomposed to exercise cache separation. Fused CUDA sm80 PTX and
+HIP gfx1100 code compile locally; inspected PTX contains `fma.rn.f32`. No NVIDIA
+or AMD execution/performance acceptance is implied. The real checkpoint's fused
+Q projection matches the independent ordered FMA oracle exactly, but still differs
+from native BLAS. Full-model gradient parity, sustained training and the original
+distributed/AMR campaign residuals remain open.
