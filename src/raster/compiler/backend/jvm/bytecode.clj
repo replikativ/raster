@@ -5105,19 +5105,6 @@
   [form bound]
   (util/free-syms form bound))
 
-(defn- optimize-chunk
-  "Apply normalize pass to chunk body before bytecoding.
-   Converts .invk calls to direct ops (Math/fma, clojure.core/+, etc.)
-   which the bytecoder compiles to smaller, tighter bytecode.
-   This reduces the total inlined code size so C2's compilation unit
-   stays within its node budget after chain-inlining."
-  [walked-body]
-  (try
-    (let [normalize (requiring-resolve 'raster.compiler.passes.scalar.normalize/normalize)]
-      (mapv normalize walked-body))
-    (catch Exception _
-      walked-body)))
-
 (defn- split-body-into-helpers
   "Extract par forms from a let-body into helper static methods.
    Scans both body forms and let-binding init expressions for par forms.
@@ -5127,7 +5114,9 @@
    Uses descriptors/par-form? for detection (centralized, not hardcoded).
    Each helper receives only its free variables as typed params.
    Primitive-constant vars are excluded (bytecoder constant-folds them to LDC).
-   Normalize pass is applied to extracted par forms for tighter bytecode.
+   Extracted forms retain their typed call boundaries. Replacing a typed call
+   with generic arithmetic can lose operand conversions and recurrence width;
+   method partitioning must not change the numerical program.
 
    Returns {:main-bindings [sym init ...], :main-body [forms], :helpers [fn-spec...]}"
   [body-forms let-bindings fn-params fn-tags source-ns _target-chunk-size]
@@ -5211,7 +5200,7 @@
                                    {:name helper-name
                                     :params helper-params
                                     :return-tag ret-tag
-                                    :walked-body (optimize-chunk [form])
+                                    :walked-body [form]
                                     :source-ns source-ns})
                             (apply list helper-name ordered-free))
                           ;; Not a par form — keep as-is

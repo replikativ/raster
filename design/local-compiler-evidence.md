@@ -1392,3 +1392,132 @@ ordered FMA as a sufficient fix. The capability extension is independently
 validated; the fused policy is not promoted to a default or a training-parity
 claim. Actual shared-operand pullbacks and inherited cotangents still need
 localization against the monolithic CPU AD oracle.
+
+### Actual shared-cotangent pullbacks — 2026-10-09
+
+Two isolated real-checkpoint block VJPs were run with the native CPU forward
+input and native CPU output cotangent supplied identically to CPU and GPU.
+The original external backward declaration and explicit fused register schedule
+were used. This removes inter-layer input/cotangent drift but still recomputes
+each block's internal forward intermediates on its respective target. Layer 1
+still exceeds the adapter threshold for Ak and Bg; layer 0 exceeds it for Ak,
+Bk, Av, Bg, Au, Bu, Ad and Bd. Thus inter-layer drift is not the only cause.
+These are diagnostic comparisons, not a substitute acceptance oracle.
+
+Wrapping the existing Float matrix-pullback typed interfaces captured 42 calls
+from the CPU layer-1 VJP without changing any of its 14 adapter gradients
+(all coordinates bit-identical). Each adapter gradient is the direct result of
+one captured `linear-dW` call. On those exact actual-model operands, all 14
+generated fused TN products match both native BLAS and an independent ordered
+Float Math/fma dot reference exactly. Their reduction width is two, matching
+the unchanged sequence length. This rules out those isolated adapter-matrix
+products as the source of the observed layer-1 discrepancy; it does not prove
+other widths, the full forward recomputation, input cotangent propagation,
+nonlinear adjoints, or the final training gate. Next localization follows the
+actual cotangents upstream and checks input-gradient products at shared operands.
+
+All 21 captured layer-1 input-gradient matrix calls were also executed on
+identical operands. Generated fused NN products match ordered Float Math/fma
+exactly in every coordinate. Native BLAS uses different accumulation results;
+the largest observed same-input absolute difference is 0.00067138671875.
+Double-dot diagnostics improve some differences and worsen others; they are not
+an automatic justification for widening the production graph. The remaining
+full-block mismatch must be diagnosed through its recomputed intermediates and
+cotangent propagation, rather than attributing it to the isolated adapter-TN
+products or replacing the monolithic oracle with a convenient local one.
+
+A separate CPU-only arithmetic simulation replaced the three typed matrix
+helpers with independent Double-dot/Float-store implementations, leaving the
+model, AD rules, nonlinear operations and native-BLAS monolithic reference
+unchanged. Widening all matrix calls still fails 8 of 28 adapter checks (maximum
+1.1460127391180726). Widening only input-gradient products leaves two failures
+(layer-1 Ak 0.02482720148392874 and Ag 0.03098584773269312). Neither diagnostic
+is a GPU execution result or an accepted replacement oracle; no production
+widening follows from it. Better local dot accuracy alone is insufficient
+evidence that the complete numerical contract is met.
+
+Replacing only the CPU matrix helpers with ordered Float FMA also fails 15
+adapter checks (maximum 0.8192590523403551), with predicted loss 17921.278125,
+the same loss as the executed fused GPU chain. The unchanged nonlinear CPU
+path is retained in this simulation. Thus matrix realization alone can
+reproduce the acceptance failure pattern; this is not a proof that every GPU
+nonlinear operation or full cotangent agrees with its CPU counterpart.
+
+Captured actual layer-1 normalization calls give additional bounds. All six
+chunked RMSNorm forward calls match CPU exactly at shared inputs. All six
+backward input-gradient calls have small differences: maximum absolute error
+0.00006103515625 and maximum coordinate-relative error
+0.00004876049798283915 (these maxima come from different calls). Capture
+preserves the original CPU adapter gradients exactly. A proposed partial-state
+diagnostic based on evaluating the retained body, including a return-projected
+anonymous ftm, did not reproduce the original compiled CPU output exactly.
+Its partial states are therefore rejected as an oracle, not used to justify
+production changes. A valid partial-state comparison must first establish
+observational equivalence through the same specialization and emission path.
+
+The native reference in this warm JVM is the selected MKL threaded LP64
+component provider (`libmkl_intel_lp64.so`), not the CUDA agent's separately
+reported OpenBLAS batch-extension environment. Provider selection is metadata,
+not a numerical proof; the captured dot comparisons above supply the functional
+evidence for these operands. Do not conflate this accumulation-order finding
+with the independent OpenBLAS interleaved-batch crash.
+
+A bounded CPU-only partitioned-FMA ladder was also checked before adding a
+production reduction policy. Strided 4/8/16-chain products each fail 9 adapter
+checks; contiguous 4/8/16-chain products fail 10/9/13 respectively. Tiny
+reductions (including the two-row adapter products) retain one FMA chain.
+The model, nonlinear CPU operations and native monolithic oracle are unchanged.
+These finite candidates do not establish that all blocked policies fail, but
+none supplies evidence for a numerical fix or a new production default. Keep
+parallel-reduction performance work separate from unchanged model acceptance.
+
+### Mixed-precision JVM helper extraction: retained call boundaries
+
+A subsequent partial-state diagnostic used named `deftm` projections with the
+original Array-float return annotation and verified that its projected output
+was bit-identical to the original captured CPU normalization call. Its partial
+dot state differed from the GPU at 35 of 64 coordinates. An independent oracle
+identified the CPU realization as Float inner products with Double weighted
+terms and a Double carry; the GPU matched narrowing the weighted term before
+each Float addition. However, the original retained loop binder and addition
+were both stamped Float. This was not evidence for introducing a new GPU
+precision mode.
+
+The JVM helper-extraction path normalized typed `.invk` calls into generic
+arithmetic, discarding both result stamps and typed-call operand conversions.
+That changed a Float addition accepting a Double term into generic Double
+arithmetic. A cancelling weighted fold reproduced the difference independently
+of the model: the small method returned zero, but the extracted version returned
+one. Retaining the original typed calls fixes that regression without a new
+type registry or a model-specific lowering. The existing typed JVM call emitter
+remains responsible for conversions; helper partitioning is not permission to
+change numerical semantics.
+
+With fresh named projections after this change, the actual model's PSS, PC and
+k1 states match the GPU exactly, and PC matches the independent Float-carry
+oracle exactly. Downstream k2 still differs at one coordinate, and dx differs
+at 536 of 1280 coordinates (maximum absolute 0.001953125, maximum coordinate
+relative 2.3887326823598837e-7). These diagnostics do not establish acceptance
+of the full real-model gradient gate or certify helper-call performance. The
+affected JVM loop and bytecode suites pass 50 tests / 139 assertions, including
+lazy and AOT changed-input checks across the actual extraction threshold.
+
+Cold CI exposed one test-metric assumption: the chunked Float RMSNorm backward
+was compared to a different reduction tree using error divided by the resulting
+dx coordinate. The maximum was 0.0010544952502931275 against 0.001 after restored
+Float rounding. Because dx subtracts two potentially large terms, that ratio
+can amplify harmless reassociation at cancellation coordinates. The test now
+uses an independent Double mathematical reference and the sum of the two term
+magnitudes as its backward-error scale, for both Float and Double schedules.
+The existing numerical bounds and finite-difference checks remain, and both
+schedules are checked against the independent reference as well as each other.
+Zero scales require exact agreement; no arbitrary absolute-error floor is added.
+No production normalization formula or pinned model acceptance metric changes.
+The three affected JVM/normalization namespaces pass 55 tests / 201 assertions
+in the fresh capped REPL, including the unchanged finite-difference checks.
+
+A fresh capped JVM reran the held real-weight harness at the original source
+pins and tolerances with no pre-fix CPU classes. Loss remains 17921.2765625 vs
+17921.271875; input-gradient error is 0.006813176206858781. Twelve of 28 adapter
+checks still fail, with maximum 1.0649456537233917. This fixes a genuine compiler
+partitioning inconsistency but does not close the real-weight acceptance gate.

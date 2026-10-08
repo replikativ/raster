@@ -72,6 +72,42 @@
           (recur (inc i) (max m (/ (Math/abs (- x y)) (max 1.0e-9 (Math/abs y))))))
         m))))
 
+(defn- rms-dx-reference
+  "Independent Double arithmetic, with a cancellation-aware backward-error scale.
+   dx subtracts two terms; their sum of magnitudes conditions that subtraction."
+  [dy x w rows features eps gain]
+  (let [values (double-array (* rows features))
+        scales (double-array (* rows features))]
+    (dotimes [row rows]
+      (let [offset (* row features)
+            [sq dot] (loop [i 0 sq 0.0 dot 0.0]
+                       (if (= i features)
+                         [sq dot]
+                         (let [j (+ offset i) xi (double (ra/aget x j))
+                               gi (+ gain (double (ra/aget w i)))]
+                           (recur (inc i) (+ sq (* xi xi))
+                                  (+ dot (* gi xi (double (ra/aget dy j))))))))
+            inv (/ 1.0 (Math/sqrt (+ (/ sq features) eps)))
+            factor (/ (* inv inv inv dot) features)]
+        (dotimes [i features]
+          (let [j (+ offset i)
+                a (* inv (+ gain (double (ra/aget w i))) (double (ra/aget dy j)))
+                b (* factor (double (ra/aget x j)))]
+            (aset values j (- a b))
+            (aset scales j (+ (Math/abs a) (Math/abs b)))))))
+    {:values values :scales scales}))
+
+(defn- maxscaled [actual expected scales]
+  (reduce max 0.0
+          (map (fn [a b scale]
+                 (let [error (Math/abs (- (double a) (double b)))
+                       scale (double scale)]
+                   (cond
+                     (or (not (Double/isFinite scale)) (neg? scale)) Double/POSITIVE_INFINITY
+                     (zero? scale) (if (zero? error) 0.0 Double/POSITIVE_INFINITY)
+                     :else (/ error scale))))
+               actual expected scales)))
+
 (deftest rms-norm-chunked-matches-row-parallel
   (testing "f64: chunked forward + backward-dx agree with the row-parallel schedule"
     (doseq [[rows feat chunks] [[8 64 8] [8 64 1] [8 64 7] [8 64 64] [8 64 128]
@@ -82,18 +118,28 @@
             y1 (nn/rms-norm-chunked x w rows feat chunks eps go)
             d0 (nn/rms-norm-backward-dx dy x w rows feat eps go)
             d1 (nn/rms-norm-chunked-backward-dx dy x w rows feat chunks eps go)
+            {:keys [values scales]} (rms-dx-reference dy x w rows feat eps go)
             tag (str "rows=" rows " feat=" feat " chunks=" chunks)]
-        ;; reassociated sums: f64 agrees to ~1e-15 relative; dx has cancellation, so
-        ;; it is checked at a looser (still far-below-f32) elementwise relative bound.
+        ;; Forward reassociation uses relative error; backward subtractive
+        ;; cancellation uses the independent reference's two term magnitudes.
         (is (< (maxrel y1 y0) 1e-12) (str "fwd " tag))
-        (is (< (maxrel d1 d0) 1e-9) (str "bwd-dx " tag)))))
+        (is (< (maxscaled d1 d0 scales) 1e-9) (str "bwd-dx " tag))
+        (is (< (maxscaled d1 values scales) 1e-9) (str "chunked reference " tag))
+        (is (< (maxscaled d0 values scales) 1e-9) (str "rowwise reference " tag)))))
   (testing "f32: same, at f32 tolerance"
     (let [rows 64 feat 640 chunks 32 go 1.0 eps 1e-6
           x (fa (* rows feat) 21) w (fa feat 22) dy (fa (* rows feat) 23)]
       (is (< (maxrel (nn/rms-norm-chunked x w rows feat chunks eps go)
                      (nn/rms-norm x w rows feat eps go)) 1e-4) "fwd f32")
-      (is (< (maxrel (nn/rms-norm-chunked-backward-dx dy x w rows feat chunks eps go)
-                     (nn/rms-norm-backward-dx dy x w rows feat eps go)) 1e-3) "bwd-dx f32"))))
+      (let [chunked (nn/rms-norm-chunked-backward-dx dy x w rows feat chunks eps go)
+            rowwise (nn/rms-norm-backward-dx dy x w rows feat eps go)
+            {:keys [values scales]} (rms-dx-reference dy x w rows feat eps go)]
+        ;; A coordinate's dx may nearly cancel. Dividing by that result measures
+        ;; conditioning, not reduction accuracy. Keep the same bound, using an
+        ;; independent mathematical reference's two term magnitudes as the scale.
+        (is (< (maxscaled chunked rowwise scales) 1e-3) "bwd-dx f32 reassociation")
+        (is (< (maxscaled chunked values scales) 1e-3) "chunked vs independent dx")
+        (is (< (maxscaled rowwise values scales) 1e-3) "rowwise vs independent dx")))))
 
 (deftm rms-chunked-loss [x :- (Array float) w :- (Array float) tgt :- (Array float)
                          rows :- Long feat :- Long chunks :- Long
