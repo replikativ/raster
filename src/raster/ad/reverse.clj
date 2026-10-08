@@ -284,6 +284,7 @@
 (declare ^:private gen-reverse-dotimes)
 (declare ^:private gen-reverse-par-map)
 (declare ^:private gen-reverse-par-reduce)
+(declare ^:private gen-reverse-ordered-reduce)
 (declare ^:private gen-reverse-par-scan)
 (declare ^:private let-gradient-pieces)
 (declare ^:private extract-let-parts)
@@ -2274,18 +2275,179 @@
          :body-result body-result
          :free-syms (disj all-free idx-sym acc-sym)}))))
 
+;; ================================================================
+;; Additive reductions: acc ± term(i)
+;; ================================================================
+
+(defn- additive-step
+  "{:sign ±1 :term t} when `expr` adds (or subtracts) a term to the
+  accumulator that does not itself read the accumulator; else nil."
+  [expr acc-sym]
+  (when (seq? expr)
+    (let [[op args] (if (= '.invk (first expr))
+                      [(second expr) (nnext expr)]
+                      [(first expr) (rest expr)])
+          op-name (when (symbol? op) (name op))
+          numeric? (and op-name (= "raster.numeric" (namespace op)))
+          kind (cond
+                 (contains? '#{+ clojure.core/+ raster.numeric/+} op) :plus
+                 (contains? '#{- clojure.core/- raster.numeric/-} op) :minus
+                 (and numeric? (.startsWith ^String op-name "_plus__m_")) :plus
+                 (and numeric? (.startsWith ^String op-name "_minus__m_")) :minus)
+          reads-acc? #(contains? (util/free-syms %) acc-sym)]
+      (when (and kind (= 2 (count args)))
+        (let [[a b] args]
+          (cond
+            (and (= acc-sym a) (not (reads-acc? b)))
+            {:sign (if (= :plus kind) 1 -1) :term b}
+            (and (= :plus kind) (= acc-sym b) (not (reads-acc? a)))
+            {:sign 1 :term a}))))))
+
+(declare ^:private untemplated-scan-call? lower-composites)
+
+(defn- gen-reverse-additive-reduce
+  "Reverse mode for a reduction whose step adds a term independent of the
+  accumulator: acc_n = init ± Σ term(i). The accumulator's cotangent is the
+  same at every step, so the backward needs no carry tape and no forward
+  replay of the accumulator: one loop evaluates each term's gradient under
+  that cotangent, scatter-adds array cotangents at each read's own index (the
+  loop is sequential, so a gathered read such as alpha[group[i]] may repeat a
+  destination) and sums scalar gradients. The forward is the source-order
+  loop, unchanged. nil when the step is not additive or reads an active array
+  the term's gradient cannot replay."
+  [par-reduce-form active-params]
+  (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
+        ;; as for a scan step: inline untemplated deftm calls before
+        ;; differentiating the term
+        step-expr (if (untemplated-scan-call? body-expr)
+                    (lower-composites body-expr)
+                    body-expr)
+        analyzed (analyze-par-map-body step-expr idx-sym true)
+        ;; ANF ends the step in `v = acc ± term; v`: the update is v's init
+        {:keys [agets scalar-bindings body-result free-syms]}
+        (let [{:keys [scalar-bindings body-result]} analyzed
+              [last-sym last-init] (peek scalar-bindings)]
+          (if (and (symbol? body-result) (= body-result last-sym))
+            (assoc analyzed :scalar-bindings (pop scalar-bindings) :body-result last-init)
+            analyzed))
+        {:keys [sign term]} (additive-step body-result acc-sym)
+        active-free (filterv #(contains? free-syms %) active-params)]
+    (when (and term
+               (not-any? (fn [[_ init]] (contains? (util/free-syms init) acc-sym))
+                         scalar-bindings)
+               ;; an active array outside the admitted reads would be a free scalar
+               (not-any? #(= :array (:kind (tangent/tangent-kind (:raster.type/tag (meta %)))))
+                         active-free)
+               (not (and (seq? init-expr) (some (set active-params) (util/free-syms init-expr)))))
+      (let [aget-syms (mapv :sym agets)
+            iter-active (vec (distinct (concat aget-syms active-free)))
+            pure-scalar-bindings (vec (mapcat identity
+                                              (remove (fn [[sym _]] (contains? (set aget-syms) sym))
+                                                      scalar-bindings)))
+            d-acc-sym (ad-gensym "d_acc")
+            d-term-sym (ad-gensym "d_term")
+            term-sym (ad-gensym "term")
+            [_ step-bindings step-grads]
+            (gen-inline-step-gradients (conj pure-scalar-bindings term-sym term)
+                                       [term-sym] iter-active d-term-sym)
+            read-arrs (vec (distinct (map :arr agets)))
+            d-read-arr-syms (mapv (fn [arr]
+                                    (ad-gensym (str "d_" (name arr))
+                                               (or (:raster.type/tag (meta arr))
+                                                   (lost-tag! :additive-read-arr (name arr)))))
+                                  read-arrs)
+            arr->d-sym (zipmap read-arrs d-read-arr-syms)
+            d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
+            n-sym (ad-gensym "n_red")
+            reduce-result-sym (ad-gensym "red_val")
+            bwd-result-sym (ad-gensym "red_bwd")
+            n-agets (count agets)
+            bwd-body
+            (vec (concat
+                  (mapcat (fn [{:keys [sym arr idx]}] [sym (list 'aget arr idx)]) agets)
+                  step-bindings
+                  (mapcat (fn [k {:keys [arr idx]}]
+                            (let [d-arr (arr->d-sym arr)]
+                              [(ad-gensym "_scatter")
+                               (list 'aset d-arr idx
+                                     (list 'raster.ad.reverse/grad-acc
+                                           (list 'aget d-arr idx)
+                                           (nth step-grads k)))]))
+                          (range) agets)))
+            backward-loop
+            (list 'let* [n-sym (list 'clojure.core/int bound-expr)
+                         d-term-sym (if (= 1 sign) d-acc-sym (list 'raster.numeric/- d-acc-sym))]
+                  (list 'loop* (vec (concat [idx-sym 0]
+                                            (mapcat (fn [s p] [s (param-zero-expr p)])
+                                                    d-scalar-syms active-free)))
+                        (list 'if (list 'clojure.core/< idx-sym n-sym)
+                              (list 'let* bwd-body
+                                    (list* 'recur (list 'clojure.core/inc idx-sym)
+                                           (map-indexed (fn [i d-s]
+                                                          (list 'raster.ad.reverse/grad-acc d-s
+                                                                (nth step-grads (clojure.core/+ n-agets i))))
+                                                        d-scalar-syms)))
+                              ;; [d_read_arrs… d_scalars… d_init]
+                              (vec (concat d-read-arr-syms d-scalar-syms [d-acc-sym])))))]
+        {:type :par-reduce
+         :residual-kind :none
+         ;; source-order forward: the loop par/reduce stands for
+         :forward-bindings
+         [reduce-result-sym
+          (let [n (ad-gensym "n_fwd")]
+            (list 'let* [n (list 'clojure.core/int bound-expr)]
+                  (list 'loop* [idx-sym 0 acc-sym init-expr]
+                        (list 'if (list 'clojure.core/< idx-sym n)
+                              (list 'recur (list 'clojure.core/inc idx-sym) body-expr)
+                              acc-sym))))]
+         :d-acc-sym d-acc-sym
+         :written-arrs []
+         :read-arrs read-arrs
+         :d-read-arr-syms d-read-arr-syms
+         :d-scalar-syms d-scalar-syms
+         :active-free active-free
+         :shadow-allocs (vec (mapcat (fn [d arr]
+                                       [d (list 'raster.arrays/zeros-like arr
+                                                (list 'clojure.core/alength arr))])
+                                     d-read-arr-syms read-arrs))
+         :backward-maps (vec (concat
+                              [[bwd-result-sym backward-loop]]
+                              (map-indexed (fn [i d] [d (list 'nth bwd-result-sym i)])
+                                           d-read-arr-syms)))
+         :backward-reduces (vec (map-indexed
+                                 (fn [i d] [d (list 'nth bwd-result-sym (clojure.core/+ (count read-arrs) i))])
+                                 d-scalar-syms))
+         :bound-expr bound-expr
+         :reduce-result-sym reduce-result-sym
+         :bwd-result-sym bwd-result-sym
+         :init-expr init-expr}))))
+
 (defn- gen-reverse-par-reduce
   "Generate reverse-mode AD code for a raster.par/reduce form.
 
   Forward form: (raster.par/reduce acc init idx bound body-expr)
 
-  Proven-pure double-carry steps use one primitive carry tape and replay the
-  scalar step during the ordered reverse sweep. Other supported steps retain
-  their per-step closure tape; neither route reorders the carry dependence.
+  An additive step (acc ± term, term independent of acc) needs no carry
+  residual (gen-reverse-additive-reduce). Otherwise proven-pure double-carry
+  steps use one primitive carry tape and replay the scalar step during the
+  ordered reverse sweep, and other supported steps retain their per-step
+  closure tape; no route reorders the forward accumulation.
 
   Returns a record map for gen-reverse-let to use."
   [par-reduce-form active-params]
+  (or
+   (gen-reverse-additive-reduce par-reduce-form active-params)
+   (gen-reverse-ordered-reduce par-reduce-form active-params)))
+
+(defn- gen-reverse-ordered-reduce
+  "The general par/reduce reverse: the accumulator's cotangent chains through
+  the steps (see gen-reverse-par-reduce)."
+  [par-reduce-form active-params]
   (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
+        ;; as for a scan step: inline untemplated deftm calls first
+        body-expr (if (untemplated-scan-call? body-expr)
+                    (lower-composites body-expr)
+                    body-expr)
         _ (when (and (seq? init-expr)
                      (some (set active-params)
                            (util/free-syms init-expr)))
@@ -3261,6 +3423,22 @@
                   {:ok? true :locals #{}}
                   bindings))))
 
+(defn- emit-carry-recurrence
+  "A pure carry recurrence (no stored out buffer) as par/reduce when its step
+  is additive — the reduction's pullback needs no carry tape — else as the
+  synthesized-out scan. `body` may be a let* prelude ending in the update."
+  [{:keys [acc idx bound init body dtype] :as spec}]
+  (let [tail (loop [e body] (if (and (seq? e) (contains? #{'let 'let*} (first e))) (recur (last e)) e))
+        prelude-reads-acc? (and (seq? body) (contains? #{'let 'let*} (first body))
+                                (some (fn [[_ init]] (contains? (util/free-syms init) acc))
+                                      (partition 2 (second body))))]
+    (if (and (additive-step tail acc) (not prelude-reads-acc?))
+      (with-ad-gensym
+        (let [init-sym (ad-gensym "carry_init" (case dtype :float 'float :double 'double nil))]
+          (list 'let* [init-sym init]
+                (list 'raster.par/reduce acc init-sym idx bound body))))
+      (emit-carry-scan spec))))
+
 (defn- carry-loop->scan
   "Rewrite a carry loop into its canonical par/scan form, or nil when the
   soundness gates decline (see patterns/match-carry-loop). Two shapes:
@@ -3301,7 +3479,7 @@
                      (carry-scan-dtype body))]
        (when (and (some? dtype)
                   (carry-dtype-consistent? dtype body))
-         (emit-carry-scan {:out nil
+         (emit-carry-recurrence {:out nil
                            :dtype dtype
                            :cast (case dtype :float 'float :double 'double)
                            :acc acc-sym :idx index-sym
@@ -3335,7 +3513,7 @@
                   (some? dtype)
                   (carry-dtype-consistent? dtype scoped-update-expr)
                   (active-reads-match-dtype? dtype scoped-update-expr))
-         (emit-carry-scan {:out nil
+         (emit-carry-recurrence {:out nil
                            :dtype dtype
                            :cast (case dtype :float 'float :double 'double)
                            :acc acc-sym :idx index-sym
