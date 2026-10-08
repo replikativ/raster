@@ -101,7 +101,8 @@
     (is (= [:double :double :double :long :long :double]
            (mapv :dtype (:abi artifact))))
     (is (str/starts-with? (:source artifact)
-                          "#pragma OPENCL EXTENSION cl_khr_fp64 : enable"))))
+                          (str "#pragma OPENCL FP_CONTRACT OFF\n"
+                               "#pragma OPENCL EXTENSION cl_khr_fp64 : enable")))))
 
 (deftest dynamic-reference-carries-shapes-through-the-ordered-abi
   (let [{:keys [artifact graph]}
