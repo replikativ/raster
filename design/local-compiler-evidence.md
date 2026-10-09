@@ -1827,3 +1827,29 @@ Next: localize the four residual counterfactual failures and audit reduction
 numerical permissions across CPU/JVM/GPU. A reassociation certificate alone
 must not silently authorize contraction of a separately rounded product into
 FMA. Keep the real-model acceptance gate held throughout this work.
+
+### CPU dot reductions retain element-product rounding
+
+The reassociation audit found two independent consumers contracting ordinary
+`acc + a[i]*b[i]` recurrences without a contraction certificate: native C AVX2
+and JVM Vector API. The canonical reduction algebra certifies the sum tree;
+it does not authorize removing the element product's rounding boundary.
+Both emitters now keep multiply followed by add for an ordinary dot. Explicit
+source FMA still uses its intrinsic realization rather than being decomposed.
+No new operation registry, type inference or model-specific kernel is added.
+
+The regression puts -1 and a separately rounded product of (1+2^-27) and
+(1-2^-27) in successive visits to the same Double vector lane. The scheduled
+sum is zero, but FMA leaves a nonzero residual. Native Float uses the analogous
+2^-13 operands. Changed signs and zero tails exercise changed inputs and both
+vector/scalar portions without assuming an ordered scalar reduction oracle.
+The dot remains vectorized; source checks assert the retained multiply and
+absence of implicit FMA, while an explicit JVM FMA map retains `.fma`.
+
+Restoring only the pre-fix emitter functions from commit 2888c61b makes these
+same tests fail (native: sixteen failed assertions, JVM: eight; no test errors).
+The fixed two affected namespaces pass 49 tests / 266 assertions, including
+explicit-FMA preservation. This validates the isolated numerical
+permission boundary, not real-weight training parity or performance. Removing
+an implicit FMA can cost throughput; a future relaxed schedule must declare its
+contraction permission rather than relying on a syntactic product recognizer.

@@ -1239,12 +1239,13 @@
                         simd-elems (vec (for [k (range nacc)]
                                           (let [e (emit-simd elem-expr idx (nth vec-envs k) species-sym elem-type)]
                                             (if (seq? e) (with-meta (apply list e) {:tag vec-tag}) e))))
-                        ;; FMA fusion: acc + a[i]*b[i] → DoubleVector.fma(b,c)=this*b+c → one
-                        ;; vfmadd231pd. Crucially we inline the fromArray loads INTO the .fma so
+                        ;; Only an explicit source FMA authorizes contraction. A certified
+                        ;; addition monoid may reassociate sums, but its element multiplication
+                        ;; retains a separate rounding boundary. For source FMA, inline loads so
                         ;; C2 folds the memory load into the FMA instruction (vfmadd ymm,ymm,[mem])
                         ;; and unrolls deeply — matching hand-tuned Java. Pre-binding loads to vec
                         ;; syms yields register-only FMA + separate vmovupd (slower, shallow unroll).
-                        fma-f1 (when (and (= op '+) (contains? #{:double :float} elem-type)
+                        fma-f1 (when (and fma? (= op '+) (contains? #{:double :float} elem-type)
                                           (seq? elem-expr) (= 3 (count elem-expr))
                                           (contains? #{'* 'clojure.core/* 'raster.numeric/*} (first elem-expr)))
                                  (nth elem-expr 1))
