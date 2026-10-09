@@ -276,23 +276,21 @@
                              {:id id :device (get-in facts [:values ssa :device])
                               :duration-ns 1 :dependencies [ssa]})) exported)
         steps (into (into (vec (vals inputs)) (:steps projected)) retain-steps)
-        step-map (into {} (map (juxt :id identity)) steps)
-        region {:offsets [0] :shape [17]}]
-    (distributed/plan
+        step-map (into {} (map (juxt :id identity)) steps)]
+    (distributed/refinement-plan
      {:id :realized-all-reduce :mesh (distributed/mesh [{:name :workers :size n}]
                                                      (get-in refinement [:group :devices]))
       :topology cluster
-      :values (merge (:values projected)
-                     (into {} (for [[step local] locals [ssa value] (:values local)
+      :refinement refinement :input-producers inputs :combine-costs costs
+      :storage storage :combines (update-vals combines :emitted)
+      :values (into {} (for [[step local] locals [ssa value] (:values local)
                                     :when (not (contains? (:values projected) ssa))]
                                 [ssa (assoc (:abstract value) :sharding
-                                            {:kind :replicated :devices [(:device (get step-map step))]})])))
-      :shards (merge (:shards projected)
-                     (into {} (for [[step local] locals [ssa _] (:values local)
+                                            {:kind :replicated :devices [(:device (get step-map step))]})]))
+      :shards (into {} (for [[step local] locals [ssa _] (:values local)
                                     :when (not (contains? (:values projected) ssa))]
                                 [ssa [(distributed/shard {:id ssa :value ssa :device (:device (get step-map step))
-                                                          :offsets [0] :shape [17] :ownership :replica})]])))
-      :collective-groups {:workers (:group refinement)}
+                                                          :offsets [0] :shape [17] :ownership :replica})]]))
       :device-plans
       (into {} (for [worker (get-in refinement [:group :devices])
                      :let [owned (filter #(= worker (:device (get step-map (key %)))) locals)]]
@@ -302,17 +300,45 @@
                                                 [id {:entry id :bindings
                                                      (into {} (map (fn [ssa] [ssa {:value ssa :shard ssa}]))
                                                            (keys (:values local)))}])) owned)}]))
-      :copy-bindings (into {} (for [{:keys [id kind input]} (:nodes refinement) :when (= :copy kind)]
-                               [id {:source (assoc (get storage input) :region region)
-                                    :target (assoc (get storage id) :region region)}]))
-      :refinements {:all-reduce {:refinement refinement :input-producers inputs :combine-costs costs
-                                :storage storage :combines (update-vals combines :emitted)}}
-      :steps steps :outputs (mapv #(or (get exported %) %) (:completions projected))}))))
+      :steps retain-steps :outputs (mapv #(or (get exported %) %) (:completions projected))}))))
 
 (defn- realization-options []
   {:target-device :ocl:analytic
    :target-descriptor {:device-id :ocl:analytic :device-type :gpu :backend :ocl
                        :subgroup-dialect :opencl-portable :max-workgroup-size 256}})
+
+(deftest refinement-assembly-preserves-evidence-and-rejects-shadowing
+  (let [captured (atom nil)
+        assemble distributed/refinement-plan
+        expected (with-redefs [distributed/refinement-plan
+                              (fn [request] (reset! captured request) (assemble request))]
+                   (realized-plan 2 (realization-options)))
+        request @captured
+        input [:worker-0 :input]]
+    (is (= expected (assemble request)))
+    (is (= (distributed/certify expected) (distributed/certify (assemble request))))
+    (is (= expected
+           (assemble (update request :input-producers
+                             #(into (array-map) (reverse (seq %))))))
+        "producer step ordering follows participants, not the caller's map order")
+    (doseq [field [:id :mesh :topology :refinement :input-producers :combine-costs
+                   :device-plans :storage :combines :outputs]]
+      (is (= :distributed-refinement-assembly
+             (reason #(assemble (dissoc request field))))))
+    (is (= :distributed-refinement-assembly
+           (reason #(assemble (assoc request :copy-bindings {})))))
+    (is (= :distributed-refinement-assembly
+           (reason #(assemble (assoc request :values [])))))
+    (doseq [field [:values :shards]]
+      (is (= :distributed-refinement-projection
+             (reason #(assemble (assoc-in request [field input] :different-declaration))))))
+    (is (= :distributed-refinement-storage
+           (reason #(assemble (update request :storage dissoc input)))))
+    (is (= :distributed-refinement-storage
+           (reason #(assemble (assoc request :combines {})))))
+    (is (= :distributed-refinement-storage
+           (reason #(assemble (assoc-in request [:storage input :local-value]
+                                       [input :source])))))))
 
 (deftest realization-binds-complete-contribution-arithmetic-and-storage-to-its-certificate
   (doseq [n [2 3]]
