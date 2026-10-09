@@ -65,6 +65,35 @@
   {:device-type :gpu :vendor "Intel" :subgroup-size 16
    :max-workgroup-size 256})
 
+(deftest paged-body-realization-covers-every-online-state-phase
+  (let [p (problem :value-head-dim 8)
+        plan (:plan (route/route! p (assoc intel-desc :segmented-weighted-reduction-schedule :reference)))
+        sequential (:schedule (schedule-pass/plan-subgroup-online plan intel-desc))
+        tiled (:schedule (schedule-pass/plan-subgroup-online-tiled
+                          plan (assoc intel-desc :segmented-weighted-reduction-history-tile-size 2)))
+        pipelined (:schedule (schedule-pass/plan-subgroup-online-pipelined plan intel-desc))
+        policy {:overrides {[:exp :float] :f64-target-library-rte-f32}}]
+    (doseq [[label build]
+            [[:reference #(swr-body/lower-routed-paged-reference plan 64 %)]
+             [:sequential #(swr-body/lower-routed-paged plan sequential %)]
+             [:pipeline #(swr-body/lower-routed-paged-pipelined plan pipelined %)]
+             [:partial #(swr-body/lower-routed-paged-partial plan tiled %)]
+             [:merge #(swr-body/lower-routed-paged-merge plan tiled %)]]]
+      (let [ordinary (build {})
+            selected (build {:scalar-math policy})
+            math (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarExpr %)
+                               (= :exp (:op %)))
+                         (tree-seq coll? seq (:operations selected)))]
+        (is (= selected (kbody/validate! selected)) (name label))
+        (is (= (:parameters ordinary) (:parameters selected)) (name label))
+        (is (= (:launch ordinary) (:launch selected)) (name label))
+        (is (= (:schedule ordinary) (:schedule selected)) (name label))
+        (is (seq math) (name label))
+        (is (every? #(= :double (get-in % [:options :math-realization :evaluation-dtype])) math)
+            (str label " must select every online and fallback exp leaf"))
+        (is (contains? (kbody/required-scalar-dtypes (:operations selected)) :double) (name label))
+        (is (not (contains? (kbody/required-scalar-dtypes (:operations ordinary)) :double)) (name label))))))
+
 (deftest dense-packed-f32-routes-through-the-same-reduction-algebra
   (let [packed (problem :route (packed-route)
                         :page-size nil :physical-pages nil

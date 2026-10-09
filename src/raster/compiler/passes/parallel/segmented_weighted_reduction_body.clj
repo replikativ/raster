@@ -9,6 +9,7 @@
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segmented-weighted-reduction-schedule :as schedule]))
 
@@ -19,6 +20,12 @@
   ;; Arithmetic over raw device metadata intentionally carries no implied proof.  Callers must
   ;; sanitize/bound its operands and use `bounded-expr` before claiming `:no-overflow`.
   (body/scalar-expression op type arguments))
+
+(defn- math-expr [policy op type & arguments]
+  (body/scalar-expression op type arguments
+                          (if-let [realization (numerics/scalar-math-realization policy op type)]
+                            {:math-realization realization}
+                            {})))
 
 (defn- bounded-expr
   "Build an integral schedule calculation after its local range proof has bounded every operand."
@@ -600,7 +607,7 @@
    slots))
 
 (defn- online-update-region
-  [slots]
+  [slots policy]
   (let [next-accs (mapv :next-id slots)]
     [(compute 'maximum-is-nan :predicate
               (body/scalar-expression :isnan :predicate ['maximum-state]))
@@ -615,9 +622,9 @@
                       (lit Double/NaN :float)])]
       [(compute 'next-maximum-valid :float (expr :max :float 'maximum-state 'logit))
        (compute 'old-weight-valid :float
-                (expr :exp :float (expr :- :float 'maximum-state 'next-maximum-valid)))
+                (math-expr policy :exp :float (expr :- :float 'maximum-state 'next-maximum-valid)))
        (compute 'new-weight-valid :float
-                (expr :exp :float (expr :- :float 'logit 'next-maximum-valid)))
+                (math-expr policy :exp :float (expr :- :float 'logit 'next-maximum-valid)))
        (body/->Yield ['next-maximum-valid 'old-weight-valid 'new-weight-valid])]
       [(body/value 'next-maximum :float)
        (body/value 'old-weight :float)
@@ -644,7 +651,7 @@
   (vec (mapcat #(if (and (vector? %) (not (record? %))) % [%]) operations)))
 
 (defn- membership-loop*
-  [problem slots lower upper dot-ops]
+  [problem slots lower upper dot-ops policy]
   (let [csr? (attention/csr-visibility? (:visibility problem))
         member (if csr? 'membership-edge 'membership-token)
         member-type (if csr? :int :long)
@@ -667,7 +674,7 @@
         filter-expr (position-visible-expression
                      (attention/position-filter (:visibility problem)))
         value-ops (value-load-operations problem slots)
-        update-region (flatten-operations (online-update-region slots))
+        update-region (flatten-operations (online-update-region slots policy))
         unchanged (vec (concat ['member-valid-next 'maximum-state 'denominator-state]
                                acc-bindings))
         body-ops
@@ -712,13 +719,13 @@
      body-ops state-results {})))
 
 (defn- membership-loop
-  [problem schedule slots lower upper]
+  [problem schedule slots lower upper policy]
   (membership-loop* problem slots lower upper
-                    (dot-operations problem (:workgroup-size schedule))))
+                    (dot-operations problem (:workgroup-size schedule)) policy))
 
 (defn- reference-membership-loop
-  [problem slots lower upper]
-  (membership-loop* problem slots lower upper (reference-dot-operations problem)))
+  [problem slots lower upper policy]
+  (membership-loop* problem slots lower upper (reference-dot-operations problem) policy))
 
 (defn- component-slots
   [schedule]
@@ -924,7 +931,7 @@
        slots values))}))
 
 (defn- staged-online-update
-  [slots tag input-state output-state valid-next logit staged-value-ids]
+  [slots tag input-state output-state valid-next logit staged-value-ids policy]
   (let [maximum-is-nan (tagged-id tag :maximum-is-nan)
         logit-is-nan (tagged-id tag :logit-is-nan)
         state-is-nan (tagged-id tag :state-is-nan)
@@ -950,9 +957,9 @@
                        (lit Double/NaN :float)])]
        [(compute maximum-valid :float (expr :max :float (:maximum input-state) logit))
         (compute old-weight-valid :float
-                 (expr :exp :float (expr :- :float (:maximum input-state) maximum-valid)))
+                 (math-expr policy :exp :float (expr :- :float (:maximum input-state) maximum-valid)))
         (compute new-weight-valid :float
-                 (expr :exp :float (expr :- :float logit maximum-valid)))
+                 (math-expr policy :exp :float (expr :- :float logit maximum-valid)))
         (body/->Yield [maximum-valid old-weight-valid new-weight-valid])]
        [(body/value next-maximum :float)
         (body/value old-weight :float)
@@ -977,7 +984,7 @@
                :weighted-values next-weighted)))])))
 
 (defn- consume-staged-member
-  [problem scheduled slots tag member stage input-state]
+  [problem scheduled slots tag member stage input-state policy]
   (let [{route-ops :operations physical-page-valid :physical-page-valid}
         (dense-member-route problem (keyword (str (name tag) "-route")) member)
         member-valid-next (tagged-id tag :member-valid-next)
@@ -989,7 +996,7 @@
         output-state (pipeline-state (keyword (str (name tag) "-result")) slots)
         update-ops (staged-online-update
                     slots (keyword (str (name tag) "-online")) input-state output-state
-                    member-valid-next logit staged-value-ids)]
+                    member-valid-next logit staged-value-ids policy)]
     {:state output-state
      :operations
      (flatten-operations
@@ -1008,7 +1015,7 @@
         (pipeline-state-specs output-state))])}))
 
 (defn- pipelined-membership
-  [problem scheduled slots]
+  [problem scheduled slots policy]
   (let [stage-a {:key 'pipeline-key-stages :value 'pipeline-value-stages :row 0}
         stage-b {:key 'pipeline-key-stages :value 'pipeline-value-stages :row 1}
         initial-state (initial-online-state 'initial-valid slots)
@@ -1025,21 +1032,21 @@
         next-a 'pipeline-next-a-member
         next-b 'pipeline-next-b-member
         consume-a (consume-staged-member problem scheduled slots :pipeline-a current-a
-                                         stage-a loop-state)
+                                         stage-a loop-state policy)
         refill-a (stage-member-row problem scheduled :pipeline-refill-a next-a stage-a)
         consume-b (consume-staged-member problem scheduled slots :pipeline-b current-b
-                                         stage-b (:state consume-a))
+                                         stage-b (:state consume-a) policy)
         refill-b (stage-member-row problem scheduled :pipeline-refill-b next-b stage-b)
         epilogue-a-member 'pipeline-epilogue-a-member
         epilogue-b-member 'pipeline-epilogue-b-member
         epilogue-a (consume-staged-member problem scheduled slots :pipeline-epilogue-a
-                                          epilogue-a-member stage-a steady-state)
+                                          epilogue-a-member stage-a steady-state policy)
         epilogue-b (consume-staged-member problem scheduled slots :pipeline-epilogue-b
-                                          epilogue-b-member stage-b (:state epilogue-a))
+                                          epilogue-b-member stage-b (:state epilogue-a) policy)
         odd-member 'pipeline-odd-member
         odd-stage (stage-member-row problem scheduled :pipeline-odd-stage odd-member stage-a)
         odd-consume (consume-staged-member problem scheduled slots :pipeline-odd odd-member
-                                           stage-a (:state epilogue-b))
+                                           stage-a (:state epilogue-b) policy)
         tail-state (pipeline-state :pipeline-tail slots)
         pipeline
         (body/->PipelinedFor
@@ -1071,7 +1078,7 @@
          (pipeline-state-specs steady-state)
          ['pipeline-final-group-a 'pipeline-final-group-b]
          {:tail-policy (get-in scheduled [:staging :tail-policy])})
-        fallback-loop (membership-loop problem scheduled slots 'attention-begin 'attention-end)
+        fallback-loop (membership-loop problem scheduled slots 'attention-begin 'attention-end policy)
         fallback-state {:valid 'final-valid
                         :maximum 'final-maximum
                         :denominator 'final-denominator
@@ -1259,8 +1266,11 @@
    normalized reduction and ABI identities are shared with the cooperative schedules.  Only the
    physical mapping is conservative: each work-item computes its own score dot and value state,
    so the body requires no subgroup collective and is executable on every C-family GPU target."
-  [plan workgroup-size]
+  ([plan workgroup-size]
+   (lower-routed-paged-reference plan workgroup-size {}))
+  ([plan workgroup-size caller-options]
   (let [plan (swr/validate! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         problem (attention/validate! (:source-operation plan))
         _ (when-not (and (pos-int? workgroup-size)
                          (swr/online-softmax-algebra? plan)
@@ -1310,7 +1320,7 @@
            (compute 'kv-head :int
                     (expr :quot :int 'query-head
                           (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
-           (reference-membership-loop problem slots 'attention-begin 'attention-end)]
+           (reference-membership-loop problem slots 'attention-begin 'attention-end policy)]
           (output-operations problem slots)))
         launch (launch/spec
                 {:workgroup-size [workgroup-size 1 1]
@@ -1354,7 +1364,7 @@
       :attributes {:storage-kind (if (attention/dense-packed-route? (:route problem))
                                    :dense-packed-kv :routed-paged-kv)
                    :route-kind (attention/route-kind (:route problem))
-                   :visibility-kind (attention/visibility-kind (:visibility problem))}})))
+                   :visibility-kind (attention/visibility-kind (:visibility problem))}}))))
 
 (defn lower-routed-paged
   "Construct the verified KernelBody for the routed paged online schedule.
@@ -1362,8 +1372,11 @@
   This pass accepts the generic SWR plan and schedule values. The initial storage lowering is
   deliberately strict: it recognizes only the already-validated routed-paged descriptor emitted
   by canonical attention lowering and otherwise fails before target emission."
-  [plan scheduled]
+  ([plan scheduled]
+   (lower-routed-paged plan scheduled {}))
+  ([plan scheduled caller-options]
   (let [plan (swr/validate! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         scheduled (schedule/validate! scheduled)
         problem (attention/validate! (:source-operation plan))
         _ (sequential-lowering-row! plan scheduled problem)
@@ -1398,7 +1411,7 @@
            (compute 'kv-head :int
                     (expr :quot :int 'query-head
                           (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
-           (membership-loop problem scheduled slots 'attention-begin 'attention-end)]
+           (membership-loop problem scheduled slots 'attention-begin 'attention-end policy)]
           (output-operations problem slots)))
         launch (launch/spec {:workgroup-size [subgroup-size 1]
                              :group-count [(:q-heads problem)
@@ -1422,7 +1435,7 @@
       :attributes {:storage-kind (if (attention/dense-packed-route? (:route problem))
                                    :dense-packed-kv :routed-paged-kv)
                    :route-kind (attention/route-kind (:route problem))
-                   :visibility-kind (attention/visibility-kind (:visibility problem))}})))
+                   :visibility-kind (attention/visibility-kind (:visibility problem))}}))))
 
 (defn lower-routed-paged-pipelined
   "Construct a verified two-stage routed-row pipeline for an interval weighted reduction.
@@ -1430,8 +1443,11 @@
   Histories of length zero or one use the scalar scheduled loop. Longer histories stage two
   contiguous K/V rows, overlap each refill with useful work on the other row, and consume the last
   staged pair in an explicit epilogue. Semantic order and the public ABI are unchanged."
-  [plan scheduled]
+  ([plan scheduled]
+   (lower-routed-paged-pipelined plan scheduled {}))
+  ([plan scheduled caller-options]
   (let [plan (swr/validate! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         scheduled (schedule/validate! scheduled)
         problem (attention/validate! (:source-operation plan))
         _ (pipelined-lowering-row! plan scheduled problem)
@@ -1440,7 +1456,7 @@
         query-ops (query-metadata-operations problem)
         route-ops (dense-route-operations problem)
         membership-ops (interval-membership-operations problem)
-        staged (pipelined-membership problem scheduled slots)
+        staged (pipelined-membership problem scheduled slots policy)
         staging (:staging scheduled)
         allocations
         [(body/->WorkgroupAllocation
@@ -1503,7 +1519,7 @@
                    :route-kind :dense-paged
                    :visibility-kind :interval
                    :pipeline-stages 2
-                   :tail-policy (:tail-policy staging)}})))
+                   :tail-policy (:tail-policy staging)}}))))
 
 (defn- tile-bound-operations
   [problem scheduled]
@@ -1567,8 +1583,11 @@
 
 (defn lower-routed-paged-partial
   "Lower each statically bounded membership tile to a private mergeable online state."
-  [plan scheduled]
+  ([plan scheduled]
+   (lower-routed-paged-partial plan scheduled {}))
+  ([plan scheduled caller-options]
   (let [plan (swr/validate! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         scheduled (schedule/validate! scheduled)
         problem (attention/validate! (:source-operation plan))
         _ (tiled-lowering-row! plan scheduled problem)
@@ -1606,7 +1625,7 @@
                     (expr :quot :int 'query-head
                           (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
            (membership-loop problem scheduled slots
-                            'tile-membership-begin 'tile-membership-end)]
+                            'tile-membership-begin 'tile-membership-end policy)]
           (partial-store-operations partial-ids slots)))
         launch (launch/spec {:workgroup-size [subgroup-size 1 1]
                              :group-count [(:q-heads problem)
@@ -1632,10 +1651,10 @@
       :attributes {:storage-kind :routed-paged-kv
                    :route-kind (attention/route-kind (:route problem))
                    :visibility-kind (attention/visibility-kind (:visibility problem))
-                   :history-tiles tile-count}})))
+                   :history-tiles tile-count}}))))
 
 (defn- merge-update-region
-  [slots]
+  [slots policy]
   (let [next-accs (mapv :next-id slots)]
     [(compute 'merge-maximum-is-nan :predicate
               (body/scalar-expression :isnan :predicate ['maximum-state]))
@@ -1651,10 +1670,10 @@
       [(compute 'merged-maximum-valid :float
                 (expr :max :float 'maximum-state 'tile-maximum))
        (compute 'old-state-weight-valid :float
-                (expr :exp :float
+                (math-expr policy :exp :float
                       (expr :- :float 'maximum-state 'merged-maximum-valid)))
        (compute 'tile-state-weight-valid :float
-                (expr :exp :float
+                (math-expr policy :exp :float
                       (expr :- :float 'tile-maximum 'merged-maximum-valid)))
        (body/->Yield ['merged-maximum-valid
                       'old-state-weight-valid 'tile-state-weight-valid])]
@@ -1677,7 +1696,7 @@
       (vec (concat ['next-valid 'next-maximum 'next-denominator] next-accs)))]))
 
 (defn- merge-loop
-  [scheduled partial-ids slots]
+  [scheduled partial-ids slots policy]
   (let [acc-bindings (mapv :binding-id slots)
         acc-results (mapv :result-id slots)
         state-bindings (vec (concat [(body/value 'merge-valid-state :predicate)
@@ -1711,7 +1730,7 @@
                           ['query-token 'query-head 'merge-tile id]
                           mask-id (lit 0.0 :float))])
            slots)
-          (merge-update-region slots)))]
+          (merge-update-region slots policy)))]
     (body/->ForLoop
      (body/value 'merge-tile :int) 0
      (get-in scheduled [:membership-tiling :tile-count]) 1
@@ -1721,8 +1740,11 @@
 
 (defn lower-routed-paged-merge
   "Merge private tile states in increasing tile order and materialize the semantic output."
-  [plan scheduled]
+  ([plan scheduled]
+   (lower-routed-paged-merge plan scheduled {}))
+  ([plan scheduled caller-options]
   (let [plan (swr/validate! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         scheduled (schedule/validate! scheduled)
         problem (attention/validate! (:source-operation plan))
         _ (tiled-lowering-row! plan scheduled problem)
@@ -1745,7 +1767,7 @@
                             (slot-indices problem scheduled slots)))
       :masks (slot-masks problem slots)
       :operations (flatten-operations
-                   [(merge-loop scheduled partial-ids slots)
+                   [(merge-loop scheduled partial-ids slots policy)
                     (output-operations problem slots)])
       :schedule (assoc scheduled :subgroup-size subgroup-size :phase :merge)
       :launch launch
@@ -1756,4 +1778,4 @@
       :attributes {:storage-kind :private-online-state
                    :merge-kind (get-in scheduled [:state :merge :kind])
                    :merge-order (get-in scheduled [:state :merge :order])
-                   :history-tiles (get-in scheduled [:membership-tiling :tile-count])}})))
+                   :history-tiles (get-in scheduled [:membership-tiling :tile-count])}}))))
