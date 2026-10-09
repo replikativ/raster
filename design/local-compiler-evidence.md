@@ -2273,3 +2273,16 @@ checks pass 11 tests / 121 assertions after rebuilding their warm-REPL defonce
 fixture, which retained pre-reload record classes. No production codec change or
 oracle relaxation was needed. Public dispatch/cache request propagation and
 physical execution admission remain pending; the held model gate is unchanged.
+
+Equation dispatch now forwards separate caller options to independent validation
+of every candidate and all boundary/write queries. Dispatch numerical permission
+still governs reassociation and paired operational models, not scalar-math
+realization consent. A selected exact portable reference and selected mixed
+matrix candidate retain the same boundary and complete-write domains; default
+admission and policy embedded in dispatch numerical permission both reject them.
+The exact fallback requirement is unchanged. Independent review found no blocker.
+Affected dispatch and typed-route suites pass 85 tests / 1093 assertions in the
+warm REPL. Proof-count test instrumentation forwards the new caller argument
+without relaxing its one-reconstruction assertions. Enclosing program evidence,
+public compilation/cache request identity and physical admission remain pending;
+default behavior and the held real-model gate are unchanged.
