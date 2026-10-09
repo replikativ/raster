@@ -26,6 +26,28 @@
     (native a b out 3)
     (is (= (mapv (if (= op 'Math/min) min max) a b) (vec out)))))
 
+(deftest native-absolute-evaluates-once-and-retains-result-type
+  (let [name (get-in intrinsics/table [:abs :native-c :fn])
+        body (str "void abs_once(float *x, float *out) {"
+                  "out[0] = " name "(x[0]++); out[1] = x[0];"
+                  "out[2] = _Generic(" name "(x[0]), float: 1, default: 0);}")
+        source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
+        native (cpu/load-kernel (cpu/compile-source! source) "abs_once" 2 [])
+        x (float-array [-2.0]) out (float-array 3)]
+    (native x out)
+    (is (= [2.0 -1.0 1.0] (vec out)))))
+
+(deftest native-absolute-preserves-integral-width-and-minima
+  (doseq [[dtype make-array values reference]
+          [[:int int-array [Integer/MIN_VALUE Integer/MAX_VALUE -16777217 -1 0 1]
+            #(Math/abs (int %))]
+           [:long long-array [Long/MIN_VALUE Long/MAX_VALUE -9007199254740993 -1 0 1]
+            #(Math/abs (long %))]]]
+    (let [native (cpu/compile-elementwise "abs_integral" dtype '(Math/abs x) 1)
+          x (make-array values) out (make-array (count values))]
+      (native x out (count values))
+      (is (= (mapv reference values) (vec out))))))
+
 (deftest native-source-cache-key-test
   (let [key-fn (ns-resolve 'raster.compiler.backend.cpu.codegen 'source-cache-key)
         identity-var (ns-resolve 'raster.compiler.backend.cpu.codegen 'compiler-identity)

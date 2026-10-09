@@ -199,7 +199,11 @@
    load, not a Double pointer load. Callers certify supported storage widths as well
    as syntax before emission. Throws on anything unvectorizable."
   [expr idx isa felem jv array-syms target-dom]
-  (let [fti (in/simd-type-info isa felem)
+  (let [vector-op (fn [op elem]
+                    (or (in/simd-op isa op elem)
+                        (throw (ex-info "csimd: no vector lowering for operation"
+                                        {:op op :isa isa :elem elem}))))
+        fti (in/simd-type-info isa felem)
         iti (in/simd-type-info isa :i32)
         to-float (fn [[s d]] (case d
                                :float s
@@ -231,7 +235,7 @@
                (let [op (first e) as (map go (rest e))]
                  (cond
                    (some #(= :float (second %)) as)     ; any float operand → float op, coerce rest
-                   [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]
+                   [(str (vector-op op felem) "(" (str/join ", " (map to-float as)) ")") :float]
                    (some #(= :int (second %)) as)        ; int op (widening MAC subtract/add)
                    (if (= :int (dtype/dtype-for-scalar-tag (:raster.type/tag (meta e))))
                      (if-let [iop (in/simd-op isa op :i32)]
@@ -240,7 +244,7 @@
                      (throw (ex-info "csimd: integer lane arithmetic requires retained i32 evidence"
                                      {:op op :reason :unsupported-integer-lane-width})))
                    :else                                 ; all poly → default float
-                   [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]))
+                   [(str (vector-op op felem) "(" (str/join ", " (map to-float as)) ")") :float]))
                :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr e}))))]
     (case target-dom
       :int (to-int (go expr))

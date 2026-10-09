@@ -1893,3 +1893,20 @@ reproducible algorithm, widen model math, or relax training acceptance. WASM's
 polynomial facet remains separate. The real-weight gate remains held; resolving
 the near-zero derivative sensitivity still needs numerical and workload-level
 evidence rather than declaring library accuracy sufficient for that gate.
+
+### Native absolute-value precision and vector admission
+
+Public Float/Double `deftm` maps using Math/abs and raster.numeric/abs exposed
+31 failing assertions before the native correction. The scalar native facet
+now selects the actual C operand type, evaluates the operand once, and handles
+signed integer minima without undefined negation. Double inputs no longer
+narrow through fabsf. GPU library facets are unchanged.
+
+The same regression exposed a separate SIMD admission defect: an unavailable
+vector operation name could stringify as empty text and silently turn a unary
+operation into its operand. Float/poly vector operations now require an actual
+intrinsic or decline emission. AVX2 Float/Double abs clears the sign bit, with
+scalar tails retaining the native source semantics. The focused three-test
+run passed 291 assertions, including raw-bit floating comparisons, integer
+minima, operand evaluation count, and changed inputs across vector boundaries.
+No model oracle, provider, precision policy or acceptance tolerance changed.

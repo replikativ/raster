@@ -657,6 +657,7 @@
    devirtualized calls. Function aliases must not bypass the target facet."
   [base]
   (case base
+      "fabs" (:float-abs *emit-config* "fabs")
       "fmax" (:float-max *emit-config* "fmax")
       "fmin" (:float-min *emit-config* "fmin")
       base))
@@ -666,7 +667,6 @@
   [op]
   (let [base (get op-map op)]
     (case base
-      "fabs" (:float-abs *emit-config* "fabs")
       "atan2" (or (:atan2-name *emit-config*) "atan2")
       (or (resolve-c-function base) (c-symbol op)))))
 
