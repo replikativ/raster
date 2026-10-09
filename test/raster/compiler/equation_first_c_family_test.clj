@@ -695,6 +695,8 @@
           certificate (get-in artifact [:provenance :scheduled-operation])
           linked (equation-first/lower compilation [(float-array 15) (float-array 21)])]
       (is (= 1 (count (:kernels compilation))))
+      (is (= :f32-storage-f64-arithmetic-rte-f32
+             (get-in artifact [:attributes :precision])))
       (is (= :double (get-in certificate [:numerics :accumulator-dtype])))
       (is (= :float (get-in certificate [:numerics :result-dtype])))
       (is (= {:rounding :nearest-even :overflow :ieee}

@@ -11,7 +11,7 @@ The public plan declines unknown or unsupported Double capabilities. Dispatch
 is not admitted: retaining its portable Float alternative would not guarantee
 the requested arithmetic. Defaults remain unchanged.
 
-Focused validation now passes 11 tests / 245 assertions, zero failures/errors.
+Focused validation now passes 11 tests / 251 assertions, zero failures/errors.
 This covers NN/NT/TN tails, Float result transforms/inout storage, certificate
 reconstruction and tampering, explicit strategy/capability rejection, and public
 equation-first compilation/lowering on synthetic OpenCL/CUDA/HIP targets.
@@ -39,6 +39,23 @@ FMA in the fused variant, and final Float conversions; HIP inspection enabled
 cross-statement contraction explicitly. This is hardware-free target compilation,
 not NVIDIA/AMD numerical or performance acceptance. Original-model acceptance
 remains required; no full-model success or performance improvement is claimed.
+
+A fresh coherent JVM at `996009cd` ran the unchanged pinned real-weight case,
+reader, oracle and thresholds with widened contractions and the previously
+selected tanh realization. Loss error was 0.0046875 and input-gradient error
+0.00313778 (both accepted), but eight of 28 adapter checks failed at iteration
+zero, with maximum coordinate-relative error 0.666274. The failing adapters
+were layer-0 Ak/Bk/Au/Bu/Ad/Bd and layer-1 Ak/Ag. The held gate remains open.
+The same CPU input/cotangent layer-1 control preserves all fourteen original
+monolithic CPU gradients; only Ak (0.320088) and Ag (0.0258330) exceed the
+unchanged threshold there. These errors are not additive and do not isolate
+a sole cause.
+
+The runtime report contained 154 register-tiled admission records, but their
+precision labels still said `:f32`. The certificate now labels the explicit
+widening policy correctly, and public target tests check that projection.
+This reporting correction changes neither KernelBody arithmetic nor defaults.
+Counts describe admission records, not unique kernels or replay invocations.
 
 ## SIMD retained-operation precision — 2026-10-09
 
