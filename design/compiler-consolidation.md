@@ -1790,5 +1790,13 @@ boundary until those regions have a shared capture rewrite; a one-lambda rewrite
 The unchanged tiny Gemma resident fixture again completes its 25-step trajectory and compares
 certified runtime views rather than confusing logical node IDs with session-qualified allocations.
 This is not actual-model training acceptance.
+The broader CI suite exposed a missing non-JVM dtype projection for Half epilogues.
+Canonical intrinsic result inference now consumes independently proved operand dtypes centrally:
+homogeneous Half operations retain their kernel domain, mixed floating operands widen Half to
+Float before ordinary promotion, and unsupported or mixed non-floating Half domains fail closed.
+No JVM primitive tag is fabricated. Scalar-region lowering delegates to this same inference
+boundary. Epilogue regressions retain Double literal operations rather than restoring the former
+uniform-result-dtype behavior; resident terminal-fusion checks assert the captured gain, Double
+accumulation and Float result separately.
 The original real-model gradient oracle, tolerance, provider and source-precision policy remain
 unchanged. Neither the compiler-default switch nor the full campaign is complete.

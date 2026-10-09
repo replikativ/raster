@@ -17,6 +17,7 @@
   This is the walker's canonical type representation."
   (:require [clojure.string :as str]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.ir.form :as form]))
@@ -1935,6 +1936,41 @@ stable physical-leaf order on every backend."}
   [env sym]
   (let [entry (get env sym)]
     (when (map? entry) (:element entry))))
+
+(defn infer-scalar-intrinsic-dtype
+  "Infer a canonical intrinsic result from independently proved operand dtypes.
+   JVM-representable operands use the ordinary dispatch inference. Homogeneous half
+   arithmetic is a closed kernel-language domain, not a fictitious JVM primitive tag.
+   A mixed floating domain widens half to Float before ordinary promotion; mixed
+   non-floating domains require explicit conversion. Unknown operands prove nothing."
+  [operation operand-dtypes source-ns]
+  (when (and (seq operand-dtypes) (every? some? operand-dtypes))
+    (let [operand-dtypes (mapv dtype/canon operand-dtypes)
+          canonical (intrinsics/canonical operation)
+          tags (mapv #(get (dtype/info %) :scalar-tag) operand-dtypes)
+          tags (if (and (some #{:half} operand-dtypes)
+                        (every? dtype/fp-dtype? operand-dtypes))
+                 (mapv #(or % 'float) tags)
+                 tags)]
+      (cond
+        (and (some #{:half} operand-dtypes)
+             (not (intrinsics/accepts-scalar-dtype? canonical :half)))
+        nil
+
+        (and canonical (= :half (first operand-dtypes))
+             (apply = operand-dtypes)
+             (not= :cmp (:kind (intrinsics/descriptor canonical)))
+             (intrinsics/accepts-scalar-dtype? canonical :half))
+        :half
+
+        (every? some? tags)
+        (let [parameters (mapv #(symbol (str "%source-operand" %))
+                               (range (count tags)))
+              environment (into {} (map (fn [id tag] [id {:tag tag}]) parameters tags))]
+          (some-> (infer-expr-tag (apply list operation parameters) environment source-ns)
+                  dtype/dtype-for-scalar-tag))
+
+        :else nil))))
 
 (defn infer-arg-tag
   "Infer the type tag of an expression in the late pipeline.

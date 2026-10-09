@@ -226,19 +226,9 @@
                                    (not (contains? util/*shadowing-locals* source-operation))
                                    (descriptor/scalar-op? qualified-operation))
                             qualified-operation source-operation)
-                          inference-parameters
-                          (mapv #(symbol (str "%source-operand" %))
-                                (range (count argument-types)))
-                          type-env
-                          (into {}
-                                (map (fn [id type]
-                                       [id {:tag (:scalar-tag (dtype/info
-                                                               (canon-type type)))}])
-                                     inference-parameters argument-types))
-                          inference-expression (apply list inference-operation
-                                                      inference-parameters)]
-                      (some-> (inference/infer-expr-tag inference-expression type-env *ns*)
-                              dtype/dtype-for-scalar-tag canon-type))))
+                          inferred (inference/infer-scalar-intrinsic-dtype
+                                    inference-operation argument-types *ns*)]
+                      (some-> inferred canon-type))))
 
                 ;; A value conditional owns a result type when both alternatives independently
                 ;; prove the same type. The enclosing cast target contributes no evidence.
