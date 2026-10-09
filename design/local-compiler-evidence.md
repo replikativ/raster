@@ -1741,6 +1741,10 @@ their existing target lowering. Half scalar extrema widen exactly to Float,
 select the source-semantic operand there, and reuse the existing verified
 nearest-even narrowing emitter; no separate half helper or type inference is
 introduced. Other unsupported floating carriers are rejected.
+Capability demand includes canonical retained ValueSpec, Literal and ScalarExpr
+dtypes, not just buffer storage. A Float-only buffer kernel with expression-local
+Half casts/extrema therefore requests FP16; local Double literals also request
+FP64. The source fixtures include this storage-free boundary.
 Double helper demand contributes to the OpenCL FP64 extension requirement even
 when the surrounding result is not a named Double value.
 

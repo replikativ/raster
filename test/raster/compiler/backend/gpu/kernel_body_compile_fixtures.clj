@@ -952,10 +952,12 @@
                              "scalar_product"
                              (body-fixtures/scalar-product-body type fused?)
                              {:target-dialect dialect})))
-           (for [operator [:min :max]]
-             (write-source! directory suffix (str "half-extremum-" (name operator))
+           (for [operator [:min :max]
+                 [label make-body] [["half-extremum" body-fixtures/half-extremum-body]
+                                    ["local-half-extremum" body-fixtures/local-half-extremum-body]]]
+             (write-source! directory suffix (str label "-" (name operator))
                             (body-emit/emit-scalar-kernel
-                             "half_extremum" (body-fixtures/half-extremum-body operator)
+                             "half_extremum" (make-body operator)
                              {:target-dialect dialect})))
            (map (fn [dt]
                   (write-artifact! directory suffix (str "storage-probe-" (name dt))

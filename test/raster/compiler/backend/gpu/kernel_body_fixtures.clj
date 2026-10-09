@@ -44,6 +44,27 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn local-half-extremum-body
+  "Float-only storage with expression-local half conversions and extrema."
+  [operator]
+  (body/make
+   {:id [:local-half-extremum operator]
+    :parameters [(body/->KernelParameter 'x :input :float [1] :global
+                                         (layout/row-major [1] :float) :input)
+                 (body/->KernelParameter 'out :output :float [1] :global
+                                         (layout/row-major [1] :float) :result)]
+    :operations [(body/->ScalarLoad (body/value 'operand :float) 'x [0] nil nil :cached)
+                 (body/->ScalarCompute (body/value 'result :float)
+                   (body/cast-expression
+                    (body/scalar-expression operator :half
+                      [(body/cast-expression 'operand :half :nearest-even :ieee)
+                       (body/cast-expression 'operand :half :nearest-even :ieee)])
+                    :float :exact :exact))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn trapping-integral-cast-body
   "Checked signed narrowing fixture shared by emitter tests and hardware-free target CI."
   [source-type result-type]

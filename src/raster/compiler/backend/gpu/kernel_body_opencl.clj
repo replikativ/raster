@@ -1706,9 +1706,20 @@
                 ce/opencl-atomic-add-float-helper)
               (:source intrinsic-module)))
         storage-declarations (concat parameters (:allocations kernel-body))
+        retained-scalar-types
+        (set (keep (fn [value]
+                     (let [type (cond
+                                  (or (record-kind? "ValueSpec" value) (record-kind? "Literal" value))
+                                  (:type value)
+                                  (record-kind? "ScalarExpr" value) (:result-type value))]
+                       (when type
+                         (if (= :predicate type) :predicate (dtype/canon type)))))
+                   (tree-seq coll? seq (:operations kernel-body))))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
-        uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
+        uses-half? (or (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
+                       (contains? retained-scalar-types :half))
         uses-double? (or (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
+                         (contains? retained-scalar-types :double)
                          (some #{:double} (vals value-types))
                          ;; Expression-valued operands need no named ValueSpec. This exact
                          ;; emitted helper demand also covers their narrowing/extrema boundaries.
