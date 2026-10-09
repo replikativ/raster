@@ -26,6 +26,32 @@
 
 (defn- stats-of [form] (:stats (slp/segop-lower-pass form {})))
 
+(deftest compatibility-captures-retain-source-binder-integral-widths
+  (let [source '(let* [^long width (clojure.core/long n)
+                       result (raster.par/map! out i width nil
+                                (+ (clojure.core/aget input i) (double width)))] result)
+        lowered (:form (slp/segop-lower-pass
+                        source {:dtype :float :scalar-types {'n :long}
+                                :array-types {'input :float 'out :float}}))]
+    ;; The use of width is intentionally untagged; the binder is the authority.
+    (is (= :long (get-in lowered [:values 'width :dtype])))))
+
+(deftest compatibility-scalar-declarations-cannot-conflict-with-retained-source
+  (let [source '(let* [^long width (clojure.core/long n)
+                       result (raster.par/map! out i width nil
+                                (+ (clojure.core/aget input i) (double width)))] result)]
+    (try
+      (slp/segop-lower-pass source {:dtype :float :scalar-types {'n :long 'width :float}
+                                   :array-types {'input :float 'out :float}})
+      (is false "a stale scalar map cannot override the retained integer declaration")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :parallel-program-source-type-conflict (:reason (ex-data exception))))))))
+
+(deftest integral-kernel-policy-does-not-retype-declared-floating-scalars
+  (doseq [[tag expected] [['float :float] ['double :double]]]
+    (let [id (with-meta 'gain {:raster.type/tag tag})]
+      (is (= expected (#'slp/declared-scalar-type! id nil :int))))))
+
 (deftest staged-contraction-equation-retains-storage-dependencies-and-result-type
   (let [source
         '(let* [result

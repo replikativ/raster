@@ -16,6 +16,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.reduction :as reduction]
@@ -25,6 +26,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
 (defn- decline!
@@ -141,11 +143,10 @@
                        (and result-region
                             (contains? #{:single :cross-block} phase)
                             (contains? #{:float :double} output-type)
-                            (scalar-region-lower/completed-floating-conversion? result-region)
                             (= output-type (dtype/canon (:result-dtype result-region)))))
                    (every? #{accumulator-dtype} input-types))
       (decline! :uniform-scalar-storage
-                "portable scalar SegRed requires uniform input/accumulator storage and a certified terminal conversion"
+                "portable scalar SegRed requires uniform input/accumulator storage and a certified floating terminal region"
                 {:operation (:id segred) :segred-dtype (:dtype segred)
                  :accumulator-dtype accumulator-dtype :input-dtypes input-types
                  :output-dtype output-type}))
@@ -844,8 +845,18 @@
 
 (defn validate-against-node!
   "Close scalar SegRed over its exact source, body, launch, and KernelGraph storage facts."
-  [scheduled node kernel-graph]
-  (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
+  ([scheduled node kernel-graph]
+   (validate-against-node! scheduled node kernel-graph nil nil))
+  ([scheduled node kernel-graph closed-algorithm closed-body]
+  (let [storage-scalars (equation-graph/validated-storage-scalars
+                        kernel-graph closed-algorithm closed-body)
+        ;; Canonical equality is justified only by the independently reconstructed closed graph.
+        ;; Standalone callers keep the original exact-equality contract.
+        project-extent (if closed-body
+                         #(extent-expression/canonical
+                           (launch/rebind-expression % storage-scalars))
+                         identity)
+        scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
         source (:source scheduled)
         _ (when-not (segop/seg-red? source)
             (decline! :schedule-source
@@ -895,7 +906,9 @@
                               (contains? resident-scalar-captures (:id parameter)) 1
                               :else (:bound (segop/seg-space-reduced-dim (:space source))))]
         (when-not (and buffer
-                       (= source-elements realized-elements (:elements buffer)))
+                       (= (project-extent source-elements)
+                          (project-extent realized-elements)
+                          (project-extent (:elements buffer))))
           (decline! :storage-extent
                     "scalar SegRed pointer extent differs across source, body, and graph"
                     {:node (:id node) :parameter (:id parameter) :argument argument
@@ -904,9 +917,10 @@
     (when-not (and (= 1 (count (:outputs source)))
                    (= semantic-output physical-result (:id output-parameter))
                    output-use output-buffer output-parameter bound-binding
-                   (= [output-elements] realized-shape)
-                   (= output-elements group-count)
-                   (= output-elements (:elements output-buffer)))
+                   (= [(project-extent output-elements)] (mapv project-extent realized-shape))
+                   (= (project-extent output-elements) (project-extent group-count))
+                   (= (project-extent output-elements)
+                      (project-extent (:elements output-buffer))))
       (decline! :output-elements
                 "scalar SegRed output extent differs from its launch or KernelGraph storage"
                 {:node (:id node) :output-use output-use :output-buffer output-buffer
@@ -935,4 +949,4 @@
                   "scalar SegRed scheduled body is not the exact refinement of its source"
                   {:node (:id node) :source (:id source)
                    :expected-body (:body expected) :actual-body (:body scheduled)})))
-    scheduled))
+    scheduled)))

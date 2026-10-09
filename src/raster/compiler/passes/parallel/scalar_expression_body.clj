@@ -22,6 +22,11 @@
   [expression]
   (boolean (some descriptor/aget-call? (tree-seq coll? seq expression))))
 
+(defn- ordered-fold-intrinsic?
+  [intrinsic operator argument-count]
+  (and (= 2 (:arity intrinsic)) (> argument-count 2)
+       (contains? #{:+ :* :- :div :min :max} operator)))
+
 (defn- match-ordered-loop
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
   [expression]
@@ -54,9 +59,11 @@
    `:load` accepts a declared buffer and proved coordinate vector; `:compute` accepts a canonical
    operator, result dtype, already-converted argument vector and explicit operation options.
    `:fresh-binding` reserves an SSA identity for an owner's structured-control binder.
+   `:owner-load-coordinates` optionally supplies independently proved coordinate vectors for
+   closed layout regions; when supplied, retained source indices are not a second authority.
    These typed entries leave admission and proofs to the owner and final KernelBody validation."
   [{:keys [array-types scalar-types scalar-ranges arrays index-scope lower-index lower-load-index predicate id-prefix decline!
-           conversion-policy load-other source-region require-source-types?]
+           conversion-policy load-other source-region require-source-types? owner-load-coordinates]
     :or {id-prefix "scalar" scalar-ranges {}}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
         normalized-form (fn [form type source]
@@ -224,19 +231,24 @@
                                    (not (contains? util/*shadowing-locals* source-operation))
                                    (descriptor/scalar-op? qualified-operation))
                             qualified-operation source-operation)
-                          inference-parameters
-                          (mapv #(symbol (str "%source-operand" %))
-                                (range (count argument-types)))
-                          type-env
-                          (into {}
-                                (map (fn [id type]
-                                       [id {:tag (:scalar-tag (dtype/info
-                                                               (canon-type type)))}])
-                                     inference-parameters argument-types))
-                          inference-expression (apply list inference-operation
-                                                      inference-parameters)]
-                      (some-> (inference/infer-expr-tag inference-expression type-env *ns*)
-                              dtype/dtype-for-scalar-tag canon-type))))
+                          operator (intrinsics/canonical source-operation)
+                          intrinsic (intrinsics/descriptor operator)
+                          inferred
+                          (cond
+                            (and (= :- operator) (= 1 (count argument-types)))
+                            (first argument-types)
+
+                            (ordered-fold-intrinsic? intrinsic operator (count argument-types))
+                            (reduce (fn [left right]
+                                      (when left
+                                        (inference/infer-scalar-intrinsic-dtype
+                                         inference-operation [left right] *ns*)))
+                                    argument-types)
+
+                            :else
+                            (inference/infer-scalar-intrinsic-dtype
+                             inference-operation argument-types *ns*))]
+                      (some-> inferred canon-type))))
 
                 ;; A value conditional owns a result type when both alternatives independently
                 ;; prove the same type. The enclosing cast target contributes no evidence.
@@ -570,6 +582,10 @@
                       (decline! :indexed-load
                                 "scalar loads require a declared typed stable tensor"
                                 {:expression expression :array array :array-types array-types}))
+                    (if owner-load-coordinates
+                      ;; Closed layout regions own coordinates independently of the retained
+                      ;; source spelling. Never evaluate that spelling as a second index authority.
+                      (load-ssa array (owner-load-coordinates array))
                     (let [coordinate-value
                           (when (or (contains-indexed-load? coordinate)
                                     (index-expression/requires-scalar-evaluation? coordinate))
@@ -582,7 +598,7 @@
                             (:result coordinate-value)
                             (lower-load-index array coordinate (set (keys env))))
                           loaded (load-ssa array [coordinate-expression])]
-                      (update loaded :operations #(into (vec (:operations coordinate-value)) %))))
+                      (update loaded :operations #(into (vec (:operations coordinate-value)) %)))))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
@@ -1115,8 +1131,7 @@
                       (decline! :scalar-expression
                                 "scalar expression has no canonical intrinsic"
                                 {:expression expression :operator operator}))
-                    (if (and (= 2 (:arity intrinsic)) (> (count arguments) 2)
-                             (contains? #{:+ :* :- :div :min :max} operator))
+                    (if (ordered-fold-intrinsic? intrinsic operator (count arguments))
                       ;; Preserve source evaluation order while spelling variadic scalar folds in
                       ;; the binary KernelBody vocabulary. This is normalization, not algebraic
                       ;; reassociation: `(- a b c)` becomes `(- (- a b) c)`.

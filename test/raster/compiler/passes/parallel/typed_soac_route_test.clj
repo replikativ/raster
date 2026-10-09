@@ -2662,6 +2662,8 @@
                                   :scalar-types {'n :long 'scale :double 'gain :float}})
         scheduled (:form (segop-lower/segop-lower-pass
                           program {:dtype :float :target-device :ze:0}))
+        reduction-attributes (second (nth (first (dialect/equations
+                                                  (get-in program [:equations 0 :algorithm]))) 3))
         reductions (->> (:equations scheduled)
                         (mapcat :operations)
                         (filter #(instance? raster.compiler.ir.segop.SegRed %))
@@ -2673,12 +2675,17 @@
     (is (= :typed-soac (:route stats)))
     (is (:typed-validated stats))
     (is (= 1 (:resident-reductions stats)))
-    (is (= 1 (:inlined-scalars stats)))
-    (is (= [] (get-in program [:values 'total :shape])))
+    (is (= 1 (:vertical stats)))
+    (is (= 0 (:inlined-scalars stats)))
+    (is (= [] (get-in program [:values 'scaled :shape])))
     (is (= :resident-scalar-buffer
-           (get-in program [:values 'total :representation :kind])))
+           (get-in program [:values 'scaled :representation :kind])))
     (is (some #{'raster.par/reduce-into} (flatten (:source program))))
-    (is (not-any? #{'scaled} (flatten (:source program))))
+    (is (not-any? #{'total} (flatten (:source program))))
+    (is (= :float (get-in program [:values 'scaled :dtype])))
+    (is (= [:double] (:dtypes reduction-attributes)))
+    (is (= :float (get-in reduction-attributes [:result-transform :result-dtype])))
+    (is (= '[gain] (mapv :value (get-in reduction-attributes [:result-transform :scalars]))))
     (is (= #{:memory/write}
            (get-in (dialect/facts (get-in program [:equations 1 :algorithm]))
                    [:equations 2 :effects])))

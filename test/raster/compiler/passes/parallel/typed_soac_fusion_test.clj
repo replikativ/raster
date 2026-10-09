@@ -764,14 +764,18 @@
     (is (= :float (get-in (dialect/facts result) [:values 'result :dtype])))
     (is (= result (dialect/validate! result)))))
 
-(deftest mixed-width-arithmetic-is-not-a-completed-conversion
+(deftest adjacent-mixed-width-arithmetic-preserves-its-terminal-region
   (let [program (frontend/form->program
                  '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
                          ^float result (float (+ total 0.25))] result)
                  {:dtype :double :array-types {'x :double} :scalar-types {'n :long}})
         [result stats] (typed-fusion/fusion-fixpoint program)]
-    (is (zero? (:vertical stats)))
-    (is (= 2 (count (dialect/equations result))))))
+    (is (= 1 (:vertical stats)))
+    (is (= 1 (count (dialect/equations result))))
+    (let [operation (dialect/operation-parts (first (dialect/equations result)))]
+      (is (= [:double] (get-in operation [:attributes :dtypes])))
+      (is (= :float (get-in operation [:attributes :result-transform :result-dtype]))))
+    (is (= result (dialect/validate! result)))))
 
 (defn- separated-reduction-conversion [intervening terminal]
   (frontend/form->program

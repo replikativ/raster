@@ -567,8 +567,10 @@
 (defn- concrete-shape!
   [value-id value]
   (let [shape (:shape value)]
-    (when-not (and (seq shape) (every? #(and (integer? %) (pos? %)) shape))
-      (fail! "distributed shard certification requires a positive concrete global shape"
+    ;; An explicit empty shape is a rank-zero tensor with one element, not an unknown shape.
+    ;; It can be replicated; the ordinary partition-axis check rejects partitioning rank zero.
+    (when-not (and (vector? shape) (every? #(and (integer? %) (pos? %)) shape))
+      (fail! "distributed shard certification requires an explicit concrete shape with positive dimensions"
              :distributed-value-shape {:value value-id :shape shape}))
     shape))
 

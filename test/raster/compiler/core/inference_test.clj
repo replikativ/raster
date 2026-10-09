@@ -10,6 +10,21 @@
 
 (defn- opts [] {:use-tc? false :source-ns *ns*})
 
+(deftest closed-kernel-intrinsic-dtypes
+  (is (= :half (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:half :half] *ns*)))
+  (is (= :half (inf/infer-scalar-intrinsic-dtype 'raster.math/sqrt [:half] *ns*)))
+  (is (= :half (inf/infer-scalar-intrinsic-dtype 'raster.math/fma [:half :half :half] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:half] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'raster.math/fma [:half :half] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'clojure.core/< [:float :float] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'source-helper [:float] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'clojure.core/bit-xor [:half :half] *ns*)))
+  (is (= :float (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:half :float] *ns*)))
+  (is (= :double (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:half :double] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:half :long] *ns*)))
+  (is (nil? (inf/infer-scalar-intrinsic-dtype 'raster.numeric/+ [:float nil] *ns*)))
+  (is (= :double (inf/infer-scalar-intrinsic-dtype 'clojure.core/+ [:float :double] *ns*))))
+
 ;; ================================================================
 ;; literal-tag
 ;; ================================================================

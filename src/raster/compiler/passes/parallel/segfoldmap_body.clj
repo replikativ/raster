@@ -756,10 +756,7 @@
                      :algorithm closed-algorithm :body closed-body})))
   (if-not closed-body
     {}
-    (let [host-prefix (vec (take-while #(true? (get-in % [:attributes :host-only]))
-                                       (:equations closed-body)))]
-      (equation-graph/validate-projection! kernel-graph closed-algorithm closed-body)
-      (equation-graph/derived-scalar-expressions (:values closed-body) host-prefix))))
+    (equation-graph/validated-storage-scalars kernel-graph closed-algorithm closed-body)))
 
 (defn validate-against-node!
   "Close a fold-map refinement over its exact source grid and graph storage descriptions.

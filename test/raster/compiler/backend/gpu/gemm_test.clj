@@ -388,7 +388,7 @@
 
 (deftest unresolved-source-helper-calls-are-not-scalar-ir
   (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo #"typed portable scalar lowering"
+       clojure.lang.ExceptionInfo #"retained source expression dtype"
        (gemm/emit-scheduled-matrix-kernel
         {:kernel-name "body_undefined_helper"
          :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k

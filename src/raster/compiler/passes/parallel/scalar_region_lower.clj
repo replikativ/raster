@@ -4,12 +4,9 @@
    The region boundary already owns value IDs, dtypes and tensor axis maps. This pass uses only
    the central intrinsic table and explicit KernelBody casts; target emitters receive no source
    expression to re-infer."
-  (:require [raster.compiler.backend.intrinsics :as intrinsics]
-            [raster.compiler.core.dtype :as dtype]
+  (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.axis-map :as axis-map]
-            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
@@ -98,155 +95,53 @@
                 {:source source :target target}))))
 
 (defn lower
-  "Lower `region` once per completed scalar reduction result.
-
-   `parameters` maps region scalar/operand IDs to KernelParameters. `coordinate-lower` translates
-   a declared operand axis-map to one or more scheduled storage coordinates. The returned `:result` is cast to
-   `store-dtype`, so ScalarStore remains completely typed."
+  "Lower a completed result region through the shared retained-type scalar language.
+   Axis maps remain owner-proved coordinates; scalar arithmetic and conversion widths are
+   retained per expression rather than inherited from the final store dtype."
   [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate
                   id-prefix]}]
-  (let [result-dtype (dtype/canon (:result-dtype region))
-        accumulator-id (first (:parameters region))
-        operand-by-id (into {} (map (juxt :sym identity)) (:operands region))
-        scalar-ids (vec (drop (inc (count operand-by-id)) (:parameters region)))
-        operations (atom [])
+  (let [accumulator-id (first (:parameters region))
+        operands (into {} (map (juxt :sym identity)) (:operands region))
+        scalar-ids (drop (inc (count operands)) (:parameters region))
+        _ (doseq [[id operand] operands
+                  :let [parameter (get parameters id)]]
+            (when-not (and parameter
+                           (or (and (= :input (:kind parameter))
+                                    (contains? #{:operand :lhs :rhs :epilogue} (:role parameter)))
+                               (and (= :inout (:kind parameter)) (= :result (:role parameter))))
+                           (= (dtype/canon (get operand :dtype :float))
+                              (dtype/canon (:dtype parameter))))
+              (decline! :result-transform-operand
+                        "result-transform operand lacks its typed KernelBody parameter"
+                        {:operand operand :parameter parameter})))
+        _ (doseq [id scalar-ids
+                  :let [parameter (get parameters id)]]
+            (when-not (and parameter (= :scalar (:kind parameter))
+                           (contains? #{:parameter :epilogue} (:role parameter)))
+              (decline! :result-transform-scalar
+                        "result-transform scalar lacks its typed KernelBody parameter"
+                        {:scalar id :parameter parameter})))
+        expression (util/subst-syms {accumulator-id accumulator} (:expression region))
+        scalar-types (cond-> (into {} (map (fn [id] [id (:dtype (get parameters id))])) scalar-ids)
+                       (symbol? accumulator) (assoc accumulator accumulator-dtype))
         builder (scalar-expression/make-lowerer
-                 {:arrays (set (keys operand-by-id))
+                 {:arrays (set (keys operands))
                   :array-types (into {} (map (fn [[id operand]] [id (get operand :dtype :float)]))
-                                     operand-by-id)
-                  :scalar-types (into {} (keep (fn [[id parameter]]
-                                                (when (= :scalar (:kind parameter))
-                                                  [id (:dtype parameter)])))
-                                      parameters)
-                  :source-region [(:expression region) accumulator (keys parameters)]
-                  :lower-index (fn [x _] x) :predicate predicate
-                  :conversion-policy cast-policy :decline! decline!
+                                     operands)
+                  :scalar-types scalar-types
+                  :source-region [expression accumulator (keys parameters)]
+                  :require-source-types? true
+                  :lower-index (fn [x _] x)
+                  :owner-load-coordinates (fn [id]
+                                            (let [coordinates (coordinate-lower (:map (get operands id)))]
+                                              (if (vector? coordinates) coordinates [coordinates])))
+                  :predicate predicate :conversion-policy cast-policy :decline! decline!
                   :id-prefix (str (when id-prefix (str id-prefix "-")) "result-transform")})
-        emit! (fn [{:keys [result type] :as lowered}]
-                (swap! operations into (:operations lowered))
-                {:value result :dtype type})]
-    (letfn [(cast [{:keys [value dtype] :as typed} target]
-              (let [dtype (dtype/canon dtype)
-                    target (dtype/canon target)]
-                (if (= dtype target)
-                  typed
-                  (emit! ((:cast builder) {:operations [] :result value :type dtype}
-                          target nil)))))
-
-            (load-operand [id]
-              (let [{:keys [map] :as operand} (get operand-by-id id)
-                    operand-dtype (dtype/canon (get operand :dtype :float))
-                    parameter (get parameters id)]
-                ;; An operand is a read-only input, or the kernel's own read-write result when
-                ;; the transform reads the element it overwrites.
-                (when-not (and operand parameter
-                               (or (and (= :input (:kind parameter))
-                                        (contains? #{:operand :lhs :rhs :epilogue}
-                                                   (:role parameter)))
-                                   (and (= :inout (:kind parameter))
-                                        (= :result (:role parameter))))
-                               (= operand-dtype (dtype/canon (:dtype parameter))))
-                  (decline! :result-transform-operand
-                            "result-transform operand lacks its typed KernelBody parameter"
-                            {:operand operand :parameter parameter}))
-                (let [coordinates (coordinate-lower map)
-                      coordinates (if (vector? coordinates) coordinates [coordinates])]
-                  (cast
-                   (emit! ((:load builder) id coordinates))
-                   result-dtype))))
-
-            (lower-let [expression env]
-              ;; A let region is an ordered sequence of typed SSA bindings: each init lowers in
-              ;; the environment of the binders before it, and the single body lowers in the
-              ;; environment of all of them. Binders shadow region parameters lexically.
-              (let [[_ bindings & body] expression]
-                (when-not (and (vector? bindings) (even? (count bindings))
-                               (every? simple-symbol? (take-nth 2 bindings))
-                               (= 1 (count body)))
-                  (decline! :result-transform-let
-                            "result-transform let requires simple symbol binders and one body"
-                            {:expression expression}))
-                (let [env (reduce (fn [env [binder init]]
-                                    (assoc env binder (lower-expression init env)))
-                                  env
-                                  (partition 2 bindings))]
-                  (lower-expression (first body) env))))
-
-            (lower-expression [expression env]
-              (cond
-                (number? expression)
-                {:value (body/literal expression result-dtype) :dtype result-dtype}
-
-                (contains? env expression)
-                (cast (get env expression) result-dtype)
-
-                (= accumulator-id expression)
-                (cast {:value accumulator :dtype accumulator-dtype} result-dtype)
-
-                (and (seq? expression) (form/let-head? (first expression)))
-                (lower-let expression env)
-
-                (contains? (set scalar-ids) expression)
-                (let [parameter (get parameters expression)]
-                  (when-not (and parameter (= :scalar (:kind parameter))
-                                 (contains? #{:parameter :epilogue} (:role parameter)))
-                    (decline! :result-transform-scalar
-                              "result-transform scalar lacks its typed KernelBody parameter"
-                              {:scalar expression :parameter parameter}))
-                  (cast {:value expression :dtype (:dtype parameter)} result-dtype))
-
-                (descriptor/aget-call? expression)
-                (let [operand (descriptor/aget-array-sym expression)]
-                  (when-not (contains? operand-by-id operand)
-                    (decline! :result-transform-load
-                              "result-transform reads an undeclared tensor operand"
-                              {:expression expression :operand operand}))
-                  (load-operand operand))
-
-                (and (seq? expression) (descriptor/cast-op? (first expression))
-                     (= 2 (count expression)))
-                (let [target (dtype/dtype-for-scalar-tag
-                              (descriptor/cast-result-tag (first expression)))]
-                  (when-not (= target result-dtype)
-                    (decline! :result-transform-explicit-cast
-                              "portable result transform requires casts to its declared result dtype"
-                              {:expression expression :target target
-                               :result-dtype result-dtype}))
-                  (cast (lower-expression (second expression) env) target))
-
-                (seq? expression)
-                (let [semantic-operation (descriptor/semantic-op expression)
-                      operator (intrinsics/canonical semantic-operation)
-                      intrinsic (intrinsics/descriptor operator)
-                      arguments (vec (descriptor/call-args expression))]
-                  (when-not (and intrinsic
-                                 (= (:arity intrinsic) (count arguments))
-                                 (not= :cmp (:kind intrinsic))
-                                 (intrinsics/accepts-scalar-dtype? operator result-dtype))
-                    (decline! :result-transform-expression
-                              "result-transform expression has no typed portable scalar lowering"
-                              {:expression expression :operator operator
-                               :result-dtype result-dtype}))
-                  (let [inputs (mapv #(:value (lower-expression % env)) arguments)
-                        ;; Result transforms retain the same source contract as ordinary scalar
-                        ;; regions.  Their arithmetic is not schedule index arithmetic and may
-                        ;; therefore never be silently certified as `:no-overflow`.
-                        overflow (when (and (contains? #{:byte :int :long} result-dtype)
-                                            (contains? #{:+ :- :*} operator))
-                                   (or (intrinsics/source-overflow-policy semantic-operation)
-                                       :trap))]
-                    (emit! ((:compute builder) operator result-dtype inputs
-                            (cond-> {} overflow (assoc :overflow overflow))))))
-
-                :else
-                (decline! :result-transform-expression
-                          "result-transform expression references an unbound or unsupported value"
-                          {:expression expression})))]
-      (let [typed-result (lower-expression (:expression region) {})
-            stored-result (cast typed-result store-dtype)]
-        {:operations @operations
-         :result (:value stored-result)
-         :result-dtype (:dtype stored-result)}))))
+        lowered ((:lower builder) expression (dtype/canon (:result-dtype region)) {})
+        stored ((:cast builder) lowered (dtype/canon store-dtype) expression)]
+    {:operations (:operations stored)
+     :result (:result stored)
+     :result-dtype (:type stored)}))
 
 (defn lower-region
   "Close a semantic ScalarRegion as validated, target-neutral scalar SSA for a store site."

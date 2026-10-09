@@ -30,6 +30,28 @@
 (defn- run-simd [form] (par-simd/simd-pass form :min-elements 0 :dtype :double))
 (defn- norm [src] (str/replace (str src) #"_\d{3,}" "_N"))
 
+(deftest compatibility-reentry-receives-pipeline-parameter-declarations
+  (let [source '(let* [result (raster.par/map! out i n nil
+                                (clojure.core/aget input i))] result)
+        types {:scalar-types {'n :long} :array-types {'input :float 'out :float}}
+        scheduled (:form (slp/segop-lower-pass
+                          source (assoc types :dtype :float :target-device :ze:0)))
+        ;; pass-backend transports the original signature this way; re-entry must consume
+        ;; these facts before scheduling, not recover them only during subsequent emission.
+        scheduled (with-meta scheduled types)
+        received (atom nil)
+        schedule-source slp/schedule-source-program
+        result (with-redefs [slp/schedule-source-program
+                             (fn [source options]
+                               (reset! received options)
+                               (schedule-source source options))]
+                 (op/opencl-pass scheduled :device-id :ze:0 :dtype :float :min-elements 0))
+        bound (first (get-in (first (:kernels result))
+                            [:attributes :scheduled-kernel-body :scalar-bindings]))]
+    (is (= :long (get-in @received [:scalar-types 'n])))
+    (is (= {:value 'n :dtype :long :kernel-dtype :long :conversion :identity}
+           (select-keys bound [:value :dtype :kernel-dtype :conversion])))))
+
 (deftest a-lowered-binding-is-consumed-not-relowered
   (doseq [[label form key] [["par/map!" map-form :ze-maps] ["par/reduce" reduce-form :ze-reduces]]]
     (testing label

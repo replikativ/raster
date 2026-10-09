@@ -9,6 +9,8 @@
    - Lowering decides phase decomposition, launch params, accumulator count
    - Backend translates SegOp to target code (SIMD, OpenCL, scalar)"
   (:require [raster.compiler.core.util :as util]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -128,6 +130,20 @@
     ;; is not proof of the buffer's physical/logical extent (padded rows and strided views are common).
     :else (unknown-vector-shape)))
 
+(defn- declared-scalar-type!
+  [id provided kernel-dtype]
+  (let [source (some-> (types/sym-type-tag id) dtype/dtype-for-scalar-tag)
+        source (when source
+                 (if (and kernel-dtype (dtype/fp-dtype? source)
+                          (dtype/fp-dtype? kernel-dtype))
+                   (dtype/canon kernel-dtype) source))
+        provided (some-> provided dtype/canon)]
+    (when (and source provided (not= source provided))
+      (throw (ex-info "compatibility scalar type contradicts its retained source declaration"
+                      {:reason :parallel-program-source-type-conflict
+                       :value id :source-dtype source :provided-dtype provided})))
+    (or provided source)))
+
 (defn- value-contract
   [id node dtype array-types scalar-types result?]
   (let [array-ids (set/union (or (soac/soac-inputs node) #{})
@@ -142,8 +158,14 @@
                 :else [])
         type-id (if (and result? (soac/contract? node)) (get-in node [:facts :out]) id)
         declared-types (if (contains? array-ids type-id) array-types scalar-types)
-        value-dtype (or (get declared-types type-id)
-                        (when (symbol? type-id) (get declared-types (symbol (name type-id))))
+        provided (or (get declared-types type-id)
+                     (when (symbol? type-id) (get declared-types (symbol (name type-id)))))
+        value-dtype (or (if (contains? array-ids type-id)
+                         provided
+                         (declared-scalar-type! type-id provided dtype))
+                        ;; Compatibility scheduling must retain integral source widths before
+                        ;; re-entry into TypedSOAC. Floating specialization keeps its existing
+                        ;; precision policy; a kernel's element dtype is not an integer type.
                         (:elem-type node)
                         dtype
                         :double)]
@@ -495,7 +517,13 @@
             target-descriptor (:target-descriptor opts)
             dtype (:dtype opts)
             array-types (:array-types opts)
-            scalar-types (:scalar-types opts)
+            ;; Retain flat source binder declarations for every later use, including uses
+            ;; whose symbol occurrence no longer carries the binder's metadata.
+            scalar-types (reduce (fn [known [id _]]
+                                   (if-let [declared (declared-scalar-type! id (get known id) dtype)]
+                                     (assoc known id declared)
+                                     known))
+                                 (:scalar-types opts) pairs)
             lowered (atom 0)
             graphs-lowered (atom 0)
           ;; Every par form the middle end could NOT represent, as data. Previously these went to
@@ -548,7 +576,8 @@
         typed-result
         (typed-route/attempt
          host-source (or (:dtype opts) :double) (:array-types opts)
-         {:scalar-types (:scalar-types opts)})
+         {:scalar-types (:scalar-types opts)
+          :resident-reductions? (true? (:resident-reductions? opts))})
         {scheduled :form stats :stats}
         (segop-lower-pass (or (:program typed-result) host-source) opts)
         ;; Compound extents may introduce a preceding host-scalar equation. Select the one

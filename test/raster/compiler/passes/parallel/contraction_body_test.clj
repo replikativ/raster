@@ -332,9 +332,10 @@
           epilogue-operations (subvec operations 1 (dec (count operations)))
           operators (keep #(get-in % [:expression :op]) epilogue-operations)]
       (is (:ok plan))
-      ;; widen acc, load bias, x = acc + bias, -1*x, exp, 1+exp, x/(1+exp), narrow to half
-      (is (= 8 (count epilogue-operations)))
-      (is (= [:cast :+ :* :exp :+ :div :cast] (vec operators))
+      ;; x is Float; the Double literals widen its later consumers. Preserve those
+      ;; source conversions, then the declared Float result and the Half store.
+      (is (= 11 (count epilogue-operations)))
+      (is (= [:cast :+ :cast :cast :* :exp :+ :div :cast :cast] (vec operators))
           "the addition bound to x is emitted once and reused, not once per use")
       (doseq [dialect [:opencl-portable :cuda :hip]]
         (let [emitted (emit/generate-contraction-kernel-body kernel :target-dialect dialect)]
@@ -345,8 +346,8 @@
           operations (:operations (:body plan))
           epilogue-operations (subvec operations 1 (dec (count operations)))]
       (is (:ok plan))
-      ;; widen acc, multiply, narrow to half
-      (is (= 3 (count epilogue-operations))))))
+      ;; Half accumulator -> Double product -> declared Float result -> Half store.
+      (is (= 4 (count epilogue-operations))))))
 
 (deftest a-result-transform-can-reuse-one-contraction-operand-without-a-second-abi-slot
   (let [epilogue {:acc 'acc

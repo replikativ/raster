@@ -253,8 +253,8 @@
                 (is (= (get-in @session [:allocations (:key resident) :id])
                        (get-in da [:view :allocation :id]))
                     (str key " shares the certified LinkPlan allocation identity"))
-                (is (= node (get-in da [:view :allocation :id]))
-                    (str key " preserves the LinkPlan allocation identity at runtime")))))
+                (is (= (:view resident) (:view da))
+                    (str key " preserves the complete certified runtime view")))))
           (testing "A1/A6: independent certified executions are bit-identical"
             (doseq [s adapters]
               (let [art (v/->host (get last-out (keyword (str (name s) "'"))))

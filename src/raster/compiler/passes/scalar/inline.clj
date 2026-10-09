@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [raster.ad.templates :as rt]
             [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
@@ -142,9 +143,11 @@
     (symbol (namespace impl-sym) n)))
 
 (defn- canonical-callee [callee]
-  ;; Mangled arithmetic names and named intrinsics use the same canonical registry.
+  ;; Preserve semantic primitives, including array reads/lengths, at their shared descriptor
+  ;; boundary. Their implementation bodies are not user scalar helpers.
   (or (intrinsics/canonical callee)
-      (intrinsics/canonical (recursion-key callee))))
+      (intrinsics/canonical (recursion-key callee))
+      (when (op/scalar-op? (recursion-key callee)) (recursion-key callee))))
 
 (defn- needs-arg-lift?
   "Evaluate nonconstant expression arguments once before substitution, even when unused.
@@ -226,11 +229,13 @@
       (let [effective-wb (if (> (count walked-body) 1)
                            [(apply list 'do walked-body)]
                            walked-body)]
-        ;; Admit bare user scalar tails without also opening array-storage helpers or
-        ;; changing the existing intrinsic implementation expansion of this pipeline.
+        ;; Scalar-result helpers may read array inputs without owning array storage. Preserve
+        ;; the declared return fact when distinguishing them from array-returning helpers.
         (when (binding [*inline-scalar-bodies?*
                         (and *inline-scalar-bodies?*
-                             (not-any? types/primitive-array-tags tags)
+                             (or (not-any? types/primitive-array-tags tags)
+                                 (some? (dtype/dtype-for-scalar-tag
+                                         (get types/boxed->primitive-tag return-tag return-tag))))
                              (let [callee (symbol (str (:ns metadata)) (str (:name metadata)))]
                                (not (canonical-callee callee))))]
                 (inlinable-body? (first effective-wb)))

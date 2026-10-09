@@ -423,13 +423,18 @@
      :min-elements  — minimum elements for GPU (default 4096)
      :compile-spirv? — compile to SPIR-V now (default false)"
   [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types
-                  buffer-projections schedule preserve-declared-array-storage?]
+                  buffer-projections schedule preserve-declared-array-storage?
+                  resident-reductions?]
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
   ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
-  (let [soa-env (soa-lower/collect-soa-env form)
+  (let [;; Pipeline parameter declarations must be available before compatibility re-entry,
+        ;; not only after that re-entry has already attempted to construct TypedSOAC.
+        scalar-types (merge (:scalar-types (meta form)) scalar-types)
+        array-types (merge (:array-types (meta form)) array-types)
+        soa-env (soa-lower/collect-soa-env form)
         soa-array-types
         (into {}
               (mapcat (fn [[binding {:keys [fields]}]]
@@ -552,6 +557,7 @@
           (segop-lower-pass/schedule-source-program
            (:source supplied-program0)
            {:target-device device-id :dtype dtype
+            :resident-reductions? (true? resident-reductions?)
             ;; A compatibility re-entry may need to rebuild structure, but it may never discard
             ;; types already retained by the prior middle-end boundary.
             :scalar-types (merge scalar-types retained-scalar-types)
@@ -568,12 +574,14 @@
           (and (nil? supplied-program) (form/binding-form? form))
           (segop-lower-pass/schedule-source-program
            form {:target-device device-id :dtype dtype
+                 :resident-reductions? (true? resident-reductions?)
                  :scalar-types scalar-types :array-types array-types})
 
           direct-mini-program?
           (segop-lower-pass/schedule-single-program
            (gensym "direct_indexed_result_") form
            {:target-device device-id :dtype dtype
+            :resident-reductions? (true? resident-reductions?)
             :scalar-types scalar-types :array-types array-types}))
         direct-program (:program direct-schedule)
         parallel-program (or supplied-program direct-program)
