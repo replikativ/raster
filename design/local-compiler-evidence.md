@@ -2002,3 +2002,29 @@ gate, original threshold, source precision and default realization policy remain
 unchanged. A reproducible-math extension must be an explicit shared realization
 contract with independent accuracy/derivative/cost evidence, not a global widening
 patch or a training-specific kernel.
+
+### Next realization vertical: explicit policy, unchanged oracle
+
+Independent architecture review recommends preserving the logical Float math
+operation and expressing any alternate evaluation at its existing ScalarExpr
+realization boundary. The first candidate is an opt-in widened target-library
+evaluation: exact Float-to-Double argument conversion, the existing Double
+intrinsic, then the existing nearest-even IEEE conversion back to Float. It
+remains implementation-defined library math, not reproducible or correctly
+rounded math. The default Float target-library realization stays unchanged.
+
+The request should be closed schedule data keyed by canonical operation and
+dtype; the shared scalar-region lowerer attaches the same contract in maps,
+reductions and fused result regions. Admission must validate the supported
+operation, operand/result dtypes and conversions. Shared C-family emission must
+use the existing intrinsic and conversion authorities. Unsupported targets must
+decline rather than silently discard the request. Existing body, artifact,
+schedule-template and executable-source identities must retain the choice;
+there is no reason for a second cache or a training-only realization registry.
+
+Before this candidate is admitted, verify unchanged default emission, closed
+schema/tamper rejection, codec retention, cache separation, fused/isolated
+contract agreement, and OpenCL/CUDA/HIP source compilation. Then run changed
+inputs locally and the unchanged whole-model gradient oracle. The local tanh
+control is motivation, not proof that this will close the model gate. Any cost
+comparison needs stationary samples and must account for FP64 throughput.

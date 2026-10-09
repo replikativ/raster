@@ -106,8 +106,9 @@
   "Validate and return a numerical contract.
 
    Exact evaluation order preserves the typed operations, not bitwise equivalence between
-   different target math libraries. Covered scalar math operations (currently exp) retain their
-   realization separately in KernelBody; unclassified transcendentals have no such attestation.
+   different target math libraries. Descriptor-classified scalar math operations retain their
+   realization separately in KernelBody; this classification does not establish an accuracy bound
+   or cross-target bitwise equivalence.
 
    `context` lets an owning IR preserve its public diagnostic identity while sharing this one
    contract."
