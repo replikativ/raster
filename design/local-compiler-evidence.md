@@ -1915,3 +1915,11 @@ Independent review caught the native `_Float16` boundary, which the initial
 generic selector omitted despite its presence in native dtype admission. The
 helper now retains the previous Float-widening/half-rounding path explicitly,
 with compiled checks for half result type and exactly representable half values.
+
+The first rebased full CI run exposed an older Clang target without `_Float16`:
+unconditional helper declarations broke ordinary Float/Double abs consumers.
+Half declarations and generic associations now depend on the compiler's half
+capability macro. A forced-absent capability test executes the ordinary Float
+helper, while the half boundary test reports whether actual half or its ordinary
+Float control branch ran. The affected native/SIMD suites pass 40 tests and
+768 assertions locally; full CI still supplies the older-toolchain acceptance.

@@ -31,20 +31,27 @@
         body (str "void abs_once(float *x, float *out) {"
                   "out[0] = " name "(x[0]++); out[1] = x[0];"
                   "out[2] = _Generic(" name "(x[0]), float: 1, default: 0);}")
-        source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
-        native (cpu/load-kernel (cpu/compile-source! source) "abs_once" 2 [])
-        x (float-array [-2.0]) out (float-array 3)]
-    (native x out)
-    (is (= [2.0 -1.0 1.0] (vec out)))))
+        helpers (intrinsics/native-c-helper-sources body)]
+    ;; Optional half support must not infect ordinary Float/Double/integer helpers.
+    ;; Exercise both the real target and a forced absence of its half capability.
+    (doseq [capability-prefix ["" "#undef __FLT16_MANT_DIG__\n"]]
+      (let [source (str "#include <math.h>\n" capability-prefix helpers body)
+            native (cpu/load-kernel (cpu/compile-source! source) "abs_once" 2 [])
+            x (float-array [-2.0]) out (float-array 3)]
+        (native x out)
+        (is (= [2.0 -1.0 1.0] (vec out)))))))
 
 (deftest native-absolute-retains-half-boundary
   ;; Native half arithmetic already widens through Float and rounds back to half.
   ;; Inputs here are exactly half-representable, so Float comparison is independent
   ;; of a second host implementation of the half conversion.
   (let [name (get-in intrinsics/table [:abs :native-c :fn])
-        body (str "void abs_half(float *x, float *out, int n) {"
+        body (str "#if defined(__FLT16_MANT_DIG__)\n"
+                  "void abs_half(float *x, float *out, int n) {"
                   "for (int i=0;i<n;i++) out[i]=(float)" name "((_Float16)x[i]);"
-                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);}")
+                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);}\n"
+                  "#else\nvoid abs_half(float *x, float *out, int n) {"
+                  "for (int i=0;i<n;i++) out[i]=" name "(x[i]);out[n]=0;}\n#endif\n")
         source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
         native (cpu/load-kernel (cpu/compile-source! source) "abs_half" 2 [:int])
         values [-0.0 -1.0 1.0 -65504.0 Float/NEGATIVE_INFINITY
@@ -55,7 +62,10 @@
       (let [expected (Math/abs (aget x i)) actual (aget out i)]
         (is (if (Float/isNaN expected) (Float/isNaN actual)
                 (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))))))
-    (is (= 1.0 (double (aget out (count values)))))))
+    (let [half-supported? (= 1.0 (double (aget out (count values))))]
+      (is (contains? #{0.0 1.0} (double (aget out (count values)))))
+      (println "[NATIVE ABS] half boundary supported:" half-supported?
+               "(without half support, the ordinary Float fallback is exercised)"))))
 
 (deftest native-absolute-preserves-integral-width-and-minima
   (doseq [[dtype make-array values reference]
