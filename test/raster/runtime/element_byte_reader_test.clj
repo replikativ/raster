@@ -60,7 +60,16 @@
   (let [failure (ex-info "download failed" {})
         bytes (byte-array [1 2 3 4])
         destination (MemorySegment/ofArray bytes)
-        reader (content/element-byte-reader 4 4 (fn [& _] (throw failure)))]
+        source (MemorySegment/ofArray (byte-array [9 8 7 6]))
+        warmed (MemorySegment/ofArray (byte-array 1))
+        fail? (atom false)
+        reader (content/element-byte-reader
+                4 4 (fn [_ _ target]
+                      (if @fail? (throw failure)
+                          (MemorySegment/copy source 0 target 0 4))))]
+    (is (= 1 (reader 0N warmed)))
+    (is (= 9 (.get warmed java.lang.foreign.ValueLayout/JAVA_BYTE 0)))
+    (reset! fail? true)
     (is (identical? failure (try (reader 1 (.asSlice destination 0 1))
                                 (catch Throwable e e))))
     (is (= [1 2 3 4] (vec bytes)))))

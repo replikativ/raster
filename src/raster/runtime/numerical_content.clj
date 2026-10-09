@@ -240,7 +240,8 @@
                      (instance? MemorySegment destination))
         (fail! "element byte read requires a valid offset and destination segment"
                :numerical-content-element-read-range {:offset offset}))
-      (let [n (.byteSize ^MemorySegment destination)]
+      (let [offset (long offset)
+            n (.byteSize ^MemorySegment destination)]
         ;; Subtraction avoids overflowing offset + n before rejection.
         (when-not (and (<= n 65536) (<= n (- extent offset)))
           (fail! "element byte read exceeds its extent or staging window"
