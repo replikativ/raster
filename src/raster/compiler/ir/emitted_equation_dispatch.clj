@@ -60,7 +60,7 @@
    The reference/default retains exact evaluation order. Reassociation requires :permitted-modes;
    approximation additionally requires an exact operational model in the ordered :permitted-models
    vector. The runtime selector cannot enlarge permission, and no universal finite bound is implied."
-  [value]
+  [value caller-options]
   (when-not (emitted-equation-dispatch? value)
     (fail! :equation-dispatch-type "expected an EmittedEquationDispatch"
            {:actual (type value)}))
@@ -69,7 +69,7 @@
                    (every? equation/emitted-equation? alternatives))
       (fail! :equation-dispatch-alternatives
              "equation dispatch requires certified emitted equations" {}))
-    (let [candidate-reports (mapv equation/validate-with-result-contracts alternatives)
+    (let [candidate-reports (mapv #(equation/validate-with-result-contracts % caller-options) alternatives)
           _ (when-not (every? #(or (swr/plan? (:algorithm %))
                                   (soac/program-form? (:algorithm %))) alternatives)
               (fail! :equation-dispatch-algorithm
@@ -151,33 +151,42 @@
   "Independently check all candidates and return their common storage and exact fallback.
    This report grants no reusable authority; the enclosing program validator seals its own
    exact-owner evidence. Runtime admission still chooses the executable independently."
-  [value]
-  (select-keys (validation-report value)
-               [:boundary :physical-results :candidates :complete-write-domains]))
+  ([value]
+   (select-keys (validation-report value {})
+                [:boundary :physical-results :candidates :complete-write-domains]))
+  ([value caller-options]
+   (select-keys (validation-report value caller-options)
+                [:boundary :physical-results :candidates :complete-write-domains])))
 
 (defn validate!
   "Validate every candidate, its numerical permission, and the common full-write domain."
-  [value]
-  (:value (validation-report value)))
+  ([value] (validate! value {}))
+  ([value caller-options]
+   (:value (validation-report value caller-options))))
 
 (defn make
-  [alternatives selection numerical-policy]
-  (validate! (->EmittedEquationDispatch alternatives selection numerical-policy)))
+  ([alternatives selection numerical-policy]
+   (make alternatives selection numerical-policy {}))
+  ([alternatives selection numerical-policy caller-options]
+   (validate! (->EmittedEquationDispatch alternatives selection numerical-policy) caller-options)))
 
 (defn candidates
   "Return each independently certified equation in its dispatch alternative order."
-  [value]
-  (:alternatives (validate! value)))
+  ([value] (candidates value {}))
+  ([value caller-options]
+   (:alternatives (validate! value caller-options))))
 
 (defn complete-write-domains
   "Return only coverage proved for every independently certified alternative."
-  [value]
-  (:complete-write-domains (validation-report value)))
+  ([value] (complete-write-domains value {}))
+  ([value caller-options]
+   (:complete-write-domains (validation-report value caller-options))))
 
 (defn default-equation
   "Return the exact fallback equation for boundary inspection, not runtime execution."
-  [value]
-  (:boundary (validation-report value)))
+  ([value] (default-equation value {}))
+  ([value caller-options]
+   (:boundary (validation-report value caller-options))))
 
 (defn boundary-equation
   "Return the exact equation for shared storage/ABI inspection.
@@ -186,11 +195,13 @@
    never selects a runtime schedule; binding-time admission still owns that choice. A single
    equation is returned unmodified: conservative coverage probes may inspect a modified graph,
    while whole-program and call validation certify executable equations separately."
-  [operation]
+  ([operation] (boundary-equation operation {}))
+  ([operation caller-options]
   (cond
-    (emitted-equation-dispatch? operation) (default-equation operation)
-    :else operation))
+    (emitted-equation-dispatch? operation) (default-equation operation caller-options)
+    :else operation)))
 
 (defn boundary-graph
-  [operation]
-  (:graph (boundary-equation operation)))
+  ([operation] (boundary-graph operation {}))
+  ([operation caller-options]
+   (:graph (boundary-equation operation caller-options))))

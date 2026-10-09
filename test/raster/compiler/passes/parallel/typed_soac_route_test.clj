@@ -29,6 +29,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.mixed-matrix-schedule :as mixed-schedule]
             [raster.compiler.passes.parallel.mixed-matrix-candidate :as mixed-candidate]
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
@@ -2621,7 +2622,34 @@
       (is (thrown? clojure.lang.ExceptionInfo (emitted-equation/validate! candidate)))
       (is (thrown? clojure.lang.ExceptionInfo
                    (emitted-equation/validate! (assoc-in candidate [:attributes :scalar-math] policy)))
-          "candidate metadata cannot authorize the selected physical math"))))
+          "candidate metadata cannot authorize the selected physical math")
+      (let [node (first (:nodes source))
+            facts (:facts (contraction-context/validate-semantic! algorithm (:operation node)))
+            reference-body (contraction-schedule/schedule-portable-for-node
+                            node source facts descriptor {:scalar-math policy})
+            reference-graph (-> source
+                                (assoc-in [:nodes 0 :operation]
+                                          (body-target/emit-artifact "selected_math_reference" reference-body
+                                                                     :opencl-intel))
+                                (assoc-in [:attributes :strategy] :selected-reference)
+                                (emitted-interface/finalize! :opencl-c {'m :int 'n :int 'k :int}))
+            reference (emitted-equation/make algorithm (:body derived) reference-graph {} {:scalar-math policy})
+            selector (kdispatch/make {:id "selected-math-dispatch"
+                                     :alternatives [reference-graph emitted]
+                                     :default-strategy :selected-reference
+                                     :selector {:kind :fixed-strategy :strategy :selected-reference}})
+            numerical-permission {:permitted-modes #{:exact :approximate-model}
+                                  :permitted-models [(:numerical-model selected)]}
+            choice (equation-dispatch/make [reference candidate] selector numerical-permission
+                                          {:scalar-math policy})]
+        (is (= choice (equation-dispatch/validate! choice {:scalar-math policy})))
+        (is (= reference (equation-dispatch/default-equation choice {:scalar-math policy})))
+        (is (= (:complete-write-domains selected)
+               (equation-dispatch/complete-write-domains choice {:scalar-math policy})))
+        (is (thrown? clojure.lang.ExceptionInfo (equation-dispatch/validate! choice)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (equation-dispatch/validate!
+                      (assoc-in choice [:numerical-policy :scalar-math] policy))))))))
 
 (deftest dynamic-result-transform-fuses-into-the-mixed-matrix-graph
   (let [transform {:acc 'acc
