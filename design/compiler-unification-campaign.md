@@ -1,5 +1,55 @@
 # Compiler unification campaign
 
+### October 9 distributed capture and physical-model reconciliation
+
+PR #1136 is merged as `4fb7ec5b` and #1137 as `9f39cd6e`, each after independent
+exact-head review and all seven registered CI gates. Original distributed owners
+now retain physical allocation budgets and owner/session-bound measured storage
+facts. Completed bounded AMR cycles capture both whole fields through the existing
+manifest/provider contracts in a pinned read scope; every download and the final
+provider callback boundary revalidate the live representation snapshot. Coordinates
+are deliberately closed to nonnegative synchronized step advancement, not arbitrary
+caller time labels. Final capture controls pass 5 tests / 40 assertions; the actual
+OpenCL/Level Zero capture/close/decode/fresh-context oracle passes 1 test / 14
+assertions without capability skips.
+
+PR #1138's independently reviewed rebased head is
+`843e04aab393a6b7e458aa1ff69a530f3fc242cc`; its fresh CI remains pending.
+Source-compiler/target-semantic compatibility is checked before opening content,
+then bounded fixture files are independently verified through read-only mmap leases
+and decoded before fresh-context continuation. Pure and native tests pass 3 tests /
+25 assertions without skips. The provider and explicit file materialization remain
+test fixtures: this does not prove production durability, metadata atomicity or
+durable parent existence. Use the existing availability finalizer before an
+application-owned publication transaction.
+
+The distributed physical model is not wholly overlap-blind: declared backend
+transfer facts distinguish submission, physical queue independence/serialization,
+event completion, staging/host lease requirements and peer mechanisms. An explicit
+transfer `:serialized-on` claim occupies the relevant compute lane in simulation.
+Directed-link bandwidth/latency remain analytical inputs, not discovered/measured
+fabric facts. Shared NIC/PCIe/switch contention domains, message-size curves,
+load-conditioned calibration and actual asynchronous distributed execution remain
+open. Never infer physical overlap merely from asynchronous API shape.
+
+Device-level calibration already feeds the single HardwareDescriptor and its
+evidence signature; it is not yet distributed route calibration. The current CPU
+microbench tags nonstationary bandwidth `:measured-noisy`, but still persists it
+and overlays its numeric value. That is a confidence label, not an admission or
+expiry policy. Stationarity, power/load regime, calibration validity and fabric
+contention need explicit evidence before treating those estimates as reliable
+production-selection facts. Reuse existing Link device-event profiling when
+instrumenting distributed execution, rather than measuring repeated mutations of
+a completed one-shot owner or inventing a second timing/cache convention.
+
+The original campaign remains intact. The next compiler/training acceptance work
+must retain the held real-weight oracle and shared typed realization contracts;
+these successful scientific state boundaries neither close that gate nor establish
+vendor-device performance. Local sibling dependencies are still old (`pretrained-rstr`
+0.2.545, `finetune-rstr` 0.2.287), and the latter still calls retired
+`bind-program!`; committed isolated acceptance sources, local checkout state and
+published consumer migration must remain separate evidence.
+
 ### October 9 verified nonlinear boundary checkpoint
 
 The shared elementary-math realization contract covers 23 C-family library operations while
@@ -3764,3 +3814,14 @@ reloading its test provider implementations in the warm REPL; the initial stale
 provider failures were not numerical failures. Actual local capture/restart
 checks pass on OpenCL and Level Zero (2 tests / 34 assertions). Independent
 exact-head review and fresh CI remain pending.
+
+### One dtype authority for hardware storage widths
+
+Hardware planning now uses `compiler.core.dtype/bytes-of`, rather than a
+second private width table. Canonical aliases and Half storage therefore have
+the same widths in planning and lowering. Width alone does not grant native
+arithmetic support. The planning helper now rejects `:short` and `:i16`: those
+are not compiler scalar dtypes, even though Half uses JVM short-array storage.
+No surface dtype was added or removed. The focused hardware, roofline and
+calibration-admission suites pass 18 tests / 154 assertions in the warm REPL;
+full CI and exact-head review remain separate gates.

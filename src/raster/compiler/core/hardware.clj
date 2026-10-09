@@ -30,38 +30,67 @@
   PROJECTS a runtime.hardware device into the planner's descriptor shape and adds the
   compiler's analytic fields; the derivations below operate on that. So the runtime owns
   the probing; the compiler owns the schedule math, over one record for :cpu and :gpu."
-  (:require [raster.runtime.hardware :as rt]))
+  (:require [raster.runtime.hardware :as rt]
+            [raster.compiler.core.dtype :as dtype]))
 
 ;; ---------------------------------------------------------------------------
 ;; Element widths — bytes per scalar of a raster dtype keyword.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private dtype-bytes
-  {:double 8 :float 4 :long 8 :int 4 :short 2 :byte 1
-   :f64 8 :f32 4 :i64 8 :i32 4 :i16 2 :i8 1})
-
 (defn bytes-of
-  "Bytes per scalar of a dtype keyword (e.g. :float -> 4, :byte -> 1)."
+  "Bytes per scalar of a supported compiler dtype, including its canonical aliases.
+   Storage width is not evidence of native arithmetic support. Half's encoded short array
+   storage does not introduce a separate :short/:i16 scalar dtype."
   [dt]
-  (or (dtype-bytes dt)
-      (throw (ex-info "Unknown dtype for hardware width" {:dtype dt}))))
+  (dtype/bytes-of dt))
 
 ;; ---------------------------------------------------------------------------
 ;; Host detection
 ;; ---------------------------------------------------------------------------
 
+(defn- positive-finite-measurement? [x]
+  (and (number? x) (Double/isFinite (double x)) (pos? x)))
+
+(defn- admitted-peaks
+  "Field-wide provenance requires a complete, consistent update, not a mixture of measured and
+   derived dtype families. Resolve aliases through the scalar dtype authority."
+  [desc measured]
+  (when (and (map? measured) (seq measured)
+             (every? positive-finite-measurement? (vals measured)))
+    (try
+      (let [groups (group-by (comp dtype/canon key) measured)
+            families (into {} (map (fn [[dt entries]] [dt (val (first entries))])) groups)
+            keys-to-update (distinct (concat (keys (:peak-flops desc)) (keys measured)
+                                             (keys families)))]
+        (when (and (every? (fn [[_ entries]] (apply == (map val entries))) groups)
+                   (every? #(contains? families (dtype/canon %)) (keys (:peak-flops desc))))
+          (into {} (map (fn [dt] [dt (get families (dtype/canon dt))])) keys-to-update)))
+      (catch clojure.lang.ExceptionInfo _ nil))))
+
 (defn- merge-measured
-  "Overlay a device's :measured microbench layer (raster.runtime.microbench) onto the probed/
-   analytic descriptor: measured bandwidth / peak-flops / launch-overhead OVERRIDE the guess, the
-   whole map is kept under :measured for inspection, and its provenance is carried. This is the
-   feedback edge — measurement improving the readable model, not a cache beside it."
+  "Retain raw calibration for inspection, but overlay only positive finite fields explicitly
+   tagged :measured. Peak-FLOPS updates must cover all existing dtype families consistently.
+   Noisy/untagged observations are not planning constants. An explicitly
+   nonstationary bandwidth bench also declines admission, even if its provenance is mistagged.
+   This projects the existing measurement registry; it does not create another cache."
   [desc device-id]
   (if-let [m (rt/measured-for device-id)]
-    (cond-> (assoc desc :measured m)
-      (:bandwidth-bytes-s m)  (assoc :bandwidth-bytes-s (:bandwidth-bytes-s m))
-      (:peak-flops m)         (update :peak-flops merge (:peak-flops m))
-      (:launch-overhead-ns m) (assoc :launch-overhead-ns (:launch-overhead-ns m))
-      (:provenance m)         (update :provenance merge (:provenance m)))
+    (let [admit? (fn [field] (= :measured (get-in m [:provenance field])))
+          bandwidth? (and (admit? :bandwidth-bytes-s)
+                          (positive-finite-measurement? (:bandwidth-bytes-s m))
+                          (not (false? (get-in m [:bench :bandwidth :stationary?]))))
+          peaks (when (admit? :peak-flops) (admitted-peaks desc (:peak-flops m)))
+          launch? (and (admit? :launch-overhead-ns)
+                       (positive-finite-measurement? (:launch-overhead-ns m)))
+          admitted (cond-> {}
+                     bandwidth? (assoc :bandwidth-bytes-s :measured)
+                     (seq peaks) (assoc :peak-flops :measured)
+                     launch? (assoc :launch-overhead-ns :measured))]
+      (cond-> (assoc desc :measured m)
+        bandwidth? (assoc :bandwidth-bytes-s (:bandwidth-bytes-s m))
+        (seq peaks) (assoc :peak-flops peaks)
+        launch? (assoc :launch-overhead-ns (:launch-overhead-ns m))
+        (seq admitted) (update :provenance merge admitted)))
     desc))
 
 (defn- gpu-arch-str [caps]
@@ -552,8 +581,9 @@
 ;; ---------------------------------------------------------------------------
 
 (defn natural-lanes
-  "SIMD lane count for a dtype on this target: vector-bits / (8 * bytes-per-elem).
-   Halide `natural_vector_size`. f32 -> 8 on AVX-512, 4 on AVX2."
+  "Storage packing lane count: vector-bits / (8 * bytes-per-elem).
+   Halide `natural_vector_size`. f32 -> 16 on AVX-512, 8 on AVX2.
+   This width calculation does not admit native arithmetic for the dtype."
   [desc dt]
   (quot (long (:vector-bits desc)) (* 8 (bytes-of dt))))
 
