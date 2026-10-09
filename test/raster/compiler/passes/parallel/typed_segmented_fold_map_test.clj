@@ -427,7 +427,7 @@
     (is (= :max (get-in scheduled [:body :schedule :reduction-operator])))
     (is (= :max (get-in scheduled [:attributes :reduction-operator])))
     (is (str/includes? source "-INFINITY"))
-    (is (str/includes? source "fmax("))))
+    (is (str/includes? source "rstr_source_max_f32("))))
 
 (deftest cooperative-minimum-materializes-its-typed-infinity-identity
   (let [operation (certified-minimum-operation)
@@ -442,7 +442,7 @@
     (is (= :min (get-in scheduled [:body :schedule :reduction-operator])))
     (is (= :min (get-in scheduled [:attributes :reduction-operator])))
     (is (str/includes? source "INFINITY"))
-    (is (str/includes? source "fmin("))))
+    (is (str/includes? source "rstr_source_min_f32("))))
 
 (deftest cooperative-fold-map-rejects-a-non-tree-workgroup
   (is (= :workgroup-size

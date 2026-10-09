@@ -403,6 +403,24 @@
                                "-fsyntax-only" "-" :in source)]
           (is (zero? (:exit result)) (:err result)))))))
 
+(deftest half-extrema-reuse-verified-widening-and-narrowing
+  (doseq [target [:opencl-portable :cuda :hip]
+          operator [:min :max]
+          make-body [fixtures/half-extremum-body fixtures/local-half-extremum-body]
+          :let [source (opencl/emit-scalar-kernel "half_extremum"
+                         (make-body operator) {:target-dialect target})]]
+    (is (str/includes? source (str "rstr_source_" (name operator) "_f32(")))
+    (is (str/includes? source "if (isnan(a)) return a;"))
+    (is (str/includes? source "signbit(a)"))
+    (is (str/includes? source (if (= :opencl-portable target)
+                              "convert_half_rte(" "__float2half_rn(")))
+    (when (= :opencl-portable target)
+      (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp16 : enable"))
+      (when (command-available? "clang")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+          (is (zero? exit) err))))))
+
 (deftest wrapping-integral-collectives-use-unsigned-carriers
   (doseq [[target unsigned bitcast]
           [[:opencl-portable "uint rstr_sum__unsigned_collective"
@@ -765,7 +783,9 @@
                                  (body/->ScalarStore 'out [0] 'narrowed nil)])
           source (opencl/emit-scalar-kernel "literal_narrowing" literal-kernel)]
       (is (str/includes? source "convert_float_rte(0.0)"))
-      (is (not (str/includes? source "rstr_narrow_f64_f32_rte"))))))
+      (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp64 : enable"))
+      (is (= 1 (count (re-seq #"rstr_narrow_f64_f32_rte\(" source)))
+          "the shared FP64 preamble defines the helper, but literal conversion does not call it"))))
 
 (deftest checked-integral-narrowing-reaches-capable-c-family-targets
   (testing "portable OpenCL declines because it has no standard terminating trap"

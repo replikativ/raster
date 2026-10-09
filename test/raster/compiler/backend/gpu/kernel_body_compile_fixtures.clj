@@ -20,6 +20,7 @@
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
+            [raster.compiler.fixtures.extrema :as extrema]
             [raster.compiler.fixtures.mixed-storage :as mixed-storage]
             [raster.compiler.fixtures.staged-contracts :as staged-public]
             [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
@@ -656,7 +657,10 @@
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha-jvp
-                 {:target device-id :dtype :float}))))))
+                 {:target device-id :dtype :float}))
+      (mapcat (fn [[source dtype]]
+                (:kernels (equation-first/compile source {:target device-id :dtype dtype})))
+              extrema/cases)))))
 
 (defn- write-artifact!
   [directory suffix label artifact]
@@ -912,6 +916,17 @@
              [(write-artifact! directory suffix "typed-equation-mma"
                                (typed-equation-matrix-artifact :cuda))
               (write-source!
+               directory suffix "matrix-source-extrema-epilogue"
+               (:source (matrix-target/emit-matrix-kernel
+                         "matrix_source_extrema_epilogue"
+                         (contraction-schedule/matrix-body
+                          {:id :matrix-source-extrema :row 'a :col 'b :out 'c
+                           :dimensions [64 64 64] :result-dtype :float
+                           :tile {:block-m 64 :block-n 64 :sg-m 32 :sg-n 32 :block-k 32
+                                  :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+                           :epilogue {:acc 'acc :expr '(raster.numeric/max acc (float 0.0))}})
+                         :cuda)))
+              (write-source!
                directory suffix "matrix-uniform-epilogue"
                (cuda-emit/emit-matrix-kernel
                 "matrix_uniform_epilogue"
@@ -936,6 +951,13 @@
                             (body-emit/emit-scalar-kernel
                              "scalar_product"
                              (body-fixtures/scalar-product-body type fused?)
+                             {:target-dialect dialect})))
+           (for [operator [:min :max]
+                 [label make-body] [["half-extremum" body-fixtures/half-extremum-body]
+                                    ["local-half-extremum" body-fixtures/local-half-extremum-body]]]
+             (write-source! directory suffix (str label "-" (name operator))
+                            (body-emit/emit-scalar-kernel
+                             "half_extremum" (make-body operator)
                              {:target-dialect dialect})))
            (map (fn [dt]
                   (write-artifact! directory suffix (str "storage-probe-" (name dt))
