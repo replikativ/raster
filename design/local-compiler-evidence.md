@@ -1923,3 +1923,42 @@ capability macro. A forced-absent capability test executes the ordinary Float
 helper, while the half boundary test reports whether actual half or its ordinary
 Float control branch ran. The affected native/SIMD suites pass 40 tests and
 768 assertions locally; full CI still supplies the older-toolchain acceptance.
+
+### Verified layer-0 tanh boundary and pullback sensitivity
+
+The follow-up uses the same captured native-model layer-0 GELU-backward inputs
+and cotangent, not newly sampled inputs. An instrumented parametric source
+retains the original Raster numeric operators and first reproduces all 4096
+original pullback values bit-for-bit. Its recorded Float tanh operands and
+results also reproduce the public JVM Float helper bit-for-bit. Instrumentation
+that fails this control is rejected; the earlier zero-call capture is not used.
+
+On those exact operands, generated Float target tanh differs from the JVM
+fallback in 2074 elements, by at most 1.1920928955078125e-7 absolute and
+3.765291834651375e-7 coordinate-relative. Explicit Double tanh followed by Float
+conversion agrees in all 4096 values for this local OpenCL execution. This is a
+case-specific observation, not a general Double-libm/JVM equivalence theorem.
+
+A separate diagnostic takes the tanh values as resident input while retaining
+the unchanged pullback arithmetic. Its JVM result with the original tanh
+values first matches the captured model pullback bit-for-bit. CPU and GPU then
+agree bit-for-bit for each of three supplied arrays: original JVM tanh, target
+Float tanh, and explicitly widened tanh. The first and third also match the
+original model pullback exactly. The target Float values induce 1357 differences
+from that pullback on both systems, with maximum absolute error
+5.817413330078125e-5 and coordinate-relative error 0.7065903880116969.
+
+This demonstrates amplification of the tanh-library difference near derivative
+cancellation. It is not a complete replay of the original GPU GELU kernel:
+that earlier kernel had 1354 differing outputs, so three differing coordinates
+still distinguish its internal operand evaluation from this supplied-boundary
+experiment. Nor does this close the full training gate or attribute every
+adapter discrepancy to tanh. The pinned model, native provider, original oracle,
+source precision and acceptance threshold remain unchanged. Do not globally
+widen Float calls or manufacture a correctly-rounded accuracy certificate.
+
+The next model acceptance work should resolve this explicitly at the existing
+typed operation/realization boundary and test the whole unchanged gradient
+trajectory. A named reproducible implementation would need independent accuracy,
+derivative and cost evidence; an implementation-defined library descriptor alone
+does not establish derivative-sensitive cross-target parity.

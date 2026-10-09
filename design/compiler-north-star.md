@@ -135,13 +135,15 @@ program. Typed one-dimensional SegMap now shares one scalar-expression lowering 
 stable loads, retained dtypes, scalar SSA, branches, and horizontally fused stores emit from the
 same KernelBody to all three C-family targets.
 
-KernelBody math realization is separate from evaluation-order attestation: the initial `exp`
-vertical records a typed target-library call with implementation-defined accuracy, not a
-correctly-rounded or JVM-bitwise guarantee. Float `exp` and explicit Double `exp` followed by a
-Float conversion remain distinct SSA programs. This C-family facet does not describe WASM's
-polynomial realization. Extend this evidence to other transcendentals and named reproducible
-algorithms before claiming a complete cross-target math contract; do not silently widen every
-Float operation to reproduce one host library.
+KernelBody math realization is separate from evaluation-order attestation: the shared intrinsic
+authority now records 23 C-family elementary target-library operations with implementation-defined
+accuracy, not correctly-rounded or JVM-bitwise guarantees. Float calls and explicit Double calls
+followed by Float conversion remain distinct SSA programs. This C-family facet does not describe
+WASM's polynomial realization. Named reproducible algorithms still require independent accuracy,
+derivative and cost evidence before claiming a complete cross-target math contract; do not silently
+widen every Float operation to reproduce one host library. Same-input real-model diagnostics
+demonstrate that a small tanh-library difference can amplify near derivative cancellation; retaining
+evaluation order alone therefore does not establish derivative-sensitive training parity.
 
 Canonical loop/recur scalar carries become ordered KernelBody `ForLoop` regions rather than being
 reassociated as reductions. This is sufficient for
