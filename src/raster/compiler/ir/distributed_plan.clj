@@ -19,6 +19,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerical-contract]
             [raster.compiler.ir.scan :as scan]
+            [raster.gpu.measurement :as measurement]
             [raster.compiler.passes.parallel.collective-combine :as collective-arithmetic]
             [raster.compiler.ir.validate :refer [fail! finite-number? non-negative-number?
                                                   positive-number? unique-by!]]))
@@ -1444,6 +1445,115 @@
                 (map (fn [device] [:compute device])
                      (get-in step [:attributes :serialized-on]))))))
 
+(defn route-layout-description
+  "Project physical view layout for empirical cost matching, excluding allocation identity.
+   This metadata projection neither validates a view nor proves ownership or byte contents."
+  [v]
+  (assoc (select-keys v [:byte-offset :byte-length :dtype :shape :strides])
+         :allocation (select-keys (:allocation v)
+                                  [:device :byte-size :memory-space :alignment :coherence])))
+
+(defn- valid-route-layout? [description bytes]
+  (try
+    (and (map? description)
+         (= #{:byte-offset :byte-length :dtype :shape :strides :allocation} (set (keys description)))
+         (map? (:allocation description))
+         (= #{:device :byte-size :memory-space :alignment :coherence}
+            (set (keys (:allocation description))))
+         (every? #(and (integer? %) (<= 0 % Long/MAX_VALUE))
+                 [(:byte-offset description) (:byte-length description)
+                  (get-in description [:allocation :byte-size])])
+         (= bytes (:byte-length description))
+         (let [allocation (buffer-view/map->BufferAllocation
+                           (assoc (:allocation description) :id ::cost-layout :ownership :borrowed))
+               v (buffer-view/map->BufferView
+                  (assoc description :id ::cost-layout :allocation allocation))]
+           ;; Shared BufferView validation checks span, bounds, dtype and alignment. These
+           ;; placeholder identities describe layout only; they grant no storage ownership.
+           (buffer-view/contiguous? (buffer-view/validate-view! v))))
+    (catch RuntimeException _ false)))
+
+(defn- empirical-route-cost
+  [plan step context profiles {:keys [now-ms max-age-ms min-samples cv-threshold cold-warm]}]
+  (let [fallback (fn [reason] {:source :analytical :reason reason
+                              :duration-ns (transfer-duration-ns (:topology plan) step)})
+        id (:id step)
+        layout (get-in context [:transfer-layouts id])
+        endpoints (mapv #(get-in layout [% :allocation :device]) [:source :target])
+        devices (select-keys (:devices context) endpoints)
+        matching? (fn [report]
+                    (let [observed (get-in report [:route-cost-context])
+                          samples (when (sequential? (:steps report))
+                                    (filter #(= id (:step %)) (:steps report)))
+                          sample (first samples)]
+                      (and (map? observed) (map? (:devices observed))
+                           (map? (:devices-before report)) (map? (:devices-after report))
+                           (every? map? (vals (select-keys (:devices-before report) endpoints)))
+                           (sequential? (:steps report))
+                           (= :synchronous-serialized (:execution-model report))
+                           (= (:devices-before report) (:devices-after report))
+                           (= (select-keys (:devices observed) endpoints)
+                              (update-vals (select-keys (:devices-before report) endpoints)
+                                           #(dissoc % :session-id)))
+                           (= devices (select-keys (:devices observed) endpoints))
+                           (= (:transport context) (:transport observed) (:transport sample))
+                           (= (:transport context) (:transport report))
+                           (= (:max-staging-bytes context) (:max-staging-bytes observed))
+                           (= (:max-staging-bytes context) (:max-staging-bytes report))
+                           (= layout (get-in observed [:transfer-layouts id]))
+                           (map? (:source-view sample)) (map? (:target-view sample))
+                           (map? (get-in sample [:source-view :allocation]))
+                           (map? (get-in sample [:target-view :allocation]))
+                           (= layout {:source (route-layout-description (:source-view sample))
+                                      :target (route-layout-description (:target-view sample))})
+                           (= 1 (count samples)) (= :transfer (:kind sample))
+                           (= :host-monotonic (:route-timing-source sample))
+                           (= :binding-execution-and-release (:host-timing-scope sample))
+                           (= (:route step) (:route sample)) (= (:bytes step) (:bytes sample))
+                           (= (mapv #(get-in plan [:topology :links %]) (:route step))
+                              (mapv #(get-in report [:plan :topology :links %]) (:route step))))))
+        stamps (map :observed-at profiles)
+        sample-owners (map #(when (map? (:devices-before %))
+                             (into {} (map (fn [[target info]] [target (:session-id info)]))
+                                   (select-keys (:devices-before %) endpoints))) profiles)]
+    (cond
+      (or (nil? layout) (some nil? endpoints)
+          (not (contains? #{:host-staged :resident-copy} (:transport context)))
+          (and (= :resident-copy (:transport context)) (not (apply = endpoints)))
+          (not (and (integer? (:max-staging-bytes context))
+                    (<= 16 (:max-staging-bytes context) Long/MAX_VALUE)))
+          (not (every? #(valid-route-layout? (get layout %) (:bytes step)) [:source :target]))
+          (not= (get-in layout [:source :dtype]) (get-in layout [:target :dtype]))
+          (not= endpoints (mapv #(get-in plan [:device-plans % :target] %) [(:source step) (:target step)]))
+          (not= (set endpoints) (set (keys devices)))
+          (some (fn [[endpoint info]]
+                  (not (and (map? (:device info)) (seq (:device info))
+                            (map? (:hardware-evidence info))
+                            (= endpoint (get-in info [:hardware-evidence :device-id])))))
+                devices)) (fallback :missing-context)
+      (< (count profiles) min-samples) (fallback :insufficient-samples)
+      (not (every? matching? profiles)) (fallback :context-mismatch)
+      (not (every? #(and (= :unix-epoch-ms (:clock %)) (integer? (:value %))
+                        (<= 0 (:value %) Long/MAX_VALUE)
+                        (<= 0 (- now-ms (:value %)) max-age-ms)) stamps)) (fallback :stale-or-clock-mismatch)
+      (or (some #(or (empty? %) (some nil? (vals %))) sample-owners)
+          (some (fn [endpoint]
+                  (not= (count profiles) (count (distinct (map #(get % endpoint) sample-owners)))))
+                endpoints)) (fallback :repeated-owner)
+      :else
+      (let [durations (mapv (fn [report]
+                             (:host-wall-ns (first (filter #(= id (:step %)) (:steps report))))) profiles)]
+        (if-not (every? #(and (positive-number? %) (< (double %) (double Long/MAX_VALUE))) durations)
+          (fallback :invalid-duration)
+          (let [summary (measurement/summarize durations :timing-source :host-monotonic
+                                               :cv-threshold cv-threshold :cold-warm cold-warm)]
+            (if-not (:stationary? summary)
+              (assoc (fallback :noisy-samples) :measurement summary)
+              {:source :empirical-host-step :duration-ns (long (Math/ceil (:median-ns summary)))
+               :measurement summary :observed-at (vec stamps)
+               :sample-owner-sessions (vec sample-owners)
+               :timing-scope :binding-execution-and-release})))))))
+
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
 
@@ -1451,9 +1561,43 @@
    link in their route and on explicitly shared serialization domains. Absent endpoint claims,
    communication and compute resource classes are independent, so communication and compute
    overlap whenever dependencies permit. The result is deterministic and suitable as an analytic
-   seed/pruner; measured costs should replace durations before production selection."
-  [plan]
+   seed/pruner; measured costs should replace durations before production selection.
+
+   Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
+   empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
+   :now-ms and :cold-warm; defaults are max-age-ms 60000, min-samples 3, cv-threshold 0.05.
+   Reports are supplied evidence, not authenticated measurements. Results retain per-route
+   admission/fallback reasons. Synchronous samples do not prove overlap or calibrate contention;
+   this diagnostic projection does not alter the plan or its analytical certificate."
+  ([plan] (simulate plan {}))
+  ([plan options]
+  (when-not (and (map? options)
+                 (set/subset? (set (keys options)) #{:route-context :profiles :route-policy}))
+    (fail! "unsupported distributed simulation options" :distributed-cost-options {:options options}))
+  (when (and (seq options) (not (map? (:route-policy options))))
+    (fail! "empirical route policy must be a map" :distributed-cost-options {:options options}))
   (let [plan (validate! plan)
+        policy (merge {:max-age-ms 60000 :min-samples 3 :cv-threshold 0.05} (:route-policy options))
+        _ (when (seq options)
+            (when-not (and (= #{:route-context :profiles :route-policy} (set (keys options)))
+                           (map? (:route-context options))
+                           (map? (get-in options [:route-context :devices] {}))
+                           (map? (get-in options [:route-context :transfer-layouts] {}))
+                           (vector? (:profiles options))
+                           (every? map? (:profiles options)) (map? (:route-policy options))
+                           (set/subset? (set (keys policy))
+                                        #{:now-ms :max-age-ms :min-samples :cv-threshold :cold-warm})
+                           (integer? (:now-ms policy)) (<= 0 (:now-ms policy) Long/MAX_VALUE)
+                           (integer? (:max-age-ms policy)) (<= 0 (:max-age-ms policy) Long/MAX_VALUE)
+                           (integer? (:min-samples policy)) (<= 3 (:min-samples policy) Long/MAX_VALUE)
+                           (non-negative-number? (:cv-threshold policy))
+                           (contains? #{:cold :warm} (:cold-warm policy)))
+              (fail! "empirical simulation requires an explicit context, profiles and valid policy"
+                     :distributed-cost-options {:options options})))
+        costs (when (seq options)
+                (into {} (for [step (:steps plan) :when (= :transfer (:kind step))]
+                           [(:id step) (empirical-route-cost plan step (:route-context options)
+                                                            (:profiles options) policy)])))
         topology (:topology plan)
         initial {:finish-by-step {}
                  :resource-free {}
@@ -1477,7 +1621,8 @@
                  start (max dependency-ready resource-ready)
                  duration (case (:kind step)
                             :compute (long (Math/ceil (double (:duration-ns step))))
-                            :transfer (transfer-duration-ns topology step))
+                            :transfer (if costs (get-in costs [(:id step) :duration-ns])
+                                          (transfer-duration-ns topology step)))
                  finish (+ start duration)
                  state (reduce (fn [state resource]
                                  (assoc-in state [:resource-free resource] finish))
@@ -1509,7 +1654,7 @@
         capacities (into {} (map (fn [[id resource]] [id (:memory-capacity-bytes resource)]))
                          (get-in plan [:topology :devices]))
         peak-memory (:peak-memory-by-device state)]
-    {:plan-id (:id plan)
+    (cond-> {:plan-id (:id plan)
      :makespan-ns makespan
      :timeline (:timeline state)
      :device-compute-ns (:device-compute-ns state)
@@ -1523,7 +1668,9 @@
      :cost-vector {:latency-ns makespan
                    :peak-memory-bytes (reduce + 0 (vals peak-memory))
                    :peak-memory-by-device peak-memory
-                   :transferred-bytes transferred-bytes}}))
+                   :transferred-bytes transferred-bytes}}
+      costs (assoc :route-cost-evidence costs :route-context (:route-context options)
+                   :route-policy policy :empirical-costs-certified? false)))))
 
 (defn- shard-coverage
   [plan]
