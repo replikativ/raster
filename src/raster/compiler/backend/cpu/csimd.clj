@@ -130,7 +130,8 @@
   "Extract the neutral vector plan from a SegRed's reduce-op, or nil if not a
    `+`-reduction with a vectorizable multiply/identity lane body. Mirrors the
    recognition core of segop_simd/compile-segred but backend-neutrally.
-   Returns {:idx :bound :acc :init :elem-expr :factors [f1 f2]|nil :fma? bool}."
+   Returns {:idx :bound :acc :init :elem-expr :factors [f1 f2]|nil}.
+   Recognizing a product does not grant contraction of its rounding boundary."
   [segred]
   (let [idx   (ss/seg-idx segred)
         bound (ss/seg-bound segred)
@@ -151,7 +152,7 @@
                                    (ss/aget-form? (nth elem 2) idx))
                           [(nth elem 1) (nth elem 2)])]
             {:idx idx :bound bound :acc acc :init init
-             :elem-expr elem :factors factors :fma? (boolean factors)}))))))
+             :elem-expr elem :factors factors}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; C emission.
@@ -347,8 +348,8 @@
            elem (vt-of (:dtype segred))
            ti   (in/simd-type-info isa elem)
            vadd (in/simd-op isa :+ elem)
-           vfma (in/simd-op isa :fma elem)]
-       (when (and ti vadd (or (nil? factors) vfma)
+           vmul (in/simd-op isa :* elem)]
+       (when (and ti vadd (or (nil? factors) vmul)
                   (storage-loads-compatible? isa elem elem-expr idx false))
          (let [vt    (:vtype ti)
                lanes (:lanes ti)
@@ -367,10 +368,11 @@
                           (let [[f1 f2] factors
                                 [a1 b1] (ss/aget-form? f1 idx)
                                 [a2 b2] (ss/aget-form? f2 idx)]
-                            (str (accs k) " = " vfma "("
+                            ;; The monoid certificate permits changing the addition tree,
+                            ;; not fusing the separately rounded element product into it.
+                            (str (accs k) " = " vadd "(" (accs k) ", " vmul "("
                                  (vec-load ti a1 b1 "j" (blk k) array-syms) ", "
-                                 (vec-load ti a2 b2 "j" (blk k) array-syms) ", "
-                                 (accs k) ");"))
+                                 (vec-load ti a2 b2 "j" (blk k) array-syms) "));"))
                          ;; non-fused: elem is a single affine load → add
                           (let [[a b] (ss/aget-form? elem-expr idx)]
                             (str (accs k) " = " vadd "(" (accs k) ", "

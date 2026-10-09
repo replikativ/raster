@@ -1,7 +1,7 @@
 (ns raster.compiler.csimd-test
   "The explicit CPU-C SIMD emitter (compile-segred-c) turns a SegRed reduction
-   into AVX2 __m256 intrinsic C that matches the scalar reduction bit-for-bit
-   across dtypes and non-multiple-of-stride sizes. This is the reusable core of
+   into AVX2 __m256 intrinsic C with explicitly reassociated sums and retained
+   element-product rounding across dtypes and non-multiple-of-stride sizes. This is the reusable core of
    #27 (the C analog of jvm/segop_simd), validated in isolation before the
    pipeline wiring. Guarded on clang + a machine that runs AVX2."
   (:require [clojure.test :refer [deftest is testing]]
@@ -61,6 +61,36 @@
   (let [out (first arrs)]
     (apply native (concat (rest arrs) [out (int n)]))
     (aget out 0)))
+
+(deftest reassociation-does-not-contract-element-products
+  ;; One vector accumulator makes the independently specified tree transparent.
+  ;; First visit contributes -1; second contributes a product rounded to +1.
+  ;; FMA instead produces a nonzero residual, despite the same addition tree.
+  (with-redefs-fn {#'cs/n-accumulators (constantly 1)}
+    (fn []
+      (doseq [[dt ct lanes castf gap]
+              [[:double "double" 4 double (Math/scalb (double 1.0) (int -27))]
+               [:float "float" 8 float (Math/scalb (double 1.0) (int -13))]]]
+        (let [{:keys [includes helpers block]}
+              (cs/compile-segred-c (dot-segred dt) :avx2 '#{a b})
+              make-array (if (= dt :double) double-array float-array)
+              source (str includes helpers "void rounded_dot(const " ct
+                          "* a, const " ct "* b, " ct "* out, int n){"
+                          ct " acc;" block "out[0]=acc;}")
+              native (cpu/load-kernel (cpu/compile-source! source) "rounded_dot" 3 [:int])]
+          (is (some? block))
+          (is (not (re-find #"_mm256_fmadd" block)))
+          (is (re-find #"_mm256_mul" block))
+          (doseq [sign [1.0 -1.0] tail [0 1 3]]
+            (let [n (+ (* 2 lanes) tail)
+                  a (make-array n) b (make-array n) out (make-array 1)]
+              (aset a 0 (castf (- sign)))
+              (aset b 0 (castf 1))
+              (aset a lanes (castf (* sign (+ 1.0 gap))))
+              (aset b lanes (castf (- 1.0 gap)))
+              (native a b out (int n))
+              (is (zero? (double (aget out 0)))
+                  (str dt " separately rounded product, changed sign=" sign ", tail=" tail)))))))))
 
 (deftest c-vector-admission-keeps-retained-floating-precision
   (let [body (fn [tag] (with-meta '(+ (aget a i) gain) {:raster.type/tag tag}))

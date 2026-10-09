@@ -269,9 +269,11 @@
   (testing "compile-segmap handles fma"
     (let [form '(raster.par/map! out i 100 double
                                  (Math/fma dt (aget k i) (aget u i)))
-          segmap (par->segmap form)]
-      (is (segop-simd/compile-segmap segmap 'out 'double)
-          "Should produce SIMD form for fma"))))
+          segmap (par->segmap form)
+          generated (segop-simd/compile-segmap segmap 'out 'double)]
+      (is generated "Should produce SIMD form for fma")
+      (is (some #(and (seq? %) (= '.fma (first %))) (all-nodes generated))
+          "explicit source FMA remains fused"))))
 
 (deftest compile-segmap-compare-blend
   (testing "compile-segmap handles if+comparison via compare+blend"
@@ -308,6 +310,33 @@
           segred (par->segred form)]
       (is (segop-simd/compile-segred segred)
           "Should produce SIMD form for dot product"))))
+
+(deftest dot-reassociation-retains-product-rounding
+  (let [segred (par->segred
+               '(raster.par/reduce acc 0.0 i n (+ acc (* (aget a i) (aget b i)))))
+        generated (segop-simd/compile-segred segred)
+        nodes (all-nodes generated)]
+    (is generated "the dot stays vectorized")
+    (is (some #(and (seq? %) (= '.mul (first %))) nodes))
+    (is (not-any? #(and (seq? %) (= '.fma (first %))) nodes)
+        "parallel addition does not authorize contraction")
+    (let [native (eval (list 'fn [(with-meta 'a {:tag 'doubles})
+                                 (with-meta 'b {:tag 'doubles}) 'n] generated))
+          lanes (.length jdk.incubator.vector.DoubleVector/SPECIES_PREFERRED)
+          nacc (#'segop-simd/effective-n-accumulators :double)
+          stride (* lanes nacc)
+          gap (Math/scalb (double 1.0) (int -27))]
+      (is (not (zero? (Math/fma (+ 1.0 gap) (- 1.0 gap) -1.0)))
+          "fixture distinguishes FMA from a rounded product")
+      (doseq [sign [1.0 -1.0] tail [0 1 3]]
+        (let [n (+ (* 2 stride) tail)
+              a (double-array n) b (double-array n)]
+          (aset-double a 0 (- sign))
+          (aset-double b 0 1.0)
+          (aset-double a stride (* sign (+ 1.0 gap)))
+          (aset-double b stride (- 1.0 gap))
+          (is (zero? (double (native a b n)))
+              (str "changed sign=" sign ", tail=" tail)))))))
 
 (deftest compile-segred-qualified-ops
   (testing "compile-segred handles qualified core ops"
