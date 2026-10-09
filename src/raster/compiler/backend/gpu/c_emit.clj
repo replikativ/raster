@@ -2051,15 +2051,19 @@
         standards (set (keep :language-standard contracts))]
     (when (> (count standards) 1)
       (throw (ex-info "conflicting intrinsic compilation standards" {:standards standards})))
-    {:source (str/join "\n" (distinct (keep :source helpers)))
+    {:source (str/join "\n"
+                       (distinct
+                        (concat (keep :source helpers)
+                                (let [extrema (intrinsics/c-floating-extremum-helper-sources body-str)]
+                                  (when (seq extrema) [extrema])))))
      :compilation (if (seq contracts)
                     {:language-standard (first standards)
                      :extensions (into #{} (mapcat :extensions) contracts)}
                     {})}))
 
 (defn intrinsic-helper-sources
-  "The C helper DEFINITIONS for every registry intrinsic whose C function is CALLED in
-   `body-str`, each once, in table order. Registry-driven: an intrinsic that carries a
+  "Demand-driven C helper definitions, including dtype-specialized source extrema,
+   each once. Registry-driven: an intrinsic that carries a
    `:c-helper-src` (today `:dp4a` → `inline int rstr_dp4a(...)`) is defined iff its `:c :fn`
    name appears in the emitted body.
 

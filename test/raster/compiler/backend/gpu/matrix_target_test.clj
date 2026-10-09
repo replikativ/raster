@@ -26,6 +26,25 @@
     :dimensions [128 128 64] :dimension-parameters ['m 'n 'k]
     :tile (mma-tile) :result-dtype :float}))
 
+(deftest matrix-epilogues-carry-shared-source-extrema-helpers
+  (doseq [[target tile] [[:opencl-intel (hardware/derive-gemm-tile {})]
+                       [:cuda (mma-tile)]]
+          op [:min :max]
+          :let [body (schedule/matrix-body
+                      {:id :matrix-extrema-test :row 'a :col 'b :out 'c
+                       :dimensions [128 128 64] :dimension-parameters ['m 'n 'k]
+                       :tile tile :result-dtype :float
+                       :epilogue {:acc 'acc
+                                  :expr (list (symbol "raster.numeric" (name op)) 'acc '(float 0.0))}})
+                source (:source (matrix-target/emit-matrix-kernel "matrix_extrema" body target))
+                helper (str "rstr_source_" (name op) "_f32")]]
+    (is (= 1 (count (re-seq (re-pattern (str "(?:inline |__forceinline__ )float " helper "\\(")) source)))
+        "the shared helper is defined exactly once")
+    (is (< 1 (count (re-seq (re-pattern (str helper "\\(")) source)))
+        "the unrolled matrix stores call their helper")
+    (is (clojure.string/includes? source "isnan(a)"))
+    (is (clojure.string/includes? source "signbit(a)"))))
+
 (deftest intel-matrix-artifact-binds-surface-and-input-alignment-contracts
   (let [body (schedule/matrix-body
               {:id :intel-surface-test :row 'a :col 'b :out 'c

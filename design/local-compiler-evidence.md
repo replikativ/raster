@@ -1728,3 +1728,30 @@ cover single operand evaluation and Long extrema beyond exact Double range.
 NaNs are compared by classification, not payload identity; finite values and
 signed zero are compared by raw bits. This closes native map extrema only:
 other target facets and reductions' numerical legality require their own gates.
+
+### Typed C-family scalar extrema — production OpenCL reproduction
+
+The native fix did not cover KernelBody. A four-element equation-first OpenCL
+max map returned 1.0 for either operand position containing NaN, while the JVM
+returned NaN. The typed C-family scalar emitter now realizes Float/Double min/max
+with demand-driven, dtype-specific helpers owned by the same intrinsic authority
+as the native fix. Their return logic is shared, not separately reimplemented.
+The dialect layer adds only OpenCL/CUDA/HIP qualifiers. Integer extrema retain
+their existing target lowering, and unsupported floating carriers are rejected.
+Double helper demand contributes to the OpenCL FP64 extension requirement even
+when the surrounding result is not a named Double value.
+
+Native and GPU tests share source fixtures and exceptional-value cases. The
+production equation-first OpenCL test compares JVM/device results for Float and
+Double min/max, with per-device FP64 gating, changed-input replay and explicit
+artifact close. Hardware-free tests check all three C-family realizations, and
+the public CUDA/HIP compile corpus includes these four fixtures. This does not
+certify floating subgroup/workgroup collectives or CUDA/HIP numerical execution;
+their separate NaN/zero contracts remain to be validated.
+
+Independent review caught the shared scalar-region consumer boundary: matrix
+epilogues also use this expression emitter. Extrema helper demand now travels
+through the existing intrinsic helper module, so CUDA/HIP fragment epilogues and
+ordinary scalar kernels use the same requirements seam. Intel DPAS source also
+consumes that module rather than emitting a dangling helper call. Focused matrix
+epilogue checks and the vendor compile corpus cover this compositional boundary.

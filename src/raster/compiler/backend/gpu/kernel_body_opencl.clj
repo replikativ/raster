@@ -356,10 +356,21 @@
                                 (lower-scalar-ssa-region
                                  kernel-body input-region parameter-names))])))
                (:input-regions plan))]
-     (emit-plan kernel-name plan
-                (assoc (or (lower-store-region kernel-body parameter-names) {})
-                       :input-values input-values
-                       :parameter-names parameter-names)))))
+     (let [source (emit-plan kernel-name plan
+                             (assoc (or (lower-store-region kernel-body parameter-names) {})
+                                    :input-values input-values
+                                    :parameter-names parameter-names))
+           helpers (ce/intrinsic-helper-module source :opencl-intel {})]
+       (when (seq (:compilation helpers))
+         (throw (ex-info "matrix OpenCL helper requires an unsupported compilation contract"
+                         {:reason :kernel-body-matrix-helper-compilation
+                          :compilation (:compilation helpers)})))
+       (str (when (some #(str/includes? source
+                                        (str (intrinsics/c-floating-extremum-name % :double) "("))
+                         [:min :max])
+              "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+            (when (seq (:source helpers)) (str (:source helpers) "\n"))
+            source)))))
 
 ;; ---------------------------------------------------------------------------
 ;; General scalar/control KernelBody lowering
@@ -703,6 +714,12 @@
       ;; overloads, so target spelling must retain the verified operand dtype.
       (and integral? (contains? #{:min :max} op))
       (str (name op) "(" (str/join ", " arguments) ")")
+
+      ;; Native fmin/fmax discard a lone NaN. The source Math/numeric operation
+      ;; propagates it and has a signed-zero tie rule, independent of the target.
+      (contains? #{:min :max} op)
+      (str (intrinsics/c-floating-extremum-name op operand-type)
+           "(" (str/join ", " arguments) ")")
 
       ;; Word shifts have the JVM/WASM width-masked count contract, independent of the
       ;; source language's choice to widen an operand. Unsigned shifts also avoid signed
@@ -1684,8 +1701,11 @@
         uses-double? (or (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
                          (some #{:double} (vals value-types))
                          ;; Expression-valued operands need no named ValueSpec. This exact
-                         ;; emitted helper demand also covers their narrowing boundary.
-                         (str/includes? operation-source "rstr_narrow_f64_f32_rte("))
+                         ;; emitted helper demand also covers their narrowing/extrema boundaries.
+                         (str/includes? operation-source "rstr_narrow_f64_f32_rte(")
+                         (some #(str/includes? operation-source
+                                               (str (intrinsics/c-floating-extremum-name % :double) "("))
+                               [:min :max]))
         collective (first (filter #(record-kind? "Collective" %) operations))
         uses-subgroups? (or collective
                             (some #(and (record-kind? "IndexBinding" %)

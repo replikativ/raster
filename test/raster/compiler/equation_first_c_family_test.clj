@@ -11,6 +11,8 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
+            [raster.compiler.fixtures.extrema :as extrema]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.fixtures.scalar-helpers :as scalar-helpers]
             [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
@@ -352,6 +354,21 @@
                      :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
                      :max-workgroup-size 1024 :shared-local-memory 131072 :total-eus 32}})
     (f)))
+
+(deftest typed-source-extrema-use-shared-semantic-realization
+  (doseq [target [ocl-target cuda-target hip-target]
+          [source dtype _array-fn _bits op] extrema/cases
+          :let [compilation (equation-first/compile source {:target target :dtype dtype})
+                kernel-source (:source (first (:kernels compilation)))
+                helper-name (intrinsics/c-floating-extremum-name op dtype)]]
+    (is (= 1 (count (:kernels compilation))))
+    (is (= 2 (count (re-seq (re-pattern (str helper-name "\\(")) kernel-source)))
+        "one helper definition and one typed call, not raw target fmin/fmax")
+    (is (str/includes? kernel-source (str (if (= target ocl-target)
+                                          "inline " "__device__ __forceinline__ ")
+                                        (name dtype) " " helper-name)))
+    (is (str/includes? kernel-source "isnan(a)"))
+    (is (str/includes? kernel-source "signbit(a)"))))
 
 (deftm c-family-dot
   "A public TypedSOAC reduction compiled without a CUDA/HIP runtime or physical GPU."

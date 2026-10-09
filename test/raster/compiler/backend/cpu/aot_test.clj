@@ -14,9 +14,10 @@
             [raster.core :refer [deftm reduce!]]
             [raster.numeric :as rn]
             [raster.arrays :as ra]
-            [raster.par :as par]
+            [raster.par]
             [raster.math]
             [raster.compiler.backend.cpu.aot :as aot]
+            [raster.compiler.fixtures.extrema :as extrema]
             [raster.compiler.ir.parallel-program :as parallel-program]))
 
 (deftest qualified-integer-size-casts-use-the-shared-descriptor
@@ -148,38 +149,12 @@
                     (map vector rq cq))
             "int8 output within 1 ULP of the lazy-JIT reference")))))
 
-(deftm native-max-float!
-  [x :- (Array float), z :- (Array float), y :- (Array float), cnt :- Long] :- (Array float)
-  (par/map! y i cnt float (Math/max (float (aget x i)) (float (aget z i))))
-  y)
-
-(deftm native-min-float!
-  [x :- (Array float), z :- (Array float), y :- (Array float), cnt :- Long] :- (Array float)
-  (par/map! y i cnt float (Math/min (float (aget x i)) (float (aget z i))))
-  y)
-
-(deftm native-max-double!
-  [x :- (Array double), z :- (Array double), y :- (Array double), cnt :- Long] :- (Array double)
-  (par/map! y i cnt double (rn/max (double (aget x i)) (double (aget z i))))
-  y)
-
-(deftm native-min-double!
-  [x :- (Array double), z :- (Array double), y :- (Array double), cnt :- Long] :- (Array double)
-  (par/map! y i cnt double (rn/min (double (aget x i)) (double (aget z i))))
-  y)
-
 (deftest native-extrema-preserve-source-semantics
   (when (clang-available?)
-    (doseq [[v dtype array-fn bits op] [[#'native-max-float! :float float-array #(Float/floatToRawIntBits (float %)) :max]
-                                     [#'native-min-float! :float float-array #(Float/floatToRawIntBits (float %)) :min]
-                                     [#'native-max-double! :double double-array #(Double/doubleToRawLongBits (double %)) :max]
-                                     [#'native-min-double! :double double-array #(Double/doubleToRawLongBits (double %)) :min]]
+    (doseq [[v dtype array-fn bits op] extrema/cases
             simd? [false true]
             :let [native (aot/compile-aot-c v dtype :simd? simd?)
-                  pairs [[Double/NaN 1.0] [1.0 Double/NaN] [Double/NaN Double/NaN]
-                         [0.0 -0.0] [-0.0 0.0] [-0.0 -0.0] [0.0 0.0]
-                         [Double/POSITIVE_INFINITY 4.0] [-4.0 Double/NEGATIVE_INFINITY]
-                         [1.00000006 1.00000007] [-8.25 9.5]]]]
+                  pairs extrema/operand-pairs]]
       (when simd?
         ;; Definitions occur once; a second occurrence proves a vector call was
         ;; actually emitted rather than a passing scalar fallback.
@@ -194,11 +169,7 @@
                     expected (array-fn n)]]
         (native x z actual n)
         (@v x z expected n)
-        (is (every? true?
-                    (map (fn [a b]
-                           (if (Double/isNaN (double b))
-                             (Double/isNaN (double a))
-                             (= (bits a) (bits b)))) actual expected))
+        (is (extrema/same-result? bits actual expected)
             (str (:name (meta v)) " simd=" simd? " n=" n " shift=" shift))))))
 
 (deftest cpu-c-round-half-up

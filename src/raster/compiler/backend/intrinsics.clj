@@ -31,13 +31,19 @@
 (defn- vt3 [f64 f32 i32] (cond-> {} f64 (assoc :f64 f64) f32 (assoc :f32 f32) i32 (assoc :i32 i32)))
 (defn- math1 [f64 f32 cfn] {:arity 1 :kind :fn :wasm (vt3 f64 f32 nil) :c {:fn cfn} :wgsl {:fn cfn}})
 
+(defn- extremum-return-source
+  [op floating?]
+  (str (when floating?
+         (str " if (isnan(a)) return a; if (isnan(b)) return b;\n"
+              " if (a == 0 && b == 0) return signbit(a) ? "
+              (if (= :min op) "a : b" "b : a") ";\n"))
+       " return a " (if (= :min op) "<=" ">=") " b ? a : b;\n"))
+
 (defn- native-extremum
   "Native C overloads preserve source NaNs and signed-zero ties. Function
    arguments are evaluated once; _Generic's controlling expression is unevaluated."
   [op]
-  (let [name (str "rstr_native_" (name op))
-        minimum? (= :min op)
-        comparison (if minimum? "<=" ">=")]
+  (let [name (str "rstr_native_" (name op))]
     {:fn name
      :source
      (str
@@ -45,11 +51,7 @@
              (for [[suffix type] [["f32" "float"] ["f64" "double"]
                                  ["i32" "int"] ["long" "long"] ["i64" "long long"]]]
                (str "static inline " type " " name "_" suffix "(" type " a, " type " b) {\n"
-                    (when (#{"f32" "f64"} suffix)
-                      (str " if (isnan(a)) return a; if (isnan(b)) return b;\n"
-                           " if (a == 0 && b == 0) return signbit(a) ? "
-                           (if minimum? "a : b" "b : a") ";\n"))
-                    " return a " comparison " b ? a : b;\n}\n")))
+                    (extremum-return-source op (#{"f32" "f64"} suffix)) "}\n")))
       "#define " name "(a,b) _Generic(((a)+(b)), "
       "float: " name "_f32, double: " name "_f64, "
       "int: " name "_i32, long: " name "_long, long long: " name "_i64)((a),(b))\n")}))
@@ -329,6 +331,25 @@
             (for [[_ {:keys [native-c]}] table
                   :when (and native-c (str/includes? body (str (:fn native-c) "(")))]
               (:source native-c))))
+
+(defn c-floating-extremum-name
+  "Name a source-semantic floating extremum at its verified operand dtype."
+  [op dtype]
+  (when-not (and (#{:min :max} op) (#{:float :double} dtype))
+    (throw (ex-info "unsupported source floating extremum"
+                    {:reason :unsupported-floating-extremum :op op :dtype dtype})))
+  (str "rstr_source_" (name op) "_" ({:float "f32" :double "f64"} dtype)))
+
+(defn c-floating-extremum-helper-sources
+  "Demand-driven shared C-family floating extrema. The dialect owner adds device
+   qualifiers; source arithmetic and numerical policy are not target choices."
+  [body]
+  (apply str
+         (for [op [:min :max] dtype [:float :double]
+               :let [fn-name (c-floating-extremum-name op dtype)]
+               :when (str/includes? body (str fn-name "("))]
+           (str "inline " (name dtype) " " fn-name "(" (name dtype) " a, " (name dtype) " b) {\n"
+                (extremum-return-source op true) "}\n"))))
 
 ;; ---------------------------------------------------------------------------
 ;; C / OpenCL / GLSL accessor — for the GPU c-emit backend.
