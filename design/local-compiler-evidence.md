@@ -1703,8 +1703,8 @@ negative zero and a Float multiply/add that differs from FMA. This is a semantic
 default change, not a performance result: implicit autovectorization may change,
 especially for transcendental loops. Legal relaxed schedules should recover
 performance through explicit numerical contracts rather than global flags.
-JVM-compatible scalar and SIMD min/max handling remains a separate open defect;
-preserving the environment alone does not change C `fmin`/`fmax` semantics.
+Preserving the environment alone did not fix JVM-compatible scalar and SIMD
+min/max: C `fmin`/`fmax` semantics needed the separate lowering described below.
 
 ### Native extrema realize JVM Math/numeric semantics
 
