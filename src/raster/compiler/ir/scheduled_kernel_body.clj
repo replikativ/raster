@@ -174,13 +174,18 @@
   [scheduled]
   (launch-from-checked-body (body/validate! (:body scheduled)) (:arguments scheduled)))
 
+(defn- target-library-expressions
+  [kernel-body]
+  (filter (fn [value]
+            (and (record-kind? "ScalarExpr" value)
+                 (= :target-library
+                    (:kernel-body-math-realization (intrinsics/descriptor (:op value))))))
+          (tree-seq coll? seq (:operations kernel-body))))
+
 (defn- validate-math-realizations!
   [kernel-body policy]
   (let [policy (numerics/validate-scalar-math-policy! policy)]
-    (doseq [value (tree-seq coll? seq (:operations kernel-body))
-            :when (and (record-kind? "ScalarExpr" value)
-                       (= :target-library
-                          (:kernel-body-math-realization (intrinsics/descriptor (:op value)))))
+    (doseq [value (target-library-expressions kernel-body)
             :let [operation (intrinsics/canonical (:op value))
                   dt (dtype/canon (:result-type value))
                   expected (or (numerics/scalar-math-realization policy operation dt)
@@ -284,6 +289,24 @@
              {:expected expected :actual (:scalar-math contract)}))
     (validate-math-realizations! (:body scheduled) expected)
     scheduled))
+
+(defn scalar-math-requirements
+  "Project executable target-library requirements after checking independent caller consent.
+
+   These are requirements, not target support evidence. Unused policy entries introduce no
+   requirements. Logical result precision and physical evaluation precision remain distinct."
+  [scheduled caller-policy]
+  (let [scheduled (validate-against-math-policy! scheduled caller-policy)]
+    (into #{}
+          (map (fn [expression]
+                 (let [logical-dtype (dtype/canon (:result-type expression))
+                       realization (get-in expression [:options :math-realization])]
+                   {:operation (intrinsics/canonical (:op expression))
+                    :logical-dtype logical-dtype
+                    :evaluation-dtype (dtype/canon (or (:evaluation-dtype realization)
+                                                      logical-dtype))
+                    :realization realization})))
+          (target-library-expressions (:body scheduled)))))
 
 (defn validate-against-node!
   "Require this refinement to implement one exact node in its complete KernelGraph context."

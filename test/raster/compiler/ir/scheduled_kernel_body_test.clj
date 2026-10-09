@@ -91,6 +91,55 @@
     (is (= :scheduled-kernel-body-math-realization
            (reason-of #(scheduled/validate! nested))))))
 
+(deftest physical-math-requirements-come-from-checked-executable-leaves
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (assoc-in (fixture) [:body :operations 1 :value]
+                           (body/scalar-expression :tanh :float ['value]))
+        selected (-> ordinary
+                     (assoc-in [:body :operations 1 :value :options :math-realization]
+                               numerics/widened-target-library-math)
+                     (assoc-in [:numerics :scalar-math] policy))
+        nested (-> selected
+                   (assoc-in [:body :masks]
+                             [(body/->Mask :active [(body/predicate :lt 0 1)])])
+                   (assoc-in [:body :operations 1]
+                             (body/->Guard :active [(get-in selected [:body :operations 1])])))]
+    (is (= #{} (scheduled/scalar-math-requirements (fixture) policy))
+        "an unused override is not a physical FP64 requirement")
+    (is (= #{{:operation :tanh :logical-dtype :float :evaluation-dtype :float
+              :realization numerics/target-library-math}}
+           (scheduled/scalar-math-requirements ordinary nil)))
+    (is (= #{{:operation :tanh :logical-dtype :float :evaluation-dtype :double
+              :realization numerics/widened-target-library-math}}
+           (scheduled/scalar-math-requirements selected policy)))
+    (is (= (scheduled/scalar-math-requirements selected policy)
+           (scheduled/scalar-math-requirements nested policy)))
+    (is (= :scheduled-kernel-body-caller-math-policy
+           (reason-of #(scheduled/scalar-math-requirements selected nil))))
+    (is (= :scheduled-kernel-body-math-realization
+           (reason-of #(scheduled/scalar-math-requirements ordinary policy))))))
+
+(deftest selected-math-needs-affirmative-frozen-target-capability
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        selected (-> (fixture)
+                     (assoc-in [:body :operations 1 :value]
+                               (body/scalar-expression
+                                :tanh :float ['value]
+                                {:math-realization numerics/widened-target-library-math}))
+                     (assoc-in [:numerics :scalar-math] policy))
+        supported {:device-id :test-device
+                   :execution {:scalar-dtype-support {:double :supported}}}]
+    (is (identical? selected (target/validate-math-target! selected policy supported)))
+    (doseq [descriptor [{}
+                        {:execution {:scalar-dtype-support {:double :unsupported}}}
+                        {:execution {:scalar-dtype-support {:double :unknown}}}
+                        {:fp64-throughput 1000000000000 :fp64? true}]]
+      (is (= :kernel-body-target-math-capability
+             (reason-of #(target/validate-math-target! selected policy descriptor)))))
+    (is (= (fixture) (target/validate-math-target! (fixture) policy {})))
+    (is (= :scheduled-kernel-body-caller-math-policy
+           (reason-of #(target/validate-math-target! selected nil supported))))))
+
 (deftest source-arithmetic-cannot-be-dropped-or-forged-in-a-scheduled-certificate
   (let [contract (numerics/blas-source-arithmetic :float)
         value (-> (fixture)
