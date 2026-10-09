@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.scheduled-kernel-body-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-target]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
@@ -128,7 +129,8 @@
                                 {:math-realization numerics/widened-target-library-math}))
                      (assoc-in [:numerics :scalar-math] policy))
         supported {:device-id :test-device
-                   :execution {:scalar-dtype-support {:double :supported}}}]
+                   :execution {:scalar-dtype-support {:double :supported}}}
+        emissions (atom 0)]
     (is (identical? selected (target/validate-math-target! selected policy supported)))
     (doseq [descriptor [{}
                         {:execution {:scalar-dtype-support {:double :unsupported}}}
@@ -138,7 +140,20 @@
              (reason-of #(target/validate-math-target! selected policy descriptor)))))
     (is (= (fixture) (target/validate-math-target! (fixture) policy {})))
     (is (= :scheduled-kernel-body-caller-math-policy
-           (reason-of #(target/validate-math-target! selected nil supported))))))
+           (reason-of #(target/validate-math-target! selected nil supported))))
+    (with-redefs [scalar-target/emit-scalar-module
+                  (fn [& _] (swap! emissions inc)
+                    (throw (ex-info "unexpected source emission" {})))]
+      (doseq [dialect [:opencl-portable :cuda :hip]]
+        (is (= :kernel-body-target-math-capability
+               (reason-of #(target/emit-artifact
+                            "rejected_math" selected dialect
+                            {:target-descriptor {} :scalar-math policy}))))
+        (is (= :scheduled-kernel-body-caller-math-policy
+               (reason-of #(target/emit-artifact
+                            "rejected_consent" selected dialect
+                            {:target-descriptor supported})))))
+      (is (zero? @emissions) "capability and consent rejection precede source emission"))))
 
 (deftest source-arithmetic-cannot-be-dropped-or-forged-in-a-scheduled-certificate
   (let [contract (numerics/blas-source-arithmetic :float)

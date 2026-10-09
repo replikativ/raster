@@ -128,12 +128,17 @@
   "Emit a ScheduledKernelBody to one C-family target artifact.
 
    Optional metadata is non-authoritative: checked body/refinement and selected-target facts win
-   on key collisions.  `parameter-names` and `target-features` affect target spelling only."
+   on key collisions. `parameter-names` and `target-features` affect target spelling only.
+   A supplied `target-descriptor` admits selected math against independent `scalar-math` consent
+   before any source emission; neither input is recovered from retained certificate metadata."
   ([kernel-name scheduled target-dialect]
    (emit-artifact kernel-name scheduled target-dialect {}))
   ([kernel-name scheduled target-dialect
-    {:keys [parameter-names target-features provenance attributes]}]
+    {:keys [parameter-names target-features provenance attributes target-descriptor scalar-math]
+     :as options}]
    (let [scheduled (scheduled-body/validate! scheduled)
+         _ (when (contains? options :target-descriptor)
+             (validate-math-target! scheduled scalar-math target-descriptor))
          kernel-body (:body scheduled)
          matrix? (matrix-body? kernel-body)
          dialect (c-dialect/resolve! target-dialect)
