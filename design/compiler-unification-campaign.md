@@ -3455,13 +3455,15 @@ intermediate storage is private scratch; the public outputs are the two state
 fields. Preparation does not open a device session or allocate device storage.
 Semantic input/output ports identify the connections, rather than inspection of
 generated ABI names. No diffusion, interpolation, reflux or restriction kernel
-is reimplemented by this provider.
+is reimplemented by this provider. Public `compiled/compose` retains the prepared
+artifact, component preparation reports and donated state boundary for subsequent
+execution-identity checks; the provider does not implement another composition API.
 
 Two consecutive invocations of the same local executable compare both complete
 fields with the independent coordinate oracle at the existing 1e-11 tolerance.
 They also check composite mass and exact average-down. The second invocation
 uses the resident committed state without a host upload; original host arrays
-remain unchanged. Focused tests pass 3 tests / 40 assertions on actual OpenCL and
+remain unchanged. Focused tests pass 4 tests / 47 assertions on actual OpenCL and
 Level Zero with no capability skips reported. Fresh-process CI and independent
 review remain required before landing.
 

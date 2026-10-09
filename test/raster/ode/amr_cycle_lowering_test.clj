@@ -1,10 +1,12 @@
 (ns raster.ode.amr-cycle-lowering-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.build-manifest :as build]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.link-composition :as composition]
             [raster.compiler.ir.link-plan :as plan]
             [raster.dl.gpu-grad-parity :as ze]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.completed-evidence-device-test :as evidence]
             [raster.gpu.core :as gpu]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.link :as runtime]
@@ -26,12 +28,23 @@
         {:keys [coarse fine]} (#'oracle/initial-state)
         coarse (double-array coarse) fine (double-array fine)]
     (with-redefs [hardware/descriptor-for (constantly descriptor)
+                  build/current-identity #'evidence/test-build
                   gpu/make-session (fn [& _] (throw (ex-info "lowering opened a device session" {})))
                   gpu/alloc! (fn [& _] (throw (ex-info "lowering allocated device storage" {})))
                   compiled/instantiate! (fn [& _] (throw (ex-info "lowering instantiated a program" {})))]
       (let [lowered (cycle/lower (projection) coarse fine 0.001 {:target target})
             local (get-in lowered [:lowering :plan])]
         (is (identical? (:lowering lowered) (composition/verify! (:lowering lowered))))
+        (is (compiled/prepared? (:prepared lowered)))
+        (is (identical? local (compiled/plan (:prepared lowered))))
+        (is (= [:coarse :fine] (mapv :key (:out-tree (:prepared lowered)))))
+        (is (= {[[:coarse :commit] :dst] :coarse
+                 [[:fine :commit] :dst] :fine}
+               (:donated (:prepared lowered))))
+        (is (not-any? #{[:cycle :coarse] [:cycle :fine]}
+                      (map :key (:in-tree (:prepared lowered)))))
+        ;; Synthetic packaged evidence checks retention, not release provenance.
+        (is (= :exact-bound-program (:scope (compiled/execution-identity (:prepared lowered)))))
         (is (= 3 (count (:instances local))))
         (is (= #{:coarse :fine} (set (keys (:fields lowered)))))
         (is (= (set (vals (:fields lowered))) (set (plan/output-value-ids local))))
@@ -53,6 +66,12 @@
                    {:target :ocl:analytic :precision :float}]]
     (is (= :amr-cycle-options
            (:reason (ex-data (try (cycle/lower nil nil nil nil options)
+                                 (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest coarse-and-fine-state-sources-must-be-distinct
+  (let [state (double-array 16)]
+    (is (= :amr-cycle-state-alias
+           (:reason (ex-data (try (cycle/lower nil state state 0.001 {:target :ocl:analytic})
                                  (catch clojure.lang.ExceptionInfo e e))))))))
 
 (defn- check-resident-cycle! [target]
