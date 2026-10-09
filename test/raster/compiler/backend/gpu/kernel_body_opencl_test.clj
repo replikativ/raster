@@ -421,6 +421,45 @@
                                          "-fsyntax-only" "-" :in source)]
           (is (zero? exit) err))))))
 
+(deftest half-extrema-collectives-require-an-explicit-widening-schedule
+  (doseq [[target width reason] [[:opencl-portable 16 :kernel-body-opencl-collective-dtype]
+                                [:cuda 32 :kernel-body-c-collective]
+                                [:hip 32 :kernel-body-c-collective]]
+          operator [:min :max]]
+    (is (= reason
+           (try
+             (opencl/emit-scalar-kernel "half_collective"
+               (fixtures/floating-extrema-collective-body :half operator width)
+               {:target-dialect target})
+             nil
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest floating-extrema-collectives-preserve-source-semantics
+  (doseq [[target width] [[:opencl-portable 16] [:cuda 32] [:hip 32]]
+          type [:float :double]
+          operator [:min :max]
+          :let [source (opencl/emit-scalar-kernel
+                        "source_collective_extrema"
+                        (fixtures/floating-extrema-collective-body type operator width)
+                        {:target-dialect target})]]
+    (if (= :opencl-portable target)
+      (do
+        (is (str/includes? source "sub_group_any(isnan("))
+        (is (str/includes? source
+                           (str "== 0 && " (when (= :max operator) "!") "signbit(")))
+        (is (str/includes? source (str "sub_group_reduce_" (name operator) "(")))
+        (when (command-available? "clang")
+          (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-" :in source)]
+            (is (zero? exit) err))))
+      (let [helper (str "rstr_source_" (name operator) "_" (if (= :float type) "f32" "f64"))]
+        (is (= 1 (count (re-seq (re-pattern (str helper "\\([^)]*\\) \\{")) source))))
+        (is (str/includes? source (str "= " helper "(rstr_extremum,")))
+        (is (str/includes? source "if (isnan(a)) return a;"))
+        (when (command-available? ({:cuda "nvcc" :hip "hipcc"} target))
+          (let [{:keys [exit err]} (compile-c-family-source target source)]
+            (is (zero? exit) err)))))))
+
 (deftest wrapping-integral-collectives-use-unsigned-carriers
   (doseq [[target unsigned bitcast]
           [[:opencl-portable "uint rstr_sum__unsigned_collective"

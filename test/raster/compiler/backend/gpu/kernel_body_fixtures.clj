@@ -6,6 +6,27 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
+(defn floating-extrema-collective-body
+  "One subgroup reads runtime operands and writes its source-semantic extremum."
+  [type operator width]
+  (body/make
+   {:id [:floating-extrema-collective type operator width]
+    :parameters [(body/->KernelParameter 'x :input type [width] :global
+                                         (layout/row-major [width] type) :input)
+                 (body/->KernelParameter 'out :output type [1] :global
+                                         (layout/row-major [1] type) :result)]
+    :indices [(body/->IndexBinding 'lane :lane 0)]
+    :masks [(body/->Mask :lane-zero [(body/predicate :eq 'lane 0)])]
+    :operations [(body/->ScalarLoad (body/value 'operand type) 'x ['lane] nil nil :cached)
+                 (body/->Collective (body/value 'extremum type) :reduce :subgroup width
+                                    'operand operator nil (body/full-participation)
+                                    :implementation-defined {:overflow :ieee})
+                 (body/->ScalarStore 'out [0] 'extremum :lane-zero)]
+    :schedule {:subgroup-size width}
+    :launch (launch/spec {:workgroup-size [width] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn scalar-product-body
   "Dynamic nested product/add or explicit FMA, shared by emission and instruction gates."
   [type fused?]

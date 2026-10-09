@@ -1762,3 +1762,25 @@ through the existing intrinsic helper module, so CUDA/HIP fragment epilogues and
 ordinary scalar kernels use the same requirements seam. Intel DPAS source also
 consumes that module rather than emitting a dangling helper call. Focused matrix
 epilogue checks and the vendor compile corpus cover this compositional boundary.
+
+### Subgroup extrema source semantics (2026-10-09 follow-up)
+
+A verified KernelBody subgroup reduction reproduced four device/JVM mismatches:
+Float min and max each discarded a NaN placed in either the first or last lane
+among numeric operands. This is distinct from the scalar extrema defect above.
+The intrinsic remains source min/max; its collective lowering may change the
+tree, not the operator's NaN or signed-zero semantics.
+
+OpenCL retains the native reduction and adds two uniformly executed subgroup
+predicate reductions, detecting any NaN and a preferred-sign zero operand. It
+then reconstructs NaN classification or the correct zero sign without depending
+on the native builtin's zero-sign choice. The operand is evaluated once. CUDA/HIP
+shuffle trees instead use the existing demand-driven typed extrema helper, so
+there is no additional operator registry or separate numerical implementation.
+
+The shared KernelBody fixture feeds hardware-free Float/Double source checks,
+the mandatory CUDA/HIP compile corpus, and an OpenCL device/JVM oracle with
+changed resident inputs covering NaNs at both ends, all-NaN lanes, zero ties,
+ordinary values and infinities. This does not certify CUDA/HIP execution or
+performance, workgroup extrema, NaN payload identity, or unrelated reductions.
+The OpenCL predicate overhead is a correctness cost, not a measured speedup.

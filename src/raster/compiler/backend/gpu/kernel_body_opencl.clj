@@ -1415,15 +1415,41 @@
                             "OpenCL subgroup builtin cannot preserve an explicit reduction tree"
                             {:reason :kernel-body-opencl-collective-association
                              :association association})))
-                      builtin (c-dialect/opencl-reduction-builtin operator)]
+                      builtin (c-dialect/opencl-reduction-builtin operator)
+                      _ (when (and (contains? #{:min :max} operator)
+                                   (dtype/fp-dtype? result-type)
+                                   (not (contains? #{:float :double} result-type)))
+                          (throw (ex-info "OpenCL source extrema collective requires Float or Double arithmetic"
+                                          {:reason :kernel-body-opencl-collective-dtype
+                                           :operator operator :dtype result-type})))]
                   (when-not builtin
                     (throw (ex-info "OpenCL has no matching subgroup reduction builtin"
                                     {:reason :kernel-body-opencl-collective
                                      :operator (:operator operation)})))
-                  (str (indent-lines depth
-                                     (str working-type " " working-name " = "
-                                          builtin "(" working-input ");"))
-                       finish))
+                  (if (and (contains? #{:min :max} operator)
+                           (contains? #{:float :double} result-type))
+                    ;; Native OpenCL extrema ignore a NaN paired with a number.
+                    ;; Evaluate the operand once and execute every predicate collective
+                    ;; uniformly, before selecting the source-semantic result. A zero
+                    ;; result must also retain the preferred sign among zero operands.
+                    (let [operand-name (str result-name "__operand")
+                          nan-name (str result-name "__any_nan")
+                          zero-name (str result-name "__preferred_zero")
+                          negative? (= :min operator)]
+                      (str
+                       (indent-lines depth (str working-type " " operand-name " = " working-input ";"))
+                       (indent-lines depth (str working-type " " working-name " = " builtin "(" operand-name ");"))
+                       (indent-lines depth (str "int " nan-name " = sub_group_any(isnan(" operand-name "));"))
+                       (indent-lines depth (str "int " zero-name " = sub_group_any(" operand-name " == 0 && "
+                                                (when-not negative? "!") "signbit(" operand-name "));"))
+                       (indent-lines depth (str working-name " = " nan-name " ? (" working-type ")NAN : ("
+                                                working-name " == 0 ? (" zero-name " ? "
+                                                (when negative? "-") "(" working-type ")0.0 : "
+                                                (when-not negative? "-") "(" working-type ")0.0) : " working-name ");"))))
+                    (str (indent-lines depth
+                                       (str working-type " " working-name " = "
+                                            builtin "(" working-input ");"))
+                         finish)))
                 (let [distances (if (= :implementation-defined association)
                                   (when (zero? (bit-and width (dec width)))
                                     (vec (take-while pos?
@@ -1442,12 +1468,8 @@
                                   :bit-or (str working-name " |= " rhs ";")
                                   :bit-xor (str working-name " ^= " rhs ";")
                                   (:min :max)
-                                  (let [fn-name (case [operator result-type]
-                                                  [:min :float] "fminf"
-                                                  [:max :float] "fmaxf"
-                                                  [:min :double] "fmin"
-                                                  [:max :double] "fmax"
-                                                  nil)]
+                                  (let [fn-name (when (contains? #{:float :double} result-type)
+                                                  (intrinsics/c-floating-extremum-name operator result-type))]
                                     (when-not fn-name
                                       (throw (ex-info "CUDA/HIP min/max collective dtype is unsupported"
                                                       {:reason :kernel-body-c-collective
