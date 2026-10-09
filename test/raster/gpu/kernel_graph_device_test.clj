@@ -3,6 +3,7 @@
             [raster.arrays :as arrays]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
@@ -37,6 +38,13 @@
                     sess :inclusive-scan graph {'values :values 'out :out}
                     {'n {:type :int :value n}})]
         (try
+          (let [planned (graph-call/temporary-storage-plan graph {'n {:type :int :value n}})
+                actual (get-in @sess [:kernel-graphs (:key handle) :temporary-buffers])]
+            (is (= (set (keys (:allocations planned))) (set (keys actual))))
+            (is (= (into {} (map (fn [[id allocation]] [id (:byte-size allocation)]))
+                               (:allocations planned))
+                   (into {} (map (fn [[id buffer]] [id (:byte-size buffer)])) actual)))
+            (is (= (:resident-bytes planned) (reduce +' 0 (map :byte-size (vals actual))))))
           (let [event (gpu/submit-kernel-graph! sess handle)]
             (try
               (is (boolean? (gpu/event-complete? sess event)))
