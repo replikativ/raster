@@ -2613,7 +2613,8 @@
     (let [node (first (:nodes source))
           request {:scalar-math policy}
           options (merge request
-                         {:target-dialect :opencl-intel :target-descriptor descriptor
+                         {:target-dialect :opencl-intel
+                          :target-descriptor (assoc-in descriptor [:execution :scalar-dtype-support :double] :supported)
                           :array-types {'A :float 'B :float 'C :float}
                           :scalar-types {'m :int 'n :int 'k :int}
                           :contraction-facts {(:id (:operation node))
@@ -2627,6 +2628,13 @@
       (is (:ok candidate))
       (is (identical? (:candidate candidate)
                       (emitted-equation/validate! (:candidate candidate) request)))
+      (try
+        (c-family/emit-mixed-contraction-alternative
+         reference (merge options {:schedule {:precision :mixed-f16-f32}
+                                   :target-descriptor (assoc-in descriptor [:execution :scalar-dtype-support :double] :unknown)}))
+        (is false "outer mixed emitter must retain frozen physical capability admission")
+        (catch clojure.lang.ExceptionInfo error
+          (is (= :kernel-body-target-math-capability (:reason (ex-data error))))))
       (is (thrown? clojure.lang.ExceptionInfo (emitted-equation/validate! (:candidate candidate)))))
     (let [emitted (update (:graph selected) :nodes
                           #(mapv (fn [index node stage]

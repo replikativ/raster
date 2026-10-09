@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
+            [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -58,7 +59,18 @@
                (get-in selected [:scheduled :body :launch])))
         (is (not (contains? (body/required-scalar-dtypes
                              (get-in selected [:scheduled :body :operations])) :double)))
-        (is (some? (:artifact (route/emit "consented_product_consumer" selected :opencl-portable))))))))
+        (is (some? (:artifact (route/emit "consented_product_consumer" selected :opencl-portable))))
+        (let [caller-options {:scalar-math policy :target-descriptor {}}
+              received (atom [])
+              emit target/emit-artifact]
+          (with-redefs [target/emit-artifact
+                        (fn [name certificate dialect options]
+                          (swap! received conj options)
+                          (emit name certificate dialect options))]
+            (is (some? (:artifact (route/emit "unused_widening_product_consumer"
+                                             selected :opencl-portable caller-options)))))
+          (is (= [caller-options] @received)
+              "fused route forwards independent request and hardware, including an unused override"))))))
 
 (deftest exact-two-node-region-refines-to-one-cooperative-node
   (let [{scheduled-body :scheduled scheduled-graph :graph witness :refinement}
