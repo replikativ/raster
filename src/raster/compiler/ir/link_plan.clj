@@ -19,6 +19,7 @@
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.write-coverage :as coverage]
@@ -41,31 +42,43 @@
 
 (def ^:dynamic ^:private *validated-program-instances* nil)
 (def ^:dynamic ^:private *retained-program-validations* nil)
+(def ^:dynamic ^:private *caller-options* nil)
 
 (def ^:private effect-evidence-seal-token (Object.))
 
+(defn- effect-evidence-seal [plan-ref owner policy]
+  (fn [candidate-plan candidate-evidence requested-policy]
+    (when (and (some? candidate-plan)
+               (identical? (.get ^java.lang.ref.WeakReference plan-ref) candidate-plan)
+               (identical? @owner candidate-evidence)
+               (= policy requested-policy))
+      effect-evidence-seal-token)))
+
+(def ^:private effect-evidence-seal-class (class (effect-evidence-seal nil nil nil)))
+
 (defn- seal-effect-evidence
-  "Authorize reuse only for the exact in-process plan and evidence objects just validated."
-  [plan evidence]
+  "Authorize exact plan/evidence reuse only under the independently checked math request."
+  [plan evidence caller-options]
   (let [plan-ref (java.lang.ref.WeakReference. plan)
         owner (volatile! nil)
-        sealed (with-meta evidence
-                 {::validation-seal
-                  (fn [candidate-plan candidate-evidence]
-                    (when (and (some? candidate-plan)
-                               (identical? (.get plan-ref) candidate-plan)
-                               (identical? @owner candidate-evidence))
-                      effect-evidence-seal-token))})]
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        sealed (with-meta evidence {::validation-seal (effect-evidence-seal plan-ref owner policy)})]
     (vreset! owner sealed)
     sealed))
 
-(defn ^:no-doc retained-effect-evidence?
+(defn- retained-effect-evidence-for-request?
   "True only for an exact plan/evidence pair returned by this process's LinkPlan validator."
-  [plan evidence]
+  [plan evidence caller-options]
   (let [seal (when (instance? LinkEffectEvidence evidence)
-               (::validation-seal (meta evidence)))]
-    (and (fn? seal)
-         (identical? effect-evidence-seal-token (seal plan evidence)))))
+               (::validation-seal (meta evidence)))
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))]
+    (and (.isInstance ^Class effect-evidence-seal-class seal)
+         (identical? effect-evidence-seal-token (seal plan evidence policy)))))
+
+(defn ^:no-doc retained-effect-evidence?
+  "Check exact plan/evidence ownership and independent caller math intent."
+  ([plan evidence] (retained-effect-evidence-for-request? plan evidence nil))
+  ([plan evidence caller-options] (retained-effect-evidence-for-request? plan evidence caller-options)))
 
 (defn link-node? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkNode" (.getName (class x)))))
@@ -361,8 +374,12 @@
                      (.get ^java.util.IdentityHashMap *retained-program-validations*
                            (:program call)))
         call (if validation
-               (program-call/validate-with-retained-program! call validation)
-               (program-call/validate! call))
+               (if (nil? *caller-options*)
+                 (program-call/validate-with-retained-program! call validation)
+                 (program-call/validate-with-retained-program! call validation *caller-options*))
+               (if (nil? *caller-options*)
+                 (program-call/validate! call)
+                 (program-call/validate! call *caller-options*)))
         buffer-values (set (keys (:buffers call)))]
     (when (nil? id)
       (throw (ex-info "a program link instance requires a stable identity"
@@ -381,7 +398,7 @@
                        :instance id :attributes attributes}))))
   instance)
 
-(defn validate-program-instance!
+(defn- validate-program-instance-in-context!
   [instance]
   (if (and *validated-program-instances*
            (.containsKey ^java.util.IdentityHashMap *validated-program-instances* instance))
@@ -390,6 +407,25 @@
       (when *validated-program-instances*
         (.put ^java.util.IdentityHashMap *validated-program-instances* checked Boolean/TRUE))
       checked)))
+
+(defn- validate-program-instance-for-request! [instance caller-options]
+  (let [policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        contextual (numerics/validate-scalar-math-policy! (:scalar-math *caller-options*))]
+    (if (= policy contextual)
+      (binding [*caller-options* caller-options] (validate-program-instance-in-context! instance))
+      (binding [*validated-program-instances* nil *retained-program-validations* nil
+                *caller-options* caller-options]
+        (validate-program-instance-uncached! instance)))))
+
+(defn validate-program-instance!
+  "Validate a program instance under independent caller math intent."
+  ([instance] (validate-program-instance-for-request! instance nil))
+  ([instance caller-options] (validate-program-instance-for-request! instance caller-options)))
+
+(defn- validate-program-instance-for-current-request! [instance]
+  (if (nil? *caller-options*)
+    (validate-program-instance! instance)
+    (validate-program-instance! instance *caller-options*)))
 
 (defn ^:no-doc program-instance-candidate
   "Construct an unvalidated instance only for synchronous final-boundary projection.
@@ -404,8 +440,9 @@
 
    KernelGraph temporaries remain graph-private. `:roles` may refine residency policy for public
    program buffer values but never supplies or reconstructs a binding."
-  [request]
-  (validate-program-instance! (program-instance-candidate request)))
+  ([request] (validate-program-instance! (program-instance-candidate request)))
+  ([request caller-options]
+   (validate-program-instance! (program-instance-candidate request) caller-options)))
 
 (defn validate-graph-instance!
   "Check the direct emitted-graph boundary without manufacturing a resident descriptor."
@@ -731,7 +768,7 @@
     (doseq [link-instance instances]
       (cond
         (link-instance? link-instance) (validate-instance! link-instance)
-        (program-link-instance? link-instance) (validate-program-instance! link-instance)
+        (program-link-instance? link-instance) (validate-program-instance-for-current-request! link-instance)
         (graph-link-instance? link-instance) (validate-graph-instance! link-instance)
         :else
         (throw (ex-info "link plan contains an unknown instance variant"
@@ -1019,12 +1056,16 @@
         evidence (when *retained-program-validations*
                    (.get ^java.util.IdentityHashMap *retained-program-validations* program))]
     (if evidence
-      (let [checked (emitted-program/checked-retained-validation! program evidence)]
+      (let [checked (if (nil? *caller-options*)
+                      (emitted-program/checked-retained-validation! program evidence)
+                      (emitted-program/checked-retained-validation! program evidence *caller-options*))]
         (emitted-program/operation-projection (:projections checked) operation))
       ;; Independent public validation never imports an owner's static report. Inspect this
       ;; exact step once, then share only its freshly reconstructed boundary within this phase.
-      (emitted-equation/validate-with-result-contracts
-       (equation-dispatch/boundary-equation operation)))))
+      (if (nil? *caller-options*)
+        (emitted-equation/validate-with-result-contracts (equation-dispatch/boundary-equation operation))
+        (emitted-equation/validate-with-result-contracts
+         (equation-dispatch/boundary-equation operation *caller-options*) *caller-options*)))))
 
 (defn- program-complete-writes [nodes values instance step call-scalars projection]
   (let [operation (:boundary projection)
@@ -1062,7 +1103,7 @@
 
 (defn- validate-program-instance-bindings!
   [nodes values instance]
-  (let [{:keys [id call]} (validate-program-instance! instance)]
+  (let [{:keys [id call]} (validate-program-instance-for-current-request! instance)]
     (validate-program-buffer-contracts! nodes values instance)
     (vec
      (mapcat
@@ -1124,7 +1165,9 @@
           (loop-call/structured-loop-call? step)
           (mapv (fn [iteration]
                   (let [{:keys [buffers scalar-values]}
-                        (loop-call/iteration-binding step iteration)]
+                        (if (nil? *caller-options*)
+                          (loop-call/iteration-binding step iteration)
+                          (loop-call/iteration-binding step iteration *caller-options*))]
                     (program-graph-fact nodes values id [step-index iteration]
                                         :structured-loop-iteration
                                         (:graph step) buffers
@@ -1263,20 +1306,23 @@
       :produces @written :complete-writes @complete :reads @reads :writes @writes
       :outputs (set outputs)})))
 
-(defn ^:no-doc validate-with-effect-evidence!
+(defn- validate-with-effect-evidence-for-request!
   "Validate a LinkPlan and retain the exact ordered effect facts derived from its executable ABIs.
    The evidence is immutable compiler data: it allocates no storage and contacts no driver.
    The second arity is an internal exact-owner static-program capability. Public one-argument
    validation always independently checks complete programs, even inside a retained scope."
-  ([plan] (validate-with-effect-evidence! plan nil))
-  ([plan retained-validation]
-   (let [validations (java.util.IdentityHashMap.)]
+  [plan retained-validation caller-options]
+   (let [_ (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+         validations (java.util.IdentityHashMap.)]
      (when retained-validation
        (let [program (:program retained-validation)]
-         (emitted-program/checked-retained-validation! program retained-validation)
+         (if (nil? caller-options)
+           (emitted-program/checked-retained-validation! program retained-validation)
+           (emitted-program/checked-retained-validation! program retained-validation caller-options))
          (.put validations program retained-validation)))
      (binding [*validated-program-instances* (java.util.IdentityHashMap.)
-               *retained-program-validations* validations]
+               *retained-program-validations* validations
+               *caller-options* caller-options]
        (let [plan (-> plan validate-plan-structure! validate-allocations-and-aliases!)
              step-facts (vec (instance-access-facts plan))
              initialization (analyze-effects! plan step-facts)]
@@ -1284,9 +1330,16 @@
           :effect-evidence
           (seal-effect-evidence
            plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
-                                     step-facts initialization))})))))
+                                     step-facts initialization) caller-options)}))))
 
-(defn ^:no-doc validate-with-certified-effect-facts!
+(defn ^:no-doc validate-with-effect-evidence!
+  "Derive exact effect evidence under independent caller intent. Retained program proof is optional."
+  ([plan] (validate-with-effect-evidence-for-request! plan nil nil))
+  ([plan retained-validation] (validate-with-effect-evidence-for-request! plan retained-validation nil))
+  ([plan retained-validation caller-options]
+   (validate-with-effect-evidence-for-request! plan retained-validation caller-options)))
+
+(defn- validate-certified-effect-facts-in-context!
   "Validate plan structure and derive a new effect witness from already certified step facts.
 
    The facts must have been remapped from immediately verified component evidence. This is the
@@ -1310,14 +1363,35 @@
      :effect-evidence
      (seal-effect-evidence
       plan (->LinkEffectEvidence :certified-component-effects :link-effects
-                                 (:id plan) (:target plan) step-facts initialization))}))
+                                 (:id plan) (:target plan) step-facts initialization) *caller-options*)}))
+
+(defn- validate-certified-effect-facts-for-request! [plan step-facts caller-options]
+   (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+   (binding [*validated-program-instances* (java.util.IdentityHashMap.)
+             *retained-program-validations* nil *caller-options* caller-options]
+     (validate-certified-effect-facts-in-context! plan step-facts)))
+
+(defn ^:no-doc validate-with-certified-effect-facts!
+  "Compose immediately verified effect facts under an independent math request."
+  ([plan step-facts] (validate-certified-effect-facts-for-request! plan step-facts nil))
+  ([plan step-facts caller-options]
+   (validate-certified-effect-facts-for-request! plan step-facts caller-options)))
 
 (defn validate!
   "Validate a LinkPlan without allocating storage, registering kernels, or contacting a driver."
-  [plan]
-  (:plan (validate-with-effect-evidence! plan)))
+  ([plan] (:plan (validate-with-effect-evidence! plan)))
+  ([plan caller-options] (:plan (validate-with-effect-evidence! plan nil caller-options))))
 
-(defn initialization-contract
+(defn- with-independent-request [caller-options invoke]
+  (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+  (binding [*validated-program-instances* nil *retained-program-validations* nil
+            *caller-options* caller-options]
+    (invoke)))
+
+(defn- validate-plan-for-current-request! [plan]
+  (if (nil? *caller-options*) (validate! plan) (validate! plan *caller-options*)))
+
+(defn- initialization-contract-in-context
   "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.
    :requires names caller-initialized nodes needed by reads or pass-through outputs;
    :initializers names nodes with declared host sources (not a content snapshot or upload event).
@@ -1333,7 +1407,13 @@
   [plan]
   (analyze-effects! (-> plan validate-plan-structure! validate-allocations-and-aliases!)))
 
-(defn value-accesses
+(defn initialization-contract
+  "Derive conditional initialization facts under an independent math request, not completion."
+  ([plan] (with-independent-request nil #(initialization-contract-in-context plan)))
+  ([plan caller-options]
+   (with-independent-request caller-options #(initialization-contract-in-context plan))))
+
+(defn- value-accesses-in-context
   "Return conservative logical-value accesses from the validated executable ABI.
 
    Uses the same bound step facts as ownership validation, not node role guesses. Ordered
@@ -1341,7 +1421,7 @@
    This summarizes reads/writes; it does not prove full initialization, disjoint ranges,
    external ownership or completion. Unused values are absent."
   [plan]
-  (let [plan (validate! plan)
+  (let [plan (validate-plan-for-current-request! plan)
         node-values (into {} (mapcat (fn [[id value]]
                                       (map (fn [leaf] [(:node leaf) id]) (:leaves value)))
                                     (:values plan)))]
@@ -1349,14 +1429,22 @@
               (update accesses (get node-values node) kabi/merge-access access))
             {} (mapcat :facts (instance-access-facts plan)))))
 
-(defn memory-report
+(defn value-accesses
+  "Derive conservative ABI accesses under independent caller math intent."
+  ([plan] (with-independent-request nil #(value-accesses-in-context plan)))
+  ([plan caller-options] (with-independent-request caller-options #(value-accesses-in-context plan))))
+
+(defn- memory-report-in-context
   "Report the validated logical/physical memory facts of a LinkPlan without allocating storage.
 
    :accesses are ordered submission facts, not completion events or a proof that storage can be
    reused. In particular, this report does not infer donation, release, cross-plan lifetimes, or
    asynchronous transfer completion. Such decisions require additional ownership/event evidence."
   [plan]
-  (let [{:keys [plan effect-evidence]} (validate-with-effect-evidence! plan)
+  (let [{:keys [plan effect-evidence]}
+        (if (nil? *caller-options*)
+          (validate-with-effect-evidence! plan)
+          (validate-with-effect-evidence! plan nil *caller-options*))
         node-values (into {} (mapcat (fn [[value-id value]]
                                       (map (fn [{:keys [node]}] [node value-id])
                                            (:leaves value)))
@@ -1407,6 +1495,11 @@
      :release :unproven
      :completion :unproven}))
 
+(defn memory-report
+  "Report checked memory/access facts under independent intent, without lifetime/completion claims."
+  ([plan] (with-independent-request nil #(memory-report-in-context plan)))
+  ([plan caller-options] (with-independent-request caller-options #(memory-report-in-context plan))))
+
 (defn- normalize-plan
   [{:keys [id target nodes values instances outputs aliases attributes]
     :or {outputs [] aliases #{} attributes {}}}]
@@ -1417,8 +1510,21 @@
 
 (defn ^:no-doc make-with-effect-evidence
   "Construct and validate a LinkPlan while retaining its derived effect witness."
-  [request]
-  (validate-with-effect-evidence! (normalize-plan request)))
+  ([request] (validate-with-effect-evidence! (normalize-plan request)))
+  ([request caller-options]
+   (validate-with-effect-evidence! (normalize-plan request) nil caller-options)))
+
+(defn- make-with-final-projection-for-request [request project retained-validation caller-options]
+  (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+  (let [{:keys [plan projection]}
+        (binding [*validated-program-instances* nil *retained-program-validations* nil
+                  *caller-options* nil]
+          (program-call/without-validation-context #(project (normalize-plan request))))
+        {:keys [plan effect-evidence]}
+        (if (nil? caller-options)
+          (validate-with-effect-evidence! plan retained-validation)
+          (validate-with-effect-evidence! plan retained-validation caller-options))]
+    {:plan plan :effect-evidence effect-evidence :projection projection}))
 
 (defn ^:no-doc make-with-final-projection
   "Normalize a construction request, project its final boundary, then validate exactly that plan.
@@ -1427,16 +1533,18 @@
    and projection metadata are returned. This is for callers whose public roles or escaped outputs
    are known only after storage identities have been normalized. Internal static evidence is scoped
    only to final validation, never to the projection callback or its returned metadata."
-  ([request project] (make-with-final-projection request project nil))
+  ([request project] (make-with-final-projection-for-request request project nil nil))
   ([request project retained-validation]
-   (let [{:keys [plan projection]} (project (normalize-plan request))
-         {:keys [plan effect-evidence]} (validate-with-effect-evidence! plan retained-validation)]
-     {:plan plan :effect-evidence effect-evidence :projection projection})))
+   (make-with-final-projection-for-request request project retained-validation nil))
+  ([request project retained-validation caller-options]
+   (make-with-final-projection-for-request request project retained-validation caller-options)))
 
 (defn ^:no-doc make-with-certified-effect-facts
   "Construct a LinkPlan by composing step facts from immediately verified component evidence."
-  [request step-facts]
-  (validate-with-certified-effect-facts! (normalize-plan request) step-facts))
+  ([request step-facts]
+   (validate-with-certified-effect-facts! (normalize-plan request) step-facts))
+  ([request step-facts caller-options]
+   (validate-with-certified-effect-facts! (normalize-plan request) step-facts caller-options)))
 
 (defn make
   "Construct and purely validate a LinkPlan.
@@ -1445,10 +1553,10 @@
    nodes into ordered logical LinkValues; every unclaimed node receives an implicit one-leaf value
    with the same identity. `:aliases` explicitly declares overlapping views. Instance order and
    each descriptor's step order define the current serial dependency schedule."
-  [request]
-  (:plan (make-with-effect-evidence request)))
+  ([request] (:plan (make-with-effect-evidence request)))
+  ([request caller-options] (:plan (make-with-effect-evidence request caller-options))))
 
-(defn borrow-owned-storage
+(defn- borrow-owned-storage-in-context
   "Project a local plan's owned allocations into storage borrowed from an enclosing execution.
    Returns the validated :plan plus original :allocations and :initializers to realize once in
    the owner. Initialization requirements refer to the original plan, before sources are removed.
@@ -1460,8 +1568,10 @@
    obligation, not proof of initialized bytes. Source-free internal/scratch/output values still require
    ordered local producers; borrowed ownership alone is not initialization evidence."
   [plan]
-  (let [plan (validate! plan)
-        initialization (initialization-contract plan)
+  (let [plan (validate-plan-for-current-request! plan)
+        initialization (if (nil? *caller-options*)
+                         (initialization-contract plan)
+                         (initialization-contract plan *caller-options*))
         owned? (fn [node] (= :owned (get-in node [:view :allocation :ownership])))
         allocations (into {} (keep (fn [[_ node]]
                                      (when (owned? node)
@@ -1484,11 +1594,17 @@
                               (if (owned? (get-in plan [:nodes (get-in value [:leaves 0 :node])]))
                                 (assoc-in value [:abstract :ownership] :borrowed)
                                 value)))]
-    {:plan (validate! (assoc plan :nodes nodes :values values))
+    {:plan (validate-plan-for-current-request! (assoc plan :nodes nodes :values values))
      :allocations allocations :initializers initializers
      :initialization initialization}))
 
-(defn instance-roles
+(defn borrow-owned-storage
+  "Project owned storage to borrowed storage; original lifetime/initialization obligations remain."
+  ([plan] (with-independent-request nil #(borrow-owned-storage-in-context plan)))
+  ([plan caller-options]
+   (with-independent-request caller-options #(borrow-owned-storage-in-context plan))))
+
+(defn- instance-roles-in-context
   "Resolve compiler-symbol roles for the runtime binder. Only `:constant` affects executable
    prologue hoisting today; the complete role map remains data for residency/lifetime policy."
   [plan instance]
@@ -1510,7 +1626,7 @@
          (:roles instance)))
 
       (program-link-instance? instance)
-      (let [{:keys [call roles]} (validate-program-instance! instance)]
+      (let [{:keys [call roles]} (validate-program-instance-for-current-request! instance)]
         (merge
          (into {}
                (map (fn [[compiler-value value-id]]
@@ -1539,3 +1655,9 @@
       (throw (ex-info "instance-roles requires a recognized LinkPlan instance"
                       {:reason :link-instance-type :instance instance
                        :actual (type instance)})))))
+
+(defn instance-roles
+  "Resolve resident roles under independent caller intent; roles never authorize a binding."
+  ([plan instance] (with-independent-request nil #(instance-roles-in-context plan instance)))
+  ([plan instance caller-options]
+   (with-independent-request caller-options #(instance-roles-in-context plan instance))))
