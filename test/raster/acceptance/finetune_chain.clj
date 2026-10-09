@@ -169,7 +169,8 @@
 (defn run-loaded!
   "Run two full resident updates against the unchanged CPU monolithic AD oracle.
    An explicit case supplies model arrays/configuration and a positive replay count.
-   Downloads are oracle reads only. Every native artifact closes, including on mismatch."
+   Downloads are oracle reads only. Reports retain binding-time admission, not proof of replay
+   or timing. Every native artifact closes, including on mismatch or failed inspection."
   ([{:keys [train oracle] :as loaded} target-device]
    (let [cfg @(oracle 'chain-cfg) n (* (:seq cfg) (:d cfg))]
      (run-loaded! loaded target-device
@@ -196,8 +197,10 @@
         live (compiled/instantiate! prepared)
         binding-ns (- (System/nanoTime) started)]
     (try
-      {:revision source-revision :target target-device :config cfg
+      (let [bound-schedules (compiled/execution-info live)]
+        {:revision source-revision :target target-device :config cfg
        :preparation-ns preparation-ns :binding-ns binding-ns
+       :bound-schedules bound-schedules
        :numerical-calls (mapv #(count (filter :graph (get-in % [:call :steps])))
                              (:instances (compiled/plan prepared)))
        :replays
@@ -238,6 +241,7 @@
                                {:reason :external-training-parity :iteration iteration
                                 :predicted-loss predicted-loss :reference-loss reference-loss
                                 :loss-error loss-error :dx-error dx-error :adapter-errors errors
+                                :bound-schedules bound-schedules
                                 :adapter-diagnostics
                                 (vec (for [layer [0 1]
                                            [index key] (map-indexed vector @(train 'adapter-keys))
@@ -250,7 +254,7 @@
              (recur (inc iteration) updated outputs
                     (conj results {:loss predicted-loss :reference-loss reference-loss
                                    :loss-error loss-error :dx-error dx-error
-                                   :adapter-count (count errors) :adapter-max-error (apply max errors)})))))}
+                                   :adapter-count (count errors) :adapter-max-error (apply max errors)})))))})
       (finally (compiled/close! live))))))
 
 (defn run! [{:keys [source-root targets] :or {targets [:ocl:0 :ze:0]}}]
