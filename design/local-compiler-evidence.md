@@ -2144,6 +2144,17 @@ Both strategies retain logical output precision and launch geometry while exposi
 the widened physical math dtype. Fold-map, scan, scalar, codec and emitted-equation
 suites pass 143 tests / 1221 assertions. Public policy admission remains disabled.
 
+Staged scalar analysis now retains optional normalized consent in the same typed
+plan that materialization consumes. Packed staging and graph-owned selection
+forward consent through either the packed schedule or scalar fallback. A legal
+post-reduction tanh epilogue records the selected hidden Double requirement and
+emits through the shared OpenCL/CUDA/HIP dialects; nonlinear stage lifts remain
+rejected by their existing linearity contract. An unused override does not add
+Double operations to ordinary scalar or packed schedules. The staged scalar and
+packed suites pass 25 tests / 169 assertions, including native default-route
+checks. Independent public reconstruction/admission remains future work; this
+private producer plumbing does not claim closure of the held Gemma model gate.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec

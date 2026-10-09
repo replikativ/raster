@@ -9,6 +9,7 @@
             [raster.compiler.ir.contract-stages :as stages]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.index-expression :as index]
@@ -29,7 +30,7 @@
 
 (defn lower
   "Schedule verified staged contraction facts through shared non-emitting admission."
-  [source & {:keys [workgroup-size] :or {workgroup-size 64}}]
+  [source & {:keys [workgroup-size scalar-math] :or {workgroup-size 64} :as options}]
   (let [{:keys [free-axes out stage-list outer inner axis-ids operands lifts array-ids legality plan n sizes]} (admission/analyze! source :workgroup-size workgroup-size)]
     (let [reserved (atom (set (filter symbol? (tree-seq coll? seq source))))
           fresh (fn [prefix]
@@ -46,7 +47,8 @@
                    {:arrays (set array-ids)
                     :array-types (merge (zipmap (map :sym operands) (repeat :byte))
                                         (zipmap (map :sym lifts) (repeat :float)))
-                    :scalar-types {} :index-scope scope :lower-index lower-index :predicate mask
+                    :scalar-types {} :scalar-math scalar-math
+                    :index-scope scope :lower-index lower-index :predicate mask
                     :source-region [source @reserved inner-carry inner-result outer-carry]
                     :id-prefix (str (fresh "stage_scalar")) :decline! decline!
                     :conversion-policy (fn [from to]
@@ -101,14 +103,18 @@
         :effects {:kind :staged-contraction :uses (scheduled/derive-uses kernel arguments)}
         :legality {:kind :staged-packed :stage-legality legality :packed-plan plan
                    :storage-elements sizes :output-elements (long n)}
-        :numerics {:mode :reassociated :policy :staged-int32-float
-                   :source-arithmetic (:source-arithmetic source)
-                   :accumulator-dtype :float :rounding :nearest-even}}))))
+        :numerics (cond-> {:mode :reassociated :policy :staged-int32-float
+                           :source-arithmetic (:source-arithmetic source)
+                           :accumulator-dtype :float :rounding :nearest-even}
+                    (contains? options :scalar-math)
+                    (assoc :scalar-math (numerics/validate-scalar-math-policy! scalar-math)))}))))
 
 (defn schedule-for-node
   "Refine an exact retained typed contraction graph node through the existing staged body.
    Graph/algorithm agreement is checked before lexical bindings reach the emitted ABI."
-  [node graph algorithm scheduled-program]
+  ([node graph algorithm scheduled-program]
+   (schedule-for-node node graph algorithm scheduled-program {}))
+  ([node graph algorithm scheduled-program options]
   (equation-graph/validate-projection! graph algorithm scheduled-program)
   (let [equations (soac/equations algorithm)
         operation (:operation node)]
@@ -123,10 +129,13 @@
                           :bindings bindings)]
       (require! (= expected operation) :typed-operation
                 {:expected expected :operation operation})
-      (let [lowered (try (lower facts)
+      (let [policy-options (if (contains? options :scalar-math)
+                             [:scalar-math (:scalar-math options)] [])
+            lowered (try (apply lower facts policy-options)
                          (catch clojure.lang.ExceptionInfo e
                            (if (declined? e)
-                             (scalar-stages/lower facts :scalar-types scalar-types)
+                             (apply scalar-stages/lower facts
+                                    (concat [:scalar-types scalar-types] policy-options))
                              (throw e))))
             arguments (mapv #(get bindings % %) (:arguments lowered))
             rebound (scheduled/make
@@ -134,4 +143,4 @@
                          (assoc :source operation :arguments arguments)
                          (assoc-in [:effects :uses]
                                    (scheduled/derive-uses (:body lowered) arguments))))]
-        (scheduled/validate-against-node! rebound node graph)))))
+        (scheduled/validate-against-node! rebound node graph))))))
