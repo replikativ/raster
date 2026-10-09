@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -130,6 +131,15 @@
     (is (= [0 [:product-ordered-consumer [2 3]]]
            (mapv :id (:equations program))))
     (is (= [2 3] (get-in fused [:attributes :emitted-source-equations])))
+    (let [retained (emitted-program/retained-numerical-equations program)]
+      (is (= [2 3] (mapv :id retained))
+          "one physical kernel retains both semantic equations, excluding host shape setup")
+      (is (every? #(not (contains? % :operations)) retained))
+      (is (= (mapv :algorithm (#'fixtures/numerical-equations scheduled))
+             (mapv :algorithm retained))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-program/retained-numerical-equations
+                  (assoc-in program [:equations 1 :attributes :emitted-source-equations] [3 2]))))
     (is (emitted-equation/emitted-equation? operation))
     (is (= 2 (count (get-in operation [:refinement :source :nodes]))))
     (is (= 1 (count (get-in operation [:graph :nodes]))))

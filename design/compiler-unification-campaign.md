@@ -3478,3 +3478,48 @@ certificate-bound facet rather than unchecked attributes. Initial synchronizatio
 CFL stability and the mathematical meaning of the pinned numerical producer
 remain separate obligations. No adaptive hierarchy, multi-patch cycle, mid-cycle
 restart, storage recycling or asynchronous completion proof is claimed.
+
+#### Temporal binding investigation
+
+The current synthetic Intel preparation retains 26 source equations in the cycle
+program: three host-only shape equations and 23 device submissions, followed by
+the two state-commit submissions. These counts are observations of this retained
+artifact, not a fixed schedule contract or a numerical correctness criterion.
+Retained equation result-storage metadata and the validated ordered memory report
+provide the storage/effect boundary; source equations must remain authoritative
+if fusion later changes the physical submission count. Matching generated kernel
+names, destination names or counts does not establish interpolation/reflux math.
+
+No new patch-reshape machinery is needed for the next distributed binding.
+`distributed-compute` already admits explicit local domains with one plain dense,
+equal-volume ABI leaf, matching dtype and row-major coordinates. A flat numerical
+ABI can therefore bind a rectangular patch through existing `:local-shape` and
+owned `:placements`, with bounds and coverage checked by the same authority.
+This does not permit arbitrary strides, quantized representations or aliasing.
+
+The temporal facet must retain the hierarchy/state/distributed certificates and
+exact prepared-program identity, distinguish the two state owners, and bind
+register reset/update/consumption evidence to the complete-cycle compute call.
+It must preserve the existing source-read/target-write transfer witness unchanged.
+Source-level temporal stage meaning is explicit producer evidence; ordering,
+storage coverage and exact artifact correspondence are independently checked.
+The facet must reject changed geometry, timestep, stage coverage, field mappings,
+completion call or retained program instead of accepting descriptive fingerprints
+as a certificate. Publication still needs real completion and durable-byte
+evidence; ordered memory accesses cannot authorize release or scratch recycling.
+
+The planning review favors a separate certified temporal execution facet over a
+schema-2 extension at this stage. Attach it to a verified schema-1
+`:hierarchy-only` workload and retain the original sealed Prepared at the ODE /
+execution layer, avoiding a compiler-IR dependency on `gpu.compiled`. Neither
+the existing transfer-cycle mode nor its two-role implementation witness changes.
+Start with pure stage/effect attestation and tamper verification, then bind the
+actual provider and project one ordinary distributed compute entry. Generalized
+multi-patch/adaptive temporal planning is the point to reconsider schema 2.
+
+Exact program identity deliberately excludes initializer bytes. A same-shaped
+topology/coefficient change need not alter it. For the first temporal facet,
+geometry and numerical-stage meaning must remain explicitly trusted producer
+attestations, bound into the certificate but not advertised as topology-byte or
+PDE correctness proofs. A later content-addressed constant projection can make
+the geometry-to-initializer correspondence independently checkable.
