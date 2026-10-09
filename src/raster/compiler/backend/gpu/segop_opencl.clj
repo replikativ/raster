@@ -768,7 +768,8 @@
                               (get scheduled-bodies (:id node)) (:scalar-math opts))
                  certificate (scheduled-body/validate-against-node! certificate node graph)]
              (kernel-body-target/emit-artifact
-              (str "graph_scheduled_" (gensym "")) certificate target-dialect))))
+              (str "graph_scheduled_" (gensym "")) certificate target-dialect
+              (select-keys opts [:target-descriptor :scalar-math])))))
         strategies (set (map (comp :strategy :attributes)
                              (vals scheduled-bodies)))
         strategy (when (and (= 1 (count (:nodes graph))) (= 1 (count strategies)))
