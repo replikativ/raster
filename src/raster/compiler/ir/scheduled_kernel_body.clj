@@ -267,6 +267,24 @@
     (validate! (->ScheduledKernelBody source body arguments scalar-bindings effects legality
                                       numerics provenance attributes preconditions))))
 
+(defn validate-against-math-policy!
+  "Check scalar realization against independently supplied caller intent.
+
+   Internal certificate consistency is not permission to select its own policy. An owner with
+   no target-library leaves may omit unused consent, but a retained policy must match the caller
+   and every executable math leaf must implement that caller's requested realization."
+  [scheduled caller-policy]
+  (let [scheduled (validate! scheduled)
+        expected (numerics/validate-scalar-math-policy! caller-policy)
+        contract (:numerics scheduled)]
+    (when (and (contains? contract :scalar-math)
+               (not= expected (numerics/validate-scalar-math-policy! (:scalar-math contract))))
+      (fail! :scheduled-kernel-body-caller-math-policy
+             "retained scalar math policy differs from independent caller intent"
+             {:expected expected :actual (:scalar-math contract)}))
+    (validate-math-realizations! (:body scheduled) expected)
+    scheduled))
+
 (defn validate-against-node!
   "Require this refinement to implement one exact node in its complete KernelGraph context."
   [scheduled node kernel-graph]

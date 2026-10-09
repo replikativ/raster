@@ -2257,3 +2257,19 @@ policy retention, physical FP64 demand and stripped-consent rejection. Two
 focused boundary/result-transform tests pass 18 assertions. Independent review
 found no blockers. Existing public emitted-equation admission still reconstructs
 default policy; no public selection is enabled by this prerequisite.
+
+Emitted-equation admission and result/write queries now accept a separate
+independent caller-options argument. Shared ScheduledKernelBody validation checks
+retained policy against caller intent and every executable target-library leaf;
+candidate metadata cannot grant its own permission. A stage without affected
+math may omit unused consent, but an explicitly retained mismatched policy is
+rejected even when unused. Indexed reduction, scan/reduction and mixed-matrix
+reconstruction plus plain-contraction write rederivation receive caller options.
+Existing arities still authorize only default realization. A selected matrix
+artifact replay passes with matching intent and rejects default admission and
+metadata-only self-authorization. Independent review found no blockers.
+Affected body/equation/typed-route suites pass 101 tests / 1122 assertions. Codec
+checks pass 11 tests / 121 assertions after rebuilding their warm-REPL defonce
+fixture, which retained pre-reload record classes. No production codec change or
+oracle relaxation was needed. Public dispatch/cache request propagation and
+physical execution admission remain pending; the held model gate is unchanged.
