@@ -336,13 +336,16 @@
    (get-in key [:semantic-request :target :descriptor-fingerprint])})
 
 (defn- resolve-compilation-template
-  [key compiler thunk persistent-report]
+  [key compiler thunk persistent-report caller-options]
   (let [persistent? (and (= :equation-first compiler)
                          (:persistent-cache-eligible? key))
         identity (when persistent? (persistent-artifact-identity key))
         loaded (when persistent?
-                 (equation-artifact-store/load-artifact
-                  *equation-artifact-store* (:semantic-fingerprint key) identity))]
+                 (if (nil? caller-options)
+                   (equation-artifact-store/load-artifact
+                    *equation-artifact-store* (:semantic-fingerprint key) identity)
+                   (equation-artifact-store/load-artifact
+                    *equation-artifact-store* (:semantic-fingerprint key) identity caller-options)))]
     (if (= :hit (:status loaded))
       (do (reset! persistent-report (dissoc loaded :value))
           (:value loaded))
@@ -360,8 +363,11 @@
             stored
             (when persistent?
               (try
-                (equation-artifact-store/store-artifact!
-                 *equation-artifact-store* (:semantic-fingerprint key) identity value)
+                (if (nil? caller-options)
+                  (equation-artifact-store/store-artifact!
+                   *equation-artifact-store* (:semantic-fingerprint key) identity value)
+                  (equation-artifact-store/store-artifact!
+                   *equation-artifact-store* (:semantic-fingerprint key) identity value caller-options))
                 (catch Exception error
                   {:status :write-failed :error-class (.getName (class error))})))]
         (reset! persistent-report
@@ -377,7 +383,7 @@
   (let [math-policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         validation-options (when (some? caller-options) {:scalar-math math-policy})
         persistent-report (atom nil)
-        value (delay (resolve-compilation-template key compiler thunk persistent-report))
+        value (delay (resolve-compilation-template key compiler thunk persistent-report validation-options))
         candidate
         {:compiler compiler
          :value value

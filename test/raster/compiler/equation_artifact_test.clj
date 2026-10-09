@@ -11,6 +11,7 @@
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
@@ -144,6 +145,54 @@
         (with-open [paths (Files/walk directory (make-array java.nio.file.FileVisitOption 0))]
           (doseq [^Path path (iterator-seq (.iterator (.sorted paths (Comparator/reverseOrder))))]
             (Files/deleteIfExists path)))))))
+
+(deftest selected-artifact-requires-independent-math-request
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        original (equation-first/compile #'artifact-map (merge {:target target :dtype :float} request))
+        envelope (artifact/seal identity original request)
+        restored (artifact/open identity (artifact/decode (artifact/encode envelope)) request)
+        decodes (atom 0)]
+    (is (= original restored))
+    (is (identical? (:emitted restored) (emitted-program/validate! (:emitted restored) request)))
+    (is (thrown? clojure.lang.ExceptionInfo (artifact/seal identity original)))
+    (is (thrown? clojure.lang.ExceptionInfo (artifact/open identity envelope))
+        "serialized options cannot grant their own math permission")
+    (with-redefs [boring/decode (fn [& _] (swap! decodes inc)
+                                (throw (ex-info "unexpected payload decode" {})))]
+      (is (= :scalar-math-policy
+             (reason-of #(artifact/open identity envelope
+                                        {:scalar-math {:overrides {} :unknown true}})))))
+    (is (zero? @decodes))))
+
+(deftest selected-template-survives-process-cache-clear-under-same-request
+  (with-temporary-directory
+    (fn [directory]
+      (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+            original (equation-first/compile #'artifact-map (merge {:target target :dtype :float} request))
+            cache (store/make-store {:root (.toFile directory)})
+            key {:semantic-fingerprint (:semantic-request-fingerprint identity)
+                 :persistent-cache-eligible? true
+                 :semantic-request {:compiler-build-fingerprint (:compiler-build-fingerprint identity)
+                                    :source {:source-dependency-fingerprint (:source-dependency-fingerprint identity)}
+                                    :target {:descriptor-fingerprint (:target-descriptor-fingerprint identity)}}}
+            report (atom nil)
+            calls (atom 0)
+            resolve! (fn []
+                       (binding [compiled/*equation-artifact-store* cache
+                                 compiled/*compilation-template-observer* #(reset! report %)]
+                         (#'compiled/cached-compilation-template
+                          key :equation-first #(do (swap! calls inc) original) request)))]
+        (compiled/clear-compilation-cache!)
+        (try
+          (is (= original (resolve!)))
+          (is (= :stored (get-in @report [:persistent-artifact :status])))
+          (is (= :miss (:status (store/load-artifact cache (:semantic-request-fingerprint identity) identity))))
+          (is (= :hit (:status (store/load-artifact cache (:semantic-request-fingerprint identity) identity request))))
+          (compiled/clear-compilation-cache!)
+          (is (= original (resolve!)))
+          (is (= :hit (get-in @report [:persistent-artifact :status])))
+          (is (= 1 @calls) "same-request durable reload must not recompile")
+          (finally (compiled/clear-compilation-cache!)))))))
 
 (deftest equation-compilation-round-trips-and-remains-lowerable
   (let [original @compilation
