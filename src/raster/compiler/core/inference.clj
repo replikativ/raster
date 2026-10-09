@@ -1938,13 +1938,16 @@ stable physical-leaf order on every backend."}
     (when (map? entry) (:element entry))))
 
 (defn infer-scalar-intrinsic-dtype
-  "Infer a canonical intrinsic result from independently proved operand dtypes.
+  "Infer a fixed-arity value intrinsic result from independently proved operand dtypes.
    JVM-representable operands use the ordinary dispatch inference. Homogeneous half
    arithmetic is a closed kernel-language domain, not a fictitious JVM primitive tag.
    A mixed floating domain widens half to Float before ordinary promotion; mixed
    non-floating domains require explicit conversion. Unknown operands prove nothing."
   [operation operand-dtypes source-ns]
-  (when (and (seq operand-dtypes) (every? some? operand-dtypes))
+  (when (and (seq operand-dtypes) (every? some? operand-dtypes)
+             (let [intrinsic (intrinsics/descriptor (intrinsics/canonical operation))]
+               (and intrinsic (= (:arity intrinsic) (count operand-dtypes))
+                    (not= :cmp (:kind intrinsic)))))
     (let [operand-dtypes (mapv dtype/canon operand-dtypes)
           canonical (intrinsics/canonical operation)
           tags (mapv #(get (dtype/info %) :scalar-tag) operand-dtypes)

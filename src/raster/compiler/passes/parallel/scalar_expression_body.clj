@@ -22,6 +22,11 @@
   [expression]
   (boolean (some descriptor/aget-call? (tree-seq coll? seq expression))))
 
+(defn- ordered-fold-intrinsic?
+  [intrinsic operator argument-count]
+  (and (= 2 (:arity intrinsic)) (> argument-count 2)
+       (contains? #{:+ :* :- :div :min :max} operator)))
+
 (defn- match-ordered-loop
   "Recognize the canonical one-index/one-carry loop without authorizing reassociation."
   [expression]
@@ -226,8 +231,23 @@
                                    (not (contains? util/*shadowing-locals* source-operation))
                                    (descriptor/scalar-op? qualified-operation))
                             qualified-operation source-operation)
-                          inferred (inference/infer-scalar-intrinsic-dtype
-                                    inference-operation argument-types *ns*)]
+                          operator (intrinsics/canonical source-operation)
+                          intrinsic (intrinsics/descriptor operator)
+                          inferred
+                          (cond
+                            (and (= :- operator) (= 1 (count argument-types)))
+                            (first argument-types)
+
+                            (ordered-fold-intrinsic? intrinsic operator (count argument-types))
+                            (reduce (fn [left right]
+                                      (when left
+                                        (inference/infer-scalar-intrinsic-dtype
+                                         inference-operation [left right] *ns*)))
+                                    argument-types)
+
+                            :else
+                            (inference/infer-scalar-intrinsic-dtype
+                             inference-operation argument-types *ns*))]
                       (some-> inferred canon-type))))
 
                 ;; A value conditional owns a result type when both alternatives independently
@@ -1111,8 +1131,7 @@
                       (decline! :scalar-expression
                                 "scalar expression has no canonical intrinsic"
                                 {:expression expression :operator operator}))
-                    (if (and (= 2 (:arity intrinsic)) (> (count arguments) 2)
-                             (contains? #{:+ :* :- :div :min :max} operator))
+                    (if (ordered-fold-intrinsic? intrinsic operator (count arguments))
                       ;; Preserve source evaluation order while spelling variadic scalar folds in
                       ;; the binary KernelBody vocabulary. This is normalization, not algebraic
                       ;; reassociation: `(- a b c)` becomes `(- (- a b) c)`.

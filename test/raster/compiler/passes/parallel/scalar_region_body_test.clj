@@ -20,6 +20,21 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest strict-source-normalization-preserves-fixed-arity-inference-boundary
+  (let [lower (:lower (scalar/make-lowerer
+                      {:arrays #{} :array-types {} :scalar-types {'x :float}
+                       :require-source-types? true
+                       :lower-index (fn [expression _] expression)
+                       :decline! (fn [rule message data]
+                                   (throw (ex-info message (assoc data :rule rule))))}))
+        negated (lower '(clojure.core/- x) :float {})
+        folded (lower '(clojure.core/+ x x x) :float {})]
+    (is (= :float (:type negated)))
+    (is (= [:neg] (mapv #(get-in % [:expression :op]) (:operations negated))))
+    (is (= :float (:type folded)))
+    (is (= [:+ :+] (mapv #(get-in % [:expression :op]) (:operations folded))))
+    (is (= [:float :float] (mapv #(get-in % [:result :type]) (:operations folded))))))
+
 (deftest scalar-fold-converts-only-its-completed-result
   (let [expression '(fold {:accumulator acc :index j :identity 0.0
                           :lower 0 :extent 3 :dtype :double :association :ordered}
