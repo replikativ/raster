@@ -3951,3 +3951,24 @@ Existing actual AD -> all-reduce -> SGD checks pass on OpenCL and Level Zero
 These are warm-REPL results; fresh CI and independent exact-head review remain
 separate gates. The original real-model training numerical acceptance remains
 open and is not replaced by these small distributed fixtures.
+
+### Canonical graph-owned temporary storage requirements
+
+`kernel-graph-call/temporary-storage-plan` now projects declared graph scratch
+through the existing graph/scalar preflight and extent algebra. Runtime
+`temporary-specs` delegates to this projection, rather than having a separate
+planning evaluator. Each byte extent is checked against signed 64-bit storage
+before allocation; aggregate requirements use exact arithmetic. Existing
+out-of-range element values still fail in the canonical extent resolver.
+
+The model counts all declared temporaries until graph unbind. It excludes
+external roots, backend temporaries, host staging, alignment/driver overhead and
+available device memory. It does not infer live-range reuse or grant allocation
+authority. Distributed root budgets do not yet include these requirements;
+binding/dispatch lifetime-aware aggregation is the remaining integration work.
+
+Focused graph-call, GEMM and SegOp checks pass 87 tests / 1,605 assertions.
+Existing native inclusive-scan tests pass on OpenCL and Level Zero (2 tests /
+14 assertions), comparing planned allocation identities/byte sizes/totals with
+actual private buffers as well as numerical output. These are warm-REPL checks;
+fresh CI and independent exact-head review remain separate gates.

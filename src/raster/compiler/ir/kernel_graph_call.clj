@@ -4,7 +4,8 @@
    KernelGraph owns stable buffers, node uses and dependencies. KernelGraphCall supplies one
    resident value for every graph buffer and turns each emitted node into a checked KernelCall.
    Driver allocation, registration, recording and events remain runtime concerns."
-  (:require [raster.compiler.ir.kernel-abi :as kabi]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -207,18 +208,40 @@
 
 (declare preflight!)
 
-(defn temporary-specs
-  "Resolve graph-owned temporary storage to core allocation specs: `{id [dtype elements nil]}`."
+(defn temporary-storage-plan
+  "Resolve and check graph-owned temporary allocations before driver contact.
+   Uses the same graph preflight and extent algebra as executable binding. Individual byte
+   extents must fit signed 64-bit storage; aggregate bytes use exact arithmetic. All declared
+   temporaries count until graph unbind, with no inferred lifetime reuse. This is a declared
+   storage requirement, not available memory or a total device peak: external roots, backend
+   temporaries, host staging, allocation alignment and driver overhead are excluded."
   [graph scalar-values]
   (let [graph (preflight! graph scalar-values)]
-    (into {}
-          (map (fn [{:keys [id dtype elements]}]
-                 (let [n (resolve-integer scalar-values elements)]
-                   (when (neg? n)
-                     (throw (ex-info "graph temporary extent must be non-negative"
-                                     {:buffer id :elements elements :resolved n})))
-                   [id [dtype n nil]])))
-          (:temporaries graph))))
+    (let [allocations
+          (into {}
+                (map (fn [{:keys [id dtype elements]}]
+                       (let [n (resolve-integer scalar-values elements)
+                             bytes (*' n (dtype/bytes-of dtype))]
+                         (when (neg? n)
+                           (throw (ex-info "graph temporary extent must be non-negative"
+                                           {:reason :kernel-graph-temporary-extent
+                                            :buffer id :elements elements :resolved n})))
+                         (when (> bytes Long/MAX_VALUE)
+                           (throw (ex-info "graph temporary byte extent exceeds signed 64-bit storage"
+                                           {:reason :kernel-graph-temporary-bytes
+                                            :buffer id :elements n :dtype dtype :byte-size bytes})))
+                         [id {:dtype dtype :elements n :byte-size bytes}])))
+                (:temporaries graph))]
+      {:model :graph-temporaries-until-unbind
+       :allocations allocations
+       :resident-bytes (reduce +' 0 (map :byte-size (vals allocations)))})))
+
+(defn temporary-specs
+  "Resolve graph-owned temporary storage to checked core allocation specs:
+   `{id [dtype elements nil]}`. Planning and runtime sizing share temporary-storage-plan."
+  [graph scalar-values]
+  (into {} (map (fn [[id {:keys [dtype elements]}]] [id [dtype elements nil]]))
+        (:allocations (temporary-storage-plan graph scalar-values))))
 
 (defn- physical-scalar
   [slot value]
