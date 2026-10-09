@@ -3,6 +3,7 @@
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.dl.array-ops :as array-ops]
             [raster.dl.nn :as nn]
             [raster.dl.loss :as loss]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -15,6 +16,28 @@
             [raster.gpu.link :as link]
             [raster.gpu.value :as value]
             [raster.par :as par]))
+
+(defn- run-strided-head-unpack-case [target]
+  (let [input (float-array (range 12))
+        arguments [input 3 2 2 11 3]
+        expected (vec (apply array-ops/unpack-heads-strided arguments))
+        prepared (compiled/lower #'array-ops/unpack-heads-strided arguments
+                                 {:compiler :equation-first :target target
+                                  :dtype :float :outputs '[out]})
+        artifact (compiled/instantiate! prepared)]
+    (try
+      (is (= 33 (count expected)))
+      (is (= expected (vec (value/->host (:out (artifact {})))))
+          "shared allocation/launch extent preserves the field permutation and zero padding")
+      (finally (compiled/close! artifact)))))
+
+(deftest strided-head-unpack-shared-extent-device-parity
+  (if @opencl/opencl-available?
+    (run-strided-head-unpack-case :ocl:0)
+    (opencl/opencl-skip! "strided head unpack extent reuse"))
+  (if @gp/gpu-available?
+    (run-strided-head-unpack-case :ze:0)
+    (gp/gpu-skip! "strided head unpack extent reuse")))
 
 (deftm twice!
   [input :- (Array float) result :- (Array float) n :- Long] :- Void
