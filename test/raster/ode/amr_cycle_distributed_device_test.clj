@@ -24,7 +24,10 @@
       (is (= :complete @(:state executable)))
       (is (= :distributed-runtime-state (reason #(runtime/run! executable)))
           "the one-shot runtime must not replay stale initialization evidence")
-      (let [outputs (get (runtime/output-values executable) (:completion attestation))
+      (runtime/with-output-values!
+       executable
+       (fn [completed-outputs]
+        (let [outputs (get completed-outputs (:completion attestation))
             session (get (:sessions executable) target)
             fields (get-in certified [:certificate :fields])]
         (is (= (set (map :value (vals fields))) (set (keys outputs))))
@@ -33,7 +36,7 @@
         (into {} (for [role [:coarse :fine]
                        :let [result (double-array 16) value (get-in fields [role :value])]]
                    (do (gpu/download-range! session (outputs value) result {:elements 16})
-                       [role (vec result)])))))))
+                       [role (vec result)])))))))))
 
 (defn- check-cycles! [target]
   (let [initial (#'oracle/initial-state)

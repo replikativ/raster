@@ -3625,3 +3625,30 @@ available and no skips. The expanded borrowing controls separately pass 18 tests
 General multi-patch/adaptive temporal planning, distributed completion-backed
 publication, physical cost calibration and the held real-model numerical gate
 remain separate open campaign obligations.
+
+### Distributed output lifetime before durable capture
+
+PR #1132 is merged as `4c7dc400` after independent exact-head review and all
+seven registered CI gates. Its two-cycle local distributed execution is not
+yet a durable checkpoint publication boundary.
+
+The next prerequisite is `distributed/with-output-values!`: a synchronous read
+scope on the existing enclosing owner. Successful completion is required;
+concurrent close waits, callback close is refused, and callback failure releases
+the scope. Asynchronous transfers must finish inside the callback and only
+copied data may escape. Direct session mutation is outside this contract. This
+does not manufacture a sealed compiler receipt or verify stored content.
+
+The hardware-free lifecycle checks pass 4 tests / 30 assertions. The existing
+AMR device oracle now copies its field bytes inside this scope; device validation
+and exact-head review are still in progress.
+
+Distributed hardware precision remains a distinct campaign obligation. The
+topology represents device descriptors, memory capacities and directed links
+with bandwidth and latency. The simulator accounts for dependencies and shared
+route links, plus explicitly stated transfer/compute serialization. Its route
+cost is an optimistic cut-through estimate, not measured fabric performance.
+Local device calibration can refine kernel descriptors, but measured cluster
+routes, shared physical bottlenecks, contention/load validity and realization
+of predicted asynchronous overlap remain open. Keep capability legality and
+ownership proofs separate from uncertain performance estimates.

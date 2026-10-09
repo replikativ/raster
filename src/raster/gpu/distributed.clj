@@ -218,8 +218,26 @@
                                    (link-plan/output-value-ids local)))])))
           (get-in executable [:plan :outputs]))))
 
+(defn with-output-values!
+  "Call `read!` synchronously with completed outputs while retaining the owner's lifetime.
+   Close on another thread waits for this scope; close from the callback is refused. The
+   callback must finish all reads (including asynchronous transfer waits) before returning.
+   Resident views must not escape or be mutated, and direct session mutation/close is outside
+   this contract. Return copied data, not borrowed views. This is a lifetime boundary, not a
+   sealed compiler completion receipt, content verification or durable publication."
+  [executable read!]
+  (locking (:state executable)
+    (let [values (output-values executable)]
+      (reset! (:state executable) :reading-outputs)
+      (try
+        (read! values)
+        (finally (reset! (:state executable) :complete))))))
+
 (defn close! [executable]
   (locking (:state executable)
+    (when (= :reading-outputs @(:state executable))
+      (throw (ex-info "distributed output read scope retains the owner lifetime"
+                      {:reason :distributed-runtime-output-scope-active})))
     (when-not (= :closed @(:state executable))
       (reset! (:state executable) :closed)
       (close-sessions! (:sessions executable))))
