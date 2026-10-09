@@ -2286,3 +2286,16 @@ warm REPL. Proof-count test instrumentation forwards the new caller argument
 without relaxing its one-reconstruction assertions. Enclosing program evidence,
 public compilation/cache request identity and physical admission remain pending;
 default behavior and the held real-model gate are unchanged.
+
+Structured-loop emission now checks each ScheduledKernelBody against independent
+caller math consent as well as its source node and artifact projection. Default
+validation and constructor arities retain default intent; explicit constructor
+descriptions remain separate from the new caller argument. A chained tanh/pure
+map regression preserves the exact scheduled loop, ABI and dependencies, rejects
+both policy-mismatch directions and metadata-only consent, and checks malformed
+requests. Legacy raw certificates cannot verify selected realization: default
+still validates while an override fails with an explicit owner error. Independent
+review found no blockers. Affected loop-lowering/routing/invocation-retention
+tests pass 58 tests / 541 assertions. Public producer, loop-call, enclosing-program
+and cached-proof context propagation remain pending; this boundary prerequisite
+does not enable policy publicly or close the held model gate.
