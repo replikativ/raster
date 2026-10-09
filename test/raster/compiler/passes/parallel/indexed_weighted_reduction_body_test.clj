@@ -7,6 +7,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -65,6 +66,31 @@
 (defn- subgroup-descriptor [width]
   {:device-type :gpu :vendor "Intel" :subgroup-size width
    :subgroup-sizes #{width} :max-workgroup-size 256})
+
+(deftest indexed-schedules-retain-caller-math-without-changing-membership-or-storage
+  (let [p (plan)
+        source (source-graph p)
+        node (first (:nodes source))
+        policy {:overrides {[:exp :float] :f64-target-library-rte-f32}}]
+    (doseq [build [(fn [options] (indexed-body/schedule-reference-for-node p node source {} options))
+                  (fn [options] (indexed-body/schedule-score-reuse-for-node
+                                 p node source (subgroup-descriptor 16) options))]]
+      (let [ordinary (build {})
+            selected (build {:scalar-math policy})
+            math (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarExpr %)
+                               (= :exp (:op %)))
+                         (tree-seq coll? seq (get-in selected [:body :operations])))]
+        (is (= policy (get-in selected [:numerics :scalar-math])))
+        (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+        (is (= (:source ordinary) (:source selected)))
+        (is (= (:legality ordinary) (:legality selected)))
+        (is (= (get-in ordinary [:body :parameters]) (get-in selected [:body :parameters])))
+        (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+        (is (= 1 (count math)))
+        (is (every? #(= :double (get-in % [:options :math-realization :evaluation-dtype])) math))
+        (is (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))))
 
 (deftest subgroup-certificate-shares-reference-storage-and-scalar-interface
   (let [plan (plan)

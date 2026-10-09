@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-capability :as capability]))
@@ -206,11 +207,13 @@
    This constructs no graph and emits no target source. The caller owns the semantic graph; this
    function proves the selected KernelBody's source identity, storage effects/dtypes, scalar
    closure, launch obligations and evaluation policy against that independently built graph."
-  [plan node kernel-graph descriptor]
+  ([plan node kernel-graph descriptor]
+   (schedule-reference-for-node plan node kernel-graph descriptor {}))
+  ([plan node kernel-graph descriptor caller-options]
   (let [{:keys [plan graph scalar-types arguments physical-values]}
         (schedule-context plan kernel-graph)
         workgroup-x (dynamic-reference-workgroup-x descriptor)
-        kernel-body (lower-dynamic-reference plan workgroup-x)
+        kernel-body (lower-dynamic-reference plan workgroup-x caller-options)
           scheduled
           (scheduled-body/make
            {:source plan
@@ -226,7 +229,9 @@
                        :algebra-key (swr/algebra-key plan)
                        :membership :edge-list-by-destination
                        :duplicate-policy :multiset}
-            :numerics {:mode :exact :policy :same-typed-ssa-evaluation-order}
+            :numerics (cond-> {:mode :exact :policy :same-typed-ssa-evaluation-order}
+                        (contains? caller-options :scalar-math)
+                        (assoc :scalar-math (numerics/validate-scalar-math-policy! (:scalar-math caller-options))))
             :provenance {:dialect :kernel-body
                          :source-dialect :segmented-weighted-reduction
                          :algebra-plan-id (:id plan)
@@ -235,7 +240,7 @@
                          :optimization-tier :reference
                          :out-elems (nth physical-values 5)
                          :dynamic-shape? true}})]
-    (scheduled-body/validate-against-node! scheduled node graph)))
+    (scheduled-body/validate-against-node! scheduled node graph))))
 
 (defn schedule-score-reuse-for-node
   "Certify the existing subgroup body against an independently built semantic graph.
@@ -243,7 +248,9 @@
    This constructs a target-admitted candidate, not a numerical-policy selection: the caller must
    authorize reassociation before choosing it. No source recognition, graph construction, target
    emission or default-route change occurs here."
-  [plan node kernel-graph descriptor]
+  ([plan node kernel-graph descriptor]
+   (schedule-score-reuse-for-node plan node kernel-graph descriptor {}))
+  ([plan node kernel-graph descriptor caller-options]
   (let [{:keys [status width reason data]} (capability/score-reuse plan descriptor)
         _ (when-not (= :supported status)
             (throw (ex-info "indexed subgroup schedule is not supported by this target"
@@ -253,7 +260,7 @@
                             {:reason :indexed-subgroup-width :width width})))
         {:keys [plan graph scalar-types arguments physical-values]}
         (schedule-context plan kernel-graph)
-        kernel-body (lower-dynamic-score-reuse plan width)
+        kernel-body (lower-dynamic-score-reuse plan width caller-options)
         scheduled
         (scheduled-body/make
          {:source plan :body kernel-body :arguments arguments
@@ -275,10 +282,12 @@
                      :plan-id (:id plan) :algebra-key (swr/algebra-key plan)
                      :membership :edge-list-by-destination :duplicate-policy :multiset
                      :required-subgroup-size width}
-          :numerics {:mode :reassociated
-                     :policy :subgroup-dot-ordered-edge-accumulation
-                     :accumulator-dtype (:accumulator-dtype plan)
-                     :rounding :implementation-defined}
+          :numerics (cond-> {:mode :reassociated
+                             :policy :subgroup-dot-ordered-edge-accumulation
+                             :accumulator-dtype (:accumulator-dtype plan)
+                             :rounding :implementation-defined}
+                      (contains? caller-options :scalar-math)
+                      (assoc :scalar-math (numerics/validate-scalar-math-policy! (:scalar-math caller-options))))
           :provenance {:dialect :kernel-body
                        :source-dialect :segmented-weighted-reduction
                        :algebra-plan-id (:id plan)
@@ -287,10 +296,15 @@
                        :optimization-tier :subgroup
                        :out-elems (nth physical-values 5)
                        :dynamic-shape? true}})]
-    (scheduled-body/validate-against-node! scheduled node graph)))
+    (scheduled-body/validate-against-node! scheduled node graph))))
 
 (defn- lit [value type] (body/literal value type))
 (defn- expr [op type & arguments] (body/scalar-expression op type arguments))
+(defn- math-expr [policy op type & arguments]
+  (body/scalar-expression op type arguments
+                          (if-let [realization (numerics/scalar-math-realization policy op type)]
+                            {:math-realization realization}
+                            {})))
 (defn- compute [id type expression]
   (body/->ScalarCompute (body/value id type) expression))
 (defn- select [condition if-true if-false type]
@@ -306,8 +320,9 @@
   ordered multiset traversal, private numerator/denominator, no edge-sized intermediates, and a
   NaN result for every active head component when any edge index is malformed. Unused row
   tails remain zero; malformed shapes produce NaN for every launched output."
-  [plan {:keys [entities edges heads components total-dim] :as shape} workgroup-x dynamic?]
+  [plan {:keys [entities edges heads components total-dim] :as shape} workgroup-x dynamic? caller-options]
   (let [plan (validate-plan! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         [q k v destination-indices source-indices] (:operands plan)
         output (:output plan)
         dtype (:accumulator-dtype plan)
@@ -387,7 +402,7 @@
                      (expr :min dtype (lit bound dtype)
                            (expr :max dtype (lit (- bound) dtype) 'scaled)))
             (compute 'score dtype (select 'scaled-is-nan 'scaled 'clamped dtype))
-            (compute 'weight dtype (expr :exp dtype 'score))
+            (compute 'weight dtype (math-expr policy :exp dtype 'score))
             (body/->ScalarLoad (body/value 'value-element dtype) (:id v)
                                ['safe-source feature] nil nil :cached)
             (compute 'weighted-value dtype (expr :* dtype 'weight 'value-element))
@@ -530,23 +545,30 @@
 
 (defn lower-reference
   "Lower a statically specialized indexed edge-list correctness schedule."
-  [plan shape workgroup-x]
-  (lower-reference* plan shape workgroup-x false))
+  ([plan shape workgroup-x]
+   (lower-reference plan shape workgroup-x {}))
+  ([plan shape workgroup-x caller-options]
+   (lower-reference* plan shape workgroup-x false caller-options)))
 
 (defn lower-dynamic-reference
   "Lower the same correctness schedule with ordered int64 runtime extents."
-  [plan workgroup-x]
+  ([plan workgroup-x]
+   (lower-dynamic-reference plan workgroup-x {}))
+  ([plan workgroup-x caller-options]
   (lower-reference* plan
                     {:entities 'n_entities :edges 'n_edges :heads 'n_heads
                      :components 'n_components :total-dim 'total_dim}
-                    workgroup-x true))
+                    workgroup-x true caller-options)))
 
 (defn lower-dynamic-score-reuse
   "One subgroup owns a destination/head/component tile. Edge traversal is uniform; each
   lane accumulates a strided dot fragment, then the subgroup shares one score. No collective
   occurs inside the lane-varying dot loop or the guarded value update."
-  [plan width]
+  ([plan width]
+   (lower-dynamic-score-reuse plan width {}))
+  ([plan width caller-options]
   (let [plan (validate-plan! plan)
+        policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         [q k v dst src] (mapv :id (:operands plan))
         out (get-in plan [:output :id])
         dtype (:accumulator-dtype plan)
@@ -608,7 +630,7 @@
                      (expr :min dtype (lit bound dtype)
                            (expr :max dtype (lit (- bound) dtype) 'scaled)))
             (compute 'score dtype (select 'scaled-is-nan 'scaled 'clamped dtype))
-            (compute 'local-weight-value dtype (expr :exp dtype 'score))
+            (compute 'local-weight-value dtype (math-expr policy :exp dtype 'score))
             (yield 'local-weight-value)]
            [(yield zero)] [(body/value 'local-weight dtype)])
           (body/->Collective (body/value 'weight dtype) :broadcast :subgroup width
@@ -696,4 +718,4 @@
                                           (launch/runtime-value 'n_entities)]})
       :provenance {:dialect :kernel-body :semantic-op :segmented-weighted-reduction
                    :algebra-plan-id (:id plan) :lowering :indexed-score-reuse-kernel-body}
-      :attributes {:dynamic-shape? true :membership-kind :edge-list-by-destination}})))
+      :attributes {:dynamic-shape? true :membership-kind :edge-list-by-destination}}))))

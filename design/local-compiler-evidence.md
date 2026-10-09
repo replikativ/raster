@@ -2225,3 +2225,14 @@ retention of unused consent without FP64 demand. GEMM and matrix-plan suites pas
 39 tests / 1257 assertions in the warm REPL. This closes the stage-body owner,
 not whole-graph numerical admission, target execution support or model validation;
 public selection is still disabled.
+
+Indexed weighted-reduction reference and subgroup score-reuse body owners now
+accept independent caller scalar-math options. Their existing exp leaves select
+physical realization through the shared numerical-contract policy; source,
+membership, accumulator arithmetic, parameters and launch remain unchanged.
+Old arities retain default bodies and certificates. Dynamic reference/subgroup
+regressions check policy retention, physical FP64 demand and stripped-consent
+rejection. The intrinsic contract rejects a sqrt target-library override, so
+sqrt remains under its existing semantics rather than broadening policy to fit
+a test. Indexed body and route suites pass 24 tests / 198 assertions. Public
+selection and whole-graph reconstruction are still separate pending work.
