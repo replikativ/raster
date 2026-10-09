@@ -261,6 +261,25 @@
                                     [:kernel-body-decline :missing-rule])))
           (is (= :none (:fallback (ex-data exception)))))))))
 
+(deftest stencil-retains-selected-math-consent
+  (let [operation (segop/->SegStencil
+                   905 (segop/make-seg-space 'i 32) (segop/->SegLevel :thread :virtual)
+                   (with-meta '(raster.numeric/tanh (clojure.core/aget input i))
+                     {:raster.type/tag 'float})
+                   #{'input} #{'output} #{} (segop/->KernelGrid 1 32 0)
+                   :float 'output 1 :dirichlet nil :no-write-alias)
+        options {:array-types {'input :float 'output :float} :workgroup-size 32}
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (segstencil-body/schedule operation options)
+        selected (segstencil-body/schedule operation (assoc options :scalar-math policy))]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))
+
 (deftest typed-stencil-emits-a-guarded-typed-artifact
   (let [source '(let* [result
                        (raster.par/stencil!

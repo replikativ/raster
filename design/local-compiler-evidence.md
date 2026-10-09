@@ -2097,6 +2097,19 @@ element regression checks hidden Double demand with an unchanged Float result.
 Independent review approved the delta. The affected warm-REPL suites pass 105
 tests / 966 assertions; backend/public admission remains disabled.
 
+The stencil producer now uses and retains the same optional policy without
+changing logical dtype, boundary guards, radius, or launch geometry. A regression
+checks unchanged default metadata, selected hidden Double demand and rejection
+after consent is stripped. Independent review approved the delta; the affected
+warm suites pass 106 tests / 971 assertions.
+
+The scan inventory found a remaining consolidation prerequisite: scan emission
+currently constructs artifacts directly from raw KernelBody, bypassing
+ScheduledKernelBody. Before enabling policy for scans, migrate that existing
+route through ScheduledKernelBody plus independent graph-owned reconstruction
+and the shared artifact emitter. Retaining consent only in artifact attributes
+would create a duplicate, self-attested authority and is not the chosen route.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec

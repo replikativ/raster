@@ -5,6 +5,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.index-expression :as index-expression]
@@ -41,7 +42,7 @@
 
    The interior branch dominates all neighborhood loads. Boundary lanes yield the typed zero
    value and perform one final store, so no target emitter reconstructs boundary semantics."
-  [stencil {:keys [workgroup-size array-types scalar-types]
+  [stencil {:keys [workgroup-size array-types scalar-types scalar-math]
             :or {workgroup-size 256 array-types {} scalar-types {}}}]
   (when-not (segop/seg-stencil? stencil)
     (throw (ex-info "stencil KernelBody lowering requires SegStencil"
@@ -95,6 +96,7 @@
                         index-types)))
         lowerer (scalar-expression/make-lowerer
                  {:array-types array-types :scalar-types scalar-types
+                  :scalar-math scalar-math
                   :arrays (set inputs) :index-scope index-scope
                   :lower-index lower-index :predicate nil
                   :id-prefix "stencil" :decline! decline!})
@@ -230,7 +232,10 @@
                  :boundary :dirichlet
                  :radius 1
                  :aliasing :no-write-alias}
-      :numerics {:mode :exact :policy :same-scalar-evaluation-order}
+      :numerics (cond-> {:mode :exact :policy :same-scalar-evaluation-order}
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options))))
       :provenance {:dialect :kernel-body :source-dialect :segstencil
                    :segop-id (:id stencil)}
       :attributes {:array-params (vec (concat inputs outputs))
