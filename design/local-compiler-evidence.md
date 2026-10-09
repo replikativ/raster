@@ -2063,6 +2063,19 @@ Isolated and fused retained scalar regions carry the same realization and
 physical Double demand. The affected scalar-region suite passes 49 tests / 535
 assertions in the warm REPL after refreshing its stale index-lowering dependency.
 
+The next checked boundary retains optional `:scalar-math` policy in the existing
+numerical contract. ScheduledKernelBody validation walks all operation fields,
+including expression-valued stores and nested controls, and requires every
+target-library realization to match that policy. Missing consent rejects widened
+math; a selected override rejects an ordinary realization of that operation.
+This uses the existing intrinsic descriptor and closed realization authority,
+not another operator registry. Independent review approved the boundary.
+The scheduled-body suite passes 16 tests / 139 assertions; shared scalar-region,
+scalar-emitter and matrix-emitter suites pass 87 tests / 1333 assertions.
+Public schedule admission remains disabled until outer consent, all producer
+paths and independent reconstruction carry the same policy. Neither this local
+evidence nor the optional policy closes the held whole-model training gate.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec

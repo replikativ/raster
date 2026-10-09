@@ -160,6 +160,8 @@
                     (keyword? (:policy contract)))
        (fail! "numerical contract requires a supported mode and named policy"
               {:value contract :supported modes}))
+     (when (contains? contract :scalar-math)
+       (validate-scalar-math-policy! (:scalar-math contract)))
      (case (:mode contract)
        :exact nil
        :reassociated
