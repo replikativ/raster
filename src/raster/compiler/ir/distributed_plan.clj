@@ -1434,16 +1434,21 @@
           :device-plans {} :steps []} requests)]
     (plan (merge fields context))))
 
+(defn- physical-target [plan worker]
+  ;; One explicit placement projection, not recursive rewriting of target identities.
+  (get-in plan [:device-plans worker :target] worker))
+
 (defn- transfer-resources
-  [topology step]
+  [plan step]
+  (let [topology (:topology plan)]
   (vec (distinct
         (concat (map (fn [link-id] [:link link-id]) (:route step))
                 (mapcat (fn [link-id]
                           (map (fn [domain] [:serialization-domain domain])
                                (get-in topology [:links link-id :attributes :serialization-domains])))
                         (:route step))
-                (map (fn [device] [:compute device])
-                     (get-in step [:attributes :serialized-on]))))))
+                (map (fn [device] [:compute (physical-target plan device)])
+                     (get-in step [:attributes :serialized-on])))))))
 
 (defn route-layout-description
   "Project physical view layout for empirical cost matching, excluding allocation identity.
@@ -1524,7 +1529,7 @@
                     (<= 16 (:max-staging-bytes context) Long/MAX_VALUE)))
           (not (every? #(valid-route-layout? (get layout %) (:bytes step)) [:source :target]))
           (not= (get-in layout [:source :dtype]) (get-in layout [:target :dtype]))
-          (not= endpoints (mapv #(get-in plan [:device-plans % :target] %) [(:source step) (:target step)]))
+          (not= endpoints (mapv #(physical-target plan %) [(:source step) (:target step)]))
           (not= (set endpoints) (set (keys devices)))
           (some (fn [[endpoint info]]
                   (not (and (map? (:device info)) (seq (:device info))
@@ -1557,11 +1562,15 @@
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
 
-   Compute steps serialize on their device compute lane. Transfers serialize on every directed
+   Compute steps serialize on their physical target compute lane, using the existing explicit
+   worker placement (otherwise worker identity). Transfers serialize on every directed
    link in their route and on explicitly shared serialization domains. Absent endpoint claims,
    communication and compute resource classes are independent, so communication and compute
    overlap whenever dependencies permit. The result is deterministic and suitable as an analytic
    seed/pruner; measured costs should replace durations before production selection.
+   Logical per-worker compute and peak-memory accounting is retained; physical-compute-ns
+   additionally aggregates compute service time by placed target. This does not aggregate
+   physical memory capacities or infer sharing between logical topology links.
 
    Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
    empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
@@ -1604,6 +1613,7 @@
                  :resource-free {}
                  :timeline {}
                  :device-compute-ns {}
+                 :physical-compute-ns {}
                  :link-transfer-bytes {}
                  :link-busy-ns {}
                  :peak-memory-by-device {}}
@@ -1615,8 +1625,8 @@
                  ;; a transfer an endpoint physically serializes with compute (a stated
                  ;; capability, carried as `:serialized-on`) occupies that compute lane too
                  resources (case (:kind step)
-                             :compute [[:compute (:device step)]]
-                             :transfer (transfer-resources topology step))
+                             :compute [[:compute (physical-target plan (:device step))]]
+                             :transfer (transfer-resources plan step))
                  resource-ready (reduce max 0 (map #(get-in state [:resource-free %] 0)
                                                    resources))
                  start (max dependency-ready resource-ready)
@@ -1638,6 +1648,8 @@
                :compute
                (-> state
                    (update-in [:device-compute-ns (:device step)] (fnil + 0) duration)
+                   (update-in [:physical-compute-ns (physical-target plan (:device step))]
+                              (fnil + 0) duration)
                    (update-in [:peak-memory-by-device (:device step)]
                               (fnil max 0) (:peak-memory-bytes step)))
 
@@ -1659,6 +1671,7 @@
      :makespan-ns makespan
      :timeline (:timeline state)
      :device-compute-ns (:device-compute-ns state)
+     :physical-compute-ns (:physical-compute-ns state)
      :link-transfer-bytes (:link-transfer-bytes state)
      :link-busy-ns (:link-busy-ns state)
      :peak-memory-by-device peak-memory
@@ -1687,7 +1700,7 @@
         (keep (fn [step]
                 (when (= :transfer (:kind step))
                   [(:id step) {:route (:route step) :bytes (:bytes step)
-                               :resources (transfer-resources (:topology plan) step)
+                               :resources (transfer-resources plan step)
                                :duration-ns (transfer-duration-ns (:topology plan) step)}])))
         (:steps plan)))
 

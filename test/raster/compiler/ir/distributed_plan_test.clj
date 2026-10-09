@@ -65,6 +65,56 @@
               :dependencies [:independent-gradient-1 :send-gradient]})]
     :outputs [:apply-gradient]}))
 
+(deftest compute-lanes-follow-one-step-physical-placement
+  (let [base (-> (training-plan)
+                 (update :steps #(filterv (fn [s] (= :compute (:kind s))) %))
+                 (assoc-in [:steps 2 :dependencies] [:gradient-0 :independent-gradient-1]))
+        placed (fn [a b] (assoc base :device-plans {:gpu-0 {:target a} :gpu-1 {:target b}}))
+        baseline (distributed/simulate base)
+        colocated (distributed/simulate (placed :same-physical :same-physical))
+        distinct (distributed/simulate (placed :physical-a :physical-b))
+        one-step (distributed/simulate (placed :gpu-1 :physical-b))]
+    (is (= 700 (:makespan-ns baseline) (:makespan-ns distinct) (:makespan-ns one-step)))
+    (is (= 800 (:makespan-ns colocated)))
+    (is (= 100 (get-in colocated [:timeline :independent-gradient-1 :start-ns])))
+    (is (= [[:compute :same-physical]] (get-in colocated [:timeline :gradient-0 :resources])))
+    (is (= [[:compute :gpu-1]] (get-in one-step [:timeline :gradient-0 :resources]))
+        "physical target names are not recursively remapped as worker names")
+    (is (= {:same-physical 800} (:physical-compute-ns colocated)))
+    (is (= {:physical-a 100 :physical-b 700} (:physical-compute-ns distinct)))
+    (is (= (:device-compute-ns baseline) (:device-compute-ns colocated)))
+    (is (= (:peak-memory-by-device baseline) (:peak-memory-by-device colocated)))
+    (is (= (:transferred-bytes baseline) (:transferred-bytes colocated)))))
+
+(deftest transfer-claims-use-the-same-physical-compute-lanes
+  (let [p (-> (training-plan)
+              (assoc :device-plans {:gpu-0 {:target :same-physical} :gpu-1 {:target :same-physical}})
+              (assoc-in [:steps 2 :attributes :serialized-on] [:gpu-0 :gpu-1]))
+        simulation (distributed/simulate p)
+        certified (distributed/certify p)
+        renamed (-> p
+                    (assoc-in [:device-plans :gpu-0 :target] :renamed-physical)
+                    (assoc-in [:device-plans :gpu-1 :target] :renamed-physical))
+        reordered (-> p
+                      (update :steps (fn [[a b send apply]] [a send b apply]))
+                      (assoc-in [:steps 1 :attributes :serialized-on] [:gpu-0]))
+        resources [[:link :gpu-0->gpu-1] [:compute :same-physical]]]
+    (is (= resources (get-in simulation [:timeline :send-gradient :resources])))
+    (is (= resources (get-in certified [:certificate :route-costs :send-gradient :resources])))
+    (is (= 600 (get-in simulation [:timeline :send-gradient :start-ns])))
+    (is (= 41100 (get-in (distributed/simulate reordered)
+                        [:timeline :independent-gradient-1 :start-ns]))
+        "claiming one worker blocks a different worker on the same physical target")
+    (is (= certified (distributed/verify! certified)))
+    (is (= (:makespan-ns simulation) (:makespan-ns (distributed/simulate renamed))))
+    (is (= :distributed-certificate
+           (try (distributed/verify! (assoc certified :plan renamed)) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :distributed-certificate
+           (try (distributed/verify!
+                 (assoc-in certified [:plan :device-plans :gpu-1 :target] :other-physical)) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest topology-revalidates-modified-physical-facts
   (let [base (training-plan)
         certified (distributed/certify base)]
