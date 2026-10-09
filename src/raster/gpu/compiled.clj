@@ -26,7 +26,6 @@
             [raster.compiler.equation-artifact-store :as equation-artifact-store]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.build-manifest :as build-manifest]
-            [raster.compiler.backend.gpu.storage-representation :as storage-probe]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -40,6 +39,7 @@
             [raster.compiler.source-dependencies :as source-dependencies]
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
+            [raster.gpu.storage-representation :as storage-representation]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.gpu.value :as v]
@@ -1484,42 +1484,6 @@
 (defn representation-evidence? [candidate]
   (and (instance? ResidentRepresentationEvidence candidate) (sealed-artifact? candidate)))
 
-(defn- run-storage-probe! [session dt artifact]
-  (let [key (keyword (str "storage-probe-" (random-uuid)))
-        allocated? (volatile! false)
-        handle (volatile! nil)
-        primary (volatile! nil)
-        bytes (byte-array (* 2 (dtype/bytes-of dt)))]
-    (try
-      (gpu/alloc! session {key [dt 2 nil]})
-      (vreset! allocated? true)
-      (vreset! handle (gpu/bind-kernel-call! session key artifact [key]))
-      (gpu/run-kernel-graph! session @handle)
-      (gpu/download-range! session key (MemorySegment/ofArray bytes) {:elements 2})
-      (let [observation (mapv #(bit-and 255 %) bytes)]
-        {:byte-order (storage-probe/classify-bytes dt observation)
-         :observation observation
-         :content (numerical-content/content-address-of (MemorySegment/ofArray bytes))})
-      (catch Throwable error (vreset! primary error) (throw error))
-      (finally
-        ;; Attempt every release, preserving the computation's first failure. A failed native
-        ;; destruction may require session close; never pretend it was successfully reclaimed.
-        (let [failure (volatile! @primary)]
-          (doseq [release! (cond-> []
-                            @handle (conj #(gpu/release-kernel-graph! session @handle))
-                            @allocated? (conj #(gpu/free-buffer! session key)))]
-            (try (release!)
-                 (catch Throwable cleanup
-                   (if-let [error @failure]
-                     (when-not (identical? error cleanup) (.addSuppressed error cleanup))
-                     (vreset! failure cleanup)))))
-          (when (and @failure (nil? @primary)) (throw @failure))
-          (when (and (nil? @failure)
-                     (or (contains? (:buffers @session) key)
-                         (contains? (:kernel-graphs @session) key)))
-            (throw (ex-info "storage probe cleanup left owned resources live"
-                            {:reason :compiled-representation-cleanup}))))))))
-
 (defn measure-storage-representation!
   "Measure one dtype on an original wholly owned Compiled under its exclusive lifetime guard.
 
@@ -1537,26 +1501,20 @@
         session (:session executable)
         _ (when-not (:owns-session? executable)
             (throw (ex-info "representation evidence requires an owned session"
-                            {:reason :compiled-evidence-ownership})))
-        artifact (storage-probe/emit-artifact dt (gpu/kernel-body-c-dialect session))]
+                            {:reason :compiled-evidence-ownership})))]
     (gpu-link/with-unleased-execution!
      executable :measure-storage-representation
      (fn []
        (require-no-evidence-events! executable)
-       (let [device (gpu/execution-device-info session)]
-         (when-not (contains? (:storage-types device) dt)
-           (throw (ex-info "selected device does not advertise this storage dtype"
-                           {:reason :compiled-representation-unsupported :dtype dt})))
+       (storage-representation/observe!
+        session dt
+        (fn [observe]
          (gpu-link/with-exclusive-mutation!
           executable :measure-storage-representation
           (fn []
             (invalidate-live-outputs! c)
-            (let [observation (run-storage-probe! session dt artifact)
-                  after (gpu/execution-device-info session)]
+            (let [observation (observe)]
               (require-no-evidence-events! executable)
-              (when-not (= device after)
-                (throw (ex-info "device identity changed during storage measurement"
-                                {:reason :compiled-representation-device-changed})))
               (seal-artifact
                (->ResidentRepresentationEvidence
                 {:kind :raster.compiled/resident-representation-v1
@@ -1564,12 +1522,12 @@
                  :abi {:encoding (if (:fp? (dtype/info dt)) :ieee-binary :twos-complement)
                        :bits (* 8 (dtype/bytes-of dt))}
                  :program-fingerprint (:fingerprint program)
-                 :device device
-                 :device-fingerprint (semantic-fingerprint/fingerprint device)
-                 :probe-fingerprint (semantic-fingerprint/fingerprint artifact)
-                 :observed-bytes (:observation observation)
-                 :observed-content (:content observation)}
-                c executable session (:session-id @session) nil))))))))))
+                 :device (:device observation)
+                 :device-fingerprint (:device-fingerprint observation)
+                 :probe-fingerprint (:probe-fingerprint observation)
+                 :observed-bytes (:observed-bytes observation)
+                 :observed-content (:observed-content observation)}
+                c executable session (:session-id @session) nil)))))))))))
 
 (defn completed-storage-description
   "Project actual completed bytes onto measured raw-array storage for this exact live owner.
