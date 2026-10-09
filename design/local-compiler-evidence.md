@@ -1910,3 +1910,8 @@ scalar tails retaining the native source semantics. The focused three-test
 run passed 291 assertions, including raw-bit floating comparisons, integer
 minima, operand evaluation count, and changed inputs across vector boundaries.
 No model oracle, provider, precision policy or acceptance tolerance changed.
+
+Independent review caught the native `_Float16` boundary, which the initial
+generic selector omitted despite its presence in native dtype admission. The
+helper now retains the previous Float-widening/half-rounding path explicitly,
+with compiled checks for half result type and exactly representable half values.

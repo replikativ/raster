@@ -80,7 +80,9 @@
                       " return value == " minimum " ? value : (value < 0 ? -value : value);\n}\n")))
         ;; Unary + applies only integral promotion. Float remains Float; the controlling
         ;; expression is unevaluated, and the actual function argument is evaluated once.
-        "#define rstr_native_abs(a) _Generic((+(a)), "
+        "static inline _Float16 rstr_native_abs_f16(_Float16 value) {\n"
+        " return (_Float16)fabsf((float)value);\n}\n"
+        "#define rstr_native_abs(a) _Generic((+(a)), _Float16: rstr_native_abs_f16, "
         "float: fabsf, double: fabs, int: rstr_native_abs_i32, "
         "long: rstr_native_abs_long, long long: rstr_native_abs_i64)((a))\n")})
 

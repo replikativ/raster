@@ -37,6 +37,26 @@
     (native x out)
     (is (= [2.0 -1.0 1.0] (vec out)))))
 
+(deftest native-absolute-retains-half-boundary
+  ;; Native half arithmetic already widens through Float and rounds back to half.
+  ;; Inputs here are exactly half-representable, so Float comparison is independent
+  ;; of a second host implementation of the half conversion.
+  (let [name (get-in intrinsics/table [:abs :native-c :fn])
+        body (str "void abs_half(float *x, float *out, int n) {"
+                  "for (int i=0;i<n;i++) out[i]=(float)" name "((_Float16)x[i]);"
+                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);}")
+        source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
+        native (cpu/load-kernel (cpu/compile-source! source) "abs_half" 2 [:int])
+        values [-0.0 -1.0 1.0 -65504.0 Float/NEGATIVE_INFINITY
+                Float/POSITIVE_INFINITY Float/NaN (- (Math/scalb (double 1.0) (int -24)))]
+        x (float-array values) out (float-array (inc (count values)))]
+    (native x out (int (count values)))
+    (doseq [i (range (count values))]
+      (let [expected (Math/abs (aget x i)) actual (aget out i)]
+        (is (if (Float/isNaN expected) (Float/isNaN actual)
+                (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))))))
+    (is (= 1.0 (double (aget out (count values)))))))
+
 (deftest native-absolute-preserves-integral-width-and-minima
   (doseq [[dtype make-array values reference]
           [[:int int-array [Integer/MIN_VALUE Integer/MAX_VALUE -16777217 -1 0 1]
