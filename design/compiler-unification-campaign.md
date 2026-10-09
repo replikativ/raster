@@ -3535,3 +3535,24 @@ does not erase the numerical spine or authorize an application interpretation.
 Host-prefix validation and projection use one numerical-body extraction helper.
 Affected provenance/fusion/dispatch/structured-control suites pass 72 tests /
 685 assertions on the capped warm REPL; fresh CI remains a landing requirement.
+
+The first ODE temporal projection now checks the bounded producer's nine-stage
+attestation against that shared semantic spine: each numerical equation occurs
+once in source order; every stage retains its predecessor, time-fraction roles
+and register transition. Register evidence preserves declared result-storage
+access roles as well as operand dependencies, so a read/write update cannot be
+misclassified as a write-only reset. Its last semantic use is derived from those
+events. The register must be a nonempty plain FP64 tensor, not an input scalar or
+packed representation. These are structural checks over a numerical producer
+attestation, not inference of its mathematical meaning from destination names.
+
+The stage layer deliberately leaves full-write reset coverage, completion and
+release unproven. It does not yet bind a Prepared, workload, geometry bytes or
+distributed call. Those remain the next execution-facet obligations; no new
+planner/runtime or alternate diffusion kernel is introduced. Tests compile the
+actual numerical cycle without device allocation and include isolated access-role
+and storage-facet controls. The focused stage suite passes 5 tests / 25 assertions
+on the warm REPL; exact-head review and fresh CI remain landing requirements.
+Together with the existing numerical/device/provider suites, the affected AMR
+check passes 18 tests / 374 assertions, including actual OpenCL and Level Zero
+cycles and synchronized restart with no capability skips reported.
