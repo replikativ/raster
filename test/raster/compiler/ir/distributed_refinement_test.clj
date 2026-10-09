@@ -126,7 +126,7 @@
                  (distributed/refinement-facts
                   (assoc-in refinement [:operation :reduction :combine] '*))))))
 
-(defn- projection-inputs [n]
+(defn ^:no-doc projection-inputs [n]
   (let [refinement (direct-refinement n)
         devices (get-in refinement [:group :devices])
         links (distinct (mapcat :route (filter #(= :copy (:kind %)) (:nodes refinement))))]
