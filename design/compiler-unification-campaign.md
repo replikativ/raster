@@ -705,6 +705,25 @@ Fresh focused host validation on `b853cc5a` plus this documentation reconciliati
 assertions in the capped REPL. This does not refresh the device/restart measurements or
 close the real-checkpoint training gate.
 
+Fresh local refresh on `5e3a7af6` exercises the five AMR geometry, transfer, subcycle,
+device-packing and device-subcycle namespaces: 20 tests / 1359 assertions pass without
+capability skips, including OpenCL and Level Zero packing and synchronized restart.
+The bounded plain-patch packing vertical already exists in #1030; historical statements
+that *all* device patch packing is missing are superseded by that evidence. Generalized
+packing, temporal outer-plan integration and adaptive/multi-patch acceptance remain open.
+
+### Rank-zero distributed compute composition (2026-10-09)
+
+Explicit local compute domains now admit shape `[]` under the same dense single-leaf,
+dtype, equal-volume, containment and ownership checks as positive-rank tensors. It projects
+exactly one physical element; an absent shape, extra element or rank-mismatched offset
+does not gain admission. Structural regressions preserve the original ABI leaf and allocation.
+A complete public prediction/MSE objective also runs through an ordinary one-worker
+DistributedPlan on OpenCL and Level Zero and matches the JVM scalar loss. No scalar-loss
+opcode, trainer API, special transport or runtime replay convention is introduced.
+This closes local scalar-output composition, not multi-step/fabric training or the held
+real-weight numerical gate.
+
 ### External training publication readiness (2026-10-08)
 
 The local `../finetune-rstr` repository at `9e9ba5d` has no configured Git remote;

@@ -67,7 +67,9 @@
         logical-shape (:shape abstract)
         layout (:logical-layout abstract)
         base (:view (first leaves))
-        concrete? #(and (vector? %) (seq %) (every? pos-int? %))]
+        ;; [] is a concrete rank-zero tensor with one element, not an absent shape.
+        ;; Equal volume still proves that it can only project a one-element ABI leaf.
+        concrete? #(and (vector? %) (every? pos-int? %))]
     (when-not (and (= :tensor (:kind abstract)) (concrete? shape) (concrete? logical-shape)
                    (= 1 (count leaves))
                    (= {:kind :plain} (:representation abstract))

@@ -236,6 +236,44 @@
            (failure-reason #(make-plan {:link-plan local})))
         "without explicit coordinates the old exact-shape contract is unchanged")))
 
+(deftest rank-zero-local-domains-retain-one-element-physical-storage
+  (let [local (local-link-plan {:x-shape [1] :tail-shape [1] :elements 1})
+        globals (into {} (map (fn [id] [id (assoc (global-value) :shape [])])) [:x :weights :y])
+        shard-map (into {} (map (fn [id]
+                                 [id (mapv #(assoc % :shape [] :offsets []) (shards id id))]))
+                        [:x :weights :y])
+        reference (fn [id]
+                    {:local-shape []
+                     :placements [{:kind :owned :value id
+                                   :shard (keyword (str (name id) "-0")) :local-offsets []}]})
+        request {:values globals :shards shard-map
+                 :device-plans (device-plans local {:local-x (reference :x)
+                                                    :local-y (reference :y)})}
+        plan (make-plan request)
+        bindings (get-in (distributed/compute-bindings plan) [:bindings :copy-0 :values])]
+    (doseq [id [:local-x :local-y]
+            :let [bound (get bindings id)]]
+      (is (= [] (get-in bound [:domain :shape])))
+      (is (= [] (get-in bound [:domain :view :shape])))
+      (is (= [] (get-in bound [:domain :view :strides])))
+      (is (= [1] (get-in bound [:leaves 0 :view :shape])))
+      (is (= 4 (get-in bound [:domain :view :byte-length])))
+      (is (= (get-in bound [:domain :view :allocation])
+             (get-in bound [:leaves 0 :view :allocation]))))
+    (is (= :distributed-compute-local-domain
+           (failure-reason #(make-plan (assoc request :device-plans
+                                             (device-plans (local-link-plan {:elements 2 :x-shape [2]
+                                                                             :tail-shape [2]})
+                                                           {:local-x (reference :x)
+                                                            :local-y (reference :y)}))))))
+    (is (= :distributed-compute-local-domain
+           (failure-reason #(make-plan (assoc-in request [:device-plans :gpu-0 :steps :copy-0
+                                                        :bindings :local-x :local-shape] nil)))))
+    (is (= :buffer-view-region
+           (failure-reason #(make-plan (assoc-in request [:device-plans :gpu-0 :steps :copy-0
+                                                        :bindings :local-x :placements 0
+                                                        :local-offsets] [0])))))))
+
 (deftest local-domain-does-not-admit-unproven-layouts-or-padding
   (let [local (local-link-plan {:x-shape [6]})
         check (fn [plan reference]

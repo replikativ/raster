@@ -253,6 +253,65 @@
             (is (java.util.Arrays/equals ^floats (first actual) ^floats result)
                 "all replicas consume the same reduced gradient and initial parameters")))))))
 
+(defn- check-distributed-scalar-loss! [device]
+  (let [{:keys [x y rows]} (first (batches [1]))
+        args [(initial-theta) x y rows 17]
+        expected (apply local-loss args)
+        local (place-lowering :scalar-objective #'local-loss args device)
+        output (first (link/output-value-ids local))
+        accesses (link/value-accesses local)
+        boundaries (into #{output}
+                         (keep (fn [[id _]]
+                                 (let [node (value-node local id)]
+                                   (when (and (contains? accesses id)
+                                              (or (contains? #{:input :state} (:role node))
+                                                  (and (= :constant (:role node)) (nil? (:source node)))))
+                                     id))))
+                         (:values local))
+        globals (into {} (map (fn [id]
+                               [id (assoc (get-in local [:values id :abstract])
+                                          :shape (if (= id output) []
+                                                     (get-in local [:values id :abstract :shape]))
+                                          :sharding {:kind :replicated :devices [:worker]})])) boundaries)
+        plan (distributed/plan
+              {:id :scalar-loss :mesh (distributed/mesh [{:name :workers :size 1}] [:worker])
+               :topology (distributed/topology [(distributed/device {:id :worker
+                                                                      :memory-capacity-bytes 1048576})] [])
+               :values globals
+               :shards (into {} (map (fn [[id value]]
+                                      [id [(distributed/shard {:id id :value id :device :worker
+                                                              :shape (:shape value)
+                                                              :offsets (vec (repeat (count (:shape value)) 0))
+                                                              :ownership :replica})]])) globals)
+               :device-plans {:worker {:target device :entries {:loss {:link-plan local}}
+                                      :steps {:loss {:entry :loss
+                                                     :bindings (into {} (map (fn [id]
+                                                                              [id (if (= id output)
+                                                                                    {:local-shape []
+                                                                                     :placements [{:kind :owned :value id
+                                                                                                   :shard id :local-offsets []}]}
+                                                                                    {:value id :shard id})])) boundaries)}}}}
+               :steps [(distributed/compute-step {:id :loss :device :worker :duration-ns 1})]
+               :outputs [:loss]})]
+    (distributed/verify! (distributed/certify plan))
+    (is (= [] (get-in (distributed/compute-bindings plan)
+                      [:bindings :loss :values output :domain :shape])))
+    (with-open [executable (runtime/instantiate! plan {:device-capacities {device 1048576}})]
+      (runtime/run! executable)
+      (let [actual (double-array 1)
+            result (get-in (runtime/output-values executable) [:loss output])]
+        (gpu/download-range! (get (:sessions executable) device) result actual {:elements 1})
+        (is (= [expected] (vec actual))
+            "a rank-zero distributed output is the complete public loss, not an intermediate array")))))
+
+(deftest scalar-loss-as-an-explicit-rank-zero-distributed-output
+  (if @opencl/opencl-available?
+    (check-distributed-scalar-loss! :ocl:0)
+    (opencl/opencl-skip! "rank-zero distributed scalar loss"))
+  (if @ze/gpu-available?
+    (check-distributed-scalar-loss! :ze:0)
+    (ze/gpu-skip! "rank-zero distributed scalar loss")))
+
 (deftest actual-ad-all-reduce-sgd-on-colocated-opencl-workers
   (if @opencl/opencl-available?
     (check-training! :ocl:0)
