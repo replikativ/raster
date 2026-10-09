@@ -1011,6 +1011,31 @@
     (is (= :stage-once-host-repetition (get-in call [:attributes :execution])))
     (is (false? (get-in call [:attributes :source-inspected])))))
 
+(deftest equation-call-projections-cannot-cross-independent-math-requests
+  (let [{:keys [call]} (prepared-mixed-call 3)
+        request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        proof (emitted-program/validate-with-physical-results! (:program call) request)
+        projections (java.util.IdentityHashMap. (:projections proof))
+        step (first (filter program-call/emitted-equation-call? (:steps call)))
+        projections-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                    '*validated-boundary-projections*)
+        policy-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                               '*validated-projection-policy*)]
+    (is (some? step) "the request isolation check exercises a numerical equation")
+    (is (identical? call (program-call/validate! call)))
+    (is (identical? call (program-call/validate! call request)))
+    (with-bindings {projections-var projections policy-var (:scalar-math request)}
+      (is (identical? step (program-call/validate-equation-call! step request)))
+      (is (= :emitted-program-projection-math-request
+             (try (program-call/validate-equation-call! step)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (let [before (into {} projections)]
+        (is (identical? call (program-call/validate! call))
+            "a fresh default request obtains its own evidence")
+        (is (= before (into {} projections))
+            "fresh evidence is not published into a foreign request scope")))))
+
 (deftest program-target-projection-retains-boundary-artifact-validation
   (let [{:keys [call]} (prepared-mixed-call 3)
         source-program (:program call)
@@ -1701,6 +1726,33 @@
                    [output])]
     (program/->ProgramEquation [id] [:test id] nil [input] [output] algorithm [] #{}
                               {:source :test} {:host-only true})))
+
+(deftest host-evaluators-and-futures-do-not-inherit-request-proof-scopes
+  (let [value (av/tensor {:dtype :double :shape []})
+        emitted (program/make
+                 {:dialect :opencl-parallel :values {'input value 'answer value}
+                  :inputs '[input] :outputs '[answer]
+                  :equations [(host-identity-equation 'host 'input 'answer value)]})
+        request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        proof (emitted-program/validate-with-physical-results! emitted request)
+        projections-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                    '*validated-boundary-projections*)
+        policy-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                               '*validated-projection-policy*)
+        observed (atom [])
+        observe #(vector (var-get projections-var) (var-get policy-var))
+        evaluate (fn [_ {:keys [operands]}]
+                   (swap! observed conj (observe) @(future (observe)))
+                   {'answer (get operands 'input)})]
+    (with-bindings {projections-var (java.util.IdentityHashMap.)
+                   policy-var (:scalar-math request)}
+      (doseq [retained [nil proof]]
+        (let [call (program-call/make emitted {} {'input {:type :double :value 2.0}}
+                                     {} evaluate {} retained request)]
+          (is (= {:type :double :value 2.0} (get-in call [:outputs 'answer])))
+          (is (identical? call (program-call/validate! call request))))))
+    (is (= [[nil nil] [nil nil] [nil nil] [nil nil]] @observed)
+        "both fresh and retained construction clear scopes before calling user code")))
 
 (deftest staged-host-result-conflicts-use-exact-scalar-bits
   (let [value (av/tensor {:dtype :double :shape []})
