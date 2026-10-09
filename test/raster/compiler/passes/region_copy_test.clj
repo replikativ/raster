@@ -23,6 +23,8 @@
     (is (= 'y dst))
     (is (= (list 'clojure.core/+ '(clojure.core/* i out-f) index) dst-index)
         "the destination index is the copy offset plus the element ordinal")
+    (is (= 'long (:raster.type/tag (meta dst-index)))
+        "synthesized address arithmetic retains the ordinal's long width")
     (is (= (list 'clojure.core/aget 'b index) read) "a zero source offset is the bare ordinal")
     (is (= 'float (:raster.type/tag (meta read)))
         "the read carries the copied element type the call states")))
@@ -41,6 +43,8 @@
     (is (= '(clojure.core/aset out (clojure.core/+ 3 rstr_copy_1)
                                (clojure.core/aget src (clojure.core/+ 2 rstr_copy_1)))
            (nth loop 2)))
+    (is (= 'long (:raster.type/tag (meta (nth (nth loop 2) 2)))))
+    (is (= 'long (:raster.type/tag (meta (nth (nth (nth loop 2) 3) 2)))))
     (is (= '(clojure.core/aset out rstr_copy_2 (clojure.core/aget src rstr_copy_2))
            (nth zero-loop 2)))))
 
