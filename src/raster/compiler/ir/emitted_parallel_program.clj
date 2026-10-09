@@ -95,6 +95,11 @@
   [equation]
   (dissoc equation :operations))
 
+(defn- candidate-numerical-equations
+  [candidate]
+  (filterv #(not (true? (get-in % [:attributes :host-only])))
+           (get-in candidate [:body :equations])))
+
 (defn- validate-host-prefix-slices!
   "Bind every narrowed emitted body to its exact enclosing host-scalar execution prefix.
 
@@ -113,8 +118,7 @@
                   body-equations (:equations body)
                   actual-prefix (filterv #(true? (get-in % [:attributes :host-only]))
                                          body-equations)
-                  numerical-body (filterv #(not (true? (get-in % [:attributes :host-only])))
-                                          body-equations)
+                  numerical-body (candidate-numerical-equations candidate)
                   source-equations (get-in equation [:attributes :emitted-source-equations])
                   exact-source?
                   (if source-equations
@@ -211,10 +215,11 @@
   (validate-program! parallel-program equation-candidates))
 
 (defn retained-numerical-equations
-  "Project ordered semantic equations from a validated emitted program, before physical fusion.
+  "Project ordered top-level semantic equations from a validated emitted program, before fusion.
 
    Host-only shape/scalar equations and target operation sequences are excluded. A compound
    emission expands its retained numerical body, not its kernel count or generated name.
+   Nested control remains in its enclosing equation's algorithm; this does not flatten loops.
    Every dispatch alternative must preserve the same semantic projection. This is structural
    provenance, not a proof of an application's mathematical interpretation of these equations."
   [parallel-program]
@@ -230,13 +235,12 @@
                     projections
                     (mapv (fn [candidate]
                             (mapv scheduled-equation-view
-                                  (remove #(true? (get-in % [:attributes :host-only]))
-                                          (get-in candidate [:body :equations]))))
+                                  (candidate-numerical-equations candidate)))
                           (equation-candidates (first (:operations equation))))
                     projected (first projections)]
                 (when-not (and (seq projections)
                                (= expected (mapv :id projected))
-                               (every? #(= projected %) projections))
+                               (every? #(semantic-fingerprint/equivalent? projected %) projections))
                   (throw (ex-info "compound alternatives differ in retained semantic equations"
                                   {:reason :emitted-program-semantic-projection
                                    :equation (:id equation)})))

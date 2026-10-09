@@ -45,7 +45,10 @@
     (is (pos? (get-in compiler-report [:emission :kernel-count])))
     (is (= #{:kernel-body}
            (set (keys (get-in compiler-report [:emission :routes])))))
-    (is (= :opencl-parallel (:dialect (:emitted-program diagnostic))))))
+    (is (= :opencl-parallel (:dialect (:emitted-program diagnostic))))
+    (is (some #(control/loop-program? (:algorithm %))
+              (emitted-program/retained-numerical-equations (:emitted-program diagnostic)))
+        "a structured loop remains one semantic equation with its nested control")))
 
 (deftest wrapping-casts-do-not-prove-shape-projections
   (is (= 'xs (#'route/shape-projection-source '(clojure.core/long (alength xs)))))

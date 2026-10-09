@@ -3464,8 +3464,8 @@ fields with the independent coordinate oracle at the existing 1e-11 tolerance.
 They also check composite mass and exact average-down. The second invocation
 uses the resident committed state without a host upload; original host arrays
 remain unchanged. Focused tests pass 4 tests / 47 assertions on actual OpenCL and
-Level Zero with no capability skips reported. Fresh-process CI and independent
-review remain required before landing.
+Level Zero with no capability skips reported. PR #1127 landed after exact-head
+independent approval and all seven fresh-process/compiler CI contexts succeeded.
 
 This boundary is not yet an AMR temporal certificate or a distributed cycle.
 The next planner slice must explicitly bind the exact existing program and its
@@ -3523,3 +3523,15 @@ geometry and numerical-stage meaning must remain explicitly trusted producer
 attestations, bound into the certificate but not advertised as topology-byte or
 PDE correctness proofs. A later content-addressed constant projection can make
 the geometry-to-initializer correspondence independently checkable.
+
+`emitted-parallel-program/retained-numerical-equations` now supplies the shared
+top-level semantic projection needed by stage coverage. It validates the emitted
+program, excludes host-only setup and physical operation sequences, and expands
+the retained source equations of a compound emission. Dispatch alternatives
+must agree under the existing canonical fingerprint relation, including NaN and
+signed-zero semantics; expanded equation IDs must remain unique. Structured
+loops retain their nested control under one outer equation. Physical fusion
+does not erase the numerical spine or authorize an application interpretation.
+Host-prefix validation and projection use one numerical-body extraction helper.
+Affected provenance/fusion/dispatch/structured-control suites pass 72 tests /
+685 assertions on the capped warm REPL; fresh CI remains a landing requirement.
