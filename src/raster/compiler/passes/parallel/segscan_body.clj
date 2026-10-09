@@ -14,6 +14,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
@@ -180,7 +181,7 @@
 
 (defn- element-operations
   [operation context]
-  (let [{:keys [result-type pointer-ids scalar-ids scalar-type scan-algebra]} context
+  (let [{:keys [result-type pointer-ids scalar-ids scalar-type scan-algebra scalar-math]} context
         source-index (:name (segop/seg-space-reduced-dim (:space operation)))
         ;; Algebra owns reassociation evidence; the scheduled operator owns the concrete typed
         ;; element. In particular, do not execute a scalar-conversion source projection stored in
@@ -202,6 +203,7 @@
            (index-expression/lower form (set/union index-scope extra-scope) decline!)))
         lowerer (scalar-expression/make-lowerer
                  {:array-types array-types :scalar-types scalar-types
+                  :scalar-math scalar-math
                   :arrays (set pointer-ids) :index-scope index-scope
                   :lower-index lower-index :predicate nil
                   :id-prefix "scan-element" :decline! decline!})
@@ -461,7 +463,7 @@
   [operation options]
   (let [context (merge (common-context operation options)
                        (select-keys options [:uses :buffers :temporary-ids :output-ids
-                                             :scan-algebra :scan-mode :scan-workgroup]))
+                                             :scan-algebra :scan-mode :scan-workgroup :scalar-math]))
         kernel-body (case (:phase context)
                       (:single :intra-block) (scan-node-body operation context)
                       :block-scan (block-scan-body operation context)
@@ -495,7 +497,10 @@
                          :rounding (if (dtype/integral? accumulator-dtype)
                                      :exact :implementation-defined)
                          :accumulator-dtype accumulator-dtype}
-                  (dtype/integral? accumulator-dtype) (assoc :overflow (:overflow algebra)))
+                  (dtype/integral? accumulator-dtype) (assoc :overflow (:overflow algebra))
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options))))
       :provenance {:dialect :kernel-body :source-dialect :segscan
                    :segop-id (:id operation)}
       :attributes {:phase phase :dtype accumulator-dtype :scan-mode (:scan-mode options)
@@ -535,7 +540,8 @@
                          :actual (get-in kernel-graph [:attributes field])})))
         scheduled (schedule
                    (:operation node)
-                   {:uses (:uses node)
+                   (merge (select-keys options [:scalar-math])
+                          {:uses (:uses node)
                     :buffers (into {} (map (juxt :id identity))
                                    (concat (:inputs kernel-graph) (:outputs kernel-graph)
                                            (:temporaries kernel-graph)))
@@ -543,7 +549,7 @@
                     :output-ids (set (map :id (:outputs kernel-graph)))
                     :scan-algebra algebra :scan-mode scan-mode
                     :scan-workgroup (or (get-in first-scan [:grid :block-size]) 256)
-                    :scalar-types (merge legacy-bound-types supplied declared)})]
+                    :scalar-types (merge legacy-bound-types supplied declared)}))]
     ;; Direct legacy graph constructors predate explicit GraphScalar declarations.
     ;; Typed production graphs must close their scalar dependencies here as well.
     (if (some? (:scalars kernel-graph))

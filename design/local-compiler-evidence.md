@@ -2126,7 +2126,15 @@ every logical output with independent CPU prefix sums, including the exclusive
 scan's final total at output index 1025 (2 tests / 8 assertions, no skips).
 These exactly representable inputs test schedule/indexing/replay correctness,
 not arbitrary floating-point reassociation accuracy or distributed performance.
-No scan math-policy selection has been enabled by this migration.
+No public scan math-policy selection has been enabled by this migration.
+
+The private scan schedule now forwards explicit scalar-math consent into the
+shared element lowerer and retains normalized consent across all three stages.
+Reconstruction requires matching caller-owned consent; missing or empty consent
+cannot validate a selected candidate. Logical dtype, launch, interface, effects
+and tree-reassociation rules are unchanged. The selected Float math leaf records
+its physical Double requirement. The affected compiler/codec/boundary suites and
+native default-route replays pass 65 tests / 479 assertions in the warm REPL.
 
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,

@@ -451,6 +451,37 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (sg/generate-scan-kernel-graph graph :array-types {'values :float})))))
 
+(deftest scan-math-consent-is-retained-and-independently-reconstructed
+  (let [element (with-meta '(Math/tanh (clojure.core/aget values i))
+                  {:raster.type/tag 'float})
+        form (list 'raster.par/scan 'out 'acc 0.0 'i 'n 'float (list '+ 'acc element))
+        source (soac/par-form->soac 'scan-result form 909 :dtype :float)
+        graph (lower/scan-kernel-graph source (lower/lower-scan source nil :dtype :float) {})
+        node (first (:nodes graph))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (segscan-body/schedule-for-node node graph {})
+        selected (segscan-body/schedule-for-node node graph {:scalar-math policy})]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (= selected (segscan-body/validate-against-node!
+                     selected node graph {:scalar-math policy})))
+    (doseq [options [{} {:scalar-math {:overrides {}}}]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (segscan-body/validate-against-node! selected node graph options))))
+    (doseq [stage (:nodes graph)
+            :let [baseline (segscan-body/schedule-for-node stage graph {})
+                  chosen (segscan-body/schedule-for-node stage graph {:scalar-math policy})]]
+      (is (= policy (get-in chosen [:numerics :scalar-math])))
+      (is (= (select-keys baseline [:arguments :scalar-bindings :legality :effects])
+             (select-keys chosen [:arguments :scalar-bindings :legality :effects])))
+      (is (= chosen (segscan-body/validate-against-node!
+                     chosen stage graph {:scalar-math policy}))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))
+
 (deftest legacy-scan-scalars-still-require-type-evidence
   (let [form '(raster.par/scan out acc 0.0 i n double
                                (+ acc (* scale (aget values i))))
