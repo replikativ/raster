@@ -68,7 +68,12 @@
   (let [offset (descriptor/unwrap-int-cast offset)]
     (if (and (number? offset) (zero? offset))
       index
-      (list 'clojure.core/+ offset index))))
+      ;; The generated dotimes ordinal is long. Its addition to the integral copy
+      ;; offset therefore has a known long result, independently of element dtype.
+      ;; Retain that fact for typed address/range consumers; do not ask them to
+      ;; reconstruct arithmetic types from an unannotated synthesized expression.
+      (with-meta (list 'clojure.core/+ offset index)
+        {:raster.type/tag 'long :tag 'long}))))
 
 (defn- store-loop
   "The counted store loop equal to a copy call."
