@@ -231,9 +231,12 @@
                    (some #(= :float (second %)) as)     ; any float operand → float op, coerce rest
                    [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]
                    (some #(= :int (second %)) as)        ; int op (widening MAC subtract/add)
-                   (if-let [iop (in/simd-op isa op :i32)]
-                     [(str iop "(" (str/join ", " (map to-int as)) ")") :int]
-                     (throw (ex-info "csimd: no int vector op" {:op op})))
+                   (if (= :int (dtype/dtype-for-scalar-tag (:raster.type/tag (meta e))))
+                     (if-let [iop (in/simd-op isa op :i32)]
+                       [(str iop "(" (str/join ", " (map to-int as)) ")") :int]
+                       (throw (ex-info "csimd: no int vector op" {:op op})))
+                     (throw (ex-info "csimd: integer lane arithmetic requires retained i32 evidence"
+                                     {:op op :reason :unsupported-integer-lane-width})))
                    :else                                 ; all poly → default float
                    [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]))
                :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr e}))))]

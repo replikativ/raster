@@ -1667,3 +1667,22 @@ around four-lane boundaries. These checks use the ordinary native floating-point
 environment; they do not certify semantics under a modified host rounding mode.
 The Q4/Q8 x8 quant folds still require integer-width-aware vector conversion of
 their folded integer dots; this floating-only schedule does not close that debt.
+
+### Integer lane width must survive widening into Float
+
+A public typed map reading an Int array, subtracting a Long offset and storing
+Float reproduced a separate miscompile. For Integer/MAX_VALUE minus -1 at length
+nine, the old eight-lane i32 subtraction produced negative values, while the JVM
+and scalar tail produced positive values. A Long offset of 2^32 also exposed
+truncated scalar broadcasts. Known Int storage is not proof that its subsequent
+Long arithmetic may execute at i32 width.
+
+Int-domain SIMD arithmetic now requires retained i32 result evidence; Long or
+missing widths retain scalar execution. Public changed-input tests cover these
+boundaries, while a positive typed Integer subtraction still emits i32 operations
+and Float widening and agrees with the JVM. The old emitter fixture claimed Long
+subtraction while checking an i32 schedule; it now supplies genuine i32 evidence.
+This is a width check, not a new checked-overflow or general integer certificate.
+Restoring Long quant-fold vectorization requires a width-preserving i64 schedule
+and conversions, or proven range refinement from the general compiler—not an
+assumption that quantization-specific values fit i32.
