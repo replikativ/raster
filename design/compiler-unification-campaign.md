@@ -3556,3 +3556,39 @@ on the warm REPL; exact-head review and fresh CI remain landing requirements.
 Together with the existing numerical/device/provider suites, the affected AMR
 check passes 18 tests / 374 assertions, including actual OpenCL and Level Zero
 cycles and synchronized restart with no capability skips reported.
+
+The next execution-binding investigation confirms that an ordinary one-worker,
+one-compute DistributedPlan can bind both resident cycle state owners through
+existing explicit `[4,4]` local domains over their flat `[16]` ABI leaves. Normal
+`compute-bindings` derives `:read-write` for both fields and normal readiness
+accepts the plan's initialization/dataflow. Values still require an explicit
+sharding facet; no layout or sharding inference was added to bypass that rule.
+The probe allocates no driver resources and is not yet a certified AMR execution,
+runtime demonstration, durable publication or measured cost result. Next bind
+this exact local program and these whole-patch domains to a verified
+hierarchy-only workload and the temporal producer evidence.
+
+The bounded temporal execution facet now independently checks that workload,
+its sole distributed compute binding, and the original sealed Prepared against
+the producer's stage/timestep/field evidence. Both whole state owners require
+shared-authority complete-write coverage. Physical register evidence requires
+a complete private reset, coarse transport, fine transport and final reflux
+consumption in order; release and observed completion remain unproven.
+
+The new certificate does not retain mutable initializer arrays: its verified
+workload witness omits the ordinary live distributed certificate, while its
+source-free distributed projection replaces the single local LinkPlan with the
+existing exact execution identity. The original workload and Prepared remain
+owners outside this structural witness. Readiness still independently checks
+initializer source identity, but the retained obligations exclude source objects.
+Geometry fingerprints and synchronized input state remain explicit producer
+attestations, not verified bytes, CFL or conservation proofs.
+
+This investigation exposed missing Long result metadata in synthesized region-copy
+address additions. Retaining the known counted ordinal width lets the existing
+range/coverage authority prove full-field commits; no coverage predicate was
+weakened. Whole copies with nonzero source offsets pass, while shifted/short
+destination copies remain partial. The prerequisite is PR #1130. The focused
+warm-REPL copy/coverage/execution suites pass 14 tests / 58 assertions with no
+failures or errors. The temporal facet is still under review and has not yet
+demonstrated distributed runtime execution or durable publication.
