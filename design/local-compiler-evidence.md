@@ -2214,3 +2214,14 @@ The two focused contraction suites pass 41 tests / 324 assertions in the warm
 REPL. This is policy plumbing, not matrix accuracy or model-gradient acceptance.
 Mixed-matrix stage reconstruction and other remaining owners still need the
 same closed vertical before public policy selection can be enabled.
+
+Mixed-matrix stage body projection now accepts independent caller options for
+scalar math. Policy survives direct, batched and split-K specification projection
+and is retained in the scheduled matrix numerical contract. Existing arities
+reconstruct default math; no consent is inferred from candidate certificates.
+Direct and batched selected-tanh regressions check unchanged parameters/launch,
+physical FP64 demand and stripped-consent rejection. The split-K fixture checks
+retention of unused consent without FP64 demand. GEMM and matrix-plan suites pass
+39 tests / 1257 assertions in the warm REPL. This closes the stage-body owner,
+not whole-graph numerical admission, target execution support or model validation;
+public selection is still disabled.
