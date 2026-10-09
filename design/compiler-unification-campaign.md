@@ -3464,8 +3464,8 @@ fields with the independent coordinate oracle at the existing 1e-11 tolerance.
 They also check composite mass and exact average-down. The second invocation
 uses the resident committed state without a host upload; original host arrays
 remain unchanged. Focused tests pass 4 tests / 47 assertions on actual OpenCL and
-Level Zero with no capability skips reported. Fresh-process CI and independent
-review remain required before landing.
+Level Zero with no capability skips reported. PR #1127 landed after exact-head
+independent approval and all seven fresh-process/compiler CI contexts succeeded.
 
 This boundary is not yet an AMR temporal certificate or a distributed cycle.
 The next planner slice must explicitly bind the exact existing program and its
@@ -3478,3 +3478,60 @@ certificate-bound facet rather than unchecked attributes. Initial synchronizatio
 CFL stability and the mathematical meaning of the pinned numerical producer
 remain separate obligations. No adaptive hierarchy, multi-patch cycle, mid-cycle
 restart, storage recycling or asynchronous completion proof is claimed.
+
+#### Temporal binding investigation
+
+The current synthetic Intel preparation retains 26 source equations in the cycle
+program: three host-only shape equations and 23 device submissions, followed by
+the two state-commit submissions. These counts are observations of this retained
+artifact, not a fixed schedule contract or a numerical correctness criterion.
+Retained equation result-storage metadata and the validated ordered memory report
+provide the storage/effect boundary; source equations must remain authoritative
+if fusion later changes the physical submission count. Matching generated kernel
+names, destination names or counts does not establish interpolation/reflux math.
+
+No new patch-reshape machinery is needed for the next distributed binding.
+`distributed-compute` already admits explicit local domains with one plain dense,
+equal-volume ABI leaf, matching dtype and row-major coordinates. A flat numerical
+ABI can therefore bind a rectangular patch through existing `:local-shape` and
+owned `:placements`, with bounds and coverage checked by the same authority.
+This does not permit arbitrary strides, quantized representations or aliasing.
+
+The temporal facet must retain the hierarchy/state/distributed certificates and
+exact prepared-program identity, distinguish the two state owners, and bind
+register reset/update/consumption evidence to the complete-cycle compute call.
+It must preserve the existing source-read/target-write transfer witness unchanged.
+Source-level temporal stage meaning is explicit producer evidence; ordering,
+storage coverage and exact artifact correspondence are independently checked.
+The facet must reject changed geometry, timestep, stage coverage, field mappings,
+completion call or retained program instead of accepting descriptive fingerprints
+as a certificate. Publication still needs real completion and durable-byte
+evidence; ordered memory accesses cannot authorize release or scratch recycling.
+
+The planning review favors a separate certified temporal execution facet over a
+schema-2 extension at this stage. Attach it to a verified schema-1
+`:hierarchy-only` workload and retain the original sealed Prepared at the ODE /
+execution layer, avoiding a compiler-IR dependency on `gpu.compiled`. Neither
+the existing transfer-cycle mode nor its two-role implementation witness changes.
+Start with pure stage/effect attestation and tamper verification, then bind the
+actual provider and project one ordinary distributed compute entry. Generalized
+multi-patch/adaptive temporal planning is the point to reconsider schema 2.
+
+Exact program identity deliberately excludes initializer bytes. A same-shaped
+topology/coefficient change need not alter it. For the first temporal facet,
+geometry and numerical-stage meaning must remain explicitly trusted producer
+attestations, bound into the certificate but not advertised as topology-byte or
+PDE correctness proofs. A later content-addressed constant projection can make
+the geometry-to-initializer correspondence independently checkable.
+
+`emitted-parallel-program/retained-numerical-equations` now supplies the shared
+top-level semantic projection needed by stage coverage. It validates the emitted
+program, excludes host-only setup and physical operation sequences, and expands
+the retained source equations of a compound emission. Dispatch alternatives
+must agree under the existing canonical fingerprint relation, including NaN and
+signed-zero semantics; expanded equation IDs must remain unique. Structured
+loops retain their nested control under one outer equation. Physical fusion
+does not erase the numerical spine or authorize an application interpretation.
+Host-prefix validation and projection use one numerical-body extraction helper.
+Affected provenance/fusion/dispatch/structured-control suites pass 72 tests /
+685 assertions on the capped warm REPL; fresh CI remains a landing requirement.

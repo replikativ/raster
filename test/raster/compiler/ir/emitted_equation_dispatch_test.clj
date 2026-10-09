@@ -138,6 +138,9 @@
     (check-candidate-proof-reuse! (first alternatives) certified
                                  emitted-equation/contraction-write-domains)
     (is (= program (emitted-program/validate! program)))
+    (is (= (mapv :id (remove #(true? (get-in % [:attributes :host-only]))
+                            (:equations program)))
+           (mapv :id (emitted-program/retained-numerical-equations program))))
     (let [reversed (equation-dispatch/make (vec (reverse alternatives))
                                          (contraction-selection (vec (reverse alternatives)))
                                          policy)
@@ -441,6 +444,9 @@
     (check-candidate-proof-reuse! reference certified emitted-equation/complete-write-domains)
     (is (equation-dispatch/emitted-equation-dispatch? certified))
     (is (= program (emitted-program/validate! program)))
+    (is (= (:algorithm (peek (:equations program)))
+           (:algorithm (peek (emitted-program/retained-numerical-equations program))))
+        "SWR dispatch retains the outer semantic reduction, not a selected physical leaf")
     (let [arguments [(float-array 15) (float-array 15) (float-array 15)
                      (long-array [0 0 2 2]) (long-array [1 1 0 2]) 3 4 5 2]
           linked (equation-first/lower (assoc reference-compilation :emitted program)
