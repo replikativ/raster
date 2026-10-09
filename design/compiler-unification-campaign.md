@@ -1,5 +1,24 @@
 # Compiler unification campaign
 
+### October 9 physical topology admission
+
+Reconstruction of a topology now reruns the existing device/link constructors,
+not just their record-type and endpoint checks. Before this fix a modified link
+with NaN bandwidth simulated and freshly certified with a 700 ns makespan in
+the data-parallel fixture. Nonfinite/nonpositive bandwidth, invalid latency,
+memory capacity, descriptor and attributes now fail through the existing field
+contracts. Modified topology indexes must also match their contained record
+identities and retain actual device/link maps. Constructor, simulation, fresh
+certification and verification regression cases cover these boundaries. Pre-plan
+route-cost queries also validate each visited link and its index identity, without
+rescanning the entire topology for each transfer.
+
+The affected hardware-free plan, compute-binding and AMR-plan suites pass
+65 tests / 405 assertions. No valid constructor API or numerical policy changes;
+this rejects malformed physical claims, not measured-but-inaccurate costs.
+Explicit shared-link serialization domains, calibrated fabric costs, the held
+training gate and the remaining distributed/AMR workload obligations remain open.
+
 ### October 9 distributed capture and physical-model reconciliation
 
 PR #1136 is merged as `4fb7ec5b` and #1137 as `9f39cd6e`, each after independent
@@ -33,12 +52,15 @@ load-conditioned calibration and actual asynchronous distributed execution remai
 open. Never infer physical overlap merely from asynchronous API shape.
 
 Device-level calibration already feeds the single HardwareDescriptor and its
-evidence signature; it is not yet distributed route calibration. The current CPU
-microbench tags nonstationary bandwidth `:measured-noisy`, but still persists it
-and overlays its numeric value. That is a confidence label, not an admission or
-expiry policy. Stationarity, power/load regime, calibration validity and fabric
-contention need explicit evidence before treating those estimates as reliable
-production-selection facts. Reuse existing Link device-event profiling when
+evidence signature; it is not yet distributed route calibration. The CPU
+microbench retains nonstationary bandwidth as `:measured-noisy` for inspection.
+Since #1139, those observations do not replace planning estimates: the existing
+descriptor authority admits only positive finite fields tagged `:measured`,
+rejects explicitly nonstationary bandwidth, and requires complete, alias-consistent
+peak-FLOPS families. This admission does not establish an expiry policy or immunity
+to systematic bias. Power/load regime, calibration validity and fabric contention
+still need explicit evidence before treating estimates as reliable production-selection
+facts. Reuse existing Link device-event profiling when
 instrumenting distributed execution, rather than measuring repeated mutations of
 a completed one-shot owner or inventing a second timing/cache convention.
 

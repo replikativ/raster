@@ -65,6 +65,59 @@
               :dependencies [:independent-gradient-1 :send-gradient]})]
     :outputs [:apply-gradient]}))
 
+(deftest topology-revalidates-modified-physical-facts
+  (let [base (training-plan)
+        certified (distributed/certify base)]
+    (doseq [[path value reason]
+            [[[:devices :gpu-0 :memory-capacity-bytes] -1 :distributed-device-memory]
+             [[:devices :gpu-0 :memory-capacity-bytes] 1.5 :distributed-device-memory]
+             [[:devices :gpu-0 :descriptor] true :distributed-device-descriptor]
+             [[:devices :gpu-0 :attributes] nil :distributed-device-attributes]
+             [[:links :gpu-0->gpu-1 :bandwidth-bytes-s] Double/NaN :distributed-link-bandwidth]
+             [[:links :gpu-0->gpu-1 :bandwidth-bytes-s] Double/POSITIVE_INFINITY :distributed-link-bandwidth]
+             [[:links :gpu-0->gpu-1 :bandwidth-bytes-s] 0 :distributed-link-bandwidth]
+             [[:links :gpu-0->gpu-1 :bandwidth-bytes-s] -1 :distributed-link-bandwidth]
+             [[:links :gpu-0->gpu-1 :latency-ns] Double/NaN :distributed-link-latency]
+             [[:links :gpu-0->gpu-1 :latency-ns] -1 :distributed-link-latency]
+             [[:links :gpu-0->gpu-1 :kind] "pcie" :distributed-link-kind]
+             [[:links :gpu-0->gpu-1 :attributes] nil :distributed-link-attributes]]
+            :let [candidate (assoc-in base (into [:topology] path) value)
+                  topology (:topology candidate)]]
+      (doseq [check (cond-> [#(distributed/topology (vals (:devices topology)) (vals (:links topology)))
+                            #(distributed/simulate candidate)
+                            #(distributed/certify candidate)
+                            #(distributed/verify! (assoc certified :plan candidate))]
+                     (= :links (first path))
+                     (conj #(distributed/transfer-duration-ns topology (nth (:steps candidate) 2))))]
+        (is (= reason (try (check) nil
+                           (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            (str path " must reject modified physical facts before planning"))))))
+
+(deftest topology-map-indexes-cannot-alias-record-identities
+  (let [base (training-plan)
+        certified (distributed/certify base)]
+    (doseq [kind [:devices :links]
+            value [nil [] true]
+            :let [candidate (assoc-in base [:topology kind] value)]]
+      (is (= :distributed-topology-index
+             (try (distributed/validate! candidate) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (doseq [[kind id] [[:devices :gpu-0] [:links :gpu-0->gpu-1]]
+            :let [candidate (update-in base [:topology kind]
+                                       (fn [index] (assoc (dissoc index id) :alias (get index id))))]]
+      (when (= :links kind)
+        (is (= :distributed-topology-index
+               (try (distributed/transfer-duration-ns
+                     (:topology candidate) (assoc (nth (:steps candidate) 2) :route [:alias]))
+                    nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+      (doseq [check [#(distributed/validate! candidate)
+                     #(distributed/certify candidate)
+                     #(distributed/verify! (assoc certified :plan candidate))]]
+        (is (= :distributed-topology-index
+               (try (check) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
+
 (deftest rank-zero-values-can-be-replicated-but-not-partitioned
   (let [base (training-plan)
         scalar (abstract-value/tensor

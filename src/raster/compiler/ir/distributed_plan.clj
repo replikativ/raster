@@ -136,7 +136,8 @@
   (->TopologyLink id source target kind bandwidth-bytes-s latency-ns attributes))
 
 (defn topology
-  "Construct a topology from DeviceResource and directed TopologyLink values."
+  "Construct a topology from DeviceResource and directed TopologyLink values.
+   Revalidate their physical fields: a record type alone does not admit modified facts."
   [devices links]
   (let [devices (vec devices)
         links (vec links)]
@@ -146,6 +147,8 @@
     (when-not (every? topology-link? links)
       (fail! "cluster topology links must be TopologyLink values"
              :distributed-topology-link-type {:links links}))
+    (doseq [candidate devices] (device candidate))
+    (doseq [candidate links] (link candidate))
     (unique-by! "cluster topology devices" :distributed-topology-device-identities :id devices)
     (unique-by! "cluster topology links" :distributed-topology-link-identities :id links)
     (let [device-ids (set (map :id devices))]
@@ -708,6 +711,15 @@
         (when-not candidate
           (fail! "transfer route names an undeclared topology link"
                  :distributed-transfer-link {:step id :link link-id}))
+        (when-not (topology-link? candidate)
+          (fail! "transfer route requires a TopologyLink value"
+                 :distributed-topology-link-type {:step id :link link-id}))
+        ;; Cost queries also occur before a whole plan is constructed. Revalidate only
+        ;; visited links here, rather than rescanning the entire topology for each route.
+        (link candidate)
+        (when-not (= link-id (:id candidate))
+          (fail! "transfer route link index does not match its record identity"
+                 :distributed-topology-index {:step id :link link-id :record-id (:id candidate)}))
         (when-not (= current (:source candidate))
           (fail! "transfer route is not directionally contiguous"
                  :distributed-transfer-continuity
@@ -1072,8 +1084,17 @@
     (when-not (cluster-topology? topology)
       (fail! "distributed plan requires a ClusterTopology"
              :distributed-plan-topology {:topology topology}))
-    (raster.compiler.ir.distributed-plan/topology
-     (vals (:devices topology)) (vals (:links topology)))
+    (when-not (and (map? (:devices topology)) (map? (:links topology)))
+      (fail! "cluster topology requires device and link identity maps"
+             :distributed-topology-index
+             {:devices-type (type (:devices topology)) :links-type (type (:links topology))}))
+    (let [canonical (raster.compiler.ir.distributed-plan/topology
+                     (vals (:devices topology)) (vals (:links topology)))]
+      (when-not (= (select-keys canonical [:devices :links])
+                   (select-keys topology [:devices :links]))
+        (fail! "cluster topology indexes must match their contained record identities"
+               :distributed-topology-index
+               {:devices (keys (:devices topology)) :links (keys (:links topology))})))
     (when-not (set/subset? (set (:devices mesh)) (set (keys (:devices topology))))
       (fail! "device mesh is not contained in the cluster topology"
              :distributed-plan-mesh-topology
