@@ -41,7 +41,10 @@
         graph (equation-graph/make algorithm body)
         node (first (:nodes graph))
         operation (:operation node)
-        certificate (segred-body/schedule operation (first (:outputs operation)) options)]
+        ;; This fixture schedules a graph node directly, so supply the retained long type
+        ;; of the host-prefix extent as the production graph emitter does.
+        certificate (segred-body/schedule operation (first (:outputs operation))
+                                          (assoc-in options [:scalar-types 'extent] :long))]
     (is (seq (equation-graph/validated-storage-scalars graph algorithm body)))
     (is (= certificate (segred-body/validate-against-node! certificate node graph algorithm body)))
     (is (not (contains? (:attributes graph) :scalar-definitions)))
