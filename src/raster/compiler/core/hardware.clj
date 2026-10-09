@@ -31,7 +31,8 @@
   compiler's analytic fields; the derivations below operate on that. So the runtime owns
   the probing; the compiler owns the schedule math, over one record for :cpu and :gpu."
   (:require [raster.runtime.hardware :as rt]
-            [raster.compiler.core.dtype :as dtype]))
+            [raster.compiler.core.dtype :as dtype]
+            [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
 ;; Element widths — bytes per scalar of a raster dtype keyword.
@@ -174,6 +175,56 @@
     :unavailable 0
     1))
 
+(defn- scalar-execution-capabilities
+  "Retain explicit scalar execution facts. Missing facts remain unknown; throughput is not support."
+  [target-type caps source]
+  (let [authoritative? #(contains? #{:user :detected :observed} (source-of source % :unavailable))
+        declared (:scalar-dtypes caps)
+        _ (when (and (contains? caps :scalar-dtypes) (authoritative? :scalar-dtypes)
+                     (not (and (set? declared) (every? dtype/known? declared))))
+            (throw (ex-info "scalar execution dtypes must be an explicit supported dtype set"
+                            {:reason :hardware-scalar-dtypes-invalid :value declared})))
+        declared (when (and declared (authoritative? :scalar-dtypes))
+                   (set (map dtype/canon declared)))
+        extensions (when (and (= :ocl target-type) (contains? caps :extensions)
+                              (authoritative? :extensions))
+                     (when-not (string? (:extensions caps))
+                       (throw (ex-info "OpenCL extension facts require the reported string"
+                                       {:reason :hardware-scalar-extensions-invalid})))
+                     (set (str/split (:extensions caps) #"\s+")))
+        facts (concat
+               (when declared
+                 (for [dt (keys dtype/dtype-info)]
+                   [dt (contains? declared dt) (source-of source :scalar-dtypes :unavailable)]))
+               (for [[dt key] [[:half :fp16?] [:double :fp64?]]
+                     :when (and (contains? caps key) (authoritative? key))]
+                 (do (when-not (instance? Boolean (get caps key))
+                       (throw (ex-info "scalar execution flags must be booleans"
+                                       {:reason :hardware-scalar-flag-invalid :field key :value (get caps key)})))
+                     [dt (get caps key) (source-of source key :unavailable)]))
+               (when extensions
+                 [[:half (contains? extensions "cl_khr_fp16") (source-of source :extensions :unavailable)]
+                  [:double (boolean (some extensions ["cl_khr_fp64" "cl_amd_fp64"]))
+                   (source-of source :extensions :unavailable)]]))
+        selected (reduce (fn [result [dt supported? provenance :as fact]]
+                           (if-let [[_ previous previous-source] (get result dt)]
+                             (let [rank (provenance-rank provenance)
+                                   previous-rank (provenance-rank previous-source)]
+                               (when (and (= rank previous-rank) (not= supported? previous))
+                                 (throw (ex-info "equivalent scalar execution facts disagree"
+                                                 {:reason :hardware-scalar-dtype-conflict :dtype dt})))
+                               (if (> rank previous-rank) (assoc result dt fact) result))
+                             (assoc result dt fact))) {} facts)]
+    (when (seq selected)
+      {:support (into {} (map (fn [[dt [_ supported? _]]]
+                               [dt (if supported? :supported :unsupported)])) selected)
+       :provenance (into {} (map (fn [[dt [_ _ provenance]]] [dt provenance])) selected)})))
+
+(defn scalar-dtype-support
+  "Frozen execution capability: :supported, :unsupported or :unknown. Never inferred from cost."
+  [descriptor dt]
+  (get-in descriptor [:execution :scalar-dtype-support (dtype/canon dt)] :unknown))
+
 (defn- best-capability
   "Select among equivalent backend-native keys by provenance, with candidate order breaking ties.
    A detected/user alias must override a differently-spelled catalogue key."
@@ -246,7 +297,8 @@
    one facet: a SET of legal cooperative widths plus a distinct preferred width. A preference is
    not a hardware invariant and a schedule must still record the concrete width it selected."
   [target-type caps source]
-  (let [[widths-key widths-value]
+  (let [scalar-execution (scalar-execution-capabilities target-type caps source)
+        [widths-key widths-value]
         (best-capability caps source [:subgroup-sizes :supported-subgroup-sizes
                                       :wavefront-sizes :wave-sizes])
         [preferred-key preferred-value]
@@ -321,6 +373,7 @@
                      :max-workgroup-size (if maximum-key
                                            (source-of source maximum-key :derived)
                                            :derived)}
+                     scalar-execution (assoc :scalar-dtype-support (:provenance scalar-execution))
                      dimensions-key
                      (assoc :max-workgroup-dims
                             (source-of source dimensions-key :derived))
@@ -338,6 +391,7 @@
                     :preferred-subgroup-size preferred-subgroup-size
                     :max-workgroup-size maximum-workgroup-size
                     :provenance provenance}
+                    scalar-execution (assoc :scalar-dtype-support (:support scalar-execution))
                     dimensions (assoc :max-workgroup-dims dimensions)
                     scratchpad (assoc :scratchpad-bytes
                                       (positive-limit :scratchpad-bytes scratchpad))

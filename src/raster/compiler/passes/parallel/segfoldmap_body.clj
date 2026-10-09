@@ -13,6 +13,7 @@
             [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
@@ -68,7 +69,7 @@
 
 (defn- lower-ordered
   "Apply the portable one-work-item-per-segment schedule to a SegFoldMap."
-  [segfold {:keys [workgroup-size array-types scalar-types]
+  [segfold {:keys [workgroup-size array-types scalar-types scalar-math]
             :or {array-types {} scalar-types {}}}]
   (when-not (segop/seg-fold-map? segfold)
     (throw (ex-info "fold-map KernelBody lowering requires SegFoldMap"
@@ -227,6 +228,7 @@
                         scalar-types)
         scalar-lower (scalar-expression/make-lowerer
                       {:array-types array-types :scalar-types scalar-types
+                       :scalar-math scalar-math
                        :arrays (set inputs) :index-scope index-scope
                        :lower-index lower-index :predicate nil
                        :id-prefix "foldmap" :decline! decline!})
@@ -350,9 +352,12 @@
                  :association :ordered
                  :source-grid (:grid segfold)
                  :aliasing :no-write-alias}
-      :numerics {:mode :exact
-                 :policy :declaration-order
-                 :reassociation :none}
+      :numerics (cond-> {:mode :exact
+                         :policy :declaration-order
+                         :reassociation :none}
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options))))
       :provenance {:dialect :kernel-body :source-dialect :segfoldmap
                    :segop-id (:id segfold)}
       :attributes {:array-params (vec (concat inputs outputs))
@@ -368,7 +373,7 @@
    partials through a portable shared-memory tree. After all folds complete, lanes traverse the
    dense final map cooperatively. This is a schedule for the general SegFoldMap algebra; no
    normalization, quantization format, or tensor-library operation is recognized here."
-  [segfold {:keys [workgroup-size array-types scalar-types]
+  [segfold {:keys [workgroup-size array-types scalar-types scalar-math]
             :or {array-types {} scalar-types {}}}]
   (when-not (segop/seg-fold-map? segfold)
     (throw (ex-info "cooperative fold-map lowering requires SegFoldMap"
@@ -509,6 +514,7 @@
         base-env (merge (zipmap (map :name segment-dims) (repeat :long)) scalar-types)
         scalar-lower (scalar-expression/make-lowerer
                       {:array-types array-types :scalar-types scalar-types
+                       :scalar-math scalar-math
                        :arrays (set inputs) :index-scope index-scope
                        :lower-index lower-index :predicate nil
                        :id-prefix "cooperative-foldmap" :decline! decline!})
@@ -720,7 +726,10 @@
                    :reassociation :implementation-defined}
                   (= 1 (count (:folds segfold)))
                   (assoc :accumulator-dtype
-                         (dtype/canon (:dtype (first (:folds segfold))))))
+                         (dtype/canon (:dtype (first (:folds segfold)))))
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options))))
       :provenance {:dialect :kernel-body :source-dialect :segfoldmap
                    :segop-id (:id segfold)}
       :attributes {:array-params (vec (concat inputs outputs))
@@ -767,6 +776,8 @@
   ([scheduled node kernel-graph]
    (validate-against-node! scheduled node kernel-graph nil nil))
   ([scheduled node kernel-graph closed-algorithm closed-body]
+   (validate-against-node! scheduled node kernel-graph closed-algorithm closed-body {}))
+  ([scheduled node kernel-graph closed-algorithm closed-body options]
    (let [scheduled (scheduled-body/validate-against-node! scheduled node kernel-graph)
          source (:source scheduled)
          _ (when-not (segop/seg-fold-map? source)
@@ -811,7 +822,8 @@
                             :body parameter-elements :graph graph-elements})))))
      (let [array-types (into {} (map (juxt :id :dtype)) (vals buffers))
            scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
-           expected (schedule source {:array-types array-types :scalar-types scalar-types})]
+           expected (schedule source (merge (select-keys options [:scalar-math])
+                                             {:array-types array-types :scalar-types scalar-types}))]
        (when-not (= expected scheduled)
          (throw (ex-info "fold-map scheduled body differs from its exact source KernelGrid refinement"
                          {:reason :segfoldmap-schedule-source

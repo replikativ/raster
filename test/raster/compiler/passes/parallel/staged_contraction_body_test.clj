@@ -8,8 +8,22 @@
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged]
             [raster.gpu.device-probe :as probe]))
+
+(deftest packed-stages-retain-unused-consent-without-changing-arithmetic
+  (let [source (fixtures/packed-facts 3 5 3 32)
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (staged/lower source)
+        chosen (staged/lower source :scalar-math policy)]
+    (is (= policy (get-in chosen [:numerics :scalar-math])))
+    (is (= (:numerics ordinary) (dissoc (:numerics chosen) :scalar-math)))
+    (is (= (:arguments ordinary) (:arguments chosen)))
+    (is (= (get-in ordinary [:body :launch]) (get-in chosen [:body :launch])))
+    (is (not (contains? (body/required-scalar-dtypes (get-in chosen [:body :operations])) :double)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (staged/lower source :scalar-math {:overrides nil})))))
 
 (deftest packed-schedule-is-source-free-and-preserves-byte-storage
   (let [source (fixtures/packed-facts 3 5 3 32)

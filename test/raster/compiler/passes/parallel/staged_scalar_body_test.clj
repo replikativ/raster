@@ -8,6 +8,7 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -19,7 +20,8 @@
             [raster.gpu.device-probe :as probe]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
-            [raster.compiler.passes.parallel.staged-scalar-body :as staged]))
+            [raster.compiler.passes.parallel.staged-scalar-body :as staged]
+            [raster.compiler.passes.parallel.staged-contraction-body :as staged-route]))
 
 (defn three-stage-facts []
   (let [a-map (am/of-axes '[[i 2] [blk 2] [sub 3] [t 4]])
@@ -93,6 +95,28 @@
       (let [artifact (target/emit-artifact "three_stage_scalar" scheduled dialect)]
         (is (= [:float :float :float :float :float] (mapv :dtype (:abi artifact))))
         (is (not (re-find #"rstr_dp4a" (:source artifact))))))))
+
+(deftest staged-analysis-and-materialization-retain-the-same-math-consent
+  (let [source (facts/from-components
+                (-> (select-keys (three-stage-facts) [:out :free-axes :contract-axes :body :opts])
+                    (assoc :dtype :float)
+                    (assoc-in [:opts :epilogue]
+                              {:acc 'value :expr '(Math/tanh value) :dtype :float})))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (staged/lower source :scalar-types {'scale :float})
+        plan (staged/analyze! source :scalar-types {'scale :float} :scalar-math policy)
+        selected (staged/lower source :scalar-types {'scale :float} :scalar-math policy)]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (:scalar-math plan) (get-in selected [:numerics :scalar-math])))
+    (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+    (is (= (:arguments ordinary) (:arguments selected)))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))
+    (doseq [target [:opencl-portable :cuda :hip]]
+      (is (some? (:source (target/emit-artifact "selected_stage_math" selected target)))))))
 
 (deftest admission-constructs-typed-stages-without-materializing-a-kernel
   (let [plan (with-redefs [kernel-body/make (fn [& _] (throw (Exception. "constructed KernelBody")))
@@ -219,6 +243,20 @@
         (is (= [:float :float :float :float :float] (mapv :dtype (:abi emitted))))
         (is (= :staged-scalar
                (get-in emitted [:nodes 0 :operation :attributes :kernel-body :schedule :strategy])))))))
+
+(deftest graph-owned-staged-routing-does-not-drop-explicit-consent
+  (let [{:keys [algorithm body graph]} (production-graph)
+        node (first (:nodes graph))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (staged-route/schedule-for-node node graph algorithm body)
+        selected (staged-route/schedule-for-node node graph algorithm body {:scalar-math policy})]
+    (is (= :staged-scalar (get-in selected [:body :schedule :strategy])))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+    (is (= (:arguments ordinary) (:arguments selected)))
+    (is (not (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                        :double))
+        "an unused override does not manufacture a physical FP64 requirement")))
 
 (deftest generic-stages-bind-through-the-common-resident-graph
   (if-not @probe/opencl-available?

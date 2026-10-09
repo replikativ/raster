@@ -40,6 +40,37 @@
   (try (thunk) nil
        (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))
 
+(deftest scalar-realization-must-match-retained-numerical-consent
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        expression (body/scalar-expression :tanh :float ['value])
+        ordinary (assoc-in (fixture) [:body :operations 1 :value] expression)
+        widened (assoc-in ordinary [:body :operations 1 :value :options :math-realization]
+                          numerics/widened-target-library-math)
+        selected (assoc-in widened [:numerics :scalar-math] policy)]
+    (is (scheduled/scheduled-kernel-body? (scheduled/validate! ordinary)))
+    (is (scheduled/scheduled-kernel-body? (scheduled/validate! selected)))
+    (is (= :scheduled-kernel-body-math-realization
+           (reason-of #(scheduled/validate! widened))))
+    (is (= :scheduled-kernel-body-math-realization
+           (reason-of #(scheduled/validate! (assoc-in ordinary [:numerics :scalar-math] policy)))))
+    (is (= :scheduled-kernel-body-math-realization
+           (reason-of #(scheduled/validate! (update selected :numerics dissoc :scalar-math)))))
+    (is (= :scalar-math-policy
+           (reason-of #(scheduled/validate! (assoc-in selected [:numerics :scalar-math :extra] true)))))))
+
+(deftest nested-control-retains-scalar-math-consent
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (assoc-in (fixture) [:body :masks]
+                           [(body/->Mask :active [(body/predicate :lt 0 1)])])
+        expression (body/scalar-expression :tanh :float ['value]
+                                           {:math-realization numerics/widened-target-library-math})
+        nested (assoc-in ordinary [:body :operations 1]
+                         (body/->Guard :active [(body/->ScalarStore 'y [0] expression nil)]))
+        selected (assoc-in nested [:numerics :scalar-math] policy)]
+    (is (scheduled/scheduled-kernel-body? (scheduled/validate! selected)))
+    (is (= :scheduled-kernel-body-math-realization
+           (reason-of #(scheduled/validate! nested))))))
+
 (deftest source-arithmetic-cannot-be-dropped-or-forged-in-a-scheduled-certificate
   (let [contract (numerics/blas-source-arithmetic :float)
         value (-> (fixture)

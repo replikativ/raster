@@ -9,6 +9,7 @@
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.index-expression :as index]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
@@ -20,7 +21,8 @@
 (defn analyze!
   "Construct the typed stage plan using the shared scalar lowerer. No target emission,
    KernelBody construction or driver work occurs during frontend capability checking."
-  [source & {:keys [scalar-types workgroup-size] :or {scalar-types {} workgroup-size 64}}]
+  [source & {:keys [scalar-types workgroup-size scalar-math]
+             :or {scalar-types {} workgroup-size 64} :as options}]
   (let [{:keys [reads attributes stage-list axes n out-type sizes array-types packed-plan packed-operands]} (admission/analyze! source :scalar-types scalar-types
                                                     :workgroup-size workgroup-size)
         reserved (atom (set (filter symbol? (tree-seq coll? seq source))))
@@ -33,6 +35,7 @@
         scope (set (concat (map first axes) [group lane segment packed-index]))
         builder (scalar/make-lowerer
                  {:arrays reads :array-types array-types :scalar-types scalar-types
+                  :scalar-math scalar-math
                   :require-source-types? true
                   :index-scope scope :lower-index #(index/lower %1 (into scope %2) decline!)
                   :predicate mask :source-region source :id-prefix (str (fresh "stage_scalar"))
@@ -149,19 +152,22 @@
          (catch clojure.lang.ExceptionInfo e
            (decline! :kernel-body-proof "staged body does not satisfy the shared verifier"
                      {:cause (ex-data e) :message (.getMessage e)})))
-    {:source source :body-spec body-spec :arguments arguments
-     :sizes sizes :output-elements n :out-type out-type}))
+    (cond-> {:source source :body-spec body-spec :arguments arguments
+             :sizes sizes :output-elements n :out-type out-type}
+      (contains? options :scalar-math)
+      (assoc :scalar-math (numerics/validate-scalar-math-policy! scalar-math)))))
 
 (defn lower
   "Materialize a scheduled KernelBody from the same typed plan used by admission."
   [source & options]
-  (let [{:keys [body-spec arguments sizes output-elements out-type]}
+  (let [{:keys [body-spec arguments sizes output-elements out-type] :as plan}
         (apply analyze! source options)
         kernel (body/make body-spec)]
     (scheduled/make
      {:source source :body kernel :arguments arguments
       :effects {:kind :staged-contraction :uses (scheduled/derive-uses kernel arguments)}
       :legality {:kind :staged-scalar :storage-elements sizes :output-elements output-elements}
-      :numerics {:mode :reassociated :policy :explicit-stage-accumulators
-                 :source-arithmetic (:source-arithmetic source)
-                 :accumulator-dtype out-type :rounding :nearest-even}})))
+      :numerics (cond-> {:mode :reassociated :policy :explicit-stage-accumulators
+                         :source-arithmetic (:source-arithmetic source)
+                         :accumulator-dtype out-type :rounding :nearest-even}
+                  (contains? plan :scalar-math) (assoc :scalar-math (:scalar-math plan)))})))

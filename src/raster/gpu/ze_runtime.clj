@@ -397,19 +397,15 @@
     (root/assert-live! state)
     (init!)))
 
-(defn module-capabilities
-  "Query module capabilities of the exact selected live device, not a catalogue guess.
-   Optional FP16/FP64 support comes from ze_device_module_properties_t flags. Query failure
-   propagates; it must not masquerade as an absent optional capability."
-  []
-  (ensure-init!)
+(defn- query-module-capabilities
+  [device]
   (with-open [arena (Arena/ofConfined)]
     ;; Level Zero core ABI: stype@0, pNext@8, spirvVersionSupported@16, flags@20,
     ;; fp16flags@24, fp32flags@28, fp64flags@32. Follow this runtime's 64-bit ABI.
     (let [props (.allocate arena 128)
           _ (.set props I32 0 (int 0x5)) ; ZE_STRUCTURE_TYPE_DEVICE_MODULE_PROPERTIES
           _ (ze-call! "zeDeviceGetModuleProperties" @h-zeDeviceGetModuleProperties
-                      [(:device @state) props])
+                      [device props])
           flags (.get props I32 20)]
       {:spirv-version (.get props I32 16)
        :fp16? (not (zero? (bit-and flags 1)))
@@ -417,6 +413,25 @@
        :fp16-flags (.get props I32 24)
        :fp32-flags (.get props I32 28)
        :fp64-flags (.get props I32 32)})))
+
+(defn module-capabilities
+  "Query module capabilities of the exact selected live device, not a catalogue guess.
+   Optional FP16/FP64 support comes from ze_device_module_properties_t flags. Query failure
+   propagates; it must not masquerade as an absent optional capability."
+  []
+  (ensure-init!)
+  (query-module-capabilities (:device @state)))
+
+(defn- enumerated-module-capabilities
+  "Optional catalogue enrichment: query failure leaves support unknown, never false.
+   Execution evidence uses the fail-loud selected-device query above."
+  [device]
+  (try
+    {:module-capabilities (query-module-capabilities device)}
+    (catch Exception error
+      {:module-capabilities-query
+       {:status :unavailable :reason :module-capability-query
+        :message (.getMessage error)}})))
 
 (defn execution-device-info
   "Actual selected device/driver identity and storage capabilities for offline execution evidence.
@@ -601,7 +616,7 @@
                                                         256)]
                                             (String. name-bytes 0 (int end) "UTF-8"))
                                  total-eus (* eus-per-subslice subslices-per-slice num-slices)]
-                             {:name (.trim dev-name)
+                             (merge {:name (.trim dev-name)
                               :device-id-hex (format "0x%04x" device-id-val)
                               :integrated? integrated?
                               :core-clock-mhz core-clock
@@ -610,7 +625,8 @@
                               :simd-width simd-width
                               :eus-per-subslice eus-per-subslice
                               :subslices-per-slice subslices-per-slice
-                              :num-slices num-slices}))
+                              :num-slices num-slices}
+                                    (enumerated-module-capabilities dev))))
                          (range n-devs))))))
                 (range n-drivers)))))))
       (finally

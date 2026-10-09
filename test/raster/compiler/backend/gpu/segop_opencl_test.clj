@@ -24,6 +24,7 @@
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
@@ -55,6 +56,24 @@
                    (segred-body/validate-against-node!
                     certificate node candidate closed-algorithm closed-body))
           "an independent graph capacity or incomplete proof context cannot authorize the alias"))))
+
+(deftest portable-map-retains-selected-math-consent
+  (let [operation (segop/->SegMap
+                   903 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   (with-meta '(raster.numeric/tanh (clojure.core/aget input i))
+                     {:raster.type/tag 'float})
+                   nil #{'input} #{'output} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)
+        options {:array-types {'input :float 'output :float} :workgroup-size 32}
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (segmap-body/schedule operation options)
+        selected (segmap-body/schedule operation (assoc options :scalar-math policy))]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= #{:float} (kernel-body/required-scalar-dtypes
+                      (get-in ordinary [:body :operations]))))
+    (is (= #{:float :double} (kernel-body/required-scalar-dtypes
+                              (get-in selected [:body :operations]))))))
 
 (deftest portable-map-empty-extent-has-a-masked-valid-launch
   (let [operation (segop/->SegMap
@@ -243,6 +262,25 @@
                                     [:kernel-body-decline :missing-rule])))
           (is (= :none (:fallback (ex-data exception)))))))))
 
+(deftest stencil-retains-selected-math-consent
+  (let [operation (segop/->SegStencil
+                   905 (segop/make-seg-space 'i 32) (segop/->SegLevel :thread :virtual)
+                   (with-meta '(raster.numeric/tanh (clojure.core/aget input i))
+                     {:raster.type/tag 'float})
+                   #{'input} #{'output} #{} (segop/->KernelGrid 1 32 0)
+                   :float 'output 1 :dirichlet nil :no-write-alias)
+        options {:array-types {'input :float 'output :float} :workgroup-size 32}
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (segstencil-body/schedule operation options)
+        selected (segstencil-body/schedule operation (assoc options :scalar-math policy))]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))
+
 (deftest typed-stencil-emits-a-guarded-typed-artifact
   (let [source '(let* [result
                        (raster.par/stencil!
@@ -389,6 +427,72 @@
          graph (lower/scan-kernel-graph node operations opts)]
      (sg/generate-scan-kernel-graph graph
                                     :scalar-types (:scalar-types opts)))))
+
+(deftest scan-stages-use-shared-certificates-and-independent-reconstruction
+  (let [form '(raster.par/scan out acc 0.0 i n double (+ acc (aget values i)))
+        node (soac/par-form->soac 'scan-result form 906 :dtype :double)
+        operations (lower/lower-scan node nil :dtype :double)
+        graph (lower/scan-kernel-graph node operations {})
+        emitted (sg/generate-scan-kernel-graph graph)]
+    (doseq [[source-node emitted-node] (map vector (:nodes graph) (:nodes emitted))
+            :let [artifact (:operation emitted-node)
+                  certificate (get-in artifact [:provenance :scheduled-operation])]]
+      (is (scheduled-body/scheduled-kernel-body? certificate))
+      (is (= certificate (segscan-body/validate-against-node! certificate source-node graph)))
+      (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (segscan-body/validate-against-node!
+                    (assoc-in certificate [:numerics :policy] :unrelated-policy) source-node graph))))
+    (is (= :inout (get-in emitted [:nodes 1 :operation :abi 0 :kind])))
+    (doseq [[field value] [[:num-blocks 1] [:shared-mem-bytes 0]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sg/generate-scan-kernel-graph
+                    (assoc-in graph [:nodes 0 :operation :grid field] value)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sg/generate-scan-kernel-graph graph :array-types {'values :float})))))
+
+(deftest scan-math-consent-is-retained-and-independently-reconstructed
+  (let [element (with-meta '(Math/tanh (clojure.core/aget values i))
+                  {:raster.type/tag 'float})
+        form (list 'raster.par/scan 'out 'acc 0.0 'i 'n 'float (list '+ 'acc element))
+        source (soac/par-form->soac 'scan-result form 909 :dtype :float)
+        graph (lower/scan-kernel-graph source (lower/lower-scan source nil :dtype :float) {})
+        node (first (:nodes graph))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (segscan-body/schedule-for-node node graph {})
+        selected (segscan-body/schedule-for-node node graph {:scalar-math policy})]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (= selected (segscan-body/validate-against-node!
+                     selected node graph {:scalar-math policy})))
+    (doseq [options [{} {:scalar-math {:overrides {}}}]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (segscan-body/validate-against-node! selected node graph options))))
+    (doseq [stage (:nodes graph)
+            :let [baseline (segscan-body/schedule-for-node stage graph {})
+                  chosen (segscan-body/schedule-for-node stage graph {:scalar-math policy})]]
+      (is (= policy (get-in chosen [:numerics :scalar-math])))
+      (is (= (select-keys baseline [:arguments :scalar-bindings :legality :effects])
+             (select-keys chosen [:arguments :scalar-bindings :legality :effects])))
+      (is (= chosen (segscan-body/validate-against-node!
+                     chosen stage graph {:scalar-math policy}))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))
+
+(deftest legacy-scan-scalars-still-require-type-evidence
+  (let [form '(raster.par/scan out acc 0.0 i n double
+                               (+ acc (* scale (aget values i))))
+        node (soac/par-form->soac 'scan-result form 907 :dtype :double)
+        operations (lower/lower-scan node nil :dtype :double)
+        graph (lower/scan-kernel-graph node operations {})]
+    (is (= :kernel-scalar-dtype-unknown
+           (try (sg/generate-scan-kernel-graph graph)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (kgraph/kernel-graph?
+         (sg/generate-scan-kernel-graph graph :scalar-types {'scale :double})))))
 
 (defn- kernel-body-operations
   [artifact]
@@ -769,6 +873,37 @@
     (is (= :ceil-div (get-in index-expressions ['group-chunk :op]))
         "the checked index algebra handles zero without forming n-1 or n+groups-1")
     (is (= :add (:op (get index-expressions 'group-end))))))
+
+(deftest reduction-math-consent-is-reconstructed-from-independent-options
+  (let [form (with-meta
+               '(raster.par/reduce acc 0.0 i 32 (+ acc (clojure.core/aget a i)))
+               {:raster.type/elem-type :float})
+        base (first (lower/lower-reduce (soac/par-form->soac 'result form 904 :dtype :float)
+                                        nil :dtype :float))
+        transform (kernel-body/->ScalarRegion
+                   '[completed] (with-meta '(raster.numeric/tanh completed)
+                                   {:raster.type/tag 'float}) [] :float)
+        operation (assoc-in base [:reduction :attributes :result-region] transform)
+        node (kgraph/->ScheduledKernel
+               :reduction operation [(kgraph/->ValueUse 'a :read)
+                                     (kgraph/->ValueUse 'result :write)] #{} [])
+        graph (kgraph/make {:inputs [(kgraph/buffer 'a :float 32 :global :input)]
+                           :outputs [(kgraph/buffer 'result :float 1 :global :output)]
+                           :scalars [] :nodes [node]})
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        options {:array-types {'a :float 'result :float} :scalar-math policy}
+        selected (segred-body/schedule operation nil options)]
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= :float (get-in selected [:numerics :accumulator-dtype])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (= selected (segred-body/validate-against-node!
+                    selected node graph nil nil {:scalar-math policy})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (segred-body/validate-against-node! selected node graph)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (segred-body/validate-against-node!
+                  selected node graph nil nil {:scalar-math {:overrides {}}})))))
 
 (deftest completed-scalar-reduction-transform-is-terminal-and-numerically-explicit
   (let [form (with-meta

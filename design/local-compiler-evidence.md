@@ -2051,3 +2051,141 @@ record-kind checks, including expressions retained across warm-REPL reloads.
 The matrix fixture's mutation check follows the same handling. The final suite
 above was rerun after those fixes; expression-valued stores also retain their
 hidden Double demand without requiring a named Double SSA value.
+
+The follow-up shared builder accepts an internal closed realization policy with
+canonical `[operation :float]` keys and the single named
+`:f64-target-library-rte-f32` choice. It validates once and attaches the existing
+closed realization without another operator registry. Nil is exactly the empty
+policy; unknown operations, dtype aliases, Double requests, malformed keys,
+unsupported math choices and extra fields fail structurally. Selective unary
+calls, unrelated operations and existing Double calls are tested independently.
+Isolated and fused retained scalar regions carry the same realization and
+physical Double demand. The affected scalar-region suite passes 49 tests / 535
+assertions in the warm REPL after refreshing its stale index-lowering dependency.
+
+The next checked boundary retains optional `:scalar-math` policy in the existing
+numerical contract. ScheduledKernelBody validation walks all operation fields,
+including expression-valued stores and nested controls, and requires every
+target-library realization to match that policy. Missing consent rejects widened
+math; a selected override rejects an ordinary realization of that operation.
+This uses the existing intrinsic descriptor and closed realization authority,
+not another operator registry. Independent review approved the boundary.
+The scheduled-body suite passes 16 tests / 139 assertions; shared scalar-region,
+scalar-emitter and matrix-emitter suites pass 87 tests / 1333 assertions.
+Public schedule admission remains disabled until outer consent, all producer
+paths and independent reconstruction carry the same policy. Neither this local
+evidence nor the optional policy closes the held whole-model training gate.
+
+Fused result-region lowering and the internal SegMap producer now forward that
+same optional policy to the shared builder. Map scheduling retains its normalized
+form in the existing numerical contract only when supplied; omitted options keep
+the old contract shape. Logical result, accumulator and store dtypes do not
+change. Independent review approved this producer/certificate wiring. The warm
+REPL passes the 103 affected map/emitter, scalar-region and scheduled-body tests
+with 957 assertions after refreshing the stale stencil index-expression class
+dependency. Backend/public scheduling and independent outer reconstruction remain
+unwired; no public selection or full-model acceptance is claimed by this slice.
+
+Scalar workgroup-tree reductions now carry the same optional realization policy
+through both element computation and the terminal result transform, retaining
+the normalized consent alongside existing association/accumulator evidence.
+Independent node reconstruction takes that policy from explicit caller options,
+never from the candidate certificate. Existing verifier arities reconstruct the
+default and reject a selected candidate until their callers are wired. A graph
+regression checks matching, missing and mismatched independent consent; the
+element regression checks hidden Double demand with an unchanged Float result.
+Independent review approved the delta. The affected warm-REPL suites pass 105
+tests / 966 assertions; backend/public admission remains disabled.
+
+The stencil producer now uses and retains the same optional policy without
+changing logical dtype, boundary guards, radius, or launch geometry. A regression
+checks unchanged default metadata, selected hidden Double demand and rejection
+after consent is stripped. Independent review approved the delta; the affected
+warm suites pass 106 tests / 971 assertions.
+
+The scan inventory found a remaining consolidation prerequisite: scan emission
+currently constructs artifacts directly from raw KernelBody, bypassing
+ScheduledKernelBody. Before enabling policy for scans, migrate that existing
+route through ScheduledKernelBody plus independent graph-owned reconstruction
+and the shared artifact emitter. Retaining consent only in artifact attributes
+would create a duplicate, self-attested authority and is not the chosen route.
+
+The scan prerequisite now uses ScheduledKernelBody for every stage and the shared
+target artifact emitter, removing the manual scan artifact/ABI assembly. Its
+independent reconstructor derives storage, algebra, mode and geometry from the
+semantic graph rather than trusting candidate attributes. Source-grid/scratch and
+caller dtype contradictions fail loudly. Legacy graphs retain only their existing
+Int-bound ABI projection; typed graphs retain explicit scalar declarations.
+The emitted-equation boundary independently reconstructs scan certificates even
+when descriptive graph metadata is absent. Compiler, codec and boundary suites
+pass 62 tests / 454 assertions in the warm REPL.
+
+The production TypedSOAC scan route also passes native changed-input replay on
+both OpenCL and Level Zero: inclusive and exclusive scans of 1025 inputs compare
+every logical output with independent CPU prefix sums, including the exclusive
+scan's final total at output index 1025 (2 tests / 8 assertions, no skips).
+These exactly representable inputs test schedule/indexing/replay correctness,
+not arbitrary floating-point reassociation accuracy or distributed performance.
+No public scan math-policy selection has been enabled by this migration.
+
+The private scan schedule now forwards explicit scalar-math consent into the
+shared element lowerer and retains normalized consent across all three stages.
+Reconstruction requires matching caller-owned consent; missing or empty consent
+cannot validate a selected candidate. Logical dtype, launch, interface, effects
+and tree-reassociation rules are unchanged. The selected Float math leaf records
+its physical Double requirement. The affected compiler/codec/boundary suites and
+native default-route replays pass 65 tests / 479 assertions in the warm REPL.
+
+Ordered and cooperative fold-map schedules now thread the same private consent
+through their shared scalar lowerers. Their declaration-order versus certified
+workgroup-tree contracts remain unchanged. Independent reconstruction accepts
+only caller-supplied matching consent, never the candidate's retained policy.
+Both strategies retain logical output precision and launch geometry while exposing
+the widened physical math dtype. Fold-map, scan, scalar, codec and emitted-equation
+suites pass 143 tests / 1221 assertions. Public policy admission remains disabled.
+
+Staged scalar analysis now retains optional normalized consent in the same typed
+plan that materialization consumes. Packed staging and graph-owned selection
+forward consent through either the packed schedule or scalar fallback. A legal
+post-reduction tanh epilogue records the selected hidden Double requirement and
+emits through the shared OpenCL/CUDA/HIP dialects; nonlinear stage lifts remain
+rejected by their existing linearity contract. An unused override does not add
+Double operations to ordinary scalar or packed schedules. The staged scalar and
+packed suites pass 25 tests / 169 assertions, including native default-route
+checks. Independent public reconstruction/admission remains future work; this
+private producer plumbing does not claim closure of the held Gemma model gate.
+
+Product-reduction elements and tuple-combine regions now use the same explicitly
+selected scalar realization through their shared lowerer. Schedules retain optional
+normalized consent without changing component accumulators or the declared product
+tree. Source and graph reconstruction require caller-owned consent; old arities
+retain the default and cannot validate a selected candidate. Graph access/capacity
+admission still derives storage evidence independently. Product producer/consumer,
+shared scalar and scan emitter suites pass 120 tests / 1063 assertions. Public
+selection remains disabled pending the remaining owners and outer admission.
+
+This policy is not yet exposed as a public schedule option. That must wait for
+all scheduled-body producers and independent reconstructors to retain it,
+physical target admission to account for FP64, and public cache/source/codec
+acceptance. A partially threaded public request would be silently ignored by
+some families and is not an acceptable intermediate public contract.
+
+The next prerequisite retains scalar execution support in the frozen hardware
+descriptor, separately from estimated throughput. Authoritative OpenCL extension
+facts, Level Zero module flags, and explicit user-declared cross-compiler dtype
+sets produce per-dtype `:supported`/`:unsupported` facts with provenance. Missing
+facts remain `:unknown`; catalogue rates never authorize FP64. Conflicting
+same-rank facts and malformed authoritative declarations fail loudly. The
+existing evidence signature and full descriptor fingerprint retain this facet.
+
+Level Zero device enumeration now reuses the selected-device module-property
+query. Optional enumeration failures retain that device with an unavailable
+diagnostic and unknown optional dtypes; selected-device execution evidence still
+fails loudly. Independent review caught the initial whole-enumeration failure
+scope before landing. Hardware-free per-device, failure, identity and existing
+descriptor controls pass 29 tests / 145 assertions. The actual local Arc query
+reports identical module flags for enumeration and selected-device evidence;
+the runtime-to-descriptor path retains Half/Double support with detected
+provenance. These are execution legality facts, not hardware-native throughput
+or cross-target numerical-accuracy claims. Public math policy admission remains
+disabled pending the complete scheduling/certificate vertical.

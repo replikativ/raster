@@ -13,6 +13,7 @@
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (defrecord EmittedParallelEquation [algorithm body refinement graph provenance attributes])
@@ -98,13 +99,18 @@
                                                        [:operation :provenance
                                                         :scheduled-operation])]
                                (if (scheduled-body/scheduled-kernel-body? certificate)
-                                 (do (if (and (segop/seg-red? (:operation scheduled-node))
+                                 (do (cond
+                                       (some #(segop/seg-scan? (:operation %)) (:nodes scheduled))
+                                       (segscan-body/validate-against-node!
+                                        certificate scheduled-node scheduled)
+                                       (and (segop/seg-red? (:operation scheduled-node))
                                               (contains? #{:single :block-local :cross-block}
                                                          (:phase (:operation scheduled-node)))
                                               (empty? (segop/seg-space-segment-dims
                                                        (:space (:operation scheduled-node)))))
                                        (segred-body/validate-against-node!
                                         certificate scheduled-node scheduled algorithm body)
+                                       :else
                                        (scheduled-body/validate-against-node!
                                         certificate scheduled-node scheduled))
                                      (when (and generated-body

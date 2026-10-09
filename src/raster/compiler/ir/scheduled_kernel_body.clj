@@ -6,6 +6,7 @@
    named legality witness, and one shared numerical contract.  Target emitters consume this value;
    they must not reconstruct any of these facts from operation names or generated source."
   (:require [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -173,6 +174,23 @@
   [scheduled]
   (launch-from-checked-body (body/validate! (:body scheduled)) (:arguments scheduled)))
 
+(defn- validate-math-realizations!
+  [kernel-body policy]
+  (let [policy (numerics/validate-scalar-math-policy! policy)]
+    (doseq [value (tree-seq coll? seq (:operations kernel-body))
+            :when (and (record-kind? "ScalarExpr" value)
+                       (= :target-library
+                          (:kernel-body-math-realization (intrinsics/descriptor (:op value)))))
+            :let [operation (intrinsics/canonical (:op value))
+                  dt (dtype/canon (:result-type value))
+                  expected (or (numerics/scalar-math-realization policy operation dt)
+                               numerics/target-library-math)
+                  actual (get-in value [:options :math-realization])]]
+      (when-not (= expected actual)
+        (fail! :scheduled-kernel-body-math-realization
+               "scalar math realization disagrees with retained schedule consent"
+               {:operation operation :dtype dt :expected expected :actual actual})))))
+
 (defn validate!
   [scheduled]
   (when-not (scheduled-kernel-body? scheduled)
@@ -222,6 +240,7 @@
              {:legality legality}))
     (numerics/validate! numerics {:reason :scheduled-kernel-body-numerics
                                   :ir :scheduled-kernel-body})
+    (validate-math-realizations! kernel-body (:scalar-math numerics))
     (let [source-arithmetic (or (:source-arithmetic source)
                                (get-in source [:facts :source-arithmetic]))
           numerical-source (:source-arithmetic numerics)]

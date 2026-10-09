@@ -499,6 +499,40 @@
     (is (= :final-map (get-in (last loops) [:attributes :role])))
     (is (= ['values] (mapv :buffer (:stable-reads kernel-body))))))
 
+(deftest ordered-and-cooperative-fold-maps-retain-independent-math-consent
+  (doseq [[operation scalars]
+          [[(scheduled-operation) {'nsegments :int 'width :int}]
+           [(certified-operation) {'rows :long 'width :long}]]]
+    (let [operation (update operation :map-results
+                            #(mapv (fn [expression]
+                                     (with-meta (list 'Math/tanh expression)
+                                       {:raster.type/tag 'float})) %))
+          options {:array-types {'values :float 'out :float} :scalar-types scalars}
+          policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+          ordinary (fold-body/schedule operation options)
+          chosen (fold-body/schedule operation (assoc options :scalar-math policy))
+          axes (mapv :bound (segop/seg-space-segment-dims (:space operation)))
+          elements (apply launch/product (concat axes [(:extent operation)]))
+          graph (kgraph/from-segops
+                 [operation]
+                 {:inputs #{'values} :outputs #{'out} :dtype :float
+                  :buffer-specs {'values {:dtype :float :elements elements}
+                                 'out {:dtype :float :elements elements}}
+                  :scalars (mapv (fn [[id dt]] (kgraph/scalar id dt)) scalars)})
+          node (first (:nodes graph))]
+      (is (not (contains? (:numerics ordinary) :scalar-math)))
+      (is (= policy (get-in chosen [:numerics :scalar-math])))
+      (is (= (:numerics ordinary) (dissoc (:numerics chosen) :scalar-math)))
+      (is (= (get-in ordinary [:body :launch]) (get-in chosen [:body :launch])))
+      (is (contains? (body/required-scalar-dtypes (get-in chosen [:body :operations])) :double))
+      (is (= chosen (fold-body/validate-against-node!
+                     chosen node graph nil nil {:scalar-math policy})))
+      (doseq [consent [{} {:scalar-math {:overrides {}}}]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (fold-body/validate-against-node! chosen node graph nil nil consent))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (scheduled-body/validate! (update chosen :numerics dissoc :scalar-math)))))))
+
 (deftest ordered-fold-map-has-one-complete-scheduled-body-certificate
   (let [operation (scheduled-operation)
         options {:array-types {'values :float 'out :float}

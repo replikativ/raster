@@ -12,6 +12,7 @@
             [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.segop :as segop]
@@ -221,12 +222,15 @@
       :effects {:kind :product-reduction :uses (scheduled/derive-uses kernel-body arguments)}
       :legality {:kind :product-workgroup-tree :algebra (:algebra (:reduction segred))
                  :source-schedule (:schedule segred) :aliasing :no-write-alias}
-      :numerics {:mode :reassociated :policy :declared-product-tree
+      :numerics (cond-> {:mode :reassociated :policy :declared-product-tree
                  :accumulators (mapv (fn [{:keys [id dtype]}]
                                        {:value id :dtype dtype
                                         :rounding (if (dtype/fp-dtype? dtype) :nearest-even :exact)
                                         :policy :declared-product-tree})
                                      (:components (:reduction segred)))}
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options))))
       :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
       :attributes {:candidate-only true :source-storage-certified? false}})))
 
@@ -289,8 +293,11 @@
 
    Production admission still requires access legality and runtime capacity checks. In particular,
    this does not promote candidate-only or source-storage-certified attributes."
-  [candidate node kernel-graph algorithm scheduled-body]
-  (let [options (graph-options node kernel-graph algorithm scheduled-body)
+  ([candidate node kernel-graph algorithm scheduled-body]
+   (validate-against-node! candidate node kernel-graph algorithm scheduled-body {}))
+  ([candidate node kernel-graph algorithm scheduled-body caller-options]
+  (let [options (merge (select-keys caller-options [:scalar-math])
+                       (graph-options node kernel-graph algorithm scheduled-body))
         candidate (scheduled/validate-against-node! candidate node kernel-graph)
         source (:operation node)
         scalar-definitions (equation-graph/derived-scalar-expressions
@@ -311,16 +318,19 @@
           (decline! :graph-output-storage
                     "product output must retain the exact segment extent and component dtype"
                     {:output result :rows rows :dtype dtype :buffer buffer}))))
-    (validate-source! candidate source options)))
+    (validate-source! candidate source options))))
 
 (defn schedule-for-node
   "Admit the deterministic product body through the exact source/graph and typed-access checks.
    Graph capacities remain runtime preconditions, enforced before resident or staged submission."
-  [node kernel-graph algorithm scheduled-body]
-  (let [options (graph-options node kernel-graph algorithm scheduled-body)
+  ([node kernel-graph algorithm scheduled-body]
+   (schedule-for-node node kernel-graph algorithm scheduled-body {}))
+  ([node kernel-graph algorithm scheduled-body caller-options]
+  (let [options (merge (select-keys caller-options [:scalar-math])
+                       (graph-options node kernel-graph algorithm scheduled-body))
         source (:operation node)
         candidate (schedule source options)
-        _ (validate-against-node! candidate node kernel-graph algorithm scheduled-body)
+        _ (validate-against-node! candidate node kernel-graph algorithm scheduled-body caller-options)
         requirements (regions/dense-read-requirements source options decline!)
         scalar-definitions (equation-graph/derived-scalar-expressions
                             (:values scheduled-body)
@@ -346,4 +356,4 @@
     (-> candidate
         (assoc-in [:legality :read-requirements] requirements)
         (assoc-in [:attributes :candidate-only] false)
-        (assoc-in [:attributes :source-storage-certified?] true))))
+        (assoc-in [:attributes :source-storage-certified?] true)))))

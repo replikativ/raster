@@ -567,79 +567,23 @@
                              :outputs (mapv :id (:outputs graph))})))
         target (kernel-body-c-dialect/resolve! target-dialect)
         target-module (kernel-body-c-dialect/target target)
-        array-types (graph-array-types graph array-types)
-        buffers (into {} (map (juxt :id identity))
-                      (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
-        temporary-ids (set (map :id (:temporaries graph)))
-        output-ids (set (map :id (:outputs graph)))
-        first-scan (some #(when (segop/seg-scan? (:operation %))
-                            (:operation %))
-                         (:nodes graph))
-        scan-workgroup (or (get-in first-scan [:grid :block-size]) 256)
-        scalar-dtype (fn [id]
-                       (or (get scalar-types id)
-                           (get scalar-types (symbol (name id)))
-                           (throw (ex-info "kernel scalar parameter has no declared dtype"
-                                           {:reason :kernel-scalar-dtype-unknown :symbol id
-                                            :declared (vec (keys scalar-types))}))))
+        _ (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
          graph
-         (fn [{:keys [id operation uses]}]
-           (let [{:keys [kernel-body phase bound pointer-ids scalar-ids]}
-                 (segscan-body/lower
-                  operation
-                  {:uses uses :buffers buffers
-                   :temporary-ids temporary-ids :output-ids output-ids
-                   :scan-algebra algebra :scan-mode scan-mode
-                   :scan-workgroup scan-workgroup
-                   :scalar-types scalar-types :array-types array-types})
-                 parameters (:parameters kernel-body)
+         (fn [{:keys [id] :as node}]
+           (let [scheduled (segscan-body/schedule-for-node
+                            node graph {:scalar-types scalar-types})
+                 phase (get-in scheduled [:attributes :phase])
                  kernel-name (str kernel-name-prefix "_" (str/replace (name phase) "-" "_")
                                   "_" (gensym ""))
                  parameter-names (into {}
                                        (map (fn [parameter]
                                               [(:id parameter) (ce/c-symbol (:id parameter))]))
-                                       parameters)
-                 source (kernel-body-opencl/emit-scalar-kernel
-                         kernel-name kernel-body
-                         {:target-dialect target-dialect
-                          :parameter-names parameter-names})
-                 pointer-slots
-                 (mapv
-                  (fn [{:keys [buffer access]}]
-                    (let [spec (get buffers buffer)
-                          output? (contains? #{:write :read-write} access)]
-                      (kabi/slot
-                       buffer
-                       (case access :read :input :write :output :read-write :inout)
-                       (:dtype spec) :c-name (get parameter-names buffer)
-                       :role (cond
-                               (contains? temporary-ids buffer) :temporary
-                               (and output? (contains? output-ids buffer)) :result
-                               :else :operand))))
-                  uses)
-                 scalar-slots
-                 (mapv #(kabi/slot % :scalar (scalar-dtype %)
-                                   :c-name (get parameter-names %) :role :parameter)
-                       scalar-ids)
-                 bound-slot (kabi/slot '_n_bound :scalar :int
-                                       :c-name (get parameter-names '_n_bound) :role :bound)
-                 abi (body-abi/project-contracts
-                      (vec (concat pointer-slots scalar-slots [bound-slot])) kernel-body)
-                 artifact
-                 (kart/make
-                  {:kernel-name kernel-name :target target-module :source source :abi abi
-                   :arguments (vec (concat pointer-ids scalar-ids [bound]))
-                   :launch (:launch kernel-body) :temporaries []
-                   :effects {:kind :scan-stage :phase phase}
-                   :provenance {:dialect :kernel-body :source-dialect :segscan
-                                :segop-id (:id operation) :graph-node id}
-                   :attributes {:phase phase :dtype (:dtype algebra) :scan-mode scan-mode
-                                :scan-workgroup scan-workgroup :kernel-body kernel-body
-                                :emission-route :kernel-body
-                                :target-dialect target-dialect}})]
-             (kart/certify-scheduled-operation artifact operation))))]
+                                       (get-in scheduled [:body :parameters]))]
+             (kernel-body-target/emit-artifact
+              kernel-name scheduled target-dialect
+              {:parameter-names parameter-names :provenance {:graph-node id}}))))]
     (finalize-emitted-graph emitted target-module scalar-types)))
 
 (defn- generate-elementwise-kernel-graph

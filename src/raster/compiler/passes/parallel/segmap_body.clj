@@ -15,6 +15,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -110,7 +111,7 @@
 
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
-  [segmap {:keys [workgroup-size array-types scalar-types array-shapes]
+  [segmap {:keys [workgroup-size array-types scalar-types array-shapes scalar-math]
            :or {workgroup-size 256 array-types {} scalar-types {}}}]
   (when-not (segop/seg-map? segmap)
     (throw (ex-info "map KernelBody lowering requires SegMap"
@@ -204,6 +205,7 @@
         strict-effects? (soac-dialect/strict-effect-scalar-policy? effects)
         lowerer (scalar-expression/make-lowerer
                  (cond-> {:array-types array-types :scalar-types scalar-types
+                          :scalar-math scalar-math
                           :arrays (set inputs) :index-scope index-scope
                           :lower-index lower-index :predicate :map-active
                           :source-region [locals result effects]
@@ -745,7 +747,7 @@
                  :write-conflict conflict-kind
                  :write-conflicts (:write-conflicts segmap)
                  :conflict-contract (:conflict-contract segmap)}
-      :numerics (if reducing?
+      :numerics (cond-> (if reducing?
                   {:mode :reassociated :policy :certified-reducing-scatter
                    :accumulators
                    (mapv (fn [parameter]
@@ -755,6 +757,9 @@
                             :policy :proof-carrying-destination})
                          reduction-parameters)}
                   {:mode :exact :policy :same-scalar-evaluation-order})
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options))))
       :provenance {:dialect :kernel-body :source-dialect :segmap
                    :segop-id (:id segmap)}
       :attributes {:array-params (vec (concat inputs outputs))

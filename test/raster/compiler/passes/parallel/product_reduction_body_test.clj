@@ -12,6 +12,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.reduction-test :as fixtures]
@@ -212,6 +213,25 @@
         (catch clojure.lang.ExceptionInfo e
           (is (= :source-grid (:missing-rule (ex-data e)))))))))
 
+(deftest product-elements-retain-and-reconstruct-explicit-math-consent
+  (let [source (update-in (typed-argmax-segred) [:reduction :element :bindings 1]
+                          #(with-meta (list 'Math/tanh %) {:raster.type/tag 'float}))
+        options (dissoc options :element-binding-types :combine-binding-types)
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (product/schedule source options)
+        selected-options (assoc options :scalar-math policy)
+        selected (product/schedule source selected-options)]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double))
+    (is (= selected (product/validate-source! selected source selected-options)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (product/validate-source! selected source options)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled/validate! (update selected :numerics dissoc :scalar-math))))))
+
 (deftest source-refinement-is-replayed-not-asserted-by-a-candidate-label
   (let [source (typed-argmax-segred)
         options (dissoc options :element-binding-types :combine-binding-types)
@@ -312,6 +332,20 @@
       (is false "the exact node must belong to the graph")
       (catch clojure.lang.ExceptionInfo e
         (is (= :graph-node (:missing-rule (ex-data e))))))))
+
+(deftest product-graph-reconstruction-requires-independent-math-consent
+  (let [{:keys [algorithm body graph node]} (graph-context true)
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        options (assoc (product/graph-options node graph algorithm body) :scalar-math policy)
+        candidate (product/schedule (:operation node) options)]
+    (is (= candidate (product/validate-against-node!
+                      candidate node graph algorithm body {:scalar-math policy})))
+    (doseq [consent [{} {:scalar-math {:overrides {}}}]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (product/validate-against-node! candidate node graph algorithm body consent))))
+    (is (= policy (get-in (product/schedule-for-node
+                           node graph algorithm body {:scalar-math policy})
+                          [:numerics :scalar-math])))))
 
 (deftest unknown-product-input-storage-is-refined-from-typed-loads
   (let [{:keys [algorithm body graph node]} (graph-context false)

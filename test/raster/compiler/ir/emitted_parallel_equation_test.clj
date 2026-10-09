@@ -2,6 +2,8 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.backend.gpu.kernel-body-target :as kernel-target]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -16,6 +18,25 @@
 
 (def ^:private map-source
   '(raster.par/pmap i n float (clojure.core/+ 1.0 (clojure.core/aget values i))))
+
+(deftest emitted-scan-reconstructs-its-schedule-without-descriptive-graph-metadata
+  (let [source '(let* [effect (raster.par/scan out acc 0.0 i n double
+                                             (+ acc (aget values i)))] effect)
+        options {:dtype :double :array-types {'values :double 'out :double}
+                 :scalar-types {'n :long}}
+        typed (:program (typed-route/attempt source :double (:array-types options) options))
+        scheduled (:form (segop-lower/segop-lower-pass typed options))
+        equation (first (:equations scheduled))
+        {:keys [body graph]} (equation-graph/make-for-equation scheduled equation)
+        emitted (segop-opencl/generate-kernel-graph graph :target-dialect :opencl-portable)
+        boundary (emitted-equation/make (:algorithm equation) body emitted)
+        certificate (get-in emitted [:nodes 0 :operation :provenance :scheduled-operation])
+        altered (assoc-in certificate [:numerics :policy] :unrelated-policy)
+        altered-artifact (kernel-target/emit-artifact "altered_scan" altered :opencl-portable)]
+    (is (emitted-equation/emitted-equation? (emitted-equation/validate! boundary)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-equation/validate!
+                  (assoc-in boundary [:graph :nodes 0 :operation] altered-artifact))))))
 
 (defn- scheduled-fixture []
   (let [source (list 'let* ['result map-source] 'result)

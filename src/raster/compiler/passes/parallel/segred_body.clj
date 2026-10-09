@@ -19,6 +19,7 @@
             [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -434,7 +435,7 @@
    over typed child values use the same SSA builder as maps and ordered fold-maps."
   [expression {:keys [index coordinate dtype arrays array-types scalars scalar-types coordinate-lower
                       lower-load-index
-                      load-predicate load-other declared-result-dtype]}]
+                      load-predicate load-other declared-result-dtype scalar-math]}]
   (let [dtype (dtype/canon dtype)
         expression (inline-scalar-bindings expression)
         _ (validate-reduction-value-language! expression (some? declared-result-dtype))
@@ -471,6 +472,7 @@
                  {:arrays (set arrays)
                   :array-types array-types
                   :scalar-types scalar-types
+                  :scalar-math scalar-math
                   :source-region expression
                   ;; Only this adapter's already-approved coordinates reach KernelBody.
                   :lower-index lower-coordinate
@@ -502,7 +504,7 @@
 
   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
    accumulator remain uniform; integral scalar parameters may participate in index expressions."
-  [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof]
+  [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof scalar-math]
                      :or {dtype :double array-types {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region
          output-dtype :output-dtype}
@@ -573,6 +575,7 @@
         (lower-element-operations
          element
          {:index index :coordinate element-index :dtype dtype
+          :scalar-math scalar-math
           ;; SegRed's certified scalar region declares the dtype of its outer element value. This
           ;; authorizes only that result; nested calls still need retained walker/TypedClojure
           ;; facts in lower-element-operations.
@@ -651,6 +654,7 @@
           (scalar-region-lower/lower
            result-region
            {:accumulator final-value :accumulator-dtype dtype :store-dtype output-dtype
+            :scalar-math scalar-math
             :parameters (into {} (map (fn [parameter] [(:id parameter) parameter])) parameters)
             :coordinate-lower (fn [_]
                                 (decline! :full-reduction-result-operands
@@ -774,7 +778,8 @@
    (let [{:keys [kernel-body operator identity arrays scalars output bound group-count result-region]}
         (lower segred out-sym
                :dtype (:dtype options) :array-types (:array-types options)
-               :scalar-types scalar-types :coordinate-proof (:coordinate-proof options))
+               :scalar-types scalar-types :coordinate-proof (:coordinate-proof options)
+               :scalar-math (:scalar-math options))
         arguments (mapv (fn [parameter]
                           (if (= '_n_bound (:id parameter)) bound (:id parameter)))
                         (:parameters kernel-body))
@@ -820,6 +825,9 @@
                          :policy :certified-workgroup-tree
                          :rounding :implementation-defined
                          :accumulator-dtype (dtype/canon (:dtype segred))}
+                  (contains? options :scalar-math)
+                  (assoc :scalar-math (numerics/validate-scalar-math-policy!
+                                      (:scalar-math options)))
                   (:source-arithmetic segred)
                   (assoc :source-arithmetic (:source-arithmetic segred))
                   result-region
@@ -844,10 +852,13 @@
                    :c-op c-op}}))))
 
 (defn validate-against-node!
-  "Close scalar SegRed over its exact source, body, launch, and KernelGraph storage facts."
+  "Close scalar SegRed over its exact source, body, launch, and KernelGraph storage facts.
+   Optional math consent comes from independent caller options, never from the candidate."
   ([scheduled node kernel-graph]
    (validate-against-node! scheduled node kernel-graph nil nil))
   ([scheduled node kernel-graph closed-algorithm closed-body]
+   (validate-against-node! scheduled node kernel-graph closed-algorithm closed-body {}))
+  ([scheduled node kernel-graph closed-algorithm closed-body options]
   (let [storage-scalars (equation-graph/validated-storage-scalars
                         kernel-graph closed-algorithm closed-body)
         ;; Canonical equality is justified only by the independently reconstructed closed graph.
@@ -941,9 +952,10 @@
     (let [array-types (into {} (map (juxt :id :dtype)) (vals buffers))
           scalar-types (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
           expected (schedule source semantic-output
-                             {:dtype (:dtype source)
-                              :array-types array-types
-                              :scalar-types scalar-types})]
+                             (merge (select-keys options [:scalar-math])
+                                    {:dtype (:dtype source)
+                                     :array-types array-types
+                                     :scalar-types scalar-types}))]
       (when-not (= expected scheduled)
         (decline! :schedule-source
                   "scalar SegRed scheduled body is not the exact refinement of its source"
