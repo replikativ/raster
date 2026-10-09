@@ -176,9 +176,12 @@
   (mapv :kernel-name (artifacts (validate! executable))))
 
 (defn description
-  "Compact source-free description of a validated executable, without runtime selection claims.
+  "Compact description of a validated executable, without runtime selection claims.
    Graphs retain ordered leaf kernel labels separately from graph labels. Absent leaf facts stay
-   nil: the graph's requested precision or strategy is not evidence about an individual kernel."
+   nil: the graph's requested precision or strategy is not evidence about an individual kernel.
+   Present :numerics copies the producer's retained numerical metadata verbatim; this projection
+   does not revalidate it or independently prove emitted arithmetic. Graph metadata is never
+   inherited by leaves. Source modules and bodies are not copied into the description."
   [executable]
   (let [executable (validate! executable)]
     (cond->
@@ -189,12 +192,16 @@
                       :kernel-artifact [(:kernel-name executable)]
                       :kernel-graph (mapv #(get-in % [:operation :kernel-name])
                                           (:nodes executable)))}
+      (contains? (:attributes executable) :numerics)
+      (assoc :numerics (get-in executable [:attributes :numerics]))
       (kgraph/kernel-graph? executable)
       (assoc :kernels
              (mapv (fn [{:keys [operation]}]
-                     {:kernel-name (:kernel-name operation)
-                      :strategy (get-in operation [:attributes :strategy])
-                      :precision (get-in operation [:attributes :precision])})
+                     (cond-> {:kernel-name (:kernel-name operation)
+                              :strategy (get-in operation [:attributes :strategy])
+                              :precision (get-in operation [:attributes :precision])}
+                       (contains? (:attributes operation) :numerics)
+                       (assoc :numerics (get-in operation [:attributes :numerics]))))
                    (:nodes executable))))))
 
 (defn- cast-runtime-scalar
