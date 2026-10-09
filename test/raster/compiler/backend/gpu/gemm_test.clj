@@ -90,6 +90,32 @@
             (is (not (contains? (mixed-body/matrix-stage-spec stage :matrix-contract scalar-types)
                                 :parameter-names)))))))))
 
+(deftest mixed-matrix-reconstruction-retains-independent-caller-math-consent
+  (let [base {:id :selected-matrix-math :a 'a :b 'b :c 'c :m :m :n :n :k :k
+              :variant :nn :tile (hardware/derive-gemm-tile {})
+              :vector-width 4 :requested-splits 8}
+        epilogue {:acc 'acc :expr (with-meta '(Math/tanh acc) {:raster.type/tag 'float})
+                  :dtype :float}
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}]
+    (doseq [[planner spec used?]
+            [[mixed-schedule/plan (assoc base :epilogue epilogue) true]
+             [mixed-schedule/plan-batched (assoc base :batch :batch :epilogue epilogue) true]
+             [mixed-schedule/plan (assoc base :split-k? true) false]]]
+      (let [g (:graph (planner spec))
+            node (first (filter #(matrix-stage/matrix-stage? (:operation %)) (:nodes g)))
+            ordinary (mixed-body/schedule-for-node node g)
+            selected (mixed-body/schedule-for-node node g {:scalar-math policy})]
+        (is (= policy (get-in selected [:numerics :scalar-math])))
+        (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+        (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+        (is (= (get-in ordinary [:body :parameters]) (get-in selected [:body :parameters])))
+        (is (= used? (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double)))
+        (is (= selected (mixed-body/schedule-for-node node g {:scalar-math policy})))
+        (when used?
+          (is (not= (:body ordinary) (:body selected)))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (scheduled-body/validate! (update selected :numerics dissoc :scalar-math)))))))))
+
 (deftest opencl-backend-aliases-share-mixed-matrix-admission
   (let [desc {:device-type :gpu :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
               :subgroup-size 16 :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}

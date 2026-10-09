@@ -7,6 +7,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.layout-transform-schedule :as layout-schedule]
@@ -25,7 +26,7 @@
   "Build one canonical f16 matrix KernelBody without selecting a target spelling."
   [{:keys [kernel-name id a b c m n k dimension-parameters axis-symbols tile result-dtype provenance
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
-           k-range launch-group-count attributes epilogue input-value-regions input-layouts]
+           k-range launch-group-count attributes epilogue input-value-regions input-layouts scalar-math]
     :or {result-dtype :float provenance {}}}]
   (let [dimension-parameters
         (or dimension-parameters
@@ -44,6 +45,7 @@
       :tile tile
       :bindings {:row a :col b}
       :epilogue epilogue
+      :scalar-math scalar-math
       :input-value-regions (or input-value-regions {})
       :input-layouts (or input-layouts {})
       :result-dtype result-dtype
@@ -176,6 +178,8 @@
                      :scheduled-body (:id kernel-body)}
           :numerics (cond-> {:mode :reassociated :policy :tiled-contraction
                              :rounding :nearest-even :accumulator-dtype :float}
+                      (contains? spec :scalar-math)
+                      (assoc :scalar-math (numerics/validate-scalar-math-policy! (:scalar-math spec)))
                       (seq (:epilogue source-operation))
                       (assoc :result-transform
                              {:kind :typed-scalar-region
@@ -195,7 +199,9 @@
 
 (defn matrix-stage-spec
   "Project one validated matrix stage into its closed target-neutral body specification."
-  [stage phase scalar-types]
+  ([stage phase scalar-types]
+   (matrix-stage-spec stage phase scalar-types {}))
+  ([stage phase scalar-types caller-options]
   (let [{stage-id :id a :lhs b :rhs c :result
          [m n k] :dimensions axis-symbols :axis-symbols reduction :reduction epilogue :epilogue
          batching :batching schedule :schedule input-value-regions :input-value-regions
@@ -229,7 +235,8 @@
                    :phase phase
                    :source-operation stage
                    :provenance {:operation-id stage-id :phase phase}}]
-    (assoc (cond
+    (merge (select-keys caller-options [:scalar-math])
+     (assoc (cond
        batching
        (assoc (batched-matrix-spec
                (assoc emit-args
@@ -244,12 +251,14 @@
               :argument-values {:k-chunk kc :splits splits})
 
        :else emit-args)
-           :scalar-types scalar-types)))
+           :scalar-types scalar-types)))))
 
 (defn schedule-matrix-stage
   "Rebuild the complete scheduled certificate without target discovery or emission."
-  [stage scalar-types]
-  (schedule-matrix (matrix-stage-spec stage :matrix-contract scalar-types)))
+  ([stage scalar-types]
+   (schedule-matrix-stage stage scalar-types {}))
+  ([stage scalar-types caller-options]
+   (schedule-matrix (matrix-stage-spec stage :matrix-contract scalar-types caller-options))))
 
 (defn ^:no-doc make-schedule
   [{:keys [source body arguments effects legality numerics phase
@@ -379,7 +388,9 @@
    This does not certify algorithm equivalence or whole-graph writes. A certification caller
    must first compare the complete graph with independent typed reconstruction; generic stage
    validation alone does not establish canonical reduction geometry."
-  [node graph]
+  ([node graph]
+   (schedule-for-node node graph {}))
+  ([node graph caller-options]
   (let [graph (kgraph/validate! graph)
         _ (when-not (some #{node} (:nodes graph))
             (throw (ex-info "mixed matrix reference node is not in its stage graph"
@@ -389,7 +400,7 @@
         phase (last (:id node))
         scheduled (cond
                     (matrix-stage/matrix-stage? operation)
-                    (schedule-matrix-stage operation scalar-types)
+                    (schedule-matrix-stage operation scalar-types caller-options)
 
                     (layout-stage/layout-stage? operation)
                     (case (:operation operation)
@@ -404,4 +415,4 @@
                                          {:reason :mixed-matrix-body-operation
                                           :node (:id node) :operation operation})))]
     (scheduled-body/validate-against-node! scheduled node graph)
-    scheduled))
+    scheduled)))

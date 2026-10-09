@@ -267,6 +267,24 @@
     (is (re-find #"bias\[.*col" (:source routed)))
     (is (re-find #"convert_half_rte" (:source routed)))))
 
+(deftest matrix-epilogues-retain-selected-physical-math-without-changing-storage
+  (let [epilogue {:acc 'acc :expr (with-meta '(Math/tanh acc) {:raster.type/tag 'float})
+                  :dtype :float}
+        proof (facts/contraction-facts
+               (concat (matrix-form 128 128 128) [:out-dtype :float :epilogue epilogue])
+               :dtype :half)
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (schedule/plan-matrix-body proof nil nil)
+        selected (schedule/plan-matrix-body proof nil nil {:scalar-math policy})]
+    (is (:ok ordinary))
+    (is (:ok selected))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (= (get-in ordinary [:body :parameters]) (get-in selected [:body :parameters])))
+    (is (not (contains? (body/required-scalar-dtypes (get-in ordinary [:body :operations])) :double)))
+    (is (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double))
+    (is (= :float (:dtype (first (filter #(= :result (:role %))
+                                         (get-in selected [:body :parameters]))))))))
+
 (deftest typed-store-regions-reuse-existing-contraction-inputs-by-identity
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/+ acc (clojure.core/aget A

@@ -35,7 +35,7 @@
     (with-meta (apply list 'clojure.core/* values)
       {:raster.type/tag 'long :tag 'long})))
 
-(defn- graph-options [plan]
+(defn- graph-options [plan options]
   (let [graph (get-in plan [:source :graph])
         scheduled-body (get-in plan [:source :body])
         buffers (into {} (map (juxt :id identity))
@@ -44,7 +44,8 @@
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
         producer-requirements
         (product-regions/dense-read-requirements
-         (:producer plan) {:array-types array-types :scalar-types scalar-types} decline!)
+         (:producer plan) (merge (select-keys options [:scalar-math])
+                                 {:array-types array-types :scalar-types scalar-types}) decline!)
         requirements
         (merge-with
          (fn [left right]
@@ -198,7 +199,8 @@
 
 (defn lower
   "Build the candidate body from a replayable product-consumer analysis plan."
-  [plan]
+  ([plan] (lower plan {}))
+  ([plan options]
   (when-not (= :product-ordered-consumer (:kind plan))
     (decline! :plan "product-consumer body requires an admitted region plan" {:plan plan}))
   (let [{:keys [producer consumer intermediates workgroup-size]} plan
@@ -209,7 +211,7 @@
         strategy (:strategy physical-schedule)
         subgroup? (= :subgroup-product-ordered-consumer strategy)
         physical-workgroup-size (:workgroup-size physical-schedule)
-        {:keys [buffers array-types array-shapes scalar-types]} (graph-options plan)
+        {:keys [buffers array-types array-shapes scalar-types]} (graph-options plan options)
         components (get-in producer [:reduction :components])
         component-types (mapv (comp dtype/canon :dtype) components)
         _ (when-not (= (count intermediates) (count components))
@@ -255,7 +257,8 @@
                       (index-expression/lower-typed expression
                                                     (set/union index-scope locals)
                                                     index-types :long decline!))
-        producer-options {:array-types array-types :scalar-types scalar-types}
+        producer-options (merge (select-keys options [:scalar-math])
+                                 {:array-types array-types :scalar-types scalar-types})
         workgroup-regions (when-not subgroup?
                             (product-regions/lower producer producer-options decline!))
         element (:element workgroup-regions)
@@ -430,6 +433,7 @@
         consumer-lowerer
         (scalar/make-lowerer {:arrays consumer-arrays :array-types array-types
                               :scalar-types consumer-index-types
+                              :scalar-math (:scalar-math options)
                               :index-scope (set (keys consumer-index-types))
                               :lower-index consumer-lower-index
                               :source-region (:scalar-region consumer)
@@ -585,7 +589,7 @@
                        :outer-numerics (get-in plan [:numerics :outer])}})]
     {:kernel-body kernel-body
      :arguments (mapv :id parameters)
-     :plan plan}))
+     :plan plan})))
 
 (defn from-program
   "Analyze two equations and build their candidate cooperative KernelBody."

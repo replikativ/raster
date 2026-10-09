@@ -2164,6 +2164,17 @@ admission still derives storage evidence independently. Product producer/consume
 shared scalar and scan emitter suites pass 120 tests / 1063 assertions. Public
 selection remains disabled pending the remaining owners and outer admission.
 
+The private fused product/ordered-consumer route now carries caller-owned scalar
+consent to access-analysis, producer element/combine lowerers and the consumer
+lowerer for both workgroup and subgroup strategies. The same normalized consent
+is retained in the scheduled-body and graph-refinement numerical contracts;
+ordered outer-fold and integral inner-tree semantics remain unchanged. A builder
+coverage check caught and corrected an initially omitted access-analysis path.
+The affected body/route suites pass 12 tests / 124 assertions. This check uses an
+unused Float override on integral fixtures: it establishes complete option
+propagation without manufacturing FP64 demand, not numerical accuracy of fused
+transcendentals. Public selection and independent outer replay remain disabled.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec
@@ -2189,3 +2200,39 @@ the runtime-to-descriptor path retains Half/Double support with detected
 provenance. These are execution legality facts, not hardware-native throughput
 or cross-target numerical-accuracy claims. Public math policy admission remains
 disabled pending the complete scheduling/certificate vertical.
+
+Private contraction scheduling now carries caller-owned scalar math consent
+through portable, register-tiled and direct matrix epilogues. The selected
+physical evaluation dtype does not change logical buffer dtypes or launch
+geometry; numerical certificates retain the normalized policy and reject its
+removal when a selected math leaf remains. Complete-write reconstruction for
+portable/register bodies takes independent caller options rather than deriving
+consent from the candidate. Independent review found and corrected an omitted
+policy at the matrix strategy dispatcher; the regression exercises that public
+schedule-shaped dispatcher as well as the underlying private matrix builder.
+The two focused contraction suites pass 41 tests / 324 assertions in the warm
+REPL. This is policy plumbing, not matrix accuracy or model-gradient acceptance.
+Mixed-matrix stage reconstruction and other remaining owners still need the
+same closed vertical before public policy selection can be enabled.
+
+Mixed-matrix stage body projection now accepts independent caller options for
+scalar math. Policy survives direct, batched and split-K specification projection
+and is retained in the scheduled matrix numerical contract. Existing arities
+reconstruct default math; no consent is inferred from candidate certificates.
+Direct and batched selected-tanh regressions check unchanged parameters/launch,
+physical FP64 demand and stripped-consent rejection. The split-K fixture checks
+retention of unused consent without FP64 demand. GEMM and matrix-plan suites pass
+39 tests / 1257 assertions in the warm REPL. This closes the stage-body owner,
+not whole-graph numerical admission, target execution support or model validation;
+public selection is still disabled.
+
+Indexed weighted-reduction reference and subgroup score-reuse body owners now
+accept independent caller scalar-math options. Their existing exp leaves select
+physical realization through the shared numerical-contract policy; source,
+membership, accumulator arithmetic, parameters and launch remain unchanged.
+Old arities retain default bodies and certificates. Dynamic reference/subgroup
+regressions check policy retention, physical FP64 demand and stripped-consent
+rejection. The intrinsic contract rejects a sqrt target-library override, so
+sqrt remains under its existing semantics rather than broadening policy to fit
+a test. Indexed body and route suites pass 24 tests / 198 assertions. Public
+selection and whole-graph reconstruction are still separate pending work.

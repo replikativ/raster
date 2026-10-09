@@ -44,7 +44,7 @@
 
 (defn lower
   "Apply a portable one-work-item-per-segment schedule to a verified contraction SegRed."
-  [contract-facts segred {:keys [workgroup-size array-types scalar-types]
+  [contract-facts segred {:keys [workgroup-size array-types scalar-types scalar-math]
                           :or {workgroup-size 256 array-types {} scalar-types {}}}]
   (when-not (facts/facts? contract-facts)
     (throw (ex-info "portable contraction lowering requires verified facts"
@@ -283,6 +283,7 @@
             (scalar-region-lower/lower
              result-region
              {:accumulator reduction-result
+              :scalar-math scalar-math
               :accumulator-dtype dtype
               :store-dtype output-dtype
               :parameters parameter-map

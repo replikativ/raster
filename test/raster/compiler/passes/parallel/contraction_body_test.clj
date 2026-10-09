@@ -278,6 +278,66 @@
           (is (= '[A x] (:array-params emitted)))
           (is (= '[k m] (:scalar-params emitted))))))))
 
+(deftest portable-and-register-contractions-retain-selected-epilogue-math
+  (let [epilogue {:acc 'acc :expr (with-meta '(Math/tanh acc) {:raster.type/tag 'float})
+                  :dtype :float}
+        contraction (concat
+                     '(raster.par/contract C [[i 4] [j 8]] [[l 16]]
+                                          (* (aget A (+ (* i 16) l)) (aget B (+ (* l 8) j))))
+                     [:epilogue epilogue])
+        source (list 'let* ['result (apply list contraction)] 'result)
+        program (:form (pipeline/schedule-parallel-form
+                        source {:dtype :float :target-device :ocl:0
+                                :array-types {'A :float 'B :float 'C :float}}))
+        equation (first (:equations program))
+        graph (:graph (equation-graph/make-for-equation program equation))
+        algorithm (:algorithm equation)
+        node (first (:nodes graph))
+        verified (:facts (contraction-context/validate! algorithm (:operation node)))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}]
+    (doseq [build [(fn [options] (schedule/schedule-portable-for-node node graph verified {} options))
+                  (fn [options] (:scheduled (schedule/plan-register-tiled-for-node
+                                             node graph verified {}
+                                             (assoc options :precision :mixed-f16-f32))))]]
+      (let [ordinary (build {})
+            selected (build {:scalar-math policy})]
+        (is (scheduled-body/scheduled-kernel-body? selected))
+        (is (= policy (get-in selected [:numerics :scalar-math])))
+        (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+        (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+        (is (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double))
+        (is (some? (schedule/complete-write-domain algorithm node graph selected {:scalar-math policy})))
+        (is (nil? (schedule/complete-write-domain algorithm node graph selected)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))))
+
+(deftest matrix-dispatch-retains-caller-owned-epilogue-math
+  (let [epilogue {:acc 'acc :expr (with-meta '(Math/tanh acc) {:raster.type/tag 'float})
+                  :dtype :float}
+        contraction (concat
+                     '(raster.par/contract C [[i 128] [j 128]] [[l 128]]
+                                          (* (aget A (+ (* i 128) l)) (aget B (+ (* l 128) j))))
+                     [:out-dtype :float :epilogue epilogue])
+        source (list 'let* ['result (apply list contraction)] 'result)
+        program (:form (pipeline/schedule-parallel-form
+                        source {:dtype :half :target-device :ocl:0
+                                :array-types {'A :half 'B :half 'C :float}}))
+        equation (first (:equations program))
+        graph (:graph (equation-graph/make-for-equation program equation))
+        node (first (:nodes graph))
+        verified (:facts (contraction-context/validate! (:algorithm equation) (:operation node)))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        options {:schedule {:precision :mixed-f16-f32
+                            :typed-contraction {:strategy :matrix}}}
+        ordinary (schedule/schedule-for-node node graph verified nil options)
+        selected (schedule/schedule-for-node node graph verified nil (assoc options :scalar-math policy))]
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= (:numerics ordinary) (dissoc (:numerics selected) :scalar-math)))
+    (is (= (get-in ordinary [:body :launch]) (get-in selected [:body :launch])))
+    (is (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update selected :numerics dissoc :scalar-math))))))
+
 (deftest portable-result-transform-is-typed-scalar-ssa-on-every-c-family-target
   (let [plan (portable-result-transform-plan)
         kernel (:body plan)
