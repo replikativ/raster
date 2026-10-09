@@ -428,6 +428,39 @@
           (catch clojure.lang.ExceptionInfo error
             (is (= :kernel-body-target-math-capability (:reason (ex-data error))))))))))
 
+(deftest public-contraction-dispatch-retains-independent-math-request
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]
+    (doseq [target [ocl-target cuda-target hip-target]]
+      (let [options (merge request
+                           {:target target :dtype :float
+                            :schedule {:typed-contraction {:strategy :dispatch-register-tiled}}})
+            compilation (equation-first/compile #'contractions/fixed-matmul options)
+            program (:emitted compilation)
+            arguments [(float-array 15) (float-array 21)]
+            linked (equation-first/compile-link-plan #'contractions/fixed-matmul arguments options)]
+        (is (= (:scalar-math request) (get-in compilation [:options :scalar-math])))
+        (is (= 2 (count (:kernels compilation))))
+        (is (identical? program (emitted-program/validate! program request)))
+        (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! program)))
+        (is (link-plan/link-plan? linked))
+        (is (identical? linked (link-plan/validate! linked request)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (equation-first/lower compilation arguments)))))))
+
+(deftest public-math-request-is-validated-before-source-analysis
+  (let [walks (atom 0)]
+    (with-redefs [pipeline/get-walked-body
+                  (fn [& _] (swap! walks inc)
+                    (throw (ex-info "unexpected source analysis" {})))]
+      (try
+        (equation-first/compile #'contractions/fixed-matmul
+                               {:target cuda-target :dtype :float
+                                :scalar-math {:overrides {} :unknown true}})
+        (is false "malformed caller intent must fail before specialization")
+        (catch clojure.lang.ExceptionInfo error
+          (is (= :scalar-math-policy (:reason (ex-data error)))))))
+    (is (zero? @walks))))
+
 (deftm c-family-four-layers
   "A multi-stage contraction fixture whose named middle value is a distinct resident tap."
   [w :- (Array double) b :- (Array double) x :- (Array double)] :- (Array double)
