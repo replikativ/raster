@@ -5,7 +5,8 @@
    whether they preserve evaluation exactly, reassociate a known accumulator, or accept a named
    error model.  IR boundaries consume the same validator so numerical policy cannot drift between
    graph and single-kernel refinements."
-  (:require [raster.compiler.core.dtype :as dtype]))
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.backend.intrinsics :as intrinsics]))
 
 (def modes #{:exact :reassociated :bounded-error})
 (def rounding-policies
@@ -34,6 +35,33 @@
 
 (defn widened-target-library-math? [value]
   (= widened-target-library-math value))
+
+(defn validate-scalar-math-policy!
+  "Closed, default-empty scalar realization request. Keys are canonical [operation dtype].
+   This validates intent only; owners must retain it and targets must satisfy physical demands."
+  [policy]
+  (let [policy (if (nil? policy) {:overrides {}} policy)]
+    (when-not (and (map? policy) (= #{:overrides} (set (keys policy)))
+                   (map? (:overrides policy))
+                   (every? (fn [[key realization]]
+                             (and (vector? key) (= 2 (count key))
+                                  (let [[operation dt] key]
+                                    (and (keyword? operation)
+                                         (= operation (intrinsics/canonical operation))
+                                         (= :float dt)
+                                         (= :target-library
+                                            (:kernel-body-math-realization
+                                             (intrinsics/descriptor operation)))
+                                         (= :f64-target-library-rte-f32 realization)))))
+                           (:overrides policy)))
+      (throw (ex-info "scalar math requires canonical Float target-library overrides"
+                      {:reason :scalar-math-policy :policy policy})))
+    policy))
+
+(defn scalar-math-realization
+  "Select from an already validated policy; absent overrides preserve the descriptor default."
+  [policy operation dt]
+  (when (get (:overrides policy) [operation dt]) widened-target-library-math))
 
 (defn blas-source-arithmetic
   "Describe a resolved BLAS product, not permission for a numerical refinement.

@@ -2051,3 +2051,20 @@ record-kind checks, including expressions retained across warm-REPL reloads.
 The matrix fixture's mutation check follows the same handling. The final suite
 above was rerun after those fixes; expression-valued stores also retain their
 hidden Double demand without requiring a named Double SSA value.
+
+The follow-up shared builder accepts an internal closed realization policy with
+canonical `[operation :float]` keys and the single named
+`:f64-target-library-rte-f32` choice. It validates once and attaches the existing
+closed realization without another operator registry. Nil is exactly the empty
+policy; unknown operations, dtype aliases, Double requests, malformed keys,
+unsupported math choices and extra fields fail structurally. Selective unary
+calls, unrelated operations and existing Double calls are tested independently.
+Isolated and fused retained scalar regions carry the same realization and
+physical Double demand. The affected scalar-region suite passes 49 tests / 535
+assertions in the warm REPL after refreshing its stale index-lowering dependency.
+
+This policy is not yet exposed as a public schedule option. That must wait for
+all scheduled-body producers and independent reconstructors to retain it,
+physical target admission to account for FP64, and public cache/source/codec
+acceptance. A partially threaded public request would be silently ignored by
+some families and is not an acceptable intermediate public contract.

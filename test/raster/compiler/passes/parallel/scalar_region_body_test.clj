@@ -5,6 +5,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index]
@@ -19,6 +20,57 @@
      {:array-types {'x :float} :arrays #{'x} :scalar-types {'i :int}
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
+
+(deftest scalar-realization-policy-is-closed-and-canonical
+  (is (= {:overrides {}} (numerics/validate-scalar-math-policy! nil)))
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}]
+    (is (= policy (numerics/validate-scalar-math-policy! policy)))
+    (doseq [invalid [{} {:overrides nil} (assoc policy :accuracy :correctly-rounded)
+                     {:overrides {:tanh :f64-target-library-rte-f32}}
+                     {:overrides {[:tanh :float :extra] :f64-target-library-rte-f32}}
+                     {:overrides {[:tanh :f32] :f64-target-library-rte-f32}}
+                     {:overrides {[:tanh :double] :f64-target-library-rte-f32}}
+                     {:overrides {[:+ :float] :f64-target-library-rte-f32}}
+                     {:overrides {[:unknown :float] :f64-target-library-rte-f32}}
+                     {:overrides {['raster.numeric/tanh :float] :f64-target-library-rte-f32}}
+                     {:overrides {[:tanh :float] :correctly-rounded}}]]
+      (is (= :scalar-math-policy
+             (try (numerics/validate-scalar-math-policy! invalid)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest shared-scalar-builder-retains-selective-realization
+  (let [options {:arrays #{} :array-types {} :scalar-types {'x :float}
+                 :lower-index (fn [expression _] expression)
+                 :decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))}
+        default (scalar/make-lowerer options)
+        selected (scalar/make-lowerer
+                  (assoc options :scalar-math
+                         {:overrides {[:tanh :float] :f64-target-library-rte-f32}}))
+        expression #(get-in ((:compute %1) %2 %3 [(body/literal 0.5 %3)] {})
+                            [:operations 0 :expression])]
+    (is (= numerics/target-library-math
+           (get-in (expression default :tanh :float) [:options :math-realization])))
+    (is (= numerics/widened-target-library-math
+           (get-in (expression selected :tanh :float) [:options :math-realization])))
+    (is (= numerics/target-library-math
+           (get-in (expression selected :sin :float) [:options :math-realization])))
+    (is (= numerics/target-library-math
+           (get-in (expression selected :tanh :double) [:options :math-realization])))
+    (is (= #{:float :double}
+           (body/required-scalar-dtypes [(expression selected :tanh :float)])))
+    (let [tanh (with-meta '(raster.numeric/tanh x) {:raster.type/tag 'float})
+          isolated ((:lower selected) tanh :float {})
+          fused ((:lower-region selected)
+                 {:bindings ['t tanh]
+                  :results [(with-meta '(raster.numeric/+ t x) {:raster.type/tag 'float})]}
+                 [:float] {'t :float} {})
+          realization (fn [lowered]
+                        (->> (:operations lowered)
+                             (keep #(when (= :tanh (get-in % [:expression :op]))
+                                      (get-in % [:expression :options :math-realization]))) vec))]
+      (is (= [numerics/widened-target-library-math] (realization isolated)))
+      (is (= (realization isolated) (realization fused)))
+      (is (= #{:float :double} (body/required-scalar-dtypes (:operations fused)))))))
 
 (deftest strict-source-normalization-preserves-fixed-arity-inference-boundary
   (let [lower (:lower (scalar/make-lowerer

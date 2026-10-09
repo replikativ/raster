@@ -13,6 +13,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.index-expression :as index-expression]
@@ -61,11 +62,14 @@
    `:fresh-binding` reserves an SSA identity for an owner's structured-control binder.
    `:owner-load-coordinates` optionally supplies independently proved coordinate vectors for
    closed layout regions; when supplied, retained source indices are not a second authority.
+   `:scalar-math` is a closed, default-empty operation/dtype realization policy. It is validated
+   once here and retained in scalar expressions; it does not infer hardware capability.
    These typed entries leave admission and proofs to the owner and final KernelBody validation."
   [{:keys [array-types scalar-types scalar-ranges arrays index-scope lower-index lower-load-index predicate id-prefix decline!
-           conversion-policy load-other source-region require-source-types? owner-load-coordinates]
+           conversion-policy load-other source-region require-source-types? owner-load-coordinates scalar-math]
     :or {id-prefix "scalar" scalar-ranges {}}}]
-  (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
+  (let [scalar-math (numerics/validate-scalar-math-policy! scalar-math)
+        canon-type #(if (= :predicate %) :predicate (dtype/canon %))
         normalized-form (fn [form type source]
                           (with-meta form (assoc (meta source) :raster.type/tag
                                                  (dtype/scalar-tag-for-dtype type))))
@@ -324,7 +328,10 @@
               (reserve! arguments)
               (let [result-type (canon-type result-type)
                     result (fresh "value")
-                    range (or range (scalar-range/for-dtype result-type))]
+                    range (or range (scalar-range/for-dtype result-type))
+                    realization (numerics/scalar-math-realization
+                                 scalar-math (intrinsics/canonical operator) result-type)
+                    options (cond-> options realization (assoc :math-realization realization))]
                 (remember-range! result range)
                 {:operations [(body/->ScalarCompute
                                (body/value result result-type)
