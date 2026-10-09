@@ -1951,6 +1951,10 @@
                     "reassociated equation dispatch requires the equation-first compiler"
                     {:reason :reassociated-equation-dispatch-requires-equation-first
                      :device device-id})))
+        _ (when (= :f32-storage-f64-arithmetic-rte-f32 (:precision resolved-schedule))
+            (throw (ex-info "widened contraction arithmetic requires the equation-first compiler"
+                            {:reason :widened-contraction-requires-equation-first
+                             :device device-id :fallback :none})))
         _ (when (= :dispatch-register-tiled
                    (get-in resolved-schedule [:typed-contraction :strategy]))
             (throw (ex-info

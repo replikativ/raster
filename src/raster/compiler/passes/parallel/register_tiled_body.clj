@@ -18,6 +18,20 @@
 (def default-tile
   {:block-m 64 :block-n 64 :block-k 16 :thread-m 4 :thread-n 4})
 
+(defn arithmetic-register-bytes-per-lane
+  "Analytic arithmetic register charge, not a vendor register-allocation proof.
+   Charge the microtile accumulators, loaded operands, widened operands, and one
+   decomposed product temporary. Storage/launch tiles cannot reduce this charge."
+  [tile storage-dtype arithmetic-dtype multiply-add]
+  (let [{:keys [thread-m thread-n]} tile
+        storage-bytes (dtype/bytes-of storage-dtype)
+        arithmetic-bytes (dtype/bytes-of arithmetic-dtype)
+        widened? (not= storage-dtype arithmetic-dtype)]
+    (+ (* thread-m thread-n arithmetic-bytes)
+       (* (+ thread-m thread-n) storage-bytes)
+       (if widened? (* (+ thread-m thread-n) arithmetic-bytes) 0)
+       (if (= :decomposed multiply-add) arithmetic-bytes 0))))
+
 (def ^:private tile-candidates
   [default-tile
    {:block-m 32 :block-n 32 :block-k 16 :thread-m 4 :thread-n 4}

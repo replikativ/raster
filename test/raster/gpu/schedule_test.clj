@@ -16,6 +16,47 @@
    :machine-lanes 8192 :subgroup-size 16 :grf-bytes-per-lane 256
    :max-workgroup-size 1024})
 
+(deftest widened-contraction-policy-requires-an-explicit-non-fallback-route
+  (doseq [multiply-add [:decomposed :fused]]
+    (let [request {:precision :f32-storage-f64-arithmetic-rte-f32
+                   :typed-contraction {:strategy :register-tiled :multiply-add multiply-add}}]
+      (is (= :f32-storage-f64-arithmetic-rte-f32
+             (:precision (sched/compilation-schedule arc-desc {:schedule request}))))
+      (doseq [strategy [:auto :portable :matrix :dispatch-register-tiled :dispatch-mixed-matrix]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (sched/compilation-schedule arc-desc
+                       {:schedule (assoc-in request [:typed-contraction :strategy] strategy)})))))))
+
+(deftest widened-arithmetic-budget-cannot-be-reduced-by-an-unrelated-matrix-tile
+  (doseq [[policy bytes] [[:fused 224] [:decomposed 232]]]
+    (let [request {:precision :f32-storage-f64-arithmetic-rte-f32
+                   :typed-contraction {:strategy :register-tiled :multiply-add policy}}
+          tiny-matrix-tile {:sg-m 4 :sg-n 4 :matrix {:subgroup 16}}]
+      (doseq [schedule [request (assoc request :tile tiny-matrix-tile)]]
+        (try
+          (sched/compilation-schedule (assoc arc-desc :grf-bytes-per-lane 200)
+                                      {:schedule schedule})
+          (is false "unrelated matrix tiles cannot underprice Double microtile arithmetic")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= bytes (:required-bytes-per-lane (ex-data e))))
+            (is (= 200 (:budget-bytes-per-lane (ex-data e)))))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"default register tile"
+           (sched/compilation-schedule
+            arc-desc {:schedule (assoc-in request [:typed-contraction :tile]
+                                          {:thread-m 1 :thread-n 1})}))))))
+
+(deftest legacy-descriptor-compilation-rejects-widening-before-source-lowering
+  (with-redefs [hardware/descriptor-for (constantly arc-desc)]
+    (try
+      (pl/compile-gpu-program #'identity :ze:0 :dtype :float
+                              :schedule {:precision :f32-storage-f64-arithmetic-rte-f32
+                                         :typed-contraction {:strategy :register-tiled}})
+      (is false "the descriptor compiler must not accept an equation-first-only policy")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :widened-contraction-requires-equation-first (:reason (ex-data e))))
+        (is (= :none (:fallback (ex-data e))))))))
+
 (deftest override-normalization-preserves-policy-and-invalid-inputs
   (is (nil? (sched/normalize-override nil)))
   (is (= {:precision :f32-scalar :unknown :retained}
