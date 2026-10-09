@@ -664,7 +664,9 @@
                                       (assoc :arithmetic-dtype :double))
                           :numerics (retain-scalar-math
                                      (register-contraction-numerics contract-facts kernel-body) options)
-                          :attributes {:strategy :register-tiled :precision :f32
+                          :attributes {:strategy :register-tiled
+                                       :precision (if (= :f32-storage-f64-arithmetic-rte-f32 precision)
+                                                    precision :f32)
                                        :variant (:variant lowered)
                                        :out-elems (:output-count lowered)}})]
           {:ok true :scheduled (scheduled-body/validate-against-node! scheduled node graph)})
