@@ -54,27 +54,61 @@
    rows :- Long width :- Long] :- Double
   (loss/mse-loss (nn/linear-nb inputs weights rows width 1) targets rows))
 
-(deftest public-objective-cannot-expose-a-parallel-intermediate
-  (if-not @opencl/opencl-available?
-    (opencl/opencl-skip! "public scalar objective source-result coverage")
-    (let [arguments [(float-array [0.25 -0.5])
-                     (float-array [1 2 3 4 5 6])
-                     (float-array [0.125 0.25 0.5]) 3 2]
-          expected (apply linear-objective arguments)]
-      (is (number? expected) "the independent JVM computation returns the declared scalar loss")
-      (doseq [inline? [false true]]
-        ;; Until the complete loss is lowered, decline before device allocation rather
-        ;; than promoting its valid contraction island to the public scalar result.
-        (with-redefs [gpu/alloc! (fn [& _] (throw (AssertionError. "unexpected allocation")))
-                      link/instantiate! (fn [& _] (throw (AssertionError. "unexpected instantiation")))]
-          (try
-            (compiled/lower #'linear-objective arguments
-                            {:compiler :equation-first :target :ocl:0
-                             :dtype :float :inline? inline?})
-            (is false "the loss continuation is not yet represented by typed equations")
-            (catch clojure.lang.ExceptionInfo error
-              (is (= :structured-control-source-result (:reason (ex-data error))))
-              (is (= [:return] (:site (ex-data error)))))))))))
+(deftm narrow-after-wide-terminal-arithmetic
+  [input :- (Array double) n :- Long] :- Float
+  (let [total (par/reduce acc 0.0 i n (+ acc (arrays/aget input i)))
+        result (float (+ total 0.25))]
+    result))
+
+(deftest floating-terminal-arithmetic-retains-intermediate-precision
+  (doseq [[target available? skip!] [[:ocl:0 @opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 @gp/gpu-available? gp/gpu-skip!]]]
+    (if-not available?
+      (skip! "wide arithmetic followed by terminal float narrowing")
+      (let [input (double-array [16777217.0])
+            expected (narrow-after-wide-terminal-arithmetic input 1)
+            prepared (compiled/lower #'narrow-after-wide-terminal-arithmetic [input 1]
+                                     {:compiler :equation-first :target target :dtype :double})
+            artifact (compiled/instantiate! prepared)]
+        (try
+          (let [actual (first (value/->host (:result (artifact {}))))]
+            (is (= 16777218.0 (double expected)))
+            (is (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))
+                "Double add precedes Float rounding; early narrowing would produce 16777216"))
+          (finally (compiled/close! artifact)))))))
+
+(defn- run-public-objective-case [target]
+  (let [arguments [(float-array [0.25 -0.5])
+                   (float-array [1 2 3 4 5 6])
+                   (float-array [0.125 0.25 0.5]) 3 2]
+        changed-targets (float-array [0.5 -0.25 1.0])]
+    (doseq [inline? [false true]]
+      (let [prepared (with-redefs [gpu/alloc! (fn [& _] (throw (AssertionError. "unexpected allocation")))
+                                  link/instantiate! (fn [& _] (throw (AssertionError. "unexpected instantiation")))]
+                       (compiled/lower #'linear-objective arguments
+                                       {:compiler :equation-first :target target
+                                        :dtype :float :inline? inline?}))
+            artifact (compiled/instantiate! prepared)]
+        (try
+          (doseq [[bindings args] [[{} arguments]
+                                   [{:targets changed-targets} (assoc arguments 2 changed-targets)]]]
+            (let [expected (apply linear-objective args)
+                  outputs (artifact bindings)
+                  actual (value/->host (:result outputs))]
+              (is (= #{:result} (set (keys outputs))))
+              (is (instance? (class (double-array 0)) actual)
+                  "the terminal double epilogue does not widen FP32 reduction storage")
+              (is (= [expected] (vec actual))
+                  "the public result is the complete loss, including changed targets, not the projection")))
+          (finally (compiled/close! artifact)))))))
+
+(deftest public-objective-covers-the-complete-scalar-result
+  (if @opencl/opencl-available?
+    (run-public-objective-case :ocl:0)
+    (opencl/opencl-skip! "complete public scalar objective"))
+  (if @gp/gpu-available?
+    (run-public-objective-case :ze:0)
+    (gp/gpu-skip! "complete public scalar objective")))
 
 (defn- mutable-case [target]
   (let [state (float-array [2.0 4.0 6.0 8.0])

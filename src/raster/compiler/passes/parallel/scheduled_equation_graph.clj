@@ -683,6 +683,22 @@
              {:expected expected :actual kernel-graph})))
   kernel-graph)
 
+(defn validated-storage-scalars
+  "Derive extent aliases only from the exact retained algorithm/schedule graph projection.
+   Graph attributes never authorize these equalities. Without a closed context, no alias is proved."
+  [kernel-graph algorithm scheduled-body]
+  (when-not (= (some? algorithm) (some? scheduled-body))
+    (fail! :scheduled-equation-projection-context
+           "storage scalar projection requires both retained algorithm and scheduled body" {}))
+  (if-not scheduled-body
+    {}
+    (do
+      (validate-projection! kernel-graph algorithm scheduled-body)
+      (derived-scalar-expressions
+       (:values scheduled-body)
+       (take-while #(true? (get-in % [:attributes :host-only]))
+                   (:equations scheduled-body))))))
+
 (defn algorithm-for-equations
   "Compose the exact retained TypedSOAC algorithms for a contiguous scheduled equation region.
 

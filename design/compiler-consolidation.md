@@ -1749,3 +1749,36 @@ objective through the ordinary typed reduction/scalar algebra and restore positi
 loss parity. Keep the public compiler-default switch blocked until whole-source coverage and
 the remaining measured dispatch/workload contracts are established. The original model gate
 and the full campaign remain open.
+
+### Scalar objective investigation through ordinary typed algebra — 2026-10-09
+
+The linear-prediction/MSE prototype exercised the complete typed vertical rather than an
+intermediate contraction island. Declared scalar-result user helpers may read array operands;
+array-result storage helpers retain their existing admission boundary. Local allocation lengths
+can be resolved under canonical casts without erasing a narrowing conversion.
+
+Scalar reductions use the same independently reconstructed storage-scalar projection as fold-map.
+The retained algorithm and scheduled body must reproduce the exact KernelGraph before their
+ordered integral shape equations can justify extent equality. Source operations, checked prefix
+evaluation, scheduled arguments and ABI identities remain unchanged. Graph attributes cannot
+supply these definitions. Emitted-equation validation rechecks the scalar reduction's storage
+closure as well as its artifact projection.
+
+The proposed extension lets an adjacent pure floating scalar consumer become a terminal region,
+including arithmetic at a different floating precision. This keeps every scalar expression and
+conversion boundary; it does not change the accumulation dtype or widen intermediate storage.
+Nontrivial arithmetic remains adjacent-only, physical effects remain barriers, and integral or
+trapping conversions do not gain admission. The local regression checks unchanged JVM results
+against OpenCL and Level Zero with both inlining modes and with changed target inputs on replay.
+
+Independent review exposed the old scalar-region lowerer's uniform-result-dtype recursion.
+It is now removed: terminal regions use the shared retained-type-aware scalar lowerer, with
+independently owned AxisMap coordinates overriding source index spellings. The rounding oracle
+checks Double addition of 16777217 and 0.25 followed by Float narrowing, which must yield
+16777218 rather than the 16777216 produced by early narrowing. Shared semantic primitives such
+as array length remain unexpanded when admitting user scalar helpers. Explicit rank-zero tensor
+shapes are admitted for replicated distributed values; absent shapes and rank-zero partitioning
+remain rejected. The affected suites and independent exact-head review gate landing this slice.
+This is not actual-model training acceptance.
+The original real-model gradient oracle, tolerance, provider and source-precision policy remain
+unchanged. Neither the compiler-default switch nor the full campaign is complete.

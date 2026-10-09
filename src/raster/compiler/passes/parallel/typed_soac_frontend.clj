@@ -4139,6 +4139,19 @@
                                             direct-allocation-length
                                             (when (seq? array) (allocation-length array))]
                                         (cond
+                                          (and (seq? extent)
+                                               (descriptor/cast-op? (descriptor/semantic-op extent))
+                                               (not (contains? util/*shadowing-locals*
+                                                               (descriptor/semantic-op extent)))
+                                               (= 1 (count (descriptor/call-args extent))))
+                                          (let [operand (first (descriptor/call-args extent))
+                                                resolved (resolve-length operand seen)]
+                                            (if (= operand resolved)
+                                              extent
+                                              (with-meta
+                                                (apply list (concat (butlast extent) [resolved]))
+                                                (meta extent))))
+
                                           direct-allocation-length
                                           (resolve-length direct-allocation-length seen)
 

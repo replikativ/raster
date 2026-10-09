@@ -65,6 +65,25 @@
               :dependencies [:independent-gradient-1 :send-gradient]})]
     :outputs [:apply-gradient]}))
 
+(deftest rank-zero-values-can-be-replicated-but-not-partitioned
+  (let [base (training-plan)
+        scalar (abstract-value/tensor
+                {:dtype :double :shape []
+                 :sharding {:kind :replicated :devices [:gpu-0 :gpu-1]}})
+        shards (mapv (fn [device]
+                       (distributed/shard {:id [:scalar device] :value :scalar :device device
+                                           :offsets [] :shape [] :ownership :replica}))
+                     [:gpu-0 :gpu-1])
+        candidate (-> base (assoc-in [:values :scalar] scalar)
+                      (assoc-in [:shards :scalar] shards))]
+    (is (= candidate (distributed/validate! candidate)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (distributed/validate!
+                  (assoc-in candidate [:values :scalar :sharding]
+                            {:kind :partitioned :axis 0 :devices [:gpu-0 :gpu-1]}))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (distributed/validate! (assoc-in candidate [:values :scalar :shape] nil))))))
+
 (deftest topology-aware-simulation-overlaps-compute-and-transfer-resources
   (let [simulation (distributed/simulate (training-plan))]
     ;; transfer = 1us latency + 1MB / 25GB/s = 41us. It starts at t=100 after

@@ -54,9 +54,11 @@
    `:load` accepts a declared buffer and proved coordinate vector; `:compute` accepts a canonical
    operator, result dtype, already-converted argument vector and explicit operation options.
    `:fresh-binding` reserves an SSA identity for an owner's structured-control binder.
+   `:owner-load-coordinates` optionally supplies independently proved coordinate vectors for
+   closed layout regions; when supplied, retained source indices are not a second authority.
    These typed entries leave admission and proofs to the owner and final KernelBody validation."
   [{:keys [array-types scalar-types scalar-ranges arrays index-scope lower-index lower-load-index predicate id-prefix decline!
-           conversion-policy load-other source-region require-source-types?]
+           conversion-policy load-other source-region require-source-types? owner-load-coordinates]
     :or {id-prefix "scalar" scalar-ranges {}}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
         normalized-form (fn [form type source]
@@ -570,6 +572,10 @@
                       (decline! :indexed-load
                                 "scalar loads require a declared typed stable tensor"
                                 {:expression expression :array array :array-types array-types}))
+                    (if owner-load-coordinates
+                      ;; Closed layout regions own coordinates independently of the retained
+                      ;; source spelling. Never evaluate that spelling as a second index authority.
+                      (load-ssa array (owner-load-coordinates array))
                     (let [coordinate-value
                           (when (or (contains-indexed-load? coordinate)
                                     (index-expression/requires-scalar-evaluation? coordinate))
@@ -582,7 +588,7 @@
                             (:result coordinate-value)
                             (lower-load-index array coordinate (set (keys env))))
                           loaded (load-ssa array [coordinate-expression])]
-                      (update loaded :operations #(into (vec (:operations coordinate-value)) %))))
+                      (update loaded :operations #(into (vec (:operations coordinate-value)) %)))))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))

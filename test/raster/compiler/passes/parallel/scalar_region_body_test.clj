@@ -421,10 +421,11 @@
                                                    (fn [& args]
                                                      (swap! calls conj entry)
                                                      (apply (get builder entry) args))))
-                                          builder [:load :cast :compute])))]
+                                          builder [:lower :cast])))]
                    (result-region/lower region options))
           [load widen add scale-cast outer narrow] (:operations result)]
-      (is (= [:load :cast :compute :cast :compute :cast] @calls))
+      (is (= [:lower :cast] @calls)
+          "the entire expression uses the retained-type-aware scalar lowering entry")
       (is (= [0 1] (:coordinates load)))
       (is (= 'active (:predicate load)))
       (is (= (body/literal 0 :float) (:other load)))
@@ -436,10 +437,24 @@
       (is (= {:rounding :nearest-even :overflow :ieee}
              (get-in narrow [:expression :options])))))
   (let [result (result-region/lower
-                (body/->ScalarRegion ['acc] '(+ 1 2) [] :int)
-                {:accumulator 'carry :accumulator-dtype :int :store-dtype :int :parameters {}})]
+                (body/->ScalarRegion ['acc] '(clojure.core/+ acc acc) [] :long)
+                {:accumulator 'carry :accumulator-dtype :long :store-dtype :long :parameters {}})]
     (is (= {:overflow :trap} (get-in result [:operations 0 :expression :options]))
         "typed emission does not invent a no-overflow proof for this owner")))
+
+(deftest result-region-axis-map-is-the-only-coordinate-authority
+  (let [region (body/->ScalarRegion
+                ['acc 'x] '(aget x (clojure.core/unchecked-add-int 2147483647 1))
+                [{:sym 'x :dtype :float :map :approved-map}] :float)
+        result (result-region/lower
+                region {:accumulator 'carry :accumulator-dtype :float :store-dtype :float
+                        :coordinate-lower (fn [m] (is (= :approved-map m)) [0 1])
+                        :parameters {'x (body/->KernelParameter
+                                         'x :input :float [2 3] :global
+                                         (layout/row-major [2 3] :float) :operand)}})]
+    (is (= 1 (count (:operations result)))
+        "the retained wrapping index is not evaluated as a competing coordinate")
+    (is (= [0 1] (:coordinates (first (:operations result)))))))
 
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]

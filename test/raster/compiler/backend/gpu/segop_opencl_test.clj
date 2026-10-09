@@ -29,6 +29,30 @@
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
 
+(deftest scalar-reduction-storage-alias-requires-the-exact-closed-projection
+  (let [source '(let* [^long extent (clojure.core/long
+                                    (clojure.core/* (clojure.core/long n) (clojure.core/long 1)))
+                       result (raster.par/reduce acc 0.0 i extent
+                                                (+ acc (clojure.core/aget a i)))] result)
+        options {:dtype :double :array-types {'a :double} :scalar-types {'n :long}}
+        typed (:program (typed-route/attempt source :double {'a :double} options))
+        algorithm (:algorithm (last (:equations typed)))
+        body (:form (segop-lower/segop-lower-pass typed options))
+        graph (equation-graph/make algorithm body)
+        node (first (:nodes graph))
+        operation (:operation node)
+        certificate (segred-body/schedule operation (first (:outputs operation)) options)]
+    (is (seq (equation-graph/validated-storage-scalars graph algorithm body)))
+    (is (= certificate (segred-body/validate-against-node! certificate node graph algorithm body)))
+    (is (not (contains? (:attributes graph) :scalar-definitions)))
+    (doseq [[candidate closed-algorithm closed-body]
+            [[(update graph :inputs #(mapv (fn [b] (assoc b :elements 7)) %)) algorithm body]
+             [graph algorithm nil]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (segred-body/validate-against-node!
+                    certificate node candidate closed-algorithm closed-body))
+          "an independent graph capacity or incomplete proof context cannot authorize the alias"))))
+
 (deftest portable-map-empty-extent-has-a-masked-valid-launch
   (let [operation (segop/->SegMap
                    902 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
@@ -795,12 +819,15 @@
       (is (= source (get-in certificate [:numerics :accumulator-dtype])))
       (is (= target (get-in certificate [:numerics :result-transform :result-dtype])))
       (is (= source (:dtype (first (get-in certificate [:body :allocations])))))
-      (doseq [candidate [base
-                         (assoc-in terminal [:reduction :attributes :result-region :expression]
-                                   (list (symbol (name target)) '(+ completed 0.25)))]]
+      (let [arithmetic (assoc-in terminal [:reduction :attributes :result-region :expression]
+                                 (list (symbol (name target)) '(+ completed 0.25)))
+            arithmetic-certificate (segred-body/schedule arithmetic nil options)]
+        (is (= source (get-in arithmetic-certificate [:numerics :accumulator-dtype])))
+        (is (= target (get-in arithmetic-certificate [:numerics :result-transform :result-dtype]))))
+      (doseq [candidate [base]]
         (try
           (segred-body/schedule candidate nil options)
-          (is false "mixed output storage requires a direct certified terminal conversion")
+          (is false "mixed output storage requires a certified floating terminal region")
           (catch clojure.lang.ExceptionInfo error
             (is (= :uniform-scalar-storage (:missing-rule (ex-data error))))))))))
 

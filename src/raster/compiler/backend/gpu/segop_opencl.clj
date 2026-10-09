@@ -438,7 +438,8 @@
    body without a device. It throws only structured `:segred-kernel-body-declined` exceptions for
    unsupported scalar regions; verified-body or emitter failures remain compiler errors."
   [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect
-                            graph-node kernel-graph coordinate-proof]
+                            graph-node kernel-graph coordinate-proof
+                            scheduled-equation-algorithm scheduled-equation-body]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
   (let [scheduled
@@ -450,7 +451,9 @@
                             {:reason :segred-graph-context
                              :graph-node graph-node :kernel-graph kernel-graph})))
         _ (when graph-node
-            (segred-body/validate-against-node! scheduled graph-node kernel-graph))
+            (segred-body/validate-against-node! scheduled graph-node kernel-graph
+                                               scheduled-equation-algorithm
+                                               scheduled-equation-body))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         output (some #(when (= :result (:role %)) (:id %))
                      (get-in scheduled [:body :parameters]))
@@ -487,7 +490,8 @@
    phase contract. Unsupported scalar regions fail with their structured KernelBody decline;
    no target may recover semantics by reparsing a source-shaped lambda."
   [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect
-                            graph-node kernel-graph coordinate-proof]
+                            graph-node kernel-graph coordinate-proof
+                            scheduled-equation-algorithm scheduled-equation-body]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
                           array-types {} target-dialect :opencl-intel}}]
   (when (seq (segop/seg-space-segment-dims (:space segred)))
@@ -499,7 +503,9 @@
     (generate-segred-kernel-body
      segred out-sym :dtype dtype :kernel-name-prefix kernel-name-prefix
      :scalar-types scalar-types :array-types array-types :target-dialect target-dialect
-     :graph-node graph-node :kernel-graph kernel-graph :coordinate-proof coordinate-proof)
+     :graph-node graph-node :kernel-graph kernel-graph :coordinate-proof coordinate-proof
+     :scheduled-equation-algorithm scheduled-equation-algorithm
+     :scheduled-equation-body scheduled-equation-body)
     (catch clojure.lang.ExceptionInfo exception
       (when-not (segred-body/declined? exception) (throw exception))
       (let [decline (assoc (ex-data exception) :fallback :none)]
@@ -720,6 +726,8 @@
                 :dtype (:dtype operation)
                 :scalar-types scalar-types :array-types array-types
                 :target-dialect target-dialect
+                :scheduled-equation-algorithm scheduled-equation-algorithm
+                :scheduled-equation-body scheduled-equation-body
                 :graph-node node :kernel-graph graph))))))]
     (finalize-emitted-graph
      emitted

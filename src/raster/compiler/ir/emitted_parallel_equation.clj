@@ -5,12 +5,14 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]))
 
 (defrecord EmittedParallelEquation [algorithm body refinement graph provenance attributes])
@@ -96,8 +98,15 @@
                                                        [:operation :provenance
                                                         :scheduled-operation])]
                                (if (scheduled-body/scheduled-kernel-body? certificate)
-                                 (do (scheduled-body/validate-against-node!
-                                      certificate scheduled-node scheduled)
+                                 (do (if (and (segop/seg-red? (:operation scheduled-node))
+                                              (contains? #{:single :block-local :cross-block}
+                                                         (:phase (:operation scheduled-node)))
+                                              (empty? (segop/seg-space-segment-dims
+                                                       (:space (:operation scheduled-node)))))
+                                       (segred-body/validate-against-node!
+                                        certificate scheduled-node scheduled algorithm body)
+                                       (scheduled-body/validate-against-node!
+                                        certificate scheduled-node scheduled))
                                      (when (and generated-body
                                                 (not (semantic-fingerprint/equivalent?
                                                       generated-body certificate)))

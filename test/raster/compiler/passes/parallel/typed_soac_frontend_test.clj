@@ -142,6 +142,29 @@
     (is (not-any? #(and (seq? %) (= 'clojure.core/alength (first %)))
                   (tree-seq coll? seq normalized)))))
 
+(deftest cast-local-allocation-length-retains-the-conversion
+  (doseq [cast ['clojure.core/long 'clojure.core/int]]
+    (let [source (list 'let* ['buffer '(raster.arrays/zeros-like input n)
+                              'result (list 'raster.par/reduce 'acc '(float 0.0) 'i
+                                            (list cast '(clojure.core/alength buffer))
+                                            '(+ acc (aget buffer i)))]
+                       'result)
+          normalized (frontend/normalize-source
+                      source {:dtype :float :array-types {'input :float}
+                              :scalar-types {'n :long}})
+          forms (tree-seq coll? seq normalized)]
+      (when (= cast 'clojure.core/int)
+        (is (some #{(list cast 'n)} forms)
+            "a narrowing cast remains executable after the shape read is resolved"))
+      (is (not-any? #(and (seq? %) (= 'clojure.core/alength (first %))) forms))))
+  (let [source '(let* [result (clojure.core/float-array
+                              (clojure.core/long (clojure.core/alength input)))
+                       effect (raster.par/map! result i (clojure.core/alength input) float 0.0)] effect)
+        normalized (frontend/normalize-source
+                    source {:dtype :float :array-types {'input :float}})]
+    (is (some #{'(clojure.core/alength input)} (tree-seq coll? seq normalized))
+        "an external array length remains a runtime shape read")))
+
 (deftest map-let-spines-become-typed-locals
   (let [body '(let* [^float p1 (* (aget x i) (aget x i))
                     ^float p2 (* p1 p1)
