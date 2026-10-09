@@ -1,5 +1,6 @@
 (ns raster.ode.amr-cycle-state-device-test
-  "Actual distributed AMR capture/restart; bounded in-memory provider is not real durability."
+  "Actual distributed AMR capture/restart through verified mapped files. The bounded provider
+   and explicit fixture materialization are not production persistence or a durability receipt."
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.amr-plan :as amr]
             [raster.dl.gpu-grad-parity :as ze]
@@ -10,9 +11,11 @@
             [raster.ode.amr-cycle-state :as capture]
             [raster.ode.amr-subcycle-test :as oracle]
             [raster.runtime.numerical-content :as content]
-            [raster.runtime.resident-state-test :as provider-fixture])
-  (:import [java.lang.foreign MemorySegment]
-           [java.nio ByteOrder]))
+            [raster.runtime.resident-state-test :as provider-fixture]
+            [raster.test-support.numerical-checkpoint :as checkpoint])
+  (:import [java.lang.foreign MemorySegment ValueLayout]
+           [java.nio ByteOrder]
+           [java.nio.file Files OpenOption]))
 
 (defn- captured-cycle [target initial provider]
   (let [{:keys [workload prepared attestation]} (#'fixture/fixture target initial)
@@ -24,21 +27,38 @@
     (with-open [owner (runtime/instantiate! plan {:device-capacities {target 1048576}})]
       (runtime/run! owner)
       (let [fact (runtime/measure-storage-representation! owner target :double)]
-        (capture/capture! certified owner {target fact} provider :local
-                          {:id (keyword (str "step-" (inc (get initial :step 0))))
-                           :logical-coordinate {:step (inc (get initial :step 0)) :phase :synchronized}})))))
+        (assoc (capture/capture! certified owner {target fact} provider :local
+                                 {:id (keyword (str "step-" (inc (get initial :step 0))))
+                                  :logical-coordinate {:step (inc (get initial :step 0)) :phase :synchronized}})
+               :source-certified certified)))))
 
 (defn- decode-fields [captured provider]
-  (into {}
-        (for [[role field] (map vector [:coarse :fine] (get-in captured [:state :manifest :fields]))
-              :let [chunk (first (:chunks field)) result (double-array 16)]]
-          [role (content/with-local-content
-                 provider (:content chunk) {:tier :local}
-                 (fn [lease]
-                   (content/decode-raw-array-chunk!
-                    chunk lease :double (MemorySegment/ofArray result)
-                    (if (= ByteOrder/LITTLE_ENDIAN (ByteOrder/nativeOrder)) :little-endian :big-endian))
-                   (vec result)))])))
+  (let [source (get-in captured [:source-certified :workload :plan :state :manifest])
+        expected {:fields (mapv #(select-keys % [:id :value :coordinate-space]) (:fields source))
+                  :logical-coordinate {:step (inc (get-in source [:logical-coordinate :step])) :phase :synchronized}
+                  :numerical-contract (:numerical-contract source)}]
+    ;; Independently supplied source semantics and compiler evidence are checked before bytes.
+    (capture/verify-restore! (:state captured) (:source-certified captured) expected)
+    (let [fields (get-in captured [:state :manifest :fields])
+          paths (checkpoint/temp-files (mapv :id fields))]
+      (try
+        (into {}
+              (for [[role field] (map vector [:coarse :fine] fields)
+                    :let [chunk (first (:chunks field)) result (double-array 16) path (paths (:id field))]]
+                (do
+                  ;; Bounded fixture materialization; the source lease closes before mmap.
+                  (content/with-local-content
+                   provider (:content chunk) {:tier :local}
+                   (fn [lease]
+                     (content/verify-chunk-lease! chunk lease)
+                     (Files/write path (.toArray (content/lease-segment lease) ValueLayout/JAVA_BYTE)
+                                  (make-array OpenOption 0))))
+                  (with-open [lease (checkpoint/open-chunk-lease path chunk)]
+                    (content/decode-raw-array-chunk!
+                     chunk lease :double (MemorySegment/ofArray result)
+                     (if (= ByteOrder/LITTLE_ENDIAN (ByteOrder/nativeOrder)) :little-endian :big-endian)))
+                  [role (vec result)])))
+        (finally (doseq [path (vals paths)] (Files/deleteIfExists path)))))))
 
 (defn- check-restart [target]
   (let [{:keys [provider events]} (#'provider-fixture/provider (fn [& _]))
