@@ -2,6 +2,7 @@
   "Declared resident roots and budgets; no device allocation or execution evidence."
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.distributed-plan :as plan]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.distributed-compute-test :as fixture]))
 
 (defn- local-plan [] (#'fixture/local-link-plan))
@@ -63,6 +64,34 @@
     (is (= :distributed-runtime-memory (:reason error)))
     (is (> (:bytes error) Long/MAX_VALUE))))
 
+(deftest serial-actions-use-a-scratch-peak-not-a-scratch-sum
+  (let [local (local-plan)
+        kernel (get-in local [:instances 0 :descriptor :steps 0 :artifact])
+        executable (graph/make
+                    {:inputs [(graph/buffer 'x :float 6 :device :input)
+                              (graph/buffer 'weights :float 6 :device :input)]
+                     :outputs [(graph/buffer 'y :float 6 :device :output)]
+                     :temporaries [(graph/buffer 'scratch :float 24 :device :temporary)]
+                     :scalars [(graph/scalar 'n :long)]
+                     :nodes [(graph/->ScheduledKernel
+                              :copy kernel [(graph/->ValueUse 'x :read)
+                                            (graph/->ValueUse 'weights :read)
+                                            (graph/->ValueUse 'y :write)] #{'n} [])]
+                     :abi (:abi kernel) :arguments (:arguments kernel)})
+        local (assoc-in local [:instances 0 :descriptor :steps 0 :artifact] executable)
+        p (two-calls local local)
+        options {:device-capacities {:gpu-0 168} :include-graph-temporaries? true}
+        pool (plan/resident-storage-plan p options)
+        result (plan/simulate p options)]
+    (is (= 2 (count (:graph-temporary-plans pool))))
+    (is (= {:gpu-0 {:capacity-bytes 168 :resident-bytes 72
+                    :graph-temporary-bytes 96 :planned-peak-bytes 168}}
+           (:allocation-budgets pool)))
+    (is (= (:allocation-budgets pool) (get-in result [:resident-storage :allocation-budgets])))
+    (is (= :owned-roots-plus-serial-graph-temporaries (get-in result [:resident-storage :model])))
+    (is (= :distributed-runtime-memory
+           (reason #(plan/resident-storage-plan p (assoc options :device-capacities {:gpu-0 167})))))))
+
 (deftest remapped-targets-require-an-aggregate-budget
   (let [local (#'fixture/local-link-plan {:target :physical})
         p (-> (#'fixture/plan-map {:link-plan local})
@@ -108,7 +137,7 @@
     (is (= :distributed-runtime-allocation
            (reason #(plan/resident-storage-plan
                      (one-call (assoc-in (local-plan) [:nodes :x-node :view :allocation :byte-size] 25))))))
-    (doseq [options [nil {:device-capacities true} {:unknown true}
+    (doseq [options [nil {:device-capacities true} {:unknown true} {:include-graph-temporaries? :unknown}
                      {:device-capacities {:gpu-0 -1}} {:device-capacities {:gpu-0 Double/NaN}}]]
       (is (= :distributed-runtime-physical-budget (reason #(plan/resident-storage-plan p options)))))
     (is (= :distributed-cost-options

@@ -435,12 +435,15 @@
       (is (> (max-error (initial-theta) expected) 1.0e-3)
           "fixture must distinguish an actual update from unchanged parameter replicas")
       (with-open [executable (runtime/instantiate! plan {:transport :resident-copy
+                                                        :include-graph-temporaries? true
                                                         :device-capacities {device 1048576}})]
         (is (= (:allocation-budgets
-                (distributed/resident-storage-plan plan {:device-capacities {device 1048576}}))
+                (distributed/resident-storage-plan plan {:device-capacities {device 1048576}
+                                                         :include-graph-temporaries? true}))
                (:allocation-budgets executable)))
         (is (= (:allocation-budgets executable)
-               (get-in (distributed/simulate plan {:device-capacities {device 1048576}})
+               (get-in (distributed/simulate plan {:device-capacities {device 1048576}
+                                                   :include-graph-temporaries? true})
                        [:resident-storage :allocation-budgets])))
         (let [profile (runtime/profile! executable)]
           (is (= :synchronous-serialized (:execution-model profile)))
