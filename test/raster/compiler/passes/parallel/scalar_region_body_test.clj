@@ -33,19 +33,25 @@
     (is (= :cast (get-in (last operations) [:expression :op])))
     (is (= :float (get-in (last operations) [:result :type])))))
 
-(deftest exponential-source-precision-is-independent-of-result-storage
-  (let [lower (:lower (lowerer))
-        narrow (lower '(raster.math/exp (aget x i)) :float {'i :int})
-        wide (lower '(float (Math/exp (double (aget x i)))) :float {'i :int})
-        exponentials #(filter (fn [operation] (= :exp (get-in operation [:expression :op])))
+(deftest elementary-math-source-precision-is-independent-of-result-storage
+  (doseq [operator [:exp :tanh :sin :cos :log :expm1 :log1p]]
+    (let [lower (:lower (lowerer))
+          raster-call (symbol "raster.math" (name operator))
+          java-call (symbol "Math" (name operator))
+          ;; These are retained frontend result facts, not an emitter-side function registry.
+          narrow-call (with-meta (list raster-call '(aget x i)) {:raster.type/tag 'float})
+          wide-call (with-meta (list java-call '(double (aget x i))) {:raster.type/tag 'double})
+          narrow (lower narrow-call :float {'i :int})
+          wide (lower (list 'float wide-call) :float {'i :int})
+          math-calls #(filter (fn [operation] (= operator (get-in operation [:expression :op])))
                               (:operations %))]
-    (is (= [:float] (mapv #(get-in % [:expression :result-type]) (exponentials narrow))))
-    (is (= [:double] (mapv #(get-in % [:expression :result-type]) (exponentials wide))))
-    (doseq [operation (concat (exponentials narrow) (exponentials wide))]
-      (is (= {:kind :target-library :accuracy :implementation-defined}
-             (get-in operation [:expression :options :math-realization]))))
-    (is (= :float (:type wide)))
-    (is (= :cast (get-in (last (:operations wide)) [:expression :op])))))
+      (is (= [:float] (mapv #(get-in % [:expression :result-type]) (math-calls narrow))))
+      (is (= [:double] (mapv #(get-in % [:expression :result-type]) (math-calls wide))))
+      (doseq [operation (concat (math-calls narrow) (math-calls wide))]
+        (is (= {:kind :target-library :accuracy :implementation-defined}
+               (get-in operation [:expression :options :math-realization]))))
+      (is (= :float (:type wide)))
+      (is (= :cast (get-in (last (:operations wide)) [:expression :op]))))))
 
 (deftest static-numeric-constants-use-shared-evidence
   (let [lower (:lower (lowerer))

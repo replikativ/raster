@@ -5,6 +5,7 @@
             [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
             [raster.compiler.backend.gpu.kernel-body-c-dialect :as dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -18,6 +19,31 @@
       (is (= ["" 7] (#'opencl/emit-scalar-operations [] 7 2)))
       (is (= ["2:7:a;2:8:b;2:9:c;" 10]
              (#'opencl/emit-scalar-operations ["a" "b" "c"] 7 2))))))
+
+(deftest elementary-math-accuracy-evidence-does-not-change-target-source
+  (let [descriptor intrinsics/descriptor
+        operators (keep (fn [[op facts]]
+                          (when (= :target-library (:kernel-body-math-realization facts)) op))
+                        intrinsics/table)]
+    (doseq [op operators type [:float :double]
+            target [:opencl-intel :opencl-portable :cuda :hip]]
+      (let [arguments (vec (take (:arity (descriptor op)) ['a 'b]))
+            expression (body/scalar-expression op type arguments)
+            template (fixtures/scalar-product-body type false)
+            kernel (body/make
+                    (assoc template :operations
+                           [(body/->ScalarCompute (body/value 'result type) expression)
+                            (body/->ScalarStore 'out [0] 'result nil)]))
+            emit #(-> (opencl/emit-scalar-module "elementary_math" %
+                                               {:target-dialect target}) :source)
+            current (emit kernel)
+            previous
+            (with-redefs [intrinsics/descriptor
+                          (fn [operator]
+                            (dissoc (descriptor operator) :kernel-body-math-realization))]
+              (emit (assoc-in kernel [:operations 0 :expression :options] {})))]
+        (is (= previous current)
+            (str "accuracy evidence does not widen or alter " op " " type " " target))))))
 
 (deftest scalar-product-target-spelling-preserves-explicit-fma
   (let [emit (fn [target op type]

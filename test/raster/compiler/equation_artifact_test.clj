@@ -162,9 +162,9 @@
       (boring/encode (#'artifact/prepare-sequences value) options)
       options))))
 
-(deftest exponential-realization-round-trips-through-the-compiler-record-codec
-  (doseq [dt [:float :double]]
-    (let [expression (kernel-body/scalar-expression :exp dt [(kernel-body/literal 0.0 dt)])
+(deftest elementary-math-realization-round-trips-through-the-compiler-record-codec
+  (doseq [op [:exp :tanh :log :sin] dt [:float :double]]
+    (let [expression (kernel-body/scalar-expression op dt [(kernel-body/literal 0.0 dt)])
           restored (compiler-record-round-trip expression)]
       (is (= expression restored))
       (is (= {:kind :target-library :accuracy :implementation-defined}

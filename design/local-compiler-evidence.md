@@ -1859,3 +1859,37 @@ explicitly required `_mm256_fmadd_pd`. Its interpreter/scalar/vector numerical
 comparisons passed. The assertion now requires vector multiply and add and
 rejects implicit FMA, retaining the original numerical oracle and tolerances.
 The affected native AOT namespace passes 13 tests / 275 assertions locally.
+
+### Elementary math accuracy is separate from retained precision
+
+At the actual captured native-model layer-0 cotangent, GELU forward is again
+bit-identical for 4096 elements. Backward differs by at most
+5.817413330078125e-5 absolute and 0.7065903880116969 coordinate-relative, with
+1354 differing elements. Capturing the GELU boundary preserves all fourteen
+native layer-0 adapter gradients bit-for-bit. This isolates an operation-level
+accuracy question, not the complete cause of the remaining model discrepancy.
+
+The retained specialization selects `raster.math/tanh_m_float-impl`, with Float
+call-result metadata and the `IFn__float` interface. Generated OpenCL likewise
+uses Float `tanh`; surrounding explicit Double operations remain Double. The
+Float JVM helper implements its fallback using `float(Math.tanh(double(x)))`.
+Canonical Float target math and that JVM fallback are not a bitwise equivalence
+proof. A subsequent attempt to intercept the scalar tanh helper captured zero
+calls; it is rejected as input-capture evidence rather than used to infer an
+evaluation path or a numerical fix.
+
+Previously only exponential ScalarExpr values declared their target-library
+realization. The existing intrinsic authority now states the same descriptive
+accuracy contract for the 23 C-family elementary-library operations. A shared
+descriptor constructor removes repeated facet declarations. KernelBody's
+existing validator requires this evidence and rejects missing, forged
+correctly-rounded, or otherwise unsupported accuracy claims. Precision remains
+independent: retained Float calls stay Float; explicit Double calls followed by
+Float conversion keep both operations. Tests supply retained frontend dtype
+facts, not an emitter-side function/type inference list.
+
+This does not change target source, add a bounded-error guarantee, select a
+reproducible algorithm, widen model math, or relax training acceptance. WASM's
+polynomial facet remains separate. The real-weight gate remains held; resolving
+the near-zero derivative sensitivity still needs numerical and workload-level
+evidence rather than declaring library accuracy sufficient for that gate.

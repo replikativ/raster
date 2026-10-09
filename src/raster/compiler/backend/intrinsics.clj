@@ -31,6 +31,15 @@
 (defn- vt3 [f64 f32 i32] (cond-> {} f64 (assoc :f64 f64) f32 (assoc :f32 f32) i32 (assoc :i32 i32)))
 (defn- math1 [f64 f32 cfn] {:arity 1 :kind :fn :wasm (vt3 f64 f32 nil) :c {:fn cfn} :wgsl {:fn cfn}})
 
+(defn- target-math
+  "C-family elementary math calls carry target-library accuracy independently
+   of their retained operand/result precision. WASM's polynomial is a separate facet."
+  ([arity cfn] (target-math arity cfn nil))
+  ([arity cfn wgsl]
+   (cond-> {:arity arity :kind :fn :wasm :poly :c {:fn cfn}
+            :kernel-body-math-realization :target-library}
+     wgsl (assoc :wgsl {:fn wgsl}))))
+
 (defn- extremum-return-source
   [op floating?]
   (str (when floating?
@@ -123,15 +132,12 @@
    ;; transcendentals — wasm has no opcode; all lower to an inline polynomial
    ;; (:wasm :poly, see backend.wasm.transcendental): sin/cos/tan + exp via
    ;; squaring, log via sqrt-reduction, pow=exp(y·log x), fma=a·b+c. No bit ops.
-   :sin {:arity 1 :kind :fn :wasm :poly :c {:fn "sin"} :wgsl {:fn "sin"}}
-   :cos {:arity 1 :kind :fn :wasm :poly :c {:fn "cos"} :wgsl {:fn "cos"}}
-   :tan {:arity 1 :kind :fn :wasm :poly :c {:fn "tan"} :wgsl {:fn "tan"}}
-   :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}
-         ;; KernelBody's C-family emitters call the typed target math library.
-         ;; The separate WASM facet above emits an inline polynomial instead.
-         :kernel-body-math-realization :target-library}
-   :log {:arity 1 :kind :fn :wasm :poly :c {:fn "log"} :wgsl {:fn "log"}}
-   :pow {:arity 2 :kind :fn :wasm :poly :c {:fn "pow"} :wgsl {:fn "pow"}}
+   :sin (target-math 1 "sin" "sin")
+   :cos (target-math 1 "cos" "cos")
+   :tan (target-math 1 "tan" "tan")
+   :exp (target-math 1 "exp" "exp")
+   :log (target-math 1 "log" "log")
+   :pow (target-math 2 "pow" "pow")
    :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}
    ;; widening int8 multiply-accumulate: int8×int8 → int32 lane accumulate. The
    ;; ONE canonical quant primitive; scalar :c is a plain int-widening mul-add,
@@ -186,24 +192,24 @@
    ;; broader elementary set — all wasm via composition/polynomial (see
    ;; backend.wasm.transcendental); GPU facet set only where it's a builtin (else
    ;; omitted → GPU keeps its generated-helper fallback, no regression).
-   :asin  {:arity 1 :kind :fn :wasm :poly :c {:fn "asin"} :wgsl {:fn "asin"}}
-   :acos  {:arity 1 :kind :fn :wasm :poly :c {:fn "acos"} :wgsl {:fn "acos"}}
-   :atan  {:arity 1 :kind :fn :wasm :poly :c {:fn "atan"} :wgsl {:fn "atan"}}
-   :atan2 {:arity 2 :kind :fn :wasm :poly :c {:fn "atan2"} :wgsl {:fn "atan2"}}
-   :sinh  {:arity 1 :kind :fn :wasm :poly :c {:fn "sinh"} :wgsl {:fn "sinh"}}
-   :cosh  {:arity 1 :kind :fn :wasm :poly :c {:fn "cosh"} :wgsl {:fn "cosh"}}
-   :tanh  {:arity 1 :kind :fn :wasm :poly :c {:fn "tanh"} :wgsl {:fn "tanh"}}
-   :asinh {:arity 1 :kind :fn :wasm :poly :c {:fn "asinh"} :wgsl {:fn "asinh"}}
-   :acosh {:arity 1 :kind :fn :wasm :poly :c {:fn "acosh"} :wgsl {:fn "acosh"}}
-   :atanh {:arity 1 :kind :fn :wasm :poly :c {:fn "atanh"} :wgsl {:fn "atanh"}}
-   :cbrt  {:arity 1 :kind :fn :wasm :poly :c {:fn "cbrt"}}
-   :log2  {:arity 1 :kind :fn :wasm :poly :c {:fn "log2"} :wgsl {:fn "log2"}}
-   :log10 {:arity 1 :kind :fn :wasm :poly :c {:fn "log10"}}
-   :exp2  {:arity 1 :kind :fn :wasm :poly :c {:fn "exp2"} :wgsl {:fn "exp2"}}
+   :asin  (target-math 1 "asin" "asin")
+   :acos  (target-math 1 "acos" "acos")
+   :atan  (target-math 1 "atan" "atan")
+   :atan2 (target-math 2 "atan2" "atan2")
+   :sinh  (target-math 1 "sinh" "sinh")
+   :cosh  (target-math 1 "cosh" "cosh")
+   :tanh  (target-math 1 "tanh" "tanh")
+   :asinh (target-math 1 "asinh" "asinh")
+   :acosh (target-math 1 "acosh" "acosh")
+   :atanh (target-math 1 "atanh" "atanh")
+   :cbrt  (target-math 1 "cbrt")
+   :log2  (target-math 1 "log2" "log2")
+   :log10 (target-math 1 "log10")
+   :exp2  (target-math 1 "exp2" "exp2")
    :exp10 {:arity 1 :kind :fn :wasm :poly}
-   :expm1 {:arity 1 :kind :fn :wasm :poly :c {:fn "expm1"}}
-   :log1p {:arity 1 :kind :fn :wasm :poly :c {:fn "log1p"}}
-   :hypot {:arity 2 :kind :fn :wasm :poly :c {:fn "hypot"}}
+   :expm1 (target-math 1 "expm1")
+   :log1p (target-math 1 "log1p")
+   :hypot (target-math 2 "hypot")
    :deg2rad {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "radians"}}
    :rad2deg {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "degrees"}}
    :clamp {:arity 3 :kind :fn :wasm :poly :wgsl {:fn "clamp"}}
