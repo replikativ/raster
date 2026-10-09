@@ -1962,3 +1962,92 @@ typed operation/realization boundary and test the whole unchanged gradient
 trajectory. A named reproducible implementation would need independent accuracy,
 derivative and cost evidence; an implementation-defined library descriptor alone
 does not establish derivative-sensitive cross-target parity.
+
+### Embedded tanh realization completes the local pullback attribution
+
+The October 9 follow-up restores the same pinned two-layer checkpoint, external
+sources, seed, native CPU provider and captured layer-0 cotangent. It does not
+run a replacement full-model oracle. Instrumented CPU source first reproduces
+the captured pullback. Instrumented target source then reproduces the original
+4096-element target pullback, with raw Float bits checked rather than formatted
+values or an approximate comparison. The tapped Float operands to tanh also
+match the verified CPU operands in every raw bit.
+
+Nevertheless, embedded and isolated target `tanh` on those same operands differ
+at 19 coordinates, by at most 1.1920928955078125e-7 absolute. The isolated call
+differs from the CPU helper at 2074 coordinates; the embedded call differs at
+2073. The emitted source retains Float intermediates and a Float tanh call in
+both cases, with `#pragma OPENCL FP_CONTRACT OFF`. This observation does not
+identify a driver-internal algorithm or establish a universal accuracy bound.
+It shows that the isolated intrinsic result is not a substitute for the actual
+embedded realization when localizing this workload.
+
+Supplying the embedded target tanh values to the unchanged pullback arithmetic
+now reproduces the original target pullback in every raw Float bit, both on the
+CPU and on the target. This closes the earlier three-coordinate distinction at
+this local boundary: it was not evidence that the supplied-boundary arithmetic
+disagreed once the actual embedded values were supplied. It does not attribute
+every remaining adapter-gradient discrepancy in the full model to tanh.
+
+Exact emitted-source SHA-256 values for this run:
+
+- embedded taps: `3d2eb8f1913ccd32574ab5a2465c4f281b6fa4339e57f77ba1519ef0ef6e518a`;
+- isolated tanh: `09ceece463760ad94673ba2fd8d779ed887de0e2abb307d7753cc0f67fdbf208`.
+
+The warm-REPL control is recorded in `/tmp/raster-layer0-tapped-target-control.clj`
+and consumes the previously verified pinned-model capture; that temporary script
+is not a committed standalone acceptance harness. The evidence is deliberately
+local to these operands and this target compilation. The held full real-weight
+gate, original threshold, source precision and default realization policy remain
+unchanged. A reproducible-math extension must be an explicit shared realization
+contract with independent accuracy/derivative/cost evidence, not a global widening
+patch or a training-specific kernel.
+
+### Next realization vertical: explicit policy, unchanged oracle
+
+Independent architecture review recommends preserving the logical Float math
+operation and expressing any alternate evaluation at its existing ScalarExpr
+realization boundary. The first candidate is an opt-in widened target-library
+evaluation: exact Float-to-Double argument conversion, the existing Double
+intrinsic, then the existing nearest-even IEEE conversion back to Float. It
+remains implementation-defined library math, not reproducible or correctly
+rounded math. The default Float target-library realization stays unchanged.
+
+The request should be closed schedule data keyed by canonical operation and
+dtype; the shared scalar-region lowerer attaches the same contract in maps,
+reductions and fused result regions. Admission must validate the supported
+operation, operand/result dtypes and conversions. Shared C-family emission must
+use the existing intrinsic and conversion authorities. Unsupported targets must
+decline rather than silently discard the request. Existing body, artifact,
+schedule-template and executable-source identities must retain the choice;
+there is no reason for a second cache or a training-only realization registry.
+
+Before this candidate is admitted, verify unchanged default emission, closed
+schema/tamper rejection, codec retention, cache separation, fused/isolated
+contract agreement, and OpenCL/CUDA/HIP source compilation. Then run changed
+inputs locally and the unchanged whole-model gradient oracle. The local tanh
+control is motivation, not proof that this will close the model gate. Any cost
+comparison needs stationary samples and must account for FP64 throughput.
+
+The first implementation leaf admits this exact closed realization only for
+descriptor-owned math with Float operands and result. It reuses the shared
+Double intrinsic and checked narrowing emitters; malformed accuracy/conversion
+claims, Half/Double domains and non-math intrinsics are rejected. A shared
+KernelBody projection retains physical scalar dtype requirements, including
+the hidden Double evaluation, for scalar and Intel matrix preambles. Actual
+Intel/CUDA matrix epilogue sources retain the widened evaluation; the Intel
+Double helper and extension are defined once. CUDA/HIP CI fixture generation
+now includes dynamic unary tanh and binary pow inputs.
+
+The warm REPL passes 74 affected validation/emission/matrix tests and 1222
+assertions, including portable OpenCL source compilation and unchanged default
+emission. This is not yet public schedule wiring, native whole-model execution,
+CUDA/HIP compiler acceptance, or closure of the held training gate. Those remain
+the next steps; no numerical default, provider or acceptance tolerance changed.
+
+Independent review caught class-loader-sensitive `instance?` in the new physical
+requirement projection. It now uses the compiler's existing fully qualified
+record-kind checks, including expressions retained across warm-REPL reloads.
+The matrix fixture's mutation check follows the same handling. The final suite
+above was rerun after those fixes; expression-valued stores also retain their
+hidden Double demand without requiring a named Double SSA value.

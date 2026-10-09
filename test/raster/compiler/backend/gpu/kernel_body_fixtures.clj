@@ -2,6 +2,8 @@
   "Shared verifier, source-compile, and device fixtures for scheduled KernelBody operations."
   (:require [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
@@ -47,6 +49,19 @@
     :launch (launch/spec {:workgroup-size [1] :group-count [1]})
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
+
+(defn widened-math-body
+  "Dynamic Float inputs, explicit Double library evaluation, and shared Float narrowing."
+  [operator]
+  (let [template (scalar-product-body :float false)
+        arguments (vec (take (:arity (intrinsics/descriptor operator)) ['a 'b]))]
+    (body/make
+     (assoc template :id [:widened-math operator]
+            :operations [(body/->ScalarCompute
+                          (body/value 'result :float)
+                          (body/scalar-expression operator :float arguments
+                            {:math-realization numerics/widened-target-library-math}))
+                         (body/->ScalarStore 'out [0] 'result nil)]))))
 
 (defn half-extremum-body
   "Typed half extrema select an operand through exact Float widening."

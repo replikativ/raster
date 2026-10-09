@@ -25,6 +25,16 @@
   [value]
   (= target-library-math value))
 
+(def widened-target-library-math
+  "Opt-in Float math evaluated by the Double target library and narrowed to Float.
+   This specifies typed conversions, not correctly-rounded or JVM-equivalent library accuracy."
+  {:kind :target-library :accuracy :implementation-defined
+   :evaluation-dtype :double :argument-conversion :exact
+   :result-conversion {:dtype :float :rounding :nearest-even :overflow :ieee}})
+
+(defn widened-target-library-math? [value]
+  (= widened-target-library-math value))
+
 (defn blas-source-arithmetic
   "Describe a resolved BLAS product, not permission for a numerical refinement.
    Operand conversion and the typed result transform are outside the implementation-defined
@@ -106,8 +116,9 @@
   "Validate and return a numerical contract.
 
    Exact evaluation order preserves the typed operations, not bitwise equivalence between
-   different target math libraries. Covered scalar math operations (currently exp) retain their
-   realization separately in KernelBody; unclassified transcendentals have no such attestation.
+   different target math libraries. Descriptor-classified scalar math operations retain their
+   realization separately in KernelBody; this classification does not establish an accuracy bound
+   or cross-target bitwise equivalence.
 
    `context` lets an owning IR preserve its public diagnostic identity while sharing this one
    contract."

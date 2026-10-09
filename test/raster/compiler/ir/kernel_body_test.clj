@@ -5,6 +5,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-launch :as launch]))
 
 (def ^:private matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16})
@@ -398,6 +399,39 @@
     (is (= :predicate (get-in kernel [:operations 1 :result :type])))
     (is (= :full (get-in kernel [:operations 4 :participation :kind])))
     (is (launch/launch-spec? (:launch kernel)))))
+
+(deftest physical-scalar-requirements-include-expression-valued-realizations
+  (let [expression (body/scalar-expression :tanh :float [(body/literal 0.5 :float)]
+                     {:math-realization numerics/widened-target-library-math})]
+    (is (= #{:float :double}
+           (body/required-scalar-dtypes [(body/->ScalarStore 'out [0] expression nil)])))
+    (is (= #{:float}
+           (body/required-scalar-dtypes [(body/scalar-expression :tanh :float
+                                          [(body/literal 0.5 :float)])])))
+    (is (= #{} (body/required-scalar-dtypes [(body/literal true :predicate)])))))
+
+(deftest widened-library-realization-retains-a-closed-float-contract
+  (doseq [op [:tanh :pow]]
+    (let [arguments (vec (repeat (:arity (intrinsics/descriptor op))
+                                 (body/literal 0.5 :float)))
+          expression (body/scalar-expression op :float arguments
+                       {:math-realization numerics/widened-target-library-math})
+          compute #(scalar-body [(body/->ScalarCompute (body/value 'result :float) %)])]
+      (is (body/kernel-body? (compute expression)))
+      (doseq [contract [(assoc numerics/widened-target-library-math :accuracy :correctly-rounded)
+                        (assoc numerics/widened-target-library-math :argument-conversion :identity)
+                        (assoc-in numerics/widened-target-library-math [:result-conversion :rounding]
+                                  :toward-zero)]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (compute (assoc-in expression [:options :math-realization] contract)))))))
+  (doseq [[op dt arguments] [[:tanh :double [(body/literal 0.5 :double)]]
+                             [:tanh :half [(body/literal 0.5 :half)]]
+                             [:+ :float [(body/literal 0.5 :float) (body/literal 0.5 :float)]]]]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scalar-body [(body/->ScalarCompute
+                                (body/value 'result dt)
+                                (body/scalar-expression op dt arguments
+                                  {:math-realization numerics/widened-target-library-math}))])))))
 
 (deftest elementary-math-realization-is-explicit-not-a-bitwise-attestation
   (let [operators (into #{} (keep (fn [[op descriptor]]
