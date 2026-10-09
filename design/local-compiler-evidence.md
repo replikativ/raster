@@ -1853,3 +1853,9 @@ explicit-FMA preservation. This validates the isolated numerical
 permission boundary, not real-weight training parity or performance. Removing
 an implicit FMA can cost throughput; a future relaxed schedule must declare its
 contraction permission rather than relying on a syntactic product recognizer.
+
+The first full CI run found a stale native RMSNorm integration assertion that
+explicitly required `_mm256_fmadd_pd`. Its interpreter/scalar/vector numerical
+comparisons passed. The assertion now requires vector multiply and add and
+rejects implicit FMA, retaining the original numerical oracle and tolerances.
+The affected native AOT namespace passes 13 tests / 275 assertions locally.

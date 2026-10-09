@@ -215,7 +215,7 @@
 ;; ---- #27: explicit C-SIMD reduction (compile-aot-c :simd? true) ----
 
 ;; rms-norm with the variance reduction expressed as a reduce! SOAC (par/reduce),
-;; so :simd? true PRESERVES it and emits an AVX2 __m256 FMA loop (via csimd)
+;; so :simd? true PRESERVES it and emits an AVX2 __m256 mul/add loop (via csimd)
 ;; instead of a scalar loop left to clang auto-vec. Array output + reduction
 ;; intermediate = the real target shape (rms-norm / quant-GEMV).
 (deftm rmsnorm-red [x :- (Array double) w :- (Array double) n :- Long eps :- Double] :- (Array double)
@@ -228,11 +228,15 @@
 
 (deftest cpu-c-simd-reduction
   (when (clang-available?)
-    (testing ":simd? true emits an __m256 FMA reduction and matches the scalar path + interpreter"
+    (testing ":simd? true emits separately rounded vector products and matches the scalar path + interpreter"
       (let [f-simd (aot/compile-aot-c #'rmsnorm-red :double :simd? true)
             f-scal (aot/compile-aot-c #'rmsnorm-red :double)]
-        (is (re-find #"_mm256_fmadd_pd" (:c-source (meta f-simd)))
-            ":simd? true lowers the reduce! to a vector FMA loop")
+        (is (re-find #"_mm256_mul_pd" (:c-source (meta f-simd)))
+            ":simd? true retains the vector element product")
+        (is (re-find #"_mm256_add_pd" (:c-source (meta f-simd)))
+            ":simd? true retains the reassociated vector sum")
+        (is (not (re-find #"_mm256_fmadd_pd" (:c-source (meta f-simd))))
+            "reassociation alone does not authorize implicit FMA")
         (is (not (re-find #"_mm256_fmadd_pd" (:c-source (meta f-scal))))
             ":simd? false stays scalar (clang auto-vec only)")
         (doseq [n [16 64 257 1000]]
