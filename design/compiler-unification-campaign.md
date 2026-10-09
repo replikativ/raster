@@ -3592,3 +3592,36 @@ destination copies remain partial. The prerequisite is PR #1130. The focused
 warm-REPL copy/coverage/execution suites pass 14 tests / 58 assertions with no
 failures or errors. The temporal facet is still under review and has not yet
 demonstrated distributed runtime execution or durable publication.
+
+### Bounded temporal cycle through distributed ownership
+
+PR #1130 is merged as `7609bedb`; PR #1131 is merged as `5228aa99`.
+Both landed only after exact-head independent review and all seven registered
+CI contexts succeeded. The stage/execution facet is now an available structural
+boundary, not a theorem of PDE correctness or a device-completion receipt.
+
+The follow-up executes that exact certified cycle through the existing one-shot
+distributed runtime on both OpenCL and Level Zero. One logical worker is mapped
+explicitly to each physical target with a declared aggregate memory budget.
+Two cycles run in separately prepared plans and fresh contexts, with synchronous
+readback between them. Both match the independent coordinate-loop oracle within
+the existing `1e-11` bound, preserve composite mass, and retain exact average-down.
+Outputs are rejected before completion and a completed execution cannot replay
+stale startup evidence. This is local co-location, not a measured network/fabric
+result; copied readback inputs are not durable manifest publication.
+
+The runtime probe found a shared borrowing-boundary gap: a source-backed private
+temporary lost its caller initialization obligation when its source was removed.
+The existing projection now expresses that obligation using the existing `:state`
+role and `:requires` authority. Original initialization sources/views remain with
+the enclosing owner and are uploaded before any borrowed local call. Source-free
+private temporaries still require ordered producers; ownership alone never proves
+bytes initialized. Tests cover owner-view coverage, no spurious caller requirement
+after a first local overwrite, idempotence and missing-source rejection.
+
+The borrowing/device run passes 19 tests / 137 assertions with both FP64 probes
+available and no skips. The expanded borrowing controls separately pass 18 tests /
+103 assertions. This follow-up still requires exact-head review and fresh CI.
+General multi-patch/adaptive temporal planning, distributed completion-backed
+publication, physical cost calibration and the held real-model numerical gate
+remain separate open campaign obligations.

@@ -29,19 +29,23 @@
         (doseq [file (reverse (file-seq (.toFile root)))]
           (Files/deleteIfExists (.toPath file)))))))
 
-(defn- fixture []
-  (let [worker :amr-worker target :ocl:analytic
+(defn- fixture
+  ([] (fixture :ocl:analytic (#'oracle/initial-state)))
+  ([target initial]
+  (let [worker :amr-worker
+        descriptor (if (= :ocl:analytic target)
+                     {:device-id target :device-type :gpu :backend :ocl :fp64? true
+                      :subgroup-dialect :intel-opencl :max-workgroup-size 256}
+                     (hardware/descriptor-for target))
         hierarchy (-> (#'oracle/hierarchy)
                       (assoc :proper-nesting-width 1)
                       (update :levels #(mapv (fn [level]
                                               (update level :patches
                                                       (fn [patches] (mapv (fn [p] (assoc p :device worker)) patches)))) %)))
         projection (subcycle/project hierarchy {:domain-lengths [1.0 1.0] :diffusivity 0.2})
-        initial (#'oracle/initial-state)
         lowered (with-fresh-store
                   #(with-redefs [hardware/descriptor-for
-                             (constantly {:device-id target :device-type :gpu :backend :ocl :fp64? true
-                                          :subgroup-dialect :intel-opencl :max-workgroup-size 256})
+                             (constantly descriptor)
                              build/current-identity #'evidence/test-build]
                   (lowering/lower projection (double-array (:coarse initial))
                                   (double-array (:fine initial)) 0.001 {:target target})))
@@ -67,7 +71,7 @@
              :steps [(distributed/compute-step {:id :cycle-complete :device worker :duration-ns 1})]
              :outputs [:cycle-complete]})
         manifest (state/manifest
-                  {:id :cycle-state :parents [] :logical-coordinate {:step 0 :phase :synchronized}
+                  {:id :cycle-state :parents [] :logical-coordinate {:step (get initial :step 0) :phase :synchronized}
                    :fields (mapv (fn [patch]
                                    (let [field (:field patch) shape (:shape patch) n (reduce * shape)]
                                      (state/field
@@ -92,7 +96,7 @@
                      :fields (into {} (map (fn [role patch] [role {:patch (:id patch) :output role}])
                                           [:coarse :fine] patches))
                      :completion :cycle-complete}]
-    {:workload workload :prepared (:prepared lowered) :attestation attestation}))
+    {:workload workload :prepared (:prepared lowered) :attestation attestation})))
 
 (def ^:private retained-cycle (delay (fixture)))
 
@@ -136,7 +140,7 @@
 (deftest both-physical-register-transport-stages-are-required
   (let [{:keys [prepared attestation]} @retained-cycle
         local (raster.gpu.compiled/plan prepared)
-        instance (first (:instances local))
+        instance (#'execution/cycle-instance (:lowering prepared) (:cycle-component attestation))
         report (link/memory-report local)
         stages (:stages attestation)]
     ;; Isolate the physical lifecycle projection after ordinary plan verification.

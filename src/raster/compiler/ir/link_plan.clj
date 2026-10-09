@@ -1455,8 +1455,10 @@
    No allocation, upload, ownership transfer or initialization proof occurs here. The owner must
    keep every supplied buffer alive through all local execution and release borrowed registrations
    before freeing storage. Already external/borrowed allocations retain their original contracts.
-   Projection fails closed if removing a source leaves an internal/output value without a valid
-   caller-input role or local producer; borrowed ownership alone is not initialization evidence."
+   A source-backed private temporary becomes caller state when its source is removed: the owner
+   must realize the returned initializer before a borrower reads it. This is a conditional caller
+   obligation, not proof of initialized bytes. Source-free internal/scratch/output values still require
+   ordered local producers; borrowed ownership alone is not initialization evidence."
   [plan]
   (let [plan (validate! plan)
         initialization (initialization-contract plan)
@@ -1471,8 +1473,11 @@
         nodes (update-vals (:nodes plan)
                            (fn [node]
                              (if (owned? node)
-                               (-> node (assoc :source nil)
-                                   (assoc-in [:view :allocation :ownership] :borrowed))
+                               (cond-> (-> node (assoc :source nil)
+                                           (assoc-in [:view :allocation :ownership] :borrowed))
+                                 (and (:source node)
+                                      (not (contains? #{:input :constant :state} (:role node))))
+                                 (assoc :role :state))
                                node)))
         values (update-vals (:values plan)
                             (fn [value]
