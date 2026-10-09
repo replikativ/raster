@@ -2110,6 +2110,24 @@ route through ScheduledKernelBody plus independent graph-owned reconstruction
 and the shared artifact emitter. Retaining consent only in artifact attributes
 would create a duplicate, self-attested authority and is not the chosen route.
 
+The scan prerequisite now uses ScheduledKernelBody for every stage and the shared
+target artifact emitter, removing the manual scan artifact/ABI assembly. Its
+independent reconstructor derives storage, algebra, mode and geometry from the
+semantic graph rather than trusting candidate attributes. Source-grid/scratch and
+caller dtype contradictions fail loudly. Legacy graphs retain only their existing
+Int-bound ABI projection; typed graphs retain explicit scalar declarations.
+The emitted-equation boundary independently reconstructs scan certificates even
+when descriptive graph metadata is absent. Compiler, codec and boundary suites
+pass 62 tests / 454 assertions in the warm REPL.
+
+The production TypedSOAC scan route also passes native changed-input replay on
+both OpenCL and Level Zero: inclusive and exclusive scans of 1025 inputs compare
+every logical output with independent CPU prefix sums, including the exclusive
+scan's final total at output index 1025 (2 tests / 8 assertions, no skips).
+These exactly representable inputs test schedule/indexing/replay correctness,
+not arbitrary floating-point reassociation accuracy or distributed performance.
+No scan math-policy selection has been enabled by this migration.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec

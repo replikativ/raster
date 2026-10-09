@@ -24,6 +24,7 @@
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
@@ -426,6 +427,41 @@
          graph (lower/scan-kernel-graph node operations opts)]
      (sg/generate-scan-kernel-graph graph
                                     :scalar-types (:scalar-types opts)))))
+
+(deftest scan-stages-use-shared-certificates-and-independent-reconstruction
+  (let [form '(raster.par/scan out acc 0.0 i n double (+ acc (aget values i)))
+        node (soac/par-form->soac 'scan-result form 906 :dtype :double)
+        operations (lower/lower-scan node nil :dtype :double)
+        graph (lower/scan-kernel-graph node operations {})
+        emitted (sg/generate-scan-kernel-graph graph)]
+    (doseq [[source-node emitted-node] (map vector (:nodes graph) (:nodes emitted))
+            :let [artifact (:operation emitted-node)
+                  certificate (get-in artifact [:provenance :scheduled-operation])]]
+      (is (scheduled-body/scheduled-kernel-body? certificate))
+      (is (= certificate (segscan-body/validate-against-node! certificate source-node graph)))
+      (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (segscan-body/validate-against-node!
+                    (assoc-in certificate [:numerics :policy] :unrelated-policy) source-node graph))))
+    (is (= :inout (get-in emitted [:nodes 1 :operation :abi 0 :kind])))
+    (doseq [[field value] [[:num-blocks 1] [:shared-mem-bytes 0]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sg/generate-scan-kernel-graph
+                    (assoc-in graph [:nodes 0 :operation :grid field] value)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sg/generate-scan-kernel-graph graph :array-types {'values :float})))))
+
+(deftest legacy-scan-scalars-still-require-type-evidence
+  (let [form '(raster.par/scan out acc 0.0 i n double
+                               (+ acc (* scale (aget values i))))
+        node (soac/par-form->soac 'scan-result form 907 :dtype :double)
+        operations (lower/lower-scan node nil :dtype :double)
+        graph (lower/scan-kernel-graph node operations {})]
+    (is (= :kernel-scalar-dtype-unknown
+           (try (sg/generate-scan-kernel-graph graph)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (kgraph/kernel-graph?
+         (sg/generate-scan-kernel-graph graph :scalar-types {'scale :double})))))
 
 (defn- kernel-body-operations
   [artifact]

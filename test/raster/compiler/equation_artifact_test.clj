@@ -5,6 +5,10 @@
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-artifact-store :as store]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -161,6 +165,22 @@
      (boring/decode
       (boring/encode (#'artifact/prepare-sequences value) options)
       options))))
+
+(deftest scan-certificates-round-trip-through-the-existing-compiler-record-codec
+  (let [source (soac/par-form->soac 'result
+                                  '(raster.par/scan out acc 0.0 i n double
+                                                    (+ acc (aget input i)))
+                                  908 :dtype :double)
+        operations (soac-lower/lower-scan source nil :dtype :double)
+        graph (soac-lower/scan-kernel-graph source operations {})
+        emitted (segop-opencl/generate-scan-kernel-graph graph :target-dialect :cuda)]
+    (doseq [[node emitted-node] (map vector (:nodes graph) (:nodes emitted))
+            :let [original (:operation emitted-node)
+                  restored (compiler-record-round-trip original)
+                  certificate (get-in restored [:provenance :scheduled-operation])]]
+      (is (= original restored))
+      (is (= certificate (segscan-body/validate-against-node! certificate node graph)))
+      (is (= restored (scheduled-body/validate-artifact-projection! certificate restored))))))
 
 (deftest elementary-math-realization-round-trips-through-the-compiler-record-codec
   (doseq [op [:exp :tanh :log :sin] dt [:float :double]]

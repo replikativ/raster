@@ -12,6 +12,9 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.extent-expression :as extent]
+            [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.index-expression :as index-expression]
@@ -96,7 +99,8 @@
                 "scan graph buffer requires an explicit dtype and element extent"
                 {:buffer buffer :spec spec}))
     (body/->KernelParameter
-     buffer (if (= :read access) :input :output) buffer-type [elements] :global
+     buffer (case access :read :input :write :output :read-write :inout)
+     buffer-type [elements] :global
      (layout/row-major [elements] buffer-type) role)))
 
 (defn- common-context
@@ -111,11 +115,14 @@
         scalar-type (fn [id]
                       (dtype/canon (or (get scalar-types id)
                                        (get scalar-types (symbol (name id)))
-                                       result-type)))
+                                       (throw (ex-info "kernel scalar parameter has no declared dtype"
+                                                       {:reason :kernel-scalar-dtype-unknown
+                                                        :symbol id
+                                                        :declared (vec (keys scalar-types))})))))
         roles (fn [id access]
                 (cond
                   (contains? temporary-ids id) :temporary
-                  (contains? output-ids id) (if (= :read-write access) :inout :result)
+                  (contains? output-ids id) :result
                   :else :operand))
         parameters (vec
                     (concat
@@ -146,6 +153,25 @@
                 "portable scan requires a certified scalar scan and a power-of-two workgroup"
                 {:phase phase :mode scan-mode :algebra scan-algebra
                  :operation-dtype (:dtype operation) :workgroup-size workgroup-size}))
+    (let [groups (get-in operation [:grid :num-blocks])
+          expected-groups (case phase
+                            (:single :block-scan) 1
+                            :intra-block (launch/ceil-div bound workgroup-size)
+                            ;; Carry-in's map grid may be occupancy-capped. This portable leaf
+                            ;; intentionally expands it to cover every element without striding.
+                            :carry-in nil)
+          expected-scratch (if (= :carry-in phase) 0
+                            (* workgroup-size (dtype/bytes-of result-type)))]
+      (when (and expected-groups
+                 (not= (extent/canonical groups) (extent/canonical expected-groups)))
+        (decline! :source-grid "scan stage grid differs from its exact coverage schedule"
+                  {:phase phase :expected expected-groups :actual groups}))
+      ;; Block scan retains the base tree scratch declaration; this schedule adds one carry
+      ;; element explicitly in its physical launch/storage, rather than silently equating them.
+      (when-not (= expected-scratch (get-in operation [:grid :shared-mem-bytes]))
+        (decline! :source-scratch "scan stage scratch differs from its retained tree requirement"
+                  {:phase phase :expected expected-scratch
+                   :actual (get-in operation [:grid :shared-mem-bytes])})))
     {:phase phase :result-type result-type :workgroup-size workgroup-size :bound bound
      :pointer-ids pointer-ids :scalar-ids scalar-ids :scalar-type scalar-type
      :parameters parameters
@@ -247,7 +273,7 @@
                  [(body/->ScalarStore output [0]
                                       identity
                                       :scan-first-lane)])))
-        group-count (if (= :single phase) 1 (get-in operation [:grid :num-blocks]))]
+        group-count (if (= :single phase) 1 (launch/ceil-div '_n_bound workgroup-size))]
     (body/make
      {:id [:segscan (:id operation) phase :portable-workgroup]
       :parameters parameters :stable-reads stable-reads
@@ -424,7 +450,7 @@
                  :scan-block-size scan-workgroup :operator operator}
       :launch (launch/spec
                {:workgroup-size [workgroup-size]
-                :group-count [(launch/ceil-div bound workgroup-size)]})
+                :group-count [(launch/ceil-div '_n_bound workgroup-size)]})
       :provenance {:dialect :kernel-body :source-dialect :segscan
                    :segop-id (:id operation)}
       :attributes {:kind :portable-segscan :phase :carry-in :scan-mode scan-mode
@@ -443,3 +469,95 @@
     {:kernel-body kernel-body
      :phase (:phase context) :bound (:bound context)
      :pointer-ids (:pointer-ids context) :scalar-ids (:scalar-ids context)}))
+
+(defn schedule
+  "Close one scan stage over its body, ordered interface, effects and certified algebra."
+  [operation options]
+  (let [{:keys [kernel-body phase bound pointer-ids scalar-ids]} (lower operation options)
+        arguments (vec (concat pointer-ids scalar-ids [bound]))
+        algebra (:scan-algebra options)
+        accumulator-dtype (dtype/canon (:dtype algebra))]
+    (scheduled-body/make
+     {:source operation :body kernel-body :arguments arguments
+      :scalar-bindings (scheduled-body/derive-scalar-bindings
+                        kernel-body arguments
+                        (when (seq (:scalar-types options)) (:scalar-types options)))
+      :effects {:kind :scan-stage :phase phase
+                :uses (scheduled-body/derive-uses kernel-body arguments)}
+      :legality {:kind :segscan-body-lowering :phase phase
+                 :scan-mode (:scan-mode options) :certified-algebra algebra
+                 :source-grid (:grid operation)
+                 :grid-realization (if (= :carry-in phase) :uncapped-elementwise :exact-scan-coverage)
+                 :additional-carry-bytes (if (= :block-scan phase)
+                                           (dtype/bytes-of accumulator-dtype) 0)
+                 :workgroup-size (get-in kernel-body [:launch :workgroup-size 0])}
+      :numerics (cond-> {:mode :reassociated :policy :certified-scan-tree
+                         :rounding (if (dtype/integral? accumulator-dtype)
+                                     :exact :implementation-defined)
+                         :accumulator-dtype accumulator-dtype}
+                  (dtype/integral? accumulator-dtype) (assoc :overflow (:overflow algebra)))
+      :provenance {:dialect :kernel-body :source-dialect :segscan
+                   :segop-id (:id operation)}
+      :attributes {:phase phase :dtype accumulator-dtype :scan-mode (:scan-mode options)
+                   :scan-workgroup (:scan-workgroup options)}})))
+
+(defn schedule-for-node
+  "Derive scan schedule inputs from one exact node and its graph-owned storage and algebra.
+   Caller scalar types only fill legacy graphs without declared scalar types."
+  [node kernel-graph options]
+  (let [kernel-graph (graph/validate! kernel-graph)
+        _ (when-not (some #(= node %) (:nodes kernel-graph))
+            (decline! :graph-node "scan scheduling requires its exact graph node"
+                      {:node (:id node)}))
+        declared (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
+        supplied (:scalar-types options)
+        ;; Legacy graph constructors expose no GraphScalar table. Their bound ABI has always
+        ;; been int; project that existing contract only for missing extent leaves. Typed graphs
+        ;; never receive this compatibility default, and explicit caller types take precedence.
+        legacy-bound-types (when (nil? (:scalars kernel-graph))
+                             (zipmap (launch/expression-references
+                                      (:bound (segop/seg-space-reduced-dim
+                                               (:space (:operation node)))))
+                                     (repeat :int)))
+        _ (doseq [[id dt] declared :when (contains? supplied id)]
+            (when-not (= dt (dtype/canon (get supplied id)))
+              (decline! :scalar-contract "scan scalar types conflict with its graph"
+                        {:scalar id :declared dt :supplied (get supplied id)})))
+        first-scan (some #(when (segop/seg-scan? (:operation %)) (:operation %))
+                         (:nodes kernel-graph))
+        algebra (get-in first-scan [:scan-op :algebra])
+        scan-mode (get-in first-scan [:scan-op :mode] :inclusive)
+        _ (doseq [[field expected] [[:scan-algebra algebra] [:scan-mode scan-mode]]
+                  :when (contains? (:attributes kernel-graph) field)]
+            (when-not (= expected (get-in kernel-graph [:attributes field]))
+              (decline! :graph-scan-contract "scan graph metadata disagrees with its semantic operation"
+                        {:field field :expected expected
+                         :actual (get-in kernel-graph [:attributes field])})))
+        scheduled (schedule
+                   (:operation node)
+                   {:uses (:uses node)
+                    :buffers (into {} (map (juxt :id identity))
+                                   (concat (:inputs kernel-graph) (:outputs kernel-graph)
+                                           (:temporaries kernel-graph)))
+                    :temporary-ids (set (map :id (:temporaries kernel-graph)))
+                    :output-ids (set (map :id (:outputs kernel-graph)))
+                    :scan-algebra algebra :scan-mode scan-mode
+                    :scan-workgroup (or (get-in first-scan [:grid :block-size]) 256)
+                    :scalar-types (merge legacy-bound-types supplied declared)})]
+    ;; Direct legacy graph constructors predate explicit GraphScalar declarations.
+    ;; Typed production graphs must close their scalar dependencies here as well.
+    (if (some? (:scalars kernel-graph))
+      (scheduled-body/validate-against-node! scheduled node kernel-graph)
+      scheduled)))
+
+(defn validate-against-node!
+  "Independently reconstruct the exact scan body from its semantic node and graph facts."
+  ([scheduled node kernel-graph]
+   (validate-against-node! scheduled node kernel-graph {}))
+  ([scheduled node kernel-graph options]
+   (scheduled-body/validate! scheduled)
+   (let [expected (schedule-for-node node kernel-graph options)]
+     (when-not (= expected scheduled)
+       (decline! :schedule-source "scan body differs from its exact graph-owned schedule"
+                 {:node (:id node) :expected expected :actual scheduled})))
+   scheduled))
