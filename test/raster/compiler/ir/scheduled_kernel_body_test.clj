@@ -5,6 +5,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -281,6 +282,9 @@
       (let [artifact (target/emit-artifact "conditioned" value dialect)
             graph (target/emit-static-dense-graph "conditioned" value dialect)]
         (is (= (:preconditions value) (:preconditions artifact)))
+        (is (= (:numerics value) (:numerics (executable/description artifact))))
+        (is (= (:numerics value)
+               (get-in (executable/description graph) [:kernels 0 :numerics])))
         (is (= artifact (scheduled/validate-artifact-projection! value artifact)))
         (is (= graph (graph-call/preflight! graph {'rows {:type :int :value 6}})))
         (doseq [rows [0 7 8]]
