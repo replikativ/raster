@@ -194,6 +194,33 @@
           (is (= 1 @calls) "same-request durable reload must not recompile")
           (finally (compiled/clear-compilation-cache!)))))))
 
+(deftest prepared-math-intent-is-owned-and-checked-before-instantiation
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        prepared (compiled/lower #'artifact-map [(float-array 4) 4]
+                                 (merge {:compiler :equation-first :target target :dtype :float} request))
+        copied (assoc prepared :args [])
+        calls (atom [])]
+    (is (= request (:math-request prepared)))
+    (with-redefs [gpu-link/instantiate-certified!
+                  (fn [_ opts] (swap! calls conj [:certified opts]) ::executable)
+                  gpu-link/instantiate!
+                  (fn [_ opts] (swap! calls conj [:independent opts]) ::executable)]
+      (is (compiled/compiled? (compiled/instantiate! prepared)))
+      (is (= request (select-keys (second (first @calls)) [:scalar-math])))
+      (is (compiled/compiled? (compiled/instantiate! prepared request)))
+      (is (= :compiled-prepared-math-request
+             (reason-of #(compiled/instantiate! prepared {:scalar-math {:overrides {}}}))))
+      (is (= :compiled-prepared-math-owner
+             (reason-of #(compiled/instantiate! copied))))
+      (is (= 2 (count @calls)))
+      (is (compiled/compiled? (compiled/instantiate! copied request)))
+      (is (= [:independent request] (last @calls))))
+    (is (= :compiled-composition-math-request
+           (reason-of #(compiled/compose {:id :contextual :components [{:id :a :program prepared}]}))))
+    (is (= :compiled-resident-math-request
+           (reason-of #(compiled/lower #'artifact-map []
+                                      {:compiler :resident-descriptor :scalar-math {:overrides {}}}))))))
+
 (deftest equation-compilation-round-trips-and-remains-lowerable
   (let [original @compilation
         envelope (artifact/seal identity original)
@@ -411,6 +438,17 @@
                 (is (= :exact-bound-program (:scope a)))
                 (is (string? (:fingerprint a)))
                 (is (= a b) "host array identity and contents are deliberately not attested")
+                (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+                      selected (compiled/lower #'artifact-map [(float-array 4) 4]
+                                               (merge options request))
+                      selected-id (compiled/execution-identity selected)]
+                  (is (= :exact-bound-program (:scope selected-id)))
+                  (is (= (select-keys selected-id [:scope :fingerprint])
+                         (:program (compiled/producer-interface selected))))
+                  (is (not= (:fingerprint a) (:fingerprint selected-id))
+                      "even an unused policy is part of the exact caller compilation identity")
+                  (is (= :compiled-execution-identity-owner
+                         (reason-of #(compiled/execution-identity (dissoc selected :math-request))))))
                 (let [interface (compiled/producer-interface p)
                       updated (compiled/lower #'artifact-state! [(:default (first (:in-tree p))) 4]
                                               (assoc options :donate '[state]))
