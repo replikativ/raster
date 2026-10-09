@@ -13,6 +13,46 @@
                                   {:dtype :double :array-types {'x :double 'out :double}
                                    :scalar-types {'scale :double}}))))
 
+(deftest resident-realization-preserves-unrelated-fold-map-regions
+  (let [program (frontend/form->program
+                 '(let* [total (raster.par/reduce acc 0.0 i 4 (+ acc (aget x i)))
+                         folded (raster.par/segmented-fold-map!
+                                 [out] [[row 1]] col 4
+                                 [[sum 0.0 :double 4 (+ sum (aget x col))]]
+                                 [(+ sum (aget x col))])
+                         result (raster.par/map-void! j 4 (aset out j (* (aget x j) total)))]
+                    result)
+                 {:dtype :double :array-types {'x :double 'out :double}})
+        fold-equation (fn [p]
+                        (first (filter #(= :segmented-fold-map
+                                           (:kind (fusion/equation-info %)))
+                                       (dialect/equations p))))
+        [realized stats] (resident/realize program)]
+    (is (= 1 (:resident-reductions stats)))
+    (is (some? (fold-equation program)))
+    (is (= (fold-equation program) (fold-equation realized))
+        "unrelated fold regions and their map lambda survive without reconstruction")
+    (is (= realized (dialect/validate! realized)))))
+
+(deftest resident-realization-never-replaces-a-multi-region-extent-with-a-buffer
+  (doseq [role [:segment :fold]]
+    (let [segment-extent (if (= :segment role) 'total 1)
+          fold-extent (if (= :fold role) 'total 4)
+          source `(let* [~'total (raster.par/reduce ~'acc (long 0) ~'i 4
+                                  (clojure.core/unchecked-add ~'acc (clojure.core/aget ~'x ~'i)))
+                         ~'result (raster.par/segmented-fold-map!
+                                   [~'out] [[~'row ~segment-extent]] ~'col 4
+                                   [[~'sum 0 :long ~fold-extent
+                                     (clojure.core/unchecked-add ~'sum
+                                                                (clojure.core/aget ~'x ~'col))]]
+                                   [~'sum])]
+                    ~'result)
+          program (frontend/form->program source {:dtype :long
+                                                  :array-types {'x :long 'out :long}})
+          [realized stats] (resident/realize program)]
+      (is (= 0 (:resident-reductions stats)))
+      (is (= program realized) "every segment/fold extent keeps its scalar representation"))))
+
 (deftest resident-uniform-load-is-a-stable-device-capture
   (let [source '(let* [^double alpha (clojure.core/aget params 0)
                        result (raster.par/map-void! i n
@@ -69,7 +109,11 @@
                                                :dtype source}}})
           cast (:expression (first (:operations result)))]
       (is (= :cast (:op cast)))
-      (is (= {:rounding :nearest-even :overflow :exact} (:options cast))))))
+      (is (= {:rounding (if (and (= :int source) (= :double target))
+                         :exact :nearest-even)
+              :overflow :exact}
+             (:options cast))
+          "all Int32 values are exactly representable in Double; other pairs require rounding"))))
 
 (deftest resident-reduction-preserves-host-scalar-captures
   (let [program (fused

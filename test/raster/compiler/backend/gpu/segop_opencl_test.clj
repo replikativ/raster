@@ -31,7 +31,7 @@
 
 (deftest scalar-reduction-storage-alias-requires-the-exact-closed-projection
   (let [source '(let* [^long extent (clojure.core/long
-                                    (clojure.core/* (clojure.core/long n) (clojure.core/long 1)))
+                                    ^long (clojure.core/* (clojure.core/long n) (clojure.core/long 1)))
                        result (raster.par/reduce acc 0.0 i extent
                                                 (+ acc (clojure.core/aget a i)))] result)
         options {:dtype :double :array-types {'a :double} :scalar-types {'n :long}}

@@ -20,13 +20,19 @@
 
 (defn- operation-info
   [equation]
-  (or (fusion/equation-info equation)
+  (or (some-> (fusion/equation-info equation)
+              (assoc :original-equation equation))
       (throw (ex-info "resident realization received an unknown TypedSOAC equation"
                       {:reason :typed-soac-resident-equation :equation equation}))))
 
 (defn- emit-equation
-  [{:keys [kind id results attributes arrays captures destinations parameters locals body-results]}]
-  (list '= id (vec results)
+  [{:keys [kind id results attributes arrays captures destinations parameters locals body-results
+           original-equation rewritten?]}]
+  ;; Operations with multiple regions carry semantic parts beyond the primary lambda.
+  ;; Unchanged equations must retain all of them, not be rebuilt by a single-lambda emitter.
+  (if-not rewritten?
+    original-equation
+    (list '= id (vec results)
         (case kind
           :contract (list 'contract attributes (vec arrays) (vec captures))
           :scalar (list 'scalar attributes (vec captures)
@@ -39,7 +45,7 @@
                              (vec body-results)))
           (list (symbol (name kind)) attributes (vec arrays) (vec captures)
                 (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
-                                     (vec body-results))))))
+                                     (vec body-results)))))))
 
 (defn- parameter-parts
   [info]
@@ -57,14 +63,20 @@
      (let [{:keys [id kind arrays captures attributes]} (operation-info equation)]
        (-> uses
            (into (map (fn [value] [value {:equation id :role :array}]) arrays))
-           (into (map (fn [value] [value {:equation id :role (if (= :contract kind)
-                                                             :contract-capture :capture)}]) captures))
+           (into (map (fn [value] [value {:equation id
+                                         :role (case kind
+                                                 :contract :contract-capture
+                                                 (:product-reduce :segmented-fold-map)
+                                                 :multi-region-capture
+                                                 :capture)}]) captures))
            ;; The transform has its own typed scalar boundary. Rewriting the primary
            ;; lambda cannot turn a transform scalar into a resident buffer load.
            (into (map (fn [value] [value {:equation id :role :result-transform}])
                       (result-transform-inputs attributes)))
-           (cond-> (dialect/value-id? (:extent attributes))
-             (conj [(:extent attributes) {:equation id :role :extent}])))))
+           (into (keep (fn [extent]
+                         (when (dialect/value-id? extent)
+                           [extent {:equation id :role :extent}])))
+                 (dialect/operation-extents equation)))))
    [] equations))
 
 (defn- scalar-definitions
@@ -147,6 +159,7 @@
                                        (resident-scalar-value? (get values %)))
                                   referenced-values))]
     (assoc info
+           :rewritten? true
            :captures referenced-values
            :parameters (vec (concat accumulators elements new-parameters
                                     destination-parameters))

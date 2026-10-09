@@ -1779,6 +1779,16 @@ checks Double addition of 16777217 and 0.25 followed by Float narrowing, which m
 as array length remain unexpanded when admitting user scalar helpers. Explicit rank-zero tensor
 shapes are admitted for replicated distributed values; absent shapes and rank-zero partitioning
 remain rejected. The affected suites and independent exact-head review gate landing this slice.
+Fresh-load validation also exposed type and realization losses at compatibility re-entry.
+The original parameter declarations now reach scheduling before emission; retained flat binder
+types reach every use, and contradictory scalar declarations fail closed. Integral widths are
+not inferred from the kernel's floating element dtype. Resident compilation passes its existing
+reduction-realization policy through the same handoff instead of introducing a host scalar read.
+Resident realization preserves untouched multi-region equations exactly, including every fold
+and combine region. Rewriting a scalar capture across multiple regions remains an explicit escape
+boundary until those regions have a shared capture rewrite; a one-lambda rewrite cannot claim it.
+The unchanged tiny Gemma resident fixture again completes its 25-step trajectory and compares
+certified runtime views rather than confusing logical node IDs with session-qualified allocations.
 This is not actual-model training acceptance.
 The original real-model gradient oracle, tolerance, provider and source-precision policy remain
 unchanged. Neither the compiler-default switch nor the full campaign is complete.

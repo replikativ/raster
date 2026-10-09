@@ -1097,7 +1097,8 @@
                                        :buffer-projections (:buffer-projections opts)]
                                 ;; Resident buffers cannot be consumed by a host fallback merely
                                 ;; because specialization made a small extent a literal.
-                                (:resident-gpu? opts) (into [:min-elements 0])))]
+                                (:resident-gpu? opts)
+                                (into [:min-elements 0 :resident-reductions? true])))]
             (register-gpu-kernels! (:kernels result) target-device)
             (register-gpu-dispatches! (:dispatches result) target-device)
             {:form (:form result) :stats (:stats result)
