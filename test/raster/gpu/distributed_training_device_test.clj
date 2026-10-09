@@ -436,6 +436,12 @@
           "fixture must distinguish an actual update from unchanged parameter replicas")
       (with-open [executable (runtime/instantiate! plan {:transport :resident-copy
                                                         :device-capacities {device 1048576}})]
+        (is (= (:allocation-budgets
+                (distributed/resident-storage-plan plan {:device-capacities {device 1048576}}))
+               (:allocation-budgets executable)))
+        (is (= (:allocation-budgets executable)
+               (get-in (distributed/simulate plan {:device-capacities {device 1048576}})
+                       [:resident-storage :allocation-budgets])))
         (let [profile (runtime/profile! executable)]
           (is (= :synchronous-serialized (:execution-model profile)))
           (is (false? (:calibration? profile)))

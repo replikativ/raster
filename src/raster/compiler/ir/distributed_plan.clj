@@ -1259,6 +1259,59 @@
   [plan]
   (validated-compute-facts plan))
 
+(defn resident-storage-plan
+  "Independently validate and project the current finite runtime's owned LinkPlan root pool.
+   Every compute step must be bound. Identical physical root contracts count once; all roots
+   remain allocated until owner close. Remapped targets need explicit aggregate capacities.
+   Returns validated bindings, root specs and declared allocation budgets, potentially retaining
+   source objects. This is not a compact portable report, readiness/initialization admission,
+   measured available VRAM, live-range recycling, or permission to allocate resources.
+   KernelGraph scratch, backend temporaries, host staging and total driver memory are excluded."
+  ([plan] (resident-storage-plan plan {}))
+  ([plan {:keys [device-capacities] :or {device-capacities {}} :as options}]
+   (when-not (and (map? options) (set/subset? (set (keys options)) #{:device-capacities})
+                  (map? device-capacities))
+     (fail! "physical device capacities must be a map"
+            :distributed-runtime-physical-budget {:options options}))
+   (let [{:keys [bindings unbound]} (compute-bindings plan)
+         _ (when (seq unbound)
+             (fail! "resident storage projection requires all compute steps to be bound"
+                    :distributed-resident-unbound {:steps unbound}))
+         remapped-targets (into #{} (keep (fn [[worker local]]
+                                          (let [target (get local :target worker)]
+                                            (when (not= worker target) target)))) (:device-plans plan))
+         specs (reduce
+                (fn [specs [_ {:keys [link-plan]}]]
+                  (reduce
+                   (fn [specs [_ {:keys [view]}]]
+                     (let [a (:allocation view) device (:device a) id (:id a)
+                           dt (dtype/canon (:dtype view)) bytes (dtype/bytes-of dt) key [device id]
+                           spec {:allocation a :dtype dt}]
+                       (when-not (and (= :owned (:ownership a)) (= device (:target link-plan))
+                                      (zero? (mod (:byte-size a) bytes)))
+                         (fail! "distributed owner needs explicit owned device storage"
+                                :distributed-runtime-allocation {:allocation a}))
+                       (when-let [previous (get specs key)]
+                         (when-not (= previous spec)
+                           (fail! "one resident allocation needs one exact storage contract"
+                                  :distributed-runtime-storage-contract
+                                  {:allocation key :previous previous :actual spec})))
+                       (assoc specs key spec))) specs (:nodes link-plan))) {} bindings)
+         budgets
+         (into {} (for [[device entries] (group-by (comp first key) specs)]
+                    (let [bytes (reduce +' 0 (map (comp :byte-size :allocation val) entries))
+                          capacity (get device-capacities device
+                                        (when-not (contains? remapped-targets device)
+                                          (get-in plan [:topology :devices device :memory-capacity-bytes])))]
+                      (when-not (and (integer? capacity) (<= 0 capacity Long/MAX_VALUE))
+                        (fail! "remapped devices require an explicit aggregate physical budget"
+                               :distributed-runtime-physical-budget {:device device :capacity capacity}))
+                      (when (> bytes capacity)
+                        (fail! "resident allocation pool exceeds the declared device budget"
+                               :distributed-runtime-memory {:device device :bytes bytes :capacity capacity}))
+                      [device {:capacity-bytes capacity :resident-bytes bytes}])))]
+     {:bindings bindings :specs specs :allocation-budgets budgets})))
+
 (defn transfer-bindings
   "Validate and project every transfer to exact physical source/target BufferViews.
    Supports contiguous plain ScheduledHalo copies and explicitly bound local graph regions.
@@ -1571,6 +1624,8 @@
    Logical per-worker compute and peak-memory accounting is retained; physical-compute-ns
    additionally aggregates compute service time by placed target. This does not aggregate
    physical memory capacities or infer sharing between logical topology links.
+   Optional :device-capacities invokes the shared resident-storage-plan projection for fully
+   bound compute, exposing declared physical root budgets without changing logical peak estimates.
 
    Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
    empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
@@ -1582,14 +1637,16 @@
   ([plan] (simulate plan {}))
   ([plan options]
   (when-not (and (map? options)
-                 (set/subset? (set (keys options)) #{:route-context :profiles :route-policy}))
+                 (set/subset? (set (keys options)) #{:route-context :profiles :route-policy :device-capacities}))
     (fail! "unsupported distributed simulation options" :distributed-cost-options {:options options}))
-  (when (and (seq options) (not (map? (:route-policy options))))
+  (when (and (some #(contains? options %) [:route-context :profiles :route-policy])
+             (not (map? (:route-policy options))))
     (fail! "empirical route policy must be a map" :distributed-cost-options {:options options}))
   (let [plan (validate! plan)
         policy (merge {:max-age-ms 60000 :min-samples 3 :cv-threshold 0.05} (:route-policy options))
-        _ (when (seq options)
-            (when-not (and (= #{:route-context :profiles :route-policy} (set (keys options)))
+        route-options (select-keys options [:route-context :profiles :route-policy])
+        _ (when (seq route-options)
+            (when-not (and (= #{:route-context :profiles :route-policy} (set (keys route-options)))
                            (map? (:route-context options))
                            (map? (get-in options [:route-context :devices] {}))
                            (map? (get-in options [:route-context :transfer-layouts] {}))
@@ -1604,7 +1661,9 @@
                            (contains? #{:cold :warm} (:cold-warm policy)))
               (fail! "empirical simulation requires an explicit context, profiles and valid policy"
                      :distributed-cost-options {:options options})))
-        costs (when (seq options)
+        pool (when (contains? options :device-capacities)
+               (resident-storage-plan plan {:device-capacities (:device-capacities options)}))
+        costs (when (seq route-options)
                 (into {} (for [step (:steps plan) :when (= :transfer (:kind step))]
                            [(:id step) (empirical-route-cost plan step (:route-context options)
                                                             (:profiles options) policy)])))
@@ -1684,7 +1743,10 @@
                    :peak-memory-by-device peak-memory
                    :transferred-bytes transferred-bytes}}
       costs (assoc :route-cost-evidence costs :route-context (:route-context options)
-                   :route-policy policy :empirical-costs-certified? false)))))
+                   :route-policy policy :empirical-costs-certified? false)
+      pool (assoc :resident-storage {:model :owned-link-plan-roots-until-close
+                                    :allocation-count (count (:specs pool))
+                                    :allocation-budgets (:allocation-budgets pool)})))))
 
 (defn- shard-coverage
   [plan]
