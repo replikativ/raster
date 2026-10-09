@@ -40,6 +40,7 @@
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
             [raster.gpu.storage-representation :as storage-representation]
+            [raster.runtime.artifact-provenance :as provenance]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.schedule :as gpu-schedule]
             [raster.gpu.value :as v]
@@ -81,23 +82,17 @@
 (defn compiled? [x] (instance? Compiled x))
 (defn prepared? [x] (instance? Prepared x))
 
-(def ^:private artifact-seal-token (Object.))
+(def ^:private artifact-issuer (provenance/issuer))
 
 (defn- seal-artifact
   "Bind in-process provenance to one exact immutable artifact object. A copied or associated
    record may retain the closure but cannot satisfy its identity check. This is an optimization
    witness, never a replacement for the public, re-derivable lowering certificate."
   [artifact]
-  (let [owner (volatile! nil)
-        sealed (assoc artifact :provenance-seal
-                      (fn [candidate]
-                        (when (identical? candidate @owner) artifact-seal-token)))]
-    (vreset! owner sealed)
-    sealed))
+  ((:seal artifact-issuer) artifact))
 
 (defn- sealed-artifact? [artifact]
-  (let [seal (:provenance-seal artifact)]
-    (and (fn? seal) (identical? artifact-seal-token (seal artifact)))))
+  ((:authentic? artifact-issuer) artifact))
 
 (defrecord CompletedEvidence [data lease executable epoch values released? provenance-seal]
   java.io.Closeable

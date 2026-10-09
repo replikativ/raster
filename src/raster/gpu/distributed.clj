@@ -9,14 +9,36 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
-            [raster.gpu.resident-value :as resident-value])
+            [raster.gpu.resident-value :as resident-value]
+            [raster.gpu.storage-representation :as storage]
+            [raster.runtime.artifact-provenance :as provenance])
   (:import [java.lang.foreign Arena]))
 
 (declare close!)
 
-(defrecord DistributedExecutable [plan schedule readiness bindings projections sessions transport staging-bytes state]
+(def ^:private runtime-issuer (provenance/issuer))
+(defn- seal-runtime-value [value] ((:seal runtime-issuer) value))
+
+(defrecord DistributedExecutable [plan schedule readiness bindings projections sessions transport staging-bytes state allocation-budgets provenance-seal]
   java.io.Closeable
   (close [this] (close! this)))
+
+(defn original-executable?
+  "Whether this is the exact distributed owner issued by instantiate!, not a copied record.
+   This proves in-process issuance only, not completion, byte content or durable provenance."
+  [value]
+  (and (instance? DistributedExecutable value) ((:authentic? runtime-issuer) value)))
+
+(defrecord ResidentRepresentationEvidence [data executable session session-id provenance-seal]
+  clojure.lang.IDeref
+  (deref [this]
+    (when-not ((:authentic? runtime-issuer) this)
+      (throw (ex-info "distributed representation evidence requires its original object"
+                      {:reason :distributed-representation-owner})))
+    data))
+
+(defn representation-evidence? [value]
+  (and (instance? ResidentRepresentationEvidence value) ((:authentic? runtime-issuer) value)))
 
 (defn- schedule [plan]
   (let [queues {:compute (execution/compute-queue) :transfer (execution/transfer-queue)}
@@ -115,7 +137,8 @@
                                             :previous previous :actual {:allocation a :dtype dt}}))))
                        (assoc specs key {:allocation a :dtype dt})))
                    specs (:nodes link-plan))) {} bindings)
-         _ (doseq [[device entries] (group-by (comp first key) specs)]
+         allocation-budgets
+         (into {} (for [[device entries] (group-by (comp first key) specs)]
              (let [bytes (reduce +' 0 (map (comp :byte-size :allocation val) entries))
                    capacity (get device-capacities device
                                  (when-not (contains? remapped-targets device)
@@ -125,7 +148,8 @@
                                  {:reason :distributed-runtime-physical-budget :device device :capacity capacity})))
                (when (> bytes capacity)
                  (throw (ex-info "resident allocation pool exceeds the declared device budget"
-                                 {:reason :distributed-runtime-memory :device device :bytes bytes :capacity capacity})))))
+                                 {:reason :distributed-runtime-memory :device device :bytes bytes :capacity capacity})))
+               [device {:capacity-bytes capacity :resident-bytes bytes}])))
          _ (doseq [[index action] (map-indexed vector (:actions ready))
                    :when (contains? (set (:outputs plan)) (:id action))
                    :let [local (get-in bindings [(:id action) :link-plan])]
@@ -151,7 +175,9 @@
          (gpu/upload-range! (get @sessions (get-in view [:allocation :device]))
                             (physical-view @sessions view) source
                             {:elements (reduce * 1 (:shape view))}))
-       (->DistributedExecutable plan schedule ready bindings projections @sessions transport max-staging-bytes (atom :ready))
+       (seal-runtime-value
+        (->DistributedExecutable plan schedule ready bindings projections @sessions transport
+                                 max-staging-bytes (atom :ready) allocation-budgets nil))
        (catch Throwable e
          (try (close-sessions! @sessions) (catch Throwable cleanup (.addSuppressed e cleanup)))
          (throw e))))))
@@ -218,6 +244,17 @@
                                    (link-plan/output-value-ids local)))])))
           (get-in executable [:plan :outputs]))))
 
+(defn- with-output-scope! [executable read! state-after]
+  (let [values (locking (:state executable)
+                 (let [values (output-values executable)]
+                   (reset! (:state executable) :reading-outputs)
+                   values))]
+    (try
+      (read! values)
+      (finally
+        (locking (:state executable)
+          (reset! (:state executable) (state-after)))))))
+
 (defn with-output-values!
   "Call `read!` synchronously with completed outputs while retaining the owner's lifetime.
    Close from any thread is refused while this scope is active. No owner monitor is held
@@ -227,15 +264,81 @@
    this contract. Return copied data, not borrowed views. This is a lifetime boundary, not a
    sealed compiler completion receipt, content verification or durable publication."
   [executable read!]
-  (let [values (locking (:state executable)
-                 (let [values (output-values executable)]
-                   (reset! (:state executable) :reading-outputs)
-                   values))]
-    (try
-      (read! values)
-      (finally
-        (locking (:state executable)
-          (reset! (:state executable) :complete))))))
+  (with-output-scope! executable read! (constantly :complete)))
+
+(defn measure-storage-representation!
+  "Observe one dtype on an original completed distributed owner's physical target.
+   The exclusive output scope retains all owner sessions without holding a monitor across
+   callbacks. The generated probe writes only its private temporary, never output storage.
+   Its two-element allocation must fit the retained explicit resident-buffer budget; driver
+   and context overhead is not modeled by that budget. No async events are admitted.
+   Admission declines preserve completion; failure after entering the probe conservatively
+   marks the owner failed at scope release, preventing consumption of potentially lost storage.
+
+   Returns original owner/session-bound representation evidence. Deref is historical data;
+   this is neither a program/completion receipt nor portable authentication/publication. A
+   future capture must revalidate this owner, live session and its independent compiler plan."
+  [executable target element-dtype]
+  (when-not (original-executable? executable)
+    (throw (ex-info "representation measurement requires the original distributed owner"
+                    {:reason :distributed-runtime-owner})))
+  (let [probe-failed? (volatile! false)]
+    (with-output-scope!
+     executable
+     (fn [_]
+       (let [session (or (get (:sessions executable) target)
+                         (throw (ex-info "target is not owned by this distributed execution"
+                                         {:reason :distributed-representation-target :target target})))
+             dt (dtype/canon element-dtype)
+             {:keys [capacity-bytes resident-bytes]} (get (:allocation-budgets executable) target)
+             probe-bytes (* 2 (dtype/bytes-of dt))]
+         (when-not (and (integer? capacity-bytes) (integer? resident-bytes)
+                        (<= 0 resident-bytes capacity-bytes Long/MAX_VALUE)
+                        (<= probe-bytes (- capacity-bytes resident-bytes)))
+           (throw (ex-info "storage probe exceeds the owner's resident allocation budget"
+                           {:reason :distributed-representation-budget :target target
+                            :probe-bytes probe-bytes :capacity-bytes capacity-bytes
+                            :resident-bytes resident-bytes})))
+         (let [observation (storage/observe!
+                            session dt
+                            (fn [observe]
+                              (try (observe)
+                                   (catch Throwable error
+                                     (vreset! probe-failed? true)
+                                     (throw error)))))]
+           (seal-runtime-value
+            (->ResidentRepresentationEvidence
+             (assoc (dissoc observation :session-id)
+                    :kind :raster.distributed/resident-representation-v1 :target target)
+             executable session (:session-id observation) nil)))))
+     (fn [] (if @probe-failed? :failed :complete)))))
+
+(defn storage-representation-description
+  "Return checked representation data inside an active output read scope.
+   Requires the original distributed fact for this exact owner, target, dtype, live session
+   identity and current device snapshot. Returned maps are historical data, not transferable
+   authority; capture must validate again in the scope that actually reads bytes."
+  [executable target element-dtype fact]
+  (when-not (original-executable? executable)
+    (throw (ex-info "storage description requires the original distributed owner"
+                    {:reason :distributed-runtime-owner})))
+  (locking (:state executable)
+    (when-not (= :reading-outputs @(:state executable))
+      (throw (ex-info "storage description requires a pinned completed output scope"
+                      {:reason :distributed-runtime-state :state @(:state executable)})))
+    (let [session (get (:sessions executable) target)
+          dt (dtype/canon element-dtype)]
+      (when-not (and (representation-evidence? fact)
+                     (identical? executable (:executable fact))
+                     session (identical? session (:session fact))
+                     (= (:session-id @session) (:session-id fact))
+                     (not (:closed? @session)) (empty? (:events @session))
+                     (= :raster.distributed/resident-representation-v1 (:kind @fact))
+                     (= target (:target @fact)) (= dt (:dtype @fact))
+                     (= (gpu/execution-device-info session) (:device @fact)))
+        (throw (ex-info "distributed storage fact does not match this live owner frontier"
+                        {:reason :distributed-representation-mismatch :target target :dtype dt})))
+      @fact)))
 
 (defn close! [executable]
   (locking (:state executable)
