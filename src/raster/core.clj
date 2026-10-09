@@ -64,6 +64,9 @@
 (def ^:private compile-typed-impl-fn
   (delay (requiring-resolve 'raster.compiler.backend.jvm.bytecode/compile-typed-impl!)))
 
+(def ^:private inline-ad-applications-fn
+  (delay (requiring-resolve 'raster.compiler.passes.scalar.inline/inline-ad-applications)))
+
 (def ^:private invalidate-callsites-fn
   (delay (requiring-resolve 'raster.runtime.callsites/invalidate!)))
 
@@ -385,6 +388,15 @@
                                     (catch Throwable _
                                       walked-body))
                                walked-body)
+              ;; Use the same retained AD program as AOT, without expanding ordinary
+              ;; helper boundaries or rewalking its typed conversions. Lazy resolution
+              ;; avoids the scalar.inline -> raster.core namespace cycle.
+              effective-body
+              (if (some '#{raster.ad.reverse/value+grad raster.ad.reverse/grad}
+                        (tree-seq coll? seq effective-body))
+                (binding [*ns* (or source-ns *ns*)]
+                  (mapv #(@inline-ad-applications-fn % (zipmap params tags)) effective-body))
+                effective-body)
               ;; Vectorize par/map + par/reduce out of the box (scalar fallback inside).
               effective-body (simd-expand-jit-body effective-body source-ns)
               class-name (str "raster.compiled.DT_"

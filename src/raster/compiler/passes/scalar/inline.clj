@@ -914,6 +914,8 @@
   ([form] (inline-one-pass form subst-syms false))
   ([form subst-fn] (inline-one-pass form subst-fn false))
   ([form subst-fn skip-ad-rule-check?]
+   (inline-one-pass form subst-fn skip-ad-rule-check? false))
+  ([form subst-fn skip-ad-rule-check? ad-only?]
    (let [[_ bindings-vec0 & body-exprs-raw0] form
          ;; F1: hoist nested value+grad/grad applications out of any init/body
          ;; sub-position into their own preceding binding, so the binding-level AD
@@ -921,12 +923,14 @@
          ;; `(nth ((value+grad #'f) …) k)` otherwise never AD-transforms — silent
          ;; wrong answer (nth on the raw call → an input arg, not the gradient).
          {bindings-vec :bindings body-exprs-raw :body}
-         (hoist-nested-vg bindings-vec0 body-exprs-raw0)
+         (if ad-only?
+           {:bindings bindings-vec0 :body body-exprs-raw0}
+           (hoist-nested-vg bindings-vec0 body-exprs-raw0))
          ;; Lift body-position calls into bindings so they get inlined too.
          ;; Without this, a tail call like (dense W2 a b2) stays opaque because
          ;; inline-one-pass only processes let* binding pairs.
          [extra-body-pairs body-exprs]
-         (if (and (= 1 (count body-exprs-raw))
+         (if (and (not ad-only?) (= 1 (count body-exprs-raw))
                   (seq? (first body-exprs-raw))
                   (let [head (first (first body-exprs-raw))]
                     (and (symbol? head) (qualified-symbol? head)
@@ -992,7 +996,7 @@
                                 :mode mode})))
              ;; Rewrite D/partial-d/fn-algebra calls recursively in init
              {:keys [form bindings] :as d-result}
-             (when-not vg-partial (rewrite-D-calls-in-form init))
+             (when (and (not ad-only?) (not vg-partial)) (rewrite-D-calls-in-form init))
              d-rewritten? (and d-result (seq bindings))
              init (if d-rewritten? form init)
              ;; Check for direct ((value+grad f) args...) pattern
@@ -1009,7 +1013,7 @@
                  (reset! any-inlined? true))
              (if vg-info
            ;; value+grad call → inline AD transform
-               (if-let [vg-result (inline-value+grad-call vg-info :param-env *param-env*)]
+               (if-let [vg-result (inline-value+grad-call vg-info :param-env @type-env)]
                  (do
                    (doseq [[bsym bexpr] (:bindings vg-result)]
                      (swap! result-pairs conj [bsym bexpr]))
@@ -1028,7 +1032,7 @@
        ;; Only inline if the ftm is ^:inline OR used exactly once
        ;; (prevents code blowup from multi-use beta reduction).
                (let [beta-result
-                     (when (and (seq? init) (symbol? (first init))
+                     (when (and (not ad-only?) (seq? init) (symbol? (first init))
                                 (contains? @ftm-bindings (first init)))
                        (let [ftm-sym (first init)
                              {:keys [params body inline?]} (get @ftm-bindings ftm-sym)
@@ -1060,7 +1064,8 @@
                              arg-tags (when (and head (not has-ad-rule?) (seq? init))
                                         (let [tags (mapv #(inf/infer-arg-tag % @type-env) (call-args init))]
                                           (when (every? some? tags) tags)))
-                             deftm-info (when (and head (not has-ad-rule?)) (try-resolve-deftm head arg-tags))]
+                             deftm-info (when (and (not ad-only?) head (not has-ad-rule?))
+                                          (try-resolve-deftm head arg-tags))]
                          (if (and deftm-info (safe-to-inline? deftm-info))
                            (let [{:keys [params walked-body tags]} deftm-info
                                  args (call-args init)
@@ -1130,7 +1135,7 @@
                            (do (swap! result-pairs conj [sym init])
                ;; Track ftm-valued bindings for beta reduction.
                ;; ^:inline on the sym or the ftm form enables multi-use inlining.
-                               (when-let [ftm-info (parse-ftm-form init)]
+                               (when-let [ftm-info (when-not ad-only? (parse-ftm-form init))]
                                  (swap! ftm-bindings assoc sym
                                         (assoc ftm-info :inline?
                                                (or (:inline (meta sym))
@@ -1145,6 +1150,9 @@
      ;; Resolve (nth <vg-sym> N) in body expressions for >20 param cases
      (let [resolve-vg-nth (fn resolve-vg-nth [expr]
                             (cond
+                              (and ad-only? (seq? expr)
+                                   (or (= 'quote (first expr))
+                                       (form/scope-info expr))) expr
                               (and (seq? expr) (= 'clojure.core/nth (first expr)) (= 3 (count expr)))
                               (or (known-vg-element @vg-elements (second expr) (nth expr 2)) expr)
                               (seq? expr) (let [r (apply list (map resolve-vg-nth expr))]
@@ -1158,7 +1166,8 @@
            ;; Rewrite D-as-value and D-call patterns in body expressions.
            extra-bindings (atom [])
            d-rewritten-body (mapv (fn [expr]
-                                    (let [{:keys [form bindings]} (rewrite-D-calls-in-form expr)]
+                                    (let [{:keys [form bindings]}
+                                          (if ad-only? {:form expr} (rewrite-D-calls-in-form expr))]
                                       (if (seq bindings)
                                         (do (swap! extra-bindings into bindings)
                                             (reset! any-inlined? true)
@@ -1174,6 +1183,20 @@
                          resolved-pairs)]
          {:form (list* 'let* (vec (mapcat identity all-pairs)) resolved-body)
           :inlined? @any-inlined?})))))
+
+(defn inline-ad-applications
+  "Normalize direct AD applications in a walked straight-line let, preserving other calls.
+
+   Reuses prepared AD bodies and tuple projection authority without ordinary deftm/ftm/D
+   expansion, retyping or nested application hoisting. Scope/branch-local applications and
+   calls nested among other operands keep runtime semantics. `param-env` retains dispatch
+   tags; no result types are guessed from consumers."
+  [expression param-env]
+  (if (and (seq? expression) (contains? '#{let let*} (first expression)))
+    (binding [*param-env* param-env]
+      (with-meta (:form (inline-one-pass expression subst-syms-safe false true))
+        (meta expression)))
+    expression))
 
 (defn inline-deftm-calls
   "Inline deftm function bodies at call sites in let* forms."

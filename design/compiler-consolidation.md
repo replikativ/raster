@@ -1690,3 +1690,21 @@ not pretend that the AD tuple's missing static slot type has been recovered: ret
 information remains an optimization/type-propagation follow-up, and GPU/native layouts still
 require their existing static admission proofs. No numerical policy or AD-specific registry is
 introduced, and the original actual-model training gate remains held.
+
+### Narrow lazy-JIT AD normalization — 2026-10-09
+
+Direct AD applications in a walked straight-line `let` now consume the same prepared typed
+reverse program and known tuple projections as AOT. This occurs after TC walking and before
+optional SIMD, without rewalking the retained conversions, expanding ordinary helper or ftm
+boundaries, or introducing a result-type registry. Earlier local types participate in overload
+selection. Argument evaluation uses the shared call-by-value lifting contract; projection
+rewriting respects the canonical lexical scope description and quoted data.
+
+The admitted lazy-JIT slice does not hoist nested applications across branches, scopes or
+other operands, expand loop bodies, or perform D-algebra rewriting. Those calls retain runtime
+behavior. Indirect applications may retain their explicit constructor binding because this
+step performs no dead-code elimination; it does not claim construction-free execution for
+that shape. General non-inlined aggregate result typing remains open. New scalar and Float-array
+fixtures use runtime-constructor and boxed-array-read tripwires, while mixed Float/Double
+checks retain raw-bit conversion oracles. This is not real-model gradient acceptance or a
+numerical-policy change, and the original training gate remains held.
