@@ -468,6 +468,13 @@
                    :double))
     (is (= selected (segscan-body/validate-against-node!
                      selected node graph {:scalar-math policy})))
+    (doseq [dialect [:opencl-portable :cuda :hip]
+            :let [emitted (sg/generate-kernel-graph graph :target-dialect dialect :scalar-math policy)
+                  bodies (map #(get-in % [:operation :provenance :scheduled-operation]) (:nodes emitted))]]
+      (is (= (count (:nodes graph)) (count bodies)))
+      (is (every? #(= policy (get-in % [:numerics :scalar-math])) bodies))
+      (is (some #(contains? (kernel-body/required-scalar-dtypes (get-in % [:body :operations]))
+                           :double) bodies)))
     (doseq [options [{} {:scalar-math {:overrides {}}}]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (segscan-body/validate-against-node! selected node graph options))))
@@ -899,6 +906,19 @@
                    :double))
     (is (= selected (segred-body/validate-against-node!
                     selected node graph nil nil {:scalar-math policy})))
+    (let [emitted (sg/generate-kernel-graph graph :scheduled-bodies {:reduction selected}
+                                           :scalar-math policy :target-dialect :opencl-portable)]
+      (is (= policy (get-in emitted [:nodes 0 :operation :provenance :scheduled-operation :numerics :scalar-math]))))
+    (doseq [candidate [graph (assoc-in graph [:attributes :scalar-math] policy)]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sg/generate-kernel-graph candidate :scheduled-bodies {:reduction selected}
+                                             :target-dialect :opencl-portable))))
+    (doseq [dialect [:opencl-portable :cuda :hip]
+            :let [emitted (sg/generate-kernel-graph graph :target-dialect dialect :scalar-math policy)
+                  body (get-in emitted [:nodes 0 :operation :provenance :scheduled-operation])]]
+      (is (= policy (get-in body [:numerics :scalar-math])))
+      (is (= :float (get-in body [:numerics :accumulator-dtype])))
+      (is (contains? (kernel-body/required-scalar-dtypes (get-in body [:body :operations])) :double)))
     (is (thrown? clojure.lang.ExceptionInfo
                  (segred-body/validate-against-node! selected node graph)))
     (is (thrown? clojure.lang.ExceptionInfo

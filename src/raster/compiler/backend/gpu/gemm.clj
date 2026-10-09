@@ -206,7 +206,7 @@
      kernel-name scheduled target-dialect {:parameter-names parameter-names})))
 
 (defn- gemm-artifact
-  [stage kernel-name phase target-dialect scalar-types]
+  [stage kernel-name phase target-dialect scalar-types caller-options]
   (let [spec (mixed-body/matrix-stage-spec stage phase scalar-types)
         parameter-names (cond
                           (:batching stage) {(get-in stage [:batching :extent]) "batch"}
@@ -214,8 +214,9 @@
                           {:k-chunk "KC" :splits "splits"}
                           :else nil)]
     (emit-scheduled-matrix-artifact
-     (assoc spec :kernel-name kernel-name :target-dialect target-dialect
-                 :parameter-names parameter-names))))
+     (merge (assoc spec :kernel-name kernel-name :target-dialect target-dialect
+                        :parameter-names parameter-names)
+            (select-keys caller-options [:scalar-math])))))
 
 (defn emit-split-k-combine-kernel
   "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
@@ -248,7 +249,7 @@
 
 
 (defn- emit-stage-artifact
-  [target-dialect prefix scalar-types {:keys [operation] :as node}]
+  [target-dialect prefix scalar-types {:keys [operation] :as node} caller-options]
   (let [phase (last (:id node))]
     (cond
       (layout-stage/layout-stage? operation)
@@ -260,7 +261,7 @@
 
       (matrix-stage/matrix-stage? operation)
       (gemm-artifact operation (str prefix "_" (name phase))
-                     :matrix-contract target-dialect scalar-types)
+                     :matrix-contract target-dialect scalar-types caller-options)
 
       (segop/seg-red? operation)
       (let [{:keys [partials output mn splits]} (mixed-body/split-combine-values operation)]
@@ -279,7 +280,7 @@
    and entry-point naming remain emission inputs. When supplied, `refinement` must retain this
    exact graph rather than a boundary-compatible reconstruction."
   [stage-graph {:keys [target-dialect prefix refinement]
-                :or {target-dialect :opencl-intel prefix "scheduled_gemm"}}]
+                :or {target-dialect :opencl-intel prefix "scheduled_gemm"} :as opts}]
   (let [stage-graph (kgraph/validate! stage-graph)
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars stage-graph))
         _ (when (and refinement
@@ -290,7 +291,8 @@
         (kgraph/map-operations
          stage-graph
          (fn [node]
-           (let [artifact (emit-stage-artifact target-dialect prefix scalar-types node)
+           (let [artifact (emit-stage-artifact target-dialect prefix scalar-types node
+                                               (select-keys opts [:scalar-math]))
                  scheduled (kart/attribute artifact :scheduled-kernel-body)]
              (scheduled-body/validate-against-node! scheduled node stage-graph)
              (scheduled-body/validate-artifact-projection! scheduled artifact)
