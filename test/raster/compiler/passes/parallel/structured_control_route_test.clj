@@ -1674,8 +1674,28 @@
       (is (= 4 (count (filter #(= :run (first %)) @events))))
       (is (= 4 (count (filter #(= :release (first %)) @events)))))))
 
+(deftest compiler-preparation-plan-is-the-runtime-binding-authority
+  (doseq [trip-count [0 1 2 3 4 1000000000]]
+    (let [call (:call (prepared-mixed-call trip-count))
+          plan (program-call/preparation-plan call :execution)
+          entries (:entries plan)
+          bound (atom [])]
+      (is (= entries (program-runtime/staging-plan call :execution)))
+      (is (<= (count entries) 4))
+      (with-open [prepared (program-runtime/prepare-with!
+                            call {:bind! (fn [_ graph buffers scalars]
+                                           (swap! bound conj [graph buffers scalars]) :handle)
+                                  :run! (fn [_] (throw (AssertionError. "planning must not launch")))
+                                  :release! (fn [_])})]
+        (is (= (mapv (juxt :graph :buffers :scalar-values) entries) @bound))
+        (is (= (count entries) (count (:handles prepared)))))))
+  (is (thrown? clojure.lang.ExceptionInfo (program-call/preparation-plan {} :execution))))
+
 (deftest stage-once-declines-a-changing-induction-scalar
   (let [call (:call (prepared-mixed-call 3 (mixed-source)))]
+    (is (= :parallel-program-dynamic-loop-binding
+           (reason-of #(program-runtime/prepare-with! call {})))
+        "compiler staging declines precede executor admission; neither acquires handles")
     (try
       (program-runtime/staging-plan call :execution)
       (is false "an iteration-varying ABI value cannot be frozen into a prepared graph")

@@ -3972,3 +3972,31 @@ Existing native inclusive-scan tests pass on OpenCL and Level Zero (2 tests /
 14 assertions), comparing planned allocation identities/byte sizes/totals with
 actual private buffers as well as numerical output. These are warm-REPL checks;
 fresh CI and independent exact-head review remain separate gates.
+
+### One compiler-owned stage-once binding plan
+
+The bounded graph/carry-variant calculation now lives in
+`emitted-parallel-program-call/preparation-plan`; the runtime delegates to it.
+This is the existing staging algorithm, not a new loop interpretation: zero-trip
+loops bind no body variant, preserved initial carries plus parity rotation need
+at most three body variants, and changing induction scalars still explicitly
+decline stage-once preparation. Program-wide shape scalars and local physical
+scalar overrides retain their existing merge order. Pure planning exposes the
+same graph/scalar/buffer tuples that runtime binding consumes.
+
+Runtime preparation validates the call once through this entry before acquiring
+resources. Stage-once declines now precede invalid resolver/executor diagnostics;
+accepted program arithmetic and surface semantics are unchanged. Existing
+cleanup ownership and reverse rollback remain runtime responsibilities.
+
+This supplies a shared input to upcoming memory accounting: local prepared
+variants coexist, whereas the current synchronous distributed runner releases
+each local LinkPlan after its compute action. A physical scratch peak must not
+sum all distributed actions or count only a default dispatch alternative.
+No distributed scratch-capacity admission is enabled by this extraction.
+
+Focused cleanup and staging checks pass 35 tests / 233 assertions, including
+compiler-plan versus runtime-bind comparisons and unchanged rollback behavior.
+Actual co-located AD/all-reduce/SGD checks pass on OpenCL and Level Zero (2 tests /
+154 assertions). Warm-REPL checks do not replace fresh CI or the original
+real-model training numerical acceptance, which remains open.
