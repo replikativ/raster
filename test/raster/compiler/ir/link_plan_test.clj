@@ -290,6 +290,36 @@
       (is (empty? (:allocations again)))
       (is (empty? (:initializers again))))))
 
+(deftest borrowing-source-backed-private-storage-retains-a-caller-obligation
+  (let [source (float-array 16)
+        original (-> (valid-plan)
+                     (assoc-in [:nodes :hidden :source] source)
+                     (update :instances #(vec (reverse %))))
+        {:keys [plan allocations initializers initialization]} (link/borrow-owned-storage original)]
+    (is (= :internal (get-in original [:nodes :hidden :role])))
+    (is (= :state (get-in plan [:nodes :hidden :role])))
+    (is (nil? (get-in plan [:nodes :hidden :source])))
+    (is (identical? source (get-in initializers [:hidden :source])))
+    (is (contains? (:initializers initialization) :hidden))
+    (is (contains? (:requires (link/initialization-contract plan)) :hidden)
+        "reading the imported temporary first requires caller-initialized contents")
+    (let [required (get-in plan [:nodes :hidden :view])
+          owner-view (assoc required :allocation (get allocations (get-in required [:allocation :id])))]
+      (is (bview/contains-contiguous-view? (get-in initializers [:hidden :view]) owner-view)
+          "the owner's retained initializer covers the borrower's physical requirement"))
+    (is (= (:instances original) (:instances plan)))
+    (is (= (:outputs original) (:outputs plan)))
+    (let [written-first (:plan (link/borrow-owned-storage
+                               (update original :instances #(vec (reverse %)))))]
+      (is (not (contains? (:requires (link/initialization-contract written-first)) :hidden))
+          "a local overwrite before the first read needs no caller contents"))
+    (is (= :link-read-before-write
+           (:reason (ex-data (try
+                               (link/borrow-owned-storage
+                                (assoc-in original [:nodes :hidden :source] nil))
+                               (catch clojure.lang.ExceptionInfo e e)))))
+        "borrowed ownership cannot initialize an internal node without a source")))
+
 (deftest initialization-contract-separates-caller-data-from-ordered-producers
   (let [initialized (valid-plan)
         caller (update initialized :nodes
