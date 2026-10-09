@@ -4038,3 +4038,11 @@ linked view extents. A regression rejects invented descriptor `(extent x)`
 values; the Half descriptor test sizes from its real `n` scalar, and the direct
 graph test independently exercises physical view extents. Generalizing this
 runtime boundary remains a separate task, not an inferred precision/shape fact.
+
+Hardware-free runtime admission regressions additionally exercise the public
+`instantiate!` entry with initialized inputs. Insufficient root or opt-in scratch
+budgets reject before session creation, allocation or upload; exact-fit budgets
+reach the deliberately stopped session boundary. Default roots-only behavior and
+malformed scratch options are checked independently. The admission and storage
+planner namespaces pass together (9 tests / 47 assertions). These boundary tests
+do not execute their synthetic kernel or establish total physical memory safety.
