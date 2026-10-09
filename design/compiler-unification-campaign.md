@@ -3673,4 +3673,5 @@ non-power-of-two element widths, overflow/range rejection, download failure,
 content hashes and provider cleanup. Reloading the protocol owner required
 reloading its test provider implementations in the warm REPL; the initial stale
 provider failures were not numerical failures. Actual local capture/restart
-device checks and independent exact-head review are pending.
+checks pass on OpenCL and Level Zero (2 tests / 34 assertions). Independent
+exact-head review and fresh CI remain pending.
