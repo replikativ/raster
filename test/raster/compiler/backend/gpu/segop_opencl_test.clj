@@ -788,6 +788,37 @@
         "the checked index algebra handles zero without forming n-1 or n+groups-1")
     (is (= :add (:op (get index-expressions 'group-end))))))
 
+(deftest reduction-math-consent-is-reconstructed-from-independent-options
+  (let [form (with-meta
+               '(raster.par/reduce acc 0.0 i 32 (+ acc (clojure.core/aget a i)))
+               {:raster.type/elem-type :float})
+        base (first (lower/lower-reduce (soac/par-form->soac 'result form 904 :dtype :float)
+                                        nil :dtype :float))
+        transform (kernel-body/->ScalarRegion
+                   '[completed] (with-meta '(raster.numeric/tanh completed)
+                                   {:raster.type/tag 'float}) [] :float)
+        operation (assoc-in base [:reduction :attributes :result-region] transform)
+        node (kgraph/->ScheduledKernel
+               :reduction operation [(kgraph/->ValueUse 'a :read)
+                                     (kgraph/->ValueUse 'result :write)] #{} [])
+        graph (kgraph/make {:inputs [(kgraph/buffer 'a :float 32 :global :input)]
+                           :outputs [(kgraph/buffer 'result :float 1 :global :output)]
+                           :scalars [] :nodes [node]})
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        options {:array-types {'a :float 'result :float} :scalar-math policy}
+        selected (segred-body/schedule operation nil options)]
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= :float (get-in selected [:numerics :accumulator-dtype])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in selected [:body :operations]))
+                   :double))
+    (is (= selected (segred-body/validate-against-node!
+                    selected node graph nil nil {:scalar-math policy})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (segred-body/validate-against-node! selected node graph)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (segred-body/validate-against-node!
+                  selected node graph nil nil {:scalar-math {:overrides {}}})))))
+
 (deftest completed-scalar-reduction-transform-is-terminal-and-numerically-explicit
   (let [form (with-meta
                '(raster.par/reduce acc 0.0 i 32 (+ acc (clojure.core/aget a i)))

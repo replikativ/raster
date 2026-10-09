@@ -220,6 +220,18 @@
    [:float :int] {'candidate :float 'better :predicate}
    {'old-value :float 'old-index :int}))
 
+(deftest reduction-element-retains-selected-math
+  (let [expression (with-meta '(raster.numeric/tanh (aget x i)) {:raster.type/tag 'float})
+        options {:dtype :float :index 'i :coordinate 'i :arrays #{'x}
+                 :array-types {'x :float} :scalars #{} :scalar-types {}}
+        ordinary (segred/lower-element-operations expression options)
+        selected (segred/lower-element-operations
+                  expression (assoc options :scalar-math
+                                    {:overrides {[:tanh :float] :f64-target-library-rte-f32}}))]
+    (is (= :float (get-in (last (:operations selected)) [:result :type])))
+    (is (= #{:float} (body/required-scalar-dtypes (:operations ordinary))))
+    (is (= #{:float :double} (body/required-scalar-dtypes (:operations selected))))))
+
 (deftest scalar-ssa-identities-do-not-capture-source-values
   (let [result (segred/lower-element-operations
                 (with-meta '(+ (aget x i) element-load-1) {:raster.type/tag 'float})

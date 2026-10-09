@@ -2086,6 +2086,17 @@ with 957 assertions after refreshing the stale stencil index-expression class
 dependency. Backend/public scheduling and independent outer reconstruction remain
 unwired; no public selection or full-model acceptance is claimed by this slice.
 
+Scalar workgroup-tree reductions now carry the same optional realization policy
+through both element computation and the terminal result transform, retaining
+the normalized consent alongside existing association/accumulator evidence.
+Independent node reconstruction takes that policy from explicit caller options,
+never from the candidate certificate. Existing verifier arities reconstruct the
+default and reject a selected candidate until their callers are wired. A graph
+regression checks matching, missing and mismatched independent consent; the
+element regression checks hidden Double demand with an unchanged Float result.
+Independent review approved the delta. The affected warm-REPL suites pass 105
+tests / 966 assertions; backend/public admission remains disabled.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec
