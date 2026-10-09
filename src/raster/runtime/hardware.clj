@@ -256,6 +256,8 @@
                                                    :shared-local-memory :global-memory-bytes
                                                    :memory-bandwidth-gb-s :core-clock-mhz
                                                    :device-id-hex :integrated?]))
+                        probed (merge probed
+                                      (select-keys (:module-capabilities dev-info) [:fp16? :fp64?]))
                         caps (merge (when catalogue-spec catalogue-spec) probed)
                         ;; PER-FIELD provenance. This used to stamp {:all :detected} over the
                         ;; whole map, which was false for every catalogued field (bandwidth,

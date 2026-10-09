@@ -2068,3 +2068,23 @@ all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec
 acceptance. A partially threaded public request would be silently ignored by
 some families and is not an acceptable intermediate public contract.
+
+The next prerequisite retains scalar execution support in the frozen hardware
+descriptor, separately from estimated throughput. Authoritative OpenCL extension
+facts, Level Zero module flags, and explicit user-declared cross-compiler dtype
+sets produce per-dtype `:supported`/`:unsupported` facts with provenance. Missing
+facts remain `:unknown`; catalogue rates never authorize FP64. Conflicting
+same-rank facts and malformed authoritative declarations fail loudly. The
+existing evidence signature and full descriptor fingerprint retain this facet.
+
+Level Zero device enumeration now reuses the selected-device module-property
+query. Optional enumeration failures retain that device with an unavailable
+diagnostic and unknown optional dtypes; selected-device execution evidence still
+fails loudly. Independent review caught the initial whole-enumeration failure
+scope before landing. Hardware-free per-device, failure, identity and existing
+descriptor controls pass 29 tests / 145 assertions. The actual local Arc query
+reports identical module flags for enumeration and selected-device evidence;
+the runtime-to-descriptor path retains Half/Double support with detected
+provenance. These are execution legality facts, not hardware-native throughput
+or cross-target numerical-accuracy claims. Public math policy admission remains
+disabled pending the complete scheduling/certificate vertical.
