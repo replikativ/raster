@@ -1632,3 +1632,39 @@ rejection against a real foreign sealed source program. Packaged build identitie
 providers remain explicitly synthetic. Final independent review and all seven exact-head CI
 gates are still required before merge. Device packing, scalable hierarchy validation,
 subcycling/reflux, external training acceptance and real fabric execution remain open.
+
+### Actual local AD to collective to SGD boundary — 2026-10-09
+
+`distributed-plan/refinement-plan` assembles the existing checked projection with caller-owned
+local producer/consumer LinkPlans and generated combine evidence. It derives no identity input
+or export kernels. Terminal refinement copies target consumer input storage directly; the root
+combine and its consumer share the same exact dense physical realization. Same-worker staging
+would remain ordinary local compute, not a fabricated self-link. Producer order follows the
+retained participant vector, and incoming declarations cannot shadow derived contribution SSA.
+
+The differentiated fixture uses ordinary public `value+grad` over a linear prediction and MSE
+loss, with parameters selected by `:wrt [0]`. Local mean gradients are multiplied by their local
+sample count before the declared FP32 sum tree; SGD divides the learning rate by the global
+sample count. Unequal batches `[1 3]` and `[1 2 4]` prevent equal-size averaging from standing in
+for this contract. Public equation-first lowerings are namespaced through existing certified
+LinkComposition before ordinary, unsealed LinkPlan endpoint rebinding and validation. There is
+no separate training IR, execution loop, cache or GPU session convention, and no host gradient
+computation or download/re-upload between the actual device producers and updates.
+This is compiler acceptance evidence using checked LinkPlan rebinding, not yet a released
+public distributed trainer interface.
+
+This is one complete synchronous update with initially identical parameter replicas. It does
+not prove multi-step state reuse: the distributed owner is deliberately one-shot. Repeated
+training needs explicit canonical parameter state and a checked unrolled/replay contract, not
+calling `run!` again with stale initialization evidence. Co-located logical workers do not
+demonstrate multi-host/fabric performance; timings in this fixture are analytical declarations.
+The held original real-model gradient gate, external transformer training acceptance and the
+rest of the eight-item campaign remain open.
+
+AD type-propagation debt found by the JVM reference: a local `nth` projection from the generated
+`value+grad` tuple, immediately consumed by `broadcast`, can emit an `Object[]` access for an
+actual `float[]` and throw `ClassCastException`. The explicitly Float fixture retains `^floats`
+on that binding. Its GPU lowering succeeded even without the tag; this is not evidence that the
+JVM boundary was sound. Follow up by retaining the selected gradient slot's primitive-array
+type through the ordinary typed tuple projection, with unannotated JVM/native/GPU regression
+coverage. Do not add an AD-specific array/function registry or silently remove the CPU oracle.
