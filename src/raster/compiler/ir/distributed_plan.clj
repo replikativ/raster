@@ -1266,11 +1266,15 @@
    Returns validated bindings, root specs and declared allocation budgets, potentially retaining
    source objects. This is not a compact portable report, readiness/initialization admission,
    measured available VRAM, live-range recycling, or permission to allocate resources.
-   KernelGraph scratch, backend temporaries, host staging and total driver memory are excluded."
+   Optional :include-graph-temporaries? adds conservative local prepared graph scratch bounds:
+   variants coexist within one action, while synchronous actions release before the next action.
+   Backend temporaries, host staging, alignment/driver overhead and available VRAM are excluded."
   ([plan] (resident-storage-plan plan {}))
-  ([plan {:keys [device-capacities] :or {device-capacities {}} :as options}]
-   (when-not (and (map? options) (set/subset? (set (keys options)) #{:device-capacities})
-                  (map? device-capacities))
+  ([plan {:keys [device-capacities include-graph-temporaries?]
+          :or {device-capacities {} include-graph-temporaries? false} :as options}]
+   (when-not (and (map? options)
+                  (set/subset? (set (keys options)) #{:device-capacities :include-graph-temporaries?})
+                  (map? device-capacities) (boolean? include-graph-temporaries?))
      (fail! "physical device capacities must be a map"
             :distributed-runtime-physical-budget {:options options}))
    (let [{:keys [bindings unbound]} (compute-bindings plan)
@@ -1297,20 +1301,30 @@
                                   :distributed-runtime-storage-contract
                                   {:allocation key :previous previous :actual spec})))
                        (assoc specs key spec))) specs (:nodes link-plan))) {} bindings)
+         temporary-plans (when include-graph-temporaries?
+                           (update-vals bindings #(link-plan/temporary-storage-plan (:link-plan %))))
+         temporary-peaks (reduce (fn [peaks {:keys [target resident-bytes]}]
+                                   (update peaks target (fnil max 0) resident-bytes))
+                                 {} (vals temporary-plans))
          budgets
          (into {} (for [[device entries] (group-by (comp first key) specs)]
                     (let [bytes (reduce +' 0 (map (comp :byte-size :allocation val) entries))
+                          scratch (get temporary-peaks device 0)
+                          peak (+' bytes scratch)
                           capacity (get device-capacities device
                                         (when-not (contains? remapped-targets device)
                                           (get-in plan [:topology :devices device :memory-capacity-bytes])))]
                       (when-not (and (integer? capacity) (<= 0 capacity Long/MAX_VALUE))
                         (fail! "remapped devices require an explicit aggregate physical budget"
                                :distributed-runtime-physical-budget {:device device :capacity capacity}))
-                      (when (> bytes capacity)
+                      (when (> peak capacity)
                         (fail! "resident allocation pool exceeds the declared device budget"
-                               :distributed-runtime-memory {:device device :bytes bytes :capacity capacity}))
-                      [device {:capacity-bytes capacity :resident-bytes bytes}])))]
-     {:bindings bindings :specs specs :allocation-budgets budgets})))
+                               :distributed-runtime-memory {:device device :bytes peak :capacity capacity}))
+                      [device (cond-> {:capacity-bytes capacity :resident-bytes bytes}
+                                include-graph-temporaries?
+                                (assoc :graph-temporary-bytes scratch :planned-peak-bytes peak))])))]
+     (cond-> {:bindings bindings :specs specs :allocation-budgets budgets}
+       include-graph-temporaries? (assoc :graph-temporary-plans temporary-plans)))))
 
 (defn transfer-bindings
   "Validate and project every transfer to exact physical source/target BufferViews.
@@ -1626,6 +1640,8 @@
    physical memory capacities or infer sharing between logical topology links.
    Optional :device-capacities invokes the shared resident-storage-plan projection for fully
    bound compute, exposing declared physical root budgets without changing logical peak estimates.
+   Optional :include-graph-temporaries? includes the current serial runtime's conservative prepared
+   graph scratch peak. This is not the memory model for a future prebound asynchronous runner.
 
    Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
    empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
@@ -1637,7 +1653,8 @@
   ([plan] (simulate plan {}))
   ([plan options]
   (when-not (and (map? options)
-                 (set/subset? (set (keys options)) #{:route-context :profiles :route-policy :device-capacities}))
+                 (set/subset? (set (keys options)) #{:route-context :profiles :route-policy :device-capacities
+                                                   :include-graph-temporaries?}))
     (fail! "unsupported distributed simulation options" :distributed-cost-options {:options options}))
   (when (and (some #(contains? options %) [:route-context :profiles :route-policy])
              (not (map? (:route-policy options))))
@@ -1661,8 +1678,8 @@
                            (contains? #{:cold :warm} (:cold-warm policy)))
               (fail! "empirical simulation requires an explicit context, profiles and valid policy"
                      :distributed-cost-options {:options options})))
-        pool (when (contains? options :device-capacities)
-               (resident-storage-plan plan {:device-capacities (:device-capacities options)}))
+        pool (when (some #(contains? options %) [:device-capacities :include-graph-temporaries?])
+               (resident-storage-plan plan (select-keys options [:device-capacities :include-graph-temporaries?])))
         costs (when (seq route-options)
                 (into {} (for [step (:steps plan) :when (= :transfer (:kind step))]
                            [(:id step) (empirical-route-cost plan step (:route-context options)
@@ -1744,7 +1761,9 @@
                    :transferred-bytes transferred-bytes}}
       costs (assoc :route-cost-evidence costs :route-context (:route-context options)
                    :route-policy policy :empirical-costs-certified? false)
-      pool (assoc :resident-storage {:model :owned-link-plan-roots-until-close
+      pool (assoc :resident-storage {:model (if (:include-graph-temporaries? options)
+                                             :owned-roots-plus-serial-graph-temporaries
+                                             :owned-link-plan-roots-until-close)
                                     :allocation-count (count (:specs pool))
                                     :allocation-budgets (:allocation-budgets pool)})))))
 

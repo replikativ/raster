@@ -549,7 +549,9 @@
       (get-in schedule [:segmented-weighted-reduction :strategy] :auto))))
 
 (defn- abi-step-facts
-  [nodes values instance step-index step]
+  ([nodes values instance step-index step]
+   (abi-step-facts nodes values instance step-index step false))
+  ([nodes values instance step-index step include-binding?]
   (let [{:keys [id descriptor bindings schedule]} instance
         args (instance-arguments instance)
         interface (kexec/validate! (step-interface step))
@@ -678,8 +680,9 @@
                             {:reason :link-node-range :instance id :step step-index
                              :phase (:phase step) :buffer (:id buffer) :node node-id
                              :expected expected :capacity capacity})))))
-      {:instance id :step step-index :phase (:phase step)
-       :facts (vec (mapcat :facts binding-facts))})))
+      (cond-> {:instance id :step step-index :phase (:phase step)
+               :facts (vec (mapcat :facts binding-facts))}
+        include-binding? (assoc :runtime-arguments runtime-arguments :interface interface))))))
 
 (defn- canonical-alias-pair [pair]
   (let [pair (set pair)]
@@ -1397,6 +1400,73 @@
 
 (defn- validate-plan-for-current-request! [plan]
   (if (nil? *caller-options*) (validate! plan) (validate! plan *caller-options*)))
+
+(defn- linked-graph-temporary-storage
+  [graph scalar-values buffer-nodes]
+  (let [extents (into {}
+                      (keep (fn [[id node]]
+                              (when-let [dimension (first (get-in node [:view :shape]))]
+                                [(list 'extent id) dimension])))
+                      buffer-nodes)]
+    (kgcall/temporary-storage-plan graph (merge extents scalar-values))))
+
+(defn temporary-storage-plan
+  "Independently project a LinkPlan's declared prepared graph scratch without driver contact.
+   All separately prepared graph/carry variants coexist until local release. Descriptor dispatch
+   uses the maximum over every declared alternative, including fallback; this conservative bound
+   does not claim to predict selection. Unresolvable/inapplicable alternative extents fail rather
+   than counting as zero. Direct graphs/programs use linked view extent facts; descriptor scratch
+   uses only its actual ABI scalar environment, matching the current descriptor binder.
+   Roots, backend temporaries, host staging, alignment/driver overhead and available memory are
+   excluded. Source and specialization objects must stay stable; this report is not authority
+   to allocate, skip runtime admission, or infer lifetime reuse."
+  [plan]
+  (let [{:keys [nodes values instances target]} (validate! plan)
+        graph-storage
+        (fn [instance-id graph buffers scalars]
+          (linked-graph-temporary-storage
+           graph scalars
+           (into {} (map (fn [[id value-id]]
+                           [id (program-value-node! nodes values instance-id id value-id)])) buffers)))
+        bindings
+        (vec
+         (mapcat
+          (fn [{:keys [id] :as instance}]
+            (cond
+              (link-instance? instance)
+              (mapv
+               (fn [[step-index step]]
+                 (let [{:keys [runtime-arguments interface]}
+                       (abi-step-facts nodes values instance step-index step true)
+                       alternatives (if-let [dispatch (:dispatch step)]
+                                      (:alternatives (kdispatch/validate! dispatch)) [interface])
+                       storage
+                       (mapv
+                        (fn [executable]
+                          (assoc
+                           (if (= :kernel-graph (kexec/kind executable))
+                             (let [{:keys [scalar-values]}
+                                   (kexec/graph-bindings executable runtime-arguments)]
+                               (kgcall/temporary-storage-plan executable scalar-values))
+                             {:model :graph-temporaries-until-unbind
+                              :allocations {} :resident-bytes 0})
+                           :strategy (kexec/strategy executable))) alternatives)]
+                   {:instance id :step step-index :mode :all-alternatives-upper-bound
+                    :alternatives storage :resident-bytes (reduce max 0 (map :resident-bytes storage))}))
+               (map-indexed vector (get-in instance [:descriptor :steps])))
+
+              (program-link-instance? instance)
+              (mapv (fn [{:keys [key graph buffers scalar-values]}]
+                      (assoc (graph-storage id graph buffers scalar-values)
+                             :instance id :binding key :mode :prepared-graph))
+                    (:entries (program-call/preparation-plan (:call instance) id)))
+
+              (graph-link-instance? instance)
+              [(assoc (graph-storage id (:graph instance) (:bindings instance) (:scalar-values instance))
+                      :instance id :binding id :mode :prepared-graph)])) instances))]
+    {:model :prepared-link-plan-graph-temporaries
+     :target target :bindings bindings
+     :resident-bytes (reduce +' 0 (map :resident-bytes bindings))}))
 
 (defn- initialization-contract-in-context
   "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.

@@ -141,11 +141,12 @@
    Co-located workers declare :target in each device-plan, use :transport :resident-copy, and
    supply an aggregate physical :device-capacities budget (bytes) for remapped targets. Local
    copies still execute; logical topology predictions are not physical runtime cost evidence.
-   Budgets cover declared owned LinkPlan roots, not graph scratch or total driver memory.
+   Budgets cover declared owned LinkPlan roots. Optional :include-graph-temporaries? includes
+   conservative graph scratch bounds for this serial runner, not total driver memory.
    Source objects must remain valid and stable through this synchronous initialization."
   ([plan] (instantiate! plan {}))
-  ([plan {:keys [transport max-staging-bytes device-capacities]
-          :or {max-staging-bytes 1048576 device-capacities {}}}]
+  ([plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
+          :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false}}]
    (let [ready (distributed/check-readiness plan)
          schedule (schedule plan)
          _ (when-not (contains? #{nil :host-staged :resident-copy} transport)
@@ -164,7 +165,8 @@
                  (throw (ex-info "resident-copy requires co-located physical endpoints"
                                  {:reason :distributed-runtime-resident-copy :step (:id action)})))))
          {:keys [bindings specs allocation-budgets]}
-         (distributed/resident-storage-plan plan {:device-capacities device-capacities})
+         (distributed/resident-storage-plan plan {:device-capacities device-capacities
+                                                 :include-graph-temporaries? include-graph-temporaries?})
          projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %)))
          _ (doseq [[index action] (map-indexed vector (:actions ready))
                    :when (contains? (set (:outputs plan)) (:id action))
