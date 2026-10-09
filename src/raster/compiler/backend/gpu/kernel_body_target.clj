@@ -9,6 +9,7 @@
             [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-target]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -49,6 +50,24 @@
   "A body selects matrix target spelling exactly when it contains a scheduled MatrixMad."
   [kernel-body]
   (boolean (some #(record-kind? "MatrixMad" %) (operations (body/validate! kernel-body)))))
+
+(defn validate-math-target!
+  "Admit caller-selected wider math only with affirmative frozen execution support.
+
+   Unused overrides do not require wider hardware. This gate checks the additional evaluation
+   precision introduced by a realization; it does not change admission of default source dtypes.
+   Cost estimates and emitted metadata are never capability evidence."
+  [scheduled caller-policy descriptor]
+  (doseq [{:keys [logical-dtype evaluation-dtype] :as requirement}
+          (scheduled-body/scalar-math-requirements scheduled caller-policy)
+          :when (not= logical-dtype evaluation-dtype)
+          :let [support (hardware/scalar-dtype-support descriptor evaluation-dtype)]]
+    (when-not (= :supported support)
+      (throw (ex-info "selected scalar math evaluation lacks affirmative target support"
+                      {:reason :kernel-body-target-math-capability
+                       :device (:device-id descriptor)
+                       :requirement requirement :support support}))))
+  scheduled)
 
 (defn- scalar-parameter-names
   [kernel-body overrides]
