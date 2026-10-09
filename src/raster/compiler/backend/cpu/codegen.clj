@@ -70,11 +70,12 @@
                            (.mkdirs d) (.getAbsolutePath d)))
 
 (def ^:private cflags
-  "clang flags. -ffast-math + -fveclib=libmvec let the LLVM vectorizer reassociate
-  reductions AND call glibc's vector transcendentals (e.g. _ZGVdN4v_exp) — the
-  equivalent of the JVM Vector API's lanewise EXP. Without these, exp/log loops stay
-  scalar (libm) and lose to the JVM. Inference-grade precision (matches llama.cpp)."
-  ["-O3" "-march=native" "-funroll-loops" "-ffast-math" "-fveclib=libmvec"
+  "Preserve source floating-point operations, including NaNs and signed zero.
+  Reassociation and contraction require explicit numerical permission in the
+  lowering; they are not a property of selecting the native backend. Explicit
+  SIMD/FMA intrinsics selected by a legal schedule remain available. These flags
+  participate in compiler-identity, invalidating older fast-math artifacts."
+  ["-O3" "-march=native" "-funroll-loops" "-ffp-contract=off" "-fveclib=libmvec"
    "-shared" "-fPIC"])
 
 (def ^:private link-libs ["-lmvec" "-lm"])

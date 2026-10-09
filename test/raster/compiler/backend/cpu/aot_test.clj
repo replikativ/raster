@@ -139,15 +139,11 @@
             "the composition is a single fused C function, not two")
         (is (clojure.string/includes? src "double eps")
             "the Double scalar param is declared double, not int")
-        ;; The fused normalization reduction is compiled with -ffast-math. Retaining the
-        ;; source Long induction type may change clang's reassociation relative to the JVM,
-        ;; while preserving the same numerical algorithm. Keep this as a tight ULP oracle;
-        ;; exact equality here was compiler/architecture dependent.
+        ;; Keep the existing cross-backend ULP oracle. Native compilation no longer
+        ;; grants blanket fast-math permission; this tolerance is not such permission.
         (is (every? true? (map #(within-double-ulps? 4 %1 %2) rs cs))
             "per-block scales within four double ULPs")
-        ;; q is within 1 ULP of the reference: -ffast-math reassociation in the
-        ;; reduction can shift a value across a rounding boundary (inference-grade,
-        ;; same as llama.cpp), so allow an off-by-one, never more.
+        ;; Retain the existing quantization boundary oracle without loosening it.
         (is (every? #(<= (Math/abs (- (int (first %)) (int (second %)))) 1)
                     (map vector rq cq))
             "int8 output within 1 ULP of the lazy-JIT reference")))))

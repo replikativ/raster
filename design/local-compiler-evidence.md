@@ -1686,3 +1686,22 @@ This is a width check, not a new checked-overflow or general integer certificate
 Restoring Long quant-fold vectorization requires a width-preserving i64 schedule
 and conversions, or proven range refinement from the general compiler—not an
 assumption that quantization-specific values fit i32.
+
+### Native compilation must not silently authorize fast math
+
+The default native C compiler flags previously enabled `-ffast-math` for every
+source program. That independently permits eliminating NaN checks, ignoring
+signed zero, reassociating arithmetic and contracting multiply/add, without a
+numerical permission from the source or schedule. Default native compilation
+now omits that flag and disables implicit contraction. Explicit intrinsics remain
+explicit; this does not certify the legality of every existing SIMD schedule.
+Compiler flags already participate in native artifact identity, so older
+fast-math artifacts are not reused.
+
+A compiled-and-loaded runtime-input regression checks NaN classification,
+negative zero and a Float multiply/add that differs from FMA. This is a semantic
+default change, not a performance result: implicit autovectorization may change,
+especially for transcendental loops. Legal relaxed schedules should recover
+performance through explicit numerical contracts rather than global flags.
+JVM-compatible scalar and SIMD min/max handling remains a separate open defect;
+preserving the environment alone does not change C `fmin`/`fmax` semantics.
