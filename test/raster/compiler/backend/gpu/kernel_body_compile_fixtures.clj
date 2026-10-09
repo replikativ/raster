@@ -959,6 +959,15 @@
                             (body-emit/emit-scalar-kernel
                              "half_extremum" (make-body operator)
                              {:target-dialect dialect})))
+           (for [type [:float :double]
+                 operator [:min :max]]
+             (write-source! directory suffix
+                            (str "subgroup-extremum-" (name type) "-" (name operator))
+                            (body-emit/emit-scalar-kernel
+                             "subgroup_extremum"
+                             (body-fixtures/floating-extrema-collective-body
+                              type operator (:subgroup-size descriptor))
+                             {:target-dialect dialect})))
            (map (fn [dt]
                   (write-artifact! directory suffix (str "storage-probe-" (name dt))
                                    (storage-probe/emit-artifact dt dialect)))
