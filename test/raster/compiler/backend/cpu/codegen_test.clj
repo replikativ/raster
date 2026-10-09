@@ -49,21 +49,24 @@
         body (str "#if defined(__FLT16_MANT_DIG__)\n"
                   "void abs_half(float *x, float *out, int n) {"
                   "for (int i=0;i<n;i++) out[i]=(float)" name "((_Float16)x[i]);"
-                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);}\n"
+                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);out[n+1]=1;}\n"
                   "#else\nvoid abs_half(float *x, float *out, int n) {"
-                  "for (int i=0;i<n;i++) out[i]=" name "(x[i]);out[n]=0;}\n#endif\n")
+                  "for (int i=0;i<n;i++) out[i]=" name "(x[i]);out[n]=0;out[n+1]=0;}\n#endif\n")
         source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
         native (cpu/load-kernel (cpu/compile-source! source) "abs_half" 2 [:int])
         values [-0.0 -1.0 1.0 -65504.0 Float/NEGATIVE_INFINITY
                 Float/POSITIVE_INFINITY Float/NaN (- (Math/scalb (double 1.0) (int -24)))]
-        x (float-array values) out (float-array (inc (count values)))]
+        x (float-array values) out (float-array (+ 2 (count values)))]
     (native x out (int (count values)))
     (doseq [i (range (count values))]
       (let [expected (Math/abs (aget x i)) actual (aget out i)]
         (is (if (Float/isNaN expected) (Float/isNaN actual)
                 (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))))))
-    (let [half-supported? (= 1.0 (double (aget out (count values))))]
-      (is (contains? #{0.0 1.0} (double (aget out (count values)))))
+    (let [capability (double (aget out (inc (count values))))
+          half-supported? (= 1.0 capability)]
+      (is (contains? #{0.0 1.0} capability))
+      (is (= capability (double (aget out (count values))))
+          "supported targets must retain the half result type")
       (println "[NATIVE ABS] half boundary supported:" half-supported?
                "(without half support, the ordinary Float fallback is exercised)"))))
 
