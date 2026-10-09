@@ -189,9 +189,9 @@
         (with-redefs [equation-dispatch/validate-with-boundary
                       (fn [operation] (swap! calls inc) (original operation))
                       emitted-equation/validate-with-result-contracts
-                      (fn [candidate]
+                      (fn [candidate & [caller-options]]
                         (swap! candidate-checks inc)
-                        (original-candidate candidate))]
+                        (original-candidate candidate (or caller-options {})))]
           (let [evidence (emitted-program/validate-with-physical-results! program)
                 boundaries (#'invocation-link/equation-boundaries program (:projections evidence))
                 retained (program-call/make program (:buffers call) (:scalar-values call) {}
