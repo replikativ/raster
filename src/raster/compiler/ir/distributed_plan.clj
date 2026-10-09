@@ -1251,6 +1251,62 @@
    (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
                       device-plans copy-bindings refinements (vec steps) (vec outputs) attributes)))
 
+(defn refinement-plan
+  "Assemble one collective refinement with actual shard-local producer/consumer LinkPlans.
+
+   `device-plans`, `storage` and `combines` retain the actual local bindings and emitted
+   arithmetic evidence. No input/export kernels, buffers or runtime resources are invented.
+   `steps` contains only additional consumer compute steps; producers and collective steps are derived
+   from the retained projection request. `values`/`shards` declare additional local boundaries.
+   Conflicting declarations are rejected rather than overwritten. The ordinary plan validator
+   independently checks projection, public producer outputs, arithmetic and immutable SSA.
+
+   This is assembly convenience, not a new IR or a training-specific scheduling policy."
+  [{:keys [id mesh topology refinement input-producers combine-costs
+           values shards device-plans storage combines steps outputs attributes]
+    :or {values {} shards {} steps [] attributes {}} :as request}]
+  (let [allowed #{:id :mesh :topology :refinement :input-producers :combine-costs
+                  :values :shards :device-plans :storage :combines :steps :outputs :attributes}
+        required #{:id :mesh :topology :refinement :input-producers :combine-costs
+                   :device-plans :storage :combines :outputs}]
+    (when-not (and (map? request) (set/subset? (set (keys request)) allowed)
+                   (set/subset? required (set (keys request))))
+      (fail! "collective assembly requires a closed projection/binding request"
+             :distributed-refinement-assembly
+             {:unexpected (set/difference (set (keys request)) allowed)
+              :missing (set/difference required (set (keys request)))})))
+  (let [projected (project-refinement refinement topology input-producers combine-costs)
+        input-by-worker (set/map-invert (:inputs refinement))
+        merge-declarations
+        (fn [field declared retained]
+          (when-not (map? declared)
+            (fail! "collective assembly declarations must be maps"
+                   :distributed-refinement-assembly {:field field}))
+          (doseq [value (set/intersection (set (keys declared)) (set (keys retained)))]
+            (when-not (= (get declared value) (get retained value))
+              (fail! "collective assembly cannot replace projected SSA declarations"
+                     :distributed-refinement-projection {:field field :value value})))
+          (merge declared retained))
+        region {:offsets (vec (repeat (count (get-in refinement [:value :shape])) 0))
+                :shape (get-in refinement [:value :shape])}
+        operation-id (get-in refinement [:operation :id])]
+    (plan
+     {:id id :mesh mesh :topology topology
+      :values (merge-declarations :values values (:values projected))
+      :shards (merge-declarations :shards shards (:shards projected))
+      :collective-groups {(get-in refinement [:group :id]) (:group refinement)}
+      :device-plans device-plans
+      :copy-bindings
+      (into {} (for [{:keys [id kind input]} (:nodes refinement) :when (= :copy kind)]
+                 [id {:source (assoc (get storage input) :region region)
+                      :target (assoc (get storage id) :region region)}]))
+      :refinements {operation-id {:refinement refinement :input-producers input-producers
+                                 :combine-costs combine-costs :storage storage :combines combines}}
+      :steps (into (into (mapv (fn [worker] (get input-producers (get input-by-worker worker)))
+                              (get-in refinement [:group :devices]))
+                         (:steps projected)) steps)
+      :outputs outputs :attributes attributes})))
+
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
 
