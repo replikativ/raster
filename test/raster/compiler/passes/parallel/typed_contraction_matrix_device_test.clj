@@ -38,6 +38,44 @@
                      (Math/fma (aget left li) (aget right ri) (float acc))
                      (float (+ (double acc) (double term))))))))))))
 
+(deftest public-widened-register-arithmetic-retains-cancellation-and-ieee-overflow
+  (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
+                                    [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
+    (if-not @available?
+      (skip! (str "explicit widened projection on " device))
+      (if-not (= :supported (get-in (hardware/descriptor-for device)
+                                   [:execution :scalar-dtype-support :double]))
+        (skip! (str "explicit widened projection requires declared Double support on " device))
+        (doseq [layout [:nn :nt :tn] policy [:decomposed :fused]]
+          (let [m 2 n 3 k 3
+                activation (fn [middle]
+                             (float-array (if (= layout :tn)
+                                            [1.0e8 1.0e8 middle middle -1.0e8 -1.0e8]
+                                            [1.0e8 middle -1.0e8 1.0e8 middle -1.0e8])))
+                a (activation 1.0)
+                b (float-array (repeat (* k n) 1.0))
+                source (case layout :nn #'contractions/projected-nn
+                                    :nt #'contractions/projected-nt
+                                    :tn #'contractions/projected-tn)
+                prepared (compiled/lower source [a b m k n]
+                           {:compiler :equation-first :target device :dtype :float
+                            :schedule {:precision :f32-storage-f64-arithmetic-rte-f32
+                                       :typed-contraction {:strategy :register-tiled
+                                                           :multiply-add policy}}})
+                live (compiled/instantiate! prepared)
+                bits #(mapv (fn [v] (Float/floatToRawIntBits (float v))) %)]
+            (try
+              (doseq [middle [1.0 2.0]]
+                (let [actual (value/->host (:result (live {:a (activation middle)})))]
+                  (is (= (bits (repeat (* m n) middle)) (bits actual))
+                      (str device " " layout " " policy " preserves cancellation"))))
+              (let [actual (value/->host
+                            (:result (live {:a (float-array (repeat (* m k) Float/MAX_VALUE))
+                                            :b (float-array (repeat (* k n) Float/MAX_VALUE))})))]
+                (is (= (bits (repeat (* m n) Float/POSITIVE_INFINITY)) (bits actual))
+                    "finite Double products narrow with IEEE Float overflow"))
+              (finally (compiled/close! live)))))))))
+
 (deftest public-register-product-realizations-match-local-rounding-oracles
   (doseq [[device available? skip!] [[:ze:0 gpu-probe/gpu-available? gpu-probe/gpu-skip!]
                                     [:ocl:0 opencl/opencl-available? opencl/opencl-skip!]]]
