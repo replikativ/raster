@@ -50,16 +50,18 @@
     (distributed/close! executable)
     (is (= :closed @(:state executable)))))
 
-(deftest concurrent-close-runs-after-the-callback-exits
+(deftest provider-worker-close-is-refused-without-monitor-deadlock
   (let [executable (owner :complete)
-        attempting (promise)
-        closer (atom nil)]
+        worker (atom nil)]
     (distributed/with-output-values!
      executable
      (fn [_]
-       (reset! closer (future (deliver attempting true) (distributed/close! executable)))
-       (is (= true (deref attempting 5000 :timeout)))
+       (reset! worker (future (reason #(distributed/close! executable))))
+       (is (= :distributed-runtime-output-scope-active
+              (deref @worker 5000 :timeout)))
        (is (= :reading-outputs @(:state executable)))
-       (is (not (realized? @closer)))))
-    (is (nil? (deref @closer 5000 :timeout)))
+       (is (= :distributed-runtime-state
+              (deref (future (reason #(distributed/run! executable))) 5000 :timeout)))))
+    (is (= :complete @(:state executable)))
+    (distributed/close! executable)
     (is (= :closed @(:state executable)))))

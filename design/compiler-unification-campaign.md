@@ -3634,8 +3634,10 @@ yet a durable checkpoint publication boundary.
 
 The next prerequisite is `distributed/with-output-values!`: a synchronous read
 scope on the existing enclosing owner. Successful completion is required;
-concurrent close waits, callback close is refused, and callback failure releases
-the scope. Asynchronous transfers must finish inside the callback and only
+close from any thread is refused, and callback failure releases the scope.
+User code runs without the owner monitor held, avoiding deadlock when a provider
+worker attempts close while the capture callback awaits that worker.
+Asynchronous transfers must finish inside the callback and only
 copied data may escape. Direct session mutation is outside this contract. This
 does not manufacture a sealed compiler receipt or verify stored content.
 

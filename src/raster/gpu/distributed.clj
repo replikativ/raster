@@ -220,18 +220,22 @@
 
 (defn with-output-values!
   "Call `read!` synchronously with completed outputs while retaining the owner's lifetime.
-   Close on another thread waits for this scope; close from the callback is refused. The
+   Close from any thread is refused while this scope is active. No owner monitor is held
+   across user code, so a provider worker can observe that refusal without deadlocking. The
    callback must finish all reads (including asynchronous transfer waits) before returning.
    Resident views must not escape or be mutated, and direct session mutation/close is outside
    this contract. Return copied data, not borrowed views. This is a lifetime boundary, not a
    sealed compiler completion receipt, content verification or durable publication."
   [executable read!]
-  (locking (:state executable)
-    (let [values (output-values executable)]
-      (reset! (:state executable) :reading-outputs)
-      (try
-        (read! values)
-        (finally (reset! (:state executable) :complete))))))
+  (let [values (locking (:state executable)
+                 (let [values (output-values executable)]
+                   (reset! (:state executable) :reading-outputs)
+                   values))]
+    (try
+      (read! values)
+      (finally
+        (locking (:state executable)
+          (reset! (:state executable) :complete))))))
 
 (defn close! [executable]
   (locking (:state executable)
