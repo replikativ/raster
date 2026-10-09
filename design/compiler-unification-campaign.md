@@ -28,13 +28,20 @@ widening tests remain; mixed-precision load/compute/store vector schedules are s
 needed to recover the fold optimization without narrowing arithmetic.
 
 The fresh unchanged real-weight two-layer training gate after #1100 passes loss and
-input-gradient checks but still fails 12 of 28 adapter-gradient checks. Real-model
+input-gradient checks but still fails 12 of 28 adapter-gradient checks.
 After the subsequent retained-precision fixes, a cold unchanged run fails eleven
 of 28 adapter checks; a public strict-FP32 matrix-policy diagnostic produces the
 identical metrics. This rules out that policy switch as a remedy for this case.
 Acceptance therefore remains open; neither these narrow regressions nor synthetic
 training acceptance closes campaign item 5. Continue precision-boundary consolidation
 and identical-input matrix/VJP localization without loosening the pinned oracle.
+The October 9 diagnostic below preserves that gate: an independent CPU model
+using the default GPU's decomposed Float dot order reproduces the same eleven
+failing adapter keys and the GPU loss exactly, but four adapter comparisons
+still exceed the original coordinate threshold against that counterfactual.
+Whole-tensor relative L2 errors against the unchanged native reference are much
+smaller (at most 2.45e-5); this is evidence of sensitivity, not acceptance or
+permission to relax the original oracle. See `local-compiler-evidence.md`.
 CUDA/HIP runtime performance and multi-host execution likewise remain separate from
 hardware-free vendor compilation and local logical-worker acceptance.
 

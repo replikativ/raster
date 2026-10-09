@@ -1784,3 +1784,46 @@ changed resident inputs covering NaNs at both ends, all-NaN lanes, zero ties,
 ordinary values and infinities. This does not certify CUDA/HIP execution or
 performance, workgroup extrema, NaN payload identity, or unrelated reductions.
 The OpenCL predicate overhead is a correctness cost, not a measured speedup.
+
+### Real-weight training conditioning localization (2026-10-09)
+
+The unchanged two-layer Gemma training gate remains declined: eleven of 28
+adapter tensors exceed its coordinate-relative threshold. Loss error is
+0.004687500000727596, input-gradient error 0.0019965899080526235, and the
+largest adapter coordinate-relative error is 0.6251970207953054. The harness
+pin remains 4520615d7a970a9bf9e438c1830553224a06de2d, finetune pin
+9e9ba5d62f3822f056e01c37231d7eaa7c84947c, and pretrained reader pin
+f4c2bb476884c36b5e12a8fa934eb2ddf4ca2ead. Checkpoint SHA-256 remains
+700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab.
+No model math, reference provider, threshold or source policy was changed.
+
+Capturing the already evaluated gradient pairs gives relative L2 error at most
+2.4444621704846155e-5 per adapter tensor; the largest maximum-absolute-error
+normalized by reference maximum magnitude is 5.477350704221801e-5. Those
+summaries do not replace the original near-zero-sensitive coordinate check.
+
+A separate CPU-only counterfactual substitutes ordered Float multiply then add
+for the three matrix helpers, leaving model operations and AD otherwise
+unchanged. This matches the default GPU register body's declared decomposed
+arithmetic, not an FMA policy. Its loss is 17921.2765625, equal to the observed
+GPU loss, and its comparisons with the unchanged native reference fail the
+same eleven adapter keys. GPU comparisons with that counterfactual still fail
+four keys: layer-0 Bk (0.03741095119665075), Bg (0.1734874921955559), Au
+(0.042673148433426046), and Ad (0.021022411274254693). Matrix realization
+order therefore explains much of the pattern, but not the entire discrepancy.
+An ordered Float FMA counterfactual is a distinct experiment, not the default
+GPU policy or an acceptance oracle.
+
+At actual captured layer-1 native-model operands and cotangents, public generated
+OpenCL GELU forward is bit-identical for 4096 elements. GELU backward differs
+by at most 7.62939453125e-6 absolute and 0.0011374907921994236 coordinate-relative.
+The three attention pullbacks at their actual captured inputs differ by at most
+3.814697265625e-6 (dQ), 9.5367431640625e-6 (dK), and 2.9802322387695312e-8
+(dV) absolute. Capture wrappers preserve all fourteen native adapter gradients
+bit-for-bit. These are identical-input operation checks, not full-chain parity;
+small discrepancies can be amplified by cancellation in later operations.
+
+Next: localize the four residual counterfactual failures and audit reduction
+numerical permissions across CPU/JVM/GPU. A reassociation certificate alone
+must not silently authorize contraction of a separately rounded product into
+FMA. Keep the real-model acceptance gate held throughout this work.
