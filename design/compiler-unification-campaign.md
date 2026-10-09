@@ -3651,6 +3651,24 @@ Level Zero (2 tests / 48 assertions), including foreign facts, live output lease
 cached module reuse and output retirement. Independent exact-head review and
 fresh CI are still required.
 
+### Captured AMR restore consistency before mapped bytes
+
+The follow-up restore verifier composes the existing fixed numerical-state semantic
+boundary with independently revalidated source CertifiedCycleExecution evidence.
+Re-certifying a changed manifest cannot replace exact producer/temporal/completion
+identity, ordered source fields, synchronized next-step lineage, numerical policy or
+the complete plain FP64 storage encoding. Historical representation snapshots are
+not fresh-target evidence or authentication of serialized producer claims.
+
+The hardware-free verifier controls pass 2 tests / 11 assertions. The native
+continuation oracle is extended to check restore compatibility before opening bytes,
+materialize the bounded captured chunks as local files, independently verify their
+content through real read-only mmap leases, decode into fresh host startup inputs,
+then execute a separately instantiated next cycle. This is explicit fixture
+materialization, not a new production storage provider or a power-loss durability
+receipt. Production provider availability finalization and metadata publication
+remain application-owned, using the existing generic finalizer.
+
 ### Completion-backed bounded distributed AMR capture
 
 The next item-8 slice connects the existing CertifiedCycleExecution to an original
