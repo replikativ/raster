@@ -65,6 +65,30 @@
       "float: " name "_f32, double: " name "_f64, "
       "int: " name "_i32, long: " name "_long, long long: " name "_i64)((a),(b))\n")}))
 
+(defn- native-absolute
+  "C abs has undefined signed-minimum behavior, while JVM Math.abs returns the
+   minimum unchanged. Floating overloads must not narrow Double or widen Float."
+  []
+  {:fn "rstr_native_abs"
+   :source
+   (str "#include <limits.h>\n"
+        (apply str
+               (for [[suffix type minimum] [["i32" "int" "INT_MIN"]
+                                            ["long" "long" "LONG_MIN"]
+                                            ["i64" "long long" "LLONG_MIN"]]]
+                 (str "static inline " type " rstr_native_abs_" suffix "(" type " value) {\n"
+                      " return value == " minimum " ? value : (value < 0 ? -value : value);\n}\n")))
+        ;; Unary + applies only integral promotion. Float remains Float; the controlling
+        ;; expression is unevaluated, and the actual function argument is evaluated once.
+        "#if defined(__FLT16_MANT_DIG__)\n"
+        "static inline _Float16 rstr_native_abs_f16(_Float16 value) {\n"
+        " return (_Float16)fabsf((float)value);\n}\n"
+        "#define RSTR_NATIVE_ABS_HALF _Float16: rstr_native_abs_f16,\n"
+        "#else\n#define RSTR_NATIVE_ABS_HALF\n#endif\n"
+        "#define rstr_native_abs(a) _Generic((+(a)), RSTR_NATIVE_ABS_HALF "
+        "float: fabsf, double: fabs, int: rstr_native_abs_i32, "
+        "long: rstr_native_abs_long, long long: rstr_native_abs_i64)((a))\n")})
+
 ;; ---------------------------------------------------------------------------
 ;; CROSS-BACKEND SEMANTICS DECISION TABLE (A2)
 ;; Where backends could diverge on the same op, the CHOICE is recorded here —
@@ -115,7 +139,8 @@
    :quot {:arity 2 :kind :infix :wasm {:i32 :i32.div_s} :c "/" :wgsl "/"}
    ;; math — unary
    :sqrt  (math1 :f64.sqrt :f32.sqrt "sqrt")
-   :abs   {:arity 1 :kind :fn :wasm (vt3 :f64.abs :f32.abs nil) :c {:fn "fabs" :glsl "abs"} :wgsl {:fn "abs"}}
+   :abs   {:arity 1 :kind :fn :wasm (vt3 :f64.abs :f32.abs nil) :c {:fn "fabs" :glsl "abs"} :wgsl {:fn "abs"}
+           :native-c (native-absolute)}
    :floor (math1 :f64.floor :f32.floor "floor")
    :ceil  {:arity 1 :kind :fn :wasm :poly :c {:fn "ceil"} :wgsl {:fn "ceil"}}   ; -floor(-x)
    :trunc {:arity 1 :kind :fn :wasm (vt3 :f64.trunc :f32.trunc nil) :c {:fn "trunc"} :wgsl {:fn "trunc"}}
@@ -436,11 +461,12 @@
     :min {:f64 "rstr_avx2_min_f64" :f32 "rstr_avx2_min_f32"}
     :max {:f64 "rstr_avx2_max_f64" :f32 "rstr_avx2_max_f32"}
     :sqrt {:f64 "_mm256_sqrt_pd" :f32 "_mm256_sqrt_ps"}
+    :abs {:f64 "rstr_avx2_abs_f64" :f32 "rstr_avx2_abs_f32"}
     ;; a·b+c fused; only where the ISA has a true FMA (AVX2 implies FMA3)
     :fma {:f64 "_mm256_fmadd_pd" :f32 "_mm256_fmadd_ps"}}})
 
 (defn simd-helper-sources
-  "AVX2 extrema fix native asymmetric NaN and zero-tie behavior lane-wise."
+  "AVX2 source extrema and sign-bit absolute value helpers."
   [isa]
   (when (= :avx2 isa)
     (str "#ifndef RASTER_AVX2_SOURCE_EXTREMA\n#define RASTER_AVX2_SOURCE_EXTREMA\n"
@@ -459,6 +485,10 @@
                   (intrinsic (if (= :min op) "or" "and")) "(a,b),both_zero);\n"
                   " return " (intrinsic "blendv") "(v,a,"
                   (intrinsic "cmp") "(a,a,_CMP_UNORD_Q));\n}\n")))
+         "static inline __m256 rstr_avx2_abs_f32(__m256 a) {\n"
+         " return _mm256_andnot_ps(_mm256_set1_ps(-0.0f), a);\n}\n"
+         "static inline __m256d rstr_avx2_abs_f64(__m256d a) {\n"
+         " return _mm256_andnot_pd(_mm256_set1_pd(-0.0), a);\n}\n"
          "#endif\n")))
 
 (def ^:private simd-widen

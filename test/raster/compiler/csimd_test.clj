@@ -21,6 +21,13 @@
 (defn- numeric-invk [impl & arguments]
   (util/make-invk impl arguments))
 
+(deftest missing-vector-intrinsics-cannot-become-identity
+  (doseq [elem [:f32 :f64]
+          expression ['(Math/exp (clojure.core/aget x i))
+                      '(unknown-operation 1.0)]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no vector lowering"
+                         (cs/emit-c-vexpr expression 'i :avx2 elem "j" #{'x} :float)))))
+
 (deftest qualified-index-casts-retain-contiguous-simd-loads
   (doseq [cast '[long int clojure.core/long clojure.core/int]
           index [(list 'clojure.core/+ 'base (list cast 'i))

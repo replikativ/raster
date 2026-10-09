@@ -26,7 +26,7 @@
   {:cast-style       :c
    :atomic-add-int   "__atomic_add"      ;; not used on the single-thread path yet
    :atomic-add-float :cas-helper
-   :float-abs        "fabsf"
+   :float-abs        (get-in intrinsics/table [:abs :native-c :fn])
    :float-max        (get-in intrinsics/table [:max :native-c :fn])
    :float-min        (get-in intrinsics/table [:min :native-c :fn])
    :float-suffix?    true})

@@ -17,6 +17,7 @@
             [raster.par]
             [raster.math]
             [raster.compiler.backend.cpu.aot :as aot]
+            [raster.compiler.fixtures.absolute :as absolute]
             [raster.compiler.fixtures.extrema :as extrema]
             [raster.compiler.ir.parallel-program :as parallel-program]))
 
@@ -44,6 +45,26 @@
       (* (double ulps)
          (max (Math/ulp (double expected))
               (Math/ulp (double actual))))))
+
+(deftest native-absolute-preserves-public-source-precision
+  (doseq [[function dtype array-fn bits] absolute/cases simd? [false true]]
+    (let [native (aot/compile-aot-c function dtype :simd? simd?)]
+      (when (and simd? (#{#'absolute/float-math-abs #'absolute/double-math-abs} function))
+        (is (re-find (re-pattern (str "rstr_avx2_abs_" (if (= dtype :float) "f32" "f64") "\\("))
+                     (:c-source (meta native)))))
+      (doseq [length [0 1 3 4 5 7 8 9 17]
+              values [(absolute/operands dtype) (reverse (absolute/operands dtype))]]
+        (let [input (array-fn (take length (cycle values)))
+              reference (function input length)
+              actual (native input length)]
+          (is (= (count reference) (count actual)))
+          (is (every? true?
+                      (map (fn [expected observed]
+                             (if (Double/isNaN (double expected))
+                               (Double/isNaN (double observed))
+                               (= (bits expected) (bits observed))))
+                           reference actual))
+              (str function " " dtype " simd=" simd? " length=" length)))))))
 
 ;; ---- kernels under test (proper raster style: rn/ arithmetic, ra/ arrays) ----
 

@@ -26,6 +26,61 @@
     (native a b out 3)
     (is (= (mapv (if (= op 'Math/min) min max) a b) (vec out)))))
 
+(deftest native-absolute-evaluates-once-and-retains-result-type
+  (let [name (get-in intrinsics/table [:abs :native-c :fn])
+        body (str "void abs_once(float *x, float *out) {"
+                  "out[0] = " name "(x[0]++); out[1] = x[0];"
+                  "out[2] = _Generic(" name "(x[0]), float: 1, default: 0);}")
+        helpers (intrinsics/native-c-helper-sources body)]
+    ;; Optional half support must not infect ordinary Float/Double/integer helpers.
+    ;; Exercise both the real target and a forced absence of its half capability.
+    (doseq [capability-prefix ["" "#undef __FLT16_MANT_DIG__\n"]]
+      (let [source (str "#include <math.h>\n" capability-prefix helpers body)
+            native (cpu/load-kernel (cpu/compile-source! source) "abs_once" 2 [])
+            x (float-array [-2.0]) out (float-array 3)]
+        (native x out)
+        (is (= [2.0 -1.0 1.0] (vec out)))))))
+
+(deftest native-absolute-retains-half-boundary
+  ;; Native half arithmetic already widens through Float and rounds back to half.
+  ;; Inputs here are exactly half-representable, so Float comparison is independent
+  ;; of a second host implementation of the half conversion.
+  (let [name (get-in intrinsics/table [:abs :native-c :fn])
+        body (str "#if defined(__FLT16_MANT_DIG__)\n"
+                  "void abs_half(float *x, float *out, int n) {"
+                  "for (int i=0;i<n;i++) out[i]=(float)" name "((_Float16)x[i]);"
+                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);out[n+1]=1;}\n"
+                  "#else\nvoid abs_half(float *x, float *out, int n) {"
+                  "for (int i=0;i<n;i++) out[i]=" name "(x[i]);out[n]=0;out[n+1]=0;}\n#endif\n")
+        source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
+        native (cpu/load-kernel (cpu/compile-source! source) "abs_half" 2 [:int])
+        values [-0.0 -1.0 1.0 -65504.0 Float/NEGATIVE_INFINITY
+                Float/POSITIVE_INFINITY Float/NaN (- (Math/scalb (double 1.0) (int -24)))]
+        x (float-array values) out (float-array (+ 2 (count values)))]
+    (native x out (int (count values)))
+    (doseq [i (range (count values))]
+      (let [expected (Math/abs (aget x i)) actual (aget out i)]
+        (is (if (Float/isNaN expected) (Float/isNaN actual)
+                (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))))))
+    (let [capability (double (aget out (inc (count values))))
+          half-supported? (= 1.0 capability)]
+      (is (contains? #{0.0 1.0} capability))
+      (is (= capability (double (aget out (count values))))
+          "supported targets must retain the half result type")
+      (println "[NATIVE ABS] half boundary supported:" half-supported?
+               "(without half support, the ordinary Float fallback is exercised)"))))
+
+(deftest native-absolute-preserves-integral-width-and-minima
+  (doseq [[dtype make-array values reference]
+          [[:int int-array [Integer/MIN_VALUE Integer/MAX_VALUE -16777217 -1 0 1]
+            #(Math/abs (int %))]
+           [:long long-array [Long/MIN_VALUE Long/MAX_VALUE -9007199254740993 -1 0 1]
+            #(Math/abs (long %))]]]
+    (let [native (cpu/compile-elementwise "abs_integral" dtype '(Math/abs x) 1)
+          x (make-array values) out (make-array (count values))]
+      (native x out (count values))
+      (is (= (mapv reference values) (vec out))))))
+
 (deftest native-source-cache-key-test
   (let [key-fn (ns-resolve 'raster.compiler.backend.cpu.codegen 'source-cache-key)
         identity-var (ns-resolve 'raster.compiler.backend.cpu.codegen 'compiler-identity)

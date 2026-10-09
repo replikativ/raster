@@ -1893,3 +1893,33 @@ reproducible algorithm, widen model math, or relax training acceptance. WASM's
 polynomial facet remains separate. The real-weight gate remains held; resolving
 the near-zero derivative sensitivity still needs numerical and workload-level
 evidence rather than declaring library accuracy sufficient for that gate.
+
+### Native absolute-value precision and vector admission
+
+Public Float/Double `deftm` maps using Math/abs and raster.numeric/abs exposed
+31 failing assertions before the native correction. The scalar native facet
+now selects the actual C operand type, evaluates the operand once, and handles
+signed integer minima without undefined negation. Double inputs no longer
+narrow through fabsf. GPU library facets are unchanged.
+
+The same regression exposed a separate SIMD admission defect: an unavailable
+vector operation name could stringify as empty text and silently turn a unary
+operation into its operand. Float/poly vector operations now require an actual
+intrinsic or decline emission. AVX2 Float/Double abs clears the sign bit, with
+scalar tails retaining the native source semantics. The focused three-test
+run passed 291 assertions, including raw-bit floating comparisons, integer
+minima, operand evaluation count, and changed inputs across vector boundaries.
+No model oracle, provider, precision policy or acceptance tolerance changed.
+
+Independent review caught the native `_Float16` boundary, which the initial
+generic selector omitted despite its presence in native dtype admission. The
+helper now retains the previous Float-widening/half-rounding path explicitly,
+with compiled checks for half result type and exactly representable half values.
+
+The first rebased full CI run exposed an older Clang target without `_Float16`:
+unconditional helper declarations broke ordinary Float/Double abs consumers.
+Half declarations and generic associations now depend on the compiler's half
+capability macro. A forced-absent capability test executes the ordinary Float
+helper, while the half boundary test reports whether actual half or its ordinary
+Float control branch ran. The affected native/SIMD suites pass 40 tests and
+768 assertions locally; full CI still supplies the older-toolchain acceptance.
