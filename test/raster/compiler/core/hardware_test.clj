@@ -20,6 +20,21 @@
     (is (= 16 (hw/natural-lanes avx512 :float)))
     (is (= 4 (hw/natural-lanes neon :float)))))
 
+(deftest hardware-storage-widths-use-the-shared-dtype-authority
+  (doseq [[aliases bytes] [[[:double :f64 :float64] 8]
+                          [[:float :f32 :float32] 4]
+                          [[:half :f16 :float16] 2]
+                          [[:long :i64 :int64] 8]
+                          [[:int :i32 :int32] 4]
+                          [[:byte :i8 :int8] 1]]
+          alias aliases]
+    (is (= bytes (hw/bytes-of alias)))
+    (is (= (quot 32 bytes) (hw/natural-lanes avx2 alias))))
+  (doseq [unsupported [:short :i16 :unknown]]
+    (is (= :unknown-dtype
+           (try (hw/bytes-of unsupported)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest column-tile-test
   (testing "NC (interleave width) = f32 lanes — the hardware-derived layout tile"
     (is (= 8 (hw/column-tile avx2)))             ; matches the hard-coded NC=8 today

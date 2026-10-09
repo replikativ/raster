@@ -3796,3 +3796,14 @@ reloading its test provider implementations in the warm REPL; the initial stale
 provider failures were not numerical failures. Actual local capture/restart
 checks pass on OpenCL and Level Zero (2 tests / 34 assertions). Independent
 exact-head review and fresh CI remain pending.
+
+### One dtype authority for hardware storage widths
+
+Hardware planning now uses `compiler.core.dtype/bytes-of`, rather than a
+second private width table. Canonical aliases and Half storage therefore have
+the same widths in planning and lowering. Width alone does not grant native
+arithmetic support. The planning helper now rejects `:short` and `:i16`: those
+are not compiler scalar dtypes, even though Half uses JVM short-array storage.
+No surface dtype was added or removed. The focused hardware, roofline and
+calibration-admission suites pass 18 tests / 154 assertions in the warm REPL;
+full CI and exact-head review remain separate gates.

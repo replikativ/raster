@@ -37,15 +37,12 @@
 ;; Element widths — bytes per scalar of a raster dtype keyword.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private dtype-bytes
-  {:double 8 :float 4 :long 8 :int 4 :short 2 :byte 1
-   :f64 8 :f32 4 :i64 8 :i32 4 :i16 2 :i8 1})
-
 (defn bytes-of
-  "Bytes per scalar of a dtype keyword (e.g. :float -> 4, :byte -> 1)."
+  "Bytes per scalar of a supported compiler dtype, including its canonical aliases.
+   Storage width is not evidence of native arithmetic support. Half's encoded short array
+   storage does not introduce a separate :short/:i16 scalar dtype."
   [dt]
-  (or (dtype-bytes dt)
-      (throw (ex-info "Unknown dtype for hardware width" {:dtype dt}))))
+  (dtype/bytes-of dt))
 
 ;; ---------------------------------------------------------------------------
 ;; Host detection
@@ -584,8 +581,9 @@
 ;; ---------------------------------------------------------------------------
 
 (defn natural-lanes
-  "SIMD lane count for a dtype on this target: vector-bits / (8 * bytes-per-elem).
-   Halide `natural_vector_size`. f32 -> 8 on AVX-512, 4 on AVX2."
+  "Storage packing lane count: vector-bits / (8 * bytes-per-elem).
+   Halide `natural_vector_size`. f32 -> 16 on AVX-512, 8 on AVX2.
+   This width calculation does not admit native arithmetic for the dtype."
   [desc dt]
   (quot (long (:vector-bits desc)) (* 8 (bytes-of dt))))
 
