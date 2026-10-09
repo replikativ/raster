@@ -372,7 +372,7 @@
                    graph-node kernel-graph]
              :or {kernel-name-prefix "segmap"
                   target-dialect :opencl-intel workgroup-size 256
-                  scalar-types {} array-types {}}}]
+                  scalar-types {} array-types {}} :as opts}]
   (when (not= (some? graph-node) (some? kernel-graph))
     (throw (ex-info "map graph certification requires both node and graph"
                     {:reason :segmap-graph-context
@@ -393,9 +393,10 @@
                     segmap)
         scheduled
         (segmap-body/schedule projected
-                              {:workgroup-size workgroup-size
+                              (merge {:workgroup-size workgroup-size
                                :scalar-types scalar-types :array-types array-types
-                               :array-shapes array-shapes})
+                               :array-shapes array-shapes}
+                                     (select-keys opts [:scalar-math])))
         ;; The projected operation is private schedule input. ScheduledKernelBody remains a
         ;; refinement of the exact semantic graph node, which is what later binding validates.
         scheduled (if graph-node (assoc scheduled :source segmap) scheduled)
@@ -411,12 +412,13 @@
                      graph-node kernel-graph]
               :or {kernel-name-prefix "segstencil"
                    target-dialect :opencl-intel
-                   scalar-types {} array-types {}}}]
+                   scalar-types {} array-types {}} :as opts}]
   (let [workgroup-size (or workgroup-size (get-in stencil [:grid :block-size]) 256)
         scheduled
         (segstencil-body/schedule
-         stencil {:workgroup-size workgroup-size
-                  :scalar-types scalar-types :array-types array-types})
+         stencil (merge {:workgroup-size workgroup-size
+                         :scalar-types scalar-types :array-types array-types}
+                        (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))
             (throw (ex-info "stencil graph certification requires both node and graph"
                             {:reason :segstencil-graph-context
@@ -475,13 +477,14 @@
   [operation & {:keys [dtype kernel-name-prefix scalar-types array-types array-shapes target-dialect
                       graph-node kernel-graph]
                 :or {kernel-name-prefix "segmap" scalar-types {} array-types {}
-                     target-dialect :opencl-intel}}]
+                     target-dialect :opencl-intel} :as opts}]
   (let [dtype (or (:dtype operation) dtype :double)]
-    (generate-segmap-kernel-body
-     operation :dtype dtype :scalar-types scalar-types :array-types array-types
-     :array-shapes array-shapes
-     :graph-node graph-node :kernel-graph kernel-graph
-     :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)))
+    (apply generate-segmap-kernel-body operation
+           (mapcat identity
+                   (merge {:dtype dtype :scalar-types scalar-types :array-types array-types
+                           :array-shapes array-shapes :graph-node graph-node :kernel-graph kernel-graph
+                           :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix}
+                          (select-keys opts [:scalar-math]))))))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
@@ -588,7 +591,7 @@
 
 (defn- generate-elementwise-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect]
-          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel} :as opts}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
         scalar-types (merge scalar-types
                             (into {} (map (juxt :id :dtype)) (:scalars graph)))
@@ -606,21 +609,20 @@
          (fn [{:keys [id operation] :as node}]
            (cond
              (segop/seg-map? operation)
-             (generate-scheduled-segmap-kernel
-              operation :dtype (:dtype operation)
-              :scalar-types scalar-types :array-types array-types
-              :array-shapes static-shapes
-              :graph-node node :kernel-graph graph
-              :target-dialect target-dialect
-              :kernel-name-prefix "graph_segmap")
+             (apply generate-scheduled-segmap-kernel operation
+                    (mapcat identity
+                            (merge {:dtype (:dtype operation) :scalar-types scalar-types :array-types array-types
+                                    :array-shapes static-shapes :graph-node node :kernel-graph graph
+                                    :target-dialect target-dialect :kernel-name-prefix "graph_segmap"}
+                                   (select-keys opts [:scalar-math]))))
 
              (segop/seg-stencil? operation)
-             (generate-segstencil-kernel-body
-              operation :scalar-types scalar-types :array-types array-types
-              :target-dialect target-dialect
-              :kernel-name-prefix "graph_segstencil"
-              :graph-node node
-              :kernel-graph graph)
+             (apply generate-segstencil-kernel-body operation
+                    (mapcat identity
+                            (merge {:scalar-types scalar-types :array-types array-types
+                                    :target-dialect target-dialect :kernel-name-prefix "graph_segstencil"
+                                    :graph-node node :kernel-graph graph}
+                                   (select-keys opts [:scalar-math]))))
 
              :else
              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"

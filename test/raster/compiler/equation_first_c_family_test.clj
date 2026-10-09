@@ -32,6 +32,8 @@
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -386,6 +388,34 @@
     (raster.par/map! output index n float
                      (raster.numeric/* (float 2.0)
                                        (raster.arrays/aget input index)))))
+
+(deftest program-emission-retains-independent-selected-math-intent
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        tensor (av/tensor {:dtype :float :shape '[n]})
+        source (soac/make
+                (soac/default-program-facts
+                 {:values {'n (av/tensor {:dtype :long :shape []}) 'input tensor 'output tensor}
+                  :inputs '[n input]
+                  :equations {'activation (soac/default-equation-facts)}})
+                [(list '= 'activation '[output]
+                       (list 'map {:index 'index :extent 'n} '[input] '[]
+                             (soac/lambda-form '[x] '[(Math/tanh x)])))] '[output])
+        ;; This source-free compiler-generated algorithm exercises emission, not public
+        ;; invocation promotion; schedule-program independently validates the typed union.
+        semantic (assoc (typed-route/program-envelope source) :dialect :typed-parallel)]
+    (doseq [[target dialect] [[ocl-target :opencl-portable] [cuda-target :cuda] [hip-target :hip]]]
+      (let [options {:target-device target :target-descriptor (compiler-hardware/descriptor-for target)
+                     :target-dialect dialect :dtype :float
+                     :array-types {'input :float 'output :float} :scalar-types {'n :long}}
+            scheduled (structured-route/schedule-program semantic options)
+            ordinary (program-c-family/emit-program scheduled options)
+            selected (program-c-family/emit-program scheduled (merge options request))
+            emitted (:program selected)]
+        (is (identical? (:program ordinary) (emitted-program/validate! (:program ordinary))))
+        (is (identical? emitted (emitted-program/validate! emitted request)))
+        (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! emitted)))
+        (is (= (:values semantic) (:values emitted)))
+        (is (some #(str/includes? (:source %) "double") (:kernels selected)))))))
 
 (deftm c-family-four-layers
   "A multi-stage contraction fixture whose named middle value is a distinct resident tap."
