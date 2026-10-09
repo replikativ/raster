@@ -865,7 +865,14 @@
                     ;; Substitute actual args for formal params
                     param-names (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil)
                                       params)
-                    param-subst (zipmap param-names args)
+                    _ (check-inline-arity! var-sym param-names args vg-info)
+                    argument-bindings (atom [])
+                    ;; AD consumes the same call-by-value boundary as ordinary inlining.
+                    ;; A prepared pullback may use an argument repeatedly or not at all;
+                    ;; neither permits duplicating or dropping its evaluation.
+                    param-subst (argument-substitution
+                                 param-names args nil param-env
+                                 #(swap! argument-bindings conj %))
                     ;; Rename internal symbols to avoid conflicts, and substitute params
                     renamed-pairs
                     (let [subst (atom param-subst)]
@@ -895,7 +902,7 @@
                     elements (if (= mode :value+grad)
                                (vec (cons loss-sym grad-syms))
                                (vec grad-syms))]
-                {:bindings (vec renamed-pairs)
+                {:bindings (into @argument-bindings renamed-pairs)
                  :result-sym nil
                  :loss-sym loss-sym
                  :grad-syms grad-syms
