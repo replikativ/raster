@@ -30,9 +30,15 @@ the new policy rather than letting it reach an incompatible precision route;
 a regression checks its explicit rejection reason before any source lowering.
 The focused run temporarily loaded the branch namespaces into the owned REPL,
 then restored all original roots/metadata and removed new production interns.
-It is not a fresh coherent full-model gate. Independent review, target compiler
-checks and original-model acceptance remain required; no full-model success
-or performance improvement is claimed.
+It is not a fresh coherent full-model gate. Independent exact-head review approved
+checkpoint `296293a0`. Public widened register fixtures are now included in the
+normal CI fixture generator. Both fused and decomposed variants compile locally
+with nvcc 12.4 to sm_80 PTX and hipcc 5.7 (Clang 21) to gfx1100 device code.
+Inspection confirms Double multiply plus add in the decomposed variant, Double
+FMA in the fused variant, and final Float conversions; HIP inspection enabled
+cross-statement contraction explicitly. This is hardware-free target compilation,
+not NVIDIA/AMD numerical or performance acceptance. Original-model acceptance
+remains required; no full-model success or performance improvement is claimed.
 
 ## SIMD retained-operation precision — 2026-10-09
 

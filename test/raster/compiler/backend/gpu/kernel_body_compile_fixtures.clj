@@ -19,6 +19,8 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.core.hardware :as compiler-hardware]
+            [raster.compiler.fixtures.contractions :as contractions]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
             [raster.compiler.fixtures.extrema :as extrema]
             [raster.compiler.fixtures.mixed-storage :as mixed-storage]
@@ -467,6 +469,22 @@
          :descriptor {:device-type :gpu :backend :hip :vendor "AMD"
                       :subgroup-size 32 :max-workgroup-size 1024}}})
 
+(defn- public-widened-register-artifacts
+  "Compile fixtures retain Float storage and explicit Double arithmetic through the public API."
+  [device-id]
+  (let [descriptor (assoc-in (compiler-hardware/descriptor-for device-id)
+                             [:execution :scalar-dtype-support :double] :supported)]
+    (mapcat
+     (fn [policy]
+       (:kernels
+        (equation-first/compile
+         #'contractions/fixed-matmul
+         {:target device-id :dtype :float
+          :schedule {:precision :f32-storage-f64-arithmetic-rte-f32
+                     :typed-contraction {:strategy :register-tiled :multiply-add policy}}}
+         descriptor)))
+     [:decomposed :fused])))
+
 (defn- equation-first-artifacts
   [target descriptor]
   (let [device-id (keyword (str (name target) ":equation-first-compile-gate"))
@@ -486,6 +504,7 @@
                 :capabilities capabilities})
     (vec
      (concat
+      (public-widened-register-artifacts device-id)
       (:kernels (equation-first/compile
                  #'mixed-storage/mixed-scale
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
