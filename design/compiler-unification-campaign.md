@@ -3651,6 +3651,27 @@ Level Zero (2 tests / 48 assertions), including foreign facts, live output lease
 cached module reuse and output retirement. Independent exact-head review and
 fresh CI are still required.
 
+### Distributed representation evidence and explicit probe budgets
+
+The distributed owner now uses the shared in-process identity-witness factory,
+with a private issuer distinct from Compiled. Copies and facts from another
+owner domain do not authenticate. This removes duplicated sealing mechanics,
+not the independent compiler or lifetime checks required by each owner.
+
+After successful execution, the existing generated storage probe can run in
+the exclusive output scope. Its private allocation must fit the retained
+physical-target resident-buffer budget. Admission declines preserve completion;
+failure after probe entry marks the owner failed before releasing the scope.
+Evidence binds the exact owner, session identity, target, dtype and observed
+device snapshot. Consumption rechecks those facts inside the actual read scope.
+Historical dereference alone grants no live-byte or durable-publication authority.
+
+Focused identity, ownership, budget, cleanup and failure controls pass 14 tests /
+270 assertions. The actual OpenCL and Level Zero representation/AMR oracles pass
+3 tests / 104 assertions without skips. Independent review and fresh CI remain
+required. Completion-backed distributed checkpoint capture is the next boundary;
+this slice does not fabricate a local CompletedEvidence or certify program identity.
+
 ### Distributed output lifetime before durable capture
 
 PR #1132 is merged as `4c7dc400` after independent exact-head review and all

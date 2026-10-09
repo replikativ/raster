@@ -22,21 +22,27 @@
           "outputs are unavailable before successful completion")
       (runtime/run! executable)
       (is (= :complete @(:state executable)))
+      (is (runtime/original-executable? executable))
       (is (= :distributed-runtime-state (reason #(runtime/run! executable)))
           "the one-shot runtime must not replay stale initialization evidence")
-      (runtime/with-output-values!
-       executable
-       (fn [completed-outputs]
-        (let [outputs (get completed-outputs (:completion attestation))
-            session (get (:sessions executable) target)
-            fields (get-in certified [:certificate :fields])]
-        (is (= (set (map :value (vals fields))) (set (keys outputs))))
-        (is (false? (get-in certified [:certificate :completion-observed?]))
-            "structural certificate is not retroactively a runtime receipt")
-        (into {} (for [role [:coarse :fine]
-                       :let [result (double-array 16) value (get-in fields [role :value])]]
-                   (do (gpu/download-range! session (outputs value) result {:elements 16})
-                       [role (vec result)])))))))))
+      (let [fact (runtime/measure-storage-representation! executable target :double)]
+        (is (runtime/representation-evidence? fact))
+        (is (identical? executable (:executable fact)))
+        (is (= :complete @(:state executable)))
+        (runtime/with-output-values!
+         executable
+         (fn [completed-outputs]
+           (is (= @fact (runtime/storage-representation-description executable target :double fact)))
+           (let [outputs (get completed-outputs (:completion attestation))
+                 session (get (:sessions executable) target)
+                 fields (get-in certified [:certificate :fields])]
+             (is (= (set (map :value (vals fields))) (set (keys outputs))))
+             (is (false? (get-in certified [:certificate :completion-observed?]))
+                 "structural certificate is not retroactively a runtime receipt")
+             (into {} (for [role [:coarse :fine]
+                            :let [result (double-array 16) value (get-in fields [role :value])]]
+                        (do (gpu/download-range! session (outputs value) result {:elements 16})
+                            [role (vec result)]))))))))))
 
 (defn- check-cycles! [target]
   (let [initial (#'oracle/initial-state)
