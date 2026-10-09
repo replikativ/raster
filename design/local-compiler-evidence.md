@@ -1737,7 +1737,10 @@ returned NaN. The typed C-family scalar emitter now realizes Float/Double min/ma
 with demand-driven, dtype-specific helpers owned by the same intrinsic authority
 as the native fix. Their return logic is shared, not separately reimplemented.
 The dialect layer adds only OpenCL/CUDA/HIP qualifiers. Integer extrema retain
-their existing target lowering, and unsupported floating carriers are rejected.
+their existing target lowering. Half scalar extrema widen exactly to Float,
+select the source-semantic operand there, and reuse the existing verified
+nearest-even narrowing emitter; no separate half helper or type inference is
+introduced. Other unsupported floating carriers are rejected.
 Double helper demand contributes to the OpenCL FP64 extension requirement even
 when the surrounding result is not a named Double value.
 

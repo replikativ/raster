@@ -27,6 +27,23 @@
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
+(defn half-extremum-body
+  "Typed half extrema select an operand through exact Float widening."
+  [operator]
+  (body/make
+   {:id [:half-extremum operator]
+    :parameters [(body/->KernelParameter 'x :input :half [1] :global
+                                         (layout/row-major [1] :half) :input)
+                 (body/->KernelParameter 'out :output :half [1] :global
+                                         (layout/row-major [1] :half) :result)]
+    :operations [(body/->ScalarLoad (body/value 'operand :half) 'x [0] nil nil :cached)
+                 (body/->ScalarCompute (body/value 'result :half)
+                                       (body/scalar-expression operator :half ['operand 'operand]))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn trapping-integral-cast-body
   "Checked signed narrowing fixture shared by emitter tests and hardware-free target CI."
   [source-type result-type]

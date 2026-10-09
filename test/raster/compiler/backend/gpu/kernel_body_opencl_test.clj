@@ -403,6 +403,22 @@
                                "-fsyntax-only" "-" :in source)]
           (is (zero? (:exit result)) (:err result)))))))
 
+(deftest half-extrema-reuse-verified-widening-and-narrowing
+  (doseq [target [:opencl-portable :cuda :hip]
+          operator [:min :max]
+          :let [source (opencl/emit-scalar-kernel "half_extremum"
+                         (fixtures/half-extremum-body operator) {:target-dialect target})]]
+    (is (str/includes? source (str "rstr_source_" (name operator) "_f32(")))
+    (is (str/includes? source "if (isnan(a)) return a;"))
+    (is (str/includes? source "signbit(a)"))
+    (is (str/includes? source (if (= :opencl-portable target)
+                              "convert_half_rte(" "__float2half_rn(")))
+    (when (= :opencl-portable target)
+      (when (command-available? "clang")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+          (is (zero? exit) err))))))
+
 (deftest wrapping-integral-collectives-use-unsigned-carriers
   (doseq [[target unsigned bitcast]
           [[:opencl-portable "uint rstr_sum__unsigned_collective"

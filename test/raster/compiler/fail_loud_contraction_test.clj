@@ -112,7 +112,7 @@
       (is (= "*" (:c-op r)))
       (is (= 1.0 (:identity-val r))
           "the product identity must not become the sum identity")))
-  (testing "floating max explicitly restores Math semantics around C fmax"
+  (testing "floating max explicitly realizes source NaN and zero semantics"
     (let [routed
           (cr/route-contraction
            '(raster.par/contract O [] [[l 8]] (* (aget a l) (aget b l))
@@ -121,7 +121,7 @@
       (is (= :full-reduce (:strategy routed)))
       (is (= "fmax" (:c-op routed)))
       (is (.contains ^String (:source routed) "isnan("))
-      (is (.contains ^String (:source routed) "fmax(")))))
+      (is (.contains ^String (:source routed) "rstr_source_max_f64(")))))
 
 (deftest fp64-result-transform-uses-the-typed-register-tiled-store
   (testing "an f64 two-free/one-contract result transform executes on the register-tiled leaf"

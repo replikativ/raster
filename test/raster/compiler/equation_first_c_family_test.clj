@@ -1391,7 +1391,7 @@
       (is (link-plan/link-plan? linked))
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
       (is (some #(and (str/includes? (:source %) "isnan(")
-                      (str/includes? (:source %) "fmax"))
+                      (str/includes? (:source %) "rstr_source_max_f32("))
                 (:kernels compilation))
           "the max tree preserves Math/Raster NaN and signed-zero semantics"))))
 

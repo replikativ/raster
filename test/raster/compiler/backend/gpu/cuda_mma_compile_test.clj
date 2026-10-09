@@ -99,7 +99,7 @@
         source (cuda/emit-matrix-kernel "uniform_epilogue" body)]
     (is (re-find #"float alpha" source))
     (is (re-find #"\.x\[rstr_epilogue_element\] = .*alpha" source))
-    (is (re-find #"fmax\(" source))
+    (is (re-find #"rstr_source_max_f32\(" source))
     (is (not (re-find #"__shared__" source))
         "a coordinate-free transform needs no hidden scratch")
     (doseq [id ['rstr_epilogue_element 'n_base 'warpId]]

@@ -718,8 +718,18 @@
       ;; Native fmin/fmax discard a lone NaN. The source Math/numeric operation
       ;; propagates it and has a signed-zero tie rule, independent of the target.
       (contains? #{:min :max} op)
-      (str (intrinsics/c-floating-extremum-name op operand-type)
-           "(" (str/join ", " arguments) ")")
+      (if (= :half operand-type)
+        ;; Half operands widen exactly, and extrema select one of those values.
+        ;; Reuse the verified conversion emitter for target half representation
+        ;; and nearest-even narrowing instead of inventing another helper family.
+        (emit-cast
+         (body/cast-expression
+          (body/scalar-expression op :float
+            (mapv #(body/cast-expression % :float :exact :exact) (:arguments expression)))
+          :half :nearest-even :ieee)
+         context)
+        (str (intrinsics/c-floating-extremum-name op operand-type)
+             "(" (str/join ", " arguments) ")"))
 
       ;; Word shifts have the JVM/WASM width-masked count contract, independent of the
       ;; source language's choice to widen an operand. Unsigned shifts also avoid signed
