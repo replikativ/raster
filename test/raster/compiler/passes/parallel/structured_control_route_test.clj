@@ -1109,7 +1109,8 @@
     (is (not (emitted-program/retained-validation?
               source-program (assoc evidence :projections (java.util.IdentityHashMap.)))))
     (let [seal-key :raster.compiler.ir.emitted-parallel-program/validation-seal
-          token ((get (meta evidence) seal-key) source-program evidence)]
+          token ((get (meta evidence) seal-key) source-program evidence {:overrides {}})]
+      (is (some? token) "the forgery probe uses the genuine token for the checked default context")
       (is (not (emitted-program/retained-validation?
                 source-program (with-meta evidence {seal-key (fn [& _] token)})))
           "arbitrary metadata callbacks cannot replace the validator's owner check"))

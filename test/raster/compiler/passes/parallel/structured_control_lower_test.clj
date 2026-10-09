@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as opencl]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -61,6 +62,48 @@
       body
       {'steps trip-index 'n extent 'alpha scalar 'u0 tensor 'u-final tensor}))))
 
+(defn- enclosing-loop-program [emission]
+  (let [algorithm (get-in emission [:schedule :algorithm])
+        inputs (control/outer-operands algorithm)
+        outputs (control/outer-results algorithm)]
+    (parallel-program/make
+     {:dialect :opencl-parallel :values (control/outer-values algorithm)
+      :inputs inputs :outputs outputs
+      :equations [(parallel-program/map->ProgramEquation
+                   {:id 'time-loop :operands inputs :results outputs :algorithm algorithm
+                    :operations [emission] :effects #{} :provenance {} :attributes {}})]})))
+
+(deftest program-validation-evidence-is-bound-to-independent-math-context
+  ;; No target-library leaves: both requests validate this program. Their proofs
+  ;; must still not be interchangeable, even though this particular code is identical.
+  (let [scheduled (lower/schedule (loop-program true) {:target-device :cpu:0 :dtype :float})
+        graph (opencl/generate-kernel-graph (:graph scheduled)
+                                           :scalar-types {'alpha-in :float 'iteration :long})
+        program (enclosing-loop-program (emitted-loop/make scheduled graph))
+        request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        default-proof (emitted-program/validate-with-physical-results! program)
+        selected-proof (emitted-program/validate-with-physical-results! program request)]
+    (is (= program (emitted-program/validate! program request)))
+    (is (emitted-program/retained-validation? program default-proof))
+    (is (emitted-program/retained-validation? program default-proof {:scalar-math {:overrides {}}}))
+    (is (emitted-program/retained-validation? program selected-proof request))
+    (is (identical? selected-proof
+                    (emitted-program/checked-retained-validation! program selected-proof request)))
+    (is (not (emitted-program/retained-validation? program selected-proof)))
+    (is (not (emitted-program/retained-validation? program default-proof request)))
+    (doseq [[proof options] [[selected-proof {}] [default-proof request]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emitted-program/checked-retained-validation! program proof options))))
+    (is (not (emitted-program/retained-validation? (assoc program :source :copy) selected-proof request)))
+    (is (not (emitted-program/retained-validation? program (assoc selected-proof :extra true) request)))
+    (is (not (emitted-program/retained-validation?
+              program (assoc default-proof :scalar-math (:scalar-math request)) request)))
+    (is (= (emitted-program/retained-numerical-equations program)
+           (emitted-program/retained-numerical-equations program request)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-program/retained-validation? program default-proof
+                                                       {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))))
+
 (deftest structured-loop-scalar-math-consent-is-independent
   (let [scheduled (lower/schedule (loop-program true true) {:target-device :cpu:0 :dtype :float})
         graph (:graph scheduled)
@@ -94,6 +137,17 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (emitted-loop/validate! accepted {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))
     (is (= default (emitted-loop/validate! default)))
+    (let [program (enclosing-loop-program accepted)
+          proof (emitted-program/validate-with-physical-results! program {:scalar-math policy})]
+      (is (= program (emitted-program/validate! program {:scalar-math policy})))
+      (is (emitted-program/retained-validation? program proof {:scalar-math policy}))
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! program)))
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate-with-physical-results! program)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emitted-program/validate! (assoc-in program [:attributes :scalar-math] policy))))
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-program/retained-numerical-equations program)))
+      (is (= ['time-loop]
+             (mapv :id (emitted-program/retained-numerical-equations program {:scalar-math policy})))))
     (let [legacy (update-in default [:graph :nodes]
                             (fn [nodes]
                               (mapv (fn [node source-node]

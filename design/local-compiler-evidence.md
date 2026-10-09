@@ -2299,3 +2299,21 @@ review found no blockers. Affected loop-lowering/routing/invocation-retention
 tests pass 58 tests / 541 assertions. Public producer, loop-call, enclosing-program
 and cached-proof context propagation remain pending; this boundary prerequisite
 does not enable policy publicly or close the held model gate.
+
+Enclosing emitted-program validation now forwards independent caller options to
+plain equations, every dispatch alternative and structured-loop certificates.
+Semantic projection and physical-result queries use the same request. The
+process-local proof seal captures the canonical closed math policy separately
+from the payload, in addition to exact program/evidence identity. Default and
+selected proofs cannot substitute for each other even when a pure program is
+valid under either request; copied objects and payload/metadata forgery remain
+rejected. Default public paths preserve their existing one-entry instrumentation.
+A used-tanh loop and exact/mixed matrix dispatch verify request propagation and
+fail-closed default admission, without changing ABI or numerical permissions.
+Independent review found no blockers. Affected loop, retained-invocation,
+dispatch and typed-route suites pass 144 tests / 1664 assertions. The direct seal
+forgery probe now supplies the canonical default context and also checks that it
+obtains a genuine nonnil token before attempting callback substitution.
+Program-call/link/cache/artifact consumers still use default intent and therefore
+cannot reuse selected proof evidence yet; public activation and physical target
+admission remain pending. No numerical tolerance or default changed.
