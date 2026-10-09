@@ -512,19 +512,15 @@
        :emission (:stats emission)
        :fallback :none}))))
 
-(defn lower
+(defn- lower-for-request
   "Specialize a compiled equation-first program against ordered public arguments.
 
    Returns a validated, allocation-free LinkPlan. Public buffers retain their stable host source
    identity until instantiation; scalar prefix and host-only equations execute through the same
    typed JVM reference backend.
-   The four-argument arity is an internal capability path: retained-validation must be exact-owner
+   Retained-validation is an internal capability path: it must be exact-owner
    static evidence. Invocation materialization and final LinkPlan validation remain fresh."
-  ([compilation arguments]
-   (:plan (lower compilation arguments (fn [plan] {:plan plan}))))
-  ([compilation arguments project]
-   (lower compilation arguments project nil))
-  ([compilation arguments project retained-validation]
+  [compilation arguments project retained-validation caller-options]
   (when-not (equation-first-compilation? compilation)
     (fail! :equation-first-compilation "lower requires an EquationFirstCompilation"
            {:actual (type compilation)}))
@@ -543,20 +539,37 @@
                          source-ns equation (assoc context :buffer-shapes buffer-shapes)))
         construction-started (System/nanoTime)
         projection-ns (volatile! 0)
-        result (invocation-link/lower
-              materialized (:emitted compilation) (:target compilation)
-              evaluate-host
-              (fn [plan]
+        project (fn [plan]
                 (let [started (System/nanoTime)
                       projected (project plan)]
                   (vswap! projection-ns + (- (System/nanoTime) started))
                   projected))
-              retained-validation)]
+        result (if (nil? caller-options)
+                 (invocation-link/lower
+                  materialized (:emitted compilation) (:target compilation)
+                  evaluate-host project retained-validation)
+                 (invocation-link/lower
+                  materialized (:emitted compilation) (:target compilation)
+                  evaluate-host project retained-validation caller-options))]
     (when *lower-observer*
       (*lower-observer* {:materialization-ns materialization-ns
                          :link-plan-construction-ns
                          (- (System/nanoTime) construction-started @projection-ns)}))
-    result)))
+    result))
+
+(defn lower
+  "Specialize under independently supplied caller math intent, not compilation metadata.
+
+   Legacy arities retain default intent. Retained static evidence must belong to this exact
+   emitted program and request; materialization and final LinkPlan obligations remain fresh."
+  ([compilation arguments]
+   (:plan (lower-for-request compilation arguments (fn [plan] {:plan plan}) nil nil)))
+  ([compilation arguments project]
+   (lower-for-request compilation arguments project nil nil))
+  ([compilation arguments project retained-validation]
+   (lower-for-request compilation arguments project retained-validation nil))
+  ([compilation arguments project retained-validation caller-options]
+   (lower-for-request compilation arguments project retained-validation caller-options)))
 
 (defn compile-link-plan
   "Convenience composition of `compile` and `lower`; still performs no runtime allocation."

@@ -793,13 +793,22 @@
           projected (invocation-link/lower materialized emitted :ze:0 nil
                                            (fn [plan] {:plan plan}) proof request)
           certified (invocation-link/certify-final-projection projected request)
-          checked (invocation-link/certify (:plan projected) nil request)]
+          checked (invocation-link/certify (:plan projected) nil request)
+          public-projection (equation-first/lower compilation arguments
+                                                 (fn [plan] {:plan plan}) proof request)]
       (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
       (is (= 0 (get-in projected [:plan :attributes :driver-allocations])))
       (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request))
       (is (not (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected))))
       (is (identical? certified (invocation-link/verify! certified request)))
       (is (identical? checked (invocation-link/verify! checked request)))
+      (is (= (set (:outputs linked-plan)) (set (get-in public-projection [:plan :outputs]))))
+      (is (link/retained-effect-evidence? (:plan public-projection)
+                                        (:effect-evidence public-projection) request))
+      (is (not (link/retained-effect-evidence? (:plan public-projection)
+                                             (:effect-evidence public-projection))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (equation-first/lower compilation arguments (fn [plan] {:plan plan}) proof)))
       (is (= (get-in projected [:plan :id]) (:plan (invocation-link/memory-witness certified request))))
       (is (thrown? clojure.lang.ExceptionInfo (invocation-link/certify-final-projection projected)))
       (is (thrown? clojure.lang.ExceptionInfo
