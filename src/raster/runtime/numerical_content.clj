@@ -218,6 +218,43 @@
   (.asSlice ^MemorySegment (:segment lease) (long (:byte-offset lease))
             (long (:byte-length lease))))
 
+(defn element-byte-reader
+  "Adapt synchronous whole-element downloads to bounded arbitrary byte windows.
+   download! receives [first-element element-count destination-segment] and must fill that
+   segment before returning. Reads preserve raw bits, never decode or convert byte order.
+   The returned reader accepts at most 64 KiB per call and is sequential, not thread-safe.
+   The caller supplies the exact extent/element width and owns source lifetime, completion,
+   immutability and representation evidence. This adapter establishes none of those facts."
+  [byte-length element-bytes download!]
+  (when-not (and (integer? byte-length) (<= 0 byte-length Long/MAX_VALUE)
+                 (integer? element-bytes) (<= 1 element-bytes 65536)
+                 (zero? (mod byte-length element-bytes)) (ifn? download!))
+    (fail! "element byte reader requires a whole-element extent and synchronous downloader"
+           :numerical-content-element-reader
+           {:byte-length byte-length :element-bytes element-bytes}))
+  (let [extent (long byte-length)
+        width (long element-bytes)
+        scratch (MemorySegment/ofArray (byte-array (+ 65536 (* 2 (dec width)))))]
+    (fn [offset destination]
+      (when-not (and (integer? offset) (<= 0 offset extent)
+                     (instance? MemorySegment destination))
+        (fail! "element byte read requires a valid offset and destination segment"
+               :numerical-content-element-read-range {:offset offset}))
+      (let [offset (long offset)
+            n (.byteSize ^MemorySegment destination)]
+        ;; Subtraction avoids overflowing offset + n before rejection.
+        (when-not (and (<= n 65536) (<= n (- extent offset)))
+          (fail! "element byte read exceeds its extent or staging window"
+                 :numerical-content-element-read-range {:offset offset :bytes n :extent extent}))
+        (when (pos? n)
+          (let [end (+ (long offset) n)
+                start (- offset (mod offset width))
+                aligned-end (+ end (mod (- width (mod end width)) width))
+                span (- aligned-end start)]
+            (download! (quot start width) (quot span width) (.asSlice scratch 0 span))
+            (MemorySegment/copy scratch (- offset start) destination 0 n)))
+        n))))
+
 (defn content-address-from-reader
   "Hash exactly byte-length stored bytes through one bounded 64-KiB staging segment.
    read! receives [byte-offset destination-segment], synchronously fills that entire segment,
