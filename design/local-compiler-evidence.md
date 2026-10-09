@@ -2039,8 +2039,15 @@ Intel/CUDA matrix epilogue sources retain the widened evaluation; the Intel
 Double helper and extension are defined once. CUDA/HIP CI fixture generation
 now includes dynamic unary tanh and binary pow inputs.
 
-The warm REPL passes 73 affected validation/emission/matrix tests and 1219
+The warm REPL passes 74 affected validation/emission/matrix tests and 1222
 assertions, including portable OpenCL source compilation and unchanged default
 emission. This is not yet public schedule wiring, native whole-model execution,
 CUDA/HIP compiler acceptance, or closure of the held training gate. Those remain
 the next steps; no numerical default, provider or acceptance tolerance changed.
+
+Independent review caught class-loader-sensitive `instance?` in the new physical
+requirement projection. It now uses the compiler's existing fully qualified
+record-kind checks, including expressions retained across warm-REPL reloads.
+The matrix fixture's mutation check follows the same handling. The final suite
+above was rerun after those fixes; expression-valued stores also retain their
+hidden Double demand without requiring a named Double SSA value.

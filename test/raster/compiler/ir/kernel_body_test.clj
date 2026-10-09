@@ -400,6 +400,16 @@
     (is (= :full (get-in kernel [:operations 4 :participation :kind])))
     (is (launch/launch-spec? (:launch kernel)))))
 
+(deftest physical-scalar-requirements-include-expression-valued-realizations
+  (let [expression (body/scalar-expression :tanh :float [(body/literal 0.5 :float)]
+                     {:math-realization numerics/widened-target-library-math})]
+    (is (= #{:float :double}
+           (body/required-scalar-dtypes [(body/->ScalarStore 'out [0] expression nil)])))
+    (is (= #{:float}
+           (body/required-scalar-dtypes [(body/scalar-expression :tanh :float
+                                          [(body/literal 0.5 :float)])])))
+    (is (= #{} (body/required-scalar-dtypes [(body/literal true :predicate)])))))
+
 (deftest widened-library-realization-retains-a-closed-float-contract
   (doseq [op [:tanh :pow]]
     (let [arguments (vec (repeat (:arity (intrinsics/descriptor op))

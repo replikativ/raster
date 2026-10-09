@@ -60,7 +60,8 @@
           widened (kernel-body/validate!
                    (walk/postwalk
                     (fn [value]
-                      (if (and (instance? raster.compiler.ir.kernel_body.ScalarExpr value)
+                      (if (and (= "raster.compiler.ir.kernel_body.ScalarExpr"
+                                  (some-> value class .getName))
                                (= :tanh (:op value)))
                         (assoc-in value [:options :math-realization]
                                   numerics/widened-target-library-math)

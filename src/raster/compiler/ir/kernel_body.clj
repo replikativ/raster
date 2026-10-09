@@ -175,12 +175,12 @@
   (into #{}
         (mapcat (fn [value]
                   (let [type (cond
-                               (instance? ValueSpec value) (:type value)
-                               (instance? Literal value) (:type value)
-                               (instance? ScalarExpr value) (:result-type value))]
+                               (record-kind? "raster.compiler.ir.kernel_body.ValueSpec" value) (:type value)
+                               (record-kind? "raster.compiler.ir.kernel_body.Literal" value) (:type value)
+                               (record-kind? "raster.compiler.ir.kernel_body.ScalarExpr" value) (:result-type value))]
                     (cond-> []
                       (and type (not= :predicate type)) (conj (dtype/canon type))
-                      (and (instance? ScalarExpr value)
+                      (and (record-kind? "raster.compiler.ir.kernel_body.ScalarExpr" value)
                            (numerics/widened-target-library-math?
                             (get-in value [:options :math-realization]))) (conj :double)))))
         (tree-seq coll? seq operations)))
