@@ -404,7 +404,11 @@
         ;; invocation promotion; schedule-program independently validates the typed union.
         semantic (assoc (typed-route/program-envelope source) :dialect :typed-parallel)]
     (doseq [[target dialect] [[ocl-target :opencl-portable] [cuda-target :cuda] [hip-target :hip]]]
-      (let [options {:target-device target :target-descriptor (compiler-hardware/descriptor-for target)
+      (let [options {:target-device target
+                     ;; Synthetic cross-compilation fixture: explicitly declare support for
+                     ;; the selected evaluation, then independently remove it below.
+                     :target-descriptor (assoc-in (compiler-hardware/descriptor-for target)
+                                                  [:execution :scalar-dtype-support :double] :supported)
                      :target-dialect dialect :dtype :float
                      :array-types {'input :float 'output :float} :scalar-types {'n :long}}
             scheduled (structured-route/schedule-program semantic options)
@@ -415,7 +419,14 @@
         (is (identical? emitted (emitted-program/validate! emitted request)))
         (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! emitted)))
         (is (= (:values semantic) (:values emitted)))
-        (is (some #(str/includes? (:source %) "double") (:kernels selected)))))))
+        (is (some #(str/includes? (:source %) "double") (:kernels selected)))
+        (try
+          (program-c-family/emit-program
+           scheduled (assoc-in (merge options request)
+                               [:target-descriptor :execution :scalar-dtype-support :double] :unknown))
+          (is false "whole-program emission must preserve frozen physical math admission")
+          (catch clojure.lang.ExceptionInfo error
+            (is (= :kernel-body-target-math-capability (:reason (ex-data error))))))))))
 
 (deftm c-family-four-layers
   "A multi-stage contraction fixture whose named middle value is a distinct resident tap."

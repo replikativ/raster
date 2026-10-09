@@ -88,8 +88,11 @@
 
 (defn emit
   "Project a scheduled product-consumer region to one executable C-family graph."
-  [kernel-name {:keys [scheduled graph refinement] :as routed} target-dialect]
-  (let [artifact (target/emit-artifact kernel-name scheduled target-dialect)
+  ([kernel-name routed target-dialect]
+   (emit kernel-name routed target-dialect {}))
+  ([kernel-name {:keys [scheduled graph refinement] :as routed} target-dialect caller-options]
+  (let [artifact (target/emit-artifact kernel-name scheduled target-dialect
+                                     (select-keys caller-options [:target-descriptor :scalar-math]))
         public-interface (graph/public-interface (:abi artifact) (:arguments artifact))
         pairs (mapv vector (:abi public-interface) (:arguments public-interface))
         pointers (filterv (fn [[slot _]] (not= :scalar (:kind slot))) pairs)
@@ -110,4 +113,4 @@
       (throw (ex-info "product-consumer target emission changed scheduled dataflow"
                       {:reason :product-consumer-emission-dataflow})))
     (scheduled/validate-artifact-projection! scheduled artifact)
-    (assoc routed :emitted emitted :artifact artifact)))
+    (assoc routed :emitted emitted :artifact artifact))))

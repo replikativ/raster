@@ -203,7 +203,9 @@
   (let [kernel-name (c-emit/c-symbol kernel-name)
         scheduled (mixed-body/schedule-matrix (assoc spec :kernel-name kernel-name))]
     (kernel-body-target/emit-artifact
-     kernel-name scheduled target-dialect {:parameter-names parameter-names})))
+     kernel-name scheduled target-dialect
+     (merge {:parameter-names parameter-names}
+            (select-keys spec [:target-descriptor :scalar-math])))))
 
 (defn- gemm-artifact
   [stage kernel-name phase target-dialect scalar-types caller-options]
@@ -216,7 +218,7 @@
     (emit-scheduled-matrix-artifact
      (merge (assoc spec :kernel-name kernel-name :target-dialect target-dialect
                         :parameter-names parameter-names)
-            (select-keys caller-options [:scalar-math])))))
+            (select-keys caller-options [:scalar-math :target-descriptor])))))
 
 (defn emit-split-k-combine-kernel
   "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
@@ -292,7 +294,7 @@
          stage-graph
          (fn [node]
            (let [artifact (emit-stage-artifact target-dialect prefix scalar-types node
-                                               (select-keys opts [:scalar-math]))
+                                               (select-keys opts [:scalar-math :target-descriptor]))
                  scheduled (kart/attribute artifact :scheduled-kernel-body)]
              (scheduled-body/validate-against-node! scheduled node stage-graph)
              (scheduled-body/validate-artifact-projection! scheduled artifact)
