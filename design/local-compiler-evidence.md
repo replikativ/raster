@@ -2236,3 +2236,14 @@ rejection. The intrinsic contract rejects a sqrt target-library override, so
 sqrt remains under its existing semantics rather than broadening policy to fit
 a test. Indexed body and route suites pass 24 tests / 198 assertions. Public
 selection and whole-graph reconstruction are still separate pending work.
+
+Paged weighted-reduction raw-body builders now accept independently validated
+caller scalar math in all five phases: reference, sequential cooperative,
+two-stage pipeline, tiled partial and online-state merge. Shared exp realization
+is threaded explicitly through steady-state consumes, both pipeline epilogues,
+odd tails and the scalar fallback. A tree-wide regression checks every generated
+exp leaf, unchanged parameters/launch/schedule, selected physical FP64 demand and
+its absence by default. Independent review found no missed exp construction
+site. The attention route suite passes 27 tests / 335 assertions. Artifact and
+scheduled numerical consent plus independent outer reconstruction remain pending;
+this raw-body slice does not enable public policy or change default routing.
