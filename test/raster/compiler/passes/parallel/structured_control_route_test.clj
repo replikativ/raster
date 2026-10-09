@@ -785,7 +785,28 @@
     (is (some? first-layer-rows))
     (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
         "program shape facts remain available when a later kernel has no ABI use for them")
-    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))))
+    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
+    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          emitted (:emitted compilation)
+          materialized (materialization/materialize invocation-plan arguments evaluate-test-scalar)
+          proof (emitted-program/validate-with-physical-results! emitted request)
+          projected (invocation-link/lower materialized emitted :ze:0 nil
+                                           (fn [plan] {:plan plan}) proof request)
+          certified (invocation-link/certify-final-projection projected request)
+          checked (invocation-link/certify (:plan projected) nil request)]
+      (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
+      (is (= 0 (get-in projected [:plan :attributes :driver-allocations])))
+      (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request))
+      (is (not (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected))))
+      (is (identical? certified (invocation-link/verify! certified request)))
+      (is (identical? checked (invocation-link/verify! checked request)))
+      (is (= (get-in projected [:plan :id]) (:plan (invocation-link/memory-witness certified request))))
+      (is (thrown? clojure.lang.ExceptionInfo (invocation-link/certify-final-projection projected)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (invocation-link/lower materialized emitted :ze:0 nil
+                                          (fn [plan] {:plan plan}) proof)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (invocation-link/certify (:plan projected) [] request))))))
 
 (deftest allocation-shape-definition-remains-an-ordered-host-equation
   (let [source '(let* [size (clojure.core/* nrows width)

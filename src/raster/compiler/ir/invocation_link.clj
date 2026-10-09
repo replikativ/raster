@@ -390,29 +390,27 @@
                    (update-in [:storage token :compiler-values] conj result))))))
        state (:results equation)))))
 
-(defn lower
+(defn- lower-for-request
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.
 
    `evaluate-host` is passed unchanged to EmittedParallelProgramCall for closed, effect-free host
    scalar equations. The returned plan is allocation-free; runtime contact starts only in
    raster.gpu.link/instantiate!.
-   The six-argument arity accepts internal exact-owner static evidence, not a runtime proof;
+   Retained validation is internal exact-owner static evidence, not a runtime proof;
    materialization, call bindings and final LinkPlan memory/effect obligations remain fresh.
    Only unchanged static program validation can be shared with final construction."
-  ([materialized parallel-program target evaluate-host]
-   (:plan (lower materialized parallel-program target evaluate-host
-                 (fn [plan] {:plan plan}))))
-  ([materialized parallel-program target evaluate-host project]
-   (lower materialized parallel-program target evaluate-host project nil))
-  ([materialized parallel-program target evaluate-host project retained-validation]
+  [materialized parallel-program target evaluate-host project retained-validation caller-options]
   (let [materialized (materialization/validate! materialized)
         ;; Without a retained owner, independently prove this exact program once for this
         ;; synchronous lowering. The same sealed report feeds the storage/call/final phases;
         ;; it is never published as authority on the returned plan or bound around callbacks.
         retained-validation (if retained-validation
-                              (emitted-program/checked-retained-validation!
-                               parallel-program retained-validation)
-                              (emitted-program/validate-with-physical-results! parallel-program))
+                              (if (nil? caller-options)
+                                (emitted-program/checked-retained-validation! parallel-program retained-validation)
+                                (emitted-program/checked-retained-validation! parallel-program retained-validation caller-options))
+                              (if (nil? caller-options)
+                                (emitted-program/validate-with-physical-results! parallel-program)
+                                (emitted-program/validate-with-physical-results! parallel-program caller-options)))
         parallel-program (:program retained-validation)
         _ (when-let [providers (seq (get-in parallel-program
                                            [:attributes :native-initialization-providers]))]
@@ -444,10 +442,15 @@
         ;; Shape-only invocation scalars are part of the physical program contract even when no
         ;; kernel ABI consumes them. Retain them in the call so logical N-D values can be proved
         ;; element-equivalent to flattened result storage at the LinkPlan boundary.
-        call (program-call/make parallel-program (:buffers realized) call-scalars
+        call (if (nil? caller-options)
+               (program-call/make parallel-program (:buffers realized) call-scalars
                                 (:loop-scratch realized) evaluate-host
                                 (into {} (keep :result-view) (vals (:storage realized)))
                                 retained-validation)
+               (program-call/make parallel-program (:buffers realized) call-scalars
+                                  (:loop-scratch realized) evaluate-host
+                                  (into {} (keep :result-view) (vals (:storage realized)))
+                                  retained-validation caller-options))
         resident-outputs (into [] (remove (comp typed-scalar? val)) (:outputs call))
         output-tokens (set (map val resident-outputs))
         storage (:storage realized)
@@ -513,8 +516,7 @@
         instance (link/program-instance-candidate
                   {:id [invocation-id :emitted-program] :call call
                    :attributes {:source :typed-invocation}})]
-    (link/make-with-final-projection
-     {:id [invocation-id :link-plan]
+    (let [request {:id [invocation-id :link-plan]
       :target target
       :nodes nodes
       :values values
@@ -530,8 +532,22 @@
                    :public-buffer-roles public-buffer-roles
                    :semantic-outputs resident-outputs
                    :host-outputs (into {} (filter (comp typed-scalar? val)) (:outputs call))
-                   :driver-allocations 0}}
-     project retained-validation))))
+                   :driver-allocations 0}}]
+      (if (nil? caller-options)
+        (link/make-with-final-projection request project retained-validation)
+        (link/make-with-final-projection request project retained-validation caller-options)))))
+
+(defn lower
+  "Lower a specialized invocation under independent caller math intent, without driver allocation."
+  ([materialized parallel-program target evaluate-host]
+   (:plan (lower-for-request materialized parallel-program target evaluate-host
+                            (fn [plan] {:plan plan}) nil nil)))
+  ([materialized parallel-program target evaluate-host project]
+   (lower-for-request materialized parallel-program target evaluate-host project nil nil))
+  ([materialized parallel-program target evaluate-host project retained-validation]
+   (lower-for-request materialized parallel-program target evaluate-host project retained-validation nil))
+  ([materialized parallel-program target evaluate-host project retained-validation caller-options]
+   (lower-for-request materialized parallel-program target evaluate-host project retained-validation caller-options)))
 
 (defn- derive-certificate
   [plan effect-evidence]
@@ -554,15 +570,17 @@
      (:outputs plan) (:aliases plan)
      (:driver-allocations attributes) effect-evidence)))
 
-(defn verify!
+(defn- verify-for-request!
   "Revalidate a typed invocation LinkPlan and independently rederive its composition witness."
-  [lowering]
+  [lowering caller-options]
   (when-not (certified-link? lowering)
     (fail! :invocation-link-certificate-type
            "expected a CertifiedInvocationLink"
            {:actual (type lowering)}))
   (let [{:keys [plan effect-evidence]}
-        (link/validate-with-effect-evidence! (:plan lowering))
+        (if (nil? caller-options)
+          (link/validate-with-effect-evidence! (:plan lowering))
+          (link/validate-with-effect-evidence! (:plan lowering) nil caller-options))
         expected (derive-certificate plan effect-evidence)]
     (when-not (certificate? (:certificate lowering))
       (fail! :invocation-link-certificate-type
@@ -573,6 +591,11 @@
              "typed invocation certificate does not match its LinkPlan"
              {:expected expected :actual (:certificate lowering)}))
     lowering))
+
+(defn verify!
+  "Independently reconstruct an invocation certificate under caller math intent."
+  ([lowering] (verify-for-request! lowering nil))
+  ([lowering caller-options] (verify-for-request! lowering caller-options)))
 
 (defn- retention-position
   [equation-index equation phase]
@@ -786,7 +809,7 @@
      :storage storage-report
      :unknown (vec unknown)}))
 
-(defn memory-witness
+(defn- memory-witness-for-request
   "Join a verified typed invocation's compiler storage identities to its LinkPlan memory facts.
 
    Compiler values may share a storage identity; physical destination names with no semantic
@@ -795,14 +818,18 @@
    effect evidence. Unsupported storage histories remain explicit unknowns. A future safety
    consumer must require the aggregate :value-versions status, not cherry-pick a storage entry.
    The returned report makes no selected-order, release, reuse, or completion decision."
-  [lowering]
-  (let [{:keys [plan certificate]} (verify! lowering)
-        report (link/memory-report plan)
+  [lowering caller-options]
+  (let [{:keys [plan certificate]} (if (nil? caller-options)
+                                    (verify! lowering) (verify! lowering caller-options))
+        report (if (nil? caller-options)
+                 (link/memory-report plan) (link/memory-report plan caller-options))
         bindings (:compiler-buffer-bindings certificate)
         ;; verify! already revalidates the bound EmittedParallelProgramCall through LinkPlan.
         call (get-in plan [:instances 0 :call])
         emitted (:program call)
-        actual-bindings (set (program-call/buffer-bindings call))
+        actual-bindings (set (if (nil? caller-options)
+                              (program-call/buffer-bindings call)
+                              (program-call/buffer-bindings call caller-options)))
         reported-bindings (set bindings)
         definitions (into {}
                           (mapcat (fn [{:keys [id results]}]
@@ -859,36 +886,60 @@
      :memory report
      :value-versions (dissoc version-witness :values)}))
 
-(defn certify
+(defn memory-witness
+  "Report verified invocation storage/value retention under independent math intent, not completion."
+  ([lowering] (memory-witness-for-request lowering nil))
+  ([lowering caller-options] (memory-witness-for-request lowering caller-options)))
+
+(defn- certify-for-request
   "Wrap a validated equation-first invocation LinkPlan in a checkable composition witness.
 
    An explicit output vector declares every escaped physical node (including taps and donations)
    before validation. It may extend/reorder, but never drop, the original semantic boundary.
    This retains physical storage; it does not snapshot earlier SSA versions sharing that storage."
-  ([plan]
-   (let [{:keys [plan effect-evidence]} (link/validate-with-effect-evidence! plan)]
+  [plan outputs caller-options]
+  (when (some? outputs)
+    (when-not (vector? outputs)
+      (fail! :invocation-link-output-boundary "escaped invocation outputs must be an ordered vector"
+             {:outputs outputs}))
+    (let [missing (set/difference (set (:outputs plan)) (set outputs))]
+      (when (seq missing)
+        (fail! :invocation-link-output-boundary
+               "escaped invocation outputs must retain the semantic output boundary"
+               {:missing missing :outputs outputs}))))
+  (let [plan (if (some? outputs) (assoc plan :outputs outputs) plan)
+        {:keys [plan effect-evidence]} (if (nil? caller-options)
+                                        (link/validate-with-effect-evidence! plan)
+                                        (link/validate-with-effect-evidence! plan nil caller-options))]
      ;; Construction and certificate derivation share the same validated immutable plan. External
      ;; boundaries retain `verify!` for independent re-derivation; repeating it here proves no new
      ;; fact and made every equation-first preparation pay for the certificate twice.
      (->CertifiedInvocationLink plan (derive-certificate plan effect-evidence))))
+
+(defn certify
+  "Certify under independent caller intent. An output vector may extend, never drop, escaped outputs."
+  ([plan] (certify-for-request plan nil nil))
   ([plan outputs]
    (when-not (vector? outputs)
      (fail! :invocation-link-output-boundary
             "escaped invocation outputs must be an ordered vector"
             {:outputs outputs}))
-   (let [missing (set/difference (set (:outputs plan)) (set outputs))]
-     (when (seq missing)
-       (fail! :invocation-link-output-boundary
-              "escaped invocation outputs must retain the semantic output boundary"
-              {:missing missing :outputs outputs})))
-   (certify (assoc plan :outputs outputs))))
+   (certify-for-request plan outputs nil))
+  ([plan outputs caller-options] (certify-for-request plan outputs caller-options)))
 
-(defn ^:no-doc certify-final-projection
+(defn- certify-final-projection-for-request
   "Certify the exact final LinkPlan just validated during construction. The retained effect
    witness is valid only for that same in-process plan; arbitrary callers use `certify`."
-  [{:keys [plan effect-evidence]}]
-  (when-not (link/retained-effect-evidence? plan effect-evidence)
+  [{:keys [plan effect-evidence]} caller-options]
+  (when-not (if (nil? caller-options)
+              (link/retained-effect-evidence? plan effect-evidence)
+              (link/retained-effect-evidence? plan effect-evidence caller-options))
     (fail! :invocation-link-effect-evidence
            "final projection requires evidence sealed to its exact validated plan"
            {:plan (:id plan)}))
   (->CertifiedInvocationLink plan (derive-certificate plan effect-evidence)))
+
+(defn ^:no-doc certify-final-projection
+  "Certify only exact final-plan evidence checked against this independent math request."
+  ([projected] (certify-final-projection-for-request projected nil))
+  ([projected caller-options] (certify-final-projection-for-request projected caller-options)))
