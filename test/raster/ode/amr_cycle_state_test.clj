@@ -107,3 +107,46 @@
                 (reason #(capture/capture! certified owner {} provider :local
                                            {:id :next :logical-coordinate {:step 1 :phase :synchronized}}))))
          (is (= :complete @(:state owner))))))))
+
+(deftest coordinates-cannot-add-drop-or-rewrite-unproved-facets
+  (fixture
+   (fn [certified owner _ _ reads]
+     (let [{:keys [provider submissions]} (#'provider-fixture/provider (fn [& _]))
+           opts {:id :next :logical-coordinate {:step 1 :phase :synchronized}}]
+       (doseq [[input output] [[{:step 0 :phase :synchronized} {:step 1 :phase :synchronized :time 999}]
+                               [{:step 0 :phase :synchronized :time 0} {:step 1 :phase :synchronized}]
+                               [{:step 0 :phase :synchronized :time 0} {:step 1 :phase :synchronized :time 999}]
+                               [{:step -1 :phase :synchronized} {:step 0 :phase :synchronized}]]]
+         (is (= :amr-cycle-capture-coordinate
+                (reason #(capture/capture! (assoc-in certified [:workload :plan :state :manifest :logical-coordinate] input)
+                                           owner {} provider :local (assoc opts :logical-coordinate output))))))
+       (is (empty? @reads)) (is (empty? @submissions))))))
+
+(deftest malformed-field-and-late-provider-errors-never-return-a-manifest
+  (fixture
+   (fn [certified owner _ _ reads]
+     (let [{:keys [provider submissions]} (#'provider-fixture/provider (fn [& _]))
+           opts {:id :next :logical-coordinate {:step 1 :phase :synchronized}}
+           other (#'runtime/seal-runtime-value
+                  (runtime/map->DistributedExecutable (assoc (into {} owner) :plan {:id :other})))]
+       (is (= :amr-cycle-capture-owner
+              (reason #(capture/capture! certified other {} provider :local opts))))
+       (is (= :amr-cycle-capture-field
+              (reason #(capture/capture! (assoc-in certified [:certificate :fields :coarse :domain :shape] [1 4])
+                                         owner {} provider :local opts))))
+       (is (empty? @reads)) (is (empty? @submissions))
+       (with-redefs [runtime/storage-representation-description
+                     (fn [& _] (throw (ex-info "missing fact" {:reason :distributed-representation-mismatch})))]
+         (is (= :distributed-representation-mismatch
+                (reason #(capture/capture! certified owner {} provider :local opts)))))
+       (let [awaits (atom 0)
+             {:keys [provider blobs events]}
+             (#'provider-fixture/provider
+              (fn [& _]
+                (when (= 2 (swap! awaits inc))
+                  (throw (ex-info "second field failed" {:reason :unit-second-field})))))]
+         (is (= :unit-second-field
+                (reason #(capture/capture! certified owner {} provider :local opts))))
+         (is (pos? (count @blobs)) "orphan content is permitted, but no manifest is returned")
+         (is (empty? @events))
+         (is (= :complete @(:state owner))))))))

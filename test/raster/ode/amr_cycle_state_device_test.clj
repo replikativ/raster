@@ -51,6 +51,7 @@
         first-expected (#'oracle/reference-cycle (:coarse initial) (:fine initial) 0.001 false)
         expected (#'oracle/reference-cycle (:coarse first-expected) (:fine first-expected) 0.001 false)]
     (doseq [role [:coarse :fine]]
+      (is (every? #(< (Math/abs (double %)) 1.0e-11) (map - (role first-expected) (role restored))))
       (is (every? #(< (Math/abs (double %)) 1.0e-11) (map - (role expected) (role actual)))))
     (is (empty? @events))
     (is (= [(get-in first-capture [:state :manifest :id])]

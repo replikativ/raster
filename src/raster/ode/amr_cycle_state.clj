@@ -16,7 +16,9 @@
    Revalidates the compiler certificate and exact original runtime plan, then retains the
    output read scope through hashing and synchronous ingestion. facts maps physical targets
    to original measured Double representation evidence. opts supplies :id and
-   :logical-coordinate; the latter must advance the input step once at synchronized phase.
+   :logical-coordinate; both input and output coordinates contain exactly nonnegative :step
+   and synchronized :phase. Physical time and other coordinate facets require an explicit
+   derived extension, not arbitrary caller overrides.
 
    Field geometry, policy and lineage come from the checked workload. Geometry and initial
    numerical meaning remain producer-attested, not authenticated by downloading bytes.
@@ -36,7 +38,9 @@
     (when-not (and (distributed/original-executable? executable) (= plan (:plan executable)))
       (fail! "cycle capture requires its exact original distributed execution"
              :amr-cycle-capture-owner {}))
-    (when-not (and (integer? step) (map? coordinate)
+    (when-not (and (integer? step) (not (neg? step)) (map? coordinate)
+                   (= #{:step :phase} (set (keys (:logical-coordinate input))))
+                   (= #{:step :phase} (set (keys coordinate)))
                    (= :synchronized (:phase coordinate)) (= (inc step) (:step coordinate))
                    (some? (:id opts)) (not= (:id input) (:id opts)))
       (fail! "cycle capture must advance to a distinct synchronized state"
@@ -46,6 +50,10 @@
      (fn [outputs]
        (let [completion (get-in certified [:certificate :completion])
              fields-by-id (into {} (map (juxt :id identity)) (:fields input))
+             _ (when-not (= (set (keys fields-by-id))
+                            (set (map :field (vals (get-in certified [:certificate :fields])))))
+                 (fail! "cycle capture requires exactly its two retained state fields"
+                        :amr-cycle-capture-fields {}))
              entries
              (mapv
               (fn [role]
@@ -62,6 +70,9 @@
                       width (dtype/bytes-of :double)
                       bytes (reduce #(Math/multiplyExact (long %1) (long %2)) (long width) shape)]
                   (when-not (and resident schema (= :double (:dtype physical))
+                                 (= :double (get-in schema [:value :dtype]))
+                                 (= {:kind :plain} (get-in schema [:value :representation]))
+                                 (nil? (get-in schema [:value :logical-layout]))
                                  (view/contiguous? physical) (= shape (:shape domain))
                                  ;; The verified local-domain binding may flatten a dense patch.
                                  ;; This changes rank, not ordering, coverage or byte extent.
