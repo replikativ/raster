@@ -13,6 +13,7 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.link-composition :as link-composition]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as gpu-link]
@@ -220,6 +221,30 @@
     (is (= :compiled-resident-math-request
            (reason-of #(compiled/lower #'artifact-map []
                                       {:compiler :resident-descriptor :scalar-math {:overrides {}}}))))))
+
+(deftest composition-certificate-requires-independent-math-intent
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        prepared (compiled/lower #'artifact-map [(float-array 4) 4]
+                                 (merge {:compiler :equation-first :target target :dtype :float} request))
+        lowering (:lowering prepared)
+        output (first (link-plan/output-value-ids (:plan lowering)))
+        specification {:id :selected-composition
+                       :components [{:id :a :lowering lowering}]
+                       :outputs [[:a output]]}
+        composition (link-composition/compose specification request)]
+    (is (identical? composition (link-composition/verify! composition request)))
+    (is (thrown? clojure.lang.ExceptionInfo (link-composition/verify! composition)))
+    (is (thrown? clojure.lang.ExceptionInfo (link-composition/compose specification)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (link-composition/verify! (assoc-in composition [:specification :attributes :scalar-math]
+                                                     (:scalar-math request)))))
+    (let [nested (link-composition/compose
+                  {:id :selected-nested-composition
+                   :components [{:id :outer :lowering composition}]
+                   :outputs [[:outer (first (link-plan/output-value-ids (:plan composition)))]]}
+                  request)]
+      (is (identical? nested (link-composition/verify! nested request)))
+      (is (thrown? clojure.lang.ExceptionInfo (link-composition/verify! nested))))))
 
 (deftest equation-compilation-round-trips-and-remains-lowerable
   (let [original @compilation
