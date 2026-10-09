@@ -460,7 +460,7 @@
    Prove the return against logical results and the existing physical-storage relation
    before attaching a whole-program invocation contract. Never recognize an operation
    by its source name to manufacture a missing continuation."
-  [parallel-program]
+  [parallel-program {:keys [return-tag]}]
   (let [source (:source parallel-program)
         _ (when-not (and (seq? source) (contains? #{'let 'let*} (first source)))
             (fail! :structured-control-invocation-source
@@ -532,7 +532,10 @@
     ;; Island outputs include host live-outs and conservative terminal values. Public
     ;; promotion changes only their escape boundary, never the equations/effects that
     ;; compute them. All returned leaves must have a typed producer or storage alias.
-    (assoc parallel-program :outputs (vec (distinct (returned-values (first body)))))))
+    (assoc parallel-program :outputs
+           (if (= 'void return-tag)
+             []
+             (vec (distinct (returned-values (first body))))))))
 
 (defn- validate-host-coverage!
   "Host-controlled bindings may remain in an island's retained source, but a complete
@@ -585,7 +588,7 @@
            "source-independent promotion cannot discard native allocation and host writes"
            {:destinations (vec providers)}))
   (let [parallel-program (-> parallel-program
-                             validate-source-result!
+                             (validate-source-result! options)
                              (assoc :dialect :typed-parallel)
                              validate-typed-program!)
         parallel-program (hoist-host-invocation-equations parallel-program)

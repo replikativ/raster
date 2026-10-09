@@ -770,7 +770,10 @@
                              (get-in parallel-program [:attributes :allocations] []))
         fields #{:destination :source-binding-id :extent :initialization :dtype}
         valid? (fn [allocation]
-                 (and (= fields (set (keys allocation)))
+                 (and (contains? #{fields (conj fields :source-expression)}
+                                 (set (keys allocation)))
+                      (or (not (contains? allocation :source-expression))
+                          (seq? (:source-expression allocation)))
                       (integer? (:source-binding-id allocation))
                       (not (neg? (:source-binding-id allocation)))
                       (or (= elements (:extent allocation))

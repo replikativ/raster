@@ -855,6 +855,13 @@
           "the public projection must not expose an unrelated island live-out")
       (is (= (:equations extra-output) (:equations (route/promote-program extra-output options)))
           "output projection retains internal equations and effects for explicit physical escapes")
+      (let [void-program (route/promote-program complete (assoc options :return-tag 'void))]
+        (is (empty? (:outputs void-program))
+            "a declared Void invocation does not expose its stored operation's buffer return")
+        (is (= (:equations complete) (:equations void-program))))
+      (is (= :structured-control-source-result
+             (reason-of #(route/promote-program partial (assoc options :return-tag 'void))))
+          "Void does not authorize an uncovered host continuation")
       (is (= :structured-control-host-continuation
              (reason-of #(route/promote-program
                           (assoc complete :source '(let* [y (clojure.core/println x)] y))

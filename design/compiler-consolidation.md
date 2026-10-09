@@ -1731,6 +1731,17 @@ Clojure aggregate topology, ordering or duplicate return leaves. Generated resul
 are checked against the same typed-equation allocation constructor used by realization, not
 merely a zero-initialization label. Host removability inherits the existing effect authority;
 compiler-owned source/allocation metadata is not a general proof-carrying input format.
+The physical deftm's retained return tag controls Void projection: its equations and destination
+writes remain, but their buffer-return implementation does not create a public output. Void
+still requires complete source coverage. Original allocation witnesses retain their exact source
+expression; certified array-length reads use the shared semantic operator descriptor, including
+devirtualized reads, rather than parsing specialization names. Scheduling preserves that optional
+provenance field alongside the existing checked allocation semantics.
+Exact immutable shape reads and their canonical casts reuse a dominating source scalar when
+normalizing allocation/launch extents. The first check remains at its original source position;
+mutable element reads and opaque size functions do not receive this authority. This avoids a
+duplicate extent identity and preserves the scan's existing complete-write initialization proof
+and three-kernel schedule without dropping a genuine zero-initialization obligation.
 
 The unsupported scalar objective therefore fails before allocation instead of returning a wrong
 array. This is a correctness prerequisite, not completed loss support. Next, lower the complete
