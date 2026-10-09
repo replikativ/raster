@@ -355,7 +355,8 @@
 (def simd-isa
   {:avx2
    {:f64 {:vtype "__m256d" :lanes 4 :set1 "_mm256_set1_pd" :loadu "_mm256_loadu_pd"
-          :storeu "_mm256_storeu_pd" :setzero "_mm256_setzero_pd"}
+          :storeu "_mm256_storeu_pd" :setzero "_mm256_setzero_pd"
+          :from-f32-load "_mm_loadu_ps" :from-f32 "_mm256_cvtps_pd"}
     :f32 {:vtype "__m256"  :lanes 8 :set1 "_mm256_set1_ps" :loadu "_mm256_loadu_ps"
           :storeu "_mm256_storeu_ps" :setzero "_mm256_setzero_ps"
           ;; widening conversion i32×8 → f32×8 (the int8-MAC/quant fold boundary)

@@ -1625,3 +1625,25 @@ execution regression before a global no-erasure claim. Safe typed scalar
 optimizations should derive from existing declared signatures and canonical
 conversion/numeric authorities, not reintroduce generic rewriting through a
 different namespace. Compile-size and performance effects remain to be measured.
+
+### Native SIMD storage precision is independent of arithmetic precision
+
+C-SIMD previously selected a vector pointer load from the arithmetic species
+alone. A Double map/reduction over a retained Float array therefore emitted a
+Double pointer load, which can read the wrong values and exceed the allocation.
+The emitter now checks the existing AOT storage-type environment. AVX2 supports
+Float storage into Double arithmetic with a four-Float load followed by an exact
+four-lane widening conversion, declared in the existing intrinsics facet. Vector
+iteration and scalar tails use the same arithmetic precision; reduction-tail
+products explicitly widen each Float operand before multiplication.
+
+Unsupported known byte/long storage, narrowing loads, and conflicting output
+storage decline before vector emission. Existing i32-to-Float map widening remains
+supported; it is not permission to reinterpret byte or Long arrays as i32 arrays.
+Only an entirely empty storage environment retains the legacy direct-emitter
+interface; partial environments require every accessed/output storage fact and
+fail closed if propagation omitted one. This is not a proof of arbitrary
+mixed-storage support. Native map/reduction tests cover changed
+inputs and lengths around vector boundaries; no model oracle or tolerance changes.
+This enables a genuine storage conversion but does not yet implement mixed
+arithmetic domains or Double-compute-to-Float-store quantized folds.

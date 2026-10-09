@@ -5,9 +5,13 @@
    #27 (the C analog of jvm/segop_simd), validated in isolation before the
    pipeline wiring. Guarded on clang + a machine that runs AVX2."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
+            [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.backend.jvm.segop-simd :as ss]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.reduction :as reduction]
@@ -133,6 +137,96 @@
    :lambda '(.invk raster.numeric/_plus__m_double_double-impl
                    (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
                    (clojure.core/aget b (long L)))})
+
+(deftm mixed-storage-double-map!
+  [x :- (Array float), y :- (Array double), gain :- Double, cnt :- Long] :- (Array double)
+  (par/map! y i cnt double (+ (double (aget x i)) gain))
+  y)
+
+(deftest public-native-map-retains-storage-and-arithmetic-precision
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'mixed-storage-double-map! :double :simd? true)]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" (:c-source (meta native)))
+          "public typed source reaches the converting-load schedule")
+      (doseq [n [3 4 5 9 17] gain [1.0e-9 -0.125]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array n)
+              jvm (double-array n)
+              expected (mapv #(+ (double %) gain) x)]
+          (native x y (double gain) (long n))
+          (mixed-storage-double-map! x jvm (double gain) (long n))
+          (is (= expected (vec jvm) (vec y))
+              (str "public JVM/native changed-input parity, n=" n)))))))
+
+(deftest mixed-floating-storage-uses-converting-vector-loads
+  (when (clang-avx2?)
+    (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :double
+                     :out-sym 'y :cast-fn 'double
+                     :lambda '(+ (double (aget x i)) (double gain))}
+          {:keys [includes block]}
+          (binding [cs/*array-types* '{x :float y :double}
+                    ce/*emit-config* cpu/cpu-config ce/*scalar-type* "double"]
+            (cs/compile-segmap-c operation :avx2 '#{x y}))
+          native (cpu/load-kernel
+                  (cpu/compile-source!
+                   (str includes "void mixed(const float* x, double* y, double gain, int n){"
+                        block "}")) "mixed" 2 [:double :int])]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" block))
+      (doseq [n [3 4 5 9 17] gain [1.0e-9 -0.125]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array n)]
+          (native x y (double gain) (int n))
+          (is (= (mapv #(+ (double %) gain) x) (vec y))
+              (str "Float loads, Double arithmetic and scalar tail agree, n=" n)))))
+    (let [{:keys [includes helpers block]}
+          (binding [cs/*array-types* '{x :float}]
+            (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x}))
+          native (cpu/load-kernel
+                  (cpu/compile-source!
+                   (str includes helpers "void mixed_ssq(const float* x, double* out, int n){"
+                        "double acc;" block "out[0]=acc;}")) "mixed_ssq" 2 [:int])]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" block))
+      (doseq [n [3 4 5 17 33]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array 1)
+              expected (reduce + 0.0 (map #(* (double %) (double %)) x))]
+          (native x y (int n))
+          (is (< (Math/abs (- expected (aget y 0))) (* 1e-14 (max 1.0 expected)))
+              (str "Double products remain Double in reduction tail, n=" n)))))))
+
+(deftest unsupported-storage-widths-decline-before-vector-emission
+  (doseq [storage [:byte :long :double]]
+    (binding [cs/*array-types* {'a storage 'out :float}]
+      (is (nil? (cs/compile-segmap-c
+                 {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                  :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
+                 :avx2 '#{a out})))))
+  (doseq [storage [:byte :long :int]]
+    (binding [cs/*array-types* {'x storage}]
+      (is (nil? (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x})))))
+  (binding [cs/*array-types* '{a :float out :double}]
+    (is (nil? (cs/compile-segmap-c
+               {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
+               :avx2 '#{a out})))
+        "store pointer width must match the declared output dtype"))
+
+(deftest partial-storage-environments-fail-closed
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :double
+                   :out-sym 'y :cast-fn 'double :lambda '(double (aget x i))}]
+    (doseq [environment ['{y :double} '{x :float} '{other :double}]]
+      (binding [cs/*array-types* environment]
+        (is (nil? (cs/compile-segmap-c operation :avx2 '#{x y}))
+            "a partial retained environment cannot guess a missing input or output width")))
+    (binding [cs/*array-types* '{other :double}]
+      (is (nil? (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x}))
+          "reductions also require every accessed storage fact"))
+    (let [original intrinsics/simd-type-info]
+      (binding [cs/*array-types* '{x :float y :double}]
+        (with-redefs [intrinsics/simd-type-info
+                      (fn [isa elem] (dissoc (original isa elem) :from-f32-load))]
+          (is (nil? (cs/compile-segmap-c operation :avx2 '#{x y}))
+              "converting loads require both load and conversion facet entries"))))))
 
 (deftest segmap-elementwise-matches-scalar
   (testing "y[L]=a[L]*s+b[L] via compile-segmap-c == scalar, f64 and f32"
