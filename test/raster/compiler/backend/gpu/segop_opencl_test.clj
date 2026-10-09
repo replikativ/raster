@@ -73,7 +73,20 @@
     (is (= #{:float} (kernel-body/required-scalar-dtypes
                       (get-in ordinary [:body :operations]))))
     (is (= #{:float :double} (kernel-body/required-scalar-dtypes
-                              (get-in selected [:body :operations]))))))
+                              (get-in selected [:body :operations]))))
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (let [descriptor {:execution {:scalar-dtype-support {:double :supported}}}
+            artifact (sg/generate-scheduled-segmap-kernel
+                      operation :array-types (:array-types options) :scalar-math policy
+                      :target-descriptor descriptor :target-dialect dialect)]
+        (is (= policy (get-in artifact [:provenance :scheduled-operation :numerics :scalar-math]))))
+      (try
+        (sg/generate-scheduled-segmap-kernel
+         operation :array-types (:array-types options) :scalar-math policy
+         :target-descriptor {} :target-dialect dialect)
+        (is false "map wrapper must preserve caller hardware admission context")
+        (catch clojure.lang.ExceptionInfo error
+          (is (= :kernel-body-target-math-capability (:reason (ex-data error)))))))))
 
 (deftest portable-map-empty-extent-has-a-masked-valid-launch
   (let [operation (segop/->SegMap
