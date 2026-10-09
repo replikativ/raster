@@ -2155,6 +2155,15 @@ packed suites pass 25 tests / 169 assertions, including native default-route
 checks. Independent public reconstruction/admission remains future work; this
 private producer plumbing does not claim closure of the held Gemma model gate.
 
+Product-reduction elements and tuple-combine regions now use the same explicitly
+selected scalar realization through their shared lowerer. Schedules retain optional
+normalized consent without changing component accumulators or the declared product
+tree. Source and graph reconstruction require caller-owned consent; old arities
+retain the default and cannot validate a selected candidate. Graph access/capacity
+admission still derives storage evidence independently. Product producer/consumer,
+shared scalar and scan emitter suites pass 120 tests / 1063 assertions. Public
+selection remains disabled pending the remaining owners and outer admission.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec
