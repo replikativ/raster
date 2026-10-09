@@ -218,6 +218,19 @@
       (is (= [:independent request] (last @calls))))
     (is (= :compiled-composition-math-request
            (reason-of #(compiled/compose {:id :contextual :components [{:id :a :program prepared}]}))))
+    (let [specification {:id :contextual
+                         :components [{:id :a :program prepared}]
+                         :outputs [{:key :result :from [:a (:key (first (:out-tree prepared)))]}]}
+          composite (compiled/compose specification request)
+          independently-checked (compiled/compose
+                                 (assoc-in specification [:components 0 :program] copied) request)]
+      (is (= request (:math-request composite)))
+      (is (= request (:math-request independently-checked)))
+      (is (= :compiled-composition-math-request
+             (reason-of #(compiled/compose specification {:scalar-math {:overrides {}}}))))
+      (with-redefs [gpu-link/instantiate-certified! (fn [_ opts] (swap! calls conj [:composite opts]) ::executable)]
+        (is (compiled/compiled? (compiled/instantiate! composite)))
+        (is (= [:composite request] (last @calls)))))
     (is (= :compiled-resident-math-request
            (reason-of #(compiled/lower #'artifact-map []
                                       {:compiler :resident-descriptor :scalar-math {:overrides {}}}))))))
@@ -470,6 +483,15 @@
                   (is (= :exact-bound-program (:scope selected-id)))
                   (is (= (select-keys selected-id [:scope :fingerprint])
                          (:program (compiled/producer-interface selected))))
+                  (let [composite (compiled/compose
+                                   {:id :selected-identity-composition
+                                    :components [{:id :a :program selected}]
+                                    :outputs [{:key :result :from [:a (:key (first (:out-tree selected)))]}]}
+                                   request)
+                        identity (compiled/execution-identity composite)]
+                    (is (= :exact-bound-program (:scope identity)))
+                    (is (= (select-keys identity [:scope :fingerprint])
+                           (:program (compiled/producer-interface composite)))))
                   (is (not= (:fingerprint a) (:fingerprint selected-id))
                       "even an unused policy is part of the exact caller compilation identity")
                   (is (= :compiled-execution-identity-owner

@@ -1088,14 +1088,16 @@
     :composition
     (let [components (:components lowering)
           reports (:components report)]
-      (link-composition/verify! lowering)
+      (if caller-options
+        (link-composition/verify! lowering caller-options)
+        (link-composition/verify! lowering))
       (when-not (= (mapv :id components) (mapv :id reports))
         (throw (ex-info "composition reports must follow their exact certified components"
                         {:reason :compiled-execution-identity-components})))
       {:components (mapv (fn [component component-report]
                            {:id (:id component)
                             :artifact (exact-artifact-evidence
-                                       (:lowering component) (:report component-report))})
+                                       (:lowering component) (:report component-report) caller-options)})
                          components reports)
        :specification (:specification lowering)})
 
@@ -1159,7 +1161,7 @@
                        :available (mapv :key entries)})))
     (first matches)))
 
-(defn compose
+(defn- compose-for-request
   "Compose independently lowered Prepared artifacts through semantic boundary keys.
 
    Request shape:
@@ -1178,8 +1180,10 @@
    refresh, and exports its final state. Constants cannot be mutable borrowers; ranged views and
    escaped earlier aliases remain rejected. One linked executable owns replay and output leases."
   [{:keys [id components connections shares mutable-shares outputs attributes]
-    :or {connections [] shares [] mutable-shares [] attributes {}}}]
+    :or {connections [] shares [] mutable-shares [] attributes {}}} options]
   (let [preparation-started (System/nanoTime)
+        caller-options (when (contains? options :scalar-math)
+                         {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options))})
         components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
                                           (prepared? (:program component)))
@@ -1187,8 +1191,15 @@
                                      "each compiled component requires :id and a Prepared :program"
                                      {:reason :compiled-composition-component
                                       :component component})))
-                           (when (some? (:math-request (:program component)))
-                             (throw (ex-info "composition does not yet support contextual math components"
+                           (when (and (some? (:math-request (:program component))) (nil? caller-options))
+                             (throw (ex-info "contextual composition requires independent caller math intent"
+                                             {:reason :compiled-composition-math-request
+                                              :component (:id component)})))
+                           (when (and caller-options (sealed-artifact? (:program component))
+                                      (not= (:scalar-math caller-options)
+                                            (numerics/validate-scalar-math-policy!
+                                             (get-in component [:program :math-request :scalar-math]))))
+                             (throw (ex-info "composition caller intent differs from original component intent"
                                              {:reason :compiled-composition-math-request
                                               :component (:id component)})))
                            component)
@@ -1259,10 +1270,15 @@
                             {:reason :compiled-composition-donation
                              :expected component-donations :owners donation-owners})))
         prevalidated? (every? (comp sealed-artifact? :program) components)
+        compose-lowering (if prevalidated?
+                           link-composition/compose-prevalidated
+                           link-composition/compose)
+        compose-lowering-for-request (fn [request]
+                                       (if caller-options
+                                         (compose-lowering request caller-options)
+                                         (compose-lowering request)))
         low-level
-        ((if prevalidated?
-           link-composition/compose-prevalidated
-           link-composition/compose)
+        (compose-lowering-for-request
          {:id id
           :components (mapv (fn [{:keys [id program]}]
                               {:id id :lowering (:lowering program)})
@@ -1331,10 +1347,19 @@
                 :nodes (count (get-in low-level [:plan :nodes]))
                 :instances (count (get-in low-level [:plan :instances]))}]
     (seal-artifact
-     (->Prepared low-level in-tree out-tree
+     (cond-> (->Prepared low-level in-tree out-tree
                  (into {} (map (juxt :owner :output-key)) resolved-mutable-shares)
                  schedules (:target (:plan low-level))
-                 descriptor [] report nil))))
+                 descriptor [] report nil)
+       caller-options (assoc :math-request caller-options)))))
+
+(defn compose
+  "Compose semantic Prepared boundaries before allocation. The optional second argument supplies
+   independent :scalar-math intent; contextual components never authorize it themselves. Every
+   original component must agree, copied components are independently reconstructed, and the
+   exact resulting Prepared retains this caller intent for instantiation and evidence queries."
+  ([request] (compose-for-request request nil))
+  ([request options] (compose-for-request request options)))
 
 (defn compile
   "Lower and instantiate a deftm as one callable Compiled artifact. Use `lower`, `compose`, then
