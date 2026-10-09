@@ -9,11 +9,13 @@
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-loop-call :as loop-call]
+            [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (defn- loop-program
   ([] (loop-program false))
-  ([chained?]
+  ([chained?] (loop-program chained? false))
+  ([chained? math?]
    (let [extent (av/tensor {:dtype :int :shape []})
          trip-index (av/tensor {:dtype :long :shape []})
          scalar (av/tensor {:dtype :float :shape []})
@@ -26,7 +28,9 @@
                      '[u-in] '[alpha-in iteration]
                      (soac/lambda-form
                       '[u-value alpha-value iteration-value]
-                      '[(+ u-value alpha-value (* 0.0 iteration-value))])))
+                      (if math?
+                        '[(Math/tanh (+ u-value alpha-value (* 0.0 iteration-value)))]
+                        '[(+ u-value alpha-value (* 0.0 iteration-value))]))))
          first-equation (assoc (vec equation) 1 'advance-first 2 [first-result])
          first-equation (apply list first-equation)
          second-equation
@@ -56,6 +60,50 @@
       [{:initial 'u0 :parameter 'u-in :result 'u-next :output 'u-final}]
       body
       {'steps trip-index 'n extent 'alpha scalar 'u0 tensor 'u-final tensor}))))
+
+(deftest structured-loop-scalar-math-consent-is-independent
+  (let [scheduled (lower/schedule (loop-program true true) {:target-device :cpu:0 :dtype :float})
+        graph (:graph scheduled)
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        options {:scalar-types {'alpha-in :float 'iteration :long 'n-in :int}
+                 :array-types {'u-in :float 'u-temporary :float 'u-next :float}}
+        certificates (fn [caller-options]
+                       (into {} (map (fn [node]
+                                       [(:id node)
+                                        (segmap-body/schedule (:operation node)
+                                                             (merge options caller-options))]))
+                             (:nodes graph)))
+        emit (fn [caller-options]
+               (opencl/generate-kernel-graph graph
+                                            :scalar-types (:scalar-types options)
+                                            :scheduled-bodies (certificates caller-options)))
+        selected (emit {:scalar-math policy})
+        default (emitted-loop/make scheduled (emit {}))
+        accepted (emitted-loop/make scheduled selected {} {:scalar-math policy})]
+    (is (= accepted (emitted-loop/validate! accepted {:scalar-math policy})))
+    (is (= scheduled (:schedule accepted)) "math realization cannot change loop semantics")
+    (is (= (:arguments (:graph default)) (:arguments selected)))
+    (is (= (mapv :dependencies (:nodes (:graph default)))
+           (mapv :dependencies (:nodes selected))))
+    (is (thrown? clojure.lang.ExceptionInfo (emitted-loop/make scheduled selected)))
+    (is (thrown? clojure.lang.ExceptionInfo (emitted-loop/validate! accepted)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-loop/validate! default {:scalar-math policy})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-loop/validate! (assoc-in accepted [:attributes :scalar-math] policy))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emitted-loop/validate! accepted {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))
+    (is (= default (emitted-loop/validate! default)))
+    (let [legacy (update-in default [:graph :nodes]
+                            (fn [nodes]
+                              (mapv (fn [node source-node]
+                                      (assoc-in node [:operation :provenance :scheduled-operation]
+                                                (:operation source-node)))
+                                    nodes (:nodes graph))))]
+      (is (= legacy (emitted-loop/validate! legacy)))
+      (is (= :emitted-structured-loop-math-owner
+             (try (emitted-loop/validate! legacy {:scalar-math policy}) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
 
 (deftest structured-control-takes-the-shared-soac-schedule-vertical
   (let [scheduled (lower/schedule (loop-program) {:target-device :cpu:0 :dtype :float})
