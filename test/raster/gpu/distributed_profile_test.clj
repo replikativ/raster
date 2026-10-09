@@ -1,6 +1,7 @@
 (ns raster.gpu.distributed-profile-test
   "Hardware-free execution plumbing, not compiler/device completion evidence."
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as view]
             [raster.gpu.core :as gpu]
             [raster.gpu.distributed :as runtime]
@@ -10,7 +11,7 @@
 (defn owner []
   (runtime/map->DistributedExecutable
    {:plan {:id :test-plan} :state (atom :ready)
-    :sessions {:physical (atom {:session-id :test-session})}
+    :sessions {:physical (atom {:session-id :test-session :device-id :physical-device})}
     :readiness {:actions []}
     :projections {:first {:plan {:target :physical :nodes {}}}
                   :second {:plan {:target :physical :nodes {}}}}
@@ -23,6 +24,10 @@
 (deftest profile-is-the-only-replay-and-retains-physical-context
   (let [executable (owner) calls (atom []) opts (atom []) closes (atom 0)]
     (with-redefs [gpu/execution-device-info (constantly {:driver :test-driver})
+                  hardware/descriptor-for (fn [device]
+                                            (is (= :physical-device device))
+                                            {:device-id device :driver-version "test"
+                                             :calibration-version 3 :unrelated :ignored})
                   link/instantiate! (fn [_ options]
                                       (swap! opts conj options)
                                       (reify java.io.Closeable (close [_] (swap! closes inc))))
@@ -41,6 +46,8 @@
         (is (= [:first :second] (mapv :step (:steps report))))
         (is (= [:first] (get-in report [:steps 1 :dependencies])))
         (is (= :test-session (get-in report [:devices-before :physical :session-id])))
+        (is (= {:device-id :physical-device :driver-version "test" :calibration-version 3}
+               (get-in report [:devices-before :physical :hardware-evidence])))
         (is (= (:devices-before report) (:devices-after report)))
         (is (every? #(= :device-events (get-in % [:kernel-profile :timing-source])) (:steps report)))
         (is (every? #(<= 0 (:host-wall-ns %)) (:steps report)))
@@ -61,6 +68,7 @@
       (is (= [:run :run] @calls))))
   (let [executable (owner) calls (atom 0) closes (atom 0)]
     (with-redefs [gpu/execution-device-info (constantly {})
+                  hardware/descriptor-for (constantly {})
                   link/instantiate! (fn [& _] (reify java.io.Closeable (close [_] (swap! closes inc))))
                   link/profile! (fn [_] (when (= 2 (swap! calls inc))
                                          (throw (ex-info "second step failed" {}))))]
@@ -101,6 +109,7 @@
 (deftest hardware-drift-does-not-publish-a-completed-observation
   (let [executable (owner) snapshots (atom 0)]
     (with-redefs [gpu/execution-device-info (fn [_] {:driver (swap! snapshots inc)})
+                  hardware/descriptor-for (constantly {})
                   link/instantiate! (fn [& _] (reify java.io.Closeable (close [_])))
                   link/profile! (constantly {})]
       (is (= :distributed-profile-device-drift
@@ -153,6 +162,24 @@
         (is (= :closed @(:state executable)))
         (is (nil? @staging))
         (is (not (.isAlive (.scope ^MemorySegment @retained))))))))
+
+(deftest calibration-drift-invalidates-otherwise-stable-device-observation
+  (doseq [field [:calibration-version :bandwidth-bytes-s]]
+    (let [executable (owner) snapshots (atom 0)]
+      (with-redefs [gpu/execution-device-info (constantly {:driver :stable})
+                    hardware/descriptor-for (fn [_]
+                                              {:device-id :physical-device
+                                               field (swap! snapshots inc)})
+                    link/instantiate! (fn [& _] (reify java.io.Closeable (close [_])))
+                    link/profile! (constantly {})]
+        (let [failure (try (#'runtime/execute! executable true)
+                           (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+          (is (= :distributed-profile-device-drift (:reason failure)))
+          (is (= (get-in failure [:before :physical :device])
+                 (get-in failure [:after :physical :device])))
+          (is (= 1 (get-in failure [:before :physical :hardware-evidence field])))
+          (is (= 2 (get-in failure [:after :physical :hardware-evidence field])))
+          (is (= :failed @(:state executable))))))))
 
 (deftest shared-cleanup-errors-do-not-stop-independent-session-teardown
   (let [failure (ex-info "shared teardown failure" {}) calls (atom [])

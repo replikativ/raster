@@ -1,5 +1,18 @@
 # Compiler unification campaign
 
+### October 9 distributed profiling hardware-evidence context
+
+Distributed profiling now retains the existing HardwareDescriptor evidence
+signature for each physical session, alongside live backend device/driver and
+session identity. Queries use the session device, not a logical worker label.
+Before/after calibration-version or admitted bandwidth drift invalidates the
+observation; normal unprofiled execution is unchanged. Focused hardware-free
+and real OpenCL/Level Zero context tests cover this boundary. These signatures
+are necessary context for measured route-cost admission, not measurements of
+the fabric, automatic topology discovery or an adaptive cost overlay. Exact
+route/byte/transport/staging matching and noisy/stale sample admission remain
+the next distributed calibration slice; analytical simulation remains a seed.
+
 ### October 9 shared physical service lanes
 
 Directed links may now explicitly declare `:attributes :serialization-domains`,
