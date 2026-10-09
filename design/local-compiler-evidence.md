@@ -2076,6 +2076,16 @@ Public schedule admission remains disabled until outer consent, all producer
 paths and independent reconstruction carry the same policy. Neither this local
 evidence nor the optional policy closes the held whole-model training gate.
 
+Fused result-region lowering and the internal SegMap producer now forward that
+same optional policy to the shared builder. Map scheduling retains its normalized
+form in the existing numerical contract only when supplied; omitted options keep
+the old contract shape. Logical result, accumulator and store dtypes do not
+change. Independent review approved this producer/certificate wiring. The warm
+REPL passes the 103 affected map/emitter, scalar-region and scheduled-body tests
+with 957 assertions after refreshing the stale stencil index-expression class
+dependency. Backend/public scheduling and independent outer reconstruction remain
+unwired; no public selection or full-model acceptance is claimed by this slice.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec

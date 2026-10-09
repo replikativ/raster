@@ -99,7 +99,7 @@
    Axis maps remain owner-proved coordinates; scalar arithmetic and conversion widths are
    retained per expression rather than inherited from the final store dtype."
   [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate
-                  id-prefix]}]
+                  id-prefix scalar-math]}]
   (let [accumulator-id (first (:parameters region))
         operands (into {} (map (juxt :sym identity)) (:operands region))
         scalar-ids (drop (inc (count operands)) (:parameters region))
@@ -129,6 +129,7 @@
                   :array-types (into {} (map (fn [[id operand]] [id (get operand :dtype :float)]))
                                      operands)
                   :scalar-types scalar-types
+                  :scalar-math scalar-math
                   :source-region [expression accumulator (keys parameters)]
                   :require-source-types? true
                   :lower-index (fn [x _] x)

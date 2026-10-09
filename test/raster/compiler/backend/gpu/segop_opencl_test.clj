@@ -56,6 +56,24 @@
                     certificate node candidate closed-algorithm closed-body))
           "an independent graph capacity or incomplete proof context cannot authorize the alias"))))
 
+(deftest portable-map-retains-selected-math-consent
+  (let [operation (segop/->SegMap
+                   903 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   (with-meta '(raster.numeric/tanh (clojure.core/aget input i))
+                     {:raster.type/tag 'float})
+                   nil #{'input} #{'output} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)
+        options {:array-types {'input :float 'output :float} :workgroup-size 32}
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (segmap-body/schedule operation options)
+        selected (segmap-body/schedule operation (assoc options :scalar-math policy))]
+    (is (not (contains? (:numerics ordinary) :scalar-math)))
+    (is (= policy (get-in selected [:numerics :scalar-math])))
+    (is (= #{:float} (kernel-body/required-scalar-dtypes
+                      (get-in ordinary [:body :operations]))))
+    (is (= #{:float :double} (kernel-body/required-scalar-dtypes
+                              (get-in selected [:body :operations]))))))
+
 (deftest portable-map-empty-extent-has-a-masked-valid-launch
   (let [operation (segop/->SegMap
                    902 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)

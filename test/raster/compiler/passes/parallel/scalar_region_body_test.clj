@@ -509,6 +509,27 @@
     (is (= {:overflow :trap} (get-in result [:operations 0 :expression :options]))
         "typed emission does not invent a no-overflow proof for this owner")))
 
+(deftest result-region-retains-selected-math-without-changing-logical-types
+  (let [region (body/->ScalarRegion
+                ['acc] (with-meta '(raster.numeric/tanh acc) {:raster.type/tag 'float})
+                [] :float)
+        options {:accumulator 'carry :accumulator-dtype :float :store-dtype :float
+                 :parameters {} :indices []}
+        ordinary (result-region/lower-region region options)
+        selected (result-region/lower-region
+                  region (assoc options :scalar-math
+                                {:overrides {[:tanh :float] :f64-target-library-rte-f32}}))]
+    (is (= :float (:result-dtype selected)))
+    (is (= :float (:accumulator-dtype selected)))
+    (is (= numerics/target-library-math
+           (get-in ordinary [:operations 0 :expression :options :math-realization])))
+    (is (= numerics/widened-target-library-math
+           (get-in selected [:operations 0 :expression :options :math-realization])))
+    (is (= #{:float :double} (body/required-scalar-dtypes (:operations selected))))
+    (is (= :scalar-math-policy
+           (try (result-region/lower-region region (assoc options :scalar-math {:overrides nil}))
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest result-region-axis-map-is-the-only-coordinate-authority
   (let [region (body/->ScalarRegion
                 ['acc 'x] '(aget x (clojure.core/unchecked-add-int 2147483647 1))
