@@ -436,7 +436,19 @@
           "fixture must distinguish an actual update from unchanged parameter replicas")
       (with-open [executable (runtime/instantiate! plan {:transport :resident-copy
                                                         :device-capacities {device 1048576}})]
-        (runtime/run! executable)
+        (let [profile (runtime/profile! executable)]
+          (is (= :synchronous-serialized (:execution-model profile)))
+          (is (false? (:calibration? profile)))
+          (is (identical? plan (:plan profile)))
+          (is (= (mapv :id (:steps plan)) (mapv :step (:steps profile))))
+          (is (= (:session-id @(get (:sessions executable) device))
+                 (get-in profile [:devices-before device :session-id])))
+          (doseq [step (:steps profile)]
+            (is (<= 0 (:host-wall-ns step)))
+            (if (= :compute (:kind step))
+              (is (seq (get-in step [:kernel-profile :profile])))
+              (do (is (= :resident-copy (:transport step)))
+                  (is (= :host-monotonic (:route-timing-source step)))))))
         (let [outputs (runtime/output-values executable)
               session (get (:sessions executable) device)
               actual

@@ -19,7 +19,7 @@
 (def ^:private runtime-issuer (provenance/issuer))
 (defn- seal-runtime-value [value] ((:seal runtime-issuer) value))
 
-(defrecord DistributedExecutable [plan schedule readiness bindings projections sessions transport staging-bytes state allocation-budgets provenance-seal]
+(defrecord DistributedExecutable [plan schedule readiness bindings projections sessions transport staging-bytes state allocation-budgets provenance-seal staging]
   java.io.Closeable
   (close [this] (close! this)))
 
@@ -61,25 +61,74 @@
   (let [failure (volatile! nil)]
     (doseq [session (reverse (vec (vals sessions)))]
       (try (gpu/close-session! session)
-           (catch Throwable e (if-let [first @failure] (.addSuppressed ^Throwable first e)
+           (catch Throwable e (if-let [first @failure]
+                                (when-not (identical? first e) (.addSuppressed ^Throwable first e))
                                   (vreset! failure e)))))
     (when-let [error @failure] (throw error))))
 
-(defn- transfer-host-staged! [sessions source target staging-bytes]
+(defn- profile-transfer-leg! [submit! session entries]
+  (let [event (submit! session entries)
+        failure (volatile! nil)]
+    (try
+      (gpu/await-event! session event)
+      (gpu/event-measurement session event)
+      (catch Throwable e (vreset! failure e) (throw e))
+      (finally
+        ;; Drain while the enclosing staging arena is still live, including failed awaits.
+        (try (gpu/release-event! session event)
+             (catch Throwable cleanup
+               (if-let [primary @failure]
+                 (when-not (identical? primary cleanup)
+                   (.addSuppressed ^Throwable primary cleanup))
+                 (throw cleanup))))))))
+
+(defn- owner-staging! [staging bytes]
+  (or @staging
+      (let [arena (Arena/ofShared)]
+        (try
+          (let [entry {:arena arena :segment (.allocate arena (long bytes) 16)}]
+            (reset! staging entry)
+            (when-not (identical? entry @staging)
+              (throw (ex-info "staging owner rejected its lifetime"
+                              {:reason :distributed-staging-publication})))
+            entry)
+          (catch Throwable e
+            (try (.close arena)
+                 (catch Throwable cleanup
+                   (when-not (identical? e cleanup) (.addSuppressed ^Throwable e cleanup))))
+            (throw e))))))
+
+(defn- transfer-host-staged! [sessions source target staging-bytes profile? staging]
   (let [elements (reduce * 1 (:shape source))
         element-bytes (dtype/bytes-of (:dtype source))
-        chunk-elements (min elements (quot staging-bytes element-bytes))]
+        chunk-elements (min elements (quot staging-bytes element-bytes))
+        observations (volatile! [])]
     (when (pos? elements)
-      (with-open [arena (Arena/ofConfined)]
-        (let [segment (.allocate arena (long (* chunk-elements element-bytes)) (long element-bytes))]
+      ;; One bounded shared buffer belongs to the execution, not an individual transfer call.
+      ;; Submission/await/retirement failures keep it live until all sessions drain at close.
+      (let [segment (:segment (owner-staging! staging staging-bytes))]
           (loop [offset 0]
             (when (< offset elements)
               (let [n (min chunk-elements (- elements offset))]
-                (gpu/download-range! (get sessions (get-in source [:allocation :device]))
-                                     (physical-view sessions source) segment {:src-element offset :elements n})
-                (gpu/upload-range! (get sessions (get-in target [:allocation :device]))
-                                   (physical-view sessions target) segment {:dst-element offset :elements n})
-                (recur (+ offset n))))))))))
+                (if profile?
+                  (doseq [[direction submit! v opts]
+                          [[:download gpu/submit-download-ranges! source {:src-element offset :elements n}]
+                           [:upload gpu/submit-upload-ranges! target {:dst-element offset :elements n}]]]
+                    (let [device (get-in v [:allocation :device])
+                          measurement (profile-transfer-leg!
+                                       submit! (get sessions device)
+                                       [[(physical-view sessions v) segment opts]])]
+                      (vswap! observations conj {:direction direction :target device
+                                                :element-offset offset :elements n
+                                                :bytes (* n element-bytes)
+                                                :measurement measurement})))
+                  (do
+                    (gpu/download-range! (get sessions (get-in source [:allocation :device]))
+                                         (physical-view sessions source) segment {:src-element offset :elements n})
+                    (gpu/upload-range! (get sessions (get-in target [:allocation :device]))
+                                       (physical-view sessions target) segment {:dst-element offset :elements n})))
+                (recur (+ offset n)))))))
+    (when profile? @observations)))
 
 (defn instantiate!
   "Validate and initialize an owning, one-shot distributed execution.
@@ -177,34 +226,42 @@
                             {:elements (reduce * 1 (:shape view))}))
        (seal-runtime-value
         (->DistributedExecutable plan schedule ready bindings projections @sessions transport
-                                 max-staging-bytes (atom :ready) allocation-budgets nil))
+                                 max-staging-bytes (atom :ready) allocation-budgets nil (atom nil)))
        (catch Throwable e
          (try (close-sessions! @sessions) (catch Throwable cleanup (.addSuppressed e cleanup)))
          (throw e))))))
 
-(defn run!
-  "Execute the DAG once, synchronously. Completion events are recorded only after each call
-   returns. Local executables are bound after their waits, then closed before owner storage.
-   A failed or completed execution cannot be replayed using stale initialization evidence."
-  [executable]
+(defn- device-observations [executable]
+  (into {} (map (fn [[target session]]
+                  [target {:session-id (:session-id @session)
+                           :device (gpu/execution-device-info session)}]))
+        (:sessions executable)))
+
+(defn- execute! [executable profile?]
   (locking (:state executable)
     (when-not (= :ready @(:state executable))
       (throw (ex-info "distributed execution is not ready" {:reason :distributed-runtime-state :state @(:state executable)})))
     (reset! (:state executable) :running)
     (try
-      (let [actions (into {} (map (juxt :id identity)) (get-in executable [:readiness :actions]))
+      (let [start (when profile? (System/nanoTime))
+            before (when profile? (device-observations executable))
+            actions (into {} (map (juxt :id identity)) (get-in executable [:readiness :actions]))
+            observations (volatile! [])
             completed (volatile! #{})]
         (doseq [{:keys [id operation waits completion]} (get-in executable [:schedule :operations])]
           (when-not (every? @completed (map :id waits))
             (throw (ex-info "distributed operation has incomplete dependencies" {:reason :distributed-runtime-waits :step id})))
-          (case (:kind operation)
+          (let [step-start (when profile? (System/nanoTime))
+                measurement
+                (case (:kind operation)
             :compute
             (let [plan (get-in executable [:projections id :plan])
                   session (get (:sessions executable) (:target plan))
                   ids (set (map #(get-in % [:view :allocation :id]) (vals (:nodes plan))))
                   buffers (into {} (map (fn [id] [id (gpu/buffer session id)])) ids)]
-              (with-open [local (link/instantiate! plan {:session session :external-buffers buffers})]
-                (link/run! local)))
+              (with-open [local (link/instantiate! plan {:session session :external-buffers buffers
+                                                       :profile? profile?})]
+                (if profile? (link/profile! local) (do (link/run! local) nil))))
             :transfer
             (let [action (actions id)]
               (if (= :resident-copy (:transport executable))
@@ -214,11 +271,60 @@
                                    (physical-view (:sessions executable) target)
                                    {:elements (reduce * 1 (:shape source))}))
                 (transfer-host-staged! (:sessions executable) (first (:reads action))
-                                       (first (:writes action)) (:staging-bytes executable)))))
+                                       (first (:writes action)) (:staging-bytes executable) profile?
+                                       (:staging executable)))))]
+            (when profile?
+              (vswap! observations conj
+                      (cond-> {:step id :kind (:kind operation) :dependencies (:dependencies operation)
+                               :host-wall-ns (- (System/nanoTime) step-start)
+                               :host-timing-scope :binding-execution-and-release}
+                        (= :compute (:kind operation))
+                        (assoc :target (get-in executable [:projections id :plan :target])
+                               :kernel-profile measurement)
+                        (= :transfer (:kind operation))
+                        (assoc :transport (:transport executable) :bytes (:bytes operation)
+                               :route (:route operation)
+                               :source-view (first (:reads (actions id)))
+                               :target-view (first (:writes (actions id)))
+                               :transfer-legs (if (= :host-staged (:transport executable)) measurement [])
+                               :route-timing-source :host-monotonic)))))
           (vswap! completed conj (:id completion)))
-        (reset! (:state executable) :complete)
-        executable)
+        (let [after (when profile? (device-observations executable))
+              _ (when (and profile? (not= before after))
+                  (throw (ex-info "execution hardware identity changed during profiling"
+                                  {:reason :distributed-profile-device-drift
+                                   :before before :after after})))
+              report (when profile?
+                       {:plan (:plan executable) :execution-model :synchronous-serialized
+                        :calibration? false :devices-before before
+                        :transport (:transport executable)
+                        :max-staging-bytes (:staging-bytes executable)
+                        :allocation-budgets (:allocation-budgets executable)
+                        :devices-after after
+                        :steps @observations :host-wall-ns (- (System/nanoTime) start)
+                        :host-timing-scope :execution-with-observation-overhead})]
+          (reset! (:state executable) :complete)
+          (if profile? report executable)))
       (catch Throwable e (reset! (:state executable) :failed) (throw e)))))
+
+(defn run!
+  "Execute the DAG once, synchronously. Completion is recorded after each call returns.
+   Failed/completed owners cannot replay stale initialization evidence."
+  [executable]
+  (execute! executable false))
+
+(defn profile!
+  "Execute once with existing Link kernel profiling and awaited transfer-event measurements.
+   Not an extra replay: consumes the same ready owner as run!, and leaves outputs available.
+   Returns a complete observation only on success. Host step times include binding/cleanup;
+   resident copies have host timing only. Host-staged legs retain their backend timing sources.
+   Logical route time is not attributed to individual topology links. This serialized execution
+   observation neither proves overlap nor updates calibration or topology automatically."
+  [executable]
+  (when-not (original-executable? executable)
+    (throw (ex-info "profiling requires the original distributed owner"
+                    {:reason :distributed-runtime-owner})))
+  (execute! executable true))
 
 (defn output-values
   "Return retained compute outputs as step-id -> logical-value-id -> resident value.
@@ -346,6 +452,12 @@
       (throw (ex-info "distributed output read scope retains the owner lifetime"
                       {:reason :distributed-runtime-output-scope-active})))
     (when-not (= :closed @(:state executable))
-      (reset! (:state executable) :closed)
-      (close-sessions! (:sessions executable))))
+      ;; A failed close prohibits reuse but retains retryable teardown and staging lifetime.
+      (reset! (:state executable) :closing)
+      (close-sessions! (:sessions executable))
+      (when-let [staging (:staging executable)]
+        (when-let [^Arena arena (:arena @staging)]
+          (when (.isAlive (.scope arena)) (.close arena)))
+        (reset! staging nil))
+      (reset! (:state executable) :closed)))
   nil)
