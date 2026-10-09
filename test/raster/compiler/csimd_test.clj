@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.par :as par]
+            [raster.numeric :as numeric]
             [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
@@ -147,6 +148,54 @@
   [x :- (Array float), y :- (Array float), gain :- Double, cnt :- Long] :- (Array float)
   (par/map! y i cnt float (+ (double (aget x i)) (* gain gain)))
   y)
+
+(deftm long-offset-float-map!
+  [x :- (Array int), y :- (Array float), offset :- Long, cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (- (long (aget x i)) offset))
+  y)
+
+(deftm int-offset-float-map!
+  [x :- (Array int), y :- (Array float), offset :- Integer, cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (numeric/- (aget x i) offset))
+  y)
+
+(deftest public-native-map-keeps-retained-i32-widening
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'int-offset-float-map! :float :simd? true)
+          source (:c-source (meta native))]
+      (is (re-find #"_mm256_sub_epi32" source))
+      (is (re-find #"_mm256_cvtepi32_ps" source))
+      (doseq [n [7 8 9 17] offset [-5 5]]
+        (let [x (int-array (range n)) y (float-array n) jvm (float-array n)]
+          (native x y (int offset) (long n))
+          (int-offset-float-map! x jvm (int offset) (long n))
+          (is (= (mapv #(float (unchecked-subtract-int (int %) (int offset))) x)
+                 (vec jvm) (vec y))
+              "retained i32 arithmetic still vectorizes and matches the scalar tail"))))))
+
+(deftest integer-lane-arithmetic-requires-retained-width
+  (binding [cs/*array-types* '{x :int y :float}]
+    (doseq [step ['(- (aget x i) k)
+                 (with-meta '(- (aget x i) k) {:raster.type/tag 'long})]]
+      (is (nil? (cs/compile-segmap-c
+                 {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                  :out-sym 'y :cast-fn 'float :lambda (list 'float step)}
+                 :avx2 '#{x y}))
+          "neither missing stamps nor retained Long width authorize i32 operations"))))
+
+(deftest public-native-map-does-not-narrow-long-arithmetic-to-i32
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'long-offset-float-map! :float :simd? true)]
+      (is (not (re-find #"_mm256_sub_epi32" (:c-source (meta native)))))
+      (doseq [n [7 8 9 17] [value offset] [[Integer/MAX_VALUE -1]
+                                         [Integer/MIN_VALUE 1]
+                                         [0 4294967296]]]
+        (let [x (int-array (repeat n value)) y (float-array n) jvm (float-array n)
+              expected (vec (repeat n (float (- (long value) (long offset)))))]
+          (native x y (long offset) (long n))
+          (long-offset-float-map! x jvm (long offset) (long n))
+          (is (= expected (vec jvm) (vec y))
+              (str "retained Long arithmetic at changed-input boundaries, n=" n)))))))
 
 (deftest public-native-map-separates-compute-and-store-precision
   (when (clang-avx2?)
@@ -333,13 +382,16 @@
   (testing "mixed int/float map via compile-segmap-c emits cvtepi32_ps + epi32 ops, matches scalar"
     (if-not (clang-avx2?)
       (println "[csimd-test] clang/AVX2 unavailable — skipping")
-      (let [segmap {:space {:dims [{:name 'L :bound 'n}]} :dtype :float :out-sym 'acc :cast-fn 'float
-                    :lambda '(.invk raster.numeric/_plus__m_float_float-impl
-                                    (clojure.core/aget acc (long L))
-                                    (.invk raster.numeric/_star__m_float_float-impl
-                                           (clojure.core/aget scale (long L))
-                                           (float (.invk raster.numeric/_minus__m_long_long-impl
-                                                         (long (clojure.core/aget iarr (long L))) k))))}
+      (let [integer-step (with-meta
+                           '(.invk raster.numeric/_minus__m_int_int-impl
+                                   (clojure.core/aget iarr (long L)) k)
+                           {:raster.type/tag 'int})
+            segmap {:space {:dims [{:name 'L :bound 'n}]} :dtype :float :out-sym 'acc :cast-fn 'float
+                    :lambda (list '.invk 'raster.numeric/_plus__m_float_float-impl
+                                  '(clojure.core/aget acc (long L))
+                                  (list '.invk 'raster.numeric/_star__m_float_float-impl
+                                        '(clojure.core/aget scale (long L))
+                                        (list 'float integer-step)))}
             {:keys [includes block]}
             (binding [cs/*array-types* '{acc :float scale :float iarr :int}
                       ce/*emit-config* cpu/cpu-config ce/*scalar-type* "float" ce/*int-vars* '#{n k}]
