@@ -30,7 +30,8 @@
   PROJECTS a runtime.hardware device into the planner's descriptor shape and adds the
   compiler's analytic fields; the derivations below operate on that. So the runtime owns
   the probing; the compiler owns the schedule math, over one record for :cpu and :gpu."
-  (:require [raster.runtime.hardware :as rt]))
+  (:require [raster.runtime.hardware :as rt]
+            [raster.compiler.core.dtype :as dtype]))
 
 ;; ---------------------------------------------------------------------------
 ;; Element widths — bytes per scalar of a raster dtype keyword.
@@ -50,18 +51,49 @@
 ;; Host detection
 ;; ---------------------------------------------------------------------------
 
+(defn- positive-finite-measurement? [x]
+  (and (number? x) (Double/isFinite (double x)) (pos? x)))
+
+(defn- admitted-peaks
+  "Field-wide provenance requires a complete, consistent update, not a mixture of measured and
+   derived dtype families. Resolve aliases through the scalar dtype authority."
+  [desc measured]
+  (when (and (map? measured) (seq measured)
+             (every? positive-finite-measurement? (vals measured)))
+    (try
+      (let [groups (group-by (comp dtype/canon key) measured)
+            families (into {} (map (fn [[dt entries]] [dt (val (first entries))])) groups)
+            keys-to-update (distinct (concat (keys (:peak-flops desc)) (keys measured)
+                                             (keys families)))]
+        (when (and (every? (fn [[_ entries]] (apply == (map val entries))) groups)
+                   (every? #(contains? families (dtype/canon %)) (keys (:peak-flops desc))))
+          (into {} (map (fn [dt] [dt (get families (dtype/canon dt))])) keys-to-update)))
+      (catch clojure.lang.ExceptionInfo _ nil))))
+
 (defn- merge-measured
-  "Overlay a device's :measured microbench layer (raster.runtime.microbench) onto the probed/
-   analytic descriptor: measured bandwidth / peak-flops / launch-overhead OVERRIDE the guess, the
-   whole map is kept under :measured for inspection, and its provenance is carried. This is the
-   feedback edge — measurement improving the readable model, not a cache beside it."
+  "Retain raw calibration for inspection, but overlay only positive finite fields explicitly
+   tagged :measured. Peak-FLOPS updates must cover all existing dtype families consistently.
+   Noisy/untagged observations are not planning constants. An explicitly
+   nonstationary bandwidth bench also declines admission, even if its provenance is mistagged.
+   This projects the existing measurement registry; it does not create another cache."
   [desc device-id]
   (if-let [m (rt/measured-for device-id)]
-    (cond-> (assoc desc :measured m)
-      (:bandwidth-bytes-s m)  (assoc :bandwidth-bytes-s (:bandwidth-bytes-s m))
-      (:peak-flops m)         (update :peak-flops merge (:peak-flops m))
-      (:launch-overhead-ns m) (assoc :launch-overhead-ns (:launch-overhead-ns m))
-      (:provenance m)         (update :provenance merge (:provenance m)))
+    (let [admit? (fn [field] (= :measured (get-in m [:provenance field])))
+          bandwidth? (and (admit? :bandwidth-bytes-s)
+                          (positive-finite-measurement? (:bandwidth-bytes-s m))
+                          (not (false? (get-in m [:bench :bandwidth :stationary?]))))
+          peaks (when (admit? :peak-flops) (admitted-peaks desc (:peak-flops m)))
+          launch? (and (admit? :launch-overhead-ns)
+                       (positive-finite-measurement? (:launch-overhead-ns m)))
+          admitted (cond-> {}
+                     bandwidth? (assoc :bandwidth-bytes-s :measured)
+                     (seq peaks) (assoc :peak-flops :measured)
+                     launch? (assoc :launch-overhead-ns :measured))]
+      (cond-> (assoc desc :measured m)
+        bandwidth? (assoc :bandwidth-bytes-s (:bandwidth-bytes-s m))
+        (seq peaks) (assoc :peak-flops peaks)
+        launch? (assoc :launch-overhead-ns (:launch-overhead-ns m))
+        (seq admitted) (update :provenance merge admitted)))
     desc))
 
 (defn- gpu-arch-str [caps]

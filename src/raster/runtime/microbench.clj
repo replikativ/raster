@@ -1,17 +1,18 @@
 (ns raster.runtime.microbench
   "Stationary-machine hardware CALIBRATION — measures what a probe can't report (memory bandwidth,
    effective peak-flops, kernel launch overhead, cache knees) and fills the descriptor's :measured
-   layer. The analytic model (raster.compiler.core.hardware) proposes; measurement here disposes and
-   OVERWRITES the readable descriptor constants (the loop XLA/Triton/Inductor leave open — they cache
-   measurements beside a stale model; raster feeds them back into the model).
+   layer. The analytic model (raster.compiler.core.hardware) admits positive finite stationary
+   measurements as descriptor constants; noisy observations remain inspectable without replacing
+   the planning estimates.
 
    Methodology (do-bench): warmup, iteration count derived from a TIME budget, cache-flush between
    timed iterations, report MIN (autotune) and MEDIAN (report). The stationary-machine assumption is
    ASSERTED, not hoped: the coefficient of variation across samples must be below a threshold, else
-   the measurement is flagged non-stationary (thermal/contention) and the field stays low-confidence.
+   the measurement is flagged non-stationary (thermal/contention) and is not admitted as a planning
+   constant. Low variation alone does not prove freedom from systematic measurement bias.
 
-   Provenance: every :measured field is tagged :measured; a caller reading the descriptor always
-   knows whether a number is measured-and-stationary or a probed/catalogue/analytic guess."
+   Provenance: stationary fields are tagged :measured, noisy fields :measured-noisy. The descriptor
+   retains the complete raw calibration separately from the admitted planning fields."
   (:require [raster.runtime.hardware :as rt]))
 
 ;; ================================================================
@@ -83,7 +84,7 @@
 
 (defn calibrate-cpu!
   "Measure the CPU (:cpu:0) and store a :measured map in the hardware registry, so descriptor-for
-   projects it (measured OVERRIDES catalogue/analytic). MEASURE-ONCE: reuses a matching on-disk
+   projects its admitted stationary fields. MEASURE-ONCE: reuses a matching on-disk
    calibration unless :force? is set; a fresh measurement is persisted (keyed by device signature ×
    version). Returns the :measured map."
   [& {:keys [device-id force?] :or {device-id :cpu:0}}]
