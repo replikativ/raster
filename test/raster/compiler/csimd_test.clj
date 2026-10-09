@@ -143,6 +143,81 @@
   (par/map! y i cnt double (+ (double (aget x i)) gain))
   y)
 
+(deftm double-compute-float-store!
+  [x :- (Array float), y :- (Array float), gain :- Double, cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (+ (double (aget x i)) (* gain gain)))
+  y)
+
+(deftest public-native-map-separates-compute-and-store-precision
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'double-compute-float-store! :float :simd? true)
+          source (:c-source (meta native))]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" source))
+      (is (re-find #"_mm_storeu_ps\([^\n]*_mm256_cvtpd_ps" source))
+      (doseq [n [3 4 5 9 17] gain [1.00000006 0.300000005]]
+        (let [x (float-array (take n (cycle [0.0 -1.0 0.25 -0.5])))
+              y (float-array n)
+              jvm (float-array n)
+              bits #(Float/floatToRawIntBits (float %))
+              expected (mapv #(bits (+ (double %) (* gain gain))) x)]
+          (native x y (double gain) (long n))
+          (double-compute-float-store! x jvm (double gain) (long n))
+          (is (= expected (mapv bits jvm) (mapv bits y))
+              (str "Double operations and final Float rounding agree, n=" n))))
+      (is (not= (Float/floatToRawIntBits (float (* 1.00000006 1.00000006)))
+                (Float/floatToRawIntBits (float (* (float 1.00000006) (float 1.00000006)))))
+          "fixture distinguishes Double computation from all-Float computation"))))
+
+(deftest double-compute-float-store-requires-complete-narrowing-capability
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float
+                   :lambda (with-meta '(+ (double (aget a i)) (double gain))
+                             {:raster.type/tag 'double})}
+        original intrinsics/simd-type-info]
+    (binding [cs/*array-types* '{a :float out :float}]
+      (is (some? (cs/compile-segmap-c operation :avx2 '#{a out})))
+      (doseq [missing [:to-f32 :to-f32-store]]
+        (with-redefs [intrinsics/simd-type-info
+                      (fn [isa elem] (dissoc (original isa elem) missing))]
+          (is (nil? (cs/compile-segmap-c operation :avx2 '#{a out}))))))
+    (binding [cs/*array-types* '{a :float out :float}]
+      (is (nil? (cs/compile-segmap-c
+                 (assoc operation :lambda '(double (float (+ (double (aget a i)) gain))))
+                 :avx2 '#{a out}))
+          "intervening Float rounding is not erased to make a uniform Double schedule"))))
+
+(deftest terminal-narrowing-preserves-declared-conversion-policy
+  (let [body (with-meta '(+ (double (aget a i)) (double gain)) {:raster.type/tag 'double})
+        operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float :out-sym 'out}
+        attributes {:source-dtype :double :target-dtype :float
+                    :rounding :nearest-even :overflow :ieee
+                    :source-op 'clojure.core/float}]
+    (binding [cs/*array-types* '{a :float out :float}]
+      (is (some? (cs/compile-segmap-c
+                  (assoc operation :lambda (dialect/scalar-convert attributes body))
+                  :avx2 '#{a out})))
+      (doseq [policy [(assoc attributes :rounding :toward-zero)
+                      (assoc attributes :overflow :saturate)
+                      (assoc attributes :unknown-policy true)
+                      (assoc attributes :source-op 'clojure.core/double)]]
+        (is (= :invalid-canonical-scalar-conversion
+               (try
+                 (cs/compile-segmap-c
+                  (assoc operation :lambda (dialect/scalar-convert policy body))
+                  :avx2 '#{a out})
+                 nil
+                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "a different conversion policy cannot acquire ordinary Float-store lowering")))))
+
+(deftest changing-arithmetic-species-requires-complete-operation-evidence
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float}
+        mixed '(+ (double (aget a i)) (* (aget b i) (aget c i)))]
+    (binding [cs/*array-types* '{a :float b :float c :float out :float}]
+      (doseq [expression [mixed (with-meta mixed {:raster.type/tag 'double})]]
+        (is (nil? (cs/compile-segmap-c (assoc operation :lambda expression) :avx2 '#{a b c out}))
+            "an unstamped inner product cannot be promoted to Double merely because its parent is Double")))))
+
 (deftest public-native-map-retains-storage-and-arithmetic-precision
   (when (clang-avx2?)
     (let [native (aot/compile-aot-c #'mixed-storage-double-map! :double :simd? true)]
