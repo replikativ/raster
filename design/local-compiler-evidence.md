@@ -2028,3 +2028,19 @@ contract agreement, and OpenCL/CUDA/HIP source compilation. Then run changed
 inputs locally and the unchanged whole-model gradient oracle. The local tanh
 control is motivation, not proof that this will close the model gate. Any cost
 comparison needs stationary samples and must account for FP64 throughput.
+
+The first implementation leaf admits this exact closed realization only for
+descriptor-owned math with Float operands and result. It reuses the shared
+Double intrinsic and checked narrowing emitters; malformed accuracy/conversion
+claims, Half/Double domains and non-math intrinsics are rejected. A shared
+KernelBody projection retains physical scalar dtype requirements, including
+the hidden Double evaluation, for scalar and Intel matrix preambles. Actual
+Intel/CUDA matrix epilogue sources retain the widened evaluation; the Intel
+Double helper and extension are defined once. CUDA/HIP CI fixture generation
+now includes dynamic unary tanh and binary pow inputs.
+
+The warm REPL passes 73 affected validation/emission/matrix tests and 1219
+assertions, including portable OpenCL source compilation and unchanged default
+emission. This is not yet public schedule wiring, native whole-model execution,
+CUDA/HIP compiler acceptance, or closure of the held training gate. Those remain
+the next steps; no numerical default, provider or acceptance tolerance changed.

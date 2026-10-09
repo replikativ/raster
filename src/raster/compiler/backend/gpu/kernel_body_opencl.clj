@@ -12,6 +12,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.scalar-range :as scalar-range]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-body :as body]))
 
 (defn- record-kind? [simple-name value]
@@ -365,10 +366,8 @@
          (throw (ex-info "matrix OpenCL helper requires an unsupported compilation contract"
                          {:reason :kernel-body-matrix-helper-compilation
                           :compilation (:compilation helpers)})))
-       (str (when (some #(str/includes? source
-                                        (str (intrinsics/c-floating-extremum-name % :double) "("))
-                         [:min :max])
-              "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+       (str (when (contains? (body/required-scalar-dtypes (:operations kernel-body)) :double)
+              (c-dialect/preamble (c-dialect/resolve! :opencl-intel) {:uses-double? true}))
             (when (seq (:source helpers)) (str (:source helpers) "\n"))
             source)))))
 
@@ -696,6 +695,17 @@
         integral? (contains? #{:byte :int :long} operand-type)
         overflow-policy (get-in expression [:options :overflow])]
     (cond
+      ;; Keep the logical Float operation while executing its explicitly admitted realization.
+      ;; Existing typed casts and the intrinsic authority own every physical conversion/call.
+      (numerics/widened-target-library-math?
+       (get-in expression [:options :math-realization]))
+      (emit-cast
+       (body/cast-expression
+        (body/scalar-expression op :double
+          (mapv #(body/cast-expression % :double :exact :exact) (:arguments expression)))
+        :float :nearest-even :ieee)
+       context)
+
       ;; C-family signed overflow is undefined. Preserve the verified modulo-2^N contract by
       ;; doing the arithmetic in the same-width unsigned representation and converting the bits
       ;; back to the expression's declared signed storage type.
@@ -1729,14 +1739,7 @@
               (:source intrinsic-module)))
         storage-declarations (concat parameters (:allocations kernel-body))
         retained-scalar-types
-        (set (keep (fn [value]
-                     (let [type (cond
-                                  (or (record-kind? "ValueSpec" value) (record-kind? "Literal" value))
-                                  (:type value)
-                                  (record-kind? "ScalarExpr" value) (:result-type value))]
-                       (when type
-                         (if (= :predicate type) :predicate (dtype/canon type)))))
-                   (tree-seq coll? seq (:operations kernel-body))))
+        (body/required-scalar-dtypes (:operations kernel-body))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
         uses-half? (or (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
                        (contains? retained-scalar-types :half))

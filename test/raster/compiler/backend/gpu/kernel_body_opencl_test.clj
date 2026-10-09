@@ -8,6 +8,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
 
@@ -44,6 +45,23 @@
               (emit (assoc-in kernel [:operations 0 :expression :options] {})))]
         (is (= previous current)
             (str "accuracy evidence does not widen or alter " op " " type " " target))))))
+
+(deftest widened-library-emission-uses-shared-conversion-authority
+  (doseq [op [:tanh :pow]
+          target [:opencl-intel :opencl-portable :cuda :hip]]
+    (let [kernel (fixtures/widened-math-body op)
+          source (:source (opencl/emit-scalar-module "widened_math" kernel
+                                                   {:target-dialect target}))]
+      (is (str/includes? source (str (name op) "((double)(")))
+      (if (contains? #{:opencl-intel :opencl-portable} target)
+        (do (is (str/includes? source "cl_khr_fp64"))
+            (is (str/includes? source (str "rstr_narrow_f64_f32_rte(" (name op) "(")))
+            (is (str/includes? source "convert_float_rte(materialized)"))
+            (when (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
+              (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                               "-fsyntax-only" "-" :in source)]
+                (is (zero? exit) err))))
+        (is (str/includes? source "__double2float_rn("))))))
 
 (deftest scalar-product-target-spelling-preserves-explicit-fma
   (let [emit (fn [target op type]

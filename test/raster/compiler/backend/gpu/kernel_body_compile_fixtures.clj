@@ -952,6 +952,11 @@
                              "scalar_product"
                              (body-fixtures/scalar-product-body type fused?)
                              {:target-dialect dialect})))
+           (for [operator [:tanh :pow]]
+             (write-source! directory suffix (str "widened-math-" (name operator))
+                            (body-emit/emit-scalar-kernel
+                             "widened_math" (body-fixtures/widened-math-body operator)
+                             {:target-dialect dialect})))
            (for [operator [:min :max]
                  [label make-body] [["half-extremum" body-fixtures/half-extremum-body]
                                     ["local-half-extremum" body-fixtures/local-half-extremum-body]]]

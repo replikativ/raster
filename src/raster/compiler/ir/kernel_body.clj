@@ -168,6 +168,23 @@
   (scalar-expression :cast result-type [argument]
                      {:rounding rounding :overflow overflow}))
 
+(defn required-scalar-dtypes
+  "Physical scalar dtypes retained in a verified operation tree, including math realizations.
+   This is a target requirement projection, not evidence that a target supports those dtypes."
+  [operations]
+  (into #{}
+        (mapcat (fn [value]
+                  (let [type (cond
+                               (instance? ValueSpec value) (:type value)
+                               (instance? Literal value) (:type value)
+                               (instance? ScalarExpr value) (:result-type value))]
+                    (cond-> []
+                      (and type (not= :predicate type)) (conj (dtype/canon type))
+                      (and (instance? ScalarExpr value)
+                           (numerics/widened-target-library-math?
+                            (get-in value [:options :math-realization]))) (conj :double)))))
+        (tree-seq coll? seq operations)))
+
 (defn full-participation
   "Every lane in the collective's statically selected subgroup participates."
   []
@@ -1315,7 +1332,10 @@
                            :proof proof})))
         (when (and target-math?
                    (not (and (= #{:math-realization} (set (keys options)))
-                             (numerics/target-library-math? (:math-realization options)))))
+                             (or (numerics/target-library-math? (:math-realization options))
+                                 (and (= :float operand-type result-type)
+                                      (numerics/widened-target-library-math?
+                                       (:math-realization options)))))))
           (throw (ex-info "target math requires its explicit implementation-defined realization"
                           {:reason :kernel-body-math-realization
                            :operation canonical-op :options options})))

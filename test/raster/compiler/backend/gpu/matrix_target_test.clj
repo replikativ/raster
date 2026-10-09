@@ -1,11 +1,14 @@
 (ns raster.compiler.backend.gpu.matrix-target-test
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
+            [clojure.string :as str]
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
             [raster.compiler.backend.gpu.matrix-target :as matrix-target]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-call :as kernel-call]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -44,6 +47,32 @@
         "the unrolled matrix stores call their helper")
     (is (clojure.string/includes? source "isnan(a)"))
     (is (clojure.string/includes? source "signbit(a)"))))
+
+(deftest matrix-epilogue-retains-widened-math-requirements
+  (doseq [[target tile] [[:opencl-intel (hardware/derive-gemm-tile {})]
+                       [:cuda (mma-tile)]]]
+    (let [original (schedule/matrix-body
+                    {:id :matrix-widened-test :row 'a :col 'b :out 'c
+                     :dimensions [128 128 64] :dimension-parameters ['m 'n 'k]
+                     :tile tile :result-dtype :float
+                     :epilogue {:acc 'acc :expr (with-meta '(raster.numeric/tanh acc)
+                                                 {:raster.type/tag 'float})}})
+          widened (kernel-body/validate!
+                   (walk/postwalk
+                    (fn [value]
+                      (if (and (instance? raster.compiler.ir.kernel_body.ScalarExpr value)
+                               (= :tanh (:op value)))
+                        (assoc-in value [:options :math-realization]
+                                  numerics/widened-target-library-math)
+                        value)) original))
+          source (:source (matrix-target/emit-matrix-kernel "matrix_widened" widened target))]
+      (is (contains? (kernel-body/required-scalar-dtypes (:operations widened)) :double))
+      (is (str/includes? source "tanh((double)("))
+      (if (= :opencl-intel target)
+        (do (is (= 1 (count (re-seq #"cl_khr_fp64 : enable" source))))
+            (is (= 1 (count (re-seq #"inline float rstr_narrow_f64_f32_rte" source))))
+            (is (str/includes? source "rstr_narrow_f64_f32_rte(tanh(")))
+        (is (str/includes? source "__double2float_rn(tanh("))))))
 
 (deftest intel-matrix-artifact-binds-surface-and-input-alignment-contracts
   (let [body (schedule/matrix-body
