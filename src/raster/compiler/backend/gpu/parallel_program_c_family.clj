@@ -32,6 +32,18 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :parallel-program-c-family))))
 
+(defn- make-emitted-equation
+  [algorithm body emitted metadata opts]
+  (if (contains? opts :scalar-math)
+    (emitted-equation/make algorithm body emitted metadata (select-keys opts [:scalar-math]))
+    (emitted-equation/make algorithm body emitted metadata)))
+
+(defn- contraction-write-domains
+  [reference opts]
+  (if (contains? opts :scalar-math)
+    (emitted-equation/contraction-write-domains reference (select-keys opts [:scalar-math]))
+    (emitted-equation/contraction-write-domains reference)))
+
 (defn- emit-graph
   [scheduled-graph opts]
   ;; Graph construction already projects and checks the logical scalar interface. Do not
@@ -40,7 +52,7 @@
         types (into {} (map (juxt :id :dtype)) (:scalars scheduled-graph))]
     (segop-emission/generate-kernel-graph
      scheduled-graph
-     (assoc (select-keys opts [:array-types :target-device :target-descriptor :schedule
+     (assoc (select-keys opts [:array-types :target-device :target-descriptor :schedule :scalar-math
                               :contraction-facts :scheduled-equation-algorithm
                               :scheduled-equation-body :scheduled-bodies])
             :scalar-types (merge (:scalar-types opts) types)
@@ -65,7 +77,7 @@
    Unsupported equations return an explicit admission decline. No source analysis, source
    recognition, or second semantic program is involved; target emission retains the same spine."
   [reference {:keys [target-descriptor schedule target-dialect] :as opts}]
-  (if-not (emitted-equation/contraction-write-domains reference)
+  (if-not (contraction-write-domains reference opts)
     {:ok false :reason :not-single-plain-fp32-contraction}
     (let [algorithm (:algorithm reference)
           source (equation-graph/make algorithm (:body reference))
@@ -82,12 +94,12 @@
               artifact (body-target/emit-artifact
                         (str (:kernel-name original) "_register_tiled")
                         (:scheduled planned) target-dialect)
-              candidate (emitted-equation/make
+              candidate (make-emitted-equation
                          algorithm (:body reference)
                          (-> (:graph reference)
                              (assoc-in [:nodes 0 :operation] artifact)
                              (assoc-in [:attributes :strategy] :register-tiled))
-                         {:provenance (:provenance reference)})]
+                         {:provenance (:provenance reference)} opts)]
           {:ok true :candidate candidate})))))
 
 (defn emit-mixed-contraction-alternative
@@ -96,11 +108,11 @@
    This does not select or authorize approximation. Dispatch admission must consent to the
    independently reconstructed numerical model and retain the exact portable fallback."
   [reference {:keys [target-descriptor target-dialect schedule]
-              :or {target-dialect :opencl-intel}}]
+              :or {target-dialect :opencl-intel} :as opts}]
   (cond
     (not= :opencl-intel (:id (c-dialect/resolve! target-dialect)))
     {:ok false :reason :mixed-matrix-target-dialect}
-    (not (emitted-equation/contraction-write-domains reference))
+    (not (contraction-write-domains reference opts))
     {:ok false :reason :not-single-plain-fp32-contraction}
     :else
     (let [algorithm (:algorithm reference)
@@ -117,11 +129,13 @@
                         :prefix (str (get-in reference [:graph :nodes 0 :operation :kernel-name])
                                      "_mixed")
                         :refinement (:refinement planned)})
-              candidate (emitted-equation/make
+              candidate (make-emitted-equation
                          algorithm (:body reference) emitted
                          {:refinement (:refinement planned)
-                          :provenance (:provenance reference)})
-              report (emitted-equation/validate-with-result-contracts candidate)]
+                          :provenance (:provenance reference)} opts)
+              report (if (contains? opts :scalar-math)
+                       (emitted-equation/validate-with-result-contracts candidate (select-keys opts [:scalar-math]))
+                       (emitted-equation/validate-with-result-contracts candidate))]
           (if-not (seq (:complete-write-domains report))
             {:ok false :reason :mixed-matrix-complete-write}
             {:ok true :candidate candidate :numerical-model (:numerical-model report)
@@ -162,7 +176,9 @@
                             (control/body (:algorithm scheduled))
                             :scheduled-equation-body body))]
         (assoc equation :operations
-               [(emitted-loop/make scheduled emitted {:provenance provenance})]))
+               [(if (contains? opts :scalar-math)
+                  (emitted-loop/make scheduled emitted {:provenance provenance} (select-keys opts [:scalar-math]))
+                  (emitted-loop/make scheduled emitted {:provenance provenance}))]))
 
       (and (soac/program-form? algorithm)
            (true? (get-in equation [:attributes :host-only])))
@@ -183,7 +199,7 @@
                                   (seq contraction-facts)
                                   (assoc :contraction-facts contraction-facts)))]
         (assoc equation :operations
-               [(emitted-equation/make algorithm body emitted {:provenance provenance})]))
+               [(make-emitted-equation algorithm body emitted {:provenance provenance} opts)]))
 
       (swr/plan? algorithm)
       (let [{:keys [body graph]} (equation-graph/make-for-plan-equation
@@ -192,7 +208,7 @@
             certificate (first (:operations equation))
             emitted (emit-graph graph (assoc opts :scheduled-bodies {(:id node) certificate}))]
         (assoc equation :operations
-               [(emitted-equation/make algorithm body emitted {:provenance provenance})]))
+               [(make-emitted-equation algorithm body emitted {:provenance provenance} opts)]))
 
       :else
       (fail! :c-family-parallel-algorithm
@@ -234,7 +250,9 @@
                                  (map? target-device) target-device
                                  target-device (hardware/descriptor-for target-device)
                                  :else nil))
-        routed (product-consumer-route/schedule plan target-description)
+        routed (if (contains? opts :scalar-math)
+                 (product-consumer-route/schedule plan target-description (select-keys opts [:scalar-math]))
+                 (product-consumer-route/schedule plan target-description))
         kernel-name (str "rstr_product_consumer_" (:region-ordinal plan))
         {:keys [emitted refinement]} (product-consumer-route/emit
                                       kernel-name routed target-dialect)
@@ -245,13 +263,13 @@
         retained-operands (set (concat (map :id (:inputs source-graph))
                                        (map :id (:scalars source-graph))))
         operands (filterv retained-operands (:inputs facts))
-        operation (emitted-equation/make
+        operation (make-emitted-equation
                    algorithm body emitted
                    {:refinement refinement
                     :provenance {:target-dialect target-dialect
                                  :target-module target-module
                                  :pass :parallel-program-c-family
-                                 :schedule :product-ordered-consumer}})]
+                                 :schedule :product-ordered-consumer}} opts)]
     (program/->ProgramEquation
      [:product-ordered-consumer (:equations plan)]
      [:equation-region (:equations plan)] nil
@@ -274,8 +292,14 @@
           (remove #(contains? producers (:id %)) (:equations parallel-program)))))
 
 (defn validate-program!
-  [parallel-program]
-  (emitted-program/validate! parallel-program))
+  ([parallel-program] (emitted-program/validate! parallel-program))
+  ([parallel-program caller-options] (emitted-program/validate! parallel-program caller-options)))
+
+(defn- validate-program-for-request
+  [parallel-program opts]
+  (if (contains? opts :scalar-math)
+    (validate-program! parallel-program (select-keys opts [:scalar-math]))
+    (validate-program! parallel-program)))
 
 (defn emit-program
   "Emit every numerical equation directly to `:target-dialect`.
@@ -295,7 +319,7 @@
                           (program/infer-inputs equations)
                           (:inputs parallel-program))
          emitted-program
-         (validate-program!
+         (validate-program-for-request
           (program/make
            {:dialect program-dialect
             :source (:source parallel-program)
@@ -310,7 +334,10 @@
                                :target-module target-module)
             :attributes (:attributes parallel-program)
             :operation? emitted-program/emitted-operation?
-            :algorithm? emitted-program/emitted-boundary?}))
+            :algorithm? (if (contains? opts :scalar-math)
+                          #(emitted-program/emitted-boundary? %1 %2 (select-keys opts [:scalar-math]))
+                          emitted-program/emitted-boundary?)})
+          opts)
          graphs (keep (fn [equation]
                         (when-let [operation (first (:operations equation))]
                           (cond
