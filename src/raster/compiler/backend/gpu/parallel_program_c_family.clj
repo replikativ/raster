@@ -120,15 +120,17 @@
           planned (mixed-candidate/plan
                    algorithm source target-descriptor
                    (merge (select-keys schedule [:precision])
-                          (select-keys (:typed-contraction schedule) [:tile :input-fusion])))]
+                          (select-keys (:typed-contraction schedule) [:tile :input-fusion])
+                          (select-keys opts [:scalar-math])))]
       (if-not (:ok planned)
         planned
         (let [emitted (matrix-emission/emit-scheduled-stage-graph
                        (:graph planned)
-                       {:target-dialect target-dialect
+                       (merge {:target-dialect target-dialect
                         :prefix (str (get-in reference [:graph :nodes 0 :operation :kernel-name])
                                      "_mixed")
-                        :refinement (:refinement planned)})
+                        :refinement (:refinement planned)}
+                              (select-keys opts [:scalar-math])))
               candidate (make-emitted-equation
                          algorithm (:body reference) emitted
                          {:refinement (:refinement planned)

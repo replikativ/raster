@@ -37,7 +37,7 @@
    The public slice admits uniform int or long dimensions and existing NN/NT tile-input fusion, or
    materialized NN/NT/TN/TT storage. Leading batches use the existing fused-slice schedule."
   [algorithm source descriptor {:keys [precision tile input-fusion]
-                                :or {input-fusion :tile-inputs}}]
+                                :or {input-fusion :tile-inputs} :as options}]
   (if-not (= :mixed-f16-f32 precision)
     {:ok false :reason :matrix-numerical-policy}
     (if-not (= 1 (count (:nodes source)))
@@ -85,5 +85,8 @@
                     planned ((if (:batched? view) schedule/plan-batched schedule/plan) spec)]
                 (if-not planned
                   {:ok false :reason :mixed-matrix-input-fusion-declined}
-                  (assoc (validation/validate-reconstruction! algorithm source (:refinement planned))
+                  (assoc (if (contains? options :scalar-math)
+                           (validation/validate-reconstruction! algorithm source (:refinement planned)
+                                                                (select-keys options [:scalar-math]))
+                           (validation/validate-reconstruction! algorithm source (:refinement planned)))
                          :ok true :target-schedule target))))))))))
