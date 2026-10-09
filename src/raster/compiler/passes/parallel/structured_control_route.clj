@@ -879,14 +879,18 @@
                                     {})
                      certificate
                      (try
-                       ((case (get-in opts [:schedule :segmented-weighted-reduction :strategy]
+                       (let [schedule-for-node
+                             (case (get-in opts [:schedule :segmented-weighted-reduction :strategy]
                                       :auto)
                           ;; Explicit subgroup selection authorizes the candidate's stated dot
                           ;; reassociation. Auto stays reference until equation dispatch carries
                           ;; per-alternative preflight and numerical-policy-aware tuning evidence.
                           :subgroup-score-reuse indexed-body/schedule-score-reuse-for-node
-                          (:auto :reference) indexed-body/schedule-reference-for-node)
-                        algorithm (first (:nodes graph)) graph descriptor)
+                          (:auto :reference) indexed-body/schedule-reference-for-node)]
+                         (if (contains? opts :scalar-math)
+                           (schedule-for-node algorithm (first (:nodes graph)) graph descriptor
+                                              (select-keys opts [:scalar-math]))
+                           (schedule-for-node algorithm (first (:nodes graph)) graph descriptor)))
                        (catch clojure.lang.ExceptionInfo exception
                          (if (= :indexed-segmented-reduction-plan-unsupported
                                 (:reason (ex-data exception)))

@@ -26,6 +26,7 @@
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.ir.kernel-executable :as kernel-executable]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
@@ -164,15 +165,28 @@
            {:target target :descriptor-target (:device-id descriptor)}))
   descriptor)
 
+(defn- validate-emitted-program-for-request
+  [program caller-options]
+  (if (contains? caller-options :scalar-math)
+    (emitted-program/validate! program (select-keys caller-options [:scalar-math]))
+    (emitted-program/validate! program)))
+
+(defn- make-equation-dispatch-for-request
+  [candidates selection numerical-policy caller-options]
+  (if (contains? caller-options :scalar-math)
+    (equation-dispatch/make candidates selection numerical-policy
+                            (select-keys caller-options [:scalar-math]))
+    (equation-dispatch/make candidates selection numerical-policy)))
+
 (defn- dispatch-reduction-emissions
   "Join two independently emitted schedules over one retained semantic equation spine.
 
    This runs after TypedSOAC construction: it neither repeats source analysis nor recognizes
    a model operation from target code. Non-reduction semantic boundaries must be identical;
    their independently emitted local SSA is discarded in favor of the reference emission."
-  [function-id schedule target-descriptor reference subgroup]
-  (let [reference-program (emitted-program/validate! (:program reference))
-        subgroup-program (emitted-program/validate! (:program subgroup))
+  [function-id schedule target-descriptor reference subgroup caller-options]
+  (let [reference-program (validate-emitted-program-for-request (:program reference) caller-options)
+        subgroup-program (validate-emitted-program-for-request (:program subgroup) caller-options)
         ref-equations (:equations reference-program)
         subgroup-equations (:equations subgroup-program)
         measured-selectors (get-in schedule
@@ -222,9 +236,9 @@
                                                 :analytic-runtime-shape)}})
                                  measured-selector
                                  (kernel-dispatch/with-selector measured-selector))
-                     operation (equation-dispatch/make
+                     operation (make-equation-dispatch-for-request
                                 candidates selection
-                                {:permitted-modes #{:exact :reassociated}})]
+                                {:permitted-modes #{:exact :reassociated}} caller-options)]
                  (assoc reference-equation :operations [operation]))
                (do
                  (when-not (= (dissoc reference-equation :operations)
@@ -240,8 +254,8 @@
           _ (when (zero? dispatch-count)
               (fail! :equation-dispatch-no-reduction
                      "reassociated reduction dispatch requires a segmented reduction" {}))
-          program (emitted-program/validate!
-                   (assoc reference-program :equations equations))
+          program (validate-emitted-program-for-request
+                   (assoc reference-program :equations equations) caller-options)
           kernels (vec
                    (mapcat (fn [equation]
                              (let [operation (first (:operations equation))]
@@ -331,9 +345,9 @@
                                                        :decomposed)))
                                       :layout {:external-interface interface}}}})
                            measured-selector (kernel-dispatch/with-selector measured-selector))
-                         certified (equation-dispatch/make
+                         certified (make-equation-dispatch-for-request
                                     alternatives selection
-                                    numerical-policy)]
+                                    numerical-policy options)]
                      (swap! admitted inc)
                      (swap! new-kernels into (map :operation (get-in candidate [:graph :nodes])))
                      (when measured-selector (swap! consumed conj id))
@@ -345,7 +359,8 @@
                    {:dispatch-ids (vec (sort unconsumed)) :consumed (vec (sort @consumed))
                     :declines @declines}))
         kernels (into (:kernels reference) @new-kernels)]
-    {:program (emitted-program/validate! (assoc (:program reference) :equations equations))
+    {:program (validate-emitted-program-for-request
+               (assoc (:program reference) :equations equations) options)
      :kernels kernels
      :stats (assoc (:stats reference)
                    :emission-routes (frequencies (map kernel-artifact/emission-route kernels))
@@ -373,7 +388,10 @@
      (fail! :equation-first-host-only
             "equation-first GPU compilation was requested for an explicitly host-only deftm"
             {:function (function-symbol f-var) :target target}))
-   (let [resolved-var (physical-function f-var dtype)
+   (let [options (cond-> options
+                   (contains? options :scalar-math)
+                   (update :scalar-math numerics/validate-scalar-math-policy!))
+         resolved-var (physical-function f-var dtype)
          _ (when (dispatch/host-only? resolved-var)
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
@@ -481,7 +499,7 @@
                                     (assoc subgroup-options :target-dialect target-dialect))]
              (dispatch-reduction-emissions
               (function-symbol f-var) resolved-schedule target-descriptor
-              reference-emission subgroup-emission))
+              reference-emission subgroup-emission options))
            reference-emission)
          emission
          (if dispatch-contractions?
@@ -582,5 +600,6 @@
   [f-var arguments options]
   (let [compilation (compile f-var options)]
     (if (contains? options :scalar-math)
-      (:plan (lower compilation arguments (fn [plan] {:plan plan}) nil options))
+      (:plan (lower compilation arguments (fn [plan] {:plan plan}) nil
+                    (select-keys options [:scalar-math])))
       (lower compilation arguments))))
