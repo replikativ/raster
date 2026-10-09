@@ -541,7 +541,13 @@
   [parallel-program prefix]
   (let [prefix-bindings (into {} prefix)
         allocations (into {} (map (juxt :destination :source-expression))
-                          (get-in parallel-program [:attributes :allocations]))]
+                          (get-in parallel-program [:attributes :allocations]))
+        claimed (into (set (concat (keys prefix-bindings) (keys allocations)))
+                      (mapcat (fn [equation]
+                                (concat (when (= :binding (first (:site equation)))
+                                          [(second (:site equation))])
+                                        (map :binding (get-in equation [:attributes :realization-bindings])))))
+                      (:equations parallel-program))]
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
                                  (= expression (get prefix-bindings symbol))))
@@ -549,7 +555,10 @@
                        (not (typed-route/realization-binding? parallel-program symbol expression))
                        (not (and (contains? allocations symbol)
                                  (= expression (get allocations symbol))))
-                       (not (effects/removable-expr? expression)))]
+                       ;; A changed claimed binding invalidates its executor even when the new
+                       ;; source expression is pure. Only unclaimed host work may be removed.
+                       (or (contains? claimed symbol)
+                           (not (effects/removable-expr? expression))))]
       (fail! :structured-control-host-continuation
              "a retained host computation has no executor in the complete typed invocation"
              {:binding symbol :expression expression :site [:binding symbol]

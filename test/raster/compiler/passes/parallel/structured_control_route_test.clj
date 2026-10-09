@@ -760,7 +760,17 @@
                                                                 bindings)))
                                              equations))))]
               (is (false? (typed-route/realization-binding? forged binding wrong))
-                  "a forged witness cannot change canonical allocation dtype, extent or arity"))))))
+                  "a forged witness cannot change canonical allocation dtype, extent or arity")))
+          (let [pure-source (list 'let* (vec (mapcat (fn [[symbol value]]
+                                                     [symbol (if (= binding symbol) 'x value)])
+                                                   (partition 2 (second (:source semantic)))))
+                                 (last (:source semantic)))]
+            (is (= :structured-control-host-continuation
+                   (reason-of #(route/promote-program (assoc semantic :source pure-source)
+                                                     {:public-parameters (mapv :symbol (:parameters invocation-plan))
+                                                      :array-types {'W1 :double 'b1 :double 'W2 :double
+                                                                    'b2 :double 'x :double}})))
+                "a removable replacement cannot bypass a claimed allocation witness")))))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
     (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
@@ -849,7 +859,12 @@
              (reason-of #(route/promote-program
                           (assoc complete :source '(let* [y (clojure.core/println x)] y))
                           options)))
-          "a coincident binding site cannot authorize execution of a stale equation"))))
+          "a coincident binding site cannot authorize execution of a stale equation")
+      (doseq [replacement ['x 0.0]]
+        (is (= :structured-control-host-continuation
+               (reason-of #(route/promote-program
+                            (assoc complete :source (list 'let* ['y replacement] 'y)) options)))
+            "removability cannot authorize a stale equation for a claimed binding")))))
 
 (deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
   (let [source '(let* [checked (clojure.core/int n)
