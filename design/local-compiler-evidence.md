@@ -1705,3 +1705,26 @@ especially for transcendental loops. Legal relaxed schedules should recover
 performance through explicit numerical contracts rather than global flags.
 JVM-compatible scalar and SIMD min/max handling remains a separate open defect;
 preserving the environment alone does not change C `fmin`/`fmax` semantics.
+
+### Native extrema realize JVM Math/numeric semantics
+
+The two-array public Float max reproduction returned a finite value for
+max(NaN, 1) and negative zero for max(+0, -0), unlike JVM execution. Native-only
+scalar min/max implementations now live in the shared intrinsic descriptors.
+C overload selection uses the actual emitted operand types without evaluating
+them, and each argument is evaluated once by the selected helper. Float, Double
+and integral operations are distinct; integral extrema do not pass through FP.
+The shared source emitter applies the same target extrema override to retained
+devirtualized calls as to Java Math calls.
+
+The AVX2 facet uses lane-wise zero-tie repair and NaN propagation instead of
+exposing raw asymmetric min/max instructions as the source operation. Public
+Float Math and Double raster.numeric maps compare native scalar/SIMD results
+against JVM execution across empty, short, exact-vector and tail lengths,
+with changed inputs, both NaN positions, signed-zero orders, infinities, and
+Double values that differ only below Float precision. Tests require an emitted
+vector call, not merely a correct scalar fallback. Additional native checks
+cover single operand evaluation and Long extrema beyond exact Double range.
+NaNs are compared by classification, not payload identity; finite values and
+signed zero are compared by raw bits. This closes native map extrema only:
+other target facets and reductions' numerical legality require their own gates.

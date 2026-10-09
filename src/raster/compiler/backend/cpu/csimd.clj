@@ -106,7 +106,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Horizontal-reduce helpers (emitted once per compiled unit that uses them).
 ;; ---------------------------------------------------------------------------
-(def simd-includes "#include <immintrin.h>\n")
+(def simd-includes
+  (str "#include <immintrin.h>\n" (in/simd-helper-sources :avx2)))
 
 (def simd-helpers
   (str
