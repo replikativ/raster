@@ -12,6 +12,7 @@
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.resident-plan :as resident-plan]))
 
 (defrecord LinkCompositionCertificate
@@ -28,11 +29,15 @@
 
 (declare verify!)
 
-(defn- verify-component! [component]
+(defn- verify-component! [component caller-options]
   (cond
     (resident-plan/certified-plan? component) (resident-plan/verify! component)
-    (invocation-link/certified-link? component) (invocation-link/verify! component)
-    (certified-composition? component) (verify! component)
+    (invocation-link/certified-link? component) (if caller-options
+                                               (invocation-link/verify! component caller-options)
+                                               (invocation-link/verify! component))
+    (certified-composition? component) (if caller-options
+                                       (verify! component caller-options)
+                                       (verify! component))
     :else
     (throw (ex-info "link composition components must carry a verified lowering certificate"
                     {:reason :link-composition-component-type :actual (type component)}))))
@@ -45,7 +50,7 @@
                     {:reason :link-composition-component-type :actual (type component)})))
   component)
 
-(defn- normalize-components! [components verify-components?]
+(defn- normalize-components! [components verify-components? caller-options]
   (let [components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
                                           (contains? component :lowering))
@@ -54,7 +59,7 @@
                                               :component component})))
                            (update component :lowering
                                    (if verify-components?
-                                     verify-component!
+                                     #(verify-component! % caller-options)
                                      certified-component!)))
                          components)
         ids (mapv :id components)]
@@ -110,7 +115,7 @@
          :id namespaced-id
          :leaves (mapv #(update % :node node-mapping) (:leaves value))))
 
-(defn- namespace-instance [namespaced-id value-mapping instance]
+(defn- namespace-instance [namespaced-id value-mapping instance caller-options]
   (cond
     (link-plan/link-instance? instance)
     (assoc instance
@@ -120,7 +125,9 @@
     (link-plan/program-link-instance? instance)
     (assoc instance
            :id namespaced-id
-           :call (program-call/map-buffers (:call instance) value-mapping))
+           :call (if caller-options
+                   (program-call/map-buffers (:call instance) value-mapping caller-options)
+                   (program-call/map-buffers (:call instance) value-mapping)))
 
     (link-plan/graph-link-instance? instance)
     (assoc instance
@@ -359,11 +366,12 @@
 
 (defn- derive-composition
   [id components {:keys [connections shares mutable-shares outputs attributes]
-                  :or {connections [] shares [] mutable-shares [] attributes {}} :as specification}]
+                  :or {connections [] shares [] mutable-shares [] attributes {}} :as specification}
+   caller-options]
   (when (nil? id)
     (throw (ex-info "link composition requires a stable plan identity"
                     {:reason :link-composition-id})))
-  (let [components (normalize-components! components *verify-components?*)
+  (let [components (normalize-components! components *verify-components?* caller-options)
         component-plans (into {} (map (juxt :id (comp :plan :lowering))) components)
         targets (set (map :target (vals component-plans)))
         _ (when-not (= 1 (count targets))
@@ -540,7 +548,7 @@
                           (namespace-instance
                            (get instance-mapping [component-id (:id instance)])
                            (comp resolve-value #(get value-mapping0 [component-id %]))
-                           instance))
+                           instance caller-options))
                         (get-in lowering [:plan :instances])))
                  components))
         aliases (into #{} (map set)
@@ -558,8 +566,12 @@
                              (mapv (comp :id :plan :lowering) components)})}
         {:keys [plan effect-evidence]}
         (if (some? effect-facts)
-          (link-plan/make-with-certified-effect-facts plan-request effect-facts)
-          (link-plan/make-with-effect-evidence plan-request))
+          (if caller-options
+            (link-plan/make-with-certified-effect-facts plan-request effect-facts caller-options)
+            (link-plan/make-with-certified-effect-facts plan-request effect-facts))
+          (if caller-options
+            (link-plan/make-with-effect-evidence plan-request caller-options)
+            (link-plan/make-with-effect-evidence plan-request)))
         certificate
         (->LinkCompositionCertificate
          :certified-link-plans :link-plan id target
@@ -570,16 +582,19 @@
      :specification (assoc specification :connections connections :shares shares :mutable-shares mutable-shares
                            :outputs outputs :attributes attributes)}))
 
-(defn verify!
-  "Re-derive a certified composition from its certified components and explicit boundary map."
-  [composition]
+(defn- caller-math-options [options]
+  (when (some? options)
+    {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options))}))
+
+(defn- verify-for-request! [composition options]
+  (let [caller-options (caller-math-options options)]
   (when-not (certified-composition? composition)
     (throw (ex-info "expected a CertifiedLinkComposition"
                     {:reason :link-composition-type :actual (type composition)})))
   (let [actual (select-keys composition [:plan :certificate :components :specification])
         expected (derive-composition (get-in composition [:plan :id])
                                      (:components composition)
-                                     (:specification composition))]
+                                     (:specification composition) caller-options)]
     (when-not (certificate? (:certificate composition))
       (throw (ex-info "link composition requires a LinkCompositionCertificate"
                       {:reason :link-composition-certificate-type
@@ -589,7 +604,20 @@
                       {:reason :link-composition-certificate
                        :expected (select-keys expected [:plan :certificate])
                        :actual (select-keys actual [:plan :certificate])})))
-    composition))
+    composition)))
+
+(defn verify!
+  "Re-derive composition under independent caller intent, never retained metadata."
+  ([composition] (verify-for-request! composition nil))
+  ([composition options] (verify-for-request! composition options)))
+
+(defn- compose-for-request [{:keys [id components] :as request} options prevalidated?]
+  (let [caller-options (caller-math-options options)
+        specification (select-keys request [:connections :shares :mutable-shares :outputs :attributes])
+        {:keys [plan certificate components specification]}
+        (binding [*verify-components?* (if prevalidated? false *verify-components?*)]
+          (derive-composition id components specification caller-options))]
+    (->CertifiedLinkComposition plan certificate components specification)))
 
 (defn compose
   "Compose certified LinkPlans before allocation and return a checkable witness.
@@ -608,20 +636,13 @@
 
    Composite values unify atomically across their ordered leaves. Endpoints whose individual
    physical allocations have multiple views remain rejected until ranged composition is explicit."
-  [{:keys [id components] :as request}]
-  (let [specification (select-keys request [:connections :shares :mutable-shares :outputs :attributes])
-        {:keys [plan certificate components specification]}
-        (derive-composition id components specification)]
-    (->CertifiedLinkComposition plan certificate components specification)))
+  ([request] (compose-for-request request nil false))
+  ([request options] (compose-for-request request options false)))
 
 (defn ^:no-doc compose-prevalidated
   "Internal construction path for exact, identity-sealed Prepared values created by
    raster.gpu.compiled. It skips only component certificate re-derivation; the complete composed
    LinkPlan and all cross-component boundaries are still independently validated. Callers without
    that in-process provenance must use `compose`."
-  [{:keys [id components] :as request}]
-  (let [specification (select-keys request [:connections :shares :mutable-shares :outputs :attributes])
-        {:keys [plan certificate components specification]}
-        (binding [*verify-components?* false]
-          (derive-composition id components specification))]
-    (->CertifiedLinkComposition plan certificate components specification)))
+  ([request] (compose-for-request request nil true))
+  ([request options] (compose-for-request request options true)))
