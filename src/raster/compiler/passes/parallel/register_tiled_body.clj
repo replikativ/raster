@@ -222,7 +222,7 @@
    decline until they can be projected to checked, typed scalar ABI values.
    :multiply-add selects decomposed typed operations (default) or explicit canonical :fma.
    Decomposed SSA alone does not forbid contraction by a downstream vendor compiler."
-  [contract-facts {:keys [tile descriptor operation-id scalar-types multiply-add]
+  [contract-facts {:keys [tile descriptor operation-id scalar-types multiply-add scalar-math]
                   :or {multiply-add :decomposed}}]
   (when-not (facts/facts? contract-facts)
     (throw (ex-info "register-tiled scheduling requires verified contraction facts"
@@ -539,6 +539,7 @@
                        (scalar-region-lower/lower
                         semantic-region
                         {:accumulator accumulator
+                         :scalar-math scalar-math
                          :accumulator-dtype dtype
                          :store-dtype dtype
                          :parameters parameter-map

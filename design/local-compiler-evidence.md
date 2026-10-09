@@ -2200,3 +2200,17 @@ the runtime-to-descriptor path retains Half/Double support with detected
 provenance. These are execution legality facts, not hardware-native throughput
 or cross-target numerical-accuracy claims. Public math policy admission remains
 disabled pending the complete scheduling/certificate vertical.
+
+Private contraction scheduling now carries caller-owned scalar math consent
+through portable, register-tiled and direct matrix epilogues. The selected
+physical evaluation dtype does not change logical buffer dtypes or launch
+geometry; numerical certificates retain the normalized policy and reject its
+removal when a selected math leaf remains. Complete-write reconstruction for
+portable/register bodies takes independent caller options rather than deriving
+consent from the candidate. Independent review found and corrected an omitted
+policy at the matrix strategy dispatcher; the regression exercises that public
+schedule-shaped dispatcher as well as the underlying private matrix builder.
+The two focused contraction suites pass 41 tests / 324 assertions in the warm
+REPL. This is policy plumbing, not matrix accuracy or model-gradient acceptance.
+Mixed-matrix stage reconstruction and other remaining owners still need the
+same closed vertical before public policy selection can be enabled.

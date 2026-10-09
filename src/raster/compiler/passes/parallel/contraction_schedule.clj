@@ -16,6 +16,7 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.contraction-body :as contraction-body]
@@ -25,6 +26,11 @@
 
 (defn- decline [reason & [data]]
   (merge {:ok false :reason reason} data))
+
+(defn- retain-scalar-math [contract options]
+  (cond-> contract
+    (contains? options :scalar-math)
+    (assoc :scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options)))))
 
 (defn- additive? [combine]
   (contains? '#{+ clojure.core/+ raster.numeric/+} combine))
@@ -127,7 +133,7 @@
   [{:keys [id row col out dimensions dimension-parameters axis-symbols tile bindings epilogue
            result-dtype provenance additional-parameters additional-indices buffer-shapes
            buffer-views operation-buffers k-range launch-group-count attributes input-value-regions
-           input-layouts]
+           input-layouts scalar-math]
     :or {axis-symbols ['i 'j 'k]
          result-dtype :half
          provenance {}
@@ -333,6 +339,7 @@
           (scalar-region-lower/lower-region
            semantic-region
            {:accumulator (first (:parameters semantic-region))
+            :scalar-math scalar-math
             :accumulator-dtype :float
             :store-dtype result-dtype
             :indices [i j]
@@ -392,7 +399,7 @@
   separate qualified boundary; admission here never implies runtime support."
   ([contract-facts desc tile]
    (plan-matrix-body contract-facts desc tile {}))
-  ([contract-facts desc tile {:keys [operation-id]}]
+  ([contract-facts desc tile {:keys [operation-id scalar-math]}]
    (when-not (facts/facts? contract-facts)
      (throw (ex-info "contraction scheduling requires verified contraction facts"
                      {:reason :raster/bug :facts contract-facts})))
@@ -514,6 +521,7 @@
                 :bindings bindings
                 :result-dtype result-dtype
                 :epilogue epilogue
+                :scalar-math scalar-math
                 :provenance {:dialect :segcontract :operation-id operation-id}})}))))
 
 (defn- portable-workgroup-size
@@ -531,13 +539,14 @@
   ([contract-facts segred desc]
    (plan-portable-body contract-facts segred desc {}))
   ([contract-facts segred desc {:keys [array-types scalar-types]
-                                :or {array-types {} scalar-types {}}}]
+                                :or {array-types {} scalar-types {}} :as options}]
    (try
      (let [workgroup-size (portable-workgroup-size desc)
            lowered (contraction-body/lower
                     contract-facts segred
-                    {:workgroup-size workgroup-size
-                     :array-types array-types :scalar-types scalar-types})]
+                    (merge (select-keys options [:scalar-math])
+                           {:workgroup-size workgroup-size
+                            :array-types array-types :scalar-types scalar-types}))]
        {:ok true
         :body (:kernel-body lowered)
         :workgroup-size workgroup-size
@@ -577,8 +586,9 @@
                       :effects {:kind :pure-contraction
                                 :uses (scheduled-body/derive-uses kernel-body arguments)}
                       :legality {:kind :ordered-portable-contraction}
-                      :numerics {:mode :exact :policy :same-typed-ssa-evaluation-order
-                                 :source-arithmetic (:source-arithmetic contract-facts)}
+                      :numerics (retain-scalar-math
+                                 {:mode :exact :policy :same-typed-ssa-evaluation-order
+                                  :source-arithmetic (:source-arithmetic contract-facts)} options)
                       :attributes {:strategy (get-in kernel-body [:schedule :strategy])
                                    :out-elems (get-in kernel-body [:attributes :launch-segment-count])}})]
       (scheduled-body/validate-against-node! scheduled node graph))))
@@ -639,7 +649,8 @@
                           :legality {:kind :register-tiled-contraction
                                      :tile (:tile lowered) :variant (:variant lowered)
                                      :multiply-add (get-in kernel-body [:schedule :multiply-add])}
-                          :numerics (register-contraction-numerics contract-facts kernel-body)
+                          :numerics (retain-scalar-math
+                                     (register-contraction-numerics contract-facts kernel-body) options)
                           :attributes {:strategy :register-tiled :precision :f32
                                        :variant (:variant lowered)
                                        :out-elems (:output-count lowered)}})]
@@ -655,14 +666,15 @@
    The target descriptor chooses the instruction and tile; the typed contraction fixes the
    arithmetic, storage and output. A decline is an error for this explicit schedule, never a
    silent portable fallback."
-  [node graph contract-facts descriptor {:keys [precision matrix-tiles]}]
+  [node graph contract-facts descriptor {:keys [precision matrix-tiles] :as options}]
   (if (not= :mixed-f16-f32 precision)
     {:ok false :reason :matrix-numerical-policy}
     (let [tiles (if (vector? matrix-tiles)
                   matrix-tiles
                   (hardware/gemm-tile-candidates descriptor))
           attempts (mapv #(plan-matrix-body contract-facts descriptor %
-                                            {:operation-id (get-in node [:operation :id])})
+                                            (merge (select-keys options [:scalar-math])
+                                                   {:operation-id (get-in node [:operation :id])}))
                          tiles)
           planned (or (first (filter :ok attempts))
                       {:ok false :reason :no-legal-matrix-tile
@@ -685,9 +697,10 @@
                           :legality {:kind :matrix-instruction-tiling
                                      :tile (:tile planned)
                                      :instruction (get-in planned [:tile :matrix])}
-                          :numerics {:mode :reassociated :policy :tiled-contraction
-                                     :source-arithmetic (:source-arithmetic contract-facts)
-                                     :rounding :nearest-even :accumulator-dtype :float}
+                          :numerics (retain-scalar-math
+                                     {:mode :reassociated :policy :tiled-contraction
+                                      :source-arithmetic (:source-arithmetic contract-facts)
+                                      :rounding :nearest-even :accumulator-dtype :float} options)
                           :attributes {:strategy :matrix
                                        :out-elems (apply * (map second
                                                               (:free-axes contract-facts)))}})]
@@ -721,8 +734,9 @@
       :matrix
       (let [planned (plan-matrix-for-node
                      node graph contract-facts descriptor
-                     {:precision (:precision schedule)
-                      :matrix-tiles (get-in schedule [:typed-contraction :matrix-tiles])})]
+                     (merge (select-keys options [:scalar-math])
+                            {:precision (:precision schedule)
+                             :matrix-tiles (get-in schedule [:typed-contraction :matrix-tiles])}))]
         (if (:ok planned)
           (:scheduled planned)
           (throw (ex-info "explicit matrix contraction schedule is not legal"
@@ -742,7 +756,9 @@
    Require exact body, compiler-argument and scalar-binding identity, including stores, masks
    and launch geometry. Target and numerical admission stay with the original
    certificate; this query neither discovers hardware nor claims numerical equivalence."
-  [algorithm node graph scheduled]
+  ([algorithm node graph scheduled]
+   (complete-write-domain algorithm node graph scheduled {}))
+  ([algorithm node graph scheduled caller-options]
   (let [scheduled (scheduled-body/validate-against-node! scheduled node graph)
         contract-facts (:facts (contraction-context/validate! algorithm (:operation node)))
         kernel-body (:body scheduled)
@@ -752,8 +768,9 @@
         scalar-types (into {} (map (juxt :id :dtype)) (:scalars graph))
         array-types (into {} (map (juxt :id :dtype))
                           (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
-        options {:operation-id (get-in scheduled [:source :id])
-                 :array-types array-types :scalar-types scalar-types}
+        options (merge (select-keys caller-options [:scalar-math])
+                       {:operation-id (get-in scheduled [:source :id])
+                        :array-types array-types :scalar-types scalar-types})
         expected
         (case (get-in scheduled [:legality :kind])
           :ordered-portable-contraction
@@ -787,7 +804,8 @@
     (when (and expected plain-output? preconditions-valid?
                (or (not= :register-tiled-contraction (get-in scheduled [:legality :kind]))
                    (= (:numerics scheduled)
-                      (register-contraction-numerics contract-facts (:kernel-body expected))))
+                      (retain-scalar-math
+                       (register-contraction-numerics contract-facts (:kernel-body expected)) options)))
                (= kernel-body (:kernel-body expected))
                (= (:arguments scheduled) expected-arguments)
                (= (:scalar-bindings scheduled)
@@ -795,4 +813,4 @@
                    (:kernel-body expected) expected-arguments scalar-types))
                (= 1 (count outputs)) (= :output (:kind output))
                (= (:out contract-facts) (:id output)))
-      {(:out contract-facts) (apply launch/product (map second (:free-axes contract-facts)))})))
+      {(:out contract-facts) (apply launch/product (map second (:free-axes contract-facts)))}))))
