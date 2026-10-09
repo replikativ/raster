@@ -83,10 +83,12 @@
              [[:links :gpu-0->gpu-1 :attributes] nil :distributed-link-attributes]]
             :let [candidate (assoc-in base (into [:topology] path) value)
                   topology (:topology candidate)]]
-      (doseq [check [#(distributed/topology (vals (:devices topology)) (vals (:links topology)))
-                     #(distributed/simulate candidate)
-                     #(distributed/certify candidate)
-                     #(distributed/verify! (assoc certified :plan candidate))]]
+      (doseq [check (cond-> [#(distributed/topology (vals (:devices topology)) (vals (:links topology)))
+                            #(distributed/simulate candidate)
+                            #(distributed/certify candidate)
+                            #(distributed/verify! (assoc certified :plan candidate))]
+                     (= :links (first path))
+                     (conj #(distributed/transfer-duration-ns topology (nth (:steps candidate) 2))))]
         (is (= reason (try (check) nil
                            (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
             (str path " must reject modified physical facts before planning"))))))
@@ -103,6 +105,12 @@
     (doseq [[kind id] [[:devices :gpu-0] [:links :gpu-0->gpu-1]]
             :let [candidate (update-in base [:topology kind]
                                        (fn [index] (assoc (dissoc index id) :alias (get index id))))]]
+      (when (= :links kind)
+        (is (= :distributed-topology-index
+               (try (distributed/transfer-duration-ns
+                     (:topology candidate) (assoc (nth (:steps candidate) 2) :route [:alias]))
+                    nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
       (doseq [check [#(distributed/validate! candidate)
                      #(distributed/certify candidate)
                      #(distributed/verify! (assoc certified :plan candidate))]]

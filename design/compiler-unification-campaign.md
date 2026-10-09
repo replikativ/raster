@@ -9,10 +9,12 @@ the data-parallel fixture. Nonfinite/nonpositive bandwidth, invalid latency,
 memory capacity, descriptor and attributes now fail through the existing field
 contracts. Modified topology indexes must also match their contained record
 identities and retain actual device/link maps. Constructor, simulation, fresh
-certification and verification regression cases cover these boundaries.
+certification and verification regression cases cover these boundaries. Pre-plan
+route-cost queries also validate each visited link and its index identity, without
+rescanning the entire topology for each transfer.
 
 The affected hardware-free plan, compute-binding and AMR-plan suites pass
-65 tests / 396 assertions. No valid constructor API or numerical policy changes;
+65 tests / 405 assertions. No valid constructor API or numerical policy changes;
 this rejects malformed physical claims, not measured-but-inaccurate costs.
 Explicit shared-link serialization domains, calibrated fabric costs, the held
 training gate and the remaining distributed/AMR workload obligations remain open.

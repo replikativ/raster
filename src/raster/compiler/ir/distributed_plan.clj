@@ -711,6 +711,15 @@
         (when-not candidate
           (fail! "transfer route names an undeclared topology link"
                  :distributed-transfer-link {:step id :link link-id}))
+        (when-not (topology-link? candidate)
+          (fail! "transfer route requires a TopologyLink value"
+                 :distributed-topology-link-type {:step id :link link-id}))
+        ;; Cost queries also occur before a whole plan is constructed. Revalidate only
+        ;; visited links here, rather than rescanning the entire topology for each route.
+        (link candidate)
+        (when-not (= link-id (:id candidate))
+          (fail! "transfer route link index does not match its record identity"
+                 :distributed-topology-index {:step id :link link-id :record-id (:id candidate)}))
         (when-not (= current (:source candidate))
           (fail! "transfer route is not directionally contiguous"
                  :distributed-transfer-continuity
