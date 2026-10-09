@@ -26,6 +26,48 @@
       (numeric/+ (arrays/aget src i) (float (numeric/* gain gain))))
     out))
 
+(deftm double-comparison-map
+  [src :- (Array float) lo :- Double hi :- Double] :- (Array float)
+  (let [out (arrays/alloc-like src (arrays/alength src))]
+    (par/map! out i (arrays/alength src) float
+      (if (numeric/< lo hi) (float 1) (float 2)))
+    out))
+
+(deftest simd-preserves-selected-comparison-domain
+  (let [scalar (pipeline/compile-aot #'double-comparison-map :simd? false)
+        vectorized (pipeline/compile-aot #'double-comparison-map :simd? true)
+        input (float-array 65)]
+    ;; Each pair collapses to a single Float, but remains distinct in Double.
+    (doseq [[lo hi] [[1.00000006 1.00000007] [1.00000007 1.00000006]]]
+      (let [expected (if (< (double lo) (double hi)) (float 1) (float 2))
+            reference (vec (scalar input lo hi))
+            actual (vec (vectorized input lo hi))]
+        (is (= (vec (repeat 65 expected)) reference))
+        (is (= reference actual))))))
+
+(deftest comparison-admission-uses-declared-parameters-not-boolean-result
+  (let [expression
+        (fn [tags]
+          (segop-simd/normalize-invk
+           (list 'if
+                 (with-meta
+                   (list '.invk
+                         (with-meta 'declared-comparison-impl
+                           {:raster.type/fn-info {:param-tags tags}})
+                         'lo 'hi)
+                   {:raster.op/original 'raster.numeric/< :raster.type/tag 'boolean})
+                 '(float 1) '(float 2))))]
+    (is (segop-simd/simd-able? (expression '[float float]) 'i :float))
+    (is (not (segop-simd/simd-able? (expression '[double double]) 'i :float)))
+    (is (not (segop-simd/simd-able? (expression '[long long]) 'i :float)))
+    (is (not (segop-simd/simd-able? (expression nil) 'i :float)))
+    (is (not (segop-simd/simd-able? (expression '[float]) 'i :float)))
+    (is (not (segop-simd/simd-able?
+              (list 'if (with-meta '(< lo hi) {:raster.type/tag 'boolean})
+                    '(float 1) '(float 2)) 'i :float)))
+    (is (segop-simd/simd-able? '(if (< lo hi) (float 1) (float 2)) 'i)
+        "untyped compatibility syntax is not a typed signature proof")))
+
 (deftest simd-keeps-double-computation-before-float-narrowing
   (let [scalar (pipeline/compile-aot #'mixed-precision-square-map :simd? false)
         vectorized (pipeline/compile-aot #'mixed-precision-square-map :simd? true)]

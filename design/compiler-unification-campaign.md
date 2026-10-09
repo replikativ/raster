@@ -14,8 +14,11 @@ These are shared semantic fixes, not replacement model kernels or a new type reg
 The follow-up threads active-species precision obligations into stencil and C-SIMD
 consumers and checks complete reduction recurrences. C integer-widening syntax
 admission remains emitter-specific; canonical conversion precision is checked before
-source projection. Typed comparison domains and missing operation stamps still need
-separate evidence, and mixed-species vector execution remains unimplemented.
+source projection. A further reproduced Boolean comparison miscompile requires
+retaining selected interface parameter tags through SIMD canonicalization. Declared
+comparison domains are checked before compare-and-blend; missing signatures decline
+rather than being inferred. Untyped compatibility and missing operation stamps still
+need separate evidence, and mixed-species vector execution remains unimplemented.
 
 The C-SIMD guard also exposes a quant-fold performance residual: Q4 x8 explicitly
 computes Double scale products into Float storage, while its old vector assertion
