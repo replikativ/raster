@@ -14,7 +14,7 @@
             [raster.core :refer [deftm reduce!]]
             [raster.numeric :as rn]
             [raster.arrays :as ra]
-            [raster.par]
+            [raster.par :as par]
             [raster.math]
             [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.ir.parallel-program :as parallel-program]))
@@ -147,6 +147,59 @@
         (is (every? #(<= (Math/abs (- (int (first %)) (int (second %)))) 1)
                     (map vector rq cq))
             "int8 output within 1 ULP of the lazy-JIT reference")))))
+
+(deftm native-max-float!
+  [x :- (Array float), z :- (Array float), y :- (Array float), cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (Math/max (float (aget x i)) (float (aget z i))))
+  y)
+
+(deftm native-min-float!
+  [x :- (Array float), z :- (Array float), y :- (Array float), cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (Math/min (float (aget x i)) (float (aget z i))))
+  y)
+
+(deftm native-max-double!
+  [x :- (Array double), z :- (Array double), y :- (Array double), cnt :- Long] :- (Array double)
+  (par/map! y i cnt double (rn/max (double (aget x i)) (double (aget z i))))
+  y)
+
+(deftm native-min-double!
+  [x :- (Array double), z :- (Array double), y :- (Array double), cnt :- Long] :- (Array double)
+  (par/map! y i cnt double (rn/min (double (aget x i)) (double (aget z i))))
+  y)
+
+(deftest native-extrema-preserve-source-semantics
+  (when (clang-available?)
+    (doseq [[v dtype array-fn bits op] [[#'native-max-float! :float float-array #(Float/floatToRawIntBits (float %)) :max]
+                                     [#'native-min-float! :float float-array #(Float/floatToRawIntBits (float %)) :min]
+                                     [#'native-max-double! :double double-array #(Double/doubleToRawLongBits (double %)) :max]
+                                     [#'native-min-double! :double double-array #(Double/doubleToRawLongBits (double %)) :min]]
+            simd? [false true]
+            :let [native (aot/compile-aot-c v dtype :simd? simd?)
+                  pairs [[Double/NaN 1.0] [1.0 Double/NaN] [Double/NaN Double/NaN]
+                         [0.0 -0.0] [-0.0 0.0] [-0.0 -0.0] [0.0 0.0]
+                         [Double/POSITIVE_INFINITY 4.0] [-4.0 Double/NEGATIVE_INFINITY]
+                         [1.00000006 1.00000007] [-8.25 9.5]]]]
+      (when simd?
+        ;; Definitions occur once; a second occurrence proves a vector call was
+        ;; actually emitted rather than a passing scalar fallback.
+        (let [name (str "rstr_avx2_" (name op) "_" (if (= dtype :float) "f32" "f64"))]
+          (is (< 1 (count (re-seq (re-pattern (str name "\\(")) (:c-source (meta native))))))))
+      (doseq [n [0 1 3 4 5 7 8 9 17]
+              shift [0 4 8]
+              :let [inputs (take n (drop shift (cycle pairs)))
+                    x (array-fn (map first inputs))
+                    z (array-fn (map second inputs))
+                    actual (array-fn n)
+                    expected (array-fn n)]]
+        (native x z actual n)
+        (@v x z expected n)
+        (is (every? true?
+                    (map (fn [a b]
+                           (if (Double/isNaN (double b))
+                             (Double/isNaN (double a))
+                             (= (bits a) (bits b)))) actual expected))
+            (str (:name (meta v)) " simd=" simd? " n=" n " shift=" shift))))))
 
 (deftest cpu-c-round-half-up
   (when (clang-available?)

@@ -12,7 +12,8 @@
   primitive whose lowering emits the maddubs intrinsic (the one ISA seam)."
   (:require [clojure.string :as str]
             [clojure.java.io :as io]
-            [raster.compiler.backend.gpu.c-emit :as ce])
+            [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.intrinsics :as intrinsics])
   (:import [java.lang.foreign Arena Linker Linker$Option FunctionDescriptor
             SymbolLookup ValueLayout MemoryLayout MemorySegment]
            [java.nio.channels FileChannel]
@@ -20,14 +21,14 @@
            [java.nio.file Files OpenOption StandardCopyOption StandardOpenOption]
            [java.security MessageDigest]))
 
-;; ---- backend config: native C (float uses fabsf/fmaxf, statement-exprs ok) ----
+;; ---- backend config: native C (source extrema, statement-exprs ok) ----
 (def cpu-config
   {:cast-style       :c
    :atomic-add-int   "__atomic_add"      ;; not used on the single-thread path yet
    :atomic-add-float :cas-helper
    :float-abs        "fabsf"
-   :float-max        "fmaxf"
-   :float-min        "fminf"
+   :float-max        (get-in intrinsics/table [:max :native-c :fn])
+   :float-min        (get-in intrinsics/table [:min :native-c :fn])
    :float-suffix?    true})
 
 ;; Reuse the shared faceted registry (dtype/native-types via c-emit) rather than a
@@ -51,12 +52,14 @@
         params (str/join ", " (concat (map #(str "const " ct "* restrict arr" %) (range n-arrays))
                                       [(str ct "* restrict out") "int n"]))
         reads (str/join "\n" (map #(str "    " ct " " (get vars % (str "v" %)) " = arr" % "[idx];")
-                                  (range n-arrays)))]
+                                  (range n-arrays)))
+        body (emit-body body-expr dtype)]
     (str "#include <math.h>\n"
+         (intrinsics/native-c-helper-sources body)
          "void " kernel-name "(" params ") {\n"
          "  for (int idx = 0; idx < n; idx++) {\n"
          reads "\n"
-         "    out[idx] = " (emit-body body-expr dtype) ";\n"
+         "    out[idx] = " body ";\n"
          "  }\n}\n")))
 
 ;; ---- compile + load (clang -O3 -march=native -> .so -> Panama) ----

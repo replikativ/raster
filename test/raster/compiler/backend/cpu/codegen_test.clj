@@ -1,6 +1,30 @@
 (ns raster.compiler.backend.cpu.codegen-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.backend.cpu.codegen :as cpu]))
+            [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.backend.intrinsics :as intrinsics]))
+
+(deftest native-extrema-evaluate-operands-once
+  (doseq [op [:min :max]
+          :let [name (get-in intrinsics/table [op :native-c :fn])
+                body (str "void extrema_once(float *x, float *out) {\n"
+                          "out[0] = " name "(x[0]++, x[1]++);\n"
+                          "out[1] = x[0]; out[2] = x[1];\n}\n")
+                source (str "#include <math.h>\n"
+                            (intrinsics/native-c-helper-sources body) body)
+                native (cpu/load-kernel (cpu/compile-source! source) "extrema_once" 2 [])
+                x (float-array [-2.0 -3.0])
+                out (float-array 3)]]
+    (native x out)
+    (is (= [(if (= :min op) -3.0 -2.0) -1.0 -2.0] (vec out)))))
+
+(deftest native-extrema-preserve-integral-operands
+  (doseq [op ['Math/min 'Math/max]
+          :let [native (cpu/compile-elementwise "extrema_long" :long (list op 'x 'y) 2)
+                a (long-array [Long/MAX_VALUE Long/MIN_VALUE 9007199254740993])
+                b (long-array [(dec Long/MAX_VALUE) (inc Long/MIN_VALUE) 9007199254740992])
+                out (long-array 3)]]
+    (native a b out 3)
+    (is (= (mapv (if (= op 'Math/min) min max) a b) (vec out)))))
 
 (deftest native-source-cache-key-test
   (let [key-fn (ns-resolve 'raster.compiler.backend.cpu.codegen 'source-cache-key)

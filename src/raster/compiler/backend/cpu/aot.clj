@@ -610,6 +610,7 @@
         ;; which lowers to a maddubs helper via its :c-helper override).
         [helper-incs helper-defs] (helper-c-defs stripped)]
     (str "#include <math.h>\n#include <stdbool.h>\n#include <stdint.h>\n"
+         (intrinsics/native-c-helper-sources (str helper-defs body-c))
          (apply str @simd-pre)   ; immintrin + hsum helpers, if any C-SIMD block emitted
          helper-incs
          (when (seq helper-defs) (str helper-defs "\n"))
