@@ -3651,6 +3651,31 @@ Level Zero (2 tests / 48 assertions), including foreign facts, live output lease
 cached module reuse and output retirement. Independent exact-head review and
 fresh CI are still required.
 
+### Completion-backed bounded distributed AMR capture
+
+The next item-8 slice connects the existing CertifiedCycleExecution to an original
+completed distributed owner and the existing NumericalStateManifest/ContentProvider
+contracts. It revalidates the exact compiler plan, pins its own output scope, and
+captures the two complete fields with bounded element-aligned downloads and SHA-256.
+The verified local domain explicitly relates a flat physical array to its dense
+patch shape; identical element counts and byte extent do not license arbitrary
+striding, packing or partial coverage. Storage evidence is checked before every
+download and after the final provider callback.
+
+The captured manifest retains field geometry, numerical policy and producer-attested
+meaning, with an advanced synchronized coordinate and the input state's identity as
+its parent. All manifest fields are validated before ingestion. Ingestion failure
+returns no state but may leave orphan blobs. The existing availability finalizer
+must independently verify/promote content before application-owned metadata
+publication. Neither observation nor hashing proves the producer's PDE semantics,
+initial geometry bytes or parent existence in a durable catalog.
+
+Hardware-free fault controls and an actual OpenCL/Level Zero capture/close/decode/
+fresh-context continuation oracle are under validation. The native test's bounded
+in-memory provider is explicitly not evidence of real durable storage. A mapped
+provider realization and publication/restore compatibility controls remain next,
+alongside the broader multi-patch, adaptive and physical-calibration obligations.
+
 ### Distributed representation evidence and explicit probe budgets
 
 The distributed owner now uses the shared in-process identity-witness factory,
