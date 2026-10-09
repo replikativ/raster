@@ -48,6 +48,31 @@ particular, physical padding or reuse must not change a source-visible `alength`
 must not invalidate a value unless the language explicitly exposes that transfer of ownership.
 Compatibility can be removed, but never by an undocumented semantic shift.
 
+## Physical scratch accounting integration
+
+Keep the existing allocation and staging authorities: DistributedPlan owns the
+validated shared LinkPlan root pool; KernelGraphCall resolves graph temporary
+extents; EmittedParallelProgramCall projects the bounded stage-once binding set.
+Do not reconstruct carry rotation or evaluate arbitrary source forms in a memory
+pass. Extent facts must come from the same linked physical views and scalar
+environment used by runtime binding.
+
+For the current synchronous distributed runner, all roots remain resident but
+each local LinkPlan is released after its compute action. Thus the declared
+storage bound on a physical target is its root pool plus the maximum local
+prepared scratch requirement among its actions, not the sum across actions.
+Within one local action, separately prepared graph variants coexist and their
+temporary allocations add, even when their emitted graph is identical. Future
+asynchronous execution must use overlapping completion lifetimes instead of
+this serial formula.
+
+Descriptor dispatch must account for actual binding admission and fallback, not
+just its preferred/default alternative. Either prove the selected executable
+matches runtime binding, or conservatively bound every reachable alternative.
+Unknown or inapplicable size facts must remain explicit; they cannot count as
+zero scratch. Backend temporaries, staging, alignment and driver overhead remain
+separate exclusions until their own contracts are joined to the budget.
+
 ### Certified independent forward/VJP state
 
 The explicit composition contract is implemented. The concrete acceptance case is a generated

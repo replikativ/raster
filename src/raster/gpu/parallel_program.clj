@@ -131,75 +131,9 @@
                     {:reason :parallel-program-closed :operation operation})))
   prepared)
 
-(defn- loop-staging-plan
-  [step execution-id step-index caller-options]
-  (when (and (get-in step [:scalars :iteration]) (> (:trip-count step) 1))
-    (throw (ex-info
-            "stage-once execution cannot freeze a changing loop induction scalar"
-            {:reason :parallel-program-dynamic-loop-binding
-             :step-index step-index :trip-count (:trip-count step)
-             :fallback :bounded-iteration-execution})))
-  ;; StructuredLoopCall has either an in-place carry or one initial buffer plus a two-buffer
-  ;; parity rotation. Consequently iteration zero and the two parities after it are the complete
-  ;; binding state space. Inspecting more iterations would only allocate O(trip-count) host data
-  ;; before the first launch—the exact failure bounded replay exists to avoid.
-  (reduce
-   (fn [{:keys [bindings entries] :as state} iteration]
-     (let [{:keys [buffers scalar-values]}
-           (if (nil? caller-options)
-             (loop-call/iteration-binding step iteration)
-             (loop-call/iteration-binding step iteration caller-options))
-           binding [buffers scalar-values]]
-       (if (contains? bindings binding)
-         state
-         (let [variant (count bindings)
-               key [:parallel-program execution-id step-index :variant variant]]
-           (when (>= variant 3)
-             (throw (ex-info
-                     "structured loop produced more than the bounded carry rotation variants"
-                     {:reason :parallel-program-unbounded-loop-binding
-                      :step-index step-index :iteration iteration
-                      :variants (inc variant)})))
-           {:bindings (assoc bindings binding key)
-            :entries (conj entries
-                           {:key key :graph (:graph step)
-                            :buffers buffers :scalar-values scalar-values})}))))
-   {:bindings {} :entries []}
-   (range (min 3 (:trip-count step)))))
-
 (defn- preparation-plan
   [call execution-id caller-options]
-  (let [program-scalars (:scalar-values call)
-        plan
-        (reduce
-         (fn [{:keys [entries step-keys] :as plan} [step-index step]]
-           (cond
-             (program-call/evaluated-host-equation? step)
-             plan
-
-             (program-call/emitted-equation-call? step)
-             (let [key [:parallel-program execution-id step-index]]
-               {:entries (conj entries
-                               {:key key :graph (:graph step)
-                                :buffers (:buffers step)
-                                :scalar-values (:scalar-values step)})
-                :step-keys (assoc step-keys step-index key)})
-
-             (loop-call/structured-loop-call? step)
-             (let [{:keys [bindings] loop-entries :entries}
-                   (loop-staging-plan step execution-id step-index caller-options)]
-               {:entries (into entries loop-entries)
-                :step-keys (assoc step-keys step-index bindings)})))
-         {:entries [] :step-keys {}}
-         (map-indexed vector (:steps call)))]
-    ;; Kernel-local maps deliberately contain only ABI scalars. Program-wide shape values still
-    ;; participate in graph buffer extents, including intermediate tensors consumed by a later
-    ;; equation, so retain them while staging. A local target-width cast remains authoritative.
-    (update plan :entries
-            (fn [entries]
-              (mapv #(update % :scalar-values
-                             (fn [local] (merge program-scalars local)))
-                    entries)))))
+  (program-call/preparation-plan call execution-id caller-options))
 
 (defn- staging-plan-for-request
   "Return the bounded set of distinct graph bindings to prepare without contacting a driver.
@@ -208,10 +142,7 @@
    returned host data and the eventual driver bindings are therefore constant rather than
    proportional to trip count; replay order is streamed separately by `run-with!`."
   [call execution-id caller-options]
-  (let [call (if (nil? caller-options)
-               (program-call/validate! call)
-               (program-call/validate! call caller-options))]
-    (:entries (preparation-plan call execution-id caller-options))))
+  (:entries (preparation-plan call execution-id caller-options)))
 
 (defn staging-plan
   "Return bounded graph bindings under independent caller math intent, without driver work."
@@ -256,9 +187,7 @@
    executor's `:buffer-view` resolver from a buffer token to its checked live BufferView; exact
    logical extent and prefix aliasing are checked before the first bind."
   [call {:keys [bind! run! release! buffer-view] :as executor} caller-options]
-  (let [call (if (nil? caller-options)
-               (program-call/validate! call)
-               (program-call/validate! call caller-options))]
+  (let [plan (preparation-plan call (random-uuid) caller-options)]
     (doseq [step (:steps call)
             [result physical] (:result-views step)]
       (when-not (ifn? buffer-view)
@@ -280,7 +209,6 @@
     (validate-executor! executor)
     (let [handles (volatile! {})
           binding-order (volatile! [])
-          plan (preparation-plan call (random-uuid) caller-options)
           owner (cleanup/owner
                  (mapv (fn [{:keys [key]}]
                          {:id [:graph key]
