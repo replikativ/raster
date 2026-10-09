@@ -211,16 +211,15 @@
 (defn ^:no-doc validate-with-physical-results
   "Validate an equation and return its exact boundary with the derived storage projection.
    This report is data, not authority to accept a later call without checking its bindings."
-  ([emitted] (validate-with-physical-results emitted {}))
+  ([emitted]
+   (select-keys (validate-with-result-contracts emitted)
+                [:boundary :physical-results :complete-write-domains]))
   ([emitted caller-options]
    (select-keys (validate-with-result-contracts emitted caller-options)
                 [:boundary :physical-results :complete-write-domains])))
 
-(defn ^:no-doc validate-with-result-contracts
-  "Independently check one candidate and derive storage, writes and any mixed operational model.
-   The returned data cannot authorize a later validation; no checked source graph is retained."
-  ([emitted] (validate-with-result-contracts emitted {}))
-  ([emitted caller-options]
+(defn- result-contract-report
+  [emitted caller-options]
   (let [{:keys [boundary source-graph mixed-reconstruction]} (validation-report emitted caller-options)
         algorithm (:algorithm boundary)]
     {:boundary boundary
@@ -229,7 +228,13 @@
      :complete-write-domains
      (if (swr/plan? algorithm)
        (complete-write-domains-for-validated-boundary boundary)
-       (contraction-write-domains-for-validated-boundary boundary source-graph mixed-reconstruction caller-options))})))
+       (contraction-write-domains-for-validated-boundary boundary source-graph mixed-reconstruction caller-options))}))
+
+(defn ^:no-doc validate-with-result-contracts
+  "Independently check one candidate and derive storage, writes and any mixed operational model.
+   The returned data cannot authorize a later validation; no checked source graph is retained."
+  ([emitted] (result-contract-report emitted {}))
+  ([emitted caller-options] (result-contract-report emitted caller-options)))
 
 (defn physical-results
   "Project logical results to physical storage from the retained, validated semantic equation."
