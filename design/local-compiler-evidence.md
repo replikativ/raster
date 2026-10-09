@@ -2164,6 +2164,17 @@ admission still derives storage evidence independently. Product producer/consume
 shared scalar and scan emitter suites pass 120 tests / 1063 assertions. Public
 selection remains disabled pending the remaining owners and outer admission.
 
+The private fused product/ordered-consumer route now carries caller-owned scalar
+consent to access-analysis, producer element/combine lowerers and the consumer
+lowerer for both workgroup and subgroup strategies. The same normalized consent
+is retained in the scheduled-body and graph-refinement numerical contracts;
+ordered outer-fold and integral inner-tree semantics remain unchanged. A builder
+coverage check caught and corrected an initially omitted access-analysis path.
+The affected body/route suites pass 12 tests / 124 assertions. This check uses an
+unused Float override on integral fixtures: it establishes complete option
+propagation without manufacturing FP64 demand, not numerical accuracy of fused
+transcendentals. Public selection and independent outer replay remain disabled.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec

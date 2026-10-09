@@ -7,12 +7,14 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.passes.parallel.product-consumer-region :as region]
             [raster.compiler.passes.parallel.product-consumer-region-test :as fixtures]
             [raster.compiler.passes.parallel.product-consumer-route :as route]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar]
             [raster.quant.ggml-kernels :as ggml-kernels]
             [raster.runtime.hardware :as runtime-hardware]))
 
@@ -32,6 +34,31 @@
 
 (defn- record-name [value]
   (some-> value class .getSimpleName))
+
+(deftest product-consumer-policy-reaches-every-lowering-and-refinement
+  (let [program (#'fixtures/scheduled-product-consumer)
+        plan (region/analyze program (#'fixtures/numerical-equations program))
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        factory scalar/make-lowerer]
+    (doseq [device [nil subgroup-device]]
+      (let [seen (atom [])
+            ordinary (route/schedule plan device)
+            selected (with-redefs [scalar/make-lowerer
+                                  (fn [options]
+                                    (swap! seen conj (:scalar-math options))
+                                    (factory options))]
+                       (route/schedule plan device {:scalar-math policy}))]
+        (is (<= 2 (count @seen)))
+        (is (every? #(= policy %) @seen))
+        (is (= policy (get-in selected [:scheduled :numerics :scalar-math])
+               (get-in selected [:refinement :numerics :scalar-math])))
+        (is (= (get-in ordinary [:scheduled :numerics])
+               (dissoc (get-in selected [:scheduled :numerics]) :scalar-math)))
+        (is (= (get-in ordinary [:scheduled :body :launch])
+               (get-in selected [:scheduled :body :launch])))
+        (is (not (contains? (body/required-scalar-dtypes
+                             (get-in selected [:scheduled :body :operations])) :double)))
+        (is (some? (:artifact (route/emit "consented_product_consumer" selected :opencl-portable))))))))
 
 (deftest exact-two-node-region-refines-to-one-cooperative-node
   (let [{scheduled-body :scheduled scheduled-graph :graph witness :refinement}

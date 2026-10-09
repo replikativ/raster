@@ -6,6 +6,7 @@
   (:require [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.passes.parallel.product-consumer-body :as body]
@@ -16,8 +17,8 @@
    :equations (:equations plan)
    :operations [(:producer plan) (:consumer plan)]})
 
-(defn- numerical-contract [plan]
-  {:mode :reassociated
+(defn- numerical-contract [plan options]
+  (cond-> {:mode :reassociated
    :policy :declared-integral-tree-with-ordered-outer-fold
    :accumulators
    (mapv (fn [ordinal dtype]
@@ -26,14 +27,18 @@
             :overflow (get-in plan [:numerics :inner :overflow])
             :policy :declared-product-tree})
          (range) (get-in plan [:numerics :inner :dtypes]))
-   :ordered-consumer (get-in plan [:numerics :outer])})
+   :ordered-consumer (get-in plan [:numerics :outer])}
+    (contains? options :scalar-math)
+    (assoc :scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options)))))
 
 (defn schedule
   "Build one ScheduledKernelBody and graph refinement from an admitted region plan."
   ([plan] (schedule plan nil))
   ([plan target-device]
+   (schedule plan target-device {}))
+  ([plan target-device options]
   (let [plan (schedule/select plan target-device)
-        {kernel-body :kernel-body arguments :arguments} (body/lower plan)
+        {kernel-body :kernel-body arguments :arguments} (body/lower plan options)
         source (compound-source plan)
         scheduled
         (scheduled/make
@@ -45,7 +50,7 @@
                      :equations (:equations plan)
                      :axis-partition (:axes plan)
                      :intermediate-loads (:intermediate-loads plan)}
-          :numerics (numerical-contract plan)
+          :numerics (numerical-contract plan options)
           :provenance {:source-dialect :segop
                        :source-operations (get-in plan [:provenance :source-operations])}
           :attributes {:candidate-only true}})
@@ -76,7 +81,7 @@
                      :intermediate-substitution
                      (get-in plan [:physical-schedule :intermediate-substitution])
                      :axis-partition (:axes plan)}
-          :numerics (numerical-contract plan)
+          :numerics (numerical-contract plan options)
           :provenance {:source-operations (get-in plan [:provenance :source-operations])}
           :attributes {:private-intermediates (:intermediates plan)}})]
     {:scheduled scheduled :graph refined :refinement witness :plan plan})))
