@@ -113,7 +113,8 @@
         (is (= selected (mixed-body/schedule-for-node node g {:scalar-math policy})))
         (when used?
           (let [emitted (gemm/emit-scheduled-stage-graph
-                         g {:scalar-math policy :prefix "selected_matrix_math"})
+                         g {:scalar-math policy :prefix "selected_matrix_math"
+                            :target-descriptor {:execution {:scalar-dtype-support {:double :supported}}}})
                 emitted-node (first (filter #(= (:id node) (:id %)) (:nodes emitted)))
                 certificate (artifact/attribute (:operation emitted-node) :scheduled-kernel-body)]
             (is (= policy (get-in certificate [:numerics :scalar-math])))
@@ -121,6 +122,11 @@
             (is (identical? certificate (scheduled-body/validate-against-math-policy! certificate policy)))
             (is (thrown? clojure.lang.ExceptionInfo
                          (scheduled-body/validate-against-math-policy! certificate nil))))
+          (try
+            (gemm/emit-scheduled-stage-graph g {:scalar-math policy :target-descriptor {}})
+            (is false "matrix epilogue must retain the independent hardware admission context")
+            (catch clojure.lang.ExceptionInfo error
+              (is (= :kernel-body-target-math-capability (:reason (ex-data error))))))
           (is (not= (:body ordinary) (:body selected)))
           (is (thrown? clojure.lang.ExceptionInfo
                        (scheduled-body/validate! (update selected :numerics dissoc :scalar-math)))))))))
