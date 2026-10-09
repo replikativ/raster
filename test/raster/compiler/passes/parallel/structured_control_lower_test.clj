@@ -137,6 +137,30 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (emitted-loop/validate! accepted {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))
     (is (= default (emitted-loop/validate! default)))
+    (let [buffers {'u0 :initial-buffer 'u-final :output-buffer}
+          scalars {'steps {:type :long :value 3}
+                   'n {:type :int :value 64}
+                   'alpha {:type :float :value 0.25}}
+          scratch {'u-final :scratch-buffer}
+          request {:scalar-math policy}
+          call (loop-call/make scheduled selected buffers scalars scratch request)]
+      (is (= call (loop-call/validate! call request)))
+      (is (= call (loop-call/validate-in-context! call buffers scalars scratch request)))
+      (is (= {'u-in :initial-buffer 'u-next :output-buffer}
+             (:buffers (loop-call/iteration-binding call 0 request))))
+      (is (= {'u-in :output-buffer 'u-next :scratch-buffer}
+             (:buffers (loop-call/iteration-binding call 1 request))))
+      (is (= {'u-in :scratch-buffer 'u-next :output-buffer}
+             (:buffers (loop-call/iteration-binding call 2 request))))
+      (is (thrown? clojure.lang.ExceptionInfo (loop-call/make scheduled selected buffers scalars scratch)))
+      (is (thrown? clojure.lang.ExceptionInfo (loop-call/validate! call)))
+      (is (thrown? clojure.lang.ExceptionInfo (loop-call/iteration-binding call 0)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (loop-call/validate-in-context! call buffers scalars scratch)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (loop-call/validate! (assoc-in call [:attributes :scalar-math] policy))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (loop-call/validate-in-context! (assoc call :trip-count 4) buffers scalars scratch request))))
     (let [program (enclosing-loop-program accepted)
           proof (emitted-program/validate-with-physical-results! program {:scalar-math policy})]
       (is (= program (emitted-program/validate! program {:scalar-math policy})))
