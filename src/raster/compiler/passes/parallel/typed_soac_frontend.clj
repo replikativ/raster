@@ -5738,6 +5738,7 @@
                   (when (= :scalar kind)
                     (when-let [extent (allocation-length expr)]
                       {:destination sym :source-binding-id id
+                       :source-expression expr
                        :extent (canonical-extent shape-equalities values extent)
                        :initialization (descriptor/allocation-initialization
                                         (descriptor/semantic-op expr))

@@ -357,7 +357,10 @@
                                                  (clojure.core/* n width))]
                                 out-storage))
         promoted (route/promote-program
-                  typed {:dtype :float :public-parameters '[x n width]
+                  (assoc-in typed [:attributes :allocations]
+                            [{:destination 'out-storage
+                              :source-expression (second (second (:source typed)))}])
+                  {:dtype :float :public-parameters '[x n width]
                          :array-types {'x :float}
                          :scalar-types {'n :long 'width :int}})
         plan (get-in promoted [:attributes :invocation-plan])]
@@ -721,6 +724,22 @@
                                                    (= 0 (:axis %)))
                                             (:steps invocation-plan))))]
     (is (= :typed-parallel (:dialect semantic)))
+    (let [witnesses (mapcat #(get-in % [:attributes :realization-bindings]) (:equations semantic))
+          allocation (first (filter #(= :result-allocation (:kind %)) witnesses))]
+      (is (some? allocation) "functional map realization certifies its generated allocation")
+      (doseq [{:keys [binding expression]} witnesses]
+        (is (typed-route/realization-binding? semantic binding expression)))
+      (when allocation
+        (let [{:keys [binding expression]} allocation
+              altered (list 'let* (vec (mapcat (fn [[symbol value]]
+                                                [symbol (if (= binding symbol)
+                                                          '(clojure.core/println :unexpected) value)])
+                                              (partition 2 (second (:source semantic)))))
+                            (last (:source semantic)))]
+          (is (false? (typed-route/realization-binding? semantic binding
+                                                       '(clojure.core/println :unexpected))))
+          (is (false? (typed-route/realization-binding? (assoc semantic :source altered)
+                                                       binding expression))))))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
     (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
@@ -755,6 +774,49 @@
     (is (true? (get-in shape-equation [:attributes :host-only])))
     (is (some #{'size} prefix-symbols)
         "the same pure size is materialized before allocation and retained as graph proof")))
+
+(deftest island-live-outs-do-not-prove-whole-source-completion
+  (let [options {:dtype :double :public-parameters '[x out n]
+                 :array-types {'x :double 'out :double}
+                 :scalar-types {'n :long}}
+        attempt (fn [source]
+                  (:program (typed-route/attempt source :double (:array-types options)
+                                                 {:scalar-types (:scalar-types options)})))
+        partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
+                                 loss (opaque-loss y)] loss))]
+    (is (= '[y] (:outputs partial)) "the island must still materialize its host consumer's input")
+    (is (= 'loss (last (:source partial))) "island realization retains the full host continuation")
+    (try
+      (route/promote-program partial options)
+      (is false "a prediction vector is not the public scalar loss")
+      (catch clojure.lang.ExceptionInfo error
+        (is (= :structured-control-source-result (:reason (ex-data error))))
+        (is (= 'loss (:source-result (ex-data error))))
+        (is (= [:return] (:site (ex-data error))))))
+    (doseq [result ['y 'out '[y]]]
+      (let [source (list 'let* '[y (raster.par/map! out i n double (clojure.core/aget x i))]
+                         result)]
+        (is (= '[y] (:outputs (route/promote-program (attempt source) options))))))
+    (let [partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
+                                   logged (clojure.core/println y)] y))]
+      (is (= :structured-control-host-continuation
+             (reason-of #(route/promote-program partial options)))
+          "return coverage alone cannot justify dropping an intervening host effect")
+      (is (= :structured-control-host-continuation
+             (reason-of #(route/promote-program
+                          (assoc-in partial [:attributes :host-binding-ids] []) options)))
+          "deleting advisory host IDs cannot make an unexecuted effect disappear"))
+    (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))]
+                                   y))
+          extra-output (assoc complete :outputs (conj (:outputs complete) 'x))]
+      (is (= :structured-control-source-result
+             (reason-of #(route/promote-program extra-output options)))
+          "the public result cannot silently include an unrelated live-out")
+      (is (= :structured-control-host-continuation
+             (reason-of #(route/promote-program
+                          (assoc complete :source '(let* [y (clojure.core/println x)] y))
+                          options)))
+          "a coincident binding site cannot authorize execution of a stale equation"))))
 
 (deftest checked-prefix-equations-are-not-pruned-into-the-invocation-prefix
   (let [source '(let* [checked (clojure.core/int n)

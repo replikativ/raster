@@ -1708,3 +1708,23 @@ that shape. General non-inlined aggregate result typing remains open. New scalar
 fixtures use runtime-constructor and boxed-array-read tripwires, while mixed Float/Double
 checks retain raw-bit conversion oracles. This is not real-model gradient acceptance or a
 numerical-policy change, and the original training gate remains held.
+
+### Complete public results versus typed island live-outs — 2026-10-09
+
+A fresh public linear-prediction/MSE probe exposed a silent equation-first miscompile: the
+function declares a scalar loss, but its emitted program returned the prediction vector and
+omitted the target input. Internal TypedSOAC island extraction correctly retains values needed
+by an opaque host consumer; those live-outs are not a certificate for the complete function.
+
+Whole-program promotion now checks the retained source return against the logical outputs and
+their existing result-storage relation. Host-controlled bindings must have an invocation or
+equation executor, or the existing effect analysis must prove them removable. Diagnostics retain
+the unsupported return/binding and source metadata. Island extraction and its host materialization
+contract are unchanged; no loss-name recognition or host download/continuation is introduced.
+
+The unsupported scalar objective therefore fails before allocation instead of returning a wrong
+array. This is a correctness prerequisite, not completed loss support. Next, lower the complete
+objective through the ordinary typed reduction/scalar algebra and restore positive JVM/device
+loss parity. Keep the public compiler-default switch blocked until whole-source coverage and
+the remaining measured dispatch/workload contracts are established. The original model gate
+and the full campaign remain open.
