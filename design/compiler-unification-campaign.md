@@ -3444,3 +3444,37 @@ The affected refinement/training suites pass 20 tests / 371 assertions on the
 capped warm REPL, including actual OpenCL and Level Zero execution with no
 capability skips reported. Whole-repository fresh-process and CUDA/HIP compiler
 checks remain CI obligations; this does not report a training throughput result.
+
+### Whole AMR cycle as a local numerical provider — 2026-10-09
+
+The existing ratio-2 diffusion cycle is lowered equation-first as one local
+program. An ordinary certified LinkComposition connects its coarse/fine outputs
+to the existing `arrays/acopy!` operation, committing both fields to initialized
+state owners. The cycle borrows those owners read-only. Topology is constant and
+intermediate storage is private scratch; the public outputs are the two state
+fields. Preparation does not open a device session or allocate device storage.
+Semantic input/output ports identify the connections, rather than inspection of
+generated ABI names. No diffusion, interpolation, reflux or restriction kernel
+is reimplemented by this provider. Public `compiled/compose` retains the prepared
+artifact, component preparation reports and donated state boundary for subsequent
+execution-identity checks; the provider does not implement another composition API.
+
+Two consecutive invocations of the same local executable compare both complete
+fields with the independent coordinate oracle at the existing 1e-11 tolerance.
+They also check composite mass and exact average-down. The second invocation
+uses the resident committed state without a host upload; original host arrays
+remain unchanged. Focused tests pass 4 tests / 47 assertions on actual OpenCL and
+Level Zero with no capability skips reported. Fresh-process CI and independent
+review remain required before landing.
+
+This boundary is not yet an AMR temporal certificate or a distributed cycle.
+The next planner slice must explicitly bind the exact existing program and its
+ordered memory/effect evidence to coarse prediction, two fine substeps, temporal
+boundary interpolation, register reset/accumulation/consumption, reflux and
+average-down. The distributed plan should see one complete local compute call,
+not duplicate its internal scratch scheduling. Keep the current schema-1
+hierarchy/transfer modes unchanged; introduce temporal facts as a validated,
+certificate-bound facet rather than unchecked attributes. Initial synchronization,
+CFL stability and the mathematical meaning of the pinned numerical producer
+remain separate obligations. No adaptive hierarchy, multi-patch cycle, mid-cycle
+restart, storage recycling or asynchronous completion proof is claimed.
