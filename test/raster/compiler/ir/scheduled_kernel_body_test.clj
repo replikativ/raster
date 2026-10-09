@@ -58,6 +58,26 @@
     (is (= :scalar-math-policy
            (reason-of #(scheduled/validate! (assoc-in selected [:numerics :scalar-math :extra] true)))))))
 
+(deftest scalar-math-requires-independent-caller-intent
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (assoc-in (fixture) [:body :operations 1 :value]
+                           (body/scalar-expression :tanh :float ['value]))
+        selected (-> ordinary
+                     (assoc-in [:body :operations 1 :value :options :math-realization]
+                               numerics/widened-target-library-math)
+                     (assoc-in [:numerics :scalar-math] policy))]
+    (is (= ordinary (scheduled/validate-against-math-policy! ordinary nil)))
+    (is (= selected (scheduled/validate-against-math-policy! selected policy)))
+    (is (= :scheduled-kernel-body-caller-math-policy
+           (reason-of #(scheduled/validate-against-math-policy! selected nil))))
+    (is (= :scheduled-kernel-body-math-realization
+           (reason-of #(scheduled/validate-against-math-policy! ordinary policy))))
+    (is (= (fixture) (scheduled/validate-against-math-policy! (fixture) policy))
+        "a pure copy may omit an unused math request")
+    (is (= :scheduled-kernel-body-caller-math-policy
+           (reason-of #(scheduled/validate-against-math-policy!
+                        (assoc-in (fixture) [:numerics :scalar-math] policy) nil))))))
+
 (deftest nested-control-retains-scalar-math-consent
   (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
         ordinary (assoc-in (fixture) [:body :masks]

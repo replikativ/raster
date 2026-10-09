@@ -102,11 +102,11 @@
       (is (= (emitted-equation/physical-results candidate) (:physical-results report)))
       (is (not (contains? report :source-graph)) "the temporary reconstructed graph does not escape"))
     (with-redefs-fn
-      {expected-graph-var (fn [algorithm body]
+      {expected-graph-var (fn [algorithm body caller-options]
                             (when (and (identical? algorithm (:algorithm candidate))
                                        (identical? body (:body candidate)))
                               (swap! reconstructions inc))
-                            (original algorithm body))}
+                            (original algorithm body caller-options))}
       (fn []
         (is (= expected-domain (write-domains candidate)))
         (is (= 1 @reconstructions)
@@ -189,9 +189,9 @@
         (with-redefs [equation-dispatch/validate-with-boundary
                       (fn [operation] (swap! calls inc) (original operation))
                       emitted-equation/validate-with-result-contracts
-                      (fn [candidate]
+                      (fn [candidate & [caller-options]]
                         (swap! candidate-checks inc)
-                        (original-candidate candidate))]
+                        (original-candidate candidate (or caller-options {})))]
           (let [evidence (emitted-program/validate-with-physical-results! program)
                 boundaries (#'invocation-link/equation-boundaries program (:projections evidence))
                 retained (program-call/make program (:buffers call) (:scalar-values call) {}

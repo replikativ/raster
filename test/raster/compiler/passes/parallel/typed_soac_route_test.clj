@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
+            [raster.compiler.backend.gpu.kernel-body-target :as body-target]
+            [raster.compiler.backend.gpu.emitted-graph-interface :as emitted-interface]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
@@ -2574,7 +2576,8 @@
                          :scalar-types {'m :int 'n :int 'k :int}}))
         equation (first (:equations program))
         algorithm (:algorithm equation)
-        source (:graph (equation-graph/make-for-equation program equation))
+        derived (equation-graph/make-for-equation program equation)
+        source (:graph derived)
         descriptor {:backend :ze
                     :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
                     :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
@@ -2598,7 +2601,27 @@
     (is (contains? (kernel-body/required-scalar-dtypes (get-in certificate [:body :operations])) :double))
     (is (not= (:stage-bodies ordinary) (:stage-bodies selected)))
     (is (thrown? clojure.lang.ExceptionInfo
-                 (scheduled-body/validate! (update certificate :numerics dissoc :scalar-math))))))
+                 (scheduled-body/validate! (update certificate :numerics dissoc :scalar-math))))
+    (let [emitted (update (:graph selected) :nodes
+                          #(mapv (fn [index node stage]
+                                   (assoc node :operation
+                                          (body-target/emit-artifact
+                                           (str "selected_math_" index) stage :opencl-intel)))
+                                 (range) % (:stage-bodies selected)))
+          emitted (emitted-interface/finalize! emitted :opencl-c {'m :int 'n :int 'k :int})
+          candidate (emitted-equation/make
+                     algorithm (:body derived) emitted
+                     {:refinement (:refinement selected)} {:scalar-math policy})]
+      (is (= candidate (emitted-equation/validate! candidate {:scalar-math policy})))
+      (is (= (:numerical-model selected)
+             (:numerical-model (emitted-equation/validate-with-result-contracts
+                                candidate {:scalar-math policy}))))
+      (is (= (:complete-write-domains selected)
+             (emitted-equation/contraction-write-domains candidate {:scalar-math policy})))
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-equation/validate! candidate)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emitted-equation/validate! (assoc-in candidate [:attributes :scalar-math] policy)))
+          "candidate metadata cannot authorize the selected physical math"))))
 
 (deftest dynamic-result-transform-fuses-into-the-mixed-matrix-graph
   (let [transform {:acc 'acc
