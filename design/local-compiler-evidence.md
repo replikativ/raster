@@ -11,13 +11,28 @@ The public plan declines unknown or unsupported Double capabilities. Dispatch
 is not admitted: retaining its portable Float alternative would not guarantee
 the requested arithmetic. Defaults remain unchanged.
 
-Constructor and OpenCL/CUDA/HIP emitted-source checks passed: two focused tests,
-40 assertions, zero failures/errors, using a temporary lower-function replacement
-restored in `finally`. This is not target compiler acceptance, device execution,
-certificate reconstruction coverage or original-model acceptance. Broader
-NN/NT/TN tails, result transforms/inout storage, cancellation/overflow,
-capability/policy declines and reconstruction-tampering tests are still required
-before a PR. No full-model success or performance improvement is claimed.
+Focused validation now passes 11 tests / 245 assertions, zero failures/errors.
+This covers NN/NT/TN tails, Float result transforms/inout storage, certificate
+reconstruction and tampering, explicit strategy/capability rejection, and public
+equation-first compilation/lowering on synthetic OpenCL/CUDA/HIP targets.
+Local Level Zero and OpenCL each execute all three layouts under fused and
+decomposed arithmetic: cancellation preserves the unit contribution, changed
+inputs preserve a second contribution, and finite Double products narrow to
+Float infinity with IEEE overflow. Both backends use the same Intel device;
+this is not NVIDIA/AMD execution or target compiler acceptance.
+
+The default-microtile analytic register charge now accounts for Double accumulators,
+loaded Float operands, widened operands and a decomposed product temporary.
+An unrelated matrix tile cannot underprice it; custom typed tiles are rejected
+until that public control is implemented. This charge is not a vendor
+register-allocation proof. The legacy descriptor compiler explicitly rejects
+the new policy rather than letting it reach an incompatible precision route;
+a regression checks its explicit rejection reason before any source lowering.
+The focused run temporarily loaded the branch namespaces into the owned REPL,
+then restored all original roots/metadata and removed new production interns.
+It is not a fresh coherent full-model gate. Independent review, target compiler
+checks and original-model acceptance remain required; no full-model success
+or performance improvement is claimed.
 
 ## SIMD retained-operation precision — 2026-10-09
 

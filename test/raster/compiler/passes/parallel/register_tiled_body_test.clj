@@ -97,6 +97,36 @@
   (is (thrown? clojure.lang.ExceptionInfo
                (register-tiled/lower (contraction) {:tile small-tile :arithmetic-dtype :half}))))
 
+(deftest widened-transpose-tails-retain-storage-masks-and-float-result-transforms
+  (doseq [[variant expression] [[:nn '(* (aget A (+ (* i 7) k)) (aget B (+ (* k 5) j)))]
+                               [:nt '(* (aget A (+ (* i 7) k)) (aget B (+ (* j 7) k)))]
+                               [:tn '(* (aget A (+ (* k 3) i)) (aget B (+ (* k 5) j)))]]
+          policy [:decomposed :fused]]
+    (let [proof (facts/from-components {:out 'C :free-axes [['i 3] ['j 5]] :contract-axes [['k 7]]
+                                       :body expression :opts {:init (float 0)} :dtype :float})
+          default (:kernel-body (register-tiled/lower proof {:tile small-tile :multiply-add policy}))
+          wide (:kernel-body (register-tiled/lower proof {:tile small-tile :multiply-add policy
+                                                        :arithmetic-dtype :double}))]
+      (is (= variant (get-in wide [:schedule :variant])))
+      (is (= wide (body/validate! wide)))
+      (is (= (:parameters default) (:parameters wide)))
+      (is (= (:allocations default) (:allocations wide)))
+      (is (= (:masks default) (:masks wide)))
+      (is (= (:launch default) (:launch wide)))))
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/+ acc (clojure.core/aget C (clojure.core/+ (clojure.core/* i 8) j)))
+                  :operands [{:sym 'C :dtype :float :map (axis-map/of-axes [['i 8] ['j 8]])}]
+                  :dtype :float}
+        wide (:kernel-body (register-tiled/lower (contraction epilogue)
+                            {:tile small-tile :arithmetic-dtype :double}))
+        stores (rest (:operations wide))
+        values (into {} (keep #(when (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                               [(get-in % [:result :id]) (get-in % [:result :type])])) stores)]
+    (is (= wide (body/validate! wide)))
+    (is (= :inout (:kind (first (filter #(= 'C (:id %)) (:parameters wide))))))
+    (doseq [store (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %) stores)]
+      (is (= :float (get values (:value store))) "the semantic Float epilogue must not widen"))))
+
 (deftest register-tile-does-not-discard-unmodeled-product-terms
   (doseq [expression ['(* 2.0 (* (aget A (+ (* i 5) k)) (aget B (+ (* k 2) j))))
                       '(+ 1.0 (* (aget A (+ (* i 5) k)) (aget B (+ (* k 2) j))))]]

@@ -16,6 +16,40 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]))
 
+(deftest widened-register-certificate-retains-types-and-fails-closed
+  (let [source '(let* [result (raster.par/contract C [[i 3] [j 5]] [[k 7]]
+                              (* (aget A (+ (* i 7) k)) (aget B (+ (* k 5) j))))] result)
+        {:keys [form]} (pipeline/schedule-parallel-form
+                        source {:dtype :float :target-device :ocl:0
+                                :array-types {'A :float 'B :float 'C :float}})
+        equation (first (:equations form))
+        graph (:graph (equation-graph/make-for-equation form equation))
+        algorithm (:algorithm equation) node (first (:nodes graph))
+        verified (:facts (contraction-context/validate! algorithm (:operation node)))
+        options {:precision :f32-storage-f64-arithmetic-rte-f32 :multiply-add :fused}
+        descriptor {:execution {:scalar-dtype-support {:double :supported}}}
+        planned (schedule/plan-register-tiled-for-node node graph verified descriptor options)
+        certificate (:scheduled planned)
+        proof #(schedule/complete-write-domain algorithm node graph %)]
+    (is (:ok planned))
+    (is (= :double (get-in certificate [:numerics :accumulator-dtype])))
+    (is (= :double (get-in certificate [:numerics :product-dtype])))
+    (is (= :float (get-in certificate [:numerics :storage-dtype])))
+    (is (= :float (get-in certificate [:numerics :result-dtype])))
+    (is (= {:rounding :nearest-even :overflow :ieee}
+           (get-in certificate [:numerics :result-conversion])))
+    (is (= 15 (launch/resolve-expression {} (get (proof certificate) 'C))))
+    (is (nil? (proof (update certificate :legality dissoc :arithmetic-dtype))))
+    (is (nil? (proof (assoc-in certificate [:body :schedule :arithmetic-dtype] :float))))
+    (is (nil? (proof (assoc-in certificate [:numerics :product-dtype] :float))))
+    (is (nil? (proof (assoc-in certificate [:numerics :result-conversion :rounding] :toward-zero))))
+    (doseq [support [:unknown :unsupported]]
+      (let [declined (schedule/plan-register-tiled-for-node node graph verified
+                      {:execution {:scalar-dtype-support {:double support}}} options)]
+        (is (= :register-tiled-double-capability (:reason declined)))
+        (is (= support (:support declined)))
+        (is (nil? (:scheduled declined)))))))
+
 (deftest candidate-complete-write-evidence-requires-the-generated-body
   (doseq [dynamic? [false true]]
    (let [source (if dynamic?

@@ -196,6 +196,10 @@
     (case (:precision schedule)
       :mixed-f16-f32 full
       :f32-scalar (quot full 4)
+      :f32-storage-f64-arithmetic-rte-f32
+      ((requiring-resolve 'raster.compiler.passes.parallel.register-tiled-body/arithmetic-register-bytes-per-lane)
+       @(requiring-resolve 'raster.compiler.passes.parallel.register-tiled-body/default-tile)
+       :float :double (get-in schedule [:typed-contraction :multiply-add] :decomposed))
       full)))
 
 (defn- register-staged-bytes-per-lane
@@ -292,6 +296,10 @@
                (not= :register-tiled typed-contraction-strategy))
       (throw (ex-info "schedule: widened Float contraction arithmetic requires an explicit register-tiled strategy"
                       {:precision prec :strategy typed-contraction-strategy})))
+    (when (and (= :f32-storage-f64-arithmetic-rte-f32 prec)
+               (some? (get-in schedule [:typed-contraction :tile])))
+      (throw (ex-info "schedule: widened arithmetic currently uses the compiler's default register tile"
+                      {:precision prec :tile (get-in schedule [:typed-contraction :tile])})))
     (when-not (valid-matrix-tile-space? matrix-tiles desc)
       (throw (ex-info "schedule: unknown typed contraction matrix tile space; expected :default, :finite, or a non-empty unique subset of the descriptor-derived family"
                       {:matrix-tiles matrix-tiles
