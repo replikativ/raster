@@ -1,5 +1,24 @@
 # Local compiler evidence — 2026-09-27
 
+## Explicit widened contraction prototype — 2026-10-10
+
+An isolated branch from coherent compiler head `18164d73` prototypes the named
+policy `:f32-storage-f64-arithmetic-rte-f32` for explicit `:register-tiled`
+contractions. Float storage/staging is unchanged; local-loaded operands widen
+exactly, products and accumulators are Double, and the final accumulator narrows
+with nearest-even/IEEE semantics before the existing Float result transform.
+The public plan declines unknown or unsupported Double capabilities. Dispatch
+is not admitted: retaining its portable Float alternative would not guarantee
+the requested arithmetic. Defaults remain unchanged.
+
+Constructor and OpenCL/CUDA/HIP emitted-source checks passed: two focused tests,
+40 assertions, zero failures/errors, using a temporary lower-function replacement
+restored in `finally`. This is not target compiler acceptance, device execution,
+certificate reconstruction coverage or original-model acceptance. Broader
+NN/NT/TN tails, result transforms/inout storage, cancellation/overflow,
+capability/policy declines and reconstruction-tampering tests are still required
+before a PR. No full-model success or performance improvement is claimed.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression
