@@ -630,11 +630,75 @@
              ['(raster.math/alloc-like input n) :unspecified]
              ['(clojure.core/aclone input) :copy]]]
       (is (= [{:destination 'output :source-binding-id 0
+               :source-expression allocation
                :extent 'n
                :initialization initialization :dtype :float}]
              (contracts allocation))))
     (is (empty? (contracts '(clojure.core/float-array n 7))))
     (is (empty? (contracts '(clojure.core/float-array [1.0 2.0]))))))
+
+(deftest allocation-provenance-accepts-only-certified-array-shape-reads
+  (let [contracts (fn [expression]
+                    (#'frontend/allocation-contracts
+                     [{:kind :scalar :id 0 :sym 'output
+                       :expr (list 'clojure.core/float-array expression)}]
+                     {'input :float 'output :float} {'n :long}
+                     {'output (av/tensor {:dtype :float :shape ['n]})
+                      'input (av/tensor {:dtype :float :shape ['n]})} {}))]
+    (doseq [expression ['(clojure.core/alength input)
+                        (with-meta (list '.invk 'specialized-length 'input)
+                          {:raster.op/original 'raster.arrays/alength})]]
+      (is (= [{:destination 'output :source-binding-id 0
+               :source-expression (list 'clojure.core/float-array expression)
+               :extent 'n :initialization :zero :dtype :float}]
+             (contracts expression)))
+      (with-bindings {#'frontend/*declared-kinds* {:arrays #{'input} :scalars #{'n}}}
+        (is (= expression (#'frontend/allocation-length
+                           (list 'clojure.core/float-array expression))))))
+    (doseq [expression ['(clojure.core/alength n)
+                        '(clojure.core/alength unknown)
+                        '(opaque-length input)]]
+      (is (empty? (contracts expression))))))
+
+(deftest repeated-checked-shape-reads-reuse-only-a-dominating-value
+  (with-bindings {#'frontend/*declared-kinds* {:arrays #{'input} :scalars #{'n}}}
+    (doseq [expression ['(clojure.core/long (clojure.core/alength input))
+                        '(clojure.core/int (clojure.core/alength input))]]
+      (is (#'frontend/immutable-scalar-operands? expression {'n :long})))
+    (doseq [expression ['(clojure.core/long (clojure.core/aget input 0))
+                        '(clojure.core/long (clojure.core/alength unknown))
+                        '(clojure.core/long (opaque-length input))]]
+      (is (not (#'frontend/immutable-scalar-operands? expression {'n :long}))))
+    (doseq [[shadow expression] [['long '(long (clojure.core/alength input))]
+                                ['int '(int (clojure.core/alength input))]
+                                ['alength '(alength input)]]]
+      (binding [util/*shadowing-locals* #{shadow}]
+        (is (not (#'frontend/immutable-shape-read? expression)))
+        (is (not (#'frontend/provably-pure-scalar? expression)))
+        (is (not (#'frontend/ordered-scalar-expression? expression)))
+        (is (nil? (#'frontend/allocation-length
+                   (list 'clojure.core/float-array expression)))))))
+  (let [source '(let* [n (clojure.core/long (clojure.core/alength input))
+                       output (clojure.core/float-array
+                               (clojure.core/long (clojure.core/alength input)))
+                       written (raster.par/map! output i n float (clojure.core/aget input i))]
+                      written)
+        normalized (frontend/normalize-source source {:array-types {'input :float}
+                                                       :scalar-types {'n :long}})
+        pairs (into {} (map vec (partition 2 (second normalized))))]
+    (is (= '(clojure.core/long (clojure.core/alength input)) (get pairs 'n))
+        "the first checked read remains at its source position")
+    (is (= '(clojure.core/float-array n) (get pairs 'output))
+        "the exact same immutable shape check does not mint a distinct allocation extent")
+    (let [narrowed (assoc-in (vec source) [1 3]
+                            '(clojure.core/float-array
+                              (clojure.core/int (clojure.core/alength input))))
+          normalized (frontend/normalize-source (apply list narrowed)
+                                                  {:array-types {'input :float}
+                                                   :scalar-types {'n :long}})
+          pairs (into {} (map vec (partition 2 (second normalized))))]
+      (is (not= '(clojure.core/float-array n) (get pairs 'output))
+          "a different narrowing check cannot borrow the earlier widened shape value"))))
 
 (deftest returned-buffer-identity-is-normalized-before-access-contracts
   (let [source '(let* [r (raster.par/contract C [[i 4]] [] (clojure.core/aget A i))

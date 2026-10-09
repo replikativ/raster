@@ -1708,3 +1708,44 @@ that shape. General non-inlined aggregate result typing remains open. New scalar
 fixtures use runtime-constructor and boxed-array-read tripwires, while mixed Float/Double
 checks retain raw-bit conversion oracles. This is not real-model gradient acceptance or a
 numerical-policy change, and the original training gate remains held.
+
+### Complete public results versus typed island live-outs — 2026-10-09
+
+A fresh public linear-prediction/MSE probe exposed a silent equation-first miscompile: the
+function declares a scalar loss, but its emitted program returned the prediction vector and
+omitted the target input. Internal TypedSOAC island extraction correctly retains values needed
+by an opaque host consumer; those live-outs are not a certificate for the complete function.
+
+Whole-program promotion now checks the retained source return against the logical outputs and
+their existing result-storage relation, then projects the public outputs from those proven
+return leaves rather than exposing conservative island live-outs. Equations, effects and values
+are retained; no dead-code elimination is added at this boundary. Lower-time explicit outputs,
+taps and donation remain independent physical escapes. Host-controlled bindings must have an invocation or
+equation executor, or the existing effect analysis must prove them removable. Diagnostics retain
+the unsupported return/binding and source metadata. Island extraction and its host materialization
+contract are unchanged; no loss-name recognition or host download/continuation is introduced.
+
+This result contract covers the complete set of unique logical device-value leaves exposed by
+the public named-output map, including exact lexical/storage aliases. It does not reconstruct
+Clojure aggregate topology, ordering or duplicate return leaves. Generated result allocations
+are checked against the same typed-equation allocation constructor used by realization, not
+merely a zero-initialization label. Host removability inherits the existing effect authority;
+compiler-owned source/allocation metadata is not a general proof-carrying input format.
+The physical deftm's retained return tag controls Void projection: its equations and destination
+writes remain, but their buffer-return implementation does not create a public output. Void
+still requires complete source coverage. Original allocation witnesses retain their exact source
+expression; certified array-length reads use the shared semantic operator descriptor, including
+devirtualized reads, rather than parsing specialization names. Scheduling preserves that optional
+provenance field alongside the existing checked allocation semantics.
+Exact immutable shape reads and their canonical casts reuse a dominating source scalar when
+normalizing allocation/launch extents. The first check remains at its original source position;
+mutable element reads and opaque size functions do not receive this authority. This avoids a
+duplicate extent identity and preserves the scan's existing complete-write initialization proof
+and three-kernel schedule without dropping a genuine zero-initialization obligation.
+
+The unsupported scalar objective therefore fails before allocation instead of returning a wrong
+array. This is a correctness prerequisite, not completed loss support. Next, lower the complete
+objective through the ordinary typed reduction/scalar algebra and restore positive JVM/device
+loss parity. Keep the public compiler-default switch blocked until whole-source coverage and
+the remaining measured dispatch/workload contracts are established. The original model gate
+and the full campaign remain open.

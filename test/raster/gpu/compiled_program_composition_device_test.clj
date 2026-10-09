@@ -3,6 +3,9 @@
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.dl.array-ops :as array-ops]
+            [raster.dl.nn :as nn]
+            [raster.dl.loss :as loss]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.hardware-fixture :as hardware-fixture]
@@ -14,6 +17,28 @@
             [raster.gpu.value :as value]
             [raster.par :as par]))
 
+(defn- run-strided-head-unpack-case [target]
+  (let [input (float-array (range 12))
+        arguments [input 3 2 2 11 3]
+        expected (vec (apply array-ops/unpack-heads-strided arguments))
+        prepared (compiled/lower #'array-ops/unpack-heads-strided arguments
+                                 {:compiler :equation-first :target target
+                                  :dtype :float :outputs '[out]})
+        artifact (compiled/instantiate! prepared)]
+    (try
+      (is (= 33 (count expected)))
+      (is (= expected (vec (value/->host (:out (artifact {})))))
+          "shared allocation/launch extent preserves the field permutation and zero padding")
+      (finally (compiled/close! artifact)))))
+
+(deftest strided-head-unpack-shared-extent-device-parity
+  (if @opencl/opencl-available?
+    (run-strided-head-unpack-case :ocl:0)
+    (opencl/opencl-skip! "strided head unpack extent reuse"))
+  (if @gp/gpu-available?
+    (run-strided-head-unpack-case :ze:0)
+    (gp/gpu-skip! "strided head unpack extent reuse")))
+
 (deftm twice!
   [input :- (Array float) result :- (Array float) n :- Long] :- Void
   (par/map-void! i n
@@ -23,6 +48,33 @@
   [state :- (Array float) gradient :- (Array float) lr :- Double n :- Long] :- Void
   (par/map-void! i n
     (arrays/aset state i (- (arrays/aget state i) (* lr (arrays/aget gradient i))))))
+
+(deftm linear-objective
+  [weights :- (Array float) inputs :- (Array float) targets :- (Array float)
+   rows :- Long width :- Long] :- Double
+  (loss/mse-loss (nn/linear-nb inputs weights rows width 1) targets rows))
+
+(deftest public-objective-cannot-expose-a-parallel-intermediate
+  (if-not @opencl/opencl-available?
+    (opencl/opencl-skip! "public scalar objective source-result coverage")
+    (let [arguments [(float-array [0.25 -0.5])
+                     (float-array [1 2 3 4 5 6])
+                     (float-array [0.125 0.25 0.5]) 3 2]
+          expected (apply linear-objective arguments)]
+      (is (number? expected) "the independent JVM computation returns the declared scalar loss")
+      (doseq [inline? [false true]]
+        ;; Until the complete loss is lowered, decline before device allocation rather
+        ;; than promoting its valid contraction island to the public scalar result.
+        (with-redefs [gpu/alloc! (fn [& _] (throw (AssertionError. "unexpected allocation")))
+                      link/instantiate! (fn [& _] (throw (AssertionError. "unexpected instantiation")))]
+          (try
+            (compiled/lower #'linear-objective arguments
+                            {:compiler :equation-first :target :ocl:0
+                             :dtype :float :inline? inline?})
+            (is false "the loss continuation is not yet represented by typed equations")
+            (catch clojure.lang.ExceptionInfo error
+              (is (= :structured-control-source-result (:reason (ex-data error))))
+              (is (= [:return] (:site (ex-data error)))))))))))
 
 (defn- mutable-case [target]
   (let [state (float-array [2.0 4.0 6.0 8.0])

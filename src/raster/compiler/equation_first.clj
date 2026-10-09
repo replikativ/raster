@@ -130,6 +130,7 @@
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
+            :return-tag (:raster.core/return-tag metadata)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}
            (when param-env {:param-env param-env}))))

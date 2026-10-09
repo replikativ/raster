@@ -1983,7 +1983,9 @@
           [[cuda-target :cuda-c]
            [hip-target :hip-cpp]]]
     (let [compilation (equation-first/compile #'diffusion/compute-alphas-cumprod
-                                              {:target target :dtype :float})]
+                                              {:target target :dtype :float :return-tag 'void})]
+      (is (= 1 (count (get-in compilation [:semantic :outputs])))
+          "a caller option cannot replace the physical deftm's non-Void return contract")
       (is (= 3 (count (:kernels compilation))))
       (is (every? #(= module-target (:target %)) (:kernels compilation)))
       (is (every? #(= :kernel-body (get-in % [:attributes :emission-route]))

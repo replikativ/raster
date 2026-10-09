@@ -3224,12 +3224,13 @@
 
     :else nil))
 
+(declare alength-array)
+
 (defn- provably-pure-scalar?
   [expression]
-  (or (effects/removable-expr? expression)
-      (and (descriptor/alength-op? (descriptor/semantic-op expression))
-           (= 1 (count (descriptor/call-args expression)))
-           (symbol? (first (descriptor/call-args expression))))))
+  (and (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression)))
+       (or (effects/removable-expr? expression)
+           (symbol? (alength-array expression)))))
 
 (defn- ordered-scalar-expression?
   "Whether a scalar may be retained and evaluated once at its source position.
@@ -3237,10 +3238,9 @@
    This is intentionally weaker than removability: a checked cast is externally pure while its
    possible exceptional control transfer must remain observable."
   [expression]
-  (or (= :pure (effects/analyze-effect expression))
-      (and (descriptor/alength-op? (descriptor/semantic-op expression))
-           (= 1 (count (descriptor/call-args expression)))
-           (symbol? (first (descriptor/call-args expression))))))
+  (and (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression)))
+       (or (= :pure (effects/analyze-effect expression))
+           (symbol? (alength-array expression)))))
 
 (defn- requires-ordered-evaluation?
   [expression]
@@ -3563,8 +3563,6 @@
     (into (set (filter symbol? (take-nth 2 bindings)))
           (mapcat keys type-maps))))
 
-(declare alength-array)
-
 (def ^:dynamic ^:private *declared-kinds*
   "Declared value kinds visible to `normalize-source`: `{:arrays #{sym} :scalars #{sym}}`."
   {:arrays #{} :scalars #{}})
@@ -3582,7 +3580,9 @@
                           (some-> (types/sym-type-tag expression) dtype/dtype-for-scalar-tag
                                   dtype/canon))))
       (integer? expression)
+      (contains? (:arrays *declared-kinds*) (alength-array expression))
       (and (seq? expression)
+           (not (contains? util/*shadowing-locals* (first expression)))
            (contains? '#{* + - quot clojure.core/* clojure.core/+ clojure.core/- clojure.core/quot
                          long int clojure.core/long clojure.core/int}
                       (first expression))
@@ -3822,6 +3822,25 @@
             expression))
         expression)))
 
+(defn- immutable-shape-read?
+  [expression]
+  (loop [expression expression]
+    (if (and (seq? expression)
+             (descriptor/cast-op? (descriptor/semantic-op expression))
+             (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression)))
+             (= 1 (count (descriptor/call-args expression))))
+      (recur (first (descriptor/call-args expression)))
+      (contains? (:arrays *declared-kinds*) (alength-array expression)))))
+
+(defn- immutable-scalar-operands?
+  "Exact repeated scalar checks may reuse a dominating successful evaluation. Array element
+   reads are not immutable; an array's shape is, including a checked conversion of that shape.
+   This grants source-order CSE only, not removal or movement of the first check."
+  [expression scalar-types]
+  (and (empty? (par/collect-aget-arrays expression))
+       (or (set/subset? (util/free-syms expression) (set (keys scalar-types)))
+           (immutable-shape-read? expression))))
+
 (defn- duplicable-counted-loop-branch
   "Peel a pure, total scalar let prefix from one counted store loop.
 
@@ -4054,9 +4073,8 @@
                      checked-scalar? (and scalar-form
                                           (ordered-scalar-expression? scalar-form)
                                           (requires-ordered-evaluation? scalar-form)
-                                          (empty? (par/collect-aget-arrays scalar-form))
-                                          (set/subset? (util/free-syms scalar-form)
-                                                       (set (keys local-scalar-types))))
+                                          (immutable-scalar-operands? scalar-form
+                                                                      local-scalar-types))
                      checked-id (when checked-scalar?
                                   (get (:checked-extents state) scalar-form))
                      state (if checked-scalar?
@@ -4069,7 +4087,8 @@
                      ;; them can have changed its value: it reads no array (a kernel in between
                      ;; may write one), or it is an array length, which no kernel changes.
                      stable-scalar? (and (seq? scalar-form)
-                                         (provably-pure-scalar? scalar-form)
+                                         (or (provably-pure-scalar? scalar-form)
+                                             (immutable-shape-read? scalar-form))
                                          (or (empty? (par/collect-aget-arrays scalar-form))
                                              (some? (alength-array scalar-form))))
                      state (cond
@@ -4133,6 +4152,10 @@
                                               (resolve-length #{})
                                               (->> (util/subst-syms scalar-aliases))
                                               (normalize-scalar-casts local-scalar-types))
+                     ;; The source binding already evaluated this immutable expression. Reuse
+                     ;; its exact SSA value rather than minting a second extent/check identity.
+                     canonical-extent (get (:pure-scalar-ids state) canonical-extent
+                                           canonical-extent)
                      fresh-extent-id
                      (fn []
                        (let [extent-dtype (or (retained-scalar-dtype canonical-extent
@@ -4173,9 +4196,7 @@
                    (and (ordered-scalar-expression? canonical-extent)
                         (requires-ordered-evaluation? canonical-extent))
                    (let [immutable-operands?
-                         (and (empty? (par/collect-aget-arrays canonical-extent))
-                              (set/subset? (util/free-syms canonical-extent)
-                                           (set (keys local-scalar-types))))]
+                         (immutable-scalar-operands? canonical-extent local-scalar-types)]
                      (if-let [extent-id (when immutable-operands?
                                           (get (:checked-extents state) canonical-extent))]
                        ;; The first identical check dominates this use. Its immutable scalar
@@ -4216,6 +4237,7 @@
 (defn- alength-array
   [expression]
   (when (and (seq? expression)
+             (not (contains? util/*shadowing-locals* (descriptor/semantic-op expression)))
              (descriptor/alength-op? (descriptor/semantic-op expression))
              (= 1 (count (descriptor/call-args expression))))
     (first (descriptor/call-args expression))))
@@ -5738,6 +5760,7 @@
                   (when (= :scalar kind)
                     (when-let [extent (allocation-length expr)]
                       {:destination sym :source-binding-id id
+                       :source-expression expr
                        :extent (canonical-extent shape-equalities values extent)
                        :initialization (descriptor/allocation-initialization
                                         (descriptor/semantic-op expr))

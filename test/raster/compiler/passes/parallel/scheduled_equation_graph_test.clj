@@ -446,6 +446,17 @@
         {:keys [body graph]} (equation-graph/make-for-plan-equation initialized equation)]
     (is (= [allocation] (get-in body [:attributes :allocations])))
     (is (= allocation (get-in graph [:attributes :output-allocation])))
+    (let [retained (assoc allocation :source-expression '(clojure.core/float-array n))
+          {:keys [body graph]} (equation-graph/make-for-plan-equation
+                               (assoc-in initialized [:attributes :allocations] [retained])
+                               equation)]
+      (is (= [retained] (get-in body [:attributes :allocations])))
+      (is (= retained (get-in graph [:attributes :output-allocation]))))
+    (doseq [extra [{:source-expression 7} {:unexpected-field true}]]
+      (is (= :segmented-plan-output-allocation
+             (reason-of #(equation-graph/make-for-plan-equation
+                          (update-in initialized [:attributes :allocations 0] merge extra)
+                          equation)))))
     (is (= :segmented-plan-output-allocation
            (reason-of #(equation-graph/make-for-plan-equation
                         (assoc-in initialized [:attributes :allocations 0 :extent] 1)

@@ -153,6 +153,16 @@
                                    :raster.buffer/hoistable true})]
     [result' (list allocation extent)]))
 
+(defn- equation-allocation-pair
+  "Exact allocation scaffolding for the equation kinds which realize fresh result storage."
+  [values equation result]
+  (let [{:keys [kind attributes]} (dialect/operation-parts equation)
+        extent (case kind
+                 map (:extent attributes)
+                 reduce 1
+                 nil)]
+    (when extent (allocation-pair values result extent))))
+
 (defn- realize-equation
   [program equation]
   (let [[_ equation-id results] equation
@@ -285,7 +295,7 @@
                                       [binding destination])))
                                 (map vector results physical-results)))
                     :else
-                    (conj (mapv #(allocation-pair values % (:extent attributes)) results)
+                    (conj (mapv #(equation-allocation-pair values equation %) results)
                           [effect source]))
            :site [:binding (if (and storage (not multiple-buffer-results?)) host-binding effect)]
            :source source}))
@@ -440,7 +450,7 @@
             {:equation-id equation-id
              :placement placement
              :pairs (cond-> []
-                      (nil? resident-destination) (conj (allocation-pair values result 1))
+                      (nil? resident-destination) (conj (equation-allocation-pair values equation result))
                       true (conj [effect source]))
              :site [:binding effect]
              :source source})
@@ -604,6 +614,45 @@
   [operation]
   (boolean (fusion/equation-info operation)))
 
+(defn realization-binding?
+  "Whether one exact retained auxiliary pair belongs to an unchanged realized equation.
+   The realization pass, not whole-program promotion, owns allocation/alias scaffolding."
+  [program symbol expression]
+  (let [source-pairs (mapv vec (partition 2 (second (:source program))))
+        source-bindings (into {} source-pairs)]
+    (boolean
+     (some
+      (fn [equation]
+        (let [primary (second (:site equation))
+              witness (get-in equation [:attributes :realization-bindings])
+              destinations (set (map :destination
+                                     (get-in equation [:attributes :result-storage])))]
+          (and (= :binding (first (:site equation)))
+               (parallel-program/equation-for-binding program primary (get source-bindings primary))
+               (vector? witness)
+               (= (count witness) (count (distinct (map :binding witness))))
+               (every? (fn [{:keys [binding expression]}]
+                         (and (not= primary binding)
+                              (= 1 (count (filter #(= [binding expression] (vec %)) source-pairs)))))
+                       witness)
+               (some (fn [{binding :binding generated :expression kind :kind}]
+                       (and (= [symbol expression] [binding generated])
+                            (case kind
+                              :result-allocation
+                              (and (some #{binding} (:results equation))
+                                   (dialect/program-form? (:algorithm equation))
+                                   (some (fn [inner]
+                                           (and (some #{binding} (nth inner 2))
+                                                (= [binding generated]
+                                                   (equation-allocation-pair
+                                                    (:values program) inner binding))))
+                                         (dialect/equations (:algorithm equation))))
+                              :storage-alias
+                              (and (symbol? generated) (contains? destinations generated))
+                              false)))
+                     witness))))
+      (:equations program)))))
+
 (defn- envelope
   [typed-program source realized]
   (let [facts (dialect/facts typed-program)
@@ -612,14 +661,20 @@
          (fn [equation]
            (let [equation-id (second equation)
                  subprogram (equation-subprogram typed-program equation)
-                 {:keys [site source]} (get realized equation-id)
-                 equation-facts (get-in facts [:equations equation-id])]
+                 {:keys [site source pairs]} (get realized equation-id)
+                 equation-facts (get-in facts [:equations equation-id])
+                 auxiliary-bindings
+                 (mapv (fn [[binding expression]]
+                         {:binding binding :expression expression
+                          :kind (if (symbol? expression) :storage-alias :result-allocation)})
+                       (remove #(= (second site) (first %)) pairs))]
              (parallel-program/->ProgramEquation
               equation-id site source
               (:inputs (dialect/facts subprogram)) (dialect/outputs subprogram)
               subprogram [equation] (:effects equation-facts)
               (assoc (:provenance equation-facts) :pass :typed-soac-fusion)
-              (assoc (:attributes equation-facts) :algorithm-dialect :typed-soac))))
+              (cond-> (assoc (:attributes equation-facts) :algorithm-dialect :typed-soac)
+                (seq auxiliary-bindings) (assoc :realization-bindings auxiliary-bindings)))))
          (dialect/equations typed-program))]
     (parallel-program/make
      {:dialect :typed-soac
