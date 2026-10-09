@@ -1,6 +1,9 @@
 (ns raster.gpu.compiled-composition-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -561,6 +564,52 @@
            (key-for (Double/longBitsToDouble 0x7ff8000000000001))))
     (is (not= (key-for (Double/longBitsToDouble 0x7ff8000000000001))
               (key-for (Double/longBitsToDouble 0x7ff8000000000002))))))
+
+(deftest template-validation-evidence-requires-independent-math-request
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          emitted (program/make {:dialect :opencl-parallel})
+          compilation (equation-first/map->EquationFirstCompilation {:emitted emitted})
+          owner (atom nil)
+          key {:guards {:compiler-revision (dispatch/compiler-definition-revision)
+                        :pipeline-identity (#'compiled/weak-identity @#'equation-first/compile)}}
+          calls (atom 0)
+          compile! (fn [] (swap! calls inc) compilation)]
+      (binding [compiled/*compilation-template-owner* owner]
+        (is (identical? compilation
+                        (#'compiled/stable-compilation-template
+                         (constantly key) :equation-first compile! request))))
+      (is (nil? (#'compiled/owned-emitted-validation @owner compilation)))
+      (is (not (realized? (get-in @owner [:entry :emitted-validation])))
+          "a foreign request must not force the cached proof")
+      (let [proof (#'compiled/owned-emitted-validation @owner compilation request)]
+        (is (emitted-program/retained-validation? emitted proof request))
+        (is (not (emitted-program/retained-validation? emitted proof)))
+        (is (identical? proof (#'compiled/owned-emitted-validation @owner compilation request)))
+        (is (nil? (#'compiled/owned-emitted-validation @owner (assoc compilation :id :other) request)))
+        (is (nil? (#'compiled/owned-emitted-validation @owner compilation))))
+      (binding [compiled/*compilation-template-owner* owner]
+        (is (identical? compilation
+                        (#'compiled/cached-compilation-template key :equation-first compile!))))
+      (is (= 1 @calls) "compilation remains single-flight even when proof consent differs")
+      (is (nil? (#'compiled/owned-emitted-validation @owner compilation)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (#'compiled/cached-compilation-template :invalid :equation-first compile!
+                                                          {:scalar-math {:unknown true}})))
+      (is (= 1 @calls) "invalid intent fails before invoking compilation")
+      (let [default-owner (atom nil)]
+        (binding [compiled/*compilation-template-owner* default-owner]
+          (#'compiled/cached-compilation-template (assoc key :kind :default)
+                                                  :equation-first compile!))
+        (is (nil? (#'compiled/owned-emitted-validation @default-owner compilation request)))
+        (is (not (realized? (get-in @default-owner [:entry :emitted-validation]))))
+        (let [proof (#'compiled/owned-emitted-validation @default-owner compilation)]
+          (is (emitted-program/retained-validation? emitted proof))
+          (is (not (emitted-program/retained-validation? emitted proof request)))
+          (is (identical? proof (#'compiled/owned-emitted-validation @default-owner compilation))))))
+    (finally
+      (compiled/clear-compilation-cache!))))
 
 (deftest structural-compilation-cache-is-single-flight
   (compiled/clear-compilation-cache!)
