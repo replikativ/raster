@@ -1,5 +1,24 @@
 # Compiler unification campaign
 
+### October 9 shared physical service lanes
+
+Directed links may now explicitly declare `:attributes :serialization-domains`,
+a vector of distinct keyword identities. A transfer occupies its route links,
+the union of their shared domains, and any existing endpoint `:serialized-on`
+compute claims. One resource-occupancy update drives all these lanes; byte
+accounting remains per route link and logical transfer, not per shared domain.
+No domains means the existing independent-link behavior. This is conservative
+exclusive serialization for declared physical sharing, not automatic discovery,
+bandwidth sharing, switch congestion, or a calibrated fabric prediction.
+
+Certificates retain each transfer's derived resource claims as well as costs:
+renaming a shared domain invalidates an old witness even when numeric makespan
+is unchanged. Warm-REPL distributed-plan, compute-binding and AMR-plan suites
+pass 67 tests / 424 assertions, covering opposite-direction routes, independent
+domains, empty/default declarations, malformed declarations and multi-hop claim
+deduplication. Measured route service curves and production distributed execution
+remain open alongside the original training and adaptive AMR obligations.
+
 ### October 9 physical topology admission
 
 Reconstruction of a topology now reruns the existing device/link constructors,

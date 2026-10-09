@@ -156,6 +156,47 @@
             :transferred-bytes 1000000}
            (:cost-vector simulation)))))
 
+(deftest shared-link-domains-serialize-distinct-routes
+  (let [base (training-plan)
+        forward (distributed/transfer-step
+                 {:id :forward :source :gpu-0 :target :gpu-1
+                  :route [:gpu-0->gpu-1] :value :weights :bytes 1000000})
+        backward (distributed/transfer-step
+                  {:id :backward :source :gpu-1 :target :gpu-0
+                   :route [:gpu-1->gpu-0] :value :weights :bytes 1000000})
+        independent (assoc base :steps [forward backward] :outputs [:forward :backward])
+        declare-domains (fn [plan domains]
+                          (reduce (fn [plan link-id]
+                                    (assoc-in plan [:topology :links link-id :attributes
+                                                    :serialization-domains] domains))
+                                  plan [:gpu-0->gpu-1 :gpu-1->gpu-0]))
+        shared (declare-domains independent [:pcie-root])
+        simulation (distributed/simulate shared)]
+    (is (= 41000 (:makespan-ns (distributed/simulate independent))))
+    (is (= (distributed/simulate independent)
+           (distributed/simulate (declare-domains independent []))))
+    (is (= 41000 (:makespan-ns
+                  (distributed/simulate
+                   (assoc-in shared [:topology :links :gpu-1->gpu-0 :attributes
+                                     :serialization-domains] [:other-root])))))
+    (is (= 82000 (:makespan-ns simulation)))
+    (is (= 41000 (get-in simulation [:timeline :backward :start-ns])))
+    (is (= [[:link :gpu-0->gpu-1] [:serialization-domain :pcie-root]]
+           (get-in simulation [:timeline :forward :resources])))
+    (is (= 2000000 (:transferred-bytes simulation)))
+    (is (= (:link-transfer-bytes (distributed/simulate independent))
+           (:link-transfer-bytes simulation)))
+    (is (distributed/certified-plan? (distributed/verify! (distributed/certify shared))))
+    ;; Changing a domain's identity preserves numeric cost but must invalidate the witness.
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"certificate does not match"
+                         (distributed/verify!
+                          (assoc (distributed/certify shared) :plan
+                                 (declare-domains independent [:another-root])))))
+    (doseq [domains [nil :pcie-root [:pcie-root :pcie-root] ["pcie-root"] #{:pcie-root}]]
+      (is (= :distributed-link-serialization-domains
+             (try (distributed/simulate (declare-domains independent domains)) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
 (deftest transfer-compute-serialization-requires-a-route-device
   (let [base (training-plan)
         transfer-index 2
@@ -609,6 +650,28 @@
       (is (= 96 (:transferred-bytes simulation)))
       ;; Six distinct directed links, all legs overlap: one latency + 16 B serialization.
       (is (= 1001 (:makespan-ns simulation))))))
+
+(deftest multi-hop-routes-deduplicate-shared-domain-claims
+  (let [{:keys [value shards]} (three-shard-field)
+        topology (reduce (fn [topology id]
+                           (assoc-in topology [:links id :attributes :serialization-domains]
+                                     [:root :nic]))
+                         (three-device-topology) [:gpu-0->gpu-1 :gpu-1->gpu-2])
+        transfer (distributed/transfer-step
+                  {:id :send :source :gpu-0 :target :gpu-2
+                   :route [:gpu-0->gpu-1 :gpu-1->gpu-2] :value :field :bytes 16})
+        plan (distributed/plan
+              {:id :multi-hop-domains
+               :mesh (distributed/mesh [{:name :space :size 3}] [:gpu-0 :gpu-1 :gpu-2])
+               :topology topology :values {:field value} :shards {:field shards}
+               :steps [transfer] :outputs [:send]})
+        simulation (distributed/simulate plan)]
+    (is (= [[:link :gpu-0->gpu-1] [:link :gpu-1->gpu-2]
+            [:serialization-domain :root] [:serialization-domain :nic]]
+           (get-in simulation [:timeline :send :resources])))
+    (is (= (distributed/transfer-duration-ns topology transfer) (:makespan-ns simulation)))
+    (is (= 16 (:transferred-bytes simulation)))
+    (is (distributed/certified-plan? (distributed/verify! (distributed/certify plan))))))
 
 (deftest periodic-halo-on-two-shards-packs-the-wrap-edge-into-a-second-round
   (let [halo (distributed/schedule-halo
