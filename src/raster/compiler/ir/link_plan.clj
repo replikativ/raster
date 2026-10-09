@@ -44,6 +44,13 @@
 (def ^:dynamic ^:private *retained-program-validations* nil)
 (def ^:dynamic ^:private *caller-options* nil)
 
+(defn ^:no-doc without-validation-context
+  "Invoke runtime/user code without inheriting LinkPlan or ProgramCall proof authority."
+  [invoke]
+  (binding [*validated-program-instances* nil *retained-program-validations* nil
+            *caller-options* nil]
+    (program-call/without-validation-context invoke)))
+
 (def ^:private effect-evidence-seal-token (Object.))
 
 (defn- effect-evidence-seal [plan-ref owner policy]
@@ -1517,9 +1524,7 @@
 (defn- make-with-final-projection-for-request [request project retained-validation caller-options]
   (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
   (let [{:keys [plan projection]}
-        (binding [*validated-program-instances* nil *retained-program-validations* nil
-                  *caller-options* nil]
-          (program-call/without-validation-context #(project (normalize-plan request))))
+        (without-validation-context #(project (normalize-plan request)))
         {:keys [plan effect-evidence]}
         (if (nil? caller-options)
           (validate-with-effect-evidence! plan retained-validation)

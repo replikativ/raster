@@ -144,7 +144,7 @@
     (when-let [error @failure] (throw error))))
 
 (defn- instance-runtime-roles
-  [plan instance initialization]
+  [plan instance initialization caller-options]
   (let [writes (map #(get-in plan [:nodes % :view]) (:writes initialization))
         captured? (fn [node]
                     (and node
@@ -159,7 +159,9 @@
                                     (not (and (seq leaves)
                                               (every? #(captured? (get-in plan [:nodes (:node %)])) leaves))))
                              :input role)])))
-          (link-plan/instance-roles plan instance))))
+          (if (nil? caller-options)
+            (link-plan/instance-roles plan instance)
+            (link-plan/instance-roles plan instance caller-options)))))
 
 (defn- ordered-program-handles
   [prepared program-instances]
@@ -168,7 +170,10 @@
       handles
       (mapv #(assoc % :instance (:id (first program-instances))) handles))))
 
-(defn instantiate!
+(defn- caller-math-options [opts]
+  (when (contains? opts :scalar-math) (select-keys opts [:scalar-math])))
+
+(defn- instantiate-with-options!
   "Instantiate a validated LinkPlan as one replayable LinkedExecutable.
 
    opts:
@@ -180,20 +185,23 @@
    caller-owned buffers. Straight-line mixtures of descriptor steps, equation-first programs
    and direct graphs record one resident command graph; dynamic emitted loops retain their
    separate bounded runner and cannot be mixed with descriptors."
-  ([plan] (instantiate! plan {}))
-  ([plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false}}]
+  [plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false} :as opts}]
    ;; This is intentionally the first operation. Everything below may contact a backend.
-   (let [instantiation-started (System/nanoTime)
+   (let [caller-options (caller-math-options opts)
+         instantiation-started (System/nanoTime)
          timings (volatile! {})
          retained-evidence (when (identical? plan (:plan *certified-plan-evidence*))
                              (:evidence *certified-plan-evidence*))
-         retained-evidence (when (link-plan/retained-effect-evidence?
-                                  plan retained-evidence)
+         retained-evidence (when (if (nil? caller-options)
+                                  (link-plan/retained-effect-evidence? plan retained-evidence)
+                                  (link-plan/retained-effect-evidence? plan retained-evidence caller-options))
                              retained-evidence)
          validated (timed-phase! timings :plan-validation
                                  #(if retained-evidence
                                     {:plan plan :effect-evidence retained-evidence}
-                                    (link-plan/validate-with-effect-evidence! plan)))
+                                    (if (nil? caller-options)
+                                      (link-plan/validate-with-effect-evidence! plan)
+                                      (link-plan/validate-with-effect-evidence! plan nil caller-options))))
          plan (:plan validated)
          ;; The same validation already derived ordered initialization from its verified ABI
          ;; facts. Re-running initialization-contract would parse and analyze the plan again.
@@ -330,17 +338,20 @@
                                          :release! #(gpu/release-kernel-graph! session %)}]
                            (if (and (not mixed?) (= 1 (count program-instances))
                                     (link-plan/program-link-instance? (first program-instances)))
-                             (parallel-program/prepare-with! (:call (first program-instances)) executor)
-                             (parallel-program/prepare-sequence-with!
-                              (mapv (fn [instance]
+                             (if (nil? caller-options)
+                               (parallel-program/prepare-with! (:call (first program-instances)) executor)
+                               (parallel-program/prepare-with! (:call (first program-instances)) executor caller-options))
+                             (let [instances (mapv (fn [instance]
                                       {:id (:id instance)
                                        :kind (if (link-plan/graph-link-instance? instance)
                                                :graph :program)
                                        :call (if (link-plan/graph-link-instance? instance)
                                                (select-keys instance [:graph :bindings :scalar-values])
                                                (:call instance))})
-                                    program-instances)
-                              executor)))))))
+                                    program-instances)]
+                               (if (nil? caller-options)
+                                 (parallel-program/prepare-sequence-with! instances executor)
+                                 (parallel-program/prepare-sequence-with! instances executor caller-options)))))))))
                    (when (or static-programs? (empty? program-instances))
                      (timed-phase!
                       timings :binding
@@ -363,7 +374,7 @@
                                                  (get-in instance [:descriptor :schedule]))
                      ;; Constant transforms may execute while recording, before run!'s input
                      ;; gate. Only captured, locally unwritten values can enter that prologue.
-                                   :roles (instance-runtime-roles plan instance initialization)})
+                                   :roles (instance-runtime-roles plan instance initialization caller-options)})
                                  (vswap! phases conj phase)))))
                      (let [gkey (graph-key execution-id)
                            handles-by-instance
@@ -436,7 +447,13 @@
                  (throw error))))]
        (if session-owner
          (cleanup/build! session-owner build nil)
-         (build))))))
+         (build)))))
+
+(defn instantiate!
+  "Instantiate a LinkPlan; :scalar-math is independent caller intent, never plan metadata.
+   Physical allocation, graph binding and session ownership retain their existing contracts."
+  ([plan] (link-plan/without-validation-context #(instantiate-with-options! plan {})))
+  ([plan opts] (link-plan/without-validation-context #(instantiate-with-options! plan opts))))
 
 (defn ^:no-doc instantiate-certified!
   "Instantiate an exact in-process certified lowering whose enclosing Prepared identity was
@@ -448,8 +465,11 @@
     (throw (ex-info "certified instantiation requires a compiler lowering witness"
                     {:reason :link-certified-lowering :actual (type lowering)})))
   (let [plan (:plan lowering)
-        evidence (get-in lowering [:certificate :effect-evidence])]
-    (when-not (link-plan/retained-effect-evidence? plan evidence)
+        evidence (get-in lowering [:certificate :effect-evidence])
+        caller-options (caller-math-options opts)]
+    (when-not (if (nil? caller-options)
+                (link-plan/retained-effect-evidence? plan evidence)
+                (link-plan/retained-effect-evidence? plan evidence caller-options))
       (throw (ex-info "certified instantiation has no matching LinkPlan effect evidence"
                       {:reason :link-certified-effect-evidence :plan (:id plan)})))
     (binding [*certified-plan-evidence* {:plan plan :evidence evidence}]

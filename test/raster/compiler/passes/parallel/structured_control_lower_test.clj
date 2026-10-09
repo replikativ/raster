@@ -15,6 +15,8 @@
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.gpu.structured-loop :as loop-runtime]
             [raster.gpu.parallel-program :as program-runtime]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (defn- loop-program
@@ -182,6 +184,44 @@
       (let [composed (link/validate-with-certified-effect-facts!
                       plan (:step-facts effect-evidence) request)]
         (is (link/retained-effect-evidence? (:plan composed) (:effect-evidence composed) request)))
+      (let [runtime-plan (link/make
+                          (update plan-request :nodes
+                                  #(mapv (fn [node]
+                                           (if (= :initial (:id node))
+                                             (assoc node :source (float-array 64)) node)) %)) request)
+            session (atom {:device-id :ocl:0 :closed? false})
+            driver-events (atom [])
+            compiler-vars (mapv #(ns-resolve 'raster.compiler.ir.link-plan %)
+                                '[*validated-program-instances* *retained-program-validations* *caller-options*])
+            driver-scopes (atom [])
+            observe #(mapv var-get (into [projection-var policy-var] compiler-vars))
+            observe-driver! #(swap! driver-scopes conj (observe) @(future (observe)))]
+        (with-redefs [gpu/alloc! (fn [_ specs] (observe-driver!) (swap! driver-events conj [:allocate (count specs)]))
+                      gpu/buffer-view (fn [_ key view] {:key key :view view})
+                      gpu/upload-range! (fn [& _] (swap! driver-events conj [:upload]))
+                      gpu/bind-kernel-graph! (fn [_ key _ _ _ _]
+                                               (swap! driver-events conj [:bind]) {:handle key})
+                      gpu/run-kernel-graph! (fn [& _] (swap! driver-events conj [:run]))
+                      gpu/release-kernel-graph! (fn [& _] (swap! driver-events conj [:release]))
+                      gpu/free-buffer! (fn [& _] (swap! driver-events conj [:free]))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (gpu-link/instantiate! runtime-plan {:session session})))
+          (is (empty? @driver-events) "default intent rejects before any driver operation")
+          (let [executable (with-bindings (merge {projection-var (java.util.IdentityHashMap.)
+                                                  policy-var (:scalar-math request)}
+                                                 (zipmap compiler-vars [(java.util.IdentityHashMap.)
+                                                                        (java.util.IdentityHashMap.) request]))
+                             (gpu-link/instantiate! runtime-plan (assoc request :session session)))]
+            (try
+              (is (= 3 (count (filter #(= :bind (first %)) @driver-events))))
+              (is (= #{:output} (set (keys (gpu-link/run! executable)))))
+              (is (= 5 (count (filter #(= :run (first %)) @driver-events))))
+              (finally (gpu-link/close! executable))))
+          (is (= 3 (count (filter #(= :release (first %)) @driver-events))))
+          (is (= 3 (count (filter #(= :free (first %)) @driver-events))))
+          (is (= [[nil nil nil nil nil] [nil nil nil nil nil]] @driver-scopes)
+              "allocation and its future inherit no compiler projection authority")
+          (is (false? (:closed? @session)) "attached session remains caller-owned")))
       (let [cache-var (ns-resolve 'raster.compiler.ir.link-plan '*validated-program-instances*)
             retained-var (ns-resolve 'raster.compiler.ir.link-plan '*retained-program-validations*)
             request-var (ns-resolve 'raster.compiler.ir.link-plan '*caller-options*)
