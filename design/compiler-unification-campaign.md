@@ -1,5 +1,17 @@
 # Compiler unification campaign
 
+### October 9 verified nonlinear boundary checkpoint
+
+The shared elementary-math realization contract covers 23 C-family library operations while
+preserving source precision. A captured real-model layer-0 diagnostic now verifies its taps
+against the unchanged JVM pullback bit-for-bit. Supplying identical tanh values makes CPU/GPU
+pullback arithmetic identical; target Float tanh differences reproduce strong derivative
+cancellation sensitivity on both systems. This is local boundary evidence, not closure of the
+held real-weight gate. See `local-compiler-evidence.md` for controls and the three-coordinate
+distinction from the original GPU kernel. All eight campaign items retain their original
+workload acceptance obligations; continue the general compiler, training and distributed
+verticals without replacing them with isolated numerical regressions.
+
 ### October 9 typed arithmetic consolidation checkpoint
 
 #1098–#1100 are merged: C-family scalar product boundaries are protected separately
