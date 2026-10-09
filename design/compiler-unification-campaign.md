@@ -4000,3 +4000,30 @@ compiler-plan versus runtime-bind comparisons and unchanged rollback behavior.
 Actual co-located AD/all-reduce/SGD checks pass on OpenCL and Level Zero (2 tests /
 154 assertions). Warm-REPL checks do not replace fresh CI or the original
 real-model training numerical acceptance, which remains open.
+
+### Producer-local fusion legality analysis
+
+A live real-model VJP preparation sampled in scalar-effect descriptor-key
+construction exposed repeated producer analysis during vertical candidate
+enumeration. The exceptional-conversion check depends only on the producer and
+the current immutable program, but previously ran again for each consumer.
+It now uses one lazy result per producer in one enumeration. The original guard
+order is unchanged, and subsequent enumerations/fixpoint iterations rederive it;
+there is no persistent cache, retained certificate or new admission authority.
+
+The four-map regression reproduces six checks on the previous implementation
+and three on the replacement, with unchanged candidate pairs. A fresh all-trapping
+enumeration rejects all candidates, and a producer without prospective consumers
+never forces its check. Existing checked-conversion completion-boundary tests
+remain. Focused fusion, placement, matrix-input and epilogue suites pass 65 tests /
+417 assertions in the capped REPL. This is reduced analysis-call evidence, not a
+measured end-to-end compile-time or device-performance improvement.
+
+The new real-model layer-1 isolation reproduces all 14 original CPU adapter
+gradients exactly with the original forward input and loss cotangent. Its GPU
+preparation did not complete: the warm process had retained an eight-argument
+math-policy invocation caller while a later staging reload restored the
+seven-argument program-call constructor. This is a mixed-revision diagnostic
+environment, not evidence of a production miscompile or a new numerical result.
+Rebuild a coherent compiler source set before continuing that comparison. The
+original componentwise real-model acceptance remains failed and unchanged.
