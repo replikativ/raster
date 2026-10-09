@@ -3654,3 +3654,23 @@ Local device calibration can refine kernel descriptors, but measured cluster
 routes, shared physical bottlenecks, contention/load validity and realization
 of predicted asynchronous overlap remain open. Keep capability legality and
 ownership proofs separate from uncertain performance estimates.
+
+### Shared bounded element-to-byte capture adapter
+
+`numerical-content/element-byte-reader` extracts the existing local resident
+capture's alignment adapter for reuse by distributed owners. An explicit
+synchronous element downloader fills bounded scratch; arbitrary provider byte
+windows receive only their requested raw bits. Extents must contain whole
+elements, each byte window is at most 64 KiB, and subtraction-based admission
+rejects overflow-sized requests before any source contact. Zero-byte windows
+perform no download. Caller lifetime/immutability/representation obligations
+remain explicit; this does not infer endianness or authenticate a producer.
+
+The existing local capture uses this shared implementation instead of maintaining
+its own alignment arithmetic. Focused adapter, local capture and storage suites
+pass 27 tests / 522 assertions, including exact bytes at unaligned windows,
+non-power-of-two element widths, overflow/range rejection, download failure,
+content hashes and provider cleanup. Reloading the protocol owner required
+reloading its test provider implementations in the warm REPL; the initial stale
+provider failures were not numerical failures. Actual local capture/restart
+device checks and independent exact-head review are pending.

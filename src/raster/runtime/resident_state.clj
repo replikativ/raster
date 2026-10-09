@@ -11,8 +11,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
             [raster.gpu.resource-cleanup :as cleanup]
-            [raster.runtime.numerical-content :as content])
-  (:import [java.lang.foreign MemorySegment]))
+            [raster.runtime.numerical-content :as content]))
 
 (defn- plain-portable-tensor? [value]
   (and (= :tensor (:kind value))
@@ -87,20 +86,12 @@
 
 (defn- resident-reader [executable {:keys [node leaf element-bytes]}]
   (let [resident (link/node-view executable node)
-        scratch (MemorySegment/ofArray (byte-array (+ 65536 (* 2 (dec element-bytes)))))
         extent (:byte-length leaf)]
-    (fn [offset ^MemorySegment destination]
-      (let [n (.byteSize destination)
-            end (Math/addExact (long offset) n)
-            start (- offset (mod offset element-bytes))
-            aligned-end (Math/addExact end (mod (- element-bytes (mod end element-bytes)) element-bytes))
-            span (- aligned-end start)]
-        (when-not (and (<= 0 offset end extent) (<= span (.byteSize scratch)))
-          (fail! "capture read exceeds its pinned leaf" :resident-state-read-range {:node node}))
-        (gpu/download-range! (:session executable) resident (.asSlice scratch 0 span)
-                             {:src-element (quot start element-bytes) :elements (quot span element-bytes)})
-        (MemorySegment/copy scratch (- offset start) destination 0 n)
-        n))))
+    (content/element-byte-reader
+     extent element-bytes
+     (fn [start elements destination]
+       (gpu/download-range! (:session executable) resident destination
+                            {:src-element start :elements elements})))))
 
 (defn- producer-bindings [prepared specs]
   (when-not (and (vector? specs) (seq specs) (every? map? specs))
