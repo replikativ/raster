@@ -1668,3 +1668,25 @@ on that binding. Its GPU lowering succeeded even without the tag; this is not ev
 JVM boundary was sound. Follow up by retaining the selected gradient slot's primitive-array
 type through the ordinary typed tuple projection, with unannotated JVM/native/GPU regression
 coverage. Do not add an AD-specific array/function registry or silently remove the CPU oracle.
+
+### Sound erased-array JVM boundary — 2026-10-09
+
+The AD fixture's unannotated tuple projection exposed a general JVM emission defect, not a
+special meaning of `nth`: unknown array storage was assumed to be `Object[]` before `aaload`
+or `aastore`. A primitive array cannot satisfy that cast. The JVM emitter now delegates erased
+reads/writes to Clojure's existing runtime array dispatch, using the existing boxed-call emitter
+for once-only, source-ordered operand evaluation and standard coercion/exception behavior.
+Retained concrete array types keep their direct JVM load/store instructions; their checkcasts
+reuse the existing JVM type-descriptor authority instead of duplicated array-class tables.
+Nested array operations likewise retain all arguments rather than using a one-dimensional
+instruction on a variadic call.
+
+The same distributed AD/collective/SGD fixture now omits `^floats`; its JVM analytic oracle and
+actual device updates remain unchanged. Separate JIT/AOT checks compare all primitive-array
+kinds and reference arrays against the ordinary Clojure runtime, with independent pre-store
+arrays, raw NaN/signed-zero bits, invalid accesses, source-ordered side effects, nested indices
+and direct-typed-path dispatch tripwires. This fixes erased JVM execution correctness. It does
+not pretend that the AD tuple's missing static slot type has been recovered: retaining that
+information remains an optimization/type-propagation follow-up, and GPU/native layouts still
+require their existing static admission proofs. No numerical policy or AD-specific registry is
+introduced, and the original actual-model training gate remains held.

@@ -30,9 +30,7 @@
    rows :- Long width :- Long] :- (Array float)
   (let [vg ((reverse/value+grad (var raster.gpu.distributed-training-device-test/local-loss) :wrt [0])
             theta x y rows width)
-        ;; The AD tuple's nth projection currently needs its declared primitive-array tag
-        ;; retained explicitly before the JVM broadcast path; see compiler-consolidation.md.
-        ^floats gradient (clojure.core/nth vg 1)]
+        gradient (clojure.core/nth vg 1)]
     ;; Each local loss is a mean. Weight its gradient by its actual batch count before all-reduce.
     (broadcast [gradient] (numeric/* gradient (float rows)))))
 
