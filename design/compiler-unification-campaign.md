@@ -3668,12 +3668,14 @@ receipt, ownership capability or a fact transferable to another owner.
 Its synchronous policy callback lets the existing compiled wrapper retain
 exclusive mutation, output invalidation/poisoning, and its original sealed
 same-owner representation evidence. Capability rejection precedes that mutation
-callback. No new store, cache, type registry or handwritten kernel is introduced.
+callback. The observation thunk is same-thread, one-shot and cannot be retained
+past that callback; quiescence and identity are rechecked before allocation.
+No new store, cache, type registry or handwritten kernel is introduced.
 Distributed ownership/evidence admission remains a follow-up, not an implied
 consequence of observing bytes on a session.
 
-The existing ownership/fault oracles plus raw-observation controls pass 8 tests /
-161 assertions. Existing actual owner-bound evidence checks pass on OpenCL and
+The existing ownership/fault oracles plus raw-observation controls pass 10 tests /
+175 assertions. Existing actual owner-bound evidence checks pass on OpenCL and
 Level Zero (2 tests / 48 assertions), including foreign facts, live output leases,
 cached module reuse and output retirement. Independent exact-head review and
 fresh CI are still required.

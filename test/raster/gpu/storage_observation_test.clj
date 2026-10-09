@@ -65,3 +65,43 @@
             (is (= [:release-graph :free] (vec (take-last 2 @trace))))
             (is (empty? (:buffers @session)))
             (is (empty? (:kernel-graphs @session)))))))))
+
+(deftest owner-thunk-is-synchronous-one-shot-and-cannot-escape
+  (let [c (#'fixture/owner)]
+    (#'fixture/simulated c {}
+      (fn [trace session]
+        (let [retained (atom nil)]
+          (is (= :storage-representation-wrapper
+                 (reason #(storage/observe! session :float nil))))
+          (is (= :storage-representation-not-observed
+                 (reason #(storage/observe! session :float
+                           (fn [observe] (reset! retained observe) :no-measurement)))))
+          (is (= :storage-representation-scope (reason #(@retained))))
+          (is (empty? @trace))
+          (is (= :little-endian
+                 (:byte-order
+                  (storage/observe!
+                   session :float
+                   (fn [observe]
+                     (reset! retained observe)
+                     (is (= :storage-representation-scope
+                            (deref (future (reason observe)) 5000 :timeout)))
+                     (let [result (observe)]
+                       (is (= :storage-representation-replayed (reason observe)))
+                       result))))))
+          (is (= :storage-representation-scope (reason #(@retained))))
+          (is (= 1 (count (filter #{:allocate} @trace))))
+          (is (empty? (:buffers @session)))
+          (is (empty? (:kernel-graphs @session))))))))
+
+(deftest wrapper-cannot-submit-async-work-before-invoking-the-probe
+  (let [c (#'fixture/owner)]
+    (#'fixture/simulated c {}
+      (fn [trace session]
+        (is (= :storage-representation-unready
+               (reason #(storage/observe!
+                         session :float
+                         (fn [observe]
+                           (swap! session assoc :events {:pending :unit})
+                           (observe))))))
+        (is (empty? @trace))))))
