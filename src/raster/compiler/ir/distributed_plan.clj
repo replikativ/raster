@@ -1253,8 +1253,8 @@
    (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
                       device-plans copy-bindings refinements (vec steps) (vec outputs) attributes)))
 
-(defn refinement-plan
-  "Assemble one collective refinement with actual shard-local producer/consumer LinkPlans.
+(defn refinement-plan-fields
+  "Construct ordinary DistributedPlan fields for one collective refinement.
 
    `device-plans`, `storage` and `combines` retain the actual local bindings and emitted
    arithmetic evidence. No input/export kernels, buffers or runtime resources are invented.
@@ -1262,6 +1262,10 @@
    from the retained projection request. `values`/`shards` declare additional local boundaries.
    Conflicting declarations are rejected rather than overwritten. The ordinary plan validator
    independently checks projection, public producer outputs, arithmetic and immutable SSA.
+
+   Returned fields are NOT a validated plan or certificate. Producers may depend on steps
+   supplied by a containing DAG. Combine fields with explicitly coordinated identities and
+   storage, then call `plan`/`certify` on the complete DAG; never execute fragments separately.
 
    This is assembly convenience, not a new IR or a training-specific scheduling policy."
   [{:keys [id mesh topology refinement input-producers combine-costs
@@ -1292,8 +1296,7 @@
         region {:offsets (vec (repeat (count (get-in refinement [:value :shape])) 0))
                 :shape (get-in refinement [:value :shape])}
         operation-id (get-in refinement [:operation :id])]
-    (plan
-     {:id id :mesh mesh :topology topology
+    {:id id :mesh mesh :topology topology
       :values (merge-declarations :values values (:values projected))
       :shards (merge-declarations :shards shards (:shards projected))
       :collective-groups {(get-in refinement [:group :id]) (:group refinement)}
@@ -1307,7 +1310,97 @@
       :steps (into (into (mapv (fn [worker] (get input-producers (get input-by-worker worker)))
                               (get-in refinement [:group :devices]))
                          (:steps projected)) steps)
-      :outputs outputs :attributes attributes})))
+      :outputs outputs :attributes attributes}))
+
+(defn refinement-plan
+  "Assemble and validate one complete collective refinement through the ordinary plan authority.
+   For compositional construction, `refinement-plan-fields` returns unvalidated fields; only
+   the complete containing DAG can establish dependency, initialization and ownership proofs."
+  [request]
+  (plan (refinement-plan-fields request)))
+
+(defn compose-refinement-plans
+  "Assemble multiple explicitly scoped collective requests into one validated ordinary DAG.
+   The context owns id, mesh, topology, outputs and optional attributes. Request outputs
+   are local construction choices, not public exports of the containing execution.
+   Nonempty request attributes are rejected; containing metadata must be retained explicitly
+   on the context rather than silently dropped or reconciled.
+   Equal value/shard/group declarations may be shared; calls, copies and refinement identities
+   must be distinct. Device entries may be shared only when exactly equal, under one target.
+   No identities, aliases, parameter transitions or dependencies are inferred. Final `plan`
+   validation checks the complete structure, bindings and retained immutable contributions.
+   The ordinary readiness/certification/runtime boundaries retain their separate obligations;
+   returning a plan is not proof that its caller-owned startup sources have been realized.
+   This creates no execution owner and does not permit replay of a completed one-shot owner."
+  [context requests]
+  (let [allowed #{:id :mesh :topology :outputs :attributes}
+        required #{:id :mesh :topology :outputs}
+        _ (when-not (and (map? context) (set/subset? (set (keys context)) allowed)
+                         (set/subset? required (set (keys context)))
+                         (vector? requests) (seq requests))
+            (fail! "refinement composition needs a closed context and nonempty request vector"
+                   :distributed-refinement-composition {}))
+        merge-map
+        (fn [path left right equal-sharing?]
+          (when-not (and (map? left) (map? right))
+            (fail! "refinement field contributions must be maps"
+                   :distributed-refinement-composition {:path path}))
+          (doseq [id (set/intersection (set (keys left)) (set (keys right)))]
+            (when-not (and equal-sharing? (= (get left id) (get right id)))
+              (fail! "refinement composition cannot shadow a retained declaration or invocation"
+                     :distributed-refinement-composition {:path path :id id})))
+          (merge left right))
+        merge-worker
+        (fn [worker left right]
+          (let [allowed #{:target :entries :steps :attributes}
+                contributions (remove nil? [left right])
+                _ (when-not (and (seq contributions)
+                                 (every? #(and (map? %)
+                                               (set/subset? (set (keys %)) allowed))
+                                         contributions)
+                                 (apply = (map #(get % :target worker) contributions))
+                                 (apply = (map #(get % :attributes {}) contributions)))
+                    (fail! "composed workers require one target and named compute entries"
+                           :distributed-refinement-composition {:worker worker}))
+                retained (first contributions)]
+            {:target (get retained :target worker)
+             :attributes (get retained :attributes {})
+             :entries (merge-map [:device-plans worker :entries]
+                                 (get left :entries {}) (get right :entries {}) true)
+             :steps (merge-map [:device-plans worker :steps]
+                               (get left :steps {}) (get right :steps {}) false)}))
+        fields
+        (reduce
+         (fn [result request]
+           (do
+             (when-not (and (= (:mesh context) (:mesh request))
+                            (= (:topology context) (:topology request)))
+               (fail! "every refinement must retain the containing mesh and topology"
+                      :distributed-refinement-composition {:request (:id request)}))
+             (let [fields (refinement-plan-fields request)
+                   _ (when-not (and (map? (:attributes fields)) (empty? (:attributes fields)))
+                       (fail! "refinement metadata must be retained explicitly on the context"
+                              :distributed-refinement-composition {:request (:id request)}))
+                   _ (when-not (and (map? (:device-plans fields))
+                                    (every? map? (vals (:device-plans fields))))
+                       (fail! "refinement composition requires named worker plan maps"
+                              :distributed-refinement-composition {:request (:id request)}))
+                   workers (set/union (set (keys (:device-plans result)))
+                                      (set (keys (:device-plans fields))))]
+               (-> (reduce (fn [result field]
+                             (assoc result field
+                                    (merge-map [field] (get result field {}) (get fields field {})
+                                               (contains? #{:values :shards :collective-groups} field))))
+                           result [:values :shards :collective-groups :copy-bindings :refinements])
+                   (assoc :device-plans
+                          (into {} (map (fn [worker]
+                                          [worker (merge-worker worker
+                                                                 (get-in result [:device-plans worker])
+                                                                 (get-in fields [:device-plans worker]))])) workers))
+                   (update :steps into (:steps fields))))))
+         {:values {} :shards {} :collective-groups {} :copy-bindings {} :refinements {}
+          :device-plans {} :steps []} requests)]
+    (plan (merge fields context))))
 
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
