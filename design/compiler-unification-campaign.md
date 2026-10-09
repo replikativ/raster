@@ -3416,3 +3416,31 @@ or AMD execution/performance acceptance is implied. The real checkpoint's fused
 Q projection matches the independent ordered FMA oracle exactly, but still differs
 from native BLAS. Full-model gradient parity, sustained training and the original
 distributed/AMR campaign residuals remain open.
+
+### Finite collective composition and parameter transitions — 2026-10-09
+
+`refinement-plan-fields` separates existing collective field construction from the
+ordinary whole-plan validation boundary. Fields are neither a certificate nor an
+executable. `refinement-plan` retains its existing single-request behavior.
+`compose-refinement-plans` merges explicitly scoped requests: equal values, shards,
+groups and local entries may be shared, but calls, copy bindings and refinements
+must remain disjoint. The containing context supplies public outputs and metadata;
+nonempty fragment attributes are rejected instead of silently losing evidence.
+There is no inferred alias, ID renaming, parameter update or dependency.
+
+The finite training regression composes three AD → all-reduce → SGD steps, with
+unequal local batch counts. One parameter value/shard/allocation and startup source
+per worker persists across steps; contributions and scratch are epoch-local. Each
+new producer depends on the preceding update and only final updates are exported.
+Existing readiness and runtime authorities still require one initialization phase
+and reject replay of a completed owner. Numerical comparison uses an independently
+rounded scalar oracle at the existing tolerance; replica equality is separately
+bitwise. This is a co-located resident-copy fixture, not multi-node fabric,
+dynamic epoch execution, a trainer API or acceptance of the held real-model gate.
+Private allocations deliberately remain distinct throughout this finite DAG;
+steady-state training and lifetime-proved scratch recycling remain follow-ups.
+
+The affected refinement/training suites pass 20 tests / 371 assertions on the
+capped warm REPL, including actual OpenCL and Level Zero execution with no
+capability skips reported. Whole-repository fresh-process and CUDA/HIP compiler
+checks remain CI obligations; this does not report a training throughput result.

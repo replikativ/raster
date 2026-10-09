@@ -2,6 +2,7 @@
   "Actual AD → collective → SGD compiler fixture using checked LinkPlan rebinding,
    not a released trainer API. Co-location is not fabric evidence."
   (:require [clojure.test :refer [deftest is]]
+            [clojure.set :as set]
             [raster.core :refer [deftm broadcast]]
             [raster.numeric :as numeric]
             [raster.ad.reverse :as reverse]
@@ -45,13 +46,15 @@
 (defn- initial-theta []
   (float-array (map #(* 0.03125 (- % 8)) (range 17))))
 
-(defn- place-lowering [id f args device]
+(defn- place-lowering
+  ([id f args device] (place-lowering id f args device :program))
+  ([id f args device component]
   (let [prepared (compiled/lower f args {:compiler :equation-first :target device :dtype :float
                                         :schedule {:precision :f32-scalar}})
         lowering (:lowering prepared)]
     (:plan (composition/compose
-            {:id id :components [{:id :program :lowering lowering}]
-             :outputs (mapv #(vector :program %) (link/output-value-ids (:plan lowering)))}))))
+            {:id id :components [{:id component :lowering lowering}]
+             :outputs (mapv #(vector component %) (link/output-value-ids (:plan lowering)))})))))
 
 (defn- value-node [plan value-id]
   (get-in plan [:nodes (get-in plan [:values value-id :leaves 0 :node])]))
@@ -62,17 +65,36 @@
     (assert (= 1 (count matches)) "fixture input must have one exact initialized boundary")
     (first matches)))
 
-(defn- training-plan [device row-counts]
+(defn- training-request
+  ([device row-counts] (training-request device row-counts {}))
+  ([device row-counts {:keys [scope theta-by-worker parameter-views predecessors]}]
   (let [n (count row-counts)
-        [refinement topology inputs costs] (fixture/projection-inputs n)
+        scoped #(if scope [scope %] %)
+        [refinement topology original-inputs costs] (fixture/projection-inputs n scope)
         workers (get-in refinement [:group :devices])
+        inputs (update-vals original-inputs
+                            #(if-let [previous (get predecessors (:device %))]
+                               (assoc % :dependencies [previous]) %))
+        theta-by-worker (or theta-by-worker (zipmap workers (repeatedly n initial-theta)))
         facts (distributed/refinement-facts refinement)
         options {:target-device device :target-descriptor (hardware/descriptor-for device)}
         data (batches row-counts)
         lr (float (/ 0.125 (reduce + row-counts)))
         producers (into {} (map (fn [worker {:keys [rows x y]}]
-                                  [worker (place-lowering [worker :gradient] #'local-gradient-sum
-                                                         [(initial-theta) x y rows 17] device)]) workers data))
+                                  (let [theta (get theta-by-worker worker)
+                                        local (place-lowering (scoped [worker :gradient]) #'local-gradient-sum
+                                                              [theta x y rows 17] device
+                                                              (scoped :program))
+                                        parameter (initialized-value local theta)
+                                        node (value-node local parameter)
+                                        local (if-let [view (get parameter-views worker)]
+                                                (-> local
+                                                    (assoc-in [:nodes (:id node) :view]
+                                                              (assoc view :id (get-in node [:view :id])))
+                                                    link/validate!) local)]
+                                    [worker local])) workers data))
+        producer-parameters (into {} (for [[worker local] producers]
+                                      [worker (initialized-value local (get theta-by-worker worker))]))
         producer-outputs (update-vals producers #(first (link/output-value-ids %)))
         nodes (into {} (for [[ssa {:keys [device]}] (:values facts)]
                         [ssa (if-let [worker (get (:inputs refinement) ssa)]
@@ -87,8 +109,18 @@
         consumers
         (into {} (for [worker workers
                        :let [gradient (float-array 17)
-                             local (place-lowering [worker :update] #'optim/sgd-step!
-                                                   [(initial-theta) gradient 17 lr] device)
+                             theta (if scope (get theta-by-worker worker) (initial-theta))
+                             local (place-lowering (scoped [worker :update]) #'optim/sgd-step!
+                                                   [theta gradient 17 lr] device (scoped :program))
+                             parameter (initialized-value local theta)
+                             parameter-node (value-node local parameter)
+                             parameter-view (:view (value-node (get producers worker)
+                                                               (get producer-parameters worker)))
+                             local (if scope
+                                     (-> local
+                                         (assoc-in [:nodes (:id parameter-node) :view]
+                                                   (assoc parameter-view :id (get-in parameter-node [:view :id])))
+                                         link/validate!) local)
                              input (initialized-value local gradient)
                              node (value-node local input)
                              canonical (get nodes (get (:outputs refinement) worker))
@@ -99,21 +131,31 @@
                                        (assoc-in [:nodes (:id node) :view]
                                                  (assoc (:view canonical) :id (get-in node [:view :id])))
                                        link/validate!)]]
-                   [worker {:plan local :gradient input}]))
-        locals (merge (into {} (map (fn [[worker local]] [[worker :produce] local])) producers)
+                   [worker {:plan local :gradient input :parameter parameter}]))
+        locals (merge (into {} (map (fn [[worker local]] [(scoped [worker :produce]) local])) producers)
                       (update-vals combines :link-plan)
-                      (into {} (map (fn [[worker {:keys [plan]}]] [[worker :update] plan])) consumers))
+                      (into {} (map (fn [[worker {:keys [plan]}]] [(scoped [worker :update]) plan])) consumers))
         node-to-ssa (into {} (map (fn [[ssa node]] [(:id node) ssa])) nodes)
         bindings
         (into {} (for [[step local] locals]
-                   [step (into {} (for [[local-id _] (:values local)]
+                   [step (into {} (for [[local-id _] (:values local)
+                                       :let [owner (some (fn [worker]
+                                                           (when (contains? #{(scoped [worker :produce])
+                                                                              (scoped [worker :update])} step)
+                                                             worker)) workers)]]
                                     [local-id
-                                     (or (when (= :produce (second step))
-                                           (when (= local-id (get producer-outputs (first step)))
-                                             [(first step) :input]))
-                                         (when (= :update (second step))
-                                           (when (= local-id (get-in consumers [(first step) :gradient]))
-                                             (get-in refinement [:outputs (first step)])))
+                                     (or (when (and scope owner
+                                                    (= local-id (if (= step (scoped [owner :produce]))
+                                                                  (get producer-parameters owner)
+                                                                  (get-in consumers [owner :parameter]))))
+                                           [owner :parameters])
+                                         (when (= step (scoped [owner :produce]))
+                                           (when (= local-id (get producer-outputs owner))
+                                             (some (fn [[ssa worker]] (when (= worker owner) ssa))
+                                                   (:inputs refinement))))
+                                         (when (= step (scoped [owner :update]))
+                                           (when (= local-id (get-in consumers [owner :gradient]))
+                                             (get-in refinement [:outputs owner])))
                                          (get node-to-ssa (:id (value-node local local-id)))
                                          [step local-id])]))]))
         projected (distributed/project-refinement refinement topology inputs costs)
@@ -130,11 +172,11 @@
                                             (filter #(= :combine (:kind %)) (:nodes refinement)))
                                       (some (fn [[worker output]]
                                               (when (= ssa output)
-                                                {:step [worker :update]
+                                                {:step (scoped [worker :update])
                                                  :local-value (get-in consumers [worker :gradient])}))
                                             (:outputs refinement))))]))
         updates (mapv (fn [worker completion]
-                        (distributed/compute-step {:id [worker :update] :device worker :duration-ns 1
+                        (distributed/compute-step {:id (scoped [worker :update]) :device worker :duration-ns 1
                                                    :dependencies [completion]}))
                       workers (:completions projected))
         step-map (into {} (map (juxt :id identity))
@@ -146,8 +188,7 @@
                    [global-id {:abstract (assoc (:abstract value) :sharding
                                                {:kind :replicated :devices [(:device (get step-map step))]})
                                :worker (:device (get step-map step))}]))]
-    (distributed/refinement-plan
-     {:id :differentiated-all-reduce-sgd :mesh (distributed/mesh [{:name :workers :size n}] workers)
+    {:id :differentiated-all-reduce-sgd :mesh (distributed/mesh [{:name :workers :size n}] workers)
       :topology topology :refinement refinement :input-producers inputs :combine-costs costs
       :storage storage :combines (update-vals combines :emitted)
       :values (update-vals additional :abstract)
@@ -163,6 +204,32 @@
                                             [id {:entry id :bindings
                                                  (update-vals (get bindings id) #(hash-map :value % :shard %))}]))}]))
       :steps updates :outputs (mapv :id updates)})))
+
+(defn- training-plan [device row-counts]
+  (distributed/refinement-plan (training-request device row-counts)))
+
+(defn- multi-step-training-plan [device row-counts iterations]
+  (let [workers (mapv #(keyword (str "worker-" %)) (range (count row-counts)))
+        theta-by-worker (zipmap workers (repeatedly (count workers) initial-theta))
+        requests
+        (:requests
+         (reduce
+          (fn [{:keys [requests parameter-views predecessors]} epoch]
+            (let [scope [:epoch epoch]
+                  request (training-request device row-counts
+                                            {:scope scope :theta-by-worker theta-by-worker
+                                             :parameter-views parameter-views :predecessors predecessors})
+                  views (into {} (for [worker workers
+                                       :let [local (get-in request [:device-plans worker :entries
+                                                                   [scope [worker :produce]] :link-plan])
+                                             parameter (initialized-value local (get theta-by-worker worker))]]
+                                   [worker (:view (value-node local parameter))]))]
+              {:requests (conj requests request) :parameter-views views
+               :predecessors (zipmap workers (:outputs request))}))
+          {:requests [] :parameter-views {} :predecessors {}} (range iterations)))
+        context (assoc (select-keys (last requests) [:mesh :topology :outputs])
+                       :id :finite-differentiated-training)]
+    (distributed/compose-refinement-plans context requests)))
 
 (defn- analytic-gradient-sum [{:keys [rows x y]}]
   (let [theta (initial-theta)
@@ -189,6 +256,139 @@
     (mapv (fn [parameter gradient]
             (float (- (double parameter) (double (float (* (double lr) (double gradient)))))))
           (initial-theta) sum)))
+
+(defn- rounded-gradient-sum
+  "Independent scalar oracle with explicit FP32 product/accumulator/storage boundaries."
+  [theta {:keys [rows x y]}]
+  (let [multiply (fn [a b] (float (* (double a) (double b))))
+        add (fn [a b] (float (+ (double a) (double b))))
+        predictions (mapv (fn [row]
+                            (reduce add (float 0)
+                                    (map #(multiply (aget ^floats theta %)
+                                                    (aget ^floats x (+ (* row 17) %)))
+                                         (range 17)))) (range rows))
+        cotangents (mapv (fn [prediction target]
+                          (float (/ (* 2.0 (- (double prediction) (double target))) rows)))
+                        predictions y)]
+    (mapv (fn [j]
+            (multiply (float rows)
+                      (reduce add (float 0)
+                              (map #(multiply (nth cotangents %)
+                                              (aget ^floats x (+ (* % 17) j)))
+                                   (range rows)))))
+          (range 17))))
+
+(defn- expected-updates [row-counts iterations]
+  (let [data (batches row-counts)
+        lr (float (/ 0.125 (reduce + row-counts)))]
+    (vec (rest
+          (reductions
+           (fn [theta _]
+             (let [contributions (mapv #(rounded-gradient-sum theta %) data)
+                   gradient (apply mapv (fn [& xs]
+                                         (reduce #(float (+ (double %1) (double %2))) xs))
+                                   contributions)]
+               (float-array
+                (map (fn [parameter grad]
+                       (float (- (double parameter)
+                                 (double (float (* (double lr) (double grad))))))) theta gradient))))
+           (initial-theta) (range iterations))))))
+
+(deftest repeated-local-ad-matches-rounded-independent-oracle
+  (doseq [row-counts [[1 3] [1 2 4]]
+          theta (cons (initial-theta) (expected-updates row-counts 2))
+          {:keys [rows x y] :as batch} (batches row-counts)]
+    (is (< (max-error (rounded-gradient-sum theta batch)
+                     (local-gradient-sum theta x y rows 17)) 1.0e-7))))
+
+(deftest finite-training-composition-retains-parameters-and-orders-updates
+  (let [device :ocl:analytic
+        descriptor {:device-id device :device-type :gpu :backend :ocl
+                    :subgroup-dialect :opencl-portable :max-workgroup-size 256}]
+    (with-redefs [hardware/descriptor-for (constantly descriptor)
+                  gpu/make-session (fn [& _] (throw (ex-info "assembly opened a session" {})))
+                  gpu/alloc! (fn [& _] (throw (ex-info "assembly allocated device storage" {})))]
+      (doseq [row-counts [[1 3] [1 2 4]]]
+        (let [plan (multi-step-training-plan device row-counts 3)
+              workers (get-in plan [:mesh :devices])
+              parameter-allocations
+              (into #{} (for [worker workers
+                              :let [step [[:epoch 0] [worker :produce]]
+                                    local (get-in plan [:device-plans worker :entries step :link-plan])]
+                              [id binding] (get-in plan [:device-plans worker :steps step :bindings])
+                              :when (= [worker :parameters] (:value binding))]
+                          (get-in (value-node local id) [:view :allocation :id])))
+              scratch-by-epoch
+              (mapv (fn [epoch]
+                      (set/difference
+                       (into #{} (for [[_ worker-plan] (:device-plans plan)
+                                       [[scope _] entry] (:entries worker-plan)
+                                       :when (= [:epoch epoch] scope)
+                                       [_ node] (get-in entry [:link-plan :nodes])
+                                       :let [id (get-in node [:view :allocation :id])]
+                                       :when id] id))
+                       parameter-allocations)) (range 3))]
+          (is (= 3 (count (:refinements plan))))
+          (is (= (mapv #(vector [:epoch 2] [% :update]) workers) (:outputs plan)))
+          (is (= (distributed/certify plan) (distributed/verify! (distributed/certify plan))))
+          (is (= (count workers) (count parameter-allocations)))
+          (is (every? seq scratch-by-epoch))
+          (doseq [left (range 3) right (range (inc left) 3)]
+            (is (empty? (set/intersection (nth scratch-by-epoch left) (nth scratch-by-epoch right)))
+                "private scratch and immutable contribution storage are fresh across epochs"))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (distributed/check-readiness
+                        (update plan :steps
+                                #(mapv (fn [step]
+                                         (if (= [[:epoch 1] [(first workers) :produce]] (:id step))
+                                           (assoc step :dependencies []) step)) %))))
+              "an epoch cannot read parameters unordered with respect to the preceding update")
+          (doseq [worker workers]
+            (let [parameters (for [epoch (range 3) kind [:produce :update]
+                                   :let [step [[:epoch epoch] [worker kind]]
+                                         local (get-in plan [:device-plans worker :entries step :link-plan])]
+                                   [id binding] (get-in plan [:device-plans worker :steps step :bindings])
+                                   :when (= [worker :parameters] (:value binding))]
+                               (value-node local id))]
+              (is (= 6 (count parameters)))
+              (is (apply = (map #(dissoc (:view %) :id) parameters)))
+              (is (every? #(identical? (:source (first parameters)) (:source %)) parameters)))
+            (doseq [epoch [1 2]]
+              (is (= [[[:epoch (dec epoch)] [worker :update]]]
+                     (:dependencies (first (filter #(= [[:epoch epoch] [worker :produce]] (:id %))
+                                                   (:steps plan)))))))))))))
+
+(defn- check-multi-step-training! [device]
+  (doseq [row-counts [[1 3] [1 2 4]]]
+    (let [iterations 3
+          plan (multi-step-training-plan device row-counts iterations)
+          expected (last (expected-updates row-counts iterations))]
+      (with-open [executable (runtime/instantiate! plan {:transport :resident-copy
+                                                        :device-capacities {device 1048576}})]
+        (runtime/run! executable)
+        (let [session (get (:sessions executable) device)
+              actual (mapv (fn [[_ values]]
+                             (is (= 1 (count values)))
+                             (let [result (float-array 17)]
+                               (gpu/download-range! session (first (vals values)) result {:elements 17})
+                               result)) (runtime/output-values executable))]
+          (is (= (count row-counts) (count actual)))
+          (is (> (max-error (first (expected-updates row-counts 1)) expected) 1.0e-3)
+              "the oracle distinguishes three updates from a stale single-step replay")
+          (doseq [result actual]
+            (is (< (max-error expected result) 1.0e-7)))
+          (doseq [result (rest actual)]
+            (is (java.util.Arrays/equals ^floats (first actual) ^floats result)))
+          (is (thrown? clojure.lang.ExceptionInfo (runtime/run! executable))
+              "finite unrolling does not authorize replay with stale startup evidence"))))))
+
+(deftest finite-multi-step-ad-all-reduce-sgd-on-local-devices
+  (if @opencl/opencl-available?
+    (check-multi-step-training! :ocl:0)
+    (opencl/opencl-skip! "finite multi-step distributed training"))
+  (if @ze/gpu-available?
+    (check-multi-step-training! :ze:0)
+    (ze/gpu-skip! "finite multi-step distributed training")))
 
 (deftest unequal-batch-local-ad-producers-match-independent-analytic-gradients
   (doseq [rows [[1 3] [1 2 4]]

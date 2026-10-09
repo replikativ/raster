@@ -126,8 +126,22 @@
                  (distributed/refinement-facts
                   (assoc-in refinement [:operation :reduction :combine] '*))))))
 
-(defn ^:no-doc projection-inputs [n]
-  (let [refinement (direct-refinement n)
+(defn ^:no-doc projection-inputs
+  ([n] (projection-inputs n nil))
+  ([n scope]
+  (let [scoped #(if scope [scope %] %)
+        original (direct-refinement n)
+        ;; Scope only declared SSA/operation identities, never worker or route identities.
+        refinement (-> original
+                       (update-in [:operation :id] scoped)
+                       (update-in [:operation :value] scoped)
+                       (update :inputs #(into {} (map (fn [[id worker]] [(scoped id) worker])) %))
+                       (update :outputs #(update-vals % scoped))
+                       (update :nodes #(mapv (fn [node]
+                                              (reduce (fn [node field]
+                                                        (if (contains? node field)
+                                                          (update node field scoped) node))
+                                                      node [:id :input :left :right])) %)))
         devices (get-in refinement [:group :devices])
         links (distinct (mapcat :route (filter #(= :copy (:kind %)) (:nodes refinement))))]
     [refinement
@@ -137,10 +151,10 @@
               (distributed/link {:id id :source source :target target
                                  :bandwidth-bytes-s 1.0e9 :latency-ns 1})) links))
      (into {} (map (fn [[id worker]]
-                     [id (distributed/compute-step {:id [worker :produce] :device worker
+                     [id (distributed/compute-step {:id (scoped [worker :produce]) :device worker
                                                     :duration-ns 1})])) (:inputs refinement))
      (into {} (keep #(when (= :combine (:kind %))
-                      [(:id %) {:duration-ns 2 :peak-memory-bytes 204}])) (:nodes refinement))]))
+                      [(:id %) {:duration-ns 2 :peak-memory-bytes 204}])) (:nodes refinement))])))
 
 (deftest topology-projection-preserves-arithmetic-dependencies-and-broadcast-completion
   (doseq [n [2 3 4 7]]
@@ -225,8 +239,8 @@
   "Small full-array all-reduce fixture. Input producers export initialized resident arrays;
    this is a collective oracle, not a differentiated training or fabric-performance claim."
   ([n options] (realized-plan n options {}))
-  ([n options {:keys [algebra input-values]}]
-  (let [[refinement cluster inputs costs] (projection-inputs n)
+  ([n options {:keys [algebra input-values scope]}]
+  (let [[refinement cluster inputs costs] (projection-inputs n scope)
         refinement (if algebra
                      (-> refinement
                          (assoc-in [:operation :reduction] algebra)
@@ -238,13 +252,15 @@
         projected (distributed/project-refinement refinement cluster inputs costs)
         facts (distributed/refinement-facts refinement)
         target (:target-device options)
-        input-index (zipmap (map #(vector % :input) (get-in refinement [:group :devices])) (range n))
+        input-index (into {} (map (fn [[ssa worker]]
+                                   [ssa (.indexOf (get-in refinement [:group :devices]) worker)]))
+                          (:inputs refinement))
         nodes (into {} (map (fn [[ssa _]]
                               [ssa (link/node
                                     {:id ssa :device target :dtype dtype :shape [17] :role :input})])) (:values facts))
         exported (into {} (for [[worker ssa] (:outputs refinement)
                                 :when (= :copy (:kind (first (filter #(= ssa (:id %)) (:nodes refinement)))))]
-                            [ssa [worker :retain]]))
+                            [ssa (if scope [scope [worker :retain]] [worker :retain])]))
         combines (into {} (for [{:keys [id kind left right]} (:nodes refinement) :when (= :combine kind)]
                             [id (arithmetic/bind-local
                                  (get-in refinement [:operation :reduction]) 17 options
@@ -316,6 +332,7 @@
         request @captured
         input [:worker-0 :input]]
     (is (= expected (assemble request)))
+    (is (= expected (distributed/plan (distributed/refinement-plan-fields request))))
     (is (= (distributed/certify expected) (distributed/certify (assemble request))))
     (is (= expected
            (assemble (update request :input-producers
@@ -329,6 +346,14 @@
            (reason #(assemble (assoc request :copy-bindings {})))))
     (is (= :distributed-refinement-assembly
            (reason #(assemble (assoc request :values [])))))
+    (let [external :earlier-state-update
+          request (assoc-in request [:input-producers input :dependencies] [external])
+          fields (distributed/refinement-plan-fields request)]
+      (is (= [external] (:dependencies (first (:steps fields)))))
+      (is (not (instance? raster.compiler.ir.distributed_plan.DistributedPlan fields)))
+      (is (= :distributed-step-dependencies
+             (reason #(distributed/plan fields)))
+          "partial dependency closure is not certified by field construction"))
     (doseq [field [:values :shards]]
       (is (= :distributed-refinement-projection
              (reason #(assemble (assoc-in request [field input] :different-declaration))))))
@@ -339,6 +364,57 @@
     (is (= :distributed-refinement-storage
            (reason #(assemble (assoc-in request [:storage input :local-value]
                                        [input :source])))))))
+
+(deftest refinement-composition-validates-one-containing-dag
+  (let [request (fn [scope]
+                  (with-redefs [distributed/refinement-plan identity]
+                    (realized-plan 2 (realization-options) {:scope scope})))
+        first-request (request :first)
+        second-request (request :second)
+        context (select-keys first-request [:id :mesh :topology :outputs])
+        context (assoc context :id :composed
+                       :outputs (into (:outputs first-request) (:outputs second-request)))
+        composed (distributed/compose-refinement-plans context [first-request second-request])
+        first-plan (distributed/refinement-plan first-request)
+        second-plan (distributed/refinement-plan second-request)]
+    (is (= :composed (:id composed)))
+    (is (= (into (:steps first-plan) (:steps second-plan)) (:steps composed)))
+    (is (= #{[:first :all-reduce] [:second :all-reduce]} (set (keys (:refinements composed)))))
+    (is (= (:collective-groups first-plan) (:collective-groups composed)))
+    (is (= (+ (count (:copy-bindings first-plan)) (count (:copy-bindings second-plan)))
+           (count (:copy-bindings composed))))
+    (is (= (distributed/certify composed)
+           (distributed/certify (distributed/plan (into {} composed)))))
+    (doseq [[worker local] (:device-plans first-request)
+            [id entry] (:entries local)]
+      (is (identical? (:link-plan entry)
+                      (get-in composed [:device-plans worker :entries id :link-plan]))))
+    (is (= (:steps first-plan)
+           (:steps (distributed/compose-refinement-plans
+                    (select-keys first-request [:id :mesh :topology :outputs]) [first-request]))))
+    (doseq [[ctx requests]
+            [[context []]
+             [(assoc context :trusted true) [first-request]]
+             [context [(assoc first-request :attributes {:evidence :must-not-disappear}) second-request]]
+             [context [first-request first-request]]
+             [context [first-request (assoc second-request :mesh nil)]]
+             [context [first-request (assoc second-request :topology nil)]]
+             [context [(assoc first-request :device-plans nil) second-request]]
+             [context [first-request (assoc-in second-request [:device-plans :worker-0] nil)]]
+             [context [first-request (assoc-in second-request [:device-plans :worker-0 :target]
+                                              :other-target)]]
+             [context [first-request (assoc-in second-request [:device-plans :worker-0 :plan]
+                                              :legacy-plan)]]
+             [context [first-request (assoc-in second-request [:values (first (keys (:values first-request)))]
+                                              :conflicting-declaration)]]]]
+      (is (= :distributed-refinement-composition
+             (reason #(distributed/compose-refinement-plans ctx requests)))))
+    (let [producer (first (keys (:input-producers second-request)))
+          second-request (assoc-in second-request [:input-producers producer :dependencies]
+                                   [(first (:outputs first-request))])
+          composed (distributed/compose-refinement-plans context [first-request second-request])]
+      (is (= [(first (:outputs first-request))]
+             (:dependencies (first (drop (count (:steps first-plan)) (:steps composed)))))))))
 
 (deftest realization-binds-complete-contribution-arithmetic-and-storage-to-its-certificate
   (doseq [n [2 3]]
