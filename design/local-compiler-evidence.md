@@ -2136,6 +2136,14 @@ and tree-reassociation rules are unchanged. The selected Float math leaf records
 its physical Double requirement. The affected compiler/codec/boundary suites and
 native default-route replays pass 65 tests / 479 assertions in the warm REPL.
 
+Ordered and cooperative fold-map schedules now thread the same private consent
+through their shared scalar lowerers. Their declaration-order versus certified
+workgroup-tree contracts remain unchanged. Independent reconstruction accepts
+only caller-supplied matching consent, never the candidate's retained policy.
+Both strategies retain logical output precision and launch geometry while exposing
+the widened physical math dtype. Fold-map, scan, scalar, codec and emitted-equation
+suites pass 143 tests / 1221 assertions. Public policy admission remains disabled.
+
 This policy is not yet exposed as a public schedule option. That must wait for
 all scheduled-body producers and independent reconstructors to retain it,
 physical target admission to account for FP64, and public cache/source/codec
