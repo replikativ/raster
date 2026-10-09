@@ -59,6 +59,51 @@
 
 (deftm option-one-loss [x :- Double] :- Double (* x x))
 
+(deftm argument-effect-loss [x :- Double unused :- Double] :- Double
+  (* x x))
+
+(deftest ad-arguments-evaluate-once-in-source-order-even-when-unused
+  (doseq [mode [:value+grad :grad]]
+    (let [expanded (inline/inline-value+grad-call
+                    {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
+                     :args '[(draw :first) (draw :unused)] :mode mode})
+          f (eval (list 'fn '[draw]
+                        (list 'let* (vec (mapcat identity (:bindings expanded)))
+                              (:elements expanded))))
+          trace (atom [])
+          draw (fn [id] (swap! trace conj id) (if (= id :first) 3.0 7.0))]
+      (is (= (if (= mode :value+grad)
+               ((rev/value+grad #'argument-effect-loss) 3.0 7.0)
+               ((rev/grad #'argument-effect-loss) 3.0 7.0))
+             (f draw)))
+      (is (= [:first :unused] @trace))
+      (reset! trace [])
+      (let [failure (ex-info "argument failed" {:argument :unused})]
+        (is (identical? failure
+                        (try (f (fn [id]
+                                  (swap! trace conj id)
+                                  (if (= id :unused) (throw failure) 3.0)))
+                             nil (catch Throwable error error))))
+        (is (= [:first :unused] @trace)))
+      (reset! trace [])
+      (let [failure (ex-info "first argument failed" {:argument :first})]
+        (is (identical? failure
+                        (try (f (fn [id] (swap! trace conj id) (throw failure)))
+                             nil (catch Throwable error error))))
+        (is (= [:first] @trace)))))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"Arity mismatch"
+       (inline/inline-value+grad-call
+        {:var-sym 'raster.compiler.passes.scalar.inline-test/argument-effect-loss
+         :args '[x] :mode :value+grad})))
+  (let [expanded (inline/inline-value+grad-call
+                  {:var-sym 'raster.compiler.passes.scalar.inline-test/option-one-loss
+                   :args '[(clojure.core/float (draw))] :mode :value+grad})
+        [argument expression] (first (:bindings expanded))]
+    (is (= '(clojure.core/float (draw)) expression))
+    (is (= 'float (:raster.type/tag (meta argument)))
+        "the Double formal must not widen the lifted Float producer")))
+
 (deftm option-overloaded-loss [x :- Float n :- Long] :- Float
   (raster.numeric/* x x))
 
