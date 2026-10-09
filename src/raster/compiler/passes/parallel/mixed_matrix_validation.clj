@@ -74,7 +74,9 @@
 
    Returns the reference plan and ordered stage bodies. Never obtain `source` from the candidate
    witness at an admission boundary: structural refinement validation cannot supply that proof."
-  [algorithm source refinement]
+  ([algorithm source refinement]
+   (validate-reconstruction! algorithm source refinement {}))
+  ([algorithm source refinement caller-options]
   (let [source (graph/validate! source)
         _ (when-not (= 1 (count (:nodes source)))
             (throw (ex-info "mixed matrix validation requires one semantic contraction"
@@ -85,8 +87,8 @@
     (when-not (fingerprint/equivalent? expected (:graph refinement))
       (throw (ex-info "mixed matrix stage graph differs from independent reconstruction"
                       {:reason :mixed-matrix-reconstruction-graph})))
-    (let [stage-bodies (mapv #(body/schedule-for-node % expected) (:nodes expected))]
+    (let [stage-bodies (mapv #(body/schedule-for-node % expected caller-options) (:nodes expected))]
       (assoc planned :stage-bodies stage-bodies
              :numerical-model (operational-numerical-model planned stage-bodies)
              :complete-write-domains
-             (full-k-write-domains algorithm source facts planned stage-bodies)))))
+             (full-k-write-domains algorithm source facts planned stage-bodies))))))

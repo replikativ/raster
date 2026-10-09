@@ -2559,6 +2559,47 @@
            (last (-> call :nodes first :call :arguments))))
     (is (nil? (get-in emitted [:stats :segop-relowered])))))
 
+(deftest independent-mixed-reconstruction-retains-caller-selected-math
+  (let [transform {:acc 'acc :expr (with-meta '(Math/tanh acc) {:raster.type/tag 'float})
+                   :dtype :float}
+        contract (apply list
+                        (concat
+                         '(raster.par/contract C [[i m] [j n]] [[l k]]
+                                               (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+                         [:epilogue transform]))
+        program (:form (pipeline/schedule-parallel-form
+                        (list 'let* ['step contract] 'step)
+                        {:target-device :ze:0 :dtype :float
+                         :array-types {'A :float 'B :float 'C :float}
+                         :scalar-types {'m :int 'n :int 'k :int}}))
+        equation (first (:equations program))
+        algorithm (:algorithm equation)
+        source (:graph (equation-graph/make-for-equation program equation))
+        descriptor {:backend :ze
+                    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :execution {:subgroup-sizes #{16 32} :max-workgroup-size 1024}
+                    :subgroup-size 16 :max-workgroup-size 1024
+                    :grf-bytes-per-lane 256 :machine-lanes 8192 :shared-local-memory 131072}
+        plan (mixed-candidate/plan algorithm source descriptor {:precision :mixed-f16-f32})
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        ordinary (mixed-validation/validate-reconstruction! algorithm source (:refinement plan))
+        selected (mixed-validation/validate-reconstruction!
+                  algorithm source (:refinement plan) {:scalar-math policy})
+        matrix-index (first (keep-indexed #(when (matrix-stage/matrix-stage? (:operation %2)) %1)
+                                         (:nodes (:graph selected))))
+        certificate (nth (:stage-bodies selected) matrix-index)]
+    (is (:ok plan))
+    (is (= (:graph ordinary) (:graph selected)))
+    (is (= (:complete-write-domains ordinary) (:complete-write-domains selected)))
+    (is (= (get-in ordinary [:numerical-model :contract])
+           (get-in selected [:numerical-model :contract])))
+    (is (= policy (get-in certificate [:numerics :scalar-math])))
+    (is (= policy (get-in selected [:numerical-model :stages matrix-index :numerics :scalar-math])))
+    (is (contains? (kernel-body/required-scalar-dtypes (get-in certificate [:body :operations])) :double))
+    (is (not= (:stage-bodies ordinary) (:stage-bodies selected)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (scheduled-body/validate! (update certificate :numerics dissoc :scalar-math))))))
+
 (deftest dynamic-result-transform-fuses-into-the-mixed-matrix-graph
   (let [transform {:acc 'acc
                    :expr '(raster.numeric/*

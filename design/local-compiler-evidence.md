@@ -2247,3 +2247,13 @@ its absence by default. Independent review found no missed exp construction
 site. The attention route suite passes 27 tests / 335 assertions. Artifact and
 scheduled numerical consent plus independent outer reconstruction remain pending;
 this raw-body slice does not enable public policy or change default routing.
+
+Independent mixed-matrix graph reconstruction now accepts explicit caller
+options when rebuilding ordered stage certificates. Algorithm/source-derived
+graph identity, source numerical permission and complete-write domains remain
+unchanged; the operational numerical model records the selected matrix-stage
+realization. A used-tanh regression checks these distinctions, certificate/model
+policy retention, physical FP64 demand and stripped-consent rejection. Two
+focused boundary/result-transform tests pass 18 assertions. Independent review
+found no blockers. Existing public emitted-equation admission still reconstructs
+default policy; no public selection is enabled by this prerequisite.
