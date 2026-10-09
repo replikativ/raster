@@ -739,7 +739,28 @@
           (is (false? (typed-route/realization-binding? semantic binding
                                                        '(clojure.core/println :unexpected))))
           (is (false? (typed-route/realization-binding? (assoc semantic :source altered)
-                                                       binding expression))))))
+                                                       binding expression)))
+          (doseq [wrong ['(clojure.core/float-array 1)
+                         '(clojure.core/double-array 1)
+                         '(clojure.core/double-array 1 7.0)]]
+            (let [source (list 'let* (vec (mapcat (fn [[symbol value]]
+                                                  [symbol (if (= binding symbol) wrong value)])
+                                                (partition 2 (second (:source semantic)))))
+                               (last (:source semantic)))
+                  forged (-> semantic
+                             (assoc :source source)
+                             (update :equations
+                                     (fn [equations]
+                                       (mapv #(update-in % [:attributes :realization-bindings]
+                                                        (fn [bindings]
+                                                          (mapv (fn [entry]
+                                                                  (cond-> entry
+                                                                    (= binding (:binding entry))
+                                                                    (assoc :expression wrong)))
+                                                                bindings)))
+                                             equations))))]
+              (is (false? (typed-route/realization-binding? forged binding wrong))
+                  "a forged witness cannot change canonical allocation dtype, extent or arity"))))))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= 3 (get-in semantic [:attributes :invocation-shape-equations])))
     (is (= 4 (get-in semantic [:attributes :invocation-scalar-equations])))
@@ -797,6 +818,17 @@
       (let [source (list 'let* '[y (raster.par/map! out i n double (clojure.core/aget x i))]
                          result)]
         (is (= '[y] (:outputs (route/promote-program (attempt source) options))))))
+    (doseq [aliased ['y 'out]]
+      (let [source (list 'let* (into '[y (raster.par/map! out i n double (clojure.core/aget x i))]
+                                   ['returned aliased 'final-result 'returned])
+                         'final-result)]
+        (is (= '[y] (:outputs (route/promote-program (attempt source) options)))
+            "exact lexical aliases preserve logical/physical return identity")))
+    (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
+                                    z (raster.par/map! x i n double (clojure.core/aget out i))]
+                                   [z y]))]
+      (is (= '[z y] (:outputs (route/promote-program complete options)))
+          "public unique leaves retain source traversal order rather than island sorting"))
     (let [partial (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))
                                    logged (clojure.core/println y)] y))]
       (is (= :structured-control-host-continuation
@@ -809,9 +841,10 @@
     (let [complete (attempt '(let* [y (raster.par/map! out i n double (clojure.core/aget x i))]
                                    y))
           extra-output (assoc complete :outputs (conj (:outputs complete) 'x))]
-      (is (= :structured-control-source-result
-             (reason-of #(route/promote-program extra-output options)))
-          "the public result cannot silently include an unrelated live-out")
+      (is (= '[y] (:outputs (route/promote-program extra-output options)))
+          "the public projection must not expose an unrelated island live-out")
+      (is (= (:equations extra-output) (:equations (route/promote-program extra-output options)))
+          "output projection retains internal equations and effects for explicit physical escapes")
       (is (= :structured-control-host-continuation
              (reason-of #(route/promote-program
                           (assoc complete :source '(let* [y (clojure.core/println x)] y))

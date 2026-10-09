@@ -153,6 +153,16 @@
                                    :raster.buffer/hoistable true})]
     [result' (list allocation extent)]))
 
+(defn- equation-allocation-pair
+  "Exact allocation scaffolding for the equation kinds which realize fresh result storage."
+  [values equation result]
+  (let [{:keys [kind attributes]} (dialect/operation-parts equation)
+        extent (case kind
+                 map (:extent attributes)
+                 reduce 1
+                 nil)]
+    (when extent (allocation-pair values result extent))))
+
 (defn- realize-equation
   [program equation]
   (let [[_ equation-id results] equation
@@ -285,7 +295,7 @@
                                       [binding destination])))
                                 (map vector results physical-results)))
                     :else
-                    (conj (mapv #(allocation-pair values % (:extent attributes)) results)
+                    (conj (mapv #(equation-allocation-pair values equation %) results)
                           [effect source]))
            :site [:binding (if (and storage (not multiple-buffer-results?)) host-binding effect)]
            :source source}))
@@ -440,7 +450,7 @@
             {:equation-id equation-id
              :placement placement
              :pairs (cond-> []
-                      (nil? resident-destination) (conj (allocation-pair values result 1))
+                      (nil? resident-destination) (conj (equation-allocation-pair values equation result))
                       true (conj [effect source]))
              :site [:binding effect]
              :source source})
@@ -630,8 +640,13 @@
                             (case kind
                               :result-allocation
                               (and (some #{binding} (:results equation))
-                                   (= :zero (descriptor/allocation-initialization
-                                             (descriptor/semantic-op generated))))
+                                   (dialect/program-form? (:algorithm equation))
+                                   (some (fn [inner]
+                                           (and (some #{binding} (nth inner 2))
+                                                (= [binding generated]
+                                                   (equation-allocation-pair
+                                                    (:values program) inner binding))))
+                                         (dialect/equations (:algorithm equation))))
                               :storage-alias
                               (and (symbol? generated) (contains? destinations generated))
                               false)))

@@ -1717,10 +1717,20 @@ omitted the target input. Internal TypedSOAC island extraction correctly retains
 by an opaque host consumer; those live-outs are not a certificate for the complete function.
 
 Whole-program promotion now checks the retained source return against the logical outputs and
-their existing result-storage relation. Host-controlled bindings must have an invocation or
+their existing result-storage relation, then projects the public outputs from those proven
+return leaves rather than exposing conservative island live-outs. Equations, effects and values
+are retained; no dead-code elimination is added at this boundary. Lower-time explicit outputs,
+taps and donation remain independent physical escapes. Host-controlled bindings must have an invocation or
 equation executor, or the existing effect analysis must prove them removable. Diagnostics retain
 the unsupported return/binding and source metadata. Island extraction and its host materialization
 contract are unchanged; no loss-name recognition or host download/continuation is introduced.
+
+This result contract covers the complete set of unique logical device-value leaves exposed by
+the public named-output map, including exact lexical/storage aliases. It does not reconstruct
+Clojure aggregate topology, ordering or duplicate return leaves. Generated result allocations
+are checked against the same typed-equation allocation constructor used by realization, not
+merely a zero-initialization label. Host removability inherits the existing effect authority;
+compiler-owned source/allocation metadata is not a general proof-carrying input format.
 
 The unsupported scalar objective therefore fails before allocation instead of returning a wrong
 array. This is a correctness prerequisite, not completed loss support. Next, lower the complete

@@ -467,14 +467,31 @@
                    "an analyzed TypedSOAC program requires a flat retained host source boundary"
                    {:source source}))
         body (drop 2 source)
-        outputs (set (:outputs parallel-program))
+        outputs (set (mapcat :results (:equations parallel-program)))
+        aliases (into {} (keep (fn [[symbol expression]]
+                                (when (symbol? expression) [symbol expression])))
+                      (partition 2 (second source)))
+        resolve-alias (fn [symbol]
+                        (loop [symbol symbol seen #{}]
+                          (cond
+                            (contains? outputs symbol) symbol
+                            (contains? seen symbol) nil
+                            (contains? aliases symbol) (recur (get aliases symbol) (conj seen symbol))
+                            :else symbol)))
         equations (:equations parallel-program)
         destinations (into {}
                            (mapcat (fn [equation]
-                                     (map (fn [result storage]
-                                            [(:destination storage) result])
-                                          (:results equation)
-                                          (get-in equation [:attributes :result-storage]))))
+                                     (let [storage (get-in equation [:attributes :result-storage])
+                                           binding (get-in equation [:attributes :host-binding])]
+                                       (concat
+                                        (map (fn [result storage]
+                                               [(:destination storage) result])
+                                             (:results equation) storage)
+                                        ;; A stored operation may return its buffer under a host
+                                        ;; binding distinct from its fresh logical SSA result.
+                                        (when (and binding (= 1 (count storage))
+                                                   (= :buffer (:host-return (first storage))))
+                                          [[binding (first (:results equation))]])))))
                            equations)
         effect-bindings (into #{}
                               (keep (fn [equation]
@@ -486,31 +503,36 @@
         projection? (fn projection? [expression]
                       (cond
                         (symbol? expression)
-                        (or (contains? outputs expression)
-                            (contains? outputs (get destinations expression))
-                            (and (empty? outputs) (contains? effect-bindings expression)))
+                        (let [expression (resolve-alias expression)]
+                          (or (contains? outputs expression)
+                              (contains? outputs (get destinations expression))
+                              (contains? effect-bindings expression)))
                         (vector? expression) (every? projection? expression)
-                        (nil? expression) (empty? outputs)
+                        (nil? expression) true
                         :else false))
         returned-values (fn returned-values [expression]
                           (cond
                             (symbol? expression)
-                            (cond
-                              (contains? outputs expression) #{expression}
-                              (contains? outputs (get destinations expression))
-                              #{(get destinations expression)}
-                              :else #{})
+                            (let [expression (resolve-alias expression)]
+                              (cond
+                                (contains? effect-bindings expression) []
+                                (contains? outputs expression) [expression]
+                                (contains? outputs (get destinations expression))
+                                [(get destinations expression)]
+                                :else []))
                             (vector? expression)
-                            (reduce set/union #{} (map returned-values expression))
-                            :else #{}))]
-    (when-not (and (= 1 (count body)) (projection? (first body))
-                   (= outputs (returned-values (first body))))
+                            (mapcat returned-values expression)
+                            :else []))]
+    (when-not (and (= 1 (count body)) (projection? (first body)))
       (fail! :structured-control-source-result
              "the complete source return is not represented by the typed program outputs"
              {:source-result (last body) :source-body (vec body)
               :program-outputs (:outputs parallel-program)
               :site [:return] :source-meta (meta (last body))}))
-    parallel-program))
+    ;; Island outputs include host live-outs and conservative terminal values. Public
+    ;; promotion changes only their escape boundary, never the equations/effects that
+    ;; compute them. All returned leaves must have a typed producer or storage alias.
+    (assoc parallel-program :outputs (vec (distinct (returned-values (first body)))))))
 
 (defn- validate-host-coverage!
   "Host-controlled bindings may remain in an island's retained source, but a complete
@@ -553,7 +575,10 @@
     (fail! :structured-control-native-initialization
            "source-independent promotion cannot discard native allocation and host writes"
            {:destinations (vec providers)}))
-  (let [parallel-program (validate-source-result! parallel-program)
+  (let [parallel-program (-> parallel-program
+                             validate-source-result!
+                             (assoc :dialect :typed-parallel)
+                             validate-typed-program!)
         parallel-program (hoist-host-invocation-equations parallel-program)
         public-parameters (vec (or public-parameters active-params))
         _ (when-not (seq public-parameters)
