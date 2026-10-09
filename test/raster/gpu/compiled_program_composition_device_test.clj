@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
+            [raster.math :as math]
+            [raster.compiler.core.hardware :as physical-hardware]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.array-ops :as array-ops]
             [raster.dl.nn :as nn]
@@ -43,6 +45,37 @@
   [input :- (Array float) result :- (Array float) n :- Long] :- Void
   (par/map-void! i n
                  (arrays/aset result i (* 2.0 (arrays/aget input i)))))
+
+(deftm selected-tanh-values
+  [input :- (Array float) n :- Long] :- (Array float)
+  (let [result (float-array n)]
+    (par/map! result i n float (math/tanh (arrays/aget input i)))))
+
+(deftest public-selected-math-executes-under-original-prepared-intent
+  (doseq [[target available? skip!] [[:ocl:0 @opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 @gp/gpu-available? gp/gpu-skip!]]]
+    (if-not available?
+      (skip! "public selected target-library math")
+      (let [input (float-array [-4.0 -1.0 -0.25 -0.0 0.0 0.25 1.0 4.0])
+            request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+            options (merge {:compiler :equation-first :target target :dtype :float} request)
+            supported? (= :supported
+                          (physical-hardware/scalar-dtype-support (physical-hardware/descriptor-for target) :double))]
+        (if-not supported?
+          (is (= :kernel-body-target-math-capability
+                 (try (compiled/lower #'selected-tanh-values [input (alength input)] options)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+              "unknown or unsupported FP64 must reject the introduced widening")
+          (let [prepared (compiled/lower #'selected-tanh-values [input (alength input)] options)
+                artifact (compiled/instantiate! prepared)]
+            (try
+              (doseq [values [input (float-array [-2.0 -0.5 -0.125 -0.0 0.0 0.125 0.5 2.0])]]
+                (let [expected (selected-tanh-values values (alength values))
+                      actual (value/->host (:result (artifact {:input values})))]
+                  (is (= (vec expected) (vec actual))
+                      "observed parity on these inputs is a regression oracle, not a library-wide rounding theorem")))
+              (finally (compiled/close! artifact)))))))))
 
 (deftm update-state!
   [state :- (Array float) gradient :- (Array float) lr :- Double n :- Long] :- Void
