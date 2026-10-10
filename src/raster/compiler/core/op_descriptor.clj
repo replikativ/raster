@@ -32,7 +32,12 @@
   [op-sym]
   (get-in (get-op-descriptor op-sym) [:buffer]))
 
-(declare resolve-op-descriptor)
+(declare resolve-op-descriptor alloc-ops)
+
+(defn- replay-safe-value? [expression environment]
+  ;; Effects depends on this descriptor namespace; analyze only after loading
+  ;; through the existing late-resolution seam, not a reverse static dependency.
+  ((requiring-resolve 'raster.compiler.passes.scalar.effects/replay-safe-value?) expression environment))
 
 (defonce ^:private auto-buffer-cache (atom {}))
 
@@ -40,23 +45,29 @@
   "If form is a pure array allocation, return the size expression. Nil otherwise.
    Does NOT match aclone (copy, not pure allocation)."
   [form]
-  (when (and (seq? form) (symbol? (first form)))
-    (let [n (name (first form))]
-      (when (or (.endsWith n "-array") (.startsWith n "zeros-like"))
-        (if (= 2 (count form)) (second form) (last form))))))
+  ;; Only the existing exact core identities and size-only overload are enough
+  ;; evidence. Suffixes, initializer/copy overloads and shape-helper calls do not
+  ;; establish the splitting contract; their explicit registered facets remain.
+  (when (and (seq? form) (= 2 (count form))
+             (contains? alloc-ops (first form))
+             (identical? (resolve (first form))
+                         (ns-resolve 'clojure.core (symbol (name (first form)))))
+             (not (contains? '#{make-array clojure.core/make-array} (first form))))
+    (second form)))
 
 (defn- param-derived?
   "True if expr depends only on param-set symbols (transitively through bindings)."
-  [expr param-set binding-map]
+  [expr param-set binding-map environment]
   (cond
     (contains? param-set expr) true
     (symbol? expr) (when-let [init (get binding-map expr)]
-                     (param-derived? init param-set binding-map))
+                     (param-derived? init param-set binding-map environment))
     (number? expr) true
     (seq? expr) (let [head (first expr)
                       args (if (= '.invk head) (drop 2 expr) (rest expr))]
-                  (and (symbol? head)
-                       (every? #(param-derived? % param-set binding-map) args)))
+                  (and (replay-safe-value? expr environment)
+                       (symbol? head)
+                       (every? #(param-derived? % param-set binding-map environment) args)))
     :else false))
 
 (defn- detect-auto-buffer-semantics
@@ -66,16 +77,27 @@
   (let [m (meta v)
         walked-body (or (:raster.core/deftm-walked-body m)
                         ((requiring-resolve 'raster.core/ensure-walked-body!) v))
-        params (:raster.core/deftm-params m)]
+        params (:raster.core/deftm-params m)
+        parameter-types (zipmap params (:raster.core/deftm-tags m))
+        ;; A one-argument constructor can also consume initializer data. Its
+        ;; argument must be a Number-size, not merely a parameter-derived value.
+        numeric-params (binding [*ns* (or (:ns m) *ns*)]
+                         (into #{} (keep (fn [[id tag]]
+                                       (when (and tag
+                                                  (.isAssignableFrom Number
+                                                                     (types/tag->check-class tag))) id)))
+                             (map vector params (:raster.core/deftm-tags m))))]
+    (binding [*ns* (or (:ns m) *ns*)]
     (when (and walked-body params (= 1 (count walked-body)))
       (let [body (first walked-body)]
         ;; Case 1: body is a direct pure alloc call (zeros-like, double-array)
         ;; Returns: just the pre-allocated buffer (no compute body)
         ;; (walked body is closed-core: let -> let*)
         (if (and (seq? body) (not (contains? #{'let 'let*} (first body))) (array-alloc-size body))
-          (let [param-set (set params)
+          (let [param-set numeric-params
                 size (array-alloc-size body)]
-            (when (param-derived? size param-set {})
+            (when (and (not (contains? parameter-types (first body)))
+                       (param-derived? size param-set {} parameter-types))
               (let [param-idx (into {} (map-indexed (fn [i p] [p i]) params))
                     resolve-to-args
                     (fn resolve-to-args [expr args]
@@ -89,14 +111,10 @@
                         :else expr))
                     alloc-ctor (first body)]
                 {:allocates? true
+                 :auto-detected? true
                  :in-place-arg nil
                  :alloc-form (fn [args _opts]
-                               (let [resolved-size (resolve-to-args size args)]
-                                 (if (> (count body) 2)
-                                   (list alloc-ctor
-                                         (resolve-to-args (second body) args)
-                                         resolved-size)
-                                   (list alloc-ctor resolved-size))))
+                               (list alloc-ctor (resolve-to-args size args)))
                  :rewrite-fn (fn [_args buf-sym] buf-sym)})))
           ;; Case 2: body is a let form with alloc-return pattern
           ;; (walked body is closed-core: let -> let*)
@@ -104,7 +122,13 @@
             (let [[_ bindings & body-exprs] body
                   pairs (vec (partition 2 bindings))
                   binding-map (into {} (map vec pairs))
-                  param-set (set params)
+                  environments
+                  (vec (reductions (fn [env [id initializer]]
+                                     (if-let [tag ((requiring-resolve 'raster.compiler.core.inference/infer-arg-tag)
+                                                  initializer env)]
+                                       (assoc env id tag) (assoc env id nil)))
+                                   parameter-types pairs))
+                  param-set numeric-params
                   return-expr (last body-exprs)]
             ;; Find the alloc binding: either returned directly (symbol) or
             ;; passed to a mutating call as last expr (BLAS pattern)
@@ -125,13 +149,21 @@
                                     (fn [i [sym init]]
                                       (when (= sym alloc-target)
                                         (when-let [size (array-alloc-size init)]
-                                          (when (param-derived? size param-set binding-map)
-                                            {:idx i :sym sym :init init :size size
-                                             :ctor (first init)
-                                             :multi-arg? (> (count init) 2)
-                                             :ref-arg (when (> (count init) 2) (second init))}))))
+                                          (when (and (not (contains? (nth environments i) (first init)))
+                                                     (param-derived? size param-set
+                                                                (into {} (map vec (take i pairs)))
+                                                                (nth environments i)))
+                                            {:idx i :sym sym :size size :ctor (first init)}))))
                                     pairs)))]
-                (when match
+                (when (and match
+                           ;; This old fragment adapter has no alpha-renaming
+                           ;; transport. Shadowed/repeated binders need a full
+                           ;; lexical prefix, not a spelling substitution map.
+                           (= (count pairs) (count (distinct (map first pairs))))
+                           (not-any? (set params) (map first pairs))
+                           (every? (fn [[[_ initializer] environment]]
+                                     (replay-safe-value? initializer environment))
+                                   (take (:idx match) (map vector pairs environments))))
                   (let [param-idx (into {} (map-indexed (fn [i p] [p i]) params))
                         ;; Resolve size expr to use call args
                         resolve-to-args
@@ -151,29 +183,22 @@
                           alloc-idx (:idx match)
                           other-pairs (vec (concat (take alloc-idx pairs)
                                                    (drop (inc alloc-idx) pairs)))
-                          sub (fn sub [form sym rep]
-                                (cond (= form sym) rep
-                                      (seq? form) (with-meta (apply list (map #(sub % sym rep) form)) (meta form))
-                                      (vector? form) (mapv #(sub % sym rep) form)
-                                      :else form))
-                          into-binds (vec (mapcat (fn [[s e]] [s (sub e alloc-sym 'buf__auto)]) other-pairs))
-                          into-exprs (map #(sub % alloc-sym 'buf__auto) body-exprs)
-                          into-template (list* 'let into-binds into-exprs)]
+                          ;; util depends on descriptors; reuse its scope engine
+                          ;; through late resolution rather than introducing a cycle.
+                          substitute (requiring-resolve 'raster.compiler.core.util/subst-syms)
+                          buffer-placeholder (gensym "buffer__")
+                          into-template (substitute
+                                         {alloc-sym buffer-placeholder}
+                                         (list* 'let* (vec (mapcat identity other-pairs)) body-exprs))]
                       {:allocates? true
+                       :auto-detected? true
                        :in-place-arg nil
                        :alloc-form (fn [args _opts]
-                                     (let [resolved-size (resolve-to-args (:size match) args)]
-                                       (if (:multi-arg? match)
-                                         (list (:ctor match)
-                                               (resolve-to-args (:ref-arg match) args)
-                                               resolved-size)
-                                         (list (:ctor match) resolved-size))))
+                                     (list (:ctor match) (resolve-to-args (:size match) args)))
                        ;; Rewrite: inline body with alloc replaced by buf
                        :rewrite-fn (fn [args buf-sym]
-                                     (let [smap (merge (zipmap params args) {'buf__auto buf-sym})]
-                                       (clojure.walk/postwalk
-                                        (fn [f] (if (and (symbol? f) (contains? smap f)) (get smap f) f))
-                                        into-template)))})))))))))))
+                                     (substitute (assoc (zipmap params args) buffer-placeholder buf-sym)
+                                                 into-template))}))))))))))))
 
 (defn resolve-buffer-semantics
   "Resolve the buffer facet, handling mangled/unqualified names.

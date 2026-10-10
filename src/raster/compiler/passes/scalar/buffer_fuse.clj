@@ -2,6 +2,7 @@
   "Buffer reuse pass: rewrite allocating ops to reuse dead buffers."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.ir.form :as form]
             [raster.analysis.memory :as ma]))
 
@@ -37,7 +38,7 @@
 
 (defn fuse-let
   "Fuse buffer allocations in a (let* [...] body) form."
-  [let-form & {:keys [dtype]}]
+  [let-form & {:keys [dtype param-env]}]
   (let [analysis (ma/analyze-sexp-let let-form)
         [_ bindings-vec & body-exprs] let-form
         pairs (vec (partition 2 bindings-vec))
@@ -52,7 +53,17 @@
             (let [head (call-head init)
                   resolved (when head (descriptor/resolve-buffer-semantics head))]
               (if-let [[entry _base-op] resolved]
-                (if (:allocates? entry)
+                (if (and (:allocates? entry)
+                         ;; Auto extraction substitutes actuals into multiple
+                         ;; fragments. Complex actuals need an evaluate-once SSA
+                         ;; prefix; do not duplicate or drop them here. Explicit
+                         ;; registered facets retain their independent authority.
+                         (or (not (:auto-detected? entry))
+                             (every? #(effects/replay-safe-value?
+                                       % (merge param-env
+                                                (zipmap (map first (take idx pairs))
+                                                        (repeat nil))))
+                                     (call-args init))))
                   (let [args (call-args init)
                         in-place-idx (:in-place-arg entry)]
                     (if (and in-place-idx
