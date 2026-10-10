@@ -1028,6 +1028,23 @@
         (contains? opts :scalar-math)
         (update :scalar-math numerics/validate-scalar-math-policy!)))))
 
+(defn- derive-invocation-layout
+  "Project immutable argument metadata only; never retain runtime admission or value liveness."
+  [in-tree donated]
+  (let [input-nodes (filterv #(= :input (:role %)) in-tree)]
+    {:in-nodes (into {} (map (juxt :key identity)) in-tree)
+     :input-nodes input-nodes
+     :input-keys (set (map :key input-nodes))
+     :donated-keys (set (keys donated))
+     :aggregate-groups (group-by :aggregate-binding (filter :aggregate-binding in-tree))}))
+
+(defn- invocation-layout-for
+  [artifact]
+  ;; Associating a different tree or copying retained metadata invalidates the exact-object seal.
+  ;; Such values derive their own layout instead of inheriting an old slot/role projection.
+  (or (when (sealed-artifact? artifact) (:invocation-layout artifact))
+      (derive-invocation-layout (:in-tree artifact) (:donated artifact))))
+
 (defn instantiate!
   "Instantiate one pure Prepared artifact as a callable Compiled value. All component plans have
    already been composed, so this performs one allocation/binding/graph-recording operation."
@@ -1041,6 +1058,10 @@
          {:keys [lowering in-tree out-tree donated schedule target descriptor args
                  preparation-report]} prepared
          evidence (get-in lowering [:certificate :effect-evidence])
+         ;; Caller-constructed Prepared metadata may contain mutable host maps. Issuing an
+         ;; exact Compiled seal cannot turn those containers into immutable compiler values.
+         invocation-layout (when (sealed-artifact? prepared)
+                             (derive-invocation-layout in-tree donated))
          executable (if (and (sealed-artifact? prepared)
                              (if caller-math-options
                                (link-plan/retained-effect-evidence? (:plan lowering) evidence caller-math-options)
@@ -1048,9 +1069,10 @@
                       (gpu-link/instantiate-certified! lowering opts)
                       (gpu-link/instantiate! (:plan lowering) opts))]
      (seal-artifact
-      (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
-                 preparation-report
-                 prepared nil (atom nil))))))
+      (assoc (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
+                         preparation-report
+                         prepared nil (atom nil))
+             :invocation-layout invocation-layout)))))
 
 (defn preparation-report
   "Return compact host-side template-cache and LinkPlan preparation facts for a Prepared or
@@ -1425,7 +1447,7 @@
    [] donated))
 
 (defn- project-aggregate-inputs
-  [in-tree inputs]
+  [aggregate-groups inputs]
   (reduce-kv
    (fn [inputs binding entries]
      (let [key (keyword (name binding))]
@@ -1450,7 +1472,7 @@
                        (map (fn [{:keys [aggregate-leaf] field-key :key}]
                               [field-key (materialization/aggregate-leaf (get inputs key) aggregate-leaf)]))
                        entries))))) inputs
-   (group-by :aggregate-binding (filter :aggregate-binding in-tree))))
+   aggregate-groups))
 
 (defn- preflight-inputs!
   [executable input-nodes inputs]
@@ -1498,12 +1520,10 @@
    donated inputs invalidated — never a mutation. Backend failures after preflight consume
    donations too: partially completed device writes cannot be rolled back."
   [^Compiled c inputs before-mutation! before-replay!]
-  (let [{:keys [executable in-tree out-tree donated target]} c
-        inputs (project-aggregate-inputs in-tree inputs)
-        in-nodes     (into {} (map (juxt :key identity)) in-tree)
-        input-nodes  (filterv #(= :input (:role %)) in-tree)
-        input-keys   (set (map :key input-nodes))
-        donated-keys (set (keys donated))
+  (let [{:keys [executable out-tree donated target]} c
+        {:keys [in-nodes input-nodes input-keys donated-keys aggregate-groups]}
+        (invocation-layout-for c)
+        inputs (project-aggregate-inputs aggregate-groups inputs)
         ;; 0. VALIDATE inputs: every passed key must be an :input-role param or a donated slot —
         ;;    never a :constant/:state key silently ignored (fail-loud, §7.7).
         _ (doseq [[k _v] inputs]
