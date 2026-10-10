@@ -367,6 +367,21 @@
       (is (thrown? clojure.lang.ExceptionInfo
                    (loop-call/validate-in-context! (assoc call :trip-count 4) buffers scalars scratch request)))
       (is (= prepared (program-call/validate! prepared request)))
+      (let [single (program-call/make program buffers
+                                     (assoc-in scalars ['steps :value] 1)
+                                     {} nil {} proof request)
+            plan (program-call/preparation-plan single :selected request)]
+        (is (= 1 (count (:entries plan))))
+        (is (= (:buffers (loop-call/iteration-binding (first (:steps single)) 0 request))
+               (:buffers (first (:entries plan)))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (program-call/preparation-plan single :selected)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (program-call/preparation-plan single :selected
+                                                    {:scalar-math {:overrides {}}})))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (program-call/preparation-plan
+                      (assoc-in single [:attributes :scalar-math] policy) :selected))))
       (is (= prepared (program-call/validate-with-retained-program! prepared proof request)))
       (is (= call (first (:steps prepared))))
       (is (= prepared (program-call/make program buffers scalars scratch nil {} nil request)))

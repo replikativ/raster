@@ -850,7 +850,7 @@
                   retained-validation caller-options))))
 
 (defn- loop-preparation-plan
-  [step execution-id step-index]
+  [step execution-id step-index caller-options]
   (when (and (get-in step [:scalars :iteration]) (> (:trip-count step) 1))
     (throw (ex-info
             "stage-once execution cannot freeze a changing loop induction scalar"
@@ -861,7 +861,7 @@
   ;; Do not materialize O(trip-count) variants for replay or memory planning.
   (reduce
    (fn [{:keys [bindings entries] :as state} iteration]
-     (let [{:keys [buffers scalar-values]} (loop-call/iteration-binding step iteration)
+     (let [{:keys [buffers scalar-values]} (loop-call/iteration-binding step iteration caller-options)
            binding [buffers scalar-values]]
        (if (contains? bindings binding)
          state
@@ -882,9 +882,12 @@
   "Independently validate and project the finite stage-once graph binding set and replay keys.
    This is pure compiler data, not driver preparation or allocation authority. Initial carry
    preservation may add a third variant to parity rotation; changing induction scalars remain
-   an explicit stage-once decline. Program-wide shape scalars remain available for sizing."
-  [call execution-id]
-  (let [call (validate! call)
+   an explicit stage-once decline. Program-wide shape scalars remain available for sizing.
+   Caller options are independent math consent, including for every loop binding variant;
+   the two-argument arity always requests the default policy."
+  ([call execution-id] (preparation-plan call execution-id nil))
+  ([call execution-id caller-options]
+  (let [call (validate! call caller-options)
         program-scalars (:scalar-values call)
         plan
         (reduce
@@ -898,11 +901,11 @@
                 :step-keys (assoc step-keys step-index key)})
              (loop-call/structured-loop-call? step)
              (let [{:keys [bindings] loop-entries :entries}
-                   (loop-preparation-plan step execution-id step-index)]
+                   (loop-preparation-plan step execution-id step-index caller-options)]
                {:entries (into entries loop-entries)
                 :step-keys (assoc step-keys step-index bindings)})))
          {:entries [] :step-keys {}}
          (map-indexed vector (:steps call)))]
     (update plan :entries
             (fn [entries]
-              (mapv #(update % :scalar-values (fn [local] (merge program-scalars local))) entries)))))
+              (mapv #(update % :scalar-values (fn [local] (merge program-scalars local))) entries))))))
