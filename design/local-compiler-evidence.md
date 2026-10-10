@@ -70,6 +70,16 @@ provenance is `/tmp/raster-wide-layer1-gradient-trace.clj` and
 `/tmp/raster-bound-layer1-ak-device-trace.clj`; these are local scratch scripts,
 not committed regression tests or portable acceptance artifacts.
 
+A same-input/cotangent layer-1 control additionally selected the existing
+Double-library/nearest-even-Float `exp` realization alongside `tanh`. It still
+fails two of fourteen adapter checks: Ak is 0.341881 and Ag is 0.0241663;
+input-gradient error is 0.00230993. It preserves all fourteen original CPU
+adapter gradients and the unchanged thresholds. This does not justify adding
+the `exp` override to the candidate: Ak worsens and the held full-model gate
+was not rerun. Runtime reporting now labels all 56 register-tiled admission
+records with the named widening policy; 101 generic records have no precision
+label. This is a local diagnostic, not whole-model or performance acceptance.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression
