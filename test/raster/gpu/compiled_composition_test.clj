@@ -19,6 +19,56 @@
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.value :as value]))
 
+(deftest static-invocation-layout-belongs-to-one-exact-artifact
+  (let [tree [{:key :x :node :x :role :input}
+              {:key :a :node :a :role :state}
+              {:key :weight :node :weight :role :constant}]
+        donated {:a :a-next}
+        layout (#'compiled/derive-invocation-layout tree donated)
+        artifact (#'compiled/seal-artifact
+                  (compiled/map->Compiled {:in-tree tree :donated donated
+                                           :invocation-layout layout}))
+        original @#'compiled/derive-invocation-layout
+        calls (atom 0)]
+    (with-redefs-fn {#'compiled/derive-invocation-layout
+                    (fn [& args] (swap! calls inc) (apply original args))}
+      (fn []
+        (is (identical? layout (#'compiled/invocation-layout-for artifact)))
+        (is (zero? @calls))
+        (let [changed (assoc-in artifact [:in-tree 0 :role] :constant)
+              changed-layout (#'compiled/invocation-layout-for changed)]
+          (is (= #{} (:input-keys changed-layout)))
+          (is (= 1 @calls)))
+        (let [changed (assoc artifact :donated {})
+              changed-layout (#'compiled/invocation-layout-for changed)]
+          (is (= #{} (:donated-keys changed-layout)))
+          (is (= 2 @calls)))
+        (is (= layout (#'compiled/invocation-layout-for
+                       (compiled/map->Compiled (into {} artifact)))))
+        (is (= 3 @calls))
+        (is (= layout (#'compiled/invocation-layout-for
+                       (compiled/map->Compiled {:in-tree tree :donated donated}))))
+        (is (= 4 @calls))))))
+
+(deftest caller-prepared-mutable-metadata-does-not-acquire-a-cached-layout
+  (let [entry (java.util.HashMap. {:key :x :node :x :role :input})
+        donated (java.util.HashMap.)
+        prepared (compiled/map->Prepared {:lowering {:plan ::plan}
+                                          :in-tree [entry] :donated donated})
+        issued (with-redefs [gpu-link/instantiate! (fn [plan opts]
+                                                    (is (= ::plan plan))
+                                                    (is (= {} opts))
+                                                    ::executable)]
+                 (compiled/instantiate! prepared))]
+    (is (#'compiled/sealed-artifact? issued))
+    (is (nil? (:invocation-layout issued)))
+    (is (= #{:x} (:input-keys (#'compiled/invocation-layout-for issued))))
+    (is (= #{} (:donated-keys (#'compiled/invocation-layout-for issued))))
+    (.put entry :role :constant)
+    (.put donated :a :a-next)
+    (is (= #{} (:input-keys (#'compiled/invocation-layout-for issued))))
+    (is (= #{:a} (:donated-keys (#'compiled/invocation-layout-for issued))))))
+
 (deftest invalid-later-donation-does-not-consume-earlier-adapter-or-write-inputs
   (let [buffer-a {:id :a :dtype :float :n-elements 4 :byte-size 16}
         buffer-b {:id :b :dtype :float :n-elements 4 :byte-size 16}
