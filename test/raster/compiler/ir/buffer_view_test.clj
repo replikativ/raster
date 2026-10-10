@@ -7,6 +7,33 @@
                     :device :ze:0 :alignment 64 :coherence :host-coherent
                     :ownership :owned}))
 
+(deftest contiguity-preserves-canonical-strides-and-fresh-validation
+  (doseq [shape [[] [1] [8] [2 3] [1 3 1] [0] [0 3] [2 0 3]]
+          strides [(view/dense-strides shape) (vec (repeat (count shape) 0))]
+          offset [0 16]]
+    (let [candidate (view/view allocation {:dtype :byte :shape shape
+                                          :strides strides :byte-offset offset})]
+      (is (= (= strides (view/dense-strides shape)) (view/contiguous? candidate))
+          (str "shape=" shape " strides=" strides " offset=" offset))))
+  (let [candidate (view/view allocation {:dtype :float :shape [2 3]})]
+    (doseq [changed [(assoc candidate :shape [-1 3])
+                     (assoc candidate :strides [1])
+                     (assoc candidate :byte-length 0)
+                     (assoc-in candidate [:allocation :byte-size] 0)]]
+      (is (thrown? clojure.lang.ExceptionInfo (view/contiguous? changed)))))
+  (doseq [shape [[Long/MAX_VALUE 2] [0 Long/MAX_VALUE 2]]]
+    ;; These strided views have a tiny/empty physical span. Canonical stride
+    ;; derivation nevertheless overflows, including after the first mismatch.
+    (let [candidate (view/view allocation {:dtype :byte :shape shape
+                                          :strides (vec (repeat (count shape) 0))})]
+      (is (thrown? ArithmeticException (view/dense-strides shape)))
+      (is (thrown? ArithmeticException (view/contiguous? candidate)))))
+  (let [shape [0 (inc (bigint Long/MAX_VALUE)) 2]
+        candidate (view/view allocation {:dtype :byte :shape shape :strides [0 2 1]})]
+    (is (= (= (:strides candidate) (view/dense-strides shape))
+           (view/contiguous? candidate))
+        "arbitrary-precision dimensions retain existing multiplication semantics")))
+
 (deftest bound-first-dimension-extents-are-not-storage-size-or-cached-facts
   (let [matrix (view/view allocation {:id :matrix :dtype :float :shape [4 8]})
         scalar (view/view allocation {:id :scalar :dtype :float :shape []})

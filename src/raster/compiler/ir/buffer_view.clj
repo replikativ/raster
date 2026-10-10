@@ -199,7 +199,14 @@
 (defn contiguous?
   [view]
   (let [{:keys [shape strides]} (validate-view! view)]
-    (= strides (dense-strides shape))))
+    ;; Compare existing vectors rather than constructing another dense stride vector.
+    ;; Still multiply every axis, including the unused outermost product, even after
+    ;; a mismatch: dense-strides' checked arithmetic is part of the existing contract.
+    (loop [axis (dec (count shape)) stride 1 matches? true]
+      (if (neg? axis)
+        matches?
+        (recur (dec axis) (* stride (nth shape axis))
+               (and matches? (= stride (nth strides axis))))))))
 
 (defn subtract-contiguous
   "Return portions of base untouched by cut; split fragments are one-dimensional typed views.
