@@ -4538,70 +4538,13 @@
 ;; carrier accepts) — never documentation, never a hardcoded op list.
 ;; ================================================================
 
-(def ^:private forward-neutral-namespaces
-  "Families without a Dual-dispatch contract. They may execute on inactive values,
-   but namespace membership is not evidence that an active call is carrier-safe."
-  #{"clojure.core" "raster.arrays"})
-
-(def ^:private forward-interop-namespaces
-  "JVM static-method namespaces: primitive interop calls cannot accept a
-  Dual, so their presence in a body makes forward mode inadmissible."
-  #{"Math" "java.lang.Math" "StrictMath" "java.lang.StrictMath"})
-
 (defn- dual-tag?
-  "True if a dispatch tag denotes the Dual carrier (short `Dual` for explicit
-  overloads, fully qualified `raster.ad.forward.Dual` for auto-specialized
-  parametric entries). Dual__Sym etc. do NOT count — they are other carriers."
+  "Use resolved type identity, never a basename shared with a foreign Dual."
   [tag]
-  (cond
-    (symbol? tag) (= "Dual" (peek (str/split (name tag) #"\.")))
-    (class? tag) (= "Dual" (.getSimpleName ^Class tag))
-    :else false))
-
-(defn- dual-lift?
-  "True when a deftm generic var can accept a Dual argument: an explicit
-  Dual overload in its dispatch table, or a parametric (All [T]) template
-  with a bare type-var param (auto-specializes for Dual on first dispatch,
-  e.g. raster.sci.special/sinc)."
-  [v qualified-op]
-  (or (when-let [dt (:raster.core/dispatch-table (meta v))]
-        (boolean (some (fn [entry] (some dual-tag? (:tags entry)))
-                       (mapcat val @dt))))
-      (boolean (some (fn [entry]
-                       (some #(contains? (:type-vars entry) %)
-                             (:annotations entry)))
-                     (get @dispatch/parametric-registry qualified-op)))))
-
-(defn- forward-op-status
-  "Classify one op head for execution on the Dual carrier.
-  Returns :covered, :neutral (never carries a Dual), or :uncovered."
-  [op-sym]
-  (let [ns-str (namespace op-sym)
-        nm (name op-sym)]
-    (cond
-      ;; Unqualified heads: special forms, binders, locals, constructors,
-      ;; interop field/method access (.v/.partials/...) — structural, not
-      ;; Dual-carrying calls (the walk qualifies every deftm call head).
-      (nil? ns-str) :neutral
-
-      ;; JVM static interop (Math/tan ...) — no Dual lift is possible.
-      (contains? forward-interop-namespaces ns-str) :uncovered
-
-      (contains? forward-neutral-namespaces ns-str) :neutral
-
-      :else
-      (let [base (mangled/extract-deftm-base
-                  (symbol ns-str (mangled/strip-impl-suffix nm)))
-            v (try (resolve base) (catch Exception _ nil))]
-        (cond
-          (nil? v) :neutral
-          ;; deftm generic (dispatch table or parametric template): the
-          ;; registry decides whether the Dual carrier is accepted.
-          (or (:raster.core/dispatch-table (meta v))
-              (contains? @dispatch/parametric-registry base))
-          (if (dual-lift? v base) :covered :uncovered)
-          ;; Plain var (defn helper, constant) — not carrier-dispatched.
-          :else :neutral)))))
+  (let [carrier (types/tag->check-class 'raster.ad.forward.Dual)]
+    (and (not= Object carrier)
+         (or (symbol? tag) (class? tag) (types/compound-tag? tag))
+         (= carrier (if (class? tag) tag (types/tag->check-class tag))))))
 
 (def ^:private array-param-tags
   '#{doubles floats ints longs shorts bytes booleans chars objects})
@@ -4609,13 +4552,21 @@
 (defn- forward-conversion-plan
   "One lexical Dual preparation: retain conversions and admit potentially active calls.
    Adapt only certified Double identities. Seed dependence is conservative, not proof
-   that a dependent result is Dual-valued. Only established discrete primitive types
-   certify carrier-free values; unknown and Object tags do not."
-  [body params tags source-ns]
+   that a dependent result is Dual-valued. Propagate selected result/carrier facts
+   separately from primal type tags; unknown and Object results prove nothing."
+  ([body params tags source-ns]
+   (forward-conversion-plan body params tags source-ns {}))
+  ([body params tags source-ns {:keys [validate-only? validation-state]}]
   (let [declines (volatile! []) call-declines (volatile! [])
-        initial-types (into {} (map (fn [p tag] [p {:tag tag}]) params tags))
+        validation-state (or validation-state {:visiting (volatile! #{}) :remaining (volatile! 128)})
+        initial-types (into {} (map (fn [p tag]
+                                     [p {:tag tag
+                                         :carriers #{(if (and (not validate-only?)
+                                                             (= :scalar (:kind (tangent/tangent-kind tag))))
+                                                       'raster.ad.forward.Dual tag)}}]) params tags))
         initial-active (set (keep (fn [[p tag]]
-                                   (when (= :scalar (:kind (tangent/tangent-kind tag))) p))
+                                   (when (if validate-only? (dual-tag? tag)
+                                             (= :scalar (:kind (tangent/tangent-kind tag)))) p))
                                  (map vector params tags)))]
     (letfn [(dependent? [expr active]
               (binding [util/*shadowing-locals* (into util/*shadowing-locals* active)]
@@ -4625,10 +4576,188 @@
                 (:tag (get env expr))
                 (or (types/sym-type-tag expr)
                     (inf/infer-expr-tag expr env source-ns))))
+            (join-carriers [facts]
+              (let [joined (apply set/union #{} facts)]
+                (if (or (empty? joined) (contains? joined nil)) #{nil} joined)))
+            (tag-fact
+              ([tag] (tag-fact tag source-ns))
+              ([tag defining-ns]
+               (binding [*ns* defining-ns]
+                 (let [cls (when (or (symbol? tag) (class? tag) (types/compound-tag? tag))
+                             (if (class? tag) tag (types/tag->check-class tag)))]
+                   #{(cond (dual-tag? tag) 'raster.ad.forward.Dual
+                           (or (nil? cls) (= Object cls)) nil
+                           (types/compound-tag? tag)
+                           (apply list (symbol (.getName ^Class cls))
+                                  (types/compound-tag-params tag))
+                           (or (dtype/dtype-for-scalar-tag tag)
+                               (contains? types/primitive-array-tags tag)) tag
+                           :else (symbol (.getName ^Class cls)))}))))
+            (tuples [facts]
+              ;; Bound the product, not just the number of alternatives per operand.
+              ;; An unknown or oversized product is a decline, never one guessed tuple.
+              (when (and (every? #(and (seq %) (not (contains? % nil))) facts)
+                         (<= (reduce *' 1 (map count facts)) 64))
+                (reduce (fn [rows choices]
+                          (vec (for [row rows choice choices] (conj row choice))))
+                        [[]] facts)))
+            (signature [operation tuple]
+              (when (symbol? operation)
+                (binding [*ns* source-ns]
+                  (let [query #(dispatch/selected-call-signature
+                                operation tuple (inf/registered-call-selection operation tuple))
+                        selected (query)
+                        selected (if (= :parametric (:selection selected))
+                                   (try
+                                     ;; A declared signature is applicability, not successful
+                                     ;; compilation. Materialize through the existing compiler
+                                     ;; callback, without invoking the callee or faking values.
+                                     (dispatch/register-parametric-call-tags! operation tuple)
+                                     (let [published (query)]
+                                       (if (= :registered (:selection published)) published
+                                           {:failure {:reason :unpublished-carrier-specialization}}))
+                                     (catch clojure.lang.ExceptionInfo e
+                                       (util/rethrow-compiler-invariant! e)
+                                       {:failure {:message (.getMessage e) :data (ex-data e)}}))
+                                   selected)
+                        carrier? (some dual-tag? tuple)
+                        dual-contract? (some dual-tag? (:tags selected))
+                        casts (:promotion-casts selected)]
+                    (cond
+                      (:failure selected) selected
+                      (and selected (or (not carrier?) dual-contract?)
+                           (not-any? true? (map (fn [tag cast] (and (dual-tag? tag) (some? cast)))
+                                                tuple (or casts (repeat nil)))))
+                      (if (and carrier? (:parametric-provenance selected))
+                        (let [key [(:mangled-sym selected) tuple]
+                              visiting (:visiting validation-state)
+                              remaining (:remaining validation-state)]
+                          (cond
+                            (contains? @visiting key)
+                            {:failure {:reason :recursive-carrier-specialization :implementation (first key)}}
+                            (not (pos? @remaining))
+                            {:failure {:reason :carrier-validation-budget}}
+                            :else
+                            (do
+                              (vswap! remaining dec)
+                              (vswap! visiting conj key)
+                              (try
+                                (let [v (resolve (:mangled-sym selected))
+                                      m (meta v)
+                                      retained (when v (rcore/ensure-walked-body! v))
+                                      ps (:raster.core/deftm-params m)
+                                      ts (:raster.core/deftm-tags m)
+                                      ns' (some-> (:raster.core/deftm-source-ns m) find-ns)]
+                                  (if (and (seq retained) ns' (= (count tuple) (count ps) (count ts)))
+                                    (let [plan (forward-conversion-plan
+                                                (first retained) ps
+                                                (mapv (fn [tag cast] (or cast tag))
+                                                      tuple (or casts (repeat nil))) ns'
+                                                {:validate-only? true :validation-state validation-state})]
+                                      (if (and (empty? (:declines plan)) (empty? (:call-declines plan)))
+                                        selected
+                                        {:failure {:reason :unsupported-carrier-specialization
+                                                   :implementation (:mangled-sym selected)
+                                                   :conversion-declines (:declines plan)
+                                                   :call-declines (:call-declines plan)}}))
+                                    {:failure {:reason :missing-carrier-specialization-body}}))
+                                (finally (vswap! visiting disj key))))))
+                        selected)
+
+                      :else nil)))))
+            (call-facts [expr env active]
+              (let [{:keys [operation arguments dispatch? recorded-op]} (op/call-description expr)
+                    facts (mapv #(carrier-tags % env active) arguments)
+                    rows (tuples facts)
+                    signatures (when (and rows (or (not dispatch?) recorded-op))
+                                 (mapv #(signature operation %) rows))]
+                {:facts facts :tuples rows :signatures signatures
+                 :result (if (and (seq signatures)
+                                  (every? #(and % (not (:failure %))) signatures))
+                           (join-carriers
+                            (map (fn [selected]
+                                   (tag-fact (:return-tag selected)
+                                             (or (some-> (:mangled-sym selected) namespace symbol find-ns)
+                                                 source-ns))) signatures))
+                           #{nil})}))
+            (bind-carriers [env active binders inits sequential?]
+              (reduce (fn [[e a] [binder init]]
+                        (let [ie (if sequential? e env) ia (if sequential? a active)]
+                          [(assoc e binder {:tag (or (types/sym-type-tag binder) (tag-of init ie))
+                                            :carriers (carrier-tags init ie ia)})
+                           ((if (dependent? init ia) conj disj) a binder)]))
+                      [env active] (map vector binders inits)))
+            (loop-carriers [expr env active]
+              (let [parsed (try (parse-loop-form expr)
+                                (catch clojure.lang.ExceptionInfo _ nil))]
+                (if parsed
+                  (let [{:keys [loop-syms recur-args recur-bindings]} parsed]
+                  (loop [e env round 0]
+                    (let [[recur-env recur-active]
+                          (bind-carriers e active (mapv first recur-bindings)
+                                         (mapv second recur-bindings) true)
+                          updates (mapv #(carrier-tags % recur-env recur-active) recur-args)
+                          e' (reduce (fn [acc [sym fact]]
+                                       (assoc-in acc [sym :carriers]
+                                                 (join-carriers [(get-in e [sym :carriers] #{nil}) fact])))
+                                     e (map vector loop-syms updates))]
+                      (cond (= e e') e
+                            (< round 8) (recur e' (inc round))
+                            :else (reduce #(assoc-in %1 [%2 :carriers] #{nil}) e loop-syms)))))
+                  (reduce #(assoc-in %1 [%2 :carriers] #{nil}) env (map first (partition 2 (second expr)))))))
+            (carrier-tags [expr env active]
+              (cond
+                (and (symbol? expr) (contains? env expr)) (get-in env [expr :carriers] #{nil})
+                (not (seq? expr)) (tag-fact (tag-of expr env))
+                (= 'quote (first expr)) #{nil}
+                (= :branch (:kind (form/form-info expr)))
+                (join-carriers (map #(carrier-tags % env active) (drop 2 expr)))
+                (= 'do (first expr)) (carrier-tags (last expr) env active)
+                :else
+                (if-let [{:keys [scopes sequential? rec?]} (form/scope-info expr)]
+                  (if (or rec? (= :lambda (:kind (form/form-info expr))))
+                    #{nil}
+                    (join-carriers
+                     (map (fn [{:keys [binders inits body]}]
+                            (let [[e a] (bind-carriers env active binders inits sequential?)
+                                  e (reduce #(assoc %1 %2 {:tag nil :carriers #{nil}})
+                                            e (drop (count inits) binders))
+                                  e (if (= :scope (:kind (form/form-info expr)))
+                                      (loop-carriers expr e a) e)]
+                              (if (= :scope (:kind (form/form-info expr)))
+                                (if-let [parsed (try (parse-loop-form expr)
+                                                     (catch clojure.lang.ExceptionInfo _ nil))]
+                                  (carrier-tags (:result-expr parsed) e a)
+                                  #{nil})
+                                (carrier-tags (last body) e a)))) scopes)))
+                  (let [{:keys [semantic-op arguments implementation-op]} (op/call-description expr)]
+                    (cond
+                      (op/cast-op? semantic-op)
+                      (if (and (= 1 (count arguments))
+                               (= :double (some-> semantic-op op/cast-result-tag dtype/dtype-for-scalar-tag))
+                               (dependent? (first arguments) active))
+                        (carrier-tags (first arguments) env active)
+                        (tag-fact (op/cast-result-tag semantic-op)))
+                      :else
+                      (let [{:keys [result facts]} (call-facts expr env active)
+                            carrier-call? (or (some #(some dual-tag? %) facts)
+                                              (some true? (map (fn [fact arg]
+                                                                 (and (contains? fact nil)
+                                                                      (dependent? arg active)))
+                                                               facts arguments))
+                                              (dependent? implementation-op active))]
+                        (if (= #{nil} result)
+                          ;; Primal source inference is never a result witness for a
+                          ;; carrier call. It remains usable for inactive expressions.
+                          (if carrier-call? #{nil}
+                              (tag-fact (or (tag-of expr env)
+                                            (binding [*ns* source-ns]
+                                              (inf/infer-rewritten-tag expr nil env)))))
+                          result)))))))
             (carrier-dependent? [expr env active]
-              (and (dependent? expr active)
-                   (not (when-let [dt (dtype/dtype-for-scalar-tag (tag-of expr env))]
-                          (dtype/integral? dt)))))
+              (let [facts (carrier-tags expr env active)]
+                (or (some dual-tag? facts)
+                    (and (contains? facts nil) (dependent? expr active)))))
             (go [expr env active]
               (cond
                 (and (seq? expr) (= 'quote (first expr))) expr
@@ -4649,7 +4778,8 @@
                                           tag (or (types/sym-type-tag binder)
                                                   (tag-of init init-env))
                                           dep? (dependent? init init-active)]
-                                      [(assoc e binder {:tag tag})
+                                      [(assoc e binder {:tag tag
+                                                        :carriers (carrier-tags init init-env init-active)})
                                        ((if dep? conj disj) a binder)
                                        (conj transformed transformed-init)]))
                                   [(if rec? (reduce #(assoc %1 %2 {:tag (types/sym-type-tag %2)}) env binders) env)
@@ -4676,7 +4806,8 @@
                                  ;; A recurrence initializer is not an invariant type witness.
                                  ;; Invalidate it for active carries, including retained symbol
                                  ;; tags, while preserving proven inactive integer counters.
-                                 env' (reduce #(assoc %1 %2 {:tag nil}) env' carry-activity)]
+                                 env' (reduce #(assoc-in %1 [%2 :tag] nil) env' carry-activity)
+                                 env' (if recurrence? (loop-carriers expr env' active') env')]
                              (assoc region :inits inits'
                                     :body (mapv #(go % env' active') body)))) scopes)]
                     (rebuild scopes' (mapv #(go % env active) outer)))
@@ -4694,7 +4825,7 @@
                                                         (case (op/cast-integral-narrowing semantic-op)
                                                           :wrap :wrap :trap)))
                             adapted-operand (go operand env active)]
-                        (if (and (= :double source target) (= [:exact :exact] policy))
+                        (if (and (not validate-only?) (= :double source target) (= [:exact :exact] policy))
                           (with-meta (list 'raster.ad.forward/identity-double-conversion adapted-operand)
                             (meta expr))
                           (do (vswap! declines conj
@@ -4710,16 +4841,23 @@
                           (let [active-arguments (vec (keep-indexed
                                                        (fn [i arg]
                                                          (when (carrier-dependent? arg env active) i)) args))
-                                active-callee? (dependent? implementation active)]
+                                active-callee? (dependent? implementation active)
+                                evidence (call-facts expr env active)
+                                admissible-tuples? (and (seq (:tuples evidence))
+                                                        (every? #(and % (not (:failure %)))
+                                                                (:signatures evidence)))]
                             (when (and (or (seq active-arguments) active-callee?)
                                        (not (and (not active-callee?)
                                                  (or (not dispatch?) recorded)
                                                  (symbol? operation)
-                                                 (= :covered (forward-op-status operation)))))
+                                                 admissible-tuples?)))
                               (vswap! call-declines conj
                                       {:reason :unsupported-forward-call :operation operation
                                        :implementation implementation
                                        :active-argument-indices active-arguments
+                                       :argument-carriers (:facts evidence)
+                                       :argument-tuples (:tuples evidence)
+                                       :signature-failures (vec (keep :failure (:signatures evidence)))
                                        :active-callee? active-callee? :form expr}))))
                         (with-meta (apply list (map #(go % env active) expr)) (meta expr))))))
                 (vector? expr) (with-meta (mapv #(go % env active) expr) (meta expr))
@@ -4729,7 +4867,7 @@
                 (set? expr) (with-meta (into (empty expr) (map #(go % env active)) expr) (meta expr))
                 :else expr))]
       {:body (go body initial-types initial-active)
-       :declines @declines :call-declines @call-declines})))
+       :declines @declines :call-declines @call-declines}))))
 
 (defn- forward-preparation
   "Queryable Dual-carrier coverage for a deftm var (framework §4a/§11).
@@ -4784,7 +4922,10 @@
 (defn forward-coverage
   "Queryable Dual-carrier admission derived from the retained body and compiler
    type/conversion contracts. Includes uncovered ops, conversion declines,
-   array parameters, and scalar tangent/constant parameter classification."
+   array parameters, and scalar tangent/constant parameter classification.
+   May materialize applicable generic specializations through the compiler;
+   never invokes helpers. Derived bodies are validated with actual carrier facts,
+   while existing explicit Dual overloads remain trusted declared contracts."
   [f-var]
   (:coverage (forward-preparation f-var)))
 

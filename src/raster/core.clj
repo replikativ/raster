@@ -1626,6 +1626,9 @@
         body-with-types (clojure.walk/postwalk
                          (fn [x] (if (symbol? x) (subst x) x))
                          body)
+        ;; Templates retain one expression (multiple source forms are already do).
+        ;; A symbol, literal or vector is a body, not a sequence of body forms.
+        body-forms [body-with-types]
         ;; Compute tags and mangled name
         tags (mapv #(types/annotation->tag %1 %2) concrete-anns params)
         ret-tag (or (types/annotation->tag concrete-ret nil) 'Object)
@@ -1637,8 +1640,7 @@
         typed-iface-name (symbol (.getName ^Class (:iface-class iface-info)))
         ;; Run TC on the specialized body for binding type inference —
         ;; same as prepare-typed-body does for normal deftm
-        tc-binding-tags (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
-                          (inf/safe-tc-binding-tags fn-name params concrete-anns body-vec source-ns))
+        tc-binding-tags (inf/safe-tc-binding-tags fn-name params concrete-anns body-forms source-ns)
         ;; Walk the body — same as deftm macro does
         type-env (build-walker-type-env params concrete-anns)
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} type-env)
@@ -1648,9 +1650,7 @@
                     ;; element dtype so contextual literal typing (B) can narrow an
                     ;; untyped floating literal to it. Only float/double matter.
                     (#{'float 'double} elem-prim) (assoc :element-dtype (keyword (str elem-prim))))
-        walked-body (vec (map #(walker/walk-body % walk-opts) (if (seq? body-with-types)
-                                                                [body-with-types]
-                                                                body-with-types)))
+        walked-body (mapv #(walker/walk-body % walk-opts) body-forms)
         ;; Collect defvalue forms for parametric value types
         body-str (str body)
         ann-str (str annotations)

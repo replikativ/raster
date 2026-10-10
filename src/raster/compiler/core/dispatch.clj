@@ -343,6 +343,11 @@
 
 (declare try-parametric-dispatch)
 
+(defn parametric-priority?
+  "Runtime template selection precedes only an absent method or all-Object fallback."
+  [entry]
+  (or (nil? entry) (every? #(= 'Object %) (:tags entry))))
+
 (defn- dispatch-arity
   [fn-name methods a0 a1 a2 a3 args n dispatch-table dispatch-var]
   (loop [ms (seq methods)]
@@ -403,7 +408,7 @@
               ;; Try parametric dispatch before generic Object catch-all.
               ;; When the only match is [Object, Object, ...], a parametric template
               ;; (e.g., [Dual, Dual] with All [T]) may provide a more specific method.
-              (and dispatch-var (every? #(= 'Object %) (:tags m)))
+              (and dispatch-var (parametric-priority? m))
               (let [full-args (case n 0 [] 1 [a0] 2 [a0 a1] 3 [a0 a1 a2]
                                     4 [a0 a1 a2 a3] (vec args))
                     qname (let [mv (meta dispatch-var)]
@@ -1105,7 +1110,7 @@
   (cond
     ;; Bare T at top level → scalar TC type (Double, Float)
     (and (symbol? annotation) (contains? bindings annotation))
-    (get element->scalar-tag (get bindings annotation) annotation)
+    (get element->scalar-tag (get bindings annotation) (get bindings annotation))
 
     ;; Compound: recurse with RAW substitution to keep element types
     (vector? annotation)
@@ -1195,7 +1200,7 @@
         arg-tags  (vec arg-tags)]
     (when (seq templates)
       (keep
-       (fn [{:keys [type-var-list annotations ret-annotation]}]
+       (fn [{:keys [type-var-list annotations ret-annotation] :as template}]
          (when (= (count annotations) (count arg-tags))
            (let [tvs (set type-var-list)
                  bindings
@@ -1211,7 +1216,7 @@
                         (merge acc b))))
                   {} (map vector annotations arg-tags))]
              (when (and bindings (every? #(contains? bindings %) tvs))
-               {:bindings bindings
+               {:template template :bindings bindings
                 :return-tag (when ret-annotation
                               (types/annotation->tag
                                (substitute-type-var ret-annotation bindings) nil))}))))
@@ -1223,7 +1228,32 @@
    A matching signature may have a nil :return-tag when no result is declared;
    that is distinct from no applicable signature (nil)."
   [op arg-tags]
-  (first (parametric-call-signatures op arg-tags)))
+  (some-> (first (parametric-call-signatures op arg-tags))
+          (select-keys [:bindings :return-tag])))
+
+(declare parametric-register)
+
+(defn register-parametric-call-tags!
+  "Materialize the first applicable declared signature from established tag facts.
+   Uses the existing non-invoking register callback, with no synthetic arguments.
+   This is compiler work (and may fail), not a pure signature query."
+  [op arg-tags]
+  (when-let [{:keys [template bindings]} (first (parametric-call-signatures op arg-tags))]
+    (@parametric-register (op->parametric-qname op) template bindings [])))
+
+(defn selected-call-signature
+  "Project scalar call evidence using runtime's existing template priority.
+   `selection` contains registered :tags and optional :signature from inference.
+   An unprojectable selected method still blocks unrelated template evidence.
+   Applicability alone is not proof that carrier specialization will compile."
+  [op arg-tags selection]
+  (when-let [v (and (symbol? op) (resolve op))]
+    (when (:raster.core/dispatch-table (meta v))
+      (if-let [parametric (when (parametric-priority? selection)
+                           (parametric-call-signature op arg-tags))]
+        (assoc parametric :selection :parametric)
+        (when-let [registered (:signature selection)]
+          (assoc registered :selection :registered))))))
 
 (defn signature-result-tag
   "Derive a result tag from the applicable declared parametric signature.

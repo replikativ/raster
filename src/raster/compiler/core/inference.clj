@@ -933,8 +933,23 @@ stable physical-leaf order on every backend."}
                  :typed-iface (:typed-iface entry)
                  :has-fn-params (boolean (:raster.core/has-fn-params (meta resolved)))
                  :return-tag (:raster.core/return-tag (meta resolved))}
+          (contains? (:warning-meta entry) :raster.compiler.core.dispatch/parametric-bindings)
+          (assoc :parametric-provenance
+                 (select-keys (:warning-meta entry)
+                              [:raster.compiler.core.dispatch/parametric-bindings
+                               :raster.compiler.core.dispatch/parametric-annotations]))
           (and casts (some some? casts))
           (assoc :promotion-casts casts))))))
+
+(defn registered-call-selection
+  "Retain selected method priority even if implementation evidence is unavailable.
+   Never invokes or specializes the method."
+  [fn-sym arg-tags]
+  (when (and (symbol? fn-sym) (every? some? arg-tags))
+    (when-let [table (get-dispatch-table fn-sym)]
+      (when-let [selected (resolve-method-entry table (vec arg-tags))]
+        {:tags (get-in selected [:entry :tags])
+         :signature (method-signature fn-sym selected)}))))
 
 (defn registered-call-signature
   "Query existing compiler dispatch selection for an exact argument-tag tuple.
@@ -942,9 +957,7 @@ stable physical-leaf order on every backend."}
    Requires known tags; unlike try-resolve-call, never synthesizes arguments or
    specializes a parametric template. A nil result is not evidence of safety."
   [fn-sym arg-tags]
-  (when (and (symbol? fn-sym) (every? some? arg-tags))
-    (when-let [table (get-dispatch-table fn-sym)]
-      (method-signature fn-sym (resolve-method-entry table (vec arg-tags))))))
+  (:signature (registered-call-selection fn-sym arg-tags)))
 
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
