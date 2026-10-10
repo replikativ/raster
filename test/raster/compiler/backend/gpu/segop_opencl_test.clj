@@ -1083,8 +1083,8 @@
     (testing "checked integral casts are not reinterpreted as wrap or saturation"
       (is (= :checked-scalar-cast (:missing-rule (decline '(int scale)))))
       (is (= :checked-scalar-cast (:missing-rule (decline '(byte 128))))))
-    (testing "integral value arithmetic waits for an explicit overflow contract"
-      (is (= :integral-scalar-arithmetic
+    (testing "integral value arithmetic cannot become a floating element implicitly"
+      (is (= :element-result-dtype
              (:missing-rule
               (decline (with-meta '(+ counter 1) {:raster.type/tag 'long}))))))
     (testing "literal and expression results cannot be silently narrowed to the accumulator"

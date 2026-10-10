@@ -28,24 +28,24 @@
 (def dtype-info
   {:double {:native {:c "double" :opencl "double" :glsl "double"}
             :scalar-tag 'double :array-tag 'doubles :vt :f64 :needs-pragma :cl_khr_fp64 :fp? true
-            :bytes 8 :jvm-array-class-name "[D" :aliases #{:float64 :f64}}
+            :bytes 8 :jvm-array-class-name "[D" :jvm-array-constructor 'clojure.core/double-array :aliases #{:float64 :f64}}
    :float  {:native {:c "float" :opencl "float" :glsl "float"}
             :scalar-tag 'float :array-tag 'floats :vt :f32 :needs-pragma nil :fp? true
-            :bytes 4 :jvm-array-class-name "[F" :aliases #{:float32 :f32}}
+            :bytes 4 :jvm-array-class-name "[F" :jvm-array-constructor 'clojure.core/float-array :aliases #{:float32 :f32}}
    :half   {:native {:c "_Float16" :opencl "half" :glsl "float16_t"}
             :scalar-tag nil :array-tag 'shorts :vt :f16 :needs-pragma :cl_khr_fp16 :fp? true
-            :bytes 2 :jvm-array-class-name "[S" :aliases #{:float16 :f16}}
+            :bytes 2 :jvm-array-class-name "[S" :jvm-array-constructor 'clojure.core/short-array :aliases #{:float16 :f16}}
    :int    {:native {:c "int" :opencl "int" :glsl "int"}
             :scalar-tag 'int :array-tag 'ints :vt :i32 :needs-pragma nil :fp? false
-            :bytes 4 :jvm-array-class-name "[I" :aliases #{:int32 :i32}
+            :bytes 4 :jvm-array-class-name "[I" :jvm-array-constructor 'clojure.core/int-array :aliases #{:int32 :i32}
             :limits {:min Integer/MIN_VALUE :max Integer/MAX_VALUE}}
    :long   {:native {:c "long long" :opencl "long" :glsl "int"}
             :scalar-tag 'long :array-tag 'longs :vt :i64 :needs-pragma nil :fp? false
-            :bytes 8 :jvm-array-class-name "[J" :aliases #{:int64 :i64}
+            :bytes 8 :jvm-array-class-name "[J" :jvm-array-constructor 'clojure.core/long-array :aliases #{:int64 :i64}
             :limits {:min Long/MIN_VALUE :max Long/MAX_VALUE}}
    :byte   {:native {:c "int8_t" :opencl "char" :glsl "int"}
             :scalar-tag 'byte :array-tag 'bytes :vt :i32 :needs-pragma nil :fp? false
-            :bytes 1 :jvm-array-class-name "[B" :aliases #{:int8 :i8}
+            :bytes 1 :jvm-array-class-name "[B" :jvm-array-constructor 'clojure.core/byte-array :aliases #{:int8 :i8}
             :limits {:min Byte/MIN_VALUE :max Byte/MAX_VALUE}}})
 
 (def ^:private alias->canonical
@@ -78,6 +78,11 @@
                       {:reason :no-native-type :dtype dt :backend backend}))))
 
 (defn bytes-of "Width of one element in bytes. Throws on unknown." [dt] (:bytes (info dt)))
+
+(defn jvm-array-constructor
+  "Qualified primitive storage constructor for a dtype, including packed half storage."
+  [dt]
+  (:jvm-array-constructor (info dt)))
 
 (defn integral? "True for integer dtypes (the widening-accumulator side of a dtype pair)."
   [dt] (not (:fp? (info dt))))

@@ -521,7 +521,7 @@
                                           (= 'clojure.core/aget (first %))) %)
                               (tree-seq coll? seq (:form result)))]
         (is invocation)
-        (is (= '[a (float-array 1) scale n] (nth invocation 3)))
+        (is (= '[a (clojure.core/float-array 1) scale n] (nth invocation 3)))
         (is (= [:block-local :cross-block]
                (mapv #(get-in % [:operation :attributes :phase]) (:nodes graph))))
         (is (= 1 (count (:temporaries graph))))

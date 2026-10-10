@@ -135,9 +135,9 @@
                 "scalar SegRed emission cannot silently replace its semantic output identity"
                 {:operation (:id segred) :semantic-output (first outputs)
                  :requested-output out-sym}))
-    (when-not (contains? #{:float :double} accumulator-dtype)
+    (when-not (contains? #{:int :long :float :double} accumulator-dtype)
       (decline! :uniform-scalar-storage
-                "portable scalar SegRed supports FP32 or FP64 storage and accumulation"
+                "portable scalar SegRed supports int32, int64, FP32 or FP64 storage and accumulation"
                 {:operation (:id segred) :accumulator-dtype accumulator-dtype}))
     (when-not (and (= accumulator-dtype (dtype/canon (:dtype segred)))
                    (or (= accumulator-dtype output-type)
@@ -275,7 +275,7 @@
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
     {:operator operator :combine (:combine derived)
      :identity (constant/literal-or-original init) :element element
-     :numerical-policy (select-keys derived [:nan-policy :signed-zero-policy])
+     :numerical-policy (select-keys derived [:overflow :nan-policy :signed-zero-policy])
      :accumulator acc}))
 
 (defn- reduction-combine-expression
@@ -284,8 +284,17 @@
   C-family fmin/fmax implement the required signed-zero tie but suppress a single NaN. The
   explicit selects restore Raster/Math NaN propagation before the target intrinsic is reached."
   [operator dtype left right numerical-policy]
-  (let [base (body/scalar-expression operator dtype [left right])]
-    (if (contains? #{:min :max} operator)
+  (let [integral? (dtype/integral? dtype)
+        options (if (and integral? (contains? #{:+ :*} operator))
+                  (do
+                    (when-not (= :wrap (:overflow numerical-policy))
+                      (decline! :integral-overflow-algebra
+                                "parallel integral reduction requires a certified wrapping combine"
+                                {:operator operator :dtype dtype :numerical-policy numerical-policy}))
+                    {:overflow :wrap})
+                  {})
+        base (body/scalar-expression operator dtype [left right] options)]
+    (if (and (not integral?) (contains? #{:min :max} operator))
       (let [expected {:nan-policy :propagate
                       :signed-zero-policy (if (= :min operator)
                                             :prefer-negative :prefer-positive)}]
@@ -414,15 +423,12 @@
       (when (and intrinsic (not= :cmp (:kind intrinsic))
                  (not (descriptor/cast-op? operation))
                  (not (dialect/scalar-convert-form? value)))
+        ;; The shared scalar lowerer retains wrapping/checked/range-proved arithmetic. Target
+        ;; emission still rejects an unsupported trap; this adapter must not erase the policy.
         (when-not (or result-dtype (and outer-declared? (identical? value expression)))
           (decline! :scalar-result-dtype
                     "scalar arithmetic requires its retained walker/TypedClojure result dtype"
-                    {:expression value :operator (intrinsics/canonical operation)}))
-        (when (and result-dtype (dtype/integral? result-dtype))
-          (decline! :integral-scalar-arithmetic
-                    "portable reduction value arithmetic requires an executable overflow contract"
-                    {:expression value :operator (intrinsics/canonical operation)
-                     :result-dtype result-dtype})))))
+                    {:expression value :operator (intrinsics/canonical operation)})))))
   expression)
 
 (defn lower-element-operations
@@ -504,7 +510,8 @@
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
-   accumulator remain uniform; integral scalar parameters may participate in index expressions."
+   accumulator remain uniform (int32/int64/FP32/FP64). Integral combines retain their certified
+   wrapping policy; integral scalar parameters may also participate in index expressions."
   [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof scalar-math]
                      :or {dtype :double array-types {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region
@@ -524,7 +531,7 @@
         array-dtype (fn [id] (or (get array-types id)
                                  (get array-types (symbol (name id))) dtype))
         bound-dimension '_n_bound
-        _ (when-not (and (contains? #{:float :double} (dtype/canon dtype))
+        _ (when-not (and (contains? #{:int :long :float :double} (dtype/canon dtype))
                          (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
                          (every? #(= (dtype/canon dtype) (dtype/canon (array-dtype %))) arrays)
@@ -745,6 +752,7 @@
     {:kernel-body kernel-body
      :operator operator
      :identity identity
+     :numerical-policy numerical-policy
      :arrays arrays
      :scalars scalars
      :output output
@@ -776,7 +784,7 @@
   ([segred options]
    (schedule segred nil options))
   ([segred out-sym {:keys [scalar-types] :as options}]
-   (let [{:keys [kernel-body operator identity arrays scalars output bound group-count result-region]}
+   (let [{:keys [kernel-body operator identity numerical-policy arrays scalars output bound group-count result-region]}
         (lower segred out-sym
                :dtype (:dtype options) :array-types (:array-types options)
                :scalar-types scalar-types :coordinate-proof (:coordinate-proof options)
@@ -798,7 +806,9 @@
                        (map vector (:parameters kernel-body) arguments)))
         phase (:phase segred)
         output-elements (launch/rebind-expression group-count {'_n_bound bound})
-        c-op ({:+ "+" :* "*" :min "fmin" :max "fmax"} operator)
+        integral? (dtype/integral? (:dtype segred))
+        c-op ({:+ "+" :* "*" :min (if integral? "min" "fmin")
+               :max (if integral? "max" "fmax")} operator)
         result-dtype (dtype/canon (or (:result-dtype result-region) (:dtype segred)))]
     (when-not c-op
       (decline! :certified-monoid
@@ -822,10 +832,12 @@
                  :certified-monoid (get-in segred [:reduction :algebra])
                  :identity identity
                  :uniform-dtype (dtype/canon (:dtype segred))}
-      :numerics (cond-> {:mode :reassociated
+      :numerics (cond-> {:mode (if integral? :exact :reassociated)
                          :policy :certified-workgroup-tree
-                         :rounding :implementation-defined
+                         :rounding (if integral? :exact :implementation-defined)
                          :accumulator-dtype (dtype/canon (:dtype segred))}
+                  (:overflow numerical-policy)
+                  (assoc :overflow (:overflow numerical-policy))
                   (contains? options :scalar-math)
                   (assoc :scalar-math (numerics/validate-scalar-math-policy!
                                       (:scalar-math options)))
