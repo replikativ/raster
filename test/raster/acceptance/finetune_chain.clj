@@ -6,6 +6,7 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [raster.ad.reverse :as reverse]
+            [raster.compiler.core.dtype :as dtype]
             [raster.dl.loss :as loss]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.value :as value]))
@@ -186,14 +187,36 @@
 
 (defn run-loaded!
   "Run two full resident updates against the unchanged CPU monolithic AD oracle.
+   An explicit case supplies unchanged model arrays/configuration and a positive replay count.
    Downloads are oracle reads only. Binding metadata is not a replay or timing witness.
    Every native artifact closes, including on mismatch or failed inspection."
-  [{:keys [train oracle]} target-device]
-  (let [cfg @(oracle 'chain-cfg)
-        n (* (:seq cfg) (:d cfg))
-        weights (mapv #((train 'rand-weights) cfg %) [11 12])
-        adapters (mapv #((train 'init-adapters) cfg % 0.02) [21 22])
-        input ((oracle 'fvec) n 31 0.5) target ((oracle 'fvec) n 32 0.5)
+  ([{:keys [train oracle] :as loaded} target-device]
+   (let [cfg @(oracle 'chain-cfg) n (* (:seq cfg) (:d cfg))]
+     (run-loaded! loaded target-device
+                  {:cfg cfg :weights (mapv #((train 'rand-weights) cfg %) [11 12])
+                   :adapters (mapv #((train 'init-adapters) cfg % 0.02) [21 22])
+                   :input ((oracle 'fvec) n 31 0.5) :target ((oracle 'fvec) n 32 0.5)
+                   :replay-count 2})))
+  ([{:keys [train oracle]} target-device
+    {:keys [cfg weights adapters input target replay-count] :as case}]
+  (when-not (and (map? case)
+                 (= #{:cfg :weights :adapters :input :target :replay-count} (set (keys case)))
+                 (map? cfg) (= 1 (:bs cfg))
+                 (integer? replay-count) (pos? replay-count)
+                 (every? #(and (integer? %) (pos? %)) [(:seq cfg) (:d cfg)])
+                 (<= (*' (:seq cfg) (:d cfg)) Integer/MAX_VALUE)
+                 (vector? weights) (vector? adapters)
+                 (= 2 (count weights)) (= 2 (count adapters))
+                 (every? map? weights) (every? map? adapters)
+                 (get train 'weight-keys) (get train 'adapter-keys)
+                 (every? #(= (set @(train 'weight-keys)) (set (keys %))) weights)
+                 (every? #(= (set @(train 'adapter-keys)) (set (keys %))) adapters)
+                 (every? #(= :float (dtype/dtype-for-jvm-array %))
+                         (concat [input target] (mapcat vals weights) (mapcat vals adapters)))
+                 (= (*' (:seq cfg) (:d cfg)) (count input) (count target)))
+    (throw (ex-info "external training case requires two FP32 layers and matching dense inputs"
+                    {:reason :external-training-case})))
+  (let [n (* (:seq cfg) (:d cfg))
         started (System/nanoTime)
         prepared (prepare-chain train target-device cfg weights adapters input target)
         preparation-ns (- (System/nanoTime) started)
@@ -209,7 +232,7 @@
                              (:instances (compiled/plan prepared)))
        :replays
        (loop [iteration 0 current adapters previous nil results []]
-         (if (= iteration 2)
+         (if (= iteration replay-count)
            results
            (let [arguments (into (reference-args oracle cfg weights current input target)
                                  (map #((train 'layer-theta) cfg %) [0 1]))
@@ -262,7 +285,7 @@
                     (conj results {:loss predicted-loss :reference-loss reference-loss
                                    :loss-error loss-error :dx-error dx-error
                                    :adapter-count (count errors) :adapter-max-error (apply max errors)})))))})
-      (finally (compiled/close! live)))))
+      (finally (compiled/close! live))))))
 
 (defn run! [{:keys [source-root targets] :or {targets [:ocl:0 :ze:0]}}]
   (when-not (and (string? source-root) (seq source-root) (vector? targets) (seq targets)
