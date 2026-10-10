@@ -3927,3 +3927,27 @@ are not compiler scalar dtypes, even though Half uses JVM short-array storage.
 No surface dtype was added or removed. The focused hardware, roofline and
 calibration-admission suites pass 18 tests / 154 assertions in the warm REPL;
 full CI and exact-head review remain separate gates.
+
+### Shared physical resident-root accounting
+
+`distributed-plan/resident-storage-plan` now owns the finite distributed runtime's
+existing root-pool projection. Runtime allocation and optional simulator capacity
+reporting consume the same independently validated bindings, exact root contracts
+and overflow-safe physical budgets. Repeated calls share identical allocation
+roots; co-located workers retain separate shard buffers and can share private
+weights. Remapped workers require an explicit aggregate target budget. Distinct
+shards still cannot silently alias storage; a test fixture attempting that was
+rejected and corrected without weakening admission.
+
+This models owned LinkPlan roots retained until owner close, not total physical
+peak memory. KernelGraph scratch, backend temporaries, host staging, driver
+allocations, available VRAM and lifetime reuse remain outside its scope. Default
+analytical simulation and certificates are unchanged. The helper may retain
+source-bearing LinkPlans and is not a portable report or allocation authority.
+
+Focused planner/storage/cost/compute checks pass 71 tests / 552 assertions.
+Existing actual AD -> all-reduce -> SGD checks pass on OpenCL and Level Zero
+(2 tests / 154 assertions), including runtime-versus-simulator budget equality.
+These are warm-REPL results; fresh CI and independent exact-head review remain
+separate gates. The original real-model training numerical acceptance remains
+open and is not replaced by these small distributed fixtures.
