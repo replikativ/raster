@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.parallel-program-opencl :as program-opencl]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.dialects :as dialects]
@@ -606,6 +607,37 @@
     (is (equation-first/equation-first-compilation? compilation))
     (is (= :none (get-in compilation [:stats :fallback])))
     (is (= :typed-parallel (:dialect semantic)))
+    (let [scope-vars (mapv (fn [[n s]] (ns-resolve n s))
+                           [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                            ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                            ['raster.compiler.ir.link-plan '*caller-options*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+          observed (atom [])
+          observe #(mapv var-get scope-vars)
+          record! (fn [stage] (swap! observed conj [stage (observe)] [stage @(future (observe))]))
+          evaluate-step typed-scalar/evaluate-invocation-step]
+      (with-redefs [typed-scalar/evaluate-invocation-step
+                    (fn [& args] (record! :prefix) (apply evaluate-step args))]
+        (doseq [request [nil {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]]
+          (let [proof (emitted-program/validate-with-physical-results! (:emitted compilation) request)
+                projected (with-bindings (assoc (zipmap scope-vars (repeat (Object.)))
+                                               #'equation-first/*lower-observer* (fn [_] (record! :observer)))
+                            (equation-first/lower compilation arguments (fn [p] {:plan p}) proof request))]
+            (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
+            (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request)))))
+      (is (= #{:prefix :observer} (set (map first @observed))))
+      (is (every? #(= (vec (repeat (count scope-vars) nil)) (second %)) @observed)
+          "prefix evaluation and lower observers, including their futures, have no outer proof authority"))
+    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          lower equation-first/lower
+          requests (atom [])]
+      (with-redefs [equation-first/compile (fn [_ options] (is (= request options)) compilation)
+                    equation-first/lower (fn [& args] (swap! requests conj args) (apply lower args))]
+        (is (= (set (:outputs linked-plan))
+               (set (:outputs (equation-first/compile-link-plan #'pde/heat-loss-rk4 arguments request)))))
+        (is (= [5] (mapv count @requests)))
+        (is (= request (last (first @requests))))))
     (is (invocation/invocation-plan? invocation-plan))
     (is (= '[u0 target alpha inv-dx2 dt nsteps]
            (mapv :symbol (:parameters invocation-plan))))
