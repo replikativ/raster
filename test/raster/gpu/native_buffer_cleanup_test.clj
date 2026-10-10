@@ -619,6 +619,89 @@
                   (finally (deliver finish true))))))
           (gpu/close-session! sess))))))
 
+(deftest execution-evidence-rejects-closed-and-releasing-sessions-before-resolution
+  (let [contacts (atom [])]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [& args] (swap! contacts conj args) (constantly :unexpected))}
+      #(doseq [state [{:closed? true} {:closed? false :lifecycle :releasing}]]
+         (is (= :session-releasing
+                (:reason (ex-data (error-of
+                                   (fn [] (gpu/execution-device-info
+                                            (atom (assoc state :device-id :ocl:0)))))))))))
+    (is (empty? @contacts))))
+
+(deftest execution-evidence-query-pins-session-until-backend-return
+  (doseq [backend [:ocl :ze]]
+    (with-session-backend
+      backend {}
+      (fn [{:keys [sess releases]}]
+        (gpu/alloc! sess {:root [:float 4 nil]})
+        (let [entered (promise) finish (promise) teardown-entered (promise)
+              resolver-var (ns-resolve 'raster.gpu.core 'rt-resolve)
+              resolver @resolver-var
+              device {:backend backend :driver {:version :fixture}}]
+          (with-redefs-fn
+            {resolver-var (fn [target name]
+                            (if (= name "execution-device-info")
+                              (fn [] (deliver entered true) @finish device)
+                              (resolver target name)))}
+            (fn []
+              (let [query (future (gpu/execution-device-info sess))
+                    closing-holder (atom nil)]
+                (try
+                  (is (= true (deref entered 2000 :timeout)))
+                  (let [closing (future (deliver teardown-entered (Thread/currentThread))
+                                        (gpu/close-session! sess))
+                        _ (reset! closing-holder closing)
+                        close-thread (deref teardown-entered 2000 nil)
+                        deadline (+ (System/nanoTime) 2000000000)]
+                    (is (some? close-thread))
+                    (when close-thread
+                      (loop []
+                        (when (and (not (realized? closing))
+                                   (not= java.lang.Thread$State/BLOCKED (.getState ^Thread close-thread))
+                                   (< (System/nanoTime) deadline))
+                          (Thread/yield)
+                          (recur))))
+                    ;; Before the guard, close retires the backend while this query is paused.
+                    (is (and close-thread
+                             (= java.lang.Thread$State/BLOCKED (.getState ^Thread close-thread))))
+                    (is (not (realized? closing)))
+                    (is (empty? @releases))
+                    (deliver finish true)
+                    (is (= device (deref query 2000 :timeout)))
+                    (is (not= :timeout (deref closing 2000 :timeout)))
+                    (is (= 1 (count @releases)))
+                    (is (= :closed (:lifecycle @sess))))
+                  (finally
+                    (deliver finish true)
+                    ;; Keep mocked runtime bindings installed until both workers settle. Any
+                    ;; worker exception was checked above; joining must not mask a primary error.
+                    (doseq [worker (cond-> [query] @closing-holder (conj @closing-holder))]
+                      (try (deref worker 2000 :timeout) (catch Throwable _))))))))
+          (gpu/close-session! sess))))))
+
+(deftest execution-evidence-preserves-failure-and-rejects-reentrant-close
+  (doseq [backend [:ocl :ze]]
+    (with-session-backend
+      backend {}
+      (fn [{:keys [sess]}]
+        (let [failure (ex-info "device evidence query failed" {})
+              observed (atom nil)
+              resolver-var (ns-resolve 'raster.gpu.core 'rt-resolve)
+              resolver @resolver-var]
+          (with-redefs-fn
+            {resolver-var (fn [target name]
+                            (if (= name "execution-device-info")
+                              (fn [] (reset! observed (error-of #(gpu/close-session! sess)))
+                                (throw failure))
+                              (resolver target name)))}
+            #(is (identical? failure (error-of (fn [] (gpu/execution-device-info sess))))))
+          (is (= :reentrant-root-lifecycle (:reason (ex-data @observed))))
+          (is (not (:closed? @sess)))
+          (gpu/close-session! sess))))))
+
 (deftest publication-watch-cannot-reenter-a-range-transfer
   (doseq [backend [:ocl :ze]]
     (with-session-backend
