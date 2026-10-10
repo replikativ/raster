@@ -41,6 +41,7 @@
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
             [raster.gpu.measurement :as measurement]
+            [raster.gpu.invocation-observation :as observation]
             [raster.gpu.runtime-backend :as runtime-backend]
             [raster.gpu.resident-value :as resident-value]
             [raster.gpu.resource-cleanup :as cleanup])
@@ -1120,17 +1121,23 @@
    (locking sess
    (assert-session-open! sess)
    (let [device-id (:device-id @sess)
-         entry (or (get-in @sess [:graphs graph-key])
-                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))
-         _ (when (recorded-graph-entry? entry) (cleanup/assert-live! (recorded-owner! entry)))
+         entry (observation/replay-detail :graph-resolution
+                 (let [entry (or (get-in @sess [:graphs graph-key])
+                                 (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))]
+                   (when (recorded-graph-entry? entry) (cleanup/assert-live! (recorded-owner! entry)))
+                   entry))
          graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
-     ((rt-resolve device-id "replay-graph!") graph)
+     ;; Recorded replay's backend contract is synchronous and opaque at this boundary. Do not
+     ;; label the combined call as submission-only or infer a device/host-wait split.
+     (observation/replay-detail :synchronous-backend-replay
+       ((rt-resolve device-id "replay-graph!") graph))
      ;; A normal replay intentionally discards profiling data, just like LinkedExecutable/run!.
      ;; Profiling events must be reset before the next replay; profile-recorded-graph! reads and
      ;; resets them instead.
      (when (and (recorded-graph-entry? entry) (:profile? entry))
-       (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
-         (reset-fn graph)))))))
+       (observation/replay-detail :profile-reset
+         (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
+           (reset-fn graph))))))))
 
 (defn release-recorded-graph!
   "Release one graph recorded by record-graph!. Idempotent. Prepared executable steps and their
@@ -2414,17 +2421,20 @@
   [sess handle]
   (with-session-use sess
     (let [{:keys [device-id]} @sess
-          {:keys [runtime-graph profile?] :as entry} (resolve-kernel-graph-entry sess handle)
-          event (submit-resolved-kernel-graph! sess handle entry)]
+          {:keys [runtime-graph profile?] :as entry}
+          (observation/replay-detail :graph-resolution (resolve-kernel-graph-entry sess handle))
+          event (observation/replay-detail :submission
+                  (submit-resolved-kernel-graph! sess handle entry))]
       (try
-        (let [outputs (await-event! sess event)]
+        (let [outputs (observation/replay-detail :await (await-event! sess event))]
         ;; A validation replay of a profiled graph intentionally discards its timestamps. Reset
         ;; the per-kernel events so a subsequent measure-graph! replay can signal them legally.
           (when profile?
-            ((rt-resolve device-id "reset-graph-events!") runtime-graph))
+            (observation/replay-detail :profile-reset
+              ((rt-resolve device-id "reset-graph-events!") runtime-graph)))
           outputs)
         (finally
-          (release-event! sess event))))))
+          (observation/replay-detail :event-release (release-event! sess event)))))))
 
 (defn release-kernel-graph!
   "Release one bound graph and its graph-owned temporaries. External session buffers survive.

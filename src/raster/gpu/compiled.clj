@@ -1584,7 +1584,12 @@
 (defn invoke-profiled
   "Invoke through the ordinary lifetime/donation/preflight path and return {:outputs :report}.
    Outputs remain resident. The report measures host-monotonic phases, not device kernel time;
-   :replay-host includes synchronous submission and waiting. Outer lock acquisition includes
+   :replay-host includes synchronous submission and waiting. :replay-detail-ns partitions the
+   graph runner within that phase (resolution, submission, await, optional reset, release).
+   Recorded graphs instead report an opaque :synchronous-backend-replay bucket;
+   these nested details are not added again to top-level totals. Submission includes admission
+   and event bookkeeping, not just native launch; the session monitor is outside those buckets.
+   Outer lock acquisition includes
    monitor overhead. Refresh routes count attempted validated writes and logical bytes (exact
    view no-ops are separate, not transfers). No extra replay, download or profiling-enabled
    compilation is required. A failure throws the original exception and returns no report.
