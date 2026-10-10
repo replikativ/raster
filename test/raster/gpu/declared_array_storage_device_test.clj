@@ -42,22 +42,34 @@
         (finally (compiled/close! artifact))))))
 
 (defn- run-scale-case [target]
-  (let [alpha (+ 1.0 (Math/scalb 1.0 (int -24)))
+  (let [probe (requiring-resolve
+               (case target :ze:0 'raster.gpu.ze-runtime/execution-device-info
+                            :ocl:0 'raster.gpu.ocl-runtime/execution-device-info))
+        facts (probe)]
+    (when-not (contains? (:storage-types facts) :double)
+      (throw (ex-info "declared Double scalar test requires affirmative selected-device support"
+                      {:reason :declared-scalar-test-capability :target target :facts facts}))))
+  (doseq [dtype [:float :double]
+          compiler [nil :equation-first]]
+   (let [alpha (+ 1.0 (Math/scalb 1.0 (int -24)))
         x (float-array [1.5 -1.5 0.0])
         expected (mapv #(float (* alpha (double %))) x)
         artifact (compiled/compile
                   #'storage/mixed-scale [alpha x]
-                  (merge storage/policy
-                         {:compiler :equation-first :target target :dtype :double}))]
+                  (cond-> (merge storage/policy {:target target :dtype dtype})
+                    compiler (assoc :compiler compiler)))
+        output-keys (mapv :key (:out-tree artifact))]
     (try
+      (is (= 1 (count output-keys)))
+      (when compiler (is (= [:result] output-keys)))
       (is (= expected (vec (storage/mixed-scale alpha x))))
       (dotimes [_ 2]
         (let [outputs (artifact {})
-              result (value/->host (:result outputs))]
-          (is (= #{:result} (set (keys outputs))))
+              result (value/->host (get outputs (first output-keys)))]
+          (is (= (set output-keys) (set (keys outputs))))
           (is (= (class x) (class result)))
           (is (= expected (vec result)))))
-      (finally (compiled/close! artifact)))))
+      (finally (compiled/close! artifact))))))
 
 (deftest mixed-scale-public-jvm-device-storage-boundary
   (if @gp/gpu-available?

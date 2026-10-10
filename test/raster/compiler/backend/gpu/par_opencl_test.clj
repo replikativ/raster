@@ -51,6 +51,19 @@
           '[ints bytes floats shorts long float]
           :float))))
 
+(deftest scalar-width-is-independent-of-tensor-storage-width
+  (doseq [kernel-dtype [:float :double :byte]]
+    (is (= {'double-scale :double 'float-scale :float 'wide :long 'narrow :int}
+           (:scalar-types
+            (opencl-pass/derive-param-types '[double-scale float-scale wide narrow]
+                                            '[double float long int] kernel-dtype)))))
+  (let [d (with-meta 'd {:raster.type/tag 'double})
+        f (with-meta 'f {:raster.type/tag 'float})
+        form (list 'clojure.core/let [d 0.1 f (float 0.1)] (list '+ d f))]
+    (doseq [kernel-dtype [:float :double]]
+      (is (= {'d :double 'f :float}
+             (opencl-pass/binder-scalar-types form kernel-dtype {}))))))
+
 (deftest generate-segmap-kernel-artifact-simple-test
   (testing "Simple element-wise add with OpenCL syntax"
     (let [form '(raster.par/map! out i n double (+ (aget a i) (aget b i)))

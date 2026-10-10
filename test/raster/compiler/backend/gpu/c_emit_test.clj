@@ -76,10 +76,11 @@
                 (with-meta 'renamed {:raster.type/tag 'long}) {} :float)))
   (is (= :byte (c-emit/scalar-parameter-dtype
                 (with-meta 'packed {:raster.type/tag 'byte}) {} :float)))
-  ;; A floating tag specializes to the kernel dtype, as a declared floating param does, so host
-  ;; encoding and kernel declaration agree on width.
-  (is (= :float (c-emit/scalar-parameter-dtype
+  ;; Scalar tags retain their precision independently of array storage policy.
+  (is (= :double (c-emit/scalar-parameter-dtype
                  (with-meta 'scale {:raster.type/tag 'double}) {} :float)))
+  (is (= :float (c-emit/scalar-parameter-dtype
+                (with-meta 'scale {:raster.type/tag 'float}) {} :double)))
   ;; No declaration and no tag: refused with a structured reason, never guessed from the name
   ;; or from the kernel dtype.
   (is (= :kernel-scalar-dtype-unknown
