@@ -18,6 +18,20 @@
 (def default-tile
   {:block-m 64 :block-n 64 :block-k 16 :thread-m 4 :thread-n 4})
 
+(defn arithmetic-register-bytes-per-lane
+  "Analytic arithmetic register charge, not a vendor register-allocation proof.
+   Charge the microtile accumulators, loaded operands, widened operands, and one
+   decomposed product temporary. Storage/launch tiles cannot reduce this charge."
+  [tile storage-dtype arithmetic-dtype multiply-add]
+  (let [{:keys [thread-m thread-n]} tile
+        storage-bytes (dtype/bytes-of storage-dtype)
+        arithmetic-bytes (dtype/bytes-of arithmetic-dtype)
+        widened? (not= storage-dtype arithmetic-dtype)]
+    (+ (* thread-m thread-n arithmetic-bytes)
+       (* (+ thread-m thread-n) storage-bytes)
+       (if widened? (* (+ thread-m thread-n) arithmetic-bytes) 0)
+       (if (= :decomposed multiply-add) arithmetic-bytes 0))))
+
 (def ^:private tile-candidates
   [default-tile
    {:block-m 32 :block-n 32 :block-k 16 :thread-m 4 :thread-n 4}
@@ -222,13 +236,19 @@
    decline until they can be projected to checked, typed scalar ABI values.
    :multiply-add selects decomposed typed operations (default) or explicit canonical :fma.
    Decomposed SSA alone does not forbid contraction by a downstream vendor compiler."
-  [contract-facts {:keys [tile descriptor operation-id scalar-types multiply-add scalar-math]
+  [contract-facts {:keys [tile descriptor operation-id scalar-types multiply-add scalar-math arithmetic-dtype]
                   :or {multiply-add :decomposed}}]
   (when-not (facts/facts? contract-facts)
     (throw (ex-info "register-tiled scheduling requires verified contraction facts"
                     {:reason :raster/bug :facts contract-facts})))
   (let [{:keys [dtype free-axes contract-axes epilogue out]} contract-facts
         dtype (dtype/canon dtype)
+        arithmetic-dtype (dtype/canon (or arithmetic-dtype dtype))
+        widened? (not= dtype arithmetic-dtype)
+        _ (when (and widened? (not= [:float :double] [dtype arithmetic-dtype]))
+            (decline! :arithmetic-dtype
+                      "register-tiled widening currently requires Float storage and Double arithmetic"
+                      {:storage-dtype dtype :arithmetic-dtype arithmetic-dtype}))
         _ (when-not (contains? #{:decomposed :fused} multiply-add)
             (decline! :multiply-add-policy
                       "register-tiled multiply-add must be :decomposed or :fused"
@@ -441,26 +461,29 @@
                  (body/value loaded dtype) col-allocation
                  [inner-index (add (mul local-col thread-n) nn)] nil nil :cached)]))
            (range thread-n))
+          (when widened?
+            (for [[prefix width] [["register-a" thread-m] ["register-b" thread-n]]
+                  index (range width)]
+              (body/->ScalarCompute
+               (body/value (identifier (str prefix "-wide") index) arithmetic-dtype)
+               (body/cast-expression (identifier prefix index) arithmetic-dtype :exact :exact))))
           (mapcat
            (fn [[mm nn]]
              (let [product (identifier "register-product" mm nn)
                    next-accumulator (identifier "register-next" mm nn)
-                   accumulator (identifier "register-inner-acc" mm nn)]
+                   accumulator (identifier "register-inner-acc" mm nn)
+                   a (identifier (if widened? "register-a-wide" "register-a") mm)
+                   b (identifier (if widened? "register-b-wide" "register-b") nn)]
                (if (= :fused multiply-add)
                  [(body/->ScalarCompute
-                   (body/value next-accumulator dtype)
-                   (body/scalar-expression :fma dtype
-                                           [(identifier "register-a" mm)
-                                            (identifier "register-b" nn)
-                                            accumulator]))]
+                   (body/value next-accumulator arithmetic-dtype)
+                   (body/scalar-expression :fma arithmetic-dtype [a b accumulator]))]
                  [(body/->ScalarCompute
-                   (body/value product dtype)
-                   (body/scalar-expression :* dtype
-                                           [(identifier "register-a" mm)
-                                            (identifier "register-b" nn)]))
+                   (body/value product arithmetic-dtype)
+                   (body/scalar-expression :* arithmetic-dtype [a b]))
                   (body/->ScalarCompute
-                   (body/value next-accumulator dtype)
-                   (body/scalar-expression :+ dtype [accumulator product]))])))
+                   (body/value next-accumulator arithmetic-dtype)
+                   (body/scalar-expression :+ arithmetic-dtype [accumulator product]))])))
            (for [mm (range thread-m) nn (range thread-n)] [mm nn]))
           [(body/->Yield
             (vec (for [mm (range thread-m) nn (range thread-n)]
@@ -469,10 +492,10 @@
         (body/->ForLoop
          (body/value inner-index :int) 0 block-k 1
          (mapv (fn [binding initial]
-                 (body/->LoopArg (body/value binding dtype) initial))
+                 (body/->LoopArg (body/value binding arithmetic-dtype) initial))
                inner-accumulator-bindings outer-accumulator-bindings)
          inner-operations
-         (mapv #(body/value % dtype) inner-results)
+         (mapv #(body/value % arithmetic-dtype) inner-results)
          {:unroll true})
         stage-row
         (staging-loop
@@ -510,11 +533,11 @@
          (if (= :long k-index-dtype) (body/index-cast 0 :long :exact) 0)
          K block-k
          (mapv (fn [binding]
-                 (body/->LoopArg (body/value binding dtype) (body/literal 0 dtype)))
+                 (body/->LoopArg (body/value binding arithmetic-dtype) (body/literal 0 arithmetic-dtype)))
                outer-accumulator-bindings)
          [stage-row stage-col (barrier) inner-loop (barrier)
           (body/->Yield inner-results)]
-         (mapv #(body/value % dtype) accumulator-results)
+         (mapv #(body/value % arithmetic-dtype) accumulator-results)
          {})
         semantic-region (scalar-region-lower/make-region epilogue)
         store-coordinate-scope (into #{block-row block-col local-row local-col}
@@ -527,6 +550,12 @@
              (fn [nn]
                (let [position (+ (* mm thread-n) nn)
                      accumulator (nth accumulator-results position)
+                     narrowed (identifier "register-narrowed" mm nn)
+                     semantic-accumulator (if widened? narrowed accumulator)
+                     narrowing (when widened?
+                                 [(body/->ScalarCompute
+                                   (body/value narrowed dtype)
+                                   (body/cast-expression accumulator dtype :nearest-even :ieee))])
                      store-mask (keyword (str "register-store-" mm "-" nn))
                      row-source (list '+ block-row (list '* local-row thread-m) mm)
                      col-source (list '+ block-col (list '* local-col thread-n) nn)
@@ -538,7 +567,7 @@
                      (when semantic-region
                        (scalar-region-lower/lower
                         semantic-region
-                        {:accumulator accumulator
+                        {:accumulator semantic-accumulator
                          :scalar-math scalar-math
                          :accumulator-dtype dtype
                          :store-dtype dtype
@@ -552,9 +581,9 @@
                                    store-coordinate-scope))
                                 (axis-map/coordinate-exprs %))
                          :predicate store-mask}))]
-                 (concat (:operations lowered)
+                 (concat narrowing (:operations lowered)
                          [(body/->ScalarStore out coordinates
-                                              (or (:result lowered) accumulator)
+                                              (or (:result lowered) semantic-accumulator)
                                               store-mask)])))
              (range thread-n)))
           (range thread-m)))
@@ -570,8 +599,9 @@
        :indices indices
        :masks masks
        :operations (into [outer-loop] stores)
-       :schedule (assoc tile :strategy :register-tiled :variant variant
-                       :multiply-add multiply-add)
+       :schedule (cond-> (assoc tile :strategy :register-tiled :variant variant
+                               :multiply-add multiply-add)
+                   widened? (assoc :arithmetic-dtype arithmetic-dtype))
        :launch (launch/spec
                 {:workgroup-size [workgroup-by-col workgroup-by-row]
                  :group-count [(launch/ceil-div N block-n)

@@ -77,6 +77,39 @@
                       "observed parity on these inputs is a regression oracle, not a library-wide rounding theorem")))
               (finally (compiled/close! artifact)))))))))
 
+(deftest nested-public-composition-executes-used-math-intent
+  (doseq [[target available? skip!] [[:ocl:0 @opencl/opencl-available? opencl/opencl-skip!]
+                                    [:ze:0 @gp/gpu-available? gp/gpu-skip!]]]
+    (if-not available?
+      (skip! "nested public composition with used selected math")
+      (let [input (float-array [-2.0 -0.5 -0.0 0.0 0.5 2.0])
+            request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+            options (merge {:compiler :equation-first :target target :dtype :float} request)
+            supported? (= :supported
+                          (physical-hardware/scalar-dtype-support
+                           (physical-hardware/descriptor-for target) :double))]
+        (if-not supported?
+          (is (= :kernel-body-target-math-capability
+                 (try (compiled/lower #'selected-tanh-values [input (alength input)] options)
+                      nil
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (let [prepared (compiled/lower #'selected-tanh-values [input (alength input)] options)
+                wrap (fn [id component]
+                       (compiled/compose
+                        {:id id :components [{:id :inner :program component}]
+                         :outputs [{:key :result :from [:inner :result]}]} request))
+                composite (wrap :used-math-inner prepared)
+                nested (wrap :used-math-outer composite)
+                artifact (compiled/instantiate! nested)]
+            (try
+              (is (= request (:math-request nested)))
+              (doseq [values [input (float-array [-4.0 -1.0 -0.25 0.25 1.0 4.0])]]
+                (let [expected (selected-tanh-values values (alength values))
+                      actual (value/->host (:result (artifact {[:inner [:inner :input]] values})))]
+                  (is (= (vec expected) (vec actual))
+                      "nested remapping executes the used widening; numeric parity is input-specific")))
+              (finally (compiled/close! artifact)))))))))
+
 (deftm update-state!
   [state :- (Array float) gradient :- (Array float) lr :- Double n :- Long] :- Void
   (par/map-void! i n

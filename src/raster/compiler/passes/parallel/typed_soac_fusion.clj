@@ -1262,17 +1262,21 @@
         uses (value-use-counts program)]
     (vec
      (for [producer-index (range (count infos))
-           consumer-index (range (inc producer-index) (count infos))
            :let [producer (nth infos producer-index)
-                 consumer (nth infos consumer-index)
-                 produced (first (:results producer))]
+                 produced (first (:results producer))
+                 ;; This proof depends on the producer and this immutable program,
+                 ;; not on the consumer. Keep it lazy to preserve the original
+                 ;; admission order, and share it only within this enumeration.
+                 exceptional? (delay (exceptional-conversion-region? program producer))]
+           consumer-index (range (inc producer-index) (count infos))
+           :let [consumer (nth infos consumer-index)]
            :when (= :map (:kind producer))
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
            :when (contains? #{:map :reduce :scan} (:kind consumer))
            ;; Per-lane fusion would interleave a trapping producer with later caller-visible
            ;; consumer writes. Preserve the materialized equation-completion boundary.
-           :when (not (exceptional-conversion-region? program producer))
+           :when (not @exceptional?)
            ;; Local SSA is currently a map-region facility. A local-bearing producer/consumer can
            ;; therefore compose vertically into another map; reduction and scan consumers remain
            ;; local-free until their regions admit typed locals.

@@ -74,6 +74,44 @@
                            conversions)))
         "the producer check remains in its materialized equation")))
 
+(deftest vertical-candidate-enumeration-checks-each-producer-once
+  (let [program (source-program
+                 '(let* [u (raster.par/pmap i n float (+ (aget x i) 1.0))
+                         v (raster.par/pmap j n float (+ (aget u j) 2.0))
+                         w (raster.par/pmap k n float (+ (aget v k) 3.0))
+                         z (raster.par/pmap l n float (+ (aget w l) 4.0))]
+                        z)
+                 {'x :float})
+        calls (atom [])
+        proof-var #'typed-fusion/exceptional-conversion-region?
+        original @proof-var
+        enumerate #(mapv (juxt :producer-index :consumer-index)
+                         (#'typed-fusion/vertical-candidates program nil))
+        candidates (with-redefs-fn
+                     {proof-var (fn [p producer]
+                                  (swap! calls conj (:id producer))
+                                  (original p producer))}
+                     enumerate)]
+    (is (= [[0 1] [1 2] [2 3]] candidates))
+    (is (= 3 (count @calls)))
+    (is (every? #(= 1 %) (vals (frequencies @calls))))
+    ;; There is no retained authority across calls or changed programs.
+    (reset! calls [])
+    (is (empty? (with-redefs-fn
+                  {proof-var (fn [_ producer]
+                               (swap! calls conj (:id producer))
+                               true)}
+                  enumerate)))
+    (is (= 3 (count @calls)))
+    (is (every? #(= 1 %) (vals (frequencies @calls))))
+    (is (empty?
+         (with-redefs-fn
+           {proof-var (fn [& _] (throw (ex-info "unused producer proof was forced" {})))}
+           #(#'typed-fusion/vertical-candidates
+              (source-program '(let* [u (raster.par/pmap i n float (aget x i))] u)
+                              {'x :float})
+              nil))))))
+
 (deftest horizontal-fusion-preserves-checked-map-completion-order
   (let [source '(let* [u (raster.par/map! left i n int
                                            (clojure.core/aget long-input i))

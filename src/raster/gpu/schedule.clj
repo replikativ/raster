@@ -99,7 +99,7 @@
     (some? b) b
     :else a))
 
-(def ^:private valid-precisions #{:mixed-f16-f32 :f32-scalar})
+(def ^:private valid-precisions #{:mixed-f16-f32 :f32-scalar :f32-storage-f64-arithmetic-rte-f32})
 (def ^:private valid-stage-spaces #{:none :slm :l3 :register})
 (def ^:private valid-grf-modes #{:grf128 :grf256})
 (def ^:private valid-segmented-reduction-strategies
@@ -196,6 +196,10 @@
     (case (:precision schedule)
       :mixed-f16-f32 full
       :f32-scalar (quot full 4)
+      :f32-storage-f64-arithmetic-rte-f32
+      ((requiring-resolve 'raster.compiler.passes.parallel.register-tiled-body/arithmetic-register-bytes-per-lane)
+       @(requiring-resolve 'raster.compiler.passes.parallel.register-tiled-body/default-tile)
+       :float :double (get-in schedule [:typed-contraction :multiply-add] :decomposed))
       full)))
 
 (defn- register-staged-bytes-per-lane
@@ -282,12 +286,20 @@
       (throw (ex-info "schedule: typed contraction multiply-add must be :decomposed or :fused"
                       {:multiply-add multiply-add})))
     (when (and (= :fused multiply-add)
-               (not (and (= :mixed-f16-f32 prec)
+               (not (and (contains? #{:mixed-f16-f32 :f32-storage-f64-arithmetic-rte-f32} prec)
                          (contains? #{:register-tiled :dispatch-register-tiled}
                                     typed-contraction-strategy))))
       (throw (ex-info "schedule: fused multiply-add requires a permissive register-tiled schedule"
                       {:multiply-add multiply-add :precision prec
                        :strategy typed-contraction-strategy})))
+    (when (and (= :f32-storage-f64-arithmetic-rte-f32 prec)
+               (not= :register-tiled typed-contraction-strategy))
+      (throw (ex-info "schedule: widened Float contraction arithmetic requires an explicit register-tiled strategy"
+                      {:precision prec :strategy typed-contraction-strategy})))
+    (when (and (= :f32-storage-f64-arithmetic-rte-f32 prec)
+               (some? (get-in schedule [:typed-contraction :tile])))
+      (throw (ex-info "schedule: widened arithmetic currently uses the compiler's default register tile"
+                      {:precision prec :tile (get-in schedule [:typed-contraction :tile])})))
     (when-not (valid-matrix-tile-space? matrix-tiles desc)
       (throw (ex-info "schedule: unknown typed contraction matrix tile space; expected :default, :finite, or a non-empty unique subset of the descriptor-derived family"
                       {:matrix-tiles matrix-tiles

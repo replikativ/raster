@@ -5,6 +5,7 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -78,6 +79,50 @@
     (is (= :scheduled-kernel-body-caller-math-policy
            (reason-of #(scheduled/validate-against-math-policy!
                         (assoc-in (fixture) [:numerics :scalar-math] policy) nil))))))
+
+(deftest caller-consent-reuses-only-an-equivalent-leaf-proof
+  (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        pure (fixture)
+        ordinary (assoc-in pure [:body :operations 1 :value]
+                           (body/scalar-expression :tanh :float ['value]))
+        selected (-> ordinary
+                     (assoc-in [:body :operations 1 :value :options :math-realization]
+                               numerics/widened-target-library-math)
+                     (assoc-in [:numerics :scalar-math] policy))
+        validator-var (ns-resolve 'raster.compiler.ir.scheduled-kernel-body
+                                  'validate-math-realizations!)
+        original @validator-var
+        calls (atom [])
+        check (fn [owner caller]
+                (reset! calls [])
+                (let [reason (reason-of #(scheduled/validate-against-math-policy! owner caller))]
+                  {:reason reason :scans (count @calls)}))]
+    (with-redefs-fn
+      {validator-var (fn [kernel-body caller]
+                       (swap! calls conj caller)
+                       (original kernel-body caller))}
+      (fn []
+        (is (= {:reason nil :scans 1} (check ordinary nil)))
+        (is (= {:reason nil :scans 1} (check ordinary {:overrides {}})))
+        (is (= {:reason nil :scans 1} (check selected policy)))
+        (is (= {:reason nil :scans 1}
+               (check (assoc-in ordinary [:numerics :scalar-math] nil) nil)))
+        (is (= {:reason nil :scans 2} (check pure policy))
+            "unused non-default intent without a retained policy requires independent checking")
+        (is (= {:reason :scheduled-kernel-body-math-realization :scans 2}
+               (check ordinary policy)))
+        (is (= {:reason :scheduled-kernel-body-caller-math-policy :scans 1}
+               (check selected nil)))
+        (is (= {:reason :scheduled-kernel-body-caller-math-policy :scans 1}
+               (check (assoc-in pure [:numerics :scalar-math] policy) nil)))
+        (is (= {:reason :scalar-math-policy :scans 1}
+               (check ordinary {:overrides {} :unexpected true})))
+        (is (= {:reason :scheduled-kernel-body-math-realization :scans 1}
+               (check (update selected :numerics dissoc :scalar-math) policy)))
+        (is (= {:reason :scheduled-kernel-body-math-realization :scans 1}
+               (check (update selected :numerics dissoc :scalar-math)
+                      {:overrides {} :unexpected true}))
+            "owner validation still precedes malformed caller validation")))))
 
 (deftest nested-control-retains-scalar-math-consent
   (let [policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
@@ -237,6 +282,9 @@
       (let [artifact (target/emit-artifact "conditioned" value dialect)
             graph (target/emit-static-dense-graph "conditioned" value dialect)]
         (is (= (:preconditions value) (:preconditions artifact)))
+        (is (= (:numerics value) (:numerics (executable/description artifact))))
+        (is (= (:numerics value)
+               (get-in (executable/description graph) [:kernels 0 :numerics])))
         (is (= artifact (scheduled/validate-artifact-projection! value artifact)))
         (is (= graph (graph-call/preflight! graph {'rows {:type :int :value 6}})))
         (doseq [rows [0 7 8]]

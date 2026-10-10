@@ -290,6 +290,25 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (kexec/description (assoc-in graph [:nodes 1 :operation :abi 0 :dtype] :half))))))
 
+(deftest numerical-descriptions-retain-only-each-executables-own-contract
+  (let [graph-policy {:mode :reassociated :policy :graph-policy
+                      :rounding :implementation-defined :accumulator-dtype :float}
+        leaf-policy {:mode :exact :policy :same-scalar-evaluation-order
+                     :scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        graph (-> (staged-graph)
+                  (assoc-in [:attributes :numerics] graph-policy)
+                  (assoc-in [:nodes 1 :operation :attributes :numerics] leaf-policy))
+        info (kexec/description graph)]
+    (is (= graph-policy (:numerics info)))
+    (is (not (contains? (first (:kernels info)) :numerics))
+        "a graph contract is not evidence about an unlabelled layout-adapter leaf")
+    (is (= leaf-policy (get-in info [:kernels 1 :numerics])))
+    (is (= leaf-policy (:numerics (kexec/description
+                                  (assoc-in reference [:attributes :numerics] leaf-policy)))))
+    (is (not (contains? (kexec/description reference) :numerics)))
+    (is (not-any? #(or (contains? % :source) (contains? % :scheduled-kernel-body))
+                  (:kernels info)))))
+
 (defn- storage-dispatch []
   (kdispatch/make
    {:id "storage-dispatch" :alternatives [(staged-graph) (direct-graph)]

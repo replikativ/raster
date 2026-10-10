@@ -682,6 +682,37 @@
         (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
         (is (= 2 (count (get-in artifact [:launch :workgroup-size]))))))))
 
+(deftest public-widened-register-contractions-preserve-the-rounded-storage-boundary
+  (doseq [target [ocl-target cuda-target hip-target] policy [:decomposed :fused]]
+    (let [descriptor (assoc-in (compiler-hardware/descriptor-for target)
+                               [:execution :scalar-dtype-support :double] :supported)
+          options {:target target :dtype :float
+                   :schedule {:precision :f32-storage-f64-arithmetic-rte-f32
+                              :typed-contraction {:strategy :register-tiled
+                                                  :multiply-add policy}}}
+          compilation (equation-first/compile #'contractions/fixed-matmul options descriptor)
+          artifact (first (:kernels compilation))
+          certificate (get-in artifact [:provenance :scheduled-operation])
+          linked (equation-first/lower compilation [(float-array 15) (float-array 21)])]
+      (is (= 1 (count (:kernels compilation))))
+      (is (= :f32-storage-f64-arithmetic-rte-f32
+             (get-in artifact [:attributes :precision])))
+      (is (= :double (get-in certificate [:numerics :accumulator-dtype])))
+      (is (= :float (get-in certificate [:numerics :result-dtype])))
+      (is (= {:rounding :nearest-even :overflow :ieee}
+             (get-in certificate [:numerics :result-conversion])))
+      (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact)))
+      (is (seq (:instances linked)))
+      (is (str/includes? (:source artifact) "double"))
+      (is (str/includes? (:source artifact)
+                        (if (= target ocl-target) "rstr_narrow_f64_f32_rte"
+                                                 "__double2float_rn")))
+      (doseq [support [:unknown :unsupported]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (equation-first/compile
+                      #'contractions/fixed-matmul options
+                      (assoc-in descriptor [:execution :scalar-dtype-support :double] support))))))))
+
 (deftest public-contraction-dispatch-emits-both-certified-c-family-alternatives
   (doseq [target [ocl-target cuda-target hip-target] policy [:decomposed :fused]]
     (let [compilation (equation-first/compile

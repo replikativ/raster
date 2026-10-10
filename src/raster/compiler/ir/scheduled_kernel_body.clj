@@ -287,7 +287,13 @@
       (fail! :scheduled-kernel-body-caller-math-policy
              "retained scalar math policy differs from independent caller intent"
              {:expected expected :actual (:scalar-math contract)}))
-    (validate-math-realizations! (:body scheduled) expected)
+    ;; validate! already checked every leaf against the retained policy (or default).
+    ;; Matching independent consent needs no second traversal. A non-default caller
+    ;; without retained consent still needs its own leaf check: pure bodies may omit
+    ;; unused requests, but default math leaves must not silently accept them.
+    (when (and (not (contains? contract :scalar-math))
+               (seq (:overrides expected)))
+      (validate-math-realizations! (:body scheduled) expected))
     scheduled))
 
 (defn scalar-math-requirements

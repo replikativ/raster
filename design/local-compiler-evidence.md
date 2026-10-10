@@ -1,5 +1,129 @@
 # Local compiler evidence — 2026-09-27
 
+## Explicit widened contraction prototype — 2026-10-10
+
+An isolated branch from coherent compiler head `18164d73` prototypes the named
+policy `:f32-storage-f64-arithmetic-rte-f32` for explicit `:register-tiled`
+contractions. Float storage/staging is unchanged; local-loaded operands widen
+exactly, products and accumulators are Double, and the final accumulator narrows
+with nearest-even/IEEE semantics before the existing Float result transform.
+The public plan declines unknown or unsupported Double capabilities. Dispatch
+is not admitted: retaining its portable Float alternative would not guarantee
+the requested arithmetic. Defaults remain unchanged.
+
+Focused validation now passes 11 tests / 251 assertions, zero failures/errors.
+This covers NN/NT/TN tails, Float result transforms/inout storage, certificate
+reconstruction and tampering, explicit strategy/capability rejection, and public
+equation-first compilation/lowering on synthetic OpenCL/CUDA/HIP targets.
+Local Level Zero and OpenCL each execute all three layouts under fused and
+decomposed arithmetic: cancellation preserves the unit contribution, changed
+inputs preserve a second contribution, and finite Double products narrow to
+Float infinity with IEEE overflow. Both backends use the same Intel device;
+this is not NVIDIA/AMD execution or target compiler acceptance.
+
+The default-microtile analytic register charge now accounts for Double accumulators,
+loaded Float operands, widened operands and a decomposed product temporary.
+An unrelated matrix tile cannot underprice it; custom typed tiles are rejected
+until that public control is implemented. This charge is not a vendor
+register-allocation proof. The legacy descriptor compiler explicitly rejects
+the new policy rather than letting it reach an incompatible precision route;
+a regression checks its explicit rejection reason before any source lowering.
+The focused run temporarily loaded the branch namespaces into the owned REPL,
+then restored all original roots/metadata and removed new production interns.
+It is not a fresh coherent full-model gate. Independent exact-head review approved
+checkpoint `296293a0`. Public widened register fixtures are now included in the
+normal CI fixture generator. Both fused and decomposed variants compile locally
+with nvcc 12.4 to sm_80 PTX and hipcc 5.7 (Clang 21) to gfx1100 device code.
+Inspection confirms Double multiply plus add in the decomposed variant, Double
+FMA in the fused variant, and final Float conversions; HIP inspection enabled
+cross-statement contraction explicitly. This is hardware-free target compilation,
+not NVIDIA/AMD numerical or performance acceptance. Original-model acceptance
+remains required; no full-model success or performance improvement is claimed.
+
+A fresh coherent JVM at `996009cd` ran the unchanged pinned real-weight case,
+reader, oracle and thresholds with widened contractions and the previously
+selected tanh realization. Loss error was 0.0046875 and input-gradient error
+0.00313778 (both accepted), but eight of 28 adapter checks failed at iteration
+zero, with maximum coordinate-relative error 0.666274. The failing adapters
+were layer-0 Ak/Bk/Au/Bu/Ad/Bd and layer-1 Ak/Ag. The held gate remains open.
+The same CPU input/cotangent layer-1 control preserves all fourteen original
+monolithic CPU gradients; only Ak (0.320088) and Ag (0.0258330) exceed the
+unchanged threshold there. These errors are not additive and do not isolate
+a sole cause.
+
+The runtime report contained 154 register-tiled admission records, but their
+precision labels still said `:f32`. The certificate now labels the explicit
+widening policy correctly, and public target tests check that projection.
+This reporting correction changes neither KernelBody arithmetic nor defaults.
+Counts describe admission records, not unique kernels or replay invocations.
+
+The widened layer-1 Ak trace preserves all fifteen untapped outputs bit-for-bit.
+Its activation matches the CPU activation exactly, while the incoming cotangent
+differs by at most 4.85778e-6 (coordinate-relative 0.00448483). The final device
+gradient matches an independent ordered Double-FMA/Float-result oracle bit-for-bit
+for all 10,240 elements. Native CPU multiplication on those captured operands
+reproduces the approximately 0.32009 gradient discrepancy against the original
+CPU model, whereas substituting only the device activation changes nothing.
+This localizes this boundary's substantial discrepancy upstream of the final
+gradient contraction; it does not diagnose every failing adapter. Diagnostic
+provenance is `/tmp/raster-wide-layer1-gradient-trace.clj` and
+`/tmp/raster-bound-layer1-ak-device-trace.clj`; these are local scratch scripts,
+not committed regression tests or portable acceptance artifacts.
+
+A same-input/cotangent layer-1 control additionally selected the existing
+Double-library/nearest-even-Float `exp` realization alongside `tanh`. It still
+fails two of fourteen adapter checks: Ak is 0.341881 and Ag is 0.0241663;
+input-gradient error is 0.00230993. It preserves all fourteen original CPU
+adapter gradients and the unchanged thresholds. This does not justify adding
+the `exp` override to the candidate: Ak worsens and the held full-model gate
+was not rerun. Runtime reporting now labels all 56 register-tiled admission
+records with the named widening policy; 101 generic records have no precision
+label. This is a local diagnostic, not whole-model or performance acceptance.
+
+Further traces on the original tanh-only widened candidate retain all fifteen
+untapped outputs bit-for-bit. Normalization backward reproduces device output
+exactly from captured activation/cotangent and original CPU weights (the weights
+were not device-captured); RoPE backward, single-KV-head layout copying and
+KV-head summation also reproduce exactly. Independent ordered Float replay of
+the causal dK body matches both the untouched CPU helper and device output on
+their respective inputs. DW and denominator-gradient reductions match CPU
+helpers exactly on captured device inputs. These controls place differences in
+incoming intermediates rather than establishing a defect in those bodies.
+The same-score softmax control differs in two of sixteen weights, by at most
+3.72529e-9; CPU-versus-device scores differ by at most 2.38419e-6. Neither
+comparison proves universal library accuracy or closes the original model gate.
+Provenance is the local `/tmp/raster-bound-layer1-ak-{norm,rope,layout,fanin,dk,dw,softmax}-trace.clj`
+scripts; these remain scratch diagnostics, not committed portable regressions.
+
+The same widened candidate's layer-1 GELU forward and backward match the CPU
+helpers bit-for-bit on captured inputs; gated products and residual sums retain
+their independently checked Float boundaries. The FFN Wu/Wg backward
+contractions each match an independent ordered Double-FMA/Float-result oracle
+for all 1,280 outputs, using device-captured frozen weights and cotangents.
+Float ordered-dot comparisons are not an oracle for this widened policy;
+mutable adapter weight taps would observe post-update values and are excluded
+from this exact check. Provenance is the local FFN projection/GELU traces and
+`/tmp/raster-wide-layer1-ffn-dot-control.clj`. These additional boundary controls
+do not close the eight failing full-model adapter checks.
+
+Device-captured frozen weights and activations also give exact ordered
+Double-FMA/Float-result parity for the three FFN forward projections: Wg/Wu
+each have 4,096 outputs and Wd has 1,280. The post-FFN normalization pullback
+has bit-identical incoming cotangent and weights and agrees bit-for-bit with
+the CPU helper on captured activation. Its activation still differs from the
+original CPU forward pass. Provenance is the local forward and post-FFN traces
+and `/tmp/raster-wide-layer1-forward-dot-control.clj`; no full gate was rerun.
+
+The existing public widening device regression now checks reduction lengths
+3 and 513 under NN/NT/TN layouts and fused/decomposed products, with changed
+inputs and IEEE overflow. Its long cancellation spans many reduction tiles
+and a masked final tile; retaining a Float carry would lose the middle term.
+The focused device test passes 72 assertions on local OpenCL and Level Zero,
+without capability skips. It is a compact policy regression, not a model or
+vendor-device performance substitute.
+The complete affected batch passes 11 tests / 287 assertions, zero failures
+and errors; the temporary load restores the original compiler roots afterward.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression

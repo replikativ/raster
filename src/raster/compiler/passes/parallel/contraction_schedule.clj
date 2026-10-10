@@ -595,12 +595,16 @@
 
 (defn- register-contraction-numerics
   [contract-facts kernel-body]
-  {:mode :reassociated
+  (cond-> {:mode :reassociated
    :policy (if (= :fused (get-in kernel-body [:schedule :multiply-add]))
              :ordered-k-fused-multiply-add
              :ordered-k-decomposed-multiply-add)
    :source-arithmetic (:source-arithmetic contract-facts)
-   :accumulator-dtype :float :rounding :implementation-defined})
+   :accumulator-dtype (get-in kernel-body [:schedule :arithmetic-dtype] :float)
+   :rounding :implementation-defined}
+    (= :double (get-in kernel-body [:schedule :arithmetic-dtype]))
+    (assoc :storage-dtype :float :product-dtype :double :result-dtype :float
+           :result-conversion {:rounding :nearest-even :overflow :ieee})))
 
 (defn plan-register-tiled-for-node
   "Admit an explicitly requested FP32 register tile through the common graph/body certificate.
@@ -614,8 +618,13 @@
   (let [dimensions (mapv second (concat (:free-axes contract-facts)
                                         (:contract-axes contract-facts)))]
     (cond
-      (not= :mixed-f16-f32 precision)
+      (not (contains? #{:mixed-f16-f32 :f32-storage-f64-arithmetic-rte-f32} precision))
       {:ok false :reason :register-tiled-numerical-policy}
+
+      (and (= :f32-storage-f64-arithmetic-rte-f32 precision)
+           (not= :supported (hardware/scalar-dtype-support descriptor :double)))
+      {:ok false :reason :register-tiled-double-capability
+       :support (hardware/scalar-dtype-support descriptor :double)}
 
       (not= :float (:dtype contract-facts))
       {:ok false :reason :register-tiled-fp32-candidate}
@@ -634,6 +643,8 @@
               lowering-options (-> options
                                    (assoc :descriptor descriptor :operation-id (:id operation))
                                    (assoc :multiply-add multiply-add)
+                                   (assoc :arithmetic-dtype (if (= :f32-storage-f64-arithmetic-rte-f32 precision)
+                                                             :double :float))
                                    (update :scalar-types #(merge (or % {}) graph-scalar-types)))
               lowered (register-tiled/lower contract-facts lowering-options)
               kernel-body (:kernel-body lowered)
@@ -646,12 +657,16 @@
                                           (:dims lowered) (:tile lowered))
                           :effects {:kind :pure-contraction
                                     :uses (scheduled-body/derive-uses kernel-body arguments)}
-                          :legality {:kind :register-tiled-contraction
+                          :legality (cond-> {:kind :register-tiled-contraction
                                      :tile (:tile lowered) :variant (:variant lowered)
                                      :multiply-add (get-in kernel-body [:schedule :multiply-add])}
+                                      (= :f32-storage-f64-arithmetic-rte-f32 precision)
+                                      (assoc :arithmetic-dtype :double))
                           :numerics (retain-scalar-math
                                      (register-contraction-numerics contract-facts kernel-body) options)
-                          :attributes {:strategy :register-tiled :precision :f32
+                          :attributes {:strategy :register-tiled
+                                       :precision (if (= :f32-storage-f64-arithmetic-rte-f32 precision)
+                                                    precision :f32)
                                        :variant (:variant lowered)
                                        :out-elems (:output-count lowered)}})]
           {:ok true :scheduled (scheduled-body/validate-against-node! scheduled node graph)})
@@ -782,6 +797,7 @@
           (when (contains? #{:decomposed :fused} (get-in scheduled [:legality :multiply-add]))
             (register-tiled/lower contract-facts
                                   (assoc options :tile (get-in scheduled [:legality :tile])
+                                                 :arithmetic-dtype (get-in scheduled [:legality :arithmetic-dtype] :float)
                                                  :multiply-add (get-in scheduled [:legality :multiply-add]))))
 
           nil)
