@@ -48,6 +48,13 @@
              (not-any? #(soac-dialect/result-storage (soac-dialect/facts algorithm) (second %))
                        (soac-dialect/equations algorithm))))))
 
+(defn- host-scalar-constructor
+  "Storage for currently supported numeric host scalars, not packed half words."
+  [storage]
+  (let [storage (dtype/canon storage)]
+    (when (contains? #{:float :double :int :long} storage)
+      (dtype/jvm-array-constructor storage))))
+
 ;; Buffer semantics of the emitted kernel-invoke marker: invoke-registered-kernel
 ;; WRITES its `out` arg in place (arg 2 of [kname inputs out scalars n]) and
 ;; RETURNS it, so the binding sym is a pure alias of the out buffer. Declared in
@@ -743,11 +750,10 @@
                           result-id (nth (:arguments emitted) result-index)
                           result-buffer (some #(when (= result-id (:id %)) %)
                                               (:outputs emitted))
-                          constructor ({:float 'float-array :double 'double-array}
-                                       (dtype/canon (:dtype result-slot)))]
+                          constructor (host-scalar-constructor (:dtype result-slot))]
                       (when-not (and result-buffer (= 1 (:elements result-buffer)) constructor)
                         (throw (ex-info
-                                "scheduled host scalar result must be one FP32/FP64 graph element"
+                                "scheduled host scalar result must be one primitive graph element"
                                 {:reason :scheduled-host-scalar-result
                                  :slot result-slot :buffer result-buffer})))
                       (assoc (vec (:arguments emitted)) result-index (list constructor 1)))
