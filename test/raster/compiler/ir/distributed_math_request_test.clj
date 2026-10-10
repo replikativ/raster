@@ -121,6 +121,8 @@
     (is (= :ready @(:state owner)))))
 
 (deftest unused-intent-is-certificate-identity-not-certificate-permission
+  (is (= {} (distributed/caller-math-options nil)
+         (distributed/caller-math-options {:scalar-math {:overrides {}}})))
   (let [fields {:id :analytical :mesh (distributed/mesh [{:name :worker :size 1}] [:worker])
                 :topology (distributed/topology
                            [(distributed/device {:id :worker :memory-capacity-bytes 1024})] [])
@@ -163,6 +165,8 @@
                  (runtime/map->DistributedExecutable
                   {:state (atom :complete) :caller-options request :plan {:outputs []}
                    :sessions {:unit :fake-session}}))]
+      (add-watch (:state owner) :scope-watch
+                 (fn [& _] (swap! observed conj (observe) @(future (observe)))))
       (is (= :copied
              (foreign #(runtime/with-output-values!
                         owner (fn [_]
@@ -171,4 +175,4 @@
       (with-redefs [gpu/close-session! (fn [_] (swap! observed conj (observe) @(future (observe))))]
         (is (nil? (foreign #(runtime/close! owner)))))
       (is (= :closed @(:state owner))))
-    (is (= (vec (repeat 6 (vec (repeat 5 nil)))) @observed))))
+    (is (= (vec (repeat 14 (vec (repeat 5 nil)))) @observed))))

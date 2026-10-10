@@ -12,7 +12,10 @@ and certificates cannot authorize selection. Empirical route policy is separate.
 Certificates retain the canonical request as structural identity and verification
 rederives it from independent caller options, including unused overrides. This
 adds a certificate field, not a new numerical surface operation or default
-arithmetic change. Runtime owners retain admitted intent before sealing; only
+arithmetic change. Empty explicit intent normalizes to the existing omitted
+default request, preserving exact refinement identity of default-compiled local
+reductions; certificates still report the canonical empty policy. Runtime owners
+retain admitted intent before sealing; only
 the exact issued owner can execute or expose outputs. Acquisition, execution,
 output callbacks and cleanup clear compiler proof scopes, including future
 inheritance. Structural output enumeration itself requires no policy argument.

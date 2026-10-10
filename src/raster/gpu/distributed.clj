@@ -372,16 +372,21 @@
                                    (link-plan/output-value-ids local)))])))
           (get-in executable [:plan :outputs]))))
 
-(defn- with-output-scope! [executable read! state-after]
+(defn- with-output-scope-without-context! [executable read! state-after]
   (let [values (locking (:state executable)
                  (let [values (output-values executable)]
                    (reset! (:state executable) :reading-outputs)
                    values))]
     (try
-      (link-plan/without-validation-context #(read! values))
+      (read! values)
       (finally
         (locking (:state executable)
           (reset! (:state executable) (state-after)))))))
+
+(defn- with-output-scope! [executable read! state-after]
+  ;; State watches and their futures are user callbacks too, including on cleanup.
+  (link-plan/without-validation-context
+   #(with-output-scope-without-context! executable read! state-after)))
 
 (defn with-output-values!
   "Call `read!` synchronously with completed outputs while retaining the owner's lifetime.

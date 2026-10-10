@@ -14,7 +14,12 @@
                 (float 0)) 5))
 
 (defn- check-device! [target]
-  (let [plan (fixture/selected-plan target (hardware/descriptor-for target))
+  (let [descriptor (hardware/descriptor-for target)]
+    (if-not (= :supported (hardware/scalar-dtype-support descriptor :double))
+      (is (= :kernel-body-target-math-capability
+             (try (fixture/selected-plan target descriptor) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+  (let [plan (fixture/selected-plan target descriptor)
         options (assoc fixture/request :device-capacities {target 1048576}
                                        :include-graph-temporaries? true)]
     (with-open [owner (runtime/instantiate! plan options)]
@@ -28,7 +33,7 @@
                  (gpu/download-range! (get (:sessions owner) target)
                                       (get-in outputs [:advance :output]) actual {:elements 64})))
         (is (every? #(<= (Math/abs (- (double %) (double (expected-value)))) 1.0e-6) actual))
-        (is (= :complete @(:state owner)))))))
+        (is (= :complete @(:state owner)))))))))
 
 (deftest selected-loop-on-opencl
   (if @opencl/opencl-available?

@@ -62,7 +62,10 @@
                 (and (map? options) (set/subset? (set (keys options)) #{:scalar-math})))
     (fail! "distributed caller intent accepts only scalar-math"
            :distributed-math-options {:options options}))
-  {:scalar-math (numerical-contract/validate-scalar-math-policy! (:scalar-math options))})
+  (let [policy (numerical-contract/validate-scalar-math-policy! (:scalar-math options))]
+    ;; Empty consent is the existing default request, not a new retained schedule field.
+    ;; Preserve source-refinement identity for default-compiled local reductions.
+    (if (seq (:overrides policy)) {:scalar-math policy} {})))
 
 (defn device-mesh? [value] (instance? DeviceMesh value))
 (defn device-resource? [value] (instance? DeviceResource value))
@@ -1837,7 +1840,7 @@
      (:device-plans plan)
      (:copy-bindings plan)
      (:refinements plan)
-     (:scalar-math caller-options))))
+     (numerical-contract/validate-scalar-math-policy! (:scalar-math caller-options)))))
 
 (defn certify
   "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.
