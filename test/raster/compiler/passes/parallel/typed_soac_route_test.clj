@@ -11,6 +11,7 @@
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -2641,11 +2642,27 @@
             numerical-permission {:permitted-modes #{:exact :approximate-model}
                                   :permitted-models [(:numerical-model selected)]}
             choice (equation-dispatch/make [reference candidate] selector numerical-permission
-                                          {:scalar-math policy})]
+                                          {:scalar-math policy})
+            program (update (assoc (:body derived) :dialect :opencl-parallel) :equations
+                            #(mapv (fn [equation]
+                                     (if (= algorithm (:algorithm equation))
+                                       (assoc equation :operations [choice]) equation)) %))
+            proof (emitted-program/validate-with-physical-results! program {:scalar-math policy})
+            projection (emitted-program/operation-projection (:projections proof) choice)]
         (is (= choice (equation-dispatch/validate! choice {:scalar-math policy})))
         (is (= reference (equation-dispatch/default-equation choice {:scalar-math policy})))
         (is (= (:complete-write-domains selected)
                (equation-dispatch/complete-write-domains choice {:scalar-math policy})))
+        (is (= program (emitted-program/validate! program {:scalar-math policy})))
+        (is (emitted-program/retained-validation? program proof {:scalar-math policy}))
+        (is (not (emitted-program/retained-validation? program proof)))
+        (is (= [reference candidate] (:candidates projection)))
+        (is (= reference (:boundary projection)))
+        (is (thrown? clojure.lang.ExceptionInfo (emitted-program/validate! program)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (emitted-program/validate-with-physical-results! program)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (emitted-program/validate! (assoc-in program [:attributes :scalar-math] policy))))
         (is (thrown? clojure.lang.ExceptionInfo (equation-dispatch/validate! choice)))
         (is (thrown? clojure.lang.ExceptionInfo
                      (equation-dispatch/validate!

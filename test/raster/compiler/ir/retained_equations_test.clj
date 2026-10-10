@@ -14,7 +14,9 @@
   (with-redefs-fn
     {#'emitted/validate! identity
      (ns-resolve 'raster.compiler.ir.emitted-parallel-program 'equation-candidates)
-     (fn [_] (mapv #(hash-map :body {:equations %}) alternatives))}
+     (fn [_ caller-options]
+       (is (nil? caller-options) "default projection passes no independent math override")
+       (mapv #(hash-map :body {:equations %}) alternatives))}
     #(emitted/retained-numerical-equations
       {:equations (into [{:id :compound :operations [:dispatch]
                           :attributes {:emitted-source-equations [:a]}}] suffix)})))
