@@ -20,6 +20,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.gpu.core :as gpu]
+            [raster.gpu.invocation-observation :as observation]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as parallel-program]
             [raster.gpu.resident-value :as resident-value]
@@ -529,7 +530,7 @@
    operations reentrantly. This is an execution boundary, not permission for private reuse."
   [executable operation f]
   (let [executable (ensure-live! executable operation)]
-    (locking (:lifetime-lock executable)
+    (observation/with-outer-lock (:lifetime-lock executable)
       (ensure-live! executable operation)
       (ensure-no-output-leases! executable operation)
       (start-use! executable)
@@ -1055,6 +1056,7 @@
        (fn []
          (begin-mutation! executable)
          (try
+           (observation/refresh-route :host-upload (get-in node [:view :byte-length]))
            (gpu/upload-range! (:session executable) (node-view executable node-id) source
                               {:elements (reduce * 1 (get-in node [:view :shape]))})
            (catch Throwable error (failed-write! executable node-id error)))
@@ -1129,7 +1131,7 @@
     (begin-mutation! executable)
     (cond
       (same-buffer-range? source-buffer source-view destination-buffer destination-view)
-      nil
+      (observation/refresh-route :exact-view-no-op (:byte-length destination-view))
 
       (identical? source-buffer destination-buffer)
       (let [source-resident
@@ -1139,11 +1141,13 @@
                               :dtype (:dtype source-view)
                               :shape (:shape source-view)
                               :strides (:strides source-view)})]
+        (observation/refresh-route :same-buffer-copy (:byte-length destination-view))
         (gpu/copy-range! session source-resident destination {:elements elements}))
 
       :else
       (let [temporary-key [::device-input (random-uuid)]
             allocation (:allocation source-view)]
+        (observation/refresh-route :foreign-buffer-copy (:byte-length destination-view))
         (gpu/register-buffer! session temporary-key source-buffer
                               {:ownership :borrowed
                                :allocation-id [::device-input-allocation (random-uuid)]

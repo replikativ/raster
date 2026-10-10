@@ -40,6 +40,7 @@
             [raster.compiler.source-dependencies :as source-dependencies]
             [raster.core :as rcore]
             [raster.gpu.core :as gpu]
+            [raster.gpu.invocation-observation :as observation]
             [raster.gpu.storage-representation :as storage-representation]
             [raster.runtime.artifact-provenance :as provenance]
             [raster.gpu.link :as gpu-link]
@@ -1522,37 +1523,43 @@
   [^Compiled c inputs before-mutation! before-replay!]
   (let [{:keys [executable out-tree donated target]} c
         {:keys [in-nodes input-nodes input-keys donated-keys aggregate-groups]}
-        (invocation-layout-for c)
-        inputs (project-aggregate-inputs aggregate-groups inputs)
+        (observation/phase :invocation-layout (invocation-layout-for c))
+        inputs (observation/phase :aggregate-input-projection
+                 (project-aggregate-inputs aggregate-groups inputs))
         ;; 0. VALIDATE inputs: every passed key must be an :input-role param or a donated slot —
         ;;    never a :constant/:state key silently ignored (fail-loud, §7.7).
-        _ (doseq [[k _v] inputs]
-            (when-not (or (contains? input-keys k) (contains? donated-keys k))
-              (throw (ex-info (str "invoke: unsupported input key " k " — only :input-role params "
-                                   (vec input-keys) " or donated slots " (vec donated-keys)
-                                   " may be passed; a :constant/:state slot is captured at bind")
-                              {:key k :inputs (keys inputs)}))))
+        _ (observation/phase :input-key-validation
+            (doseq [[k _v] inputs]
+              (when-not (or (contains? input-keys k) (contains? donated-keys k))
+                (throw (ex-info (str "invoke: unsupported input key " k " — only :input-role params "
+                                     (vec input-keys) " or donated slots " (vec donated-keys)
+                                     " may be passed; a :constant/:state slot is captured at bind")
+                                {:key k :inputs (keys inputs)})))))
         ;; 1. An invalid later adapter must not consume an earlier handle or write inputs.
-        checked-donations (checked-donations executable in-nodes donated inputs)
+        checked-donations (observation/phase :donation-preflight
+                            (checked-donations executable in-nodes donated inputs))
         ;; A malformed later input must not upload an earlier one. Reuse the LinkNode and
         ;; DeviceArray contracts, including liveness, exact ranges and portable overlap rules.
-        _ (preflight-inputs! executable input-nodes inputs)
+        _ (observation/phase :input-preflight
+            (preflight-inputs! executable input-nodes inputs))
         previous (when-let [outputs (:live-outputs c)] @outputs)
         ;; 2. Every dynamic input is refreshed on every invocation, preserving the resident-program
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
         _ (when before-mutation! (before-mutation!))
-        _ (write-invocation-inputs! c input-nodes inputs previous checked-donations)]
+        _ (observation/phase :input-refresh
+            (write-invocation-inputs! c input-nodes inputs previous checked-donations))]
     (when before-replay! (before-replay!))
     ;; 4. replay, no download on the ordinary invocation path.
-    (gpu-link/run! executable)
+    (observation/phase :replay-host (gpu-link/run! executable))
     ;; 5. project outputs as resident device values; record them for next-call invalidation.
-    (let [out (into {} (map (fn [{:keys [key] :as node}]
-                              [key (project-node executable node target)]))
-                    out-tree)]
-      (when-let [live-outputs (:live-outputs c)]
-        (reset! live-outputs (vec (vals out))))
-      out)))
+    (observation/phase :output-projection
+      (let [out (into {} (map (fn [{:keys [key] :as node}]
+                               [key (project-node executable node target)]))
+                      out-tree)]
+        (when-let [live-outputs (:live-outputs c)]
+          (reset! live-outputs (vec (vals out))))
+        out))))
 
 (defn- invoke-compiled-unleased [c inputs]
   (invoke-compiled-unleased* c inputs nil nil))
@@ -1564,6 +1571,17 @@
   (gpu-link/with-unleased-execution!
    (:executable c) :invoke-compiled
    #(invoke-compiled-unleased c inputs)))
+
+(defn invoke-profiled
+  "Invoke through the ordinary lifetime/donation/preflight path and return {:outputs :report}.
+   Outputs remain resident. The report measures host-monotonic phases, not device kernel time;
+   :replay-host includes synchronous submission and waiting. Outer lock acquisition includes
+   monitor overhead. Refresh routes count attempted validated writes and logical bytes (exact
+   view no-ops are separate, not transfers). No extra replay, download or profiling-enabled
+   compilation is required. A failure throws the original exception and returns no report.
+   Timings include observation overhead and are diagnostic, not tuning/certificate evidence."
+  [^Compiled c inputs]
+  (observation/observe #(invoke-compiled c inputs)))
 
 (defn invoke-leased
   "Invoke a Compiled artifact and pin its owned resident DeviceArray outputs until close.
