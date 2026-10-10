@@ -1,0 +1,3 @@
+(ns raster.compiler.fixtures.effect-cache-definition)
+(declare state)
+(defn child [x] (swap! state inc) x)
