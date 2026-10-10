@@ -33,6 +33,7 @@
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.pipeline :as pl]
@@ -371,23 +372,30 @@
                   :else {:status :not-stored}))
         value))))
 
-(defn- cached-compilation-template
-  [key compiler thunk]
-  (let [persistent-report (atom nil)
+(defn- cached-compilation-template-in-context
+  [key compiler thunk caller-options]
+  (let [math-policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        validation-options (when (some? caller-options) {:scalar-math math-policy})
+        persistent-report (atom nil)
         value (delay (resolve-compilation-template key compiler thunk persistent-report))
         candidate
         {:compiler compiler
          :value value
+         :math-policy math-policy
          ;; Process-local evidence belongs to this existing template owner, not to the serialized
          ;; compilation. Resolve/load/store the ordinary artifact before deriving this evidence.
          :emitted-validation
          (when (= :equation-first compiler)
            (delay
-             (let [compilation @value
-                   validator @#'emitted-program/validate-with-physical-results!]
-               (when (equation-first/equation-first-compilation? compilation)
-                 {:validation (validator (:emitted compilation))
-                  :validator-identity (weak-identity validator)}))))
+             (link-plan/without-validation-context
+              (fn []
+                (let [compilation @value
+                      validator @#'emitted-program/validate-with-physical-results!]
+                  (when (equation-first/equation-first-compilation? compilation)
+                    {:validation (if (nil? validation-options)
+                                   (validator (:emitted compilation))
+                                   (validator (:emitted compilation) validation-options))
+                     :validator-identity (weak-identity validator)}))))))
          :persistent-report persistent-report}
         [before after]
         (swap-vals! compilation-template-cache
@@ -449,7 +457,17 @@
 
 (def ^:private max-template-stabilization-attempts 8)
 
-(defn- stable-compilation-template
+(defn- cached-compilation-template-for-request [key compiler thunk caller-options]
+  (link-plan/without-validation-context
+   #(cached-compilation-template-in-context key compiler thunk caller-options)))
+
+(defn- cached-compilation-template
+  ([key compiler thunk]
+   (cached-compilation-template-for-request key compiler thunk nil))
+  ([key compiler thunk caller-options]
+   (cached-compilation-template-for-request key compiler thunk caller-options)))
+
+(defn- stable-compilation-template-in-context
   "Resolve one cached template in a compiler-definition epoch that remains unchanged for the
    complete compilation. Derived deftm specializations do not change this semantic epoch, but a
    concurrent source/type/dispatch redefinition may. In that case the result belongs only to the
@@ -457,7 +475,7 @@
 
    This makes a single preparation request converge the cache while preserving the invariant that
    every returned template was produced during a stable compiler-definition interval."
-  [key-for-revision compiler thunk]
+  [key-for-revision compiler thunk caller-options]
   (let [request-observer *compilation-template-observer*
         request-owner *compilation-template-owner*]
     (loop [attempt 1]
@@ -469,7 +487,9 @@
                       {:value
                        (binding [*compilation-template-observer* #(reset! report %)
                                  *compilation-template-owner* owner]
-                         (cached-compilation-template key compiler thunk))}
+                         (if (nil? caller-options)
+                           (cached-compilation-template key compiler thunk)
+                           (cached-compilation-template key compiler thunk caller-options)))}
                       (catch Throwable error {:error error}))
             _ (when-let [error (:error outcome)]
                 (when request-observer (request-observer @report))
@@ -506,29 +526,51 @@
                         :compiler-revision-after revision-after)))
               (throw error))))))))
 
-(defn- owned-emitted-validation
+(defn- stable-compilation-template-for-request [key-for-revision compiler thunk caller-options]
+  (link-plan/without-validation-context
+   #(stable-compilation-template-in-context key-for-revision compiler thunk caller-options)))
+
+(defn- stable-compilation-template
+  ([key-for-revision compiler thunk]
+   (stable-compilation-template-for-request key-for-revision compiler thunk nil))
+  ([key-for-revision compiler thunk caller-options]
+   (stable-compilation-template-for-request key-for-revision compiler thunk caller-options)))
+
+(defn- owned-emitted-validation-in-context
   "Reuse only facts belonging to the exact stable compilation owner and current pipeline.
    Stale guards fall back to independent validation; a failed proof is never cached negatively."
-  [{:keys [key entry]} compilation]
-  (let [current-owner? (fn []
+  [{:keys [key entry]} compilation caller-options]
+  (let [math-policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        current-owner? (fn []
                          (and (identical? entry (get @compilation-template-cache key))
                               (= (get-in key [:guards :compiler-revision])
                                  (dispatch/compiler-definition-revision))
                               (= (get-in key [:guards :pipeline-identity])
                                  (weak-identity @#'equation-first/compile))
                               (identical? compilation @(:value entry))))]
-    (when (and (:emitted-validation entry) (current-owner?))
+    (when (and (:emitted-validation entry) (= math-policy (:math-policy entry)) (current-owner?))
       (try
         (let [{:keys [validation validator-identity]} @(:emitted-validation entry)]
           (when (and (current-owner?)
                      (= validator-identity
                         (weak-identity @#'emitted-program/validate-with-physical-results!))
-                     (emitted-program/retained-validation? (:emitted compilation) validation))
+                     (if (nil? caller-options)
+                       (emitted-program/retained-validation? (:emitted compilation) validation)
+                       (emitted-program/retained-validation? (:emitted compilation) validation caller-options)))
             validation))
         (catch Throwable error
           (swap! compilation-template-cache
                  #(if (identical? entry (get % key)) (dissoc % key) %))
           (throw error))))))
+
+(defn- owned-emitted-validation-for-request [owner compilation caller-options]
+  (link-plan/without-validation-context
+   #(owned-emitted-validation-in-context owner compilation caller-options)))
+
+(defn- owned-emitted-validation
+  ([owner compilation] (owned-emitted-validation-for-request owner compilation nil))
+  ([owner compilation caller-options]
+   (owned-emitted-validation-for-request owner compilation caller-options)))
 
 ;; ================================================================
 ;; Role derivation (§4.2) and tree construction
