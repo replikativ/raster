@@ -206,6 +206,26 @@
   (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil)
             params)))
 
+(defn ^:no-doc deftm-frontend-facts
+  "Resolve one source specialization and retain its common frontend facts.
+   Does not walk, schedule, emit or allocate. Parameter tags still come from
+   deftm dispatch metadata; this is not another inference/type registry.
+   Callers retain their own admission policy for a missing source namespace."
+  [f-var requested-dtype]
+  (let [resolved (or (resolve-deftm-var f-var requested-dtype) f-var)
+        metadata (meta resolved)
+        params (get-params resolved requested-dtype)
+        parameters (clean-params params)
+        param-env (build-param-env resolved requested-dtype)
+        effective-dtype (or requested-dtype (infer-dtype resolved) :double)
+        source-ns (or (some-> (:raster.core/deftm-source-ns metadata) find-ns)
+                      (:ns metadata))]
+    {:resolved-var resolved :params params :parameters parameters
+     :param-env param-env
+     :param-specs (mapv (fn [p] {:sym p :tag (get param-env p)}) parameters)
+     :effective-dtype effective-dtype :source-ns source-ns
+     :return-tag (:raster.core/return-tag metadata)}))
+
 ;; ================================================================
 ;; Dialect validation — formal structural invariants via nanopass
 ;; ================================================================
@@ -1971,25 +1991,18 @@
                                                  (str (:name (meta resolved-var))))
                                          resolved-var)
                              :device device-id :dtype dtype})))
-        params       (get-params f-var dtype)
+        frontend (deftm-frontend-facts resolved-var dtype)
         walked-body  (get-walked-body f-var dtype)
-        active-params (clean-params params)
-        param-env    (build-param-env f-var dtype)
-        effective-dtype (or dtype (infer-dtype resolved-var) :double)
-        source-ns    (let [m (meta resolved-var)]
-                       (or (when-let [s (:raster.core/deftm-source-ns m)]
-                             (try (the-ns s) (catch Exception _ nil)))
-                           (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+        active-params (:parameters frontend)
+        param-env    (:param-env frontend)
+        effective-dtype (:effective-dtype frontend)
+        source-ns    (:source-ns frontend)
         ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
         ;; Run the front half to :write-read-fused, explode any Params-container / value-type param
         ;; into per-field array params, then construct TypedSOAC and resume to the backend. Gated on a value-type param
         ;; so flat-param deftms are untouched (their eff-param-specs == param-specs). The
         ;; descriptor's params + the backend's array types are derived from the EXPLODED leaves.
-        d-params*   (:raster.core/deftm-params (meta resolved-var))
-        d-tags*     (:raster.core/deftm-tags (meta resolved-var))
-        param-specs (mapv (fn [p t] {:sym (if (symbol? p) (with-meta p nil) (symbol (name p)))
-                                     :tag (when t (symbol t))})
-                          d-params* d-tags*)
+        param-specs (:param-specs frontend)
         ;; One representation pass owns both generated SoA companions and defvalues that already
         ;; bundle primitive arrays. The latter are common model/simulation state boundaries; their
         ;; record identity is a host ABI fact, never a scalar operation in TypedSOAC or KernelBody.

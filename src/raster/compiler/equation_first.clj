@@ -13,7 +13,6 @@
             [raster.compiler.backend.gpu.parallel-program-c-family :as program-c-family]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
-            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
@@ -78,9 +77,9 @@
   "Declared aggregate representation, shared by compilation and its cache identity."
   [f-var requested-dtype]
   (let [source-var (physical-function f-var requested-dtype)
-        parameters (pipeline/clean-params (pipeline/get-params source-var requested-dtype))
-        param-env (pipeline/build-param-env source-var requested-dtype)
-        specs (mapv (fn [sym] {:sym sym :tag (get param-env sym)}) parameters)
+        frontend (pipeline/deftm-frontend-facts source-var requested-dtype)
+        param-env (:param-env frontend)
+        specs (:param-specs frontend)
         env (soa-lower/soa-param-env specs {:mixed-products? true})
         aggregate-projection (soa-lower/parameter-projection
                               specs env (the-ns (source-namespace-symbol source-var)))
@@ -107,16 +106,15 @@
 
 (defn- compiler-options
   [f-var target requested-dtype options]
-  (let [metadata (meta f-var)
-        parameters (pipeline/clean-params (pipeline/get-params f-var requested-dtype))
-        declared-tags (:raster.core/deftm-tags metadata)
-        effective-dtype (or requested-dtype (dtype/infer-dtype-from-tags declared-tags) :double)
+  (let [frontend (pipeline/deftm-frontend-facts f-var requested-dtype)
+        parameters (:parameters frontend)
+        effective-dtype (:effective-dtype frontend)
         source-ns-symbol (source-namespace-symbol f-var)
         source-ns (or (find-ns source-ns-symbol)
                       (fail! :equation-first-source-namespace
                              "deftm defining namespace is not loaded"
                              {:function f-var :source-ns source-ns-symbol}))
-        param-env (pipeline/build-param-env f-var effective-dtype)
+        param-env (:param-env frontend)
         ;; Parametric deftm wrappers do not themselves retain dispatch tags; get-params and
         ;; build-param-env resolve the same dtype specialization used by get-walked-body.
         tags (mapv param-env parameters)
@@ -132,7 +130,7 @@
             :active-params parameters
             :public-parameters parameters
             :source-ns source-ns
-            :return-tag (:raster.core/return-tag metadata)
+            :return-tag (:return-tag frontend)
             :array-types (:array-types parameter-types)
             :scalar-types (:scalar-types parameter-types)}
            (when param-env {:param-env param-env}))))
