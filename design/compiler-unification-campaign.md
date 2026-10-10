@@ -1,5 +1,27 @@
 # Compiler unification campaign
 
+### October 10 explicit distributed math request
+
+Distributed construction, validation, compute/transfer binding, readiness,
+simulation, storage projection and certification now forward explicit caller
+`:scalar-math` intent through existing request-aware LinkPlan contracts. Selected
+math in a structured loop is no longer rejected by an intermediate default-only
+readiness or scratch query. Omitted intent remains default; artifact attributes
+and certificates cannot authorize selection. Empirical route policy is separate.
+
+Certificates retain the canonical request as structural identity and verification
+rederives it from independent caller options, including unused overrides. This
+adds a certificate field, not a new numerical surface operation or default
+arithmetic change. Runtime owners retain admitted intent before sealing; only
+the exact issued owner can execute or expose outputs. Acquisition, execution,
+output callbacks and cleanup clear compiler proof scopes, including future
+inheritance. Structural output enumeration itself requires no policy argument.
+
+The selected five-trip loop is checked against an independent rounded scalar
+oracle on local OpenCL and Level Zero. This is policy/ownership integration,
+not physical fabric overlap, calibrated throughput, full memory accounting, or
+acceptance of the unchanged held real-weight training gate.
+
 ### October 9 physical compute lanes follow explicit worker placement
 
 A reproduced simulator gap gave independent compute lanes to logical workers

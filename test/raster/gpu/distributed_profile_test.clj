@@ -9,7 +9,7 @@
   (:import [java.lang.foreign MemorySegment]))
 
 (defn owner []
-  (runtime/map->DistributedExecutable
+  (#'runtime/seal-runtime-value (runtime/map->DistributedExecutable
    {:plan {:id :test-plan} :state (atom :ready)
     :sessions {:physical (atom {:session-id :test-session :device-id :physical-device})}
     :readiness {:actions []}
@@ -19,7 +19,7 @@
                [{:id :first :operation {:kind :compute :dependencies []}
                  :waits [] :completion {:id :first-complete}}
                 {:id :second :operation {:kind :compute :dependencies [:first]}
-                 :waits [{:id :first-complete}] :completion {:id :second-complete}}]}}))
+                 :waits [{:id :first-complete}] :completion {:id :second-complete}}]}})))
 
 (deftest profile-is-the-only-replay-and-retains-physical-context
   (let [executable (owner) calls (atom []) opts (atom []) closes (atom 0)]
@@ -54,7 +54,8 @@
         (is (= :complete @(:state executable)))
         (is (thrown? clojure.lang.ExceptionInfo (runtime/run! executable)))
         (is (= [:profile :profile] @calls)))))
-  (is (thrown? clojure.lang.ExceptionInfo (runtime/profile! (owner)))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (runtime/profile! (runtime/map->DistributedExecutable (into {} (owner)))))
       "a constructed owner cannot publish an authentic observation"))
 
 (deftest normal-run-stays-unprofiled-and-failures-poison-the-one-shot-owner

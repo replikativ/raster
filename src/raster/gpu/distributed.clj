@@ -20,7 +20,7 @@
 (def ^:private runtime-issuer (provenance/issuer))
 (defn- seal-runtime-value [value] ((:seal runtime-issuer) value))
 
-(defrecord DistributedExecutable [plan schedule readiness bindings projections sessions transport staging-bytes state allocation-budgets provenance-seal staging]
+(defrecord DistributedExecutable [plan schedule readiness bindings projections sessions transport staging-bytes state allocation-budgets provenance-seal staging caller-options]
   java.io.Closeable
   (close [this] (close! this)))
 
@@ -131,7 +131,7 @@
                 (recur (+ offset n)))))))
     (when profile? @observations)))
 
-(defn instantiate!
+(defn- instantiate-with-options!
   "Validate and initialize an owning, one-shot distributed execution.
    Local LinkPlans must target real devices and all local allocations must be owned. Explicit
    `{:transport :host-staged}` permits synchronous cross-device copies via a temporary native
@@ -144,10 +144,15 @@
    Budgets cover declared owned LinkPlan roots. Optional :include-graph-temporaries? includes
    conservative graph scratch bounds for this serial runner, not total driver memory.
    Source objects must remain valid and stable through this synchronous initialization."
-  ([plan] (instantiate! plan {}))
-  ([plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
-          :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false}}]
-   (let [ready (distributed/check-readiness plan)
+  [plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
+         :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false} :as options}]
+   (when-not (and (map? options)
+                  (every? #{:transport :max-staging-bytes :device-capacities
+                            :include-graph-temporaries? :scalar-math} (keys options)))
+     (throw (ex-info "unsupported distributed runtime options"
+                     {:reason :distributed-runtime-options :options options})))
+   (let [caller-options (distributed/caller-math-options (select-keys options [:scalar-math]))
+         ready (distributed/check-readiness plan caller-options)
          schedule (schedule plan)
          _ (when-not (contains? #{nil :host-staged :resident-copy} transport)
              (throw (ex-info "unsupported distributed transport"
@@ -165,9 +170,10 @@
                  (throw (ex-info "resident-copy requires co-located physical endpoints"
                                  {:reason :distributed-runtime-resident-copy :step (:id action)})))))
          {:keys [bindings specs allocation-budgets]}
-         (distributed/resident-storage-plan plan {:device-capacities device-capacities
-                                                 :include-graph-temporaries? include-graph-temporaries?})
-         projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %)))
+         (distributed/resident-storage-plan plan (merge caller-options
+                                                       {:device-capacities device-capacities
+                                                        :include-graph-temporaries? include-graph-temporaries?}))
+         projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %) caller-options))
          _ (doseq [[index action] (map-indexed vector (:actions ready))
                    :when (contains? (set (:outputs plan)) (:id action))
                    :let [local (get-in bindings [(:id action) :link-plan])]
@@ -195,10 +201,18 @@
                             {:elements (reduce * 1 (:shape view))}))
        (seal-runtime-value
         (->DistributedExecutable plan schedule ready bindings projections @sessions transport
-                                 max-staging-bytes (atom :ready) allocation-budgets nil (atom nil)))
+                                 max-staging-bytes (atom :ready) allocation-budgets nil (atom nil) caller-options))
        (catch Throwable e
          (try (close-sessions! @sessions) (catch Throwable cleanup (.addSuppressed e cleanup)))
-         (throw e))))))
+         (throw e)))))
+
+(defn instantiate!
+  "Admit a one-shot owner with explicit caller :scalar-math intent, before acquisition.
+   Default calls retain default math. Artifacts and plan metadata never authorize selection.
+   Transport, storage budgets and caller source lifetime retain their existing obligations."
+  ([plan] (instantiate! plan {}))
+  ([plan options]
+   (link-plan/without-validation-context #(instantiate-with-options! plan options))))
 
 (defn- device-observations [executable]
   (into {} (map (fn [[target session]]
@@ -234,6 +248,9 @@
     (route-context executable (device-observations executable))))
 
 (defn- execute! [executable profile?]
+  (when-not (original-executable? executable)
+    (throw (ex-info "execution requires the original distributed owner"
+                    {:reason :distributed-runtime-owner})))
   (locking (:state executable)
     (when-not (= :ready @(:state executable))
       (throw (ex-info "distributed execution is not ready" {:reason :distributed-runtime-state :state @(:state executable)})))
@@ -256,8 +273,9 @@
                   session (get (:sessions executable) (:target plan))
                   ids (set (map #(get-in % [:view :allocation :id]) (vals (:nodes plan))))
                   buffers (into {} (map (fn [id] [id (gpu/buffer session id)])) ids)]
-              (with-open [local (link/instantiate! plan {:session session :external-buffers buffers
-                                                       :profile? profile?})]
+              (with-open [local (link/instantiate! plan (merge (:caller-options executable)
+                                                             {:session session :external-buffers buffers
+                                                              :profile? profile?}))]
                 (if profile? (link/profile! local) (do (link/run! local) nil))))
             :transfer
             (let [action (actions id)]
@@ -309,7 +327,7 @@
   "Execute the DAG once, synchronously. Completion is recorded after each call returns.
    Failed/completed owners cannot replay stale initialization evidence."
   [executable]
-  (execute! executable false))
+  (link-plan/without-validation-context #(execute! executable false)))
 
 (defn profile!
   "Execute once with existing Link kernel profiling and awaited transfer-event measurements.
@@ -325,13 +343,16 @@
   (when-not (original-executable? executable)
     (throw (ex-info "profiling requires the original distributed owner"
                     {:reason :distributed-runtime-owner})))
-  (execute! executable true))
+  (link-plan/without-validation-context #(execute! executable true)))
 
 (defn output-values
   "Return retained compute outputs as step-id -> logical-value-id -> resident value.
    Views borrow the enclosing execution lifetime and are available only after successful completion.
    A transfer-only completion has no local logical output values."
   [executable]
+  (when-not (original-executable? executable)
+    (throw (ex-info "outputs require the original distributed owner"
+                    {:reason :distributed-runtime-owner})))
   (locking (:state executable)
     (when-not (= :complete @(:state executable))
       (throw (ex-info "distributed outputs require completed execution"
@@ -357,7 +378,7 @@
                    (reset! (:state executable) :reading-outputs)
                    values))]
     (try
-      (read! values)
+      (link-plan/without-validation-context #(read! values))
       (finally
         (locking (:state executable)
           (reset! (:state executable) (state-after)))))))
@@ -447,7 +468,7 @@
                         {:reason :distributed-representation-mismatch :target target :dtype dt})))
       @fact)))
 
-(defn close! [executable]
+(defn- close-without-context! [executable]
   (locking (:state executable)
     (when (= :reading-outputs @(:state executable))
       (throw (ex-info "distributed output read scope retains the owner lifetime"
@@ -462,3 +483,6 @@
         (reset! staging nil))
       (reset! (:state executable) :closed)))
   nil)
+
+(defn close! [executable]
+  (link-plan/without-validation-context #(close-without-context! executable)))
