@@ -66,8 +66,7 @@
           'bit-shift-left 'bit-shift-right 'unsigned-bit-shift-right
           'Math/sin 'Math/cos 'Math/tan 'Math/exp 'Math/log 'Math/sqrt
           'Math/pow 'Math/abs 'Math/max 'Math/min 'Math/atan2
-          'Math/floor 'Math/ceil 'Math/round 'Math/fma
-          '.invk}
+          'Math/floor 'Math/ceil 'Math/round 'Math/fma}
         (map (fn [s] (symbol "clojure.core" (name s)))
              '[+ - * / inc dec min max abs
                double float long int byte short

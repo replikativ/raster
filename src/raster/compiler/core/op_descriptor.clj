@@ -688,6 +688,21 @@
   (when (seq? form)
     (if (= '.invk (first form)) (nnext form) (rest form))))
 
+(defn call-description
+  "Decompose retained call syntax without conflating meaning with implementation.
+   :semantic-op is the sanctioned source identity; :recorded-op also retains legacy :op
+   metadata for AD compatibility. :operation falls back to the concrete implementation for
+   rule lookup only. None of these identities certifies purity or carrier support."
+  [form]
+  (when (seq? form)
+    (let [dispatch? (= '.invk (first form))
+          semantic (semantic-op form)
+          recorded (or semantic (when dispatch? (:op (meta form))))
+          implementation (if dispatch? (second form) (first form))]
+      {:dispatch? dispatch? :semantic-op semantic :recorded-op recorded
+       :implementation-op implementation :operation (or recorded implementation)
+       :arguments (vec (call-args form))})))
+
 (defn- unwrap-array-arg
   "Unwrap a cast wrapper around an array argument — (double arr) → arr,
    (float arr) → arr — and strip metadata/namespace from a bare symbol so it
