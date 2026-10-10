@@ -20,6 +20,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
 (def ^:private tc-check-form-info-fn
@@ -312,6 +313,24 @@
   binding types and regress devirtualization."
   false)
 
+(defn- check-with-ast-fallback
+  "TC's optional checked AST can fail during its internal compilation (primitive :tag).
+   Retain its compatibility retry, but never turn compiler invariants or JVM Errors into
+   missing type enrichment. Ordinary TC exceptions remain optional-analysis declines."
+  [check-fn wrapped fn-name]
+  (try
+    (check-fn wrapped {:checked-ast true :check-config {:check-form-eval :never}})
+    (catch Exception first-error
+      (util/rethrow-compiler-invariant! first-error)
+      (try
+        (check-fn wrapped {})
+        (catch Exception retry-error
+          (util/rethrow-compiler-invariant! retry-error)
+          (when fn-name
+            (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
+                          (.getMessage first-error) " → retry: " (.getMessage retry-error))))
+          nil)))))
+
 (defn tc-analyze-deftm-body
   "Analyze a deftm body once with Typed Clojure.
 
@@ -347,16 +366,7 @@
                                     (if (instance? clojure.lang.Namespace source-ns)
                                       source-ns (the-ns source-ns))
                                     *ns*)]
-                     (try (check-fn wrapped {:checked-ast true
-                                             :check-config {:check-form-eval :never}})
-                          (catch Throwable e1
-                          ;; Fallback: retry without checked-ast if TC's internal
-                          ;; compilation fails (e.g., primitive :tag on let bindings)
-                            (try (check-fn wrapped {})
-                                 (catch Throwable e2
-                                   (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
-                                                 (.getMessage e1) " → retry: " (.getMessage e2)))
-                                   nil)))))]
+                     (check-with-ast-fallback check-fn wrapped fn-name))]
         (when result
           (when (and (seq (:type-errors result))
                      (or *tc-warn-on-error?*
@@ -392,6 +402,7 @@
                    :stability-warning stability-warning
                    :binding-tags (or binding-tags {})})))))))
     (catch Exception e
+      (util/rethrow-compiler-invariant! e)
       ;; TC analysis failure — fall through to walker heuristics
       (when *tc-warn-on-error?*
         (binding [*out* *err*]
@@ -407,7 +418,8 @@
   [fn-name params annotations body source-ns]
   (try
     (:binding-tags (tc-analyze-deftm-body fn-name params annotations body source-ns))
-    (catch Throwable e
+    (catch Exception e
+      (util/rethrow-compiler-invariant! e)
       (when *tc-warn-on-error?*
         (binding [*out* *err*]
           (println (str "[raster.tc] binding-tag analysis failed for `" fn-name "`: "
@@ -453,15 +465,13 @@
                                      [sym :- tc-type]))
                                  param-env))
           wrapped (list 'clojure.core.typed/fn fn-params tc-form)
-          result (try (check-fn wrapped {:checked-ast true
-                                         :check-config {:check-form-eval :never}})
-                      (catch Throwable _
-                        (try (check-fn wrapped {})
-                             (catch Throwable _ nil))))]
+          result (check-with-ast-fallback check-fn wrapped nil)]
       (when (and result (empty? (:type-errors result)))
         (when-let [ast (:checked-ast result)]
           (collect-binding-types-from-checked-ast ast))))
-    (catch Throwable _ nil)))
+    (catch Exception error
+      (util/rethrow-compiler-invariant! error)
+      nil)))
 
 ;; ================================================================
 ;; Literal type inference

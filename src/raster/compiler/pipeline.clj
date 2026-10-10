@@ -127,12 +127,7 @@
   (let [type-env (inf/build-param-type-env params tags annotations)
         ;; Run TC for per-binding type inference
         tc-binding-tags (when annotations
-                          (try
-                            (:binding-tags (inf/tc-analyze-deftm-body '<compile> params annotations body source-ns))
-                            (catch Throwable e
-                              (binding [*out* *err*]
-                                (println (str "WARNING: TC analysis failed at compile time: " (.getMessage e))))
-                              nil)))
+                          (inf/safe-tc-binding-tags '<compile> params annotations body source-ns))
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
                     (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
@@ -159,12 +154,9 @@
                 ;; a float body). Same effective-dtype rule the pass pipeline
                 ;; (pe-rewalk) applies to its re-walks of this body.
                 element-dtype (or dtype (infer-dtype resolved))
-                walked (try (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)
-                            (catch Throwable t
-                              (binding [*out* *err*]
-                                (println "WARNING: walker re-walk failed for" f-var
-                                         "- falling back to pre-walked body:" (.getMessage t)))
-                              nil))]
+                ;; Available source is authoritative. A failed fresh walk is a compiler failure,
+                ;; not permission to execute a stale definition-time body with older type facts.
+                walked (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)]
             ;; SSA-normalize let* rebindings (seeded with the params) BEFORE the
             ;; pass pipeline: a rebinding like `x = (alloc-op x)` otherwise
             ;; conflates the op's input and freshly-allocated output buffer in
@@ -174,7 +166,7 @@
             (when walked
               (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
                 (mapv #(util/uniquify-rebindings param-syms %) walked)))))
-        ;; Fallback: use pre-walked body from definition time or lazy walk
+        ;; Legacy source-less metadata: use a pre-walked body only when no source was available.
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
         (rcore/ensure-walked-body! resolved)
