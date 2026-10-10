@@ -98,6 +98,33 @@
                      :actual (count actual) :expected (count expected)})))
   ((oracle 'worst-rel) actual expected))
 
+(defn- difference-summary
+  "Diagnostic only: never substitutes for the pinned oracle's componentwise error."
+  [actual expected]
+  (when-not (= (count actual) (count expected))
+    (throw (ex-info "diagnostic array lengths differ"
+                    {:reason :external-training-shape
+                     :actual (count actual) :expected (count expected)})))
+  (reduce (fn [summary [index a b]]
+            (let [a (double a) b (double b)
+                  finite? (and (Double/isFinite a) (Double/isFinite b))
+                  absolute (Math/abs (- a b))]
+              (if finite?
+                (cond-> (update summary :max-finite-absolute-error max absolute)
+                  (or (nil? (:worst-finite-absolute-coordinate summary))
+                      (> absolute (get-in summary [:worst-finite-absolute-coordinate
+                                                   :absolute-error])))
+                  (assoc :worst-finite-absolute-coordinate
+                         {:index index :actual a :expected b :absolute-error absolute}))
+                (-> summary
+                    (update :nonfinite-coordinate-count inc)
+                    (update :first-nonfinite-coordinate
+                            #(or % {:index index :actual a :expected b}))))))
+          {:length (count actual) :max-finite-absolute-error 0.0
+           :worst-finite-absolute-coordinate nil :nonfinite-coordinate-count 0
+           :first-nonfinite-coordinate nil}
+          (map vector (range) actual expected)))
+
 (defn- prepare-chain [train target-device cfg weights adapters input target]
   (let [n (* (:seq cfg) (:d cfg))
         options {:compiler :equation-first :target target-device :dtype :float :inline? true}
@@ -158,7 +185,8 @@
 
 (defn run-loaded!
   "Run two full resident updates against the unchanged CPU monolithic AD oracle.
-   Downloads are oracle reads only. Every native artifact closes, including on mismatch."
+   Downloads are oracle reads only. Binding metadata is not a replay or timing witness.
+   Every native artifact closes, including on mismatch or failed inspection."
   [{:keys [train oracle]} target-device]
   (let [cfg @(oracle 'chain-cfg)
         n (* (:seq cfg) (:d cfg))
@@ -172,8 +200,10 @@
         live (compiled/instantiate! prepared)
         binding-ns (- (System/nanoTime) started)]
     (try
-      {:revision source-revision :target target-device :config cfg
+      (let [bound-schedules (compiled/execution-info live)]
+       {:revision source-revision :target target-device :config cfg
        :preparation-ns preparation-ns :binding-ns binding-ns
+       :bound-schedules bound-schedules
        :numerical-calls (mapv #(count (filter :graph (get-in % [:call :steps])))
                              (:instances (compiled/plan prepared)))
        :replays
@@ -212,11 +242,25 @@
                             (or (nil? previous) (not (value/live? (:prediction previous)))))
                (throw (ex-info "external chain differs from the monolithic CPU AD oracle"
                                {:reason :external-training-parity :iteration iteration
-                                :loss-error loss-error :dx-error dx-error :adapter-errors errors})))
+                                :predicted-loss predicted-loss :reference-loss reference-loss
+                                :loss-error loss-error :dx-error dx-error :adapter-errors errors
+                                :bound-schedules bound-schedules
+                                :dx-diagnostics
+                                (difference-summary (value/->host (:dx0 outputs)) (nth vg 1))
+                                :adapter-diagnostics
+                                (vec (for [layer [0 1]
+                                           [index key] (map-indexed vector @(train 'adapter-keys))]
+                                       (assoc (difference-summary
+                                               ((recovered layer) key)
+                                               (nth vg (+ 2 (* layer 27)
+                                                          (get @(oracle 'adapter-pos) key))))
+                                              :layer layer :adapter key
+                                              :oracle-relative-error
+                                              (errors (+ (* layer 14) index)))))})))
              (recur (inc iteration) updated outputs
                     (conj results {:loss predicted-loss :reference-loss reference-loss
                                    :loss-error loss-error :dx-error dx-error
-                                   :adapter-count (count errors) :adapter-max-error (apply max errors)})))))}
+                                   :adapter-count (count errors) :adapter-max-error (apply max errors)})))))})
       (finally (compiled/close! live)))))
 
 (defn run! [{:keys [source-root targets] :or {targets [:ocl:0 :ze:0]}}]
