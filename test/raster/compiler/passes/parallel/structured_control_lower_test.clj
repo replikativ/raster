@@ -125,6 +125,7 @@
                            (get-in scheduled [:graph :nodes]))
         graph (opencl/generate-kernel-graph (:graph scheduled)
                                            :scalar-types {'alpha-in :float 'n-in :int}
+                                           :scalar-math (:scalar-math request)
                                            :scheduled-bodies certificates)
         emitted (emitted-loop/make scheduled graph {} request)
         call (program-call/make
@@ -297,6 +298,7 @@
         emit (fn [caller-options]
                (opencl/generate-kernel-graph graph
                                             :scalar-types (:scalar-types options)
+                                            :scalar-math (:scalar-math caller-options)
                                             :scheduled-bodies (certificates caller-options)))
         selected (emit {:scalar-math policy})
         default (emitted-loop/make scheduled (emit {}))
