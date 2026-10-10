@@ -685,7 +685,7 @@
                                        (select-keys opts [:scalar-math])))]
                  (kernel-body-target/emit-artifact
                   (str "graph_contraction_" (gensym "")) scheduled target-dialect
-                  (select-keys opts [:target-descriptor :scalar-math])))
+                  (assoc (select-keys opts [:scalar-math]) :target-descriptor descriptor)))
                ;; Scalar reductions are certified against their complete graph context before
                ;; projection. Do not add the older artifact-only operation wrapper outside it.
                (apply generate-segred-kernel operation (first outputs)

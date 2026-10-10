@@ -90,6 +90,24 @@
             (is (not (contains? (mixed-body/matrix-stage-spec stage :matrix-contract scalar-types)
                                 :parameter-names)))))))))
 
+(deftest mixed-matrix-context-reaches-all-storage-and-combine-stages
+  (let [spec {:id :all-stage-context :a 'a :b 'b :c 'c :m :m :n :n :k :k
+              :variant :tn :tile (hardware/derive-gemm-tile {})
+              :vector-width 4 :requested-splits 8 :split-k? true}
+        graph (:graph (mixed-schedule/plan spec))
+        context {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+                 :target-descriptor {:execution {:scalar-dtype-support {:double :unknown}}}}
+        received (atom [])
+        emit kernel-body-target/emit-artifact]
+    (with-redefs [kernel-body-target/emit-artifact
+                  (fn [name scheduled dialect options]
+                    (swap! received conj (select-keys options [:scalar-math :target-descriptor]))
+                    (emit name scheduled dialect options))]
+      (is (= (count (:nodes graph))
+             (count (:nodes (gemm/emit-scheduled-stage-graph graph context))))))
+    (is (> (count (:nodes graph)) 2) "fixture includes storage stages and a split combine")
+    (is (= (vec (repeat (count (:nodes graph)) context)) @received))))
+
 (deftest mixed-matrix-reconstruction-retains-independent-caller-math-consent
   (let [base {:id :selected-matrix-math :a 'a :b 'b :c 'c :m :m :n :n :k :k
               :variant :nn :tile (hardware/derive-gemm-tile {})

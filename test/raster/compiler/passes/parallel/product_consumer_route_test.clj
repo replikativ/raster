@@ -3,6 +3,7 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -71,6 +72,23 @@
                                              selected :opencl-portable caller-options)))))
           (is (= [caller-options] @received)
               "fused route forwards independent request and hardware, including an unused override"))))))
+
+(deftest resolved-product-consumer-target-reaches-emission
+  (let [program (#'fixtures/scheduled-product-consumer)
+        plan (region/analyze program (#'fixtures/numerical-equations program))
+        descriptor (assoc-in subgroup-device [:execution :scalar-dtype-support :double] :unknown)
+        policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        received (atom [])
+        emit route/emit]
+    (with-redefs [hardware/descriptor-for (fn [_] descriptor)
+                  route/emit (fn [name routed dialect options]
+                               (swap! received conj options)
+                               (emit name routed dialect options))]
+      (is (some? (#'c-family/emit-product-consumer
+                   plan {:target-device :resolved-product-device :target-dialect :opencl-portable
+                         :scalar-math policy}))))
+    (is (= [{:target-descriptor descriptor :scalar-math policy}] @received)
+        "resolved hardware survives even when its wider capability is unknown and unused")))
 
 (deftest exact-two-node-region-refines-to-one-cooperative-node
   (let [{scheduled-body :scheduled scheduled-graph :graph witness :refinement}
