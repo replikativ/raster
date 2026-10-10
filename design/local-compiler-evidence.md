@@ -80,6 +80,21 @@ was not rerun. Runtime reporting now labels all 56 register-tiled admission
 records with the named widening policy; 101 generic records have no precision
 label. This is a local diagnostic, not whole-model or performance acceptance.
 
+Further traces on the original tanh-only widened candidate retain all fifteen
+untapped outputs bit-for-bit. Normalization backward reproduces device output
+exactly from captured activation/cotangent and original CPU weights (the weights
+were not device-captured); RoPE backward, single-KV-head layout copying and
+KV-head summation also reproduce exactly. Independent ordered Float replay of
+the causal dK body matches both the untouched CPU helper and device output on
+their respective inputs. DW and denominator-gradient reductions match CPU
+helpers exactly on captured device inputs. These controls place differences in
+incoming intermediates rather than establishing a defect in those bodies.
+The same-score softmax control differs in two of sixteen weights, by at most
+3.72529e-9; CPU-versus-device scores differ by at most 2.38419e-6. Neither
+comparison proves universal library accuracy or closes the original model gate.
+Provenance is the local `/tmp/raster-bound-layer1-ak-{norm,rope,layout,fanin,dk,dw,softmax}-trace.clj`
+scripts; these remain scratch diagnostics, not committed portable regressions.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression
