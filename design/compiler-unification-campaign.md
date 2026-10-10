@@ -1,5 +1,22 @@
 # Compiler unification campaign
 
+### October 9 physical compute lanes follow explicit worker placement
+
+A reproduced simulator gap gave independent compute lanes to logical workers
+explicitly placed on the same physical target. Compute steps and transfer
+`:serialized-on` claims now share one nonrecursive worker-to-target projection.
+Claims resolving to the same lane are deduplicated. Unplaced workers and
+topology-only relay identities retain their original lanes; distinct physical
+targets remain independent. Route-resource certificate witnesses use the same
+projection and reject placement changes even when makespan is unchanged.
+
+Logical compute totals, transfer bytes and per-worker peak-memory reports remain
+unchanged. `:physical-compute-ns` additionally reports accumulated compute service
+by physical target, not transfer-inclusive busy time. Physical memory-capacity
+aggregation, link-sharing discovery and actual asynchronous distributed execution
+remain separate obligations. This changes planning resource accounting, not the
+surface numerical program, kernel emission or source arithmetic.
+
 ### October 9 explicit empirical route-cost simulation
 
 The existing simulator now accepts optional live route context, supplied profile
