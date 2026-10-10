@@ -45,7 +45,7 @@ selected_files() {
   find test -type f -name '*_test.clj' -printf '%s\t%p\n' \
     | while IFS=$'\t' read -r bytes file; do
         if [[ "${selection}" == "opencl" ]] \
-           && ! grep -Eq 'opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?' "${file}"; then
+           && ! grep -Eq 'opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?|:raster.test/opencl-gate[[:space:]]+true' "${file}"; then
           continue
         fi
         printf '%s\t%s\n' "${bytes}" "${file}"

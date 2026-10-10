@@ -34,6 +34,20 @@ intrinsic namespace cost: compare multiple runs, preserve process startup overhe
 and remeasure after partition changes. Timing instrumentation is diagnostic, not a noisy CI
 wall-time regression assertion.
 
+The compiled-training acceptance fixture is split between hardware-free compiler tests and
+actual-device tests, sharing definitions and independent oracles in a non-test fixture namespace.
+All eight cases retain their original bodies, including unequal batches, three update epochs,
+fresh scratch, exact parameter ownership, analytic/rounded oracles and capability skips. A
+test-inventory check ensures each case is declared once. Tests do not share mutable parameters,
+plans or native owners to save compilation.
+
+Compiler companions that must remain in the OpenCL job declare
+`{:raster.test/opencl-gate true}` in their namespace attribute map. The shard selector honors
+this marker in addition to existing availability probes; it does not claim native execution.
+The training compiler companion uses it so repartitioning loses no OpenCL-job coverage.
+Recollect namespace weights after splitting: previous per-var timings explain the partition,
+but are not fresh namespace costs or measured speedups.
+
 Landing order:
 
 1. Collect load/test timings without dropping coverage.

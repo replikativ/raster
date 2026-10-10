@@ -60,7 +60,7 @@
         rows (mapv #(str/split % #"\t") (str/split-lines (:out plan)))
         expected (into #{}
                        (for [path (vals (weights/test-paths))
-                             :when (re-find #"opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?"
+                             :when (re-find #"opencl-(fp16-|fp64-|gpu-|subgroups-)?available\?|:raster.test/opencl-gate\s+true"
                                             (slurp path))]
                          path))
         selected (mapv (fn [shard]
@@ -70,6 +70,9 @@
                        (range 4))]
     (is (zero? (:exit plan)) (:err plan))
     (is (= expected (set (map last rows))))
+    (is (contains? expected "test/raster/compiler/ir/distributed_training_test.clj")
+        "hardware-free training companions retain OpenCL job coverage after splitting")
+    (is (contains? expected "test/raster/gpu/distributed_training_device_test.clj"))
     (is (= (count expected) (count rows)))
     (is (= (count expected) (count (distinct (mapcat identity selected)))))
     (is (= (set (map #(nth % 2) rows)) (set (mapcat identity selected))))
@@ -78,6 +81,36 @@
                             "bash" "scripts/ci-test-shard.sh" "--plan"
                             :env (assoc (into {} (System/getenv))
                                         "RASTER_TEST_SELECTION" "unknown"))))))))
+
+(defn- declared-tests [path]
+  (binding [*read-eval* false]
+    (with-open [reader (java.io.PushbackReader. (io/reader path))]
+      (loop [names []]
+        (let [form (read {:eof ::end} reader)]
+          (cond
+            (= ::end form) names
+            (and (seq? form) (= 'deftest (first form)))
+            (recur (conj names (second form)))
+            :else (recur names)))))))
+
+(deftest training-partition-preserves-all-eight-cases-once
+  (let [compiler (declared-tests "test/raster/compiler/ir/distributed_training_test.clj")
+        device (declared-tests "test/raster/gpu/distributed_training_device_test.clj")
+        all (concat compiler device)]
+    (is (= 4 (count compiler)))
+    (is (= 4 (count device)))
+    (is (= 8 (count (distinct all))))
+    (is (= '#{repeated-local-ad-matches-rounded-independent-oracle
+              finite-training-composition-retains-parameters-and-orders-updates
+              unequal-batch-local-ad-producers-match-independent-analytic-gradients
+              differentiated-training-assembly-certifies-without-device-resources
+              finite-multi-step-ad-all-reduce-sgd-on-local-devices
+              scalar-loss-as-an-explicit-rank-zero-distributed-output
+              actual-ad-all-reduce-sgd-on-colocated-opencl-workers
+              actual-ad-all-reduce-sgd-on-colocated-level-zero-workers}
+           (set all)))
+    (is (empty? (declared-tests "test/raster/compiler/fixtures/distributed_training.clj"))
+        "the common fixture cannot cause duplicate test execution")))
 
 (deftest malformed-timing-data-fails-before-test-selection
   (let [file (java.io.File/createTempFile "raster-invalid-weights-" ".tsv")]
