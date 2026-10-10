@@ -16,6 +16,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -298,7 +299,7 @@
            register! (resolve 'raster.gpu.ze-runtime/register-kernel-dispatch!)
            _ (register! dispatch)
            _ (pipeline/invoke-scheduled-executable!
-              :ze:0 (:id dispatch) [input output scale n])
+              :ze:0 (kernel-dispatch/registration-key dispatch) [input output scale n])
            actual (aget output 0)
            expected (reduce + 0.0 (map #(* scale (double %)) (seq input)))]
        (is (= 2 (count (:kernels compiled))))

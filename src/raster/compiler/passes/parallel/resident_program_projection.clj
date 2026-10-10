@@ -124,7 +124,7 @@
       (fail! :resident-projection-invocation
              "resident emitted-program projection requires its typed invocation plan" {}))
     (let [operations (numerical-operations program)
-          dispatches (mapv graph-dispatch (range) operations)
+          dispatches (mapv (comp dispatch/with-registration-key graph-dispatch) (range) operations)
           graphs (mapv dispatch/default-alternative dispatches)
           required (required-prefix-symbols plan graphs)
           prefix-steps (filterv #(contains? required (:symbol %)) (:steps plan))
@@ -139,7 +139,7 @@
                    policy (if (= 1 (count result-slots)) :single :none)]
                [(symbol (str "resident_emitted_step_" ordinal))
                 (list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                      device-id (:id graph-dispatch) (vec (:arguments graph)) policy)]))
+                      device-id (dispatch/registration-key graph-dispatch) (vec (:arguments graph)) policy)]))
            (range) graphs dispatches)
           result (case (count (:outputs program))
                    0 nil

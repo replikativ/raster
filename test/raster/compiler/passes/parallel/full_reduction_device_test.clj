@@ -159,7 +159,7 @@
             y (float-array (max 1 n) 0.5)
             out (float-array [123.0 456.0])]
         (is (identical? out (gpu/invoke-staged-executable!
-                            target (:id kernel-dispatch) [x y out (long n)])))
+                            target (dispatch/registration-key kernel-dispatch) [x y out (long n)])))
         (is (= [(float (reduce combine identity (repeat n 0.5))) 456.0] (vec out))
             "ordinary staged invocation preserves the unwritten output tail")))))
 

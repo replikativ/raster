@@ -1052,7 +1052,7 @@
          dispatch (cond-> dispatch
                     (contains? dispatch :arena-id) (dissoc :arena-id)
                     arena-id (assoc :arena-id arena-id))]
-     (swap! kernel-dispatch-registry update (:id dispatch)
+     (swap! kernel-dispatch-registry update (kdispatch/registration-key dispatch)
             kdispatch/admit-registration dispatch)
      dispatch)))
 

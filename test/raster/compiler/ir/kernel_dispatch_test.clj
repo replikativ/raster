@@ -41,6 +41,64 @@
 (def ^:private subgroup
   (artifact "dispatch_subgroup" :subgroup-score-reuse 16))
 
+(deftest emitted-registration-identities-preserve-tuning-families
+  (let [base (kdispatch/make
+              {:id "shared-tuning-family" :alternatives [reference subgroup]
+               :default-strategy :reference
+               :selector {:kind :fixed-strategy :strategy :reference}})
+        left (kdispatch/with-registration-key base)
+        right (kdispatch/with-selector left
+                                      {:kind :fixed-strategy :strategy :subgroup-score-reuse})
+        key-left (kdispatch/registration-key left)
+        key-right (kdispatch/registration-key right)]
+    (is (= (:id left) (:id right) "shared-tuning-family"))
+    (is (not= key-left key-right))
+    (is (= key-left (kdispatch/registration-key (kdispatch/with-registration-key base))))
+    (let [key-for (fn [argument]
+                    (kdispatch/registration-key
+                     (kdispatch/with-registration-key
+                      (update base :alternatives
+                              #(mapv (fn [artifact]
+                                       (assoc artifact :arguments [argument 'out 'width])) %)))))]
+      (is (= (key-for 'x) (key-for (with-meta 'x {:line 100 :file "test.clj"}))))
+      (is (not= (key-for 'x) (key-for (with-meta 'x {:tag 'float})))))
+    (doseq [[registry register entry] [[#'ocl/kernel-dispatch-registry ocl/register-kernel-dispatch!
+                                      ocl/kernel-dispatch-registry-entry]
+                                     [#'ze/kernel-dispatch-registry ze/register-kernel-dispatch!
+                                      ze/kernel-dispatch-registry-entry]]]
+      (with-redefs-fn {registry (atom {})}
+        #(do (register left nil) (register right nil)
+             (is (= :reference (:strategy (:selector (entry key-left)))))
+             (is (= :subgroup-score-reuse (:strategy (:selector (entry key-right)))))
+             (is (= 2 (count @(var-get registry)))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not match"
+                         (kdispatch/registration-key
+                          (assoc left :selector (:selector right)))))
+    (is (not= key-left
+              (kdispatch/registration-key
+               (kdispatch/with-registration-key
+                (update base :alternatives
+                        #(mapv (fn [artifact] (assoc artifact :arguments '[a b width])) %))))))))
+
+(deftest emitted-registration-compares-verified-spirv-by-content
+  (let [make-dispatch (fn [payload]
+                        (kdispatch/with-registration-key
+                         (kdispatch/make
+                          {:id "spirv-content" :alternatives [(assoc reference :spv-bytes payload)]
+                           :default-strategy :reference
+                           :selector {:kind :fixed-strategy :strategy :reference}})))
+        left (make-dispatch (byte-array [1 2 3 4]))
+        copy (make-dispatch (byte-array [1 2 3 4]))
+        changed (make-dispatch (byte-array [1 2 3 5]))]
+    (is (= (kdispatch/registration-key left) (kdispatch/registration-key copy)))
+    (is (identical? left (kdispatch/admit-registration left copy)))
+    (is (not= (kdispatch/registration-key left) (kdispatch/registration-key changed)))
+    (aset-byte ^bytes (:spv-bytes (first (:alternatives copy))) 0 (byte 9))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"does not match"
+                         (kdispatch/registration-key copy)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-empty byte array"
+                         (make-dispatch [1 2 3 4])))))
+
 (deftest compiler-requirements-cannot-collide-under-one-entry-point
   (let [cl3 (-> reference
                 (assoc-in [:attributes :strategy] :cl3)

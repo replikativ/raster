@@ -656,10 +656,11 @@
                            :default-strategy strategy
                            :selector {:kind :fixed-strategy :strategy strategy}
                            :provenance {:pass :opencl :source-dialect :kernel-body}
-                           :attributes {:operation-family :scheduled-artifact}})]
+                           :attributes {:operation-family :scheduled-artifact}})
+                dispatch (kdispatch/with-registration-key dispatch)]
             (swap! dispatches conj dispatch)
             (list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                  device-id (:id dispatch) (vec (:arguments artifact)) result-policy)))
+                  device-id (kdispatch/registration-key dispatch) (vec (:arguments artifact)) result-policy)))
 
         emit-nested-map!
         (fn [form]
@@ -716,7 +717,8 @@
                            :default-strategy :scheduled-graph
                            :selector {:kind :fixed-strategy :strategy :scheduled-graph}
                            :provenance {:pass :opencl :source-dialect :segop}
-                           :attributes {:operation-family :scheduled-graph}})]
+                           :attributes {:operation-family :scheduled-graph}})
+                dispatch (kdispatch/with-registration-key dispatch)]
             (swap! kernels into (mapv :operation (:nodes emitted)))
             (swap! dispatches conj dispatch)
             (swap! stats update :kernel-graphs inc)
@@ -752,7 +754,7 @@
                     (vec (:arguments emitted)))
                   invocation
                   (apply list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                         device-id (:id dispatch) invocation-arguments
+                         device-id (kdispatch/registration-key dispatch) invocation-arguments
                          (when (and (seq (:operations equation))
                                     (every? #(= :product (:phase %)) (:operations equation)))
                            [:none]))]
@@ -771,12 +773,13 @@
                 (if-let [dispatch0 (swr-route/dynamic-dispatch plan @target-desc schedule)]
                   (let [artifacts (mapv #(maybe-compile-spirv % compile-spirv? device-id)
                                         (:alternatives dispatch0))
-                        dispatch (kdispatch/validate! (assoc dispatch0 :alternatives artifacts))]
+                        dispatch (kdispatch/with-registration-key
+                                  (assoc dispatch0 :alternatives artifacts))]
                     (swap! stats update :ze-structured-reductions inc)
                     (swap! kernels into artifacts)
                     (swap! dispatches conj dispatch)
                     (list 'raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
-                          (:id dispatch)
+                          (kdispatch/registration-key dispatch)
                           (:kernel-name (kdispatch/default-alternative dispatch))
                           (vec (:arguments (kdispatch/default-alternative dispatch)))))
                   (let [routed (swr-route/route-dynamic! plan @target-desc)
@@ -934,7 +937,7 @@
                                           (maybe-compile-spirv (:operation node)
                                                                compile-spirv? device-id))))
                                      alternatives)))
-                          kdispatch/validate!)
+                          kdispatch/with-registration-key)
                       artifacts (mapv :operation (mapcat :nodes (:alternatives dispatch)))
                       executable (kdispatch/default-alternative dispatch)]
                   (swap! kernels into artifacts)
@@ -942,7 +945,7 @@
                   (swap! stats update :ze-contracts inc)
                   (swap! stats update :kernel-graphs inc)
                   (list 'raster.compiler.pipeline/invoke-scheduled-executable!
-                        device-id (:id dispatch) (vec (:arguments executable))))
+                        device-id (kdispatch/registration-key dispatch) (vec (:arguments executable))))
                 (let [r (ensure-contraction-marker-expressible!
                          (if bound-sr
                            (croute/route-typed-contraction
