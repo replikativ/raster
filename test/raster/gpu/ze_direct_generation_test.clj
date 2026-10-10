@@ -5,6 +5,8 @@
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-abi :as abi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.backend.gpu.storage-representation :as probe])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -25,6 +27,103 @@
                             (abi/slot 'n :scalar :long :role :bound)]
                       :workgroup-size 4}]
     {:name name :registration registration :registry (atom {name registration})}))
+
+(defn- reduction-fixture [dtype groups]
+  (let [name (str "generation_reduction_" (clojure.core/name dtype))
+        ctype (clojure.core/name dtype)
+        registration (artifact/make
+                      {:kernel-name name :target :opencl-c
+                       :source (str "__kernel void " name "(__global const " ctype
+                                    " *x, __global " ctype " *out, " ctype " scale, long n) {}")
+                       :abi [(abi/slot 'x :input dtype)
+                             (abi/slot 'out :output dtype :role :result)
+                             (abi/slot 'scale :scalar dtype)
+                             (abi/slot 'n :scalar :long :role :bound)]
+                       :arguments '[x out scale n]
+                       :launch (launch/spec {:workgroup-size [4] :group-count [groups]})
+                       :attributes {:identity-val 0.0 :c-op "+"}})]
+    {:name name :registration registration :registry (atom {name registration})}))
+
+(deftest reduction-replacement-after-geometry-precedes-native-use
+  (let [{:keys [name registration registry]} (reduction-fixture :float 3)
+        replacement (assoc-in registration [:attributes :c-op] "*")
+        realize call/realize-launch
+        seen (atom [])
+        v #(ns-resolve 'raster.gpu.ze-runtime %)]
+    (with-redefs-fn
+      {#'ze/kernel-registry registry
+       #'call/realize-launch (fn [a arguments]
+                              (let [geometry (realize a arguments)]
+                                (swap! registry assoc name replacement)
+                                geometry))
+       (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))
+       (v 'ensure-seg) (fn [_ _ ^long _] (swap! seen conj :stage))}
+      #(do
+         (is (= :registry-generation-changed
+                (:reason (ex-data (error-of (fn [] (ze/invoke-registered-reduction-kernel
+                                                   name [(float-array 12) nil {:type :float :value (float 2.0)}
+                                                         {:type :long :value 12}])))))))
+         (is (empty? @seen))
+         (is (identical? replacement (get @registry name)))))))
+
+(deftest reduction-partial-count-and-independent-rounded-combine-survive-admission
+  (doseq [[dtype groups partials expected]
+          [[:float 1 [3.25] 3.25]
+           [:float 3 [16777216.0 1.0 -16777216.0] 0.0]
+           [:double 3 [16777216.0 1.0 -16777216.0] 1.0]]]
+    (let [{:keys [name registry]} (reduction-fixture dtype groups)
+          array-fn (if (= :float dtype) float-array double-array)
+          output (array-fn partials)
+          input (array-fn 12)
+          element-bytes (if (= :float dtype) 4 8)
+          seen (atom [])
+          v #(ns-resolve 'raster.gpu.ze-runtime %)]
+      (with-redefs-fn
+        {#'ze/kernel-registry registry
+         (v 'ensure-kernel-loaded!) (fn [_]
+                                     (is (Thread/holdsLock registry))
+                                     (swap! registry update name assoc :kernel-handle :original)
+                                     {:kernel-handle :original})
+         (v 'ensure-seg) (fn [_ key ^long bytes]
+                          (is (Thread/holdsLock registry))
+                          (is (= (* element-bytes (if (= :partial-seg key) groups 12)) bytes))
+                          (MemorySegment/ofArray (if (= :partial-seg key) output input)))
+         #'ze/launch! (fn [handle ^long count ^long workgroup arguments]
+                        (is (= :registration-in-use
+                               (:reason (ex-data (error-of (fn [] (cleanup/assert-registry-mutable! registry)))))))
+                        (swap! seen conj [handle count workgroup (drop 2 arguments)]))}
+        #(do
+           (is (= expected (ze/invoke-registered-reduction-kernel
+                            name [(array-fn 12) nil {:type dtype :value (if (= :float dtype) (float 2.0) 2.0)}
+                                  {:type :long :value 12}])))
+           (is (= [[:original groups 4 [{:type dtype :value (if (= :float dtype) (float 2.0) 2.0)}
+                                       {:type :long :value 12}]]] @seen))
+           (is (nil? (cleanup/assert-registry-mutable! registry))))))))
+
+(deftest reduction-failures-preserve-identity-and-release-native-use
+  (doseq [phase [:launch :combine]]
+    (let [{:keys [name registry]} (reduction-fixture :float 3)
+          failure (ex-info "reduction injected failure" {:phase phase})
+          seen (atom [])
+          v #(ns-resolve 'raster.gpu.ze-runtime %)
+          fail! (fn []
+                  (is (= :registration-in-use
+                         (:reason (ex-data (error-of (fn [] (cleanup/assert-registry-mutable! registry)))))))
+                  (throw failure))]
+      (with-redefs-fn
+        {#'ze/kernel-registry registry
+         (v 'ensure-kernel-loaded!) (fn [_] {:kernel-handle :original})
+         (v 'ensure-seg) (fn [_ _ ^long _] (MemorySegment/ofArray (float-array 12)))
+         #'ze/launch! (fn [_ ^long _count ^long _workgroup _args]
+                        (swap! seen conj :launch)
+                        (when (= phase :launch) (fail!)))
+         (v 'combine-scalar-partials) (fn [& _] (swap! seen conj :combine) (fail!))}
+        #(do
+           (is (identical? failure (error-of (fn [] (ze/invoke-registered-reduction-kernel
+                                                   name [(float-array 12) nil {:type :float :value (float 2.0)}
+                                                         {:type :long :value 12}])))))
+           (is (= (if (= phase :launch) [:launch] [:launch :combine]) @seen))
+           (is (nil? (cleanup/assert-registry-mutable! registry))))))))
 
 (deftest map-replacement-after-pure-admission-precedes-native-use
   (let [{:keys [name registration registry]} (map-fixture)
