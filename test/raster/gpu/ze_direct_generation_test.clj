@@ -100,3 +100,24 @@
                          (error-of (fn [] (ze/invoke-registered-contraction!
                                           name [(float-array 2)])))))
          (is (nil? (cleanup/assert-registry-mutable! registry)))))))
+
+(deftest readback-failure-keeps-identity-and-releases-use-guard
+  (let [{:keys [name registry]} (fixture)
+        primary (ex-info "injected readback failure" {})
+        v #(ns-resolve 'raster.gpu.ze-runtime %)]
+    (with-redefs-fn
+      {#'ze/kernel-registry registry
+       (v 'ensure-seg) (fn [_ _ ^long _] (MemorySegment/ofArray (float-array 2)))
+       (v 'ensure-kernel-loaded!) (fn [_] {:kernel-handle :original})
+       #'ze/launch-geometry! (fn [& _] nil)
+       (v 'readback-operand!) (fn [& _]
+                               (is (= :registration-in-use
+                                      (:reason (ex-data
+                                                (error-of #(cleanup/assert-registry-mutable!
+                                                            registry))))))
+                               (throw primary))}
+      #(do
+         (is (identical? primary
+                         (error-of (fn [] (ze/invoke-registered-contraction!
+                                          name [(float-array 2)])))))
+         (is (nil? (cleanup/assert-registry-mutable! registry)))))))
