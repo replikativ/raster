@@ -908,6 +908,44 @@ stable physical-leaf order on every backend."}
 
 (declare var-ref-tag)
 
+(defn- method-signature
+  "Project a selected registered method through its actual implementation Var.
+   This projection does not specialize, register or execute a method."
+  [fn-sym result]
+  (when result
+    (let [entry (:entry result)
+          casts (:casts result)
+          mangled-sym (symbol (str (types/mangle fn-sym (:tags entry))))
+          v (resolve fn-sym)
+          ns-str (str (:ns (meta v)))
+          fq-mangled (symbol ns-str (str mangled-sym))
+          resolved (or (resolve fq-mangled)
+                       (ns-resolve *ns* mangled-sym)
+                       (when-let [mns (:mangled-ns entry)]
+                         (ns-resolve (the-ns mns) mangled-sym)))
+          actual-sym (when resolved
+                       (symbol (str (:ns (meta resolved)))
+                               (str (:name (meta resolved)))))]
+      (when actual-sym
+        (cond-> {:mangled-sym actual-sym
+                 :tags (:tags entry)
+                 :typed-impl (:typed-impl entry)
+                 :typed-iface (:typed-iface entry)
+                 :has-fn-params (boolean (:raster.core/has-fn-params (meta resolved)))
+                 :return-tag (:raster.core/return-tag (meta resolved))}
+          (and casts (some some? casts))
+          (assoc :promotion-casts casts))))))
+
+(defn registered-call-signature
+  "Query existing compiler dispatch selection for an exact argument-tag tuple.
+   Returns selected implementation, declared result tag and any promotion casts.
+   Requires known tags; unlike try-resolve-call, never synthesizes arguments or
+   specializes a parametric template. A nil result is not evidence of safety."
+  [fn-sym arg-tags]
+  (when (and (symbol? fn-sym) (every? some? arg-tags))
+    (when-let [table (get-dispatch-table fn-sym)]
+      (method-signature fn-sym (resolve-method-entry table (vec arg-tags))))))
+
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
   type-env: {sym → {:tag, :fn-info, :element}}
@@ -951,31 +989,7 @@ stable physical-leaf order on every backend."}
                     direct direct
                     ;; No entry at all — try parametric specialization.
                     :else (specialize!))]
-       (when result
-         (let [entry (:entry result)
-               casts (:casts result)
-               mangled-name (str (types/mangle fn-sym (:tags entry)))
-               mangled-sym (symbol mangled-name)
-               v (resolve fn-sym)
-               ns-str (str (:ns (meta v)))
-               fq-mangled (symbol ns-str (str (types/mangle fn-sym (:tags entry))))
-               resolved (or (resolve fq-mangled)
-                            (ns-resolve *ns* mangled-sym)
-                            (when-let [mns (:mangled-ns entry)]
-                              (ns-resolve (the-ns mns) mangled-sym)))
-               actual-sym (when resolved
-                            (symbol (str (:ns (meta resolved)))
-                                    (str (:name (meta resolved)))))]
-           (when actual-sym
-             (cond-> {:mangled-sym actual-sym
-                      :tags (:tags entry)
-                      :typed-impl (:typed-impl entry)
-                      :typed-iface (:typed-iface entry)
-                      :has-fn-params (boolean (:raster.core/has-fn-params (meta resolved)))
-                      :return-tag (:raster.core/return-tag (meta resolved))}
-               ;; Include promotion casts if any args need casting
-               (and casts (some some? casts))
-               (assoc :promotion-casts casts)))))))))
+       (method-signature fn-sym result)))))
 
 ;; ================================================================
 ;; aget/rewritten-tag inference
