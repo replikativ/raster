@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.equation-artifact-store :as artifact-store]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.buffer-view :as bview]
@@ -610,6 +611,50 @@
           (is (identical? proof (#'compiled/owned-emitted-validation @default-owner compilation))))))
     (finally
       (compiled/clear-compilation-cache!))))
+
+(deftest template-callbacks-and-delayed-proofs-do-not-inherit-compiler-scopes
+  (compiled/clear-compilation-cache!)
+  (try
+    (let [scope-vars (mapv (fn [[namespace symbol]] (ns-resolve namespace symbol))
+                           [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                            ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                            ['raster.compiler.ir.link-plan '*caller-options*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                            ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+          observed (atom [])
+          observe (fn [stage]
+                    (swap! observed conj [stage (mapv var-get scope-vars)])
+                    (swap! observed conj [stage @(future (mapv var-get scope-vars))]))
+          emitted (program/make {:dialect :opencl-parallel})
+          compilation (equation-first/map->EquationFirstCompilation {:emitted emitted})
+          owner (atom nil)
+          request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          key {:persistent-cache-eligible? true :semantic-fingerprint "scope-test"
+               :guards {:compiler-revision (dispatch/compiler-definition-revision)
+                        :pipeline-identity (#'compiled/weak-identity @#'equation-first/compile)}}
+          validator @#'emitted-program/validate-with-physical-results!]
+      (is (every? var? scope-vars))
+      (with-redefs [artifact-store/load-artifact
+                    (fn [& _] (observe :load) {:status :miss})
+                    artifact-store/store-artifact!
+                    (fn [& _] (observe :store) {:status :stored})
+                    emitted-program/validate-with-physical-results!
+                    (fn [& arguments] (observe :validator) (apply validator arguments))]
+        (with-bindings (zipmap scope-vars (repeat (Object.)))
+          (binding [compiled/*compilation-template-owner* owner
+                    compiled/*compilation-template-observer* (fn [_] (observe :observer))]
+            (is (identical? compilation
+                            (#'compiled/stable-compilation-template
+                             (fn [_] (observe :key) key) :equation-first
+                             (fn [] (observe :compile) compilation) request))))
+          ;; Force the delay directly: its execution context must not depend on its forcing thread.
+          (let [proof (:validation @(get-in @owner [:entry :emitted-validation]))]
+            (is (emitted-program/retained-validation? emitted proof request))
+            (is (identical? proof
+                            (#'compiled/owned-emitted-validation @owner compilation request))))))
+      (is (= #{:key :load :compile :store :observer :validator} (set (map first @observed))))
+      (is (every? #(= [nil nil nil nil nil] (second %)) @observed) (pr-str @observed)))
+    (finally (compiled/clear-compilation-cache!))))
 
 (deftest structural-compilation-cache-is-single-flight
   (compiled/clear-compilation-cache!)

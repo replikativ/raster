@@ -372,7 +372,7 @@
                   :else {:status :not-stored}))
         value))))
 
-(defn- cached-compilation-template-for-request
+(defn- cached-compilation-template-in-context
   [key compiler thunk caller-options]
   (let [math-policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         validation-options (when (some? caller-options) {:scalar-math math-policy})
@@ -387,13 +387,15 @@
          :emitted-validation
          (when (= :equation-first compiler)
            (delay
-             (let [compilation @value
-                   validator @#'emitted-program/validate-with-physical-results!]
-               (when (equation-first/equation-first-compilation? compilation)
-                 {:validation (if (nil? validation-options)
-                                (validator (:emitted compilation))
-                                (validator (:emitted compilation) validation-options))
-                  :validator-identity (weak-identity validator)}))))
+             (link-plan/without-validation-context
+              (fn []
+                (let [compilation @value
+                      validator @#'emitted-program/validate-with-physical-results!]
+                  (when (equation-first/equation-first-compilation? compilation)
+                    {:validation (if (nil? validation-options)
+                                   (validator (:emitted compilation))
+                                   (validator (:emitted compilation) validation-options))
+                     :validator-identity (weak-identity validator)}))))))
          :persistent-report persistent-report}
         [before after]
         (swap-vals! compilation-template-cache
@@ -455,13 +457,17 @@
 
 (def ^:private max-template-stabilization-attempts 8)
 
+(defn- cached-compilation-template-for-request [key compiler thunk caller-options]
+  (link-plan/without-validation-context
+   #(cached-compilation-template-in-context key compiler thunk caller-options)))
+
 (defn- cached-compilation-template
   ([key compiler thunk]
    (cached-compilation-template-for-request key compiler thunk nil))
   ([key compiler thunk caller-options]
    (cached-compilation-template-for-request key compiler thunk caller-options)))
 
-(defn- stable-compilation-template-for-request
+(defn- stable-compilation-template-in-context
   "Resolve one cached template in a compiler-definition epoch that remains unchanged for the
    complete compilation. Derived deftm specializations do not change this semantic epoch, but a
    concurrent source/type/dispatch redefinition may. In that case the result belongs only to the
@@ -520,13 +526,17 @@
                         :compiler-revision-after revision-after)))
               (throw error))))))))
 
+(defn- stable-compilation-template-for-request [key-for-revision compiler thunk caller-options]
+  (link-plan/without-validation-context
+   #(stable-compilation-template-in-context key-for-revision compiler thunk caller-options)))
+
 (defn- stable-compilation-template
   ([key-for-revision compiler thunk]
    (stable-compilation-template-for-request key-for-revision compiler thunk nil))
   ([key-for-revision compiler thunk caller-options]
    (stable-compilation-template-for-request key-for-revision compiler thunk caller-options)))
 
-(defn- owned-emitted-validation-for-request
+(defn- owned-emitted-validation-in-context
   "Reuse only facts belonging to the exact stable compilation owner and current pipeline.
    Stale guards fall back to independent validation; a failed proof is never cached negatively."
   [{:keys [key entry]} compilation caller-options]
@@ -552,6 +562,10 @@
           (swap! compilation-template-cache
                  #(if (identical? entry (get % key)) (dissoc % key) %))
           (throw error))))))
+
+(defn- owned-emitted-validation-for-request [owner compilation caller-options]
+  (link-plan/without-validation-context
+   #(owned-emitted-validation-in-context owner compilation caller-options)))
 
 (defn- owned-emitted-validation
   ([owner compilation] (owned-emitted-validation-for-request owner compilation nil))
