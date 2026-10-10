@@ -2133,6 +2133,17 @@
              (assert-registration-live! (cleanup/assert-registration-current! kernel-registry kernel-name info))
              arr)))))))
 
+(defmacro ^:private with-admitted-registration
+  "Keep staging and lazy loading on the exact snapshot admitted by pure checks.
+   Acquisition helpers own their guards; native launch/readback need a separate
+   registry-use guard inside this scope."
+  [kernel-name registered & body]
+  `(do
+     (cleanup/assert-registry-mutable! kernel-registry)
+     (locking kernel-registry
+       (cleanup/assert-registration-current! kernel-registry ~kernel-name ~registered)
+       ~@body)))
+
 (defn invoke-registered-kernel
   "Pipeline-friendly map invocation. Looks up the emitter-authored ordered ABI from the registry
   and stages/binds every pointer and scalar in that order.
@@ -2180,10 +2191,17 @@
                 (throw (ex-info "map kernel ABI storage dtype mismatch"
                                 {:kernel-name kernel-name :slot slot
                                  :expected (:dtype slot) :actual actual})))))
-        ;; Loading/compilation may touch the native driver. Every ABI check above deliberately
+        bound-pair (first (filter #(= :bound (:role (first %))) pairs))
+        _ (when-not bound-pair
+            (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
+        n (long (:value (second bound-pair)))
+        wg (registered-1d-workgroup-size registered)
+        group-count (long (Math/ceil (/ (double n) wg)))]
+    (with-admitted-registration kernel-name registered
+      (let [;; Loading/compilation may touch the native driver. Every ABI check above deliberately
         ;; runs first, so a malformed marker fails deterministically even on a machine without
         ;; the target device.
-        {:keys [kernel-handle] :as loaded} (ensure-kernel-loaded! kernel-name)
+        {:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         staged (mapv
                 (fn [idx [slot value]]
                   (if (= :scalar (:kind slot))
@@ -2197,21 +2215,16 @@
                           (MemorySegment/copy host 0 seg 0 n-bytes))
                         {:arg seg :value value :host host :n-bytes n-bytes :slot slot}))))
                 (range) pairs)
-        all-args (mapv :arg staged)
-        bound-pair (first (filter #(= :bound (:role (first %))) pairs))
-        _ (when-not bound-pair
-            (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
-        n (long (:value (second bound-pair)))
-        wg (registered-1d-workgroup-size loaded)
-        group-count (long (Math/ceil (/ (double n) wg)))]
-    (launch! kernel-handle group-count wg all-args)
+        all-args (mapv :arg staged)]
+    (cleanup/with-registry-use kernel-registry
+      (launch! kernel-handle group-count wg all-args)
     ;; Writable ABI kinds are the single source of copy-back truth. DeviceBuffers are already
     ;; resident and therefore need no host copy.
     (doseq [{:keys [arg host n-bytes slot]} staged
             :when (and host (kabi/writable? slot))]
       (MemorySegment/copy ^MemorySegment arg 0 ^MemorySegment host 0 (long n-bytes)))
     (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs)
-        output-array)))
+        output-array))))))
 
 (defn- combine-scalar-partials
   "Compatibility terminal combine with the storage dtype's operation-by-operation rounding."
@@ -3001,9 +3014,7 @@
     ;; Staging/loading helpers guard their own acquisitions; the surrounding
     ;; monitor keeps those phases in one registration generation. Do not nest
     ;; their registry-use guards, which deliberately reject reentrant use.
-    (cleanup/assert-registry-mutable! kernel-registry)
-    (locking kernel-registry
-      (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+    (with-admitted-registration kernel-name registered
       (let [input-index (volatile! -1)
         output (volatile! nil)
         output-seg (volatile! nil)
