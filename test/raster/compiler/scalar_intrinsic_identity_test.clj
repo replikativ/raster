@@ -11,6 +11,7 @@
 
 (deftm sin [x :- Double] :- Double (clojure.core/+ x 100.0))
 (deftm custom-sine [x :- Double] :- Double (clojure.core/+ x 100.0))
+(deftm identity-reference [x :- Double] :- Double (clojure.core/+ x 100.0))
 
 (deftm sin-map!
   [a :- (Array double) out :- (Array double) n :- Long] :- (Array double)
@@ -136,6 +137,44 @@
          (is (= 1 (count (:kernel-cache @session))) "old acquisition epochs do not accumulate")
          (is (= old (get-in @session [:kernels :old])) "already-published phases retain their artifact")))
     (operation/register-op-descriptor! identity {:intrinsic nil})))
+
+(deftest helper-collection-and-emission-share-call-identity
+  (let [base 'raster.compiler.scalar-intrinsic-identity-test/identity-reference
+        concrete (symbol (namespace base) (str (name base) "_m_double-impl"))
+        descriptor operation/get-op-descriptor
+        direct (list (symbol (namespace base) (str (name base) "_m_double")) 0.5)
+        dispatched (list '.invk concrete 0.5)]
+    (doseq [[label concrete-facet expected]
+            [[:inherited {} "sin("]
+             [:overridden {:intrinsic {:key :sqrt}} "sqrt("]
+             [:withdrawn {:intrinsic nil} "gpufn_"]]]
+      ;; Overlay only the semantic facets of a real deftm; no owner/cache/epoch reset.
+      (with-redefs [operation/get-op-descriptor
+                    (fn [identity]
+                      (cond
+                        (= identity base) (assoc (descriptor base) :intrinsic {:key :sin})
+                        (= identity concrete) (merge (dissoc (descriptor concrete) :intrinsic)
+                                                    concrete-facet)
+                        :else (descriptor identity)))]
+        (let [call (c/emit-expr dispatched 'i #{} "get_global_id(0)")
+              helpers (c/collect-gpu-fn-calls dispatched)]
+          (is (.startsWith call expected) (str label))
+          (is (= (if (= label :withdrawn) 1 0) (count helpers)) (str label))
+          (when (= label :withdrawn)
+            (is (and (seq helpers) (.startsWith call (c/gpu-helper-c-name (:sym (first helpers))))))
+            (is (and (seq helpers) (.contains (:source (c/generate-c-helper (first helpers))) "100.0")))))
+        (doseq [form [direct dispatched]
+                semantic [nil 'user.helpers/non-intrinsic]]
+          (let [retained (with-meta form {:raster.op/original semantic})
+                call (c/emit-expr retained 'i #{} "get_global_id(0)")
+                helpers (c/collect-gpu-fn-calls retained)]
+            (is (= 1 (count helpers)) (str label " explicit non-intrinsic " semantic))
+            (is (and (seq helpers) (.startsWith call (c/gpu-helper-c-name (:sym (first helpers))))))))
+        (let [intrinsic-call (with-meta dispatched {:raster.op/original base})
+              helper-call (with-meta dispatched {:raster.op/original nil})]
+          (doseq [forms [[intrinsic-call helper-call] [helper-call intrinsic-call]]]
+            (is (= 1 (count (c/collect-gpu-fn-calls (cons 'do forms))))
+                "intrinsic ownership does not mark a required helper as already collected")))))))
 
 (deftest acquisition-does-not-relabel-an-unstable-compilation
   (let [session (atom {:device-id :ocl:0 :closed? false :kernels {} :dispatches {} :kernel-cache {}})
