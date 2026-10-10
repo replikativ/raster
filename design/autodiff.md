@@ -388,6 +388,25 @@ own finite-iteration derivative and is not covered by this implicit rule.
 
 ### :mode :auto and admissibility
 
+Forward preparation checks potentially active calls in lexical scope, including
+aliases, captured callees and recurrence carries. An active plain `defn` helper
+is refused at construction, even if it happens to accept a Dual at runtime;
+inactive helpers remain available. `forward-coverage` reports `:call-declines`
+with the retained form, operation, implementation and active argument positions.
+Unknown/Object result types do not establish that a dependent value is
+carrier-free, and a loop initializer's type is not an invariant for later carries.
+
+Derivative lookup shares the recorded semantic call identity between forward and
+reverse transforms. Concrete implementation identity remains separate: it
+supplies implementation type tags and replay-effect evidence. A derivative rule
+does not certify purity, and an opaque `.invk` is not unconditionally pure.
+
+Coverage is still conservative source-level preparation, not a complete
+call-signature proof. Existing deftm-family coverage recognizes a Dual overload
+or a parametric lift, but does not yet verify every actual active argument tuple.
+Position-aware dispatch admission remains consolidation work; do not read an
+admissible family as proof of all mixed-carrier signatures.
+
 `:auto` selects the cheapest *admissible* mode: cheapest by the Griewank dimension
 test, but constrained to carriers whose ops are all covered. `forward-coverage`
 names the uncovered ops. `erf` has a Dual lift, so `:auto` may go forward; a raw

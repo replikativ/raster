@@ -54,8 +54,8 @@
     (is (= :impure (purity/pure-op? 'reset!)))
     (is (= :impure (purity/pure-op? 'aset))))
 
-  (testing ".invk dispatch is pure"
-    (is (= :pure (purity/pure-op? '.invk))))
+  (testing "dispatch syntax alone does not establish implementation purity"
+    (is (= :unknown (purity/pure-op? '.invk))))
 
   (testing "Unknown ops return :unknown"
     (is (= :unknown (purity/pure-op? 'some-random-fn)))))

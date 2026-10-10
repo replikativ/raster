@@ -514,12 +514,10 @@
   '#{double float long int doubles floats longs ints})
 
 (defmethod ad-record :call [_ sym init-expr activity]
-  (let [head (first init-expr)
-        [op args invk?] (if (= '.invk head)
-                          [(second init-expr) (vec (nnext init-expr)) true]
-                          [head (vec (rest init-expr)) false])
+  (let [{op :operation args :arguments implementation :implementation-op}
+        (op/call-description init-expr)
         resolved (or (tmpl/resolve-template op)
-                     (auto-make-deftm-rule op))
+                     (auto-make-deftm-rule implementation))
         has-active-args? (some #(and (symbol? %) (get activity % false)) args)]
     (when (and (not resolved) has-active-args?)
       (throw (ex-info (str "No AD template for `" op
@@ -530,7 +528,7 @@
     {:record
      (when resolved
        (let [[_ base-op] resolved
-             arg-tags (let [n (name (if invk? op head))
+             arg-tags (let [n (name implementation)
                             idx (.indexOf ^String n "_m_")]
                         (when (pos? idx)
                           (let [tag-str (subs n (clojure.core/+ idx 3))
@@ -4110,9 +4108,9 @@
   [form]
   (cond
     (and (seq? form) (= '.invk (first form)))
-    (let [op-sym (or (:raster.op/original (meta form)) (:op (meta form)))]
+    (let [{op-sym :recorded-op args :arguments} (op/call-description form)]
       (if op-sym
-        (apply list op-sym (map undevirtualize (drop 2 form)))
+        (apply list op-sym (map undevirtualize args))
         ;; No :op metadata — keep as-is (e.g., fn-param .invk calls)
         (apply list (map undevirtualize form))))
 
@@ -4541,37 +4539,14 @@
 ;; ================================================================
 
 (def ^:private forward-neutral-namespaces
-  "Op namespaces that never execute on the Dual carrier: clojure.core is
-  integer index/counter arithmetic by convention (see CLAUDE.md), and
-  raster.arrays is array plumbing (forward mode is scalar-only — array
-  params are rejected separately)."
+  "Families without a Dual-dispatch contract. They may execute on inactive values,
+   but namespace membership is not evidence that an active call is carrier-safe."
   #{"clojure.core" "raster.arrays"})
 
 (def ^:private forward-interop-namespaces
   "JVM static-method namespaces: primitive interop calls cannot accept a
   Dual, so their presence in a body makes forward mode inadmissible."
   #{"Math" "java.lang.Math" "StrictMath" "java.lang.StrictMath"})
-
-(defn- collect-op-heads
-  "All semantic op heads in a walked-body form. For devirtualized
-  (.invk impl args...) calls this reads the walk's stamped original-op
-  metadata via op/semantic-op (never parses mangled names); a bare .invk
-  without metadata (typed fn-param call) contributes nothing."
-  [form]
-  (let [acc (volatile! #{})]
-    (letfn [(go [f]
-                (cond
-                  (seq? f)
-                  (do (when-let [h (if (= '.invk (first f))
-                                   ;; same recovery order as undevirtualize
-                                     (or (:raster.op/original (meta f)) (:op (meta f)))
-                                     (op/semantic-op f))]
-                        (when (symbol? h) (vswap! acc conj h)))
-                      (doseq [x f] (go x)))
-                  (vector? f) (doseq [x f] (go x))
-                  (map? f) (doseq [[k v] f] (go k) (go v))))]
-      (go form))
-    @acc))
 
 (defn- dual-tag?
   "True if a dispatch tag denotes the Dual carrier (short `Dual` for explicit
@@ -4632,11 +4607,12 @@
   '#{doubles floats ints longs shorts bytes booleans chars objects})
 
 (defn- forward-conversion-plan
-  "Retain source conversions; adapt only certified Double identities for Dual.
-   Dependency is lexical seed dependence, not a claim that a discrete cast has
-   a derivative. Binder structure and primal types come from compiler owners."
+  "One lexical Dual preparation: retain conversions and admit potentially active calls.
+   Adapt only certified Double identities. Seed dependence is conservative, not proof
+   that a dependent result is Dual-valued. Only established discrete primitive types
+   certify carrier-free values; unknown and Object tags do not."
   [body params tags source-ns]
-  (let [declines (volatile! [])
+  (let [declines (volatile! []) call-declines (volatile! [])
         initial-types (into {} (map (fn [p tag] [p {:tag tag}]) params tags))
         initial-active (set (keep (fn [[p tag]]
                                    (when (= :scalar (:kind (tangent/tangent-kind tag))) p))
@@ -4645,8 +4621,14 @@
               (binding [util/*shadowing-locals* (into util/*shadowing-locals* active)]
                 (boolean (seq (set/intersection active (util/free-syms expr))))))
             (tag-of [expr env]
-              (or (types/sym-type-tag expr)
-                  (inf/infer-expr-tag expr env source-ns)))
+              (if (and (symbol? expr) (contains? env expr))
+                (:tag (get env expr))
+                (or (types/sym-type-tag expr)
+                    (inf/infer-expr-tag expr env source-ns))))
+            (carrier-dependent? [expr env active]
+              (and (dependent? expr active)
+                   (not (when-let [dt (dtype/dtype-for-scalar-tag (tag-of expr env))]
+                          (dtype/integral? dt)))))
             (go [expr env active]
               (cond
                 (and (seq? expr) (= 'quote (first expr))) expr
@@ -4678,15 +4660,30 @@
                                  uninitialized (drop (count inits) binders)
                                  env' (reduce #(assoc %1 %2 {:tag (types/sym-type-tag %2)}) env' uninitialized)
                                  active' (into active' uninitialized)
-                                 active' (if (and recurrence?
-                                                  (or (some active' binders)
-                                                      (some #(dependent? % active') body)))
-                                           (into active' binders) active')]
+                                 carry-activity
+                                 (when recurrence?
+                                   (try
+                                     (let [{:keys [bindings recur-args recur-bindings]}
+                                           (parse-loop-form expr)]
+                                       (loop-var-activity bindings recur-args active' recur-bindings))
+                                     (catch clojure.lang.ExceptionInfo _
+                                       ;; Noncanonical recurrences lack an update witness here.
+                                       ;; Never certify their carries from initialization alone.
+                                       (when (or (some active' binders)
+                                                 (some #(dependent? % active') body))
+                                         binders))))
+                                 active' (into active' carry-activity)
+                                 ;; A recurrence initializer is not an invariant type witness.
+                                 ;; Invalidate it for active carries, including retained symbol
+                                 ;; tags, while preserving proven inactive integer counters.
+                                 env' (reduce #(assoc %1 %2 {:tag nil}) env' carry-activity)]
                              (assoc region :inits inits'
                                     :body (mapv #(go % env' active') body)))) scopes)]
                     (rebuild scopes' (mapv #(go % env active) outer)))
-                  (let [semantic-op (op/semantic-op expr)
-                        args (op/call-args expr)]
+                  (let [{semantic-op :semantic-op args :arguments
+                         operation :operation recorded :recorded-op
+                         implementation :implementation-op dispatch? :dispatch?}
+                        (op/call-description expr)]
                     (if (and (op/cast-op? semantic-op) (= 1 (count args))
                              (dependent? (first args) active))
                       (let [operand (first args)
@@ -4708,20 +4705,36 @@
                                            (list '.invk (second expr) adapted-operand)
                                            (list (first expr) adapted-operand))
                                 (meta expr)))))
-                      (with-meta (apply list (map #(go % env active) expr)) (meta expr)))))
+                      (do
+                        (when (contains? #{:call :invk} (:kind (form/form-info expr)))
+                          (let [active-arguments (vec (keep-indexed
+                                                       (fn [i arg]
+                                                         (when (carrier-dependent? arg env active) i)) args))
+                                active-callee? (dependent? implementation active)]
+                            (when (and (or (seq active-arguments) active-callee?)
+                                       (not (and (not active-callee?)
+                                                 (or (not dispatch?) recorded)
+                                                 (symbol? operation)
+                                                 (= :covered (forward-op-status operation)))))
+                              (vswap! call-declines conj
+                                      {:reason :unsupported-forward-call :operation operation
+                                       :implementation implementation
+                                       :active-argument-indices active-arguments
+                                       :active-callee? active-callee? :form expr}))))
+                        (with-meta (apply list (map #(go % env active) expr)) (meta expr))))))
                 (vector? expr) (with-meta (mapv #(go % env active) expr) (meta expr))
                 (map? expr) (with-meta (into (empty expr)
                                             (map (fn [[k v]] [(go k env active) (go v env active)])) expr)
                              (meta expr))
                 (set? expr) (with-meta (into (empty expr) (map #(go % env active)) expr) (meta expr))
                 :else expr))]
-      {:body (go body initial-types initial-active) :declines @declines})))
+      {:body (go body initial-types initial-active)
+       :declines @declines :call-declines @call-declines})))
 
 (defn- forward-preparation
   "Queryable Dual-carrier coverage for a deftm var (framework §4a/§11).
-  Walks the deftm's walked body, collects semantic op heads, and checks
-  each op that would execute on the Dual carrier against the dispatch
-  registry for a Dual lift.
+  The shared lexical preparation checks calls that may receive an active carrier,
+  retaining argument and callee dependence instead of classifying heads alone.
 
   Returns {:admissible?   bool
            :uncovered-ops sorted vector of op symbols without a Dual lift
@@ -4752,14 +4765,17 @@
                               (fn [i p]
                                 (when (= :none (:kind (tangent/tangent-kind (nth tags i nil))))
                                   p)) params))
-        uncovered (->> (collect-op-heads (first walked-body))
-                       (filter #(= :uncovered (forward-op-status %)))
+        uncovered (->> (:call-declines conversion-plan)
+                       (keep :operation)
+                       (filter symbol?) distinct
                        sort
                        vec)]
     {:resolved resolved :params params :walked-body walked-body
      :conversion-plan conversion-plan
-     :coverage {:admissible? (and (empty? uncovered) (empty? array-params) (empty? (:declines conversion-plan)))
+     :coverage {:admissible? (and (empty? (:call-declines conversion-plan))
+                                 (empty? array-params) (empty? (:declines conversion-plan)))
                 :conversion-declines (:declines conversion-plan)
+                :call-declines (:call-declines conversion-plan)
                 :uncovered-ops uncovered
                 :active-indices active-indices
                 :constant-params constant-params
@@ -4919,12 +4935,16 @@
                             (when (seq (:conversion-declines cov))
                               (str "source conversions without a faithful Dual interpretation: "
                                    (pr-str (:conversion-declines cov)) ". "))
+                            (when (seq (:call-declines cov))
+                              (str "active calls without a proven Dual dispatch: "
+                                   (pr-str (:call-declines cov)) ". "))
                             "Mode selection is constrained by carrier coverage "
                             "(framework §11): use :mode :reverse, or add the "
                             "missing Dual overloads in raster.ad.forward.")
                        {:var f-var
                         :uncovered-ops (:uncovered-ops cov)
                         :conversion-declines (:conversion-declines cov)
+                        :call-declines (:call-declines cov)
                         :array-params (:array-params cov)})))
            resolved (:resolved preparation)
            params (deftm-params-or-throw f-var resolved)

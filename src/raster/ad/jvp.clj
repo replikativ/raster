@@ -114,13 +114,7 @@
   "Emit the paired tangent bindings for one active :call binding.
   Returns [tenv' extra-bindings]."
   [tenv sym init tag]
-  (let [head (first init)
-        invk? (= '.invk head)
-        args (if invk? (vec (nnext init)) (vec (rest init)))
-        ;; same op-recovery order as the reverse engine's ad-record :call
-        op (if invk?
-             (or (:raster.op/original (meta init)) (:op (meta init)) (second init))
-             head)
+  (let [{op :operation args :arguments} (opdesc/call-description init)
         tangent-args (mapv #(when (symbol? %) (get tenv %)) args)]
     (if-let [jf (tmpl/op-jvp-fn op)]
       (let [ctx {:bindings [] :gensym-fn jvp-gensym}
@@ -173,17 +167,18 @@
                    (subvec pairs (inc alloc-idx))))))
 
 (defn- pure-map-step?
-  "Ask the shared effect analysis about the source operation, not an opaque
-  devirtualized call. AD's existing template resolver is the authority for
-  that identity; an unknown .invk stays unknown and therefore declines."
+  "Ask shared effect analysis about the concrete implementation being replayed.
+   A derivative rule or recorded source name is not a purity certificate."
   [body]
   (let [semantic-body
         (walk/postwalk
          (fn [form]
            (if (and (seq? form) (= '.invk (first form)))
-             (if-let [[_ canonical] (tmpl/resolve-template (second form))]
-               (with-meta (cons canonical (nnext form)) (meta form))
-               form)
+             (let [{implementation :implementation-op args :arguments}
+                   (opdesc/call-description form)]
+               (if (and (symbol? implementation) (var? (resolve implementation)))
+                 (with-meta (cons implementation args) (meta form))
+                 form))
              form))
          body)]
     (effects/removable-expr? semantic-body)))
