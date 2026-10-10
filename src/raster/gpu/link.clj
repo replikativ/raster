@@ -521,7 +521,7 @@
       (ensure-live! executable operation)
       (ensure-no-output-leases! executable operation)
       (start-use! executable)
-      (try (f)
+      (try (link-plan/without-validation-context f)
            (finally (finish-use! executable))))))
 
 (defn- begin-mutation! [executable]
@@ -545,14 +545,16 @@
   (ensure-live! executable operation)
   (ensure-no-output-leases! executable operation)
   (start-use! executable)
-  (try
-    (begin-mutation! executable)
-    (let [result (execute!)]
-      (swap! (:completed-replays executable) inc)
-      (reset! (:output-ready? executable) true)
-      result)
-    (catch Throwable error (poison-execution! executable error))
-    (finally (finish-use! executable))))
+  (link-plan/without-validation-context
+   (fn []
+     (try
+       (begin-mutation! executable)
+       (let [result (execute!)]
+         (swap! (:completed-replays executable) inc)
+         (reset! (:output-ready? executable) true)
+         result)
+       (catch Throwable error (poison-execution! executable error))
+       (finally (finish-use! executable))))))
 
 (defn with-exclusive-mutation!
   "Run an explicitly mutating offline action under the executable lifetime lock.
@@ -1469,10 +1471,11 @@
   [executable]
   (when-not (linked-executable? executable)
     (throw (ex-info "close! requires a LinkedExecutable" {:actual (type executable)})))
-  (locking (:lifetime-lock executable)
-    (assert-closeable! executable)
-    (when-not @(:closed? executable) (reset! (:closed? executable) true))
-    (cleanup/release! (::cleanup/owner executable)))
+  (link-plan/without-validation-context
+   #(locking (:lifetime-lock executable)
+      (assert-closeable! executable)
+      (when-not @(:closed? executable) (reset! (:closed? executable) true))
+      (cleanup/release! (::cleanup/owner executable))))
   nil)
 
 (defn- prepare-private-reuse!
