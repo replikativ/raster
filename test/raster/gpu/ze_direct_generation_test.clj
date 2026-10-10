@@ -125,6 +125,109 @@
            (is (= (if (= phase :launch) [:launch] [:launch :combine]) @seen))
            (is (nil? (cleanup/assert-registry-mutable! registry))))))))
 
+(defn- void-map-fixture [typed?]
+  (let [name "generation-void-map"
+        registration (cond-> {:dtype :float :workgroup-size 4}
+                       typed? (assoc :abi [(abi/slot 'input :input :float)
+                                          (abi/slot 'state :inout :float)
+                                          (abi/slot 'scale :scalar :float)
+                                          (abi/slot 'n :scalar :long :role :bound)]))]
+    {:name name :registration registration :registry (atom {name registration})}))
+
+(deftest void-map-replacement-after-pure-admission-precedes-native-use
+  (doseq [typed? [false true]]
+    (let [{:keys [name registration registry]} (void-map-fixture typed?)
+          replacement (assoc registration :workgroup-size 8)
+          seen (atom [])
+          v #(ns-resolve 'raster.gpu.ze-runtime %)]
+      (with-redefs-fn
+        {#'ze/kernel-registry registry
+         (v 'registered-1d-workgroup-size) (fn [_] (swap! registry assoc name replacement) 4)
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))
+         (v 'ensure-seg) (fn [_ _ ^long _] (swap! seen conj :stage))
+         #'ze/launch! (fn [_ ^long _groups ^long _workgroup _args] (swap! seen conj :launch))}
+        #(do
+           (is (= :registry-generation-changed
+                  (:reason (ex-data (error-of (fn [] (ze/invoke-registered-map-void-kernel
+                                                     name [(float-array 6) (float-array 6)] [2.0] 6)))))))
+           (is (empty? @seen))
+           (is (identical? replacement (get @registry name))))))))
+
+(deftest void-map-preserves-legacy-and-typed-writes-with-default-and-override
+  (doseq [typed? [false true] opts [{} {:workgroup-size 2}]]
+    (let [{:keys [name registry]} (void-map-fixture typed?)
+          input (float-array [1 2 3 4 5 6]) state (float-array [7 8 9 10 11 12])
+          staged-input (float-array 6) staged-state (float-array 6)
+          seen (atom [])
+          v #(ns-resolve 'raster.gpu.ze-runtime %)]
+      (with-redefs-fn
+        {#'ze/kernel-registry registry
+         (v 'ensure-kernel-loaded!) (fn [_]
+                                     (is (Thread/holdsLock registry))
+                                     (swap! registry update name assoc :kernel-handle :original)
+                                     {:kernel-handle :original})
+         (v 'ensure-seg) (fn [_ key ^long bytes]
+                          (is (Thread/holdsLock registry))
+                          (is (= 24 bytes))
+                          (MemorySegment/ofArray (if (= key :void-arr-0) staged-input staged-state)))
+         #'ze/launch! (fn [handle ^long groups ^long workgroup arguments]
+                        (is (= :registration-in-use
+                               (:reason (ex-data (error-of #(cleanup/assert-registry-mutable! registry))))))
+                        (is (= [1.0 2.0 3.0 4.0 5.0 6.0] (vec staged-input)))
+                        (is (= [7.0 8.0 9.0 10.0 11.0 12.0] (vec staged-state)))
+                        (aset staged-input 0 (float 99))
+                        (aset staged-state 0 (float 88))
+                        (swap! seen conj [handle groups workgroup (drop 2 arguments)]))}
+        #(do
+           (is (nil? (ze/invoke-registered-map-void-kernel name [input state] [2.0] 6 opts)))
+           (is (= [[:original (if (seq opts) 3 2) (if (seq opts) 2 4)
+                    [{:type :float :value (float 2.0)} {:type (if typed? :long :int) :value 6}]]]
+                  @seen))
+           (is (= (if typed? 1.0 99.0) (aget input 0)))
+           (is (= 88.0 (aget state 0)))
+           (is (nil? (cleanup/assert-registry-mutable! registry))))))))
+
+(deftest void-map-malformed-markers-and-override-precede-native-use
+  (let [{:keys [name registry]} (void-map-fixture true)
+        seen (atom [])
+        v #(ns-resolve 'raster.gpu.ze-runtime %)]
+    (with-redefs-fn
+      {#'ze/kernel-registry registry
+       (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))
+       (v 'ensure-seg) (fn [_ _ ^long _] (swap! seen conj :stage))}
+      #(do
+         (doseq [[arrays scalars opts] [[[(double-array 6) (float-array 6)] [2.0] {}]
+                                       [[(float-array 6) (float-array 6)] [] {}]
+                                       [[(float-array 6) (float-array 6)] [2.0] {:workgroup-size :invalid}]]]
+           (is (some? (error-of (fn [] (ze/invoke-registered-map-void-kernel
+                                      name arrays scalars 6 opts))))))
+         (is (empty? @seen))))))
+
+(deftest void-map-native-failures-preserve-identity-and-release-use
+  (doseq [phase [:launch :readback]]
+    (let [{:keys [name registry]} (void-map-fixture true)
+          failure (ex-info "void-map injected failure" {:phase phase})
+          seen (atom [])
+          v #(ns-resolve 'raster.gpu.ze-runtime %)
+          fail! (fn []
+                  (is (= :registration-in-use
+                         (:reason (ex-data (error-of #(cleanup/assert-registry-mutable! registry))))))
+                  (throw failure))]
+      (with-redefs-fn
+        {#'ze/kernel-registry registry
+         (v 'ensure-kernel-loaded!) (fn [_] {:kernel-handle :original})
+         (v 'ensure-seg) (fn [_ _ ^long _] (MemorySegment/ofArray (float-array 6)))
+         #'ze/launch! (fn [_ ^long _groups ^long _workgroup _args]
+                        (swap! seen conj :launch)
+                        (when (= phase :launch) (fail!)))
+         (v 'readback-void-map!) (fn [& _] (swap! seen conj :readback) (fail!))}
+        #(do
+           (is (identical? failure
+                          (error-of (fn [] (ze/invoke-registered-map-void-kernel
+                                           name [(float-array 6) (float-array 6)] [2.0] 6)))))
+           (is (= (if (= phase :launch) [:launch] [:launch :readback]) @seen))
+           (is (nil? (cleanup/assert-registry-mutable! registry))))))))
+
 (deftest map-replacement-after-pure-admission-precedes-native-use
   (let [{:keys [name registration registry]} (map-fixture)
         replacement (assoc registration :workgroup-size 8)

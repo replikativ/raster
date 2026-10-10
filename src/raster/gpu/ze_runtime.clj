@@ -2365,6 +2365,14 @@
 ;; Void-map kernel invocation (side-effect-only kernels)
 ;; ================================================================
 
+(defn- readback-void-map!
+  [abi entries]
+  ;; DeviceBuffers have no host source. The ABI-less compatibility path still
+  ;; copies every host array back; typed calls copy only declared writes.
+  (doseq [{:keys [seg source ab write?]} entries]
+    (when (and source (or (nil? abi) write?))
+      (MemorySegment/copy seg 0 (MemorySegment/ofArray source) 0 (long ab)))))
+
 (defn invoke-registered-map-void-kernel
   "Pipeline-friendly void-map kernel invocation. No dedicated output array.
   All arrays are passed as read-write — copies to device before launch,
@@ -2381,7 +2389,11 @@
   ([^String kernel-name arrays scalar-args n]
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [abi (:abi (get @kernel-registry kernel-name))
+   (let [registered (or (get @kernel-registry kernel-name)
+                        (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                        {:kernel-name kernel-name
+                                         :registered (keys @kernel-registry)})))
+         abi (:abi registered)
          split-binding (when abi
                          (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
                            (kabi/validate-physical-pointer-dtypes!
@@ -2395,12 +2407,24 @@
          checked-bound (if split-binding
                          (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
                          {:type :int :value (Math/toIntExact (long n))})
-         {:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
-         dtype (kernel-info-value info :dtype :float)
+         dtype (kernel-info-value registered :dtype :float)
          workgroup-size (long (get opts :workgroup-size
-                                   (registered-1d-workgroup-size info)))
+                                   (registered-1d-workgroup-size registered)))
          n (long n)
          default-dtype-size (long (get dtype-byte-sizes dtype 4))
+         scalar-type (if (= dtype :float) :float :double)
+         scalar-kernel-args (or checked-scalars
+                               (mapv (fn [v]
+                                       (if (map? v)
+                                         v
+                                         {:type scalar-type
+                                          :value (if (= scalar-type :float)
+                                                   (float v) (double v))}))
+                                     scalar-args))
+         wg (long (or workgroup-size 256))
+         group-count (long (Math/ceil (/ (double n) wg)))]
+     (with-admitted-registration kernel-name registered
+       (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         ;; Determine per-array byte size from actual array type
          arr-byte-size (fn [arr]
                          (cond
@@ -2443,27 +2467,13 @@
                  expanded-entries (kabi/pointer-slots abi))
            expanded-entries)
          dev-segs (mapv :seg expanded-entries)
-        ;; Scalar args
-         scalar-type (if (= dtype :float) :float :double)
-         scalar-kernel-args (or checked-scalars
-                                (mapv (fn [v]
-                                        (if (map? v)
-                                          v
-                                          {:type scalar-type
-                                           :value (if (= scalar-type :float)
-                                                    (float v) (double v))}))
-                                      scalar-args))
          all-args (vec (concat dev-segs
                                scalar-kernel-args
-                               [checked-bound]))
-         wg (long (or workgroup-size 256))
-         group-count (long (Math/ceil (/ (double n) wg)))]
-     (launch! kernel-handle group-count wg all-args)
-    ;; Copy back only JVM arrays (DeviceBuffer has :source nil)
-     (doseq [{:keys [seg source ab write?]} expanded-entries]
-       (when (and source (or (nil? abi) write?))
-         (MemorySegment/copy seg 0 (MemorySegment/ofArray source) 0 (long ab))))
-     nil)))
+                               [checked-bound]))]
+     (cleanup/with-registry-use kernel-registry
+       (launch! kernel-handle group-count wg all-args)
+       (readback-void-map! abi expanded-entries)
+       nil))))))
 
 (defn bind-kernel-call
   "Bind a backend-neutral KernelCall over Level Zero resident buffers. ABI order and complete
