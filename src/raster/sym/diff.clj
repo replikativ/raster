@@ -14,7 +14,7 @@
    Differentiates an S-expression w.r.t. a named variable using
    standard calculus rules (sum, product, quotient, chain).
 
-  Output is a raw S-expression. Compose with raster.compiler.passes.scalar.simplify/simplify-derivative
+  Output is a raw S-expression. Compose with raster.compiler.passes.scalar.simplify/simplify-symbolic-derivative
    for cleanup.
 
    Usage:
@@ -237,7 +237,7 @@
 
 (defn differentiate
   "Differentiate and simplify a symbolic expression.
-   Uses raster.compiler.passes.scalar.simplify/simplify-derivative for cleanup.
+   Uses explicitly formal real-algebra cleanup, not compiler FP simplification.
 
    Takes a RAW S-expression form (seq/symbol/number), not a Sym object —
    a Sym-wrapped input used to silently differentiate to 0 (garbage-in-
@@ -251,4 +251,4 @@
                           ". If this is a raster.sym.core Sym object, unwrap it "
                           "first: (raster.sym.core/unwrap expr).")
                      {:expr expr :class (class expr) :var var-sym})))
-   (simplify/simplify-derivative (diff expr var-sym) max-rounds)))
+   (simplify/simplify-symbolic-derivative (diff expr var-sym) max-rounds)))

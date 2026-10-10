@@ -747,7 +747,10 @@
   (testing "linear expression has zero Hessian"
     ;; f = x + y  =>  d/dx = 1, d/dy = 1  =>  all second derivatives 0
     (let [result (hessian-sparsity '(+ x y) ['x 'y])]
-      (is (= [[false false] [false false]] result)))))
+      (is (= [[false false] [false false]] result))))
+  (testing "explicit formal algebra removes zero dependencies in affine derivatives"
+    (is (= 3 (differentiate '(* 3 x) 'x)))
+    (is (= [[false]] (hessian-sparsity '(* 3 x) ['x])))))
 
 (deftest hessian-sparsity-quadratic-test
   (testing "x*y has mixed partial"

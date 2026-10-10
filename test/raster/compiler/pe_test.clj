@@ -13,7 +13,7 @@
            (pe/pe '(* x y) {'x 3.0}))))
   (testing "multiple constants"
     (is (= 12.0
-           (pe/pe '(* x y) {'x 3.0 'y 4.0}))))
+           (pe/pe '(clojure.core/* x y) {'x 3.0 'y 4.0}))))
   (testing "unknown variable preserved"
     (is (= '(* x y)
            (pe/pe '(* x y) {})))))
@@ -35,7 +35,7 @@
       (is (= 'let* (first result)))))
   (testing "nested let constant propagation"
     (is (= '(* 6.0 x)
-           (pe/pe '(let* [a 3.0 b (* a 2.0)] (* b x)))))))
+           (pe/pe '(let* [a 3.0 b (clojure.core/* a 2.0)] (* b x)))))))
 
 ;; ================================================================
 ;; Dead binding elimination
@@ -89,11 +89,10 @@
   (testing "constant arithmetic chain"
     ;; (let [a 2.0 b 3.0] (* a b x)) => (* 6.0 x)
     (is (= '(* 6.0 x)
-           (pe/pe '(let* [a 2.0 b 3.0] (* (* a b) x))))))
+           (pe/pe '(let* [a 2.0 b 3.0] (* (clojure.core/* a b) x))))))
 
-  (testing "zero multiplication elimination"
-    ;; (let [a 0.0] (* a x)) => 0.0
-    (is (= 0.0
+  (testing "zero multiplication retains an unknown operand"
+    (is (= '(* 0.0 x)
            (pe/pe '(let* [a 0.0] (* a x)))))))
 
 ;; ================================================================
@@ -118,9 +117,9 @@
 (deftest fixpoint-test
   (testing "fixpoint converges"
     ;; Multiple rounds needed: first simplify inner, then outer
-    (is (= 'x (pe/pe '(+ (+ x 0) 0)))))
+    (is (= '(+ (+ x 0) 0) (pe/pe '(+ (+ x 0) 0)))))
   (testing "fixpoint with derivative cleanup"
-    (is (= 'x (pe/pe '(+ (* 1.0 x) 0.0))))))
+    (is (= '(+ (* 1.0 x) 0.0) (pe/pe '(+ (* 1.0 x) 0.0))))))
 
 ;; ================================================================
 ;; PE on walked body
@@ -135,7 +134,7 @@
                   body)]
       (is (= ['(* 10.0 (- y x))] result))))
   (testing "all params known => fully constant"
-    (let [body ['(+ a b)]
+    (let [body ['(clojure.core/+ a b)]
           result (pe/pe-walked-body '[a b] {'a 3.0 'b 4.0} body)]
       (is (= [7.0] result))))
   (testing "no params known => no change"
