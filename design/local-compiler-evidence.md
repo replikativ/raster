@@ -106,6 +106,24 @@ from this exact check. Provenance is the local FFN projection/GELU traces and
 `/tmp/raster-wide-layer1-ffn-dot-control.clj`. These additional boundary controls
 do not close the eight failing full-model adapter checks.
 
+Device-captured frozen weights and activations also give exact ordered
+Double-FMA/Float-result parity for the three FFN forward projections: Wg/Wu
+each have 4,096 outputs and Wd has 1,280. The post-FFN normalization pullback
+has bit-identical incoming cotangent and weights and agrees bit-for-bit with
+the CPU helper on captured activation. Its activation still differs from the
+original CPU forward pass. Provenance is the local forward and post-FFN traces
+and `/tmp/raster-wide-layer1-forward-dot-control.clj`; no full gate was rerun.
+
+The existing public widening device regression now checks reduction lengths
+3 and 513 under NN/NT/TN layouts and fused/decomposed products, with changed
+inputs and IEEE overflow. Its long cancellation spans many reduction tiles
+and a masked final tile; retaining a Float carry would lose the middle term.
+The focused device test passes 72 assertions on local OpenCL and Level Zero,
+without capability skips. It is a compact policy regression, not a model or
+vendor-device performance substitute.
+The complete affected batch passes 11 tests / 287 assertions, zero failures
+and errors; the temporary load restores the original compiler roots afterward.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression
