@@ -95,6 +95,17 @@ comparison proves universal library accuracy or closes the original model gate.
 Provenance is the local `/tmp/raster-bound-layer1-ak-{norm,rope,layout,fanin,dk,dw,softmax}-trace.clj`
 scripts; these remain scratch diagnostics, not committed portable regressions.
 
+The same widened candidate's layer-1 GELU forward and backward match the CPU
+helpers bit-for-bit on captured inputs; gated products and residual sums retain
+their independently checked Float boundaries. The FFN Wu/Wg backward
+contractions each match an independent ordered Double-FMA/Float-result oracle
+for all 1,280 outputs, using device-captured frozen weights and cotangents.
+Float ordered-dot comparisons are not an oracle for this widened policy;
+mutable adapter weight taps would observe post-update values and are excluded
+from this exact check. Provenance is the local FFN projection/GELU traces and
+`/tmp/raster-wide-layer1-ffn-dot-control.clj`. These additional boundary controls
+do not close the eight failing full-model adapter checks.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression
