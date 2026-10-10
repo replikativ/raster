@@ -107,8 +107,8 @@
              {:value id :role role}))
     value))
 
-(defn validate!
-  [call]
+(defn- validate-call!
+  [call caller-options]
   (when-not (structured-loop-call? call)
     (fail! :structured-loop-call-type "expected a StructuredLoopCall" {:actual (type call)}))
   (let [{scheduled :schedule emitted :graph trip-count :trip-count
@@ -116,7 +116,9 @@
         call
         scheduled (schedule/validate! scheduled)
         emitted (graph/validate! emitted)
-        _ (emitted-loop/make scheduled emitted)]
+        _ (if (nil? caller-options)
+            (emitted-loop/make scheduled emitted)
+            (emitted-loop/make scheduled emitted {} caller-options))]
     (when-not (and (integer? trip-count) (not (neg? trip-count)))
       (fail! :structured-loop-trip-count "resolved trip count must be non-negative"
              {:trip-count trip-count}))
@@ -127,13 +129,18 @@
                {:field field :value value})))
     call))
 
-(defn make
+(defn validate!
+  "Validate loop emission and runtime fields under independently supplied math intent."
+  ([call] (validate-call! call nil))
+  ([call caller-options] (validate-call! call caller-options)))
+
+(defn- make-call
   "Bind outer logical values for target-neutral host repetition.
 
    `buffers` maps outer invariant/initial/output IDs to resident keys or views. `scalars` maps
    outer scalar IDs to typed values. `scratch` maps each carry output ID to its alternate buffer;
    it is required for an out-of-place carry only when the resolved trip count exceeds one."
-  [scheduled emitted buffers scalars scratch]
+  [scheduled emitted buffers scalars scratch caller-options]
   (let [scheduled (schedule/validate! scheduled)
         algorithm (:algorithm scheduled)
         emitted (graph/validate! emitted)
@@ -219,9 +226,16 @@
                :iteration (when iteration-slot
                             {:id iteration :type (:kernel-dtype iteration-slot)})}
               scratch output-bindings {:execution :host-repetition})]
-    (validate! call)))
+    (validate-call! call caller-options)))
 
-(defn validate-in-context!
+(defn make
+  "Bind outer values for host repetition; caller intent is never recovered from call attributes."
+  ([scheduled emitted buffers scalars scratch]
+   (make-call scheduled emitted buffers scalars scratch nil))
+  ([scheduled emitted buffers scalars scratch caller-options]
+   (make-call scheduled emitted buffers scalars scratch caller-options)))
+
+(defn- validate-in-context-for-request!
   "Validate a loop call against its containing program's outer runtime bindings.
 
    A resolved trip count and carry rotation cannot be verified from the iteration ABI alone:
@@ -229,9 +243,9 @@
    through `make`, then compare execution fields. Buffer tokens use ordinary identity-aware
    equality, not content hashing; typed scalar comparisons retain floating bits. Attributes are
    diagnostic and are not execution authority. No host evaluation or driver contact occurs."
-  [call buffers scalars scratch]
-  (let [call (validate! call)
-        canonical (make (:schedule call) (:graph call) buffers scalars scratch)]
+  [call buffers scalars scratch caller-options]
+  (let [call (if (nil? caller-options) (validate! call) (validate! call caller-options))
+        canonical (make-call (:schedule call) (:graph call) buffers scalars scratch caller-options)]
     (doseq [field [:trip-count :buffers :scalars :scratch :outputs]]
       (let [expected (get canonical field)
             actual (get call field)
@@ -244,10 +258,17 @@
                  {:field field :expected expected :actual actual}))))
     call))
 
-(defn iteration-binding
+(defn validate-in-context!
+  "Reconstruct loop runtime bindings independently under the containing caller's math request."
+  ([call buffers scalars scratch]
+   (validate-in-context-for-request! call buffers scalars scratch nil))
+  ([call buffers scalars scratch caller-options]
+   (validate-in-context-for-request! call buffers scalars scratch caller-options)))
+
+(defn- iteration-binding-for-request
   "Return the ordinary KernelGraph buffer/scalar bindings for iteration `index`."
-  [call index]
-  (let [call (validate! call)
+  [call index caller-options]
+  (let [call (if (nil? caller-options) (validate! call) (validate! call caller-options))
         trip-count (:trip-count call)]
     (when-not (and (integer? index) (<= 0 index) (< index trip-count))
       (fail! :structured-loop-iteration "iteration index is outside the loop trip count"
@@ -277,3 +298,8 @@
          iteration-scalar
          (assoc (:id iteration-scalar)
                 {:type (:type iteration-scalar) :value index}))})))
+
+(defn iteration-binding
+  "Project one checked iteration without treating retained metadata as math permission."
+  ([call index] (iteration-binding-for-request call index nil))
+  ([call index caller-options] (iteration-binding-for-request call index caller-options)))

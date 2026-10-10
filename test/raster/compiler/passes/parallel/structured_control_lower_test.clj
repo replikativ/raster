@@ -4,6 +4,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
@@ -137,6 +138,64 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (emitted-loop/validate! accepted {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))
     (is (= default (emitted-loop/validate! default)))
+    (let [buffers {'u0 :initial-buffer 'u-final :output-buffer}
+          scalars {'steps {:type :long :value 3}
+                   'n {:type :int :value 64}
+                   'alpha {:type :float :value 0.25}}
+          scratch {'u-final :scratch-buffer}
+          request {:scalar-math policy}
+          call (loop-call/make scheduled selected buffers scalars scratch request)
+          program (enclosing-loop-program accepted)
+          proof (emitted-program/validate-with-physical-results! program request)
+          prepared (program-call/make program buffers scalars scratch nil {} proof request)]
+      (is (= call (loop-call/validate! call request)))
+      (is (= call (loop-call/validate-in-context! call buffers scalars scratch request)))
+      (is (= {'u-in :initial-buffer 'u-next :output-buffer}
+             (:buffers (loop-call/iteration-binding call 0 request))))
+      (is (= {'u-in :output-buffer 'u-next :scratch-buffer}
+             (:buffers (loop-call/iteration-binding call 1 request))))
+      (is (= {'u-in :scratch-buffer 'u-next :output-buffer}
+             (:buffers (loop-call/iteration-binding call 2 request))))
+      (is (thrown? clojure.lang.ExceptionInfo (loop-call/make scheduled selected buffers scalars scratch)))
+      (is (thrown? clojure.lang.ExceptionInfo (loop-call/validate! call)))
+      (is (thrown? clojure.lang.ExceptionInfo (loop-call/iteration-binding call 0)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (loop-call/validate-in-context! call buffers scalars scratch)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (loop-call/validate! (assoc-in call [:attributes :scalar-math] policy))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (loop-call/validate-in-context! (assoc call :trip-count 4) buffers scalars scratch request)))
+      (is (= prepared (program-call/validate! prepared request)))
+      (is (= prepared (program-call/validate-with-retained-program! prepared proof request)))
+      (is (= call (first (:steps prepared))))
+      (is (= prepared (program-call/make program buffers scalars scratch nil {} nil request)))
+      (is (= #{:initial-buffer :output-buffer :scratch-buffer}
+             (set (program-call/buffer-identities prepared request))))
+      (doseq [check [#(program-call/validate! prepared)
+                     #(program-call/validate-with-retained-program! prepared proof)
+                     #(program-call/make program buffers scalars scratch nil {} proof)
+                     #(program-call/buffer-bindings prepared)
+                     #(program-call/buffer-identities prepared)
+                     #(program-call/map-buffers prepared identity)
+                     #(program-call/validate! (assoc-in prepared [:attributes :scalar-math] policy))]]
+        (is (thrown? clojure.lang.ExceptionInfo (check))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (program-call/validate-with-retained-program!
+                    (assoc-in prepared [:steps 0 :trip-count] 4) proof request)))
+      (let [projection-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                       '*validated-boundary-projections*)
+            policy-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                  '*validated-projection-policy*)
+            observed (atom [])
+            remapped (program-call/map-buffers
+                      prepared (fn [buffer]
+                                 (swap! observed conj [@projection-var @policy-var])
+                                 [:renamed buffer]) request)]
+        (is (= [[nil nil] [nil nil] [nil nil]] @observed))
+        (is (= remapped (program-call/validate! remapped request)))
+        (is (= (:program prepared) (:program remapped)))
+        (is (= #{[:renamed :initial-buffer] [:renamed :output-buffer] [:renamed :scratch-buffer]}
+               (set (program-call/buffer-identities remapped request))))))
     (let [program (enclosing-loop-program accepted)
           proof (emitted-program/validate-with-physical-results! program {:scalar-math policy})]
       (is (= program (emitted-program/validate! program {:scalar-math policy})))

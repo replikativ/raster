@@ -2317,3 +2317,14 @@ obtains a genuine nonnil token before attempting callback substitution.
 Program-call/link/cache/artifact consumers still use default intent and therefore
 cannot reuse selected proof evidence yet; public activation and physical target
 admission remain pending. No numerical tolerance or default changed.
+
+The structured-loop call owner now accepts separate caller intent for construction,
+fresh validation, canonical outer-binding reconstruction and iteration projection.
+No request is stored in call attributes. Selected tanh calls preserve all three
+ping-pong bindings; default/metadata-only permission and tampered trip counts are
+rejected. Independent review found no blocker; loop-lowering/routing and
+invocation-retention suites pass 59 tests / 574 assertions. This is a checkpoint
+within the combined call-binding slice, not completed selected execution:
+program-call, LinkPlan and GPU iteration consumers must still forward the same
+independent request or consume a separately checked capability. Program-call
+projection reuse must be request-bound and kept outside host/mapper callbacks.

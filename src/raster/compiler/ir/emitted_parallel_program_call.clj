@@ -13,6 +13,7 @@
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -156,24 +157,41 @@
     call))
 
 (def ^:dynamic ^:private *validated-boundary-projections* nil)
+(def ^:dynamic ^:private *validated-projection-policy* nil)
 
-(defn- checked-operation-projection [operation]
+(defn- same-projection-request? [caller-options]
+  (= (numerics/validate-scalar-math-policy! *validated-projection-policy*)
+     (numerics/validate-scalar-math-policy! (:scalar-math caller-options))))
+
+(defn- checked-operation-projection [operation caller-options]
   (if *validated-boundary-projections*
-    (emitted-program/operation-projection *validated-boundary-projections* operation)
+    (do
+      (when-not (same-projection-request? caller-options)
+        (fail! :emitted-program-projection-math-request
+               "checked equation projections belong to a different caller math request" {}))
+      (emitted-program/operation-projection *validated-boundary-projections* operation))
     (if (equation-dispatch/emitted-equation-dispatch? operation)
-      (equation-dispatch/validate-with-boundary operation)
-      (let [projection (emitted-equation/validate-with-physical-results operation)]
+      (if (nil? caller-options)
+        (equation-dispatch/validate-with-boundary operation)
+        (equation-dispatch/validate-with-boundary operation caller-options))
+      (let [projection (if (nil? caller-options)
+                         (emitted-equation/validate-with-physical-results operation)
+                         (emitted-equation/validate-with-physical-results operation caller-options))]
         (assoc projection :candidates [(:boundary projection)])))))
 
-(defn validate-equation-call!
-  [call]
+(defn- validate-equation-call-for-request!
+  [call caller-options]
   (when-not (emitted-equation-call? call)
     (fail! :emitted-program-equation-call "expected an EmittedEquationCall" {:call call}))
   (let [{:keys [boundary physical-results candidates]}
-        (checked-operation-projection (first (:operations (:equation call))))]
+        (checked-operation-projection (first (:operations (:equation call))) caller-options)]
         ;; Independent outside checked construction. Inside it, only the exact already-checked
         ;; immutable boundary's projection may be reused; every call/binding check still runs.
     (validate-equation-call-against-boundary! call boundary physical-results candidates)))
+
+(defn validate-equation-call!
+  ([call] (validate-equation-call-for-request! call nil))
+  ([call caller-options] (validate-equation-call-for-request! call caller-options)))
 
 (defn- validate-result-views!
   [equation boundary physical result-views]
@@ -326,7 +344,7 @@
 (defn- validate-call-against-program!
   "Check a call against its exact validated program. A constructor may retain exact step objects
    it already checked; public callers pass nil and independently validate every step."
-  [call parallel-program validated-equation-calls]
+  [call parallel-program validated-equation-calls caller-options]
   (when-not (emitted-program-call? call)
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
@@ -362,7 +380,9 @@
                                 (.containsKey ^java.util.IdentityHashMap
                                               validated-equation-calls step))]
           (when-not constructed?
-            (validate-equation-call! step))
+            (if (nil? caller-options)
+              (validate-equation-call! step)
+              (validate-equation-call! step caller-options)))
             (doseq [[result physical] (:result-views step)]
               (when-not (and (= (get buffers physical) (get (:buffers step) physical))
                              (= (get buffers result) (get (:outputs step) result))
@@ -398,13 +418,18 @@
               (vreset! current-buffers next-buffers))))
 
         (loop-call/structured-loop-call? step)
-        (let [emitted (emitted-loop/validate! (first (:operations equation)))]
+        (let [operation (first (:operations equation))
+              emitted (if (nil? caller-options)
+                        (emitted-loop/validate! operation)
+                        (emitted-loop/validate! operation caller-options))]
           (when-not (and (= (:schedule emitted) (:schedule step))
                          (= (:graph emitted) (:graph step)))
             (fail! :emitted-program-call-loop
                    "structured loop call differs from its emitted equation"
                    {:equation (:id equation)}))
-          (loop-call/validate-in-context! step @current-buffers scalar-values loop-scratch)
+          (if (nil? caller-options)
+            (loop-call/validate-in-context! step @current-buffers scalar-values loop-scratch)
+            (loop-call/validate-in-context! step @current-buffers scalar-values loop-scratch caller-options))
           (vswap! current-buffers merge (:outputs step)))
 
         :else
@@ -431,55 +456,69 @@
                  {:value id :expected expected :actual actual}))))
     call))
 
-(defn validate!
+(defn- validate-for-request!
   "Independently validate a call and its complete emitted program."
-  [call]
+  [call caller-options]
   (when-not (emitted-program-call? call)
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
-  (let [{:keys [program projections]}
-        (emitted-program/validate-with-physical-results! (:program call))
+  (let [policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        {:keys [program projections]}
+        (if (nil? caller-options)
+          (emitted-program/validate-with-physical-results! (:program call))
+          (emitted-program/validate-with-physical-results! (:program call) caller-options))
         ;; A public validation's synchronous projection scope is mutable and invocation-local;
         ;; the validator's sealed static evidence itself remains read-only.
         local-projections (doto (java.util.IdentityHashMap.) (.putAll projections))
-        checked (binding [*validated-boundary-projections* local-projections]
-                  (validate-call-against-program! call program nil))]
+        checked (binding [*validated-boundary-projections* local-projections
+                          *validated-projection-policy* policy]
+                  (validate-call-against-program! call program nil caller-options))]
     ;; Every public validation starts with a fresh complete program check and projection index.
     ;; A synchronous enclosing rename may retain only facts from this successful check; mapper
     ;; callbacks never inherit that rename context and no index is stored in the returned call.
-    (when *validated-boundary-projections*
+    (when (and *validated-boundary-projections* (same-projection-request? caller-options))
       (.putAll ^java.util.IdentityHashMap *validated-boundary-projections* local-projections))
     checked))
 
-(defn ^:no-doc validate-with-retained-program!
+(defn validate!
+  "Independently validate a call and its complete program under external math intent."
+  ([call] (validate-for-request! call nil))
+  ([call caller-options] (validate-for-request! call caller-options)))
+
+(defn- validate-retained-for-request!
   "Internal exact-owner static-proof path. Recheck every concrete call binding and step;
    reuse only the unchanged emitted program's sealed validation and physical projections.
    The fresh projection scope and evidence are not installed on the returned call."
-  [call retained-validation]
+  [call retained-validation caller-options]
   (when-not (emitted-program-call? call)
     (fail! :emitted-program-call-type "expected an EmittedParallelProgramCall"
            {:actual (type call)}))
-  (let [{:keys [program projections]}
-        (emitted-program/checked-retained-validation! (:program call) retained-validation)
+  (let [policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        {:keys [program projections]}
+        (if (nil? caller-options)
+          (emitted-program/checked-retained-validation! (:program call) retained-validation)
+          (emitted-program/checked-retained-validation! (:program call) retained-validation caller-options))
         local-projections (doto (java.util.IdentityHashMap.) (.putAll projections))]
-    (binding [*validated-boundary-projections* local-projections]
+    (binding [*validated-boundary-projections* local-projections
+              *validated-projection-policy* policy]
       ;; No constructor exemptions: even steps originating from `make` are checked afresh.
-      (validate-call-against-program! call program nil))))
+      (validate-call-against-program! call program nil caller-options))))
 
-(defn execution-order
+(defn ^:no-doc validate-with-retained-program!
+  "Reuse only exact program evidence checked against this independent request; recheck bindings."
+  ([call retained-validation] (validate-retained-for-request! call retained-validation nil))
+  ([call retained-validation caller-options]
+   (validate-retained-for-request! call retained-validation caller-options)))
+
+(defn- execution-order-for-request
   "Project straight-line selected graph order without allocating device storage.
 
    Emitted equation calls retain validated, fully selected KernelGraphs. The optional observer
    receives [step-index graph] and supplies the actually bound order instead; both projections
    retain source indices across host equations. Neither projection proves completion or escape.
    Structured control requires a loop-aware witness and deliberately declines."
-  ([call]
-   (execution-order call
-                    (fn [_ graph]
-                      {:record-time-prologue []
-                       :per-replay (mapv #(hash-map :kernel-phase (:id %)) (:nodes graph))})))
-  ([call graph-order]
-   (let [call (validate! call)]
+  [call graph-order caller-options]
+   (let [call (if (nil? caller-options) (validate! call) (validate! call caller-options))]
      (when (some loop-call/structured-loop-call? (:steps call))
        (throw (ex-info "structured program execution order requires a loop-aware witness"
                        {:reason :parallel-program-structured-execution-order})))
@@ -487,7 +526,9 @@
       (fn [order [step-index step]]
         (if (evaluated-host-equation? step)
           order
-          (let [selected (graph-order step-index (:graph step))
+          (let [selected (binding [*validated-boundary-projections* nil
+                                  *validated-projection-policy* nil]
+                           (graph-order step-index (:graph step)))
                 annotate #(mapv (fn [entry] (assoc entry :source {:step step-index})) %)]
             (when-not (and (map? selected)
                            (every? #(and (vector? (get selected %))
@@ -499,16 +540,26 @@
                 (update :record-time-prologue into (annotate (:record-time-prologue selected)))
                 (update :per-replay into (annotate (:per-replay selected)))))))
       {:record-time-prologue [] :per-replay [] :completion :unproven}
-      (map-indexed vector (:steps call))))))
+      (map-indexed vector (:steps call)))))
+
+(defn- ordinary-graph-order [_ graph]
+  {:record-time-prologue []
+   :per-replay (mapv #(hash-map :kernel-phase (:id %)) (:nodes graph))})
+
+(defn execution-order
+  "Project selected graph order after independent call validation; observers inherit no proof scope."
+  ([call] (execution-order-for-request call ordinary-graph-order nil))
+  ([call graph-order] (execution-order-for-request call graph-order nil))
+  ([call graph-order caller-options] (execution-order-for-request call graph-order caller-options)))
 
 (defn- remap-buffer-map
   [remap buffers]
   (into (empty buffers) (map (fn [[id buffer]] [id (remap buffer)])) buffers))
 
 (defn- remap-loop-call
-  [call remap]
-  (let [remap-optional #(when (some? %) (remap %))]
-    (loop-call/validate!
+  [call remap caller-options]
+  (let [remap-optional #(when (some? %) (remap %))
+        remapped
      (-> call
          (update-in [:buffers :invariants] #(remap-buffer-map remap %))
          (update-in [:buffers :carries]
@@ -519,17 +570,20 @@
                                  (update :alternate remap-optional))
                             carries)))
          (update :scratch #(remap-buffer-map remap %))
-         (update :outputs #(remap-buffer-map remap %))))))
+         (update :outputs #(remap-buffer-map remap %)))]
+    (if (nil? caller-options)
+      (loop-call/validate! remapped)
+      (loop-call/validate! remapped caller-options))))
 
-(defn buffer-bindings
+(defn- buffer-bindings-for-request
   "Return every compiler-value/storage pair referenced by an emitted call boundary.
 
    A zero-trip structured loop can retain a dead carry-output token that is intentionally absent
    from the call's effective top-level `:buffers`. It is still part of the nested call structure
    and must therefore participate in total storage-identity projections. Graph-owned temporaries
    are not call-boundary storage and are excluded."
-  [call]
-  (let [call (validate! call)
+  [call caller-options]
+  (let [call (if (nil? caller-options) (validate! call) (validate! call caller-options))
         output-bindings (fn [outputs]
                           (remove (comp typed-scalar? second) outputs))
         step-bindings
@@ -560,28 +614,39 @@
                            (output-bindings (:outputs call))
                            (mapcat step-bindings (:steps call)))))))
 
+(defn buffer-bindings
+  "Return compiler-value/storage pairs after independent request-aware validation."
+  ([call] (buffer-bindings-for-request call nil))
+  ([call caller-options] (buffer-bindings-for-request call caller-options)))
+
 (defn buffer-identities
   "Return every distinct external/resident storage token referenced by an emitted call."
-  [call]
-  (vec (distinct (map second (buffer-bindings call)))))
+  ([call] (vec (distinct (map second (buffer-bindings call)))))
+  ([call caller-options] (vec (distinct (map second (buffer-bindings call caller-options))))))
 
-(defn map-buffers
+(defn- map-buffers-for-request
   "Map every external/resident buffer token in an emitted program call exactly once.
 
    `f` is a pure storage-identity projection, typically MaterializedBuffer → LinkValue ID. The
    mapping must be total, non-nil, and injective over distinct source storage: this operation may
    rename existing aliases but cannot silently introduce a new alias. Graph-owned temporaries are
    intentionally absent from EmittedParallelProgramCall and remain private to KernelGraph."
-  [call f]
+  [call f caller-options]
   ;; buffer-identities independently validates the complete input call before projecting it.
-  (let [validated-boundaries (java.util.IdentityHashMap.)
-        source-buffers (binding [*validated-boundary-projections* validated-boundaries]
-                         (buffer-identities call))]
+  (let [policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        validated-boundaries (java.util.IdentityHashMap.)
+        source-buffers (binding [*validated-boundary-projections* validated-boundaries
+                                *validated-projection-policy* policy]
+                         (if (nil? caller-options)
+                           (buffer-identities call)
+                           (buffer-identities call caller-options)))]
     (when-not (ifn? f)
       (fail! :emitted-program-buffer-mapper
              "emitted program buffer remapping requires a callable projection"
              {:mapper f}))
-    (let [target-buffers (mapv f source-buffers)]
+    (let [target-buffers (binding [*validated-boundary-projections* nil
+                                 *validated-projection-policy* nil]
+                           (mapv f source-buffers))]
       (when-let [source (some (fn [[source target]] (when (nil? target) source))
                               (map vector source-buffers target-buffers))]
         (fail! :emitted-program-buffer-remap-missing
@@ -613,7 +678,7 @@
                 (-> step
                     (update :buffers #(remap-buffer-map remap %))
                     (update :outputs #(remap-buffer-map remap %)))
-                (loop-call/structured-loop-call? step) (remap-loop-call step remap)))
+                (loop-call/structured-loop-call? step) (remap-loop-call step remap caller-options)))
             remapped
             (-> call
                 (update :steps #(mapv remap-step %))
@@ -632,17 +697,27 @@
         ;; A later public validation still independently checks the complete program.
         ;; Do not convey the validation context to mapper callbacks (or their futures).
         ;; Its only consumers are the source and final synchronous validation phases.
-        (binding [*validated-boundary-projections* validated-boundaries]
-          (validate-call-against-program! remapped (:program call) nil))))))
+        (binding [*validated-boundary-projections* validated-boundaries
+                  *validated-projection-policy* policy]
+          (validate-call-against-program! remapped (:program call) nil caller-options))))))
+
+(defn map-buffers
+  "Rename storage under caller intent without granting that request or proof scope to callbacks."
+  ([call f] (map-buffers-for-request call f nil))
+  ([call f caller-options] (map-buffers-for-request call f caller-options)))
 
 (defn- stage-inputs
   "Fresh checked inputs and host results for this construction only. The evaluator is neither
    returned nor retained. This private value is not an externally reusable validation proof."
-  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation]
+  [parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation caller-options]
   (let [{parallel-program :program projections :projections}
         (if retained-validation
-          (emitted-program/checked-retained-validation! parallel-program retained-validation)
-          (emitted-program/validate-with-physical-results! parallel-program))
+          (if (nil? caller-options)
+            (emitted-program/checked-retained-validation! parallel-program retained-validation)
+            (emitted-program/checked-retained-validation! parallel-program retained-validation caller-options))
+          (if (nil? caller-options)
+            (emitted-program/validate-with-physical-results! parallel-program)
+            (emitted-program/validate-with-physical-results! parallel-program caller-options)))
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
                                              (filter #(emitted-equation/emitted-equation?
@@ -683,14 +758,17 @@
               (fail! :emitted-program-loop-scratch
                      "loop scratch binding cannot be nil" {:value id})))
         {:keys [scalars host-steps]}
-        (evaluate-host-equations parallel-program buffers scalar-values evaluate-host)]
+        (binding [*validated-boundary-projections* nil
+                  *validated-projection-policy* nil]
+          (evaluate-host-equations parallel-program buffers scalar-values evaluate-host))]
     {:program parallel-program :projections projections :buffers buffers :scalars scalars
-     :loop-scratch loop-scratch :host-steps host-steps :result-views result-views}))
+     :loop-scratch loop-scratch :host-steps host-steps :result-views result-views
+     :caller-options caller-options}))
 
 (defn- construct-staged-call
   "Construct only from inputs just staged by this namespace. Host evaluation remains outside
    structural construction; every checked host step is installed unchanged into the call."
-  [{parallel-program :program :keys [projections buffers scalars loop-scratch host-steps result-views]}]
+  [{parallel-program :program :keys [projections buffers scalars loop-scratch host-steps result-views caller-options]}]
   (let [values (:values parallel-program)
         validated-equation-calls (java.util.IdentityHashMap.)
         planned
@@ -701,9 +779,14 @@
              {:buffers buffers :steps (conj steps (get host-steps (:id equation)))}
 
              (emitted-loop/emitted-loop? (first (:operations equation)))
-             (let [emitted (emitted-loop/validate! (first (:operations equation)))
-                   call (loop-call/make (:schedule emitted) (:graph emitted)
-                                        buffers scalars loop-scratch)]
+             (let [operation (first (:operations equation))
+                   emitted (if (nil? caller-options)
+                             (emitted-loop/validate! operation)
+                             (emitted-loop/validate! operation caller-options))
+                   call (if (nil? caller-options)
+                          (loop-call/make (:schedule emitted) (:graph emitted) buffers scalars loop-scratch)
+                          (loop-call/make (:schedule emitted) (:graph emitted)
+                                          buffers scalars loop-scratch caller-options))]
                {:buffers (merge buffers (:outputs call))
                 :steps (conj steps call)})
 
@@ -728,7 +811,7 @@
      (->EmittedParallelProgramCall
       parallel-program (:steps planned) buffers final-buffers scalars loop-scratch outputs
       {:execution :stage-once-host-repetition :source-inspected false})
-     parallel-program validated-equation-calls)))
+     parallel-program validated-equation-calls caller-options)))
 
 (defn make
   "Prepare a source-independent, target-neutral call of an emitted parallel program.
@@ -741,12 +824,20 @@
    This declares a storage relation, not proof that arbitrary runtime tokens alias: LinkPlan
    validates concrete views, and runtime preparation requires checked view resolution.
    The seven-argument arity is an internal static-evidence capability path. It skips only repeated
-   emitted-program analysis; scalar/buffer/result-view checks and host staging remain fresh."
+   emitted-program analysis; scalar/buffer/result-view checks and host staging remain fresh.
+   The eight-argument arity supplies independent caller options to both fresh and retained paths;
+   neither call attributes nor retained evidence may grant math consent."
   ([parallel-program buffers scalar-values loop-scratch evaluate-host]
-   (make parallel-program buffers scalar-values loop-scratch evaluate-host {}))
+   (construct-staged-call
+    (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host {} nil nil)))
   ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views]
-   (make parallel-program buffers scalar-values loop-scratch evaluate-host result-views nil))
+   (construct-staged-call
+    (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host result-views nil nil)))
   ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation]
    (construct-staged-call
     (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host result-views
-                  retained-validation))))
+                  retained-validation nil)))
+  ([parallel-program buffers scalar-values loop-scratch evaluate-host result-views retained-validation caller-options]
+   (construct-staged-call
+    (stage-inputs parallel-program buffers scalar-values loop-scratch evaluate-host result-views
+                  retained-validation caller-options))))
