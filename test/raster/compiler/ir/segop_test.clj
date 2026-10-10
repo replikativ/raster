@@ -128,10 +128,12 @@
         (is (= :cross-block (:phase phase-two)))
         (is (= [:reduction-phase 0 :cross-block] (:id phase-two)))
         (is (launch/dimension-expression? (get-in phase-two [:space :dims 0 :bound])))
-        (is (= (list 'clojure.core/+ acc
+        (is (= (list (get-in phase-two [:reduction :algebra :combine]) acc
                      (list 'clojure.core/aget partials index))
                lambda)
             "the scheduled second phase reduces its partial buffer, not the original element body")
+        (is (= (get-in (first segops) [:reduction :algebra :combine])
+               (first lambda)) "the terminal phase retains the certified combine operation")
         (is (not (contains? (:inputs phase-two) 'a)))))))
 
 (deftest lower-reduce-phase-id-is-structured-for-any-equation-id

@@ -17,9 +17,17 @@
             [raster.par]
             [raster.math]
             [raster.compiler.backend.cpu.aot :as aot]
+            [raster.compiler.backend.cpu.csimd :as csimd]
+            [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.core.util :as util]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [clojure.string :as str]
             [raster.compiler.fixtures.absolute :as absolute]
             [raster.compiler.fixtures.extrema :as extrema]
-            [raster.compiler.ir.parallel-program :as parallel-program]))
+            [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.segop :as segop]))
 
 (deftest qualified-integer-size-casts-use-the-shared-descriptor
   (doseq [cast '[int long clojure.core/int clojure.core/long]]
@@ -271,6 +279,159 @@
                 (str "n=" n " simd == interpreter"))
             (is (every? true? (map #(< (Math/abs (clojure.core/- %1 %2)) 1e-9) os oc))
                 (str "n=" n " simd == scalar-C"))))))))
+
+(deftest canonical-c-host-bindings-and-retained-schedules-share-exact-ids
+  (let [source '(let* [sum__98765 (raster.par/reduce acc 0.0 i (clojure.core/alength a)
+                                                       (+ acc (clojure.core/aget a i)))] sum__98765)
+        program (:form (segop-lower/segop-lower-pass source
+                                                   {:dtype :double :target-device :cpu:0
+                                                    :array-types {'a :double}}))
+        original-prefix (first (second (:source program)))
+        {normalized :form lengths :length-syms} (aot/normalize-for-c (:source program))
+        {canonical :form renames :host-value-remap} (#'aot/canonical-host-projection normalized program)
+        canonical-prefix (get renames original-prefix)
+        prefix-name (ce/c-symbol canonical-prefix)
+        emitted (binding [aot/*scheduled-program* program aot/*host-value-remap* renames]
+                  (with-redefs [csimd/active-isa (constantly :avx2)
+                                aot/compatibility-segop
+                                (fn [& _] (throw (AssertionError. "retained canonical site was not consumed")))]
+                    (aot/emit-c-fn "canonical_sum" :double [['a "double"]] [] [] [] lengths canonical)))]
+    (is (not= original-prefix canonical-prefix))
+    (is (= 'sum (get renames 'sum__98765)))
+    (is (str/includes? emitted "_mm256_add_pd") "the retained reduction really takes the SIMD path")
+    (is (re-find (re-pattern (str "\\b(?:long|int)\\s+"
+                                 (java.util.regex.Pattern/quote prefix-name) "\\s*=")) emitted)
+        "the host extent is declared using its canonical source identity")
+    (is (< 1 (count (re-seq (re-pattern (str "\\b" (java.util.regex.Pattern/quote prefix-name) "\\b"))
+                           emitted)))
+        "the retained SIMD operation uses that same declared extent")
+    (is (not (str/includes? emitted (ce/c-symbol original-prefix))))
+    (is (= program (parallel-program/validate! program)))
+    (is (= original-prefix (first (second (:source program)))) "C legalization does not mutate the schedule")))
+
+(deftest c-host-substitution-preserves-owned-reduction-scopes
+  (let [source '(let* [sum (raster.par/reduce captured 0.0 i n
+                                            (+ captured (clojure.core/aget a i)))] sum)
+        program (:form (segop-lower/segop-lower-pass source
+                                                   {:dtype :double :target-device :cpu:0
+                                                    :array-types {'a :double} :scalar-types {'n :long}}))
+        original (-> program :equations last :operations first)
+        transported (segop/substitute-host-values {'a 'captured 'n 'i} original)
+        {:keys [acc init lambda]} (segop/scalar-reduce-op transported)
+        index (get-in transported [:space :dims 0 :name])
+        evaluate (eval (list 'fn [(with-meta acc nil) (with-meta index nil) 'captured] lambda))
+        emitted (:block (csimd/compile-segred-c transported :avx2 #{'captured} 'sum))]
+    (is (not= 'captured acc) "host array must not be captured by the accumulator")
+    (is (not= 'i index) "host extent must not be captured by the loop index")
+    (is (= 'i (get-in transported [:space :dims 0 :bound])))
+    (is (= acc (get-in transported [:reduction :algebra :acc])))
+    (is (= (get-in original [:reduction :algebra :element])
+           (get-in transported [:reduction :algebra :element]))
+        "the retained TypedSOAC element formal is not a newly inferred expression")
+    (is (= 0.0 init))
+    (is (= 12.5 (evaluate 10.0 1 (double-array [1.0 2.5]))))
+    (is (string? emitted))
+    (is (str/includes? emitted "captured") "actual SIMD load uses the outer host array")
+    (is (= transported (segop/substitute-host-values {'a 'captured 'n 'i} original)))
+    (is (= emitted (:block (csimd/compile-segred-c
+                           (segop/substitute-host-values {'a 'captured 'n 'i} original)
+                           :avx2 #{'captured} 'sum))))
+    (let [alpha-equivalent (util/subst-syms {'a 'captured__123
+                                           'captured 'captured__456 'i 'i__789} original)
+          next (segop/substitute-host-values {'captured__123 'captured 'n 'i} alpha-equivalent)]
+      (is (= emitted (:block (csimd/compile-segred-c next :avx2 #{'captured} 'sum)))
+          "freshness-only alpha-equivalent owner IDs produce byte-identical C"))
+    (let [with-outer-neutral (-> original
+                                (assoc-in [:reduction :components 0 :neutral] 'captured)
+                                (assoc-in [:reduction :algebra :init] 'captured))
+          next (segop/substitute-host-values {'captured 'host-initial} with-outer-neutral)]
+      (is (= 'host-initial (get-in next [:reduction :components 0 :neutral])))
+      (is (= 'host-initial (get-in next [:reduction :algebra :init])))
+      (is (= :double (get-in next [:reduction :components 0 :dtype]))))
+    (let [result-region (kernel-body/->ScalarRegion
+                         ['captured 'a] '(+ captured (clojure.core/aget a 0))
+                         [{:sym 'a :dtype :double}] :double)
+          next (segop/substitute-host-values
+                {'a 'captured} (assoc-in original [:reduction :attributes :result-region] result-region))
+          region (get-in next [:reduction :attributes :result-region])
+          [parameter capture] (:parameters region)
+          evaluate-result (eval (list 'fn [parameter capture] (:expression region)))]
+      (is (not= 'captured parameter))
+      (is (= 'captured capture))
+      (is (= 'captured (get-in region [:operands 0 :sym])))
+      (is (= 7.0 (evaluate-result 5.0 (double-array [2.0])))))
+    (let [element-combine (-> original
+                              (assoc-in [:reduction :step] nil)
+                              (assoc-in [:reduction :element]
+                                        (reduction/->ReductionRegion [] ['element] {}))
+                              (assoc-in [:reduction :combine]
+                                        (reduction/->CombineRegion [['left 'right]] [] ['(+ left right)] {})))]
+      (is (= (:reduction element-combine) (reduction/validate! (:reduction element-combine))))
+      (try
+        (segop/substitute-host-values {} element-combine)
+        (is false "element/combine owners require their own transport proof")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :raster/bug (:reason (ex-data exception)))))))
+    (is (= original (-> program :equations last :operations first)))))
+
+(deftest canonical-c-source-reserves-declared-core-named-parameters
+  (doseq [parameter ['count 'seq]
+          used? [false true]]
+    (let [local (symbol (str (name parameter) "__123"))
+          body (if used? (list '+ parameter local) local)
+          source (list 'let* [local 5] body)
+          {canonical :form} (#'aot/canonical-host-projection source nil [parameter])
+          projected-local (first (second canonical))
+          original (eval (list 'fn [parameter] source))
+          projected (eval (list 'fn [parameter] canonical))]
+      (is (not= parameter projected-local)
+          "ABI parameters reserve their names even when not read in the body")
+      (is (= (original 3) (projected 3)))
+      (is (= canonical (:form (#'aot/canonical-host-projection source nil [parameter])))))))
+
+(deftest c-host-substitution-preserves-scalar-local-scopes-and-rejects-unknown-owners
+  (let [operation (segop/->SegMap
+                   0 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :none)
+                   '(let* [captured 2.0] (+ captured factor))
+                   {:locals [{:id 'captured :dtype :double :init 2.0}]
+                    :result '(+ captured factor)}
+                   #{} #{'out} #{'factor} (segop/->KernelGrid 1 256 0) :double 'out nil)
+        transported (segop/substitute-host-values {'factor 'captured} operation)
+        region (:scalar-region transported)
+        local (get-in region [:locals 0 :id])
+        lambda-value ((eval (list 'fn ['captured] (:lambda transported))) 3.0)
+        region-source (list 'let* (vec (mapcat (juxt :id :init) (:locals region))) (:result region))
+        region-value ((eval (list 'fn ['captured] region-source)) 3.0)]
+    (is (not= 'captured local))
+    (is (= :double (get-in region [:locals 0 :dtype])))
+    (is (= 5.0 lambda-value region-value))
+    (is (= transported (segop/substitute-host-values {'factor 'captured} operation)))
+    (is (= operation (segop/substitute-host-values {} operation)))
+    (let [outer-only (assoc-in operation [:space :dims 0 :bound] 'i)
+          next (segop/substitute-host-values {'factor 'captured} outer-only)]
+      (is (= 'i (get-in next [:space :dims 0 :bound])))
+      (is (not= 'i (get-in next [:space :dims 0 :name]))
+          "unremapped outer free IDs must also be reserved during canonicalization"))
+    (doseq [[owner host-bound] [['count 'seq] ['seq 'count]]]
+      (let [core-named (assoc operation :space (segop/make-seg-space owner host-bound)
+                             :lambda (list 'clojure.core/aget 'input owner) :scalar-region nil
+                             :inputs #{'input} :scalars #{host-bound})
+            next (segop/substitute-host-values {'input owner host-bound host-bound} core-named)
+            index (get-in next [:space :dims 0 :name])]
+        (is (not= owner index) "declared host values shadow core Vars during free analysis")
+        (is (= host-bound (get-in next [:space :dims 0 :bound])))
+        (is (= (list 'clojure.core/aget owner index) (:lambda next)))))
+    (try
+      (segop/substitute-host-values {} (segop/->SegContract 0 {} :double :cpu:0))
+      (is false "unknown owner must not be silently reshaped")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :raster/bug (:reason (ex-data exception))))))
+    (try
+      (segop/substitute-host-values {}
+                                    (update-in operation [:space :dims] conj {:name 'j :bound 'm}))
+      (is false "multi-dimensional owners require a separate transport proof")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :raster/bug (:reason (ex-data exception))))))))
 
 ;; par/map! element-wise map vectorizes on CPU-C (:simd? true) — the other half of
 ;; every kernel (silu/relu/residual/the map of rms-norm), same path as the quant fold.
