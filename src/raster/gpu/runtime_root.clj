@@ -6,6 +6,15 @@
 (defn- entries [state]
   (filterv (fn [[_ value]] (and (map? value) (::root? value))) (vec @state)))
 
+(defn- single-root? [current]
+  ;; Admission needs only cardinality, not the entry vectors used by teardown.
+  ;; Inspect current state every time; never retain root or projection authority.
+  (= 1 (reduce-kv (fn [n _ value]
+                    (if (and (map? value) (::root? value))
+                      (if (= n 1) (reduced 2) 1)
+                      n))
+                  0 current)))
+
 (defn- retire-projection! [state entry]
   (swap! state
          (fn [current]
@@ -26,7 +35,7 @@
   [state]
   (locking state
     (let [entry (::entry @state)]
-      (when-not (and entry (= 1 (count (entries state)))
+      (when-not (and entry (single-root? @state)
                      (= :live @(:phase entry)) (:initialized? @state))
         (throw (ex-info "Runtime has no admitted live root"
                         {:reason :runtime-root-unavailable})))

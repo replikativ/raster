@@ -53,6 +53,28 @@
                (is (= before @calls))
                (is (= :live (:phase (cleanup/status (::cleanup/owner entry)))))))))
 
+(deftest admission-counts-current-roots-without-weakening-projection-checks
+  (fixture {}
+    (fn [{:keys [state initialize!]}]
+      (initialize!)
+      (let [original @state entry (root/assert-live! state)]
+        (doseq [extra [nil 42 {:unrelated true} {::root/root? false}]]
+          (reset! state (assoc original :unrelated extra))
+          (is (identical? entry (root/assert-live! state))))
+        (doseq [bad [(dissoc original ::root/entry)
+                    (assoc original ::root/entry (assoc entry ::root/root? false))
+                    (assoc original :other-root {::root/root? true})
+                    (assoc original :other-root {::root/root? :truthy})
+                    (assoc original :other-root entry)]]
+          (reset! state bad)
+          (is (= :runtime-root-unavailable
+                 (:reason (ex-data (error-of #(root/assert-live! state)))))))
+        (reset! state (assoc original :queue (Object.)))
+        (is (= :runtime-generation-mismatch
+               (:reason (ex-data (error-of #(root/assert-live! state))))))
+        (reset! state original)
+        (is (identical? entry (root/assert-live! state)))))))
+
 (deftest every-unknown-create-retains-exact-debt-and-does-not-retry
   (doseq [id [:arena :context :compute :transfer]]
     (fixture {:acquire-failure id}
