@@ -6,6 +6,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.link-plan :as link]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -144,6 +145,62 @@
                            (swap! events conj [:bind buffers scalars]) key)
                   :run! (fn [handle] (record-scope) (swap! events conj [:run handle]))
                   :release! (fn [handle] (record-scope) (swap! events conj [:release handle]))}]
+    (let [instance (link/program-instance {:id :selected :call call} request)
+          plan-request {:id :selected-link :target :ocl:0
+                        :nodes (mapv #(link/node {:id % :dtype :float :shape [64]
+                                                 :device :ocl:0 :role :state})
+                                     [:initial :output :scratch])
+                        :values (mapv #(link/value {:id % :abstract (get-in call [:program :values 'u0])
+                                                    :leaves [{:name :value :node %}]})
+                                      [:initial :output :scratch])
+                        :instances [instance] :outputs [:output]}
+          {:keys [plan effect-evidence]} (link/make-with-effect-evidence plan-request request)
+          program-proof (emitted-program/validate-with-physical-results! (:program call) request)
+          seal (:raster.compiler.ir.link-plan/validation-seal (meta effect-evidence))
+          genuine-token (seal plan effect-evidence (:scalar-math request))]
+      (is (identical? plan (link/validate! plan request)))
+      (is (= #{:output} (:outputs (link/initialization-contract plan request))))
+      (is (contains? (link/value-accesses plan request) :initial))
+      (is (= (:id plan) (:plan (link/memory-report plan request))))
+      (is (link/link-plan? (:plan (link/borrow-owned-storage plan request))))
+      (is (= #{:state} (set (vals (link/instance-roles plan instance request)))))
+      (doseq [query [#(link/initialization-contract plan) #(link/value-accesses plan)
+                     #(link/memory-report plan) #(link/borrow-owned-storage plan)
+                     #(link/instance-roles plan instance)]]
+        (is (thrown? clojure.lang.ExceptionInfo (query))))
+      (is (link/retained-effect-evidence? plan effect-evidence request))
+      (is (not (link/retained-effect-evidence? plan effect-evidence)))
+      (is (not (link/retained-effect-evidence?
+                plan (with-meta effect-evidence
+                       {:raster.compiler.ir.link-plan/validation-seal (fn [& _] genuine-token)}) request)))
+      (is (not (link/retained-effect-evidence? (assoc plan :id :copy) effect-evidence request)))
+      (is (thrown? clojure.lang.ExceptionInfo (link/validate! plan)))
+      (is (thrown? clojure.lang.ExceptionInfo (link/program-instance {:id :selected :call call})))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (link/validate-with-effect-evidence! plan program-proof)))
+      (is (identical? plan (:plan (link/validate-with-effect-evidence! plan program-proof request))))
+      (let [composed (link/validate-with-certified-effect-facts!
+                      plan (:step-facts effect-evidence) request)]
+        (is (link/retained-effect-evidence? (:plan composed) (:effect-evidence composed) request)))
+      (let [cache-var (ns-resolve 'raster.compiler.ir.link-plan '*validated-program-instances*)
+            retained-var (ns-resolve 'raster.compiler.ir.link-plan '*retained-program-validations*)
+            request-var (ns-resolve 'raster.compiler.ir.link-plan '*caller-options*)
+            observed (atom [])
+            observe #(mapv var-get [cache-var retained-var request-var])
+            projected (with-bindings {cache-var (doto (java.util.IdentityHashMap.) (.put instance true))
+                                     retained-var (doto (java.util.IdentityHashMap.)
+                                                    (.put (:program call) program-proof))
+                                     request-var request}
+                        (is (thrown? clojure.lang.ExceptionInfo (link/validate-program-instance! instance))
+                            "default public validation cannot borrow selected instance evidence")
+                        (link/make-with-final-projection
+                         plan-request (fn [candidate]
+                                        (swap! observed conj (observe) @(future (observe)))
+                                        {:plan candidate :projection :checked})
+                         program-proof request))]
+        (is (= [[nil nil nil] [nil nil nil]] @observed))
+        (is (= :checked (:projection projected)))
+        (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request))))
     (is (thrown? clojure.lang.ExceptionInfo (program-runtime/prepare-with! call executor)))
     (is (empty? @events))
     (is (thrown? clojure.lang.ExceptionInfo (program-runtime/staging-plan call :execution)))
