@@ -586,7 +586,7 @@
 (defn- derive-roles
   "Effective {sym → role} for certified LinkPlan lowering: donated → :state, constants →
    :constant, and the rest fall through to the descriptor's derived defaults."
-  [descriptor donate constants explicit-roles]
+  [donate constants explicit-roles]
   (let [donate-set   (set donate)
         constant-set (set constants)
         both         (set/intersection donate-set constant-set)]
@@ -598,9 +598,30 @@
            (into {} (map (fn [s] [s :constant]) constant-set))
            explicit-roles)))
 
+(defn- boundary-request
+  "Shared caller intent, not compiler facts or an ownership certificate.
+   Keep ordering and duplicates; adapters retain their own result projection and admission.
+   Output keys remain lazy so role-conflict validation has its existing precedence."
+  [donate constants outputs taps roles]
+  (let [effective-roles (derive-roles donate constants roles)
+        entries (fn [symbols from donated?]
+                  (map (fn [s]
+                         {:key (keyword (if donated? (str (name s) "'") (name s)))
+                          :sym s :from from}) symbols))]
+    {:donate donate :constants constants :outputs outputs :taps taps :roles roles
+     :donate-set (set donate) :effective-roles effective-roles
+     :donated-entries (entries donate :donated true)
+     :output-entries (entries outputs :output false)
+     :tap-entries (entries taps :tap false)}))
+
+(defn- donated-output-keys
+  [request]
+  (into {} (map (fn [{:keys [sym key]}] [(keyword (name sym)) key]))
+        (:donated-entries request)))
+
 (defn- build-in-tree
-  [lowering descriptor arguments donate]
-  (let [donate-set (set donate)
+  [lowering descriptor arguments request]
+  (let [donate-set (:donate-set request)
         values (:values (:certificate lowering))
         argument-map (zipmap (:all-params descriptor) arguments)]
     (vec (for [p (:array-params descriptor)
@@ -617,19 +638,17 @@
 (defn- build-out-tree
   "Out-tree = donated in→out nodes + any explicit :outputs + the functional :result-sym + taps.
    Each projects to a DeviceArray over a resident buffer (§3.4 multi-output)."
-  [lowering donate outputs result-sym taps]
+  [lowering request result-sym]
   (let [values (:values (:certificate lowering))
         output-node (fn [key sym from]
                       (let [{:keys [node shape dtype]} (get values sym)]
                         {:key key :sym sym :node node :shape shape :dtype dtype :from from}))
-        donate-nodes  (for [s donate]
-                        (output-node (keyword (str (name s) "'")) s :donated))
-        output-nodes  (for [s outputs]
-                        (output-node (keyword (name s)) s :output))
+        project (fn [{:keys [key sym from]}] (output-node key sym from))
+        donate-nodes  (map project (:donated-entries request))
+        output-nodes  (map project (:output-entries request))
         result-node   (when result-sym
                         [(output-node (keyword (name result-sym)) result-sym :result)])
-        tap-nodes     (for [s taps]
-                        (output-node (keyword (name s)) s :tap))]
+        tap-nodes     (map project (:tap-entries request))]
     (vec (concat donate-nodes output-nodes result-node tap-nodes))))
 
 (defn- compilation-id
@@ -707,7 +726,8 @@
         _ (when-not prog
             (throw (ex-info "compile: compile-gpu-program returned nil — a step fell back to host (non-resident). Pass :on-non-resident :throw to see which."
                             {:fn fn-var :target target})))
-        eff-roles (derive-roles prog donate constants roles)
+        request (boundary-request donate constants outputs taps roles)
+        eff-roles (:effective-roles request)
         ;; Effect-only deftm descriptors may retain a synthetic scalar `body_result_*` even
         ;; though the resident ABI returns Void. Only pointer results are projectable device
         ;; values; explicit written buffers remain available through :outputs.
@@ -731,9 +751,9 @@
             :roles eff-roles :outputs public-symbols}))
         lowering (resident-plan/bind-template (:template plan-template-report) args)
         lowering-ns (- (System/nanoTime) lowering-started)
-        in-tree  (build-in-tree lowering prog args donate)
-        out-tree (build-out-tree lowering donate outputs result-sym taps)
-        donated  (into {} (map (fn [s] [(keyword (name s)) (keyword (str (name s) "'"))]) donate))
+        in-tree  (build-in-tree lowering prog args request)
+        out-tree (build-out-tree lowering request result-sym)
+        donated  (donated-output-keys request)
         report {:kind :resident-descriptor
                 :timing-source :host-monotonic
                 :total-ns (- (System/nanoTime) preparation-started)
@@ -792,8 +812,8 @@
             (throw (ex-info "equation-first roles name non-buffer public parameters"
                             {:reason :compiled-equation-first-role-symbols
                              :symbols unknown :available public-symbols})))
-        effective-roles (merge public-defaults
-                               (derive-roles nil donate constants roles))
+        request (boundary-request donate constants outputs taps roles)
+        effective-roles (merge public-defaults (:effective-roles request))
         token-roles (into {} (map (fn [[symbol role]]
                                     [(get public-bindings symbol) role]))
                           effective-roles)
@@ -821,7 +841,7 @@
                                                       leaves)]))
                                 aggregate-leaves)
         leaves-by-symbol (into {} (map (juxt :symbol identity)) (:physical-parameters projection))
-        donate-set (set donate)
+        donate-set (:donate-set request)
         in-tree (vec
                  (keep (fn [{:keys [symbol]}]
                          (when-let [node (get public-bindings symbol)]
@@ -848,14 +868,9 @@
         output-entry (fn [key value from]
                        (merge {:key key :sym value :from from}
                               (equation-first-value plan (resolve-node value) nil)))
-        donated-nodes (map-indexed
-                       (fn [_ symbol]
-                         (output-entry (keyword (str (name symbol) "'")) symbol :donated))
-                       donate)
-        explicit-nodes (map-indexed
-                        (fn [_ value]
-                          (output-entry (keyword (name value)) value :output))
-                        outputs)
+        project-entry (fn [{:keys [key sym from]}] (output-entry key sym from))
+        donated-nodes (map project-entry (:donated-entries request))
+        explicit-nodes (map project-entry (:output-entries request))
         semantic-outputs (vec (:semantic-outputs attributes))
         semantic-nodes (map-indexed
                         (fn [index [value _]]
@@ -863,10 +878,7 @@
                            (equation-first-output-key value index (count semantic-outputs))
                            value :result))
                         semantic-outputs)
-        tap-nodes (map-indexed
-                   (fn [_ value]
-                     (output-entry (keyword (name value)) value :tap))
-                   taps)
+        tap-nodes (map project-entry (:tap-entries request))
         out-tree (reduce (fn [entries entry]
                            (if (some #(= (:node %) (:node entry)) entries)
                              entries
@@ -885,7 +897,8 @@
                             {:reason :invocation-link-output-boundary
                              :missing missing :outputs escaped})))]
     {:plan (assoc plan :outputs escaped)
-     :projection {:in-tree in-tree :out-tree out-tree}}))
+     :projection {:in-tree in-tree :out-tree out-tree
+                  :donated (donated-output-keys request)}}))
 
 (defn- lower-equation-first
   [fn-var args {:keys [target dtype donate constants outputs taps roles]
@@ -940,7 +953,7 @@
                      (equation-first/lower compilation args project retained-validation))))
         equation-lower-ns (- (System/nanoTime) lowering-started @projection-ns)
         plan (:plan result)
-        {:keys [in-tree out-tree]} (:projection result)
+        {:keys [in-tree out-tree donated]} (:projection result)
         attributes (:attributes plan)
         public-bindings (:public-buffer-bindings attributes)
         parameters (get-in compilation [:semantic :attributes :invocation-plan :parameters])
@@ -969,10 +982,6 @@
                     :steps steps :result-sym nil :equation-first? true}
         schedule (assoc (get-in compilation [:options :schedule])
                         :compiler :equation-first :stats (:stats compilation))
-        donated (into {} (map (fn [symbol]
-                                [(keyword (name symbol))
-                                 (keyword (str (name symbol) "'"))]))
-                      donate)
         report {:kind :equation-first
                 :timing-source :host-monotonic
                 :total-ns (- (System/nanoTime) preparation-started)
