@@ -10,13 +10,13 @@
   (let [fixture-ns 'raster.compiler.fixtures.effect-cache-definition]
     (try
       (doseq [name ["effect_cache_pure"]]
-        (let [resource (io/resource (str "raster/compiler/fixtures/" name ".clj"))]
+        (let [resource (io/resource (str "raster/compiler/fixtures/" name ".source"))]
           (load-file (.getPath resource))))
       (f fixture-ns)
       (finally (remove-ns fixture-ns)))))
 
 (defn- mutate! []
-  (load-file (.getPath (io/resource "raster/compiler/fixtures/effect_cache_mutating.clj"))))
+  (load-file (.getPath (io/resource "raster/compiler/fixtures/effect_cache_mutating.source"))))
 
 (deftest ordinary-helper-redefinition-invalidates-purity
   (with-definitions
