@@ -1,5 +1,29 @@
 # Compiler unification campaign
 
+### October 10 non-executing call-signature evidence
+
+The compiler's registered-method selection now exposes a non-executing tag-tuple
+query. It shares the same implementation-Var/result-tag and promotion projection
+as ordinary devirtualization, but never synthesizes arguments, invokes a helper,
+or registers a parametric specialization. The existing parametric tag unifier
+also exposes applicability separately from its declared result: a matching
+signature with no result annotation is not the same as no matching signature.
+The older result-only query retains its existing declared-result fallback.
+
+Focused controls distinguish asymmetric `[Dual Double]` from unsupported
+`[Double Dual]`/`[Dual Dual]`, preserve promotion casts, and recover the ordinary
+Double result of `real-value` on a Dual. Queries leave registry identity and
+helper execution counts unchanged. New controls pass 5 tests / 21 assertions;
+existing dispatch/inference tests pass 29 tests / 133 assertions in the warm REPL.
+
+This is shared evidence infrastructure, not a repaired forward-AD admission
+claim. The lexical AD preparation must next propagate actual carrier result
+facts and check every reachable argument tuple, rather than treating all seed
+dependence as Dual or any Dual overload as family-wide coverage. Unknown results,
+branch/carry alternatives, parametric cold/warm behavior and unsupported carrier
+promotions remain explicit obligations. No surface numerical semantics, emitter
+default, model pin or real-weight acceptance oracle changes here.
+
 ### October 9 physical compute lanes follow explicit worker placement
 
 A reproduced simulator gap gave independent compute lanes to logical workers

@@ -1186,29 +1186,17 @@
                      op)
     :else nil))
 
-(defn signature-result-tag
-  "Derive the result dispatch tag of `op` applied to arguments whose inferred
-   dispatch tags are `arg-tags`, by unifying op's declared (All [T]) signature
-   against those tags and substituting the bound type variables into the RETURN
-   annotation. `op` is a var or (qualified/bare) symbol; `arg-tags` a seq of
-   dispatch-tag symbols (or nils).
-
-   Returns nil — so callers fall back to the :result-type facet — when:
-     - op has no registered parametric (All [T]) template (e.g. a monomorphic
-       overloaded deftm like oftype, or a plain host fn),
-     - no template's arity matches, a concrete param is inconsistent, or the
-       type variables are underdetermined,
-     - the type vars don't all bind (return annotation would stay symbolic)."
+(defn- parametric-call-signatures
+  "Applicable declared signatures in registration order, without execution."
   [op arg-tags]
   (let [qn        (op->parametric-qname op)
         templates (or (and qn (get @parametric-registry qn))
                       (when (symbol? op) (get @parametric-registry op)))
         arg-tags  (vec arg-tags)]
     (when (seq templates)
-      (some
+      (keep
        (fn [{:keys [type-var-list annotations ret-annotation]}]
-         (when (and ret-annotation
-                    (= (count annotations) (count arg-tags)))
+         (when (= (count annotations) (count arg-tags))
            (let [tvs (set type-var-list)
                  bindings
                  (reduce
@@ -1223,10 +1211,26 @@
                         (merge acc b))))
                   {} (map vector annotations arg-tags))]
              (when (and bindings (every? #(contains? bindings %) tvs))
-               (let [subst (substitute-type-var ret-annotation bindings)
-                     tag   (types/annotation->tag subst nil)]
-                 tag)))))
+               {:bindings bindings
+                :return-tag (when ret-annotation
+                              (types/annotation->tag
+                               (substitute-type-var ret-annotation bindings) nil))}))))
        templates))))
+
+(defn parametric-call-signature
+  "Query declared parametric applicability without specialization or execution.
+   Unifies every argument position through the dispatch type-variable authority.
+   A matching signature may have a nil :return-tag when no result is declared;
+   that is distinct from no applicable signature (nil)."
+  [op arg-tags]
+  (first (parametric-call-signatures op arg-tags)))
+
+(defn signature-result-tag
+  "Derive a result tag from the applicable declared parametric signature.
+   Nil means no matching signature or no declared result; callers may retain
+   their existing result-type fallback. Never specializes or executes code."
+  [op arg-tags]
+  (some :return-tag (parametric-call-signatures op arg-tags)))
 
 (declare parametric-register)
 
