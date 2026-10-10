@@ -106,15 +106,16 @@
              (evaluate-expression source-ns environment
                                   (if (evaluate-expression source-ns environment predicate)
                                     consequent alternate)))
-        and (loop [[argument & remaining] arguments, result true]
-              (if argument
-                (let [value (evaluate-expression source-ns environment argument)]
-                  (if value (recur remaining value) value))
+        and (loop [remaining arguments, result true]
+              (if (seq remaining)
+                (let [value (evaluate-expression source-ns environment (first remaining))]
+                  (if value (recur (next remaining) value) value))
                 result))
-        or (loop [[argument & remaining] arguments]
-             (when argument
-               (let [value (evaluate-expression source-ns environment argument)]
-                 (if value value (recur remaining)))))
+        or (loop [remaining arguments, result nil]
+             (if (seq remaining)
+               (let [value (evaluate-expression source-ns environment (first remaining))]
+                 (if value value (recur (next remaining) value)))
+               result))
         (let [values (mapv #(evaluate-expression source-ns environment %) arguments)]
           (if-let [callable (resolve-callable source-ns operation)]
             (apply callable values)
