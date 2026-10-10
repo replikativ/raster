@@ -1505,7 +1505,7 @@
           (resolve-gpu-inlinable-var (first expr)))
      (let [sym (first expr)
            args (rest expr)
-           c-op (mangled-name->c-op (name sym))]
+           c-op (mangled-name->c-op sym)]
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
@@ -1542,13 +1542,13 @@
           (symbol? (second expr))
           (resolve-gpu-inlinable-var (second expr)))
      (let [resolved-var (resolve-gpu-inlinable-var (second expr))
-           var-name (str (:name (meta resolved-var)))
            args (nnext expr)
            ;; Metadata-first: the walker stamps the .invk form with its semantic op
            ;; (:raster.op/original). Use it directly; fall back to mangled-name parsing.
-           c-op (or (when-let [op (:raster.op/original (meta expr))]
-                      (intrinsics/op->c-lowering op (= :glsl (:cast-style *emit-config*))))
-                    (mangled-name->c-op var-name))]
+           c-op (if-let [op (:raster.op/original (meta expr))]
+                  (intrinsics/op->c-lowering op (= :glsl (:cast-style *emit-config*)))
+                  (mangled-name->c-op
+                   (symbol (str (:ns (meta resolved-var))) (str (:name (meta resolved-var))))))]
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)

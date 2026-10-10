@@ -28,6 +28,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.execution-plan :as execution]
@@ -544,12 +545,20 @@
          ;; name → one SPIR-V compile. The bound path already mints a fresh handle per binding from
          ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
          ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
-         cache-key (cond-> [v (get opts :dtype :float)]
+         semantic-key (cond-> [v (get opts :dtype :float)]
                      (:preserve-declared-array-storage? opts)
                      (conj {:preserve-declared-array-storage? true}))
-         compiled (or (get-in @sess [:kernel-cache cache-key])
+         cached (get-in @sess [:kernel-cache semantic-key])
+         revision (dispatch/compiler-definition-revision)
+         compiled (or (when (= (:revision cached) revision)
+                        (:compiled cached))
                       (let [result (compile-deftm-internal! v device-id opts)]
-                        (swap! sess assoc-in [:kernel-cache cache-key] result)
+                        ;; Never relabel an artifact across a semantic change during compilation.
+                        ;; An unstable interval is returned uncached; the next acquisition retries.
+                        ;; Bound phases remain snapshots and stale acquisition epochs do not grow.
+                        (when (= revision (dispatch/compiler-definition-revision))
+                          (swap! sess assoc-in [:kernel-cache semantic-key]
+                                 {:revision revision :compiled result}))
                         result))
          kernels (:kernels compiled)]
      (swap! sess (fn [state]

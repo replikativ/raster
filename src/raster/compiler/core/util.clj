@@ -3,6 +3,7 @@
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.support.mangled :as mangled]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]))
 
@@ -496,29 +497,7 @@
          raster.math/exp_m_double-impl → raster.math/exp
    Returns nil if the pattern doesn't match."
   [impl-sym]
-  (when (symbol? impl-sym)
-    (let [n (name impl-sym)
-          ns-part (namespace impl-sym)
-          ;; Strip -impl suffix
-          base (if (.endsWith n "-impl") (subs n 0 (- (count n) 5)) n)
-          ;; Find _m_ separator
-          idx (.indexOf ^String base "_m_")]
-      (when (and ns-part (pos? idx))
-        (let [op-name (subs base 0 idx)
-              ;; Demangle: _plus_ → +, _minus_ → -, _star_ → *, _div_ → /, etc.
-              demangled (-> op-name
-                            (.replace "_plus_" "+")
-                            (.replace "_minus_" "-")
-                            (.replace "_star_" "*")
-                            (.replace "_div_" "/")
-                            (.replace "_lt_" "<")
-                            (.replace "_gt_" ">")
-                            (.replace "_lteq_" "<=")
-                            (.replace "_gteq_" ">=")
-                            (.replace "_eq_" "=")
-                            (.replace "_bang" "!")
-                            (.replace "_qmark" "?"))]
-          (symbol ns-part demangled))))))
+  (mangled/impl->op impl-sym))
 
 (defn make-invk
   "Construct a (.invk impl args...) form with :raster.op/original metadata.
