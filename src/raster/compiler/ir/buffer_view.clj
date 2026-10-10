@@ -131,6 +131,22 @@
 (defn byte-end [view]
   (+ (:byte-offset (validate-view! view)) (:byte-length view)))
 
+(defn first-dimension-extents
+  "Project `(extent compiler-value)` from already validated physical view bindings.
+   Accepts a map or sequence of [compiler-value BufferView] pairs. Rank-zero views
+   supply no extent; zero-sized first dimensions supply zero. This is the existing
+   linked graph convention, not flattened element count, capacity or a new proof.
+   Callers retain view validation and scalar-override precedence. No facts are cached."
+  [bindings]
+  (into {}
+        (keep (fn [[compiler-value view]]
+                (when-not (buffer-view? view)
+                  (throw (ex-info "bound extent projection requires physical BufferViews"
+                                  {:reason :bound-view-extent :value compiler-value})))
+                (when-let [dimension (first (:shape view))]
+                  [(list 'extent compiler-value) dimension])))
+        bindings))
+
 (defn- allocation-key
   "A nil device is its own identity scope, never a wildcard for concrete devices."
   [allocation]
