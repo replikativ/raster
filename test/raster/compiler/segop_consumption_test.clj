@@ -147,7 +147,12 @@
     (is (= 2 (count (:kernels compiled))))
     (is (= 1 (get-in compiled [:stats :ze-reduces])))
     (is (= 1 (get-in compiled [:stats :segop-reused])))
-    (is (= 'clojure.core/aget (first (last (:form compiled)))))))
+    (let [source (:form compiled)
+          returned (last source)
+          bindings (into {} (map vec (partition 2 (second source))))
+          expression (if (symbol? returned) (get bindings returned) returned)]
+      (is (some? expression))
+      (is (= 'clojure.core/aget (first expression))))))
 
 (deftest compatibility-reentry-cannot-overwrite-retained-value-types
   (let [form '(let* [n 8192]

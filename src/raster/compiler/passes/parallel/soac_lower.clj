@@ -1101,11 +1101,7 @@
               phase-2-space (segop/make-seg-space phase-2-idx phase-2-bound)
               grid-2 (single-block-grid grid-1)
               level-2 (segop/->SegLevel :block :none)
-              {:keys [operator identity accumulator]} (segred-body/scalar-plan phase-1)
-              combine-op ({:+ 'clojure.core/+
-                           :* 'clojure.core/*
-                           :min 'clojure.core/min
-                           :max 'clojure.core/max} operator)
+              {:keys [combine identity accumulator]} (segred-body/scalar-plan phase-1)
               component (first (:components reduction))
               result-scalars (set (drop 1 (:parameters result-region)))
               phase-2-reduction
@@ -1115,7 +1111,7 @@
                 :dtype (:dtype component)
                 :result (:sym description)
                 :index phase-2-idx
-                :step-result (list combine-op accumulator
+                :step-result (list combine accumulator
                                    (list 'clojure.core/aget partials-sym phase-2-idx))
                 :algebra (:algebra reduction)
                 :attributes (assoc (:attributes reduction)

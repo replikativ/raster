@@ -273,7 +273,8 @@
                 {:segred-id (:id segred) :declared declared :derived derived}))
     ;; Retain the concrete neutral spelling after proving it equivalent to the typed registry
     ;; identity. KernelBody consumers need a literal, while the certificate remains the proof.
-    {:operator operator :identity (constant/literal-or-original init) :element element
+    {:operator operator :combine (:combine derived)
+     :identity (constant/literal-or-original init) :element element
      :numerical-policy (select-keys derived [:nan-policy :signed-zero-policy])
      :accumulator acc}))
 

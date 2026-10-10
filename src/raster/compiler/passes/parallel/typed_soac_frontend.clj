@@ -3042,10 +3042,12 @@
                           (set [symbol acc idx]) descriptor/aget-ops descriptor/aset-ops)]
       (merge {:kind :reduce :id id :sym symbol :results [symbol] :index idx :extent bound
               :product (reduction/scalar
-                        ;; The walker stamps contextual FP narrowing on the par form.  Without
-                        ;; that retained fact, Clojure's scalar reduction semantics are double;
-                        ;; the target's preferred array dtype is not permission to narrow it.
-                        {:accumulator acc :neutral init :dtype (or elem-type :double)
+                        ;; Explicit contextual narrowing wins; otherwise the accumulator's
+                        ;; retained initializer/binder type owns its carrier, not kernel dtype.
+                        {:accumulator acc :neutral init
+                         :dtype (or elem-type
+                                    (retained-expression-dtype expression array-types scalar-types)
+                                    :double)
                          :result symbol :index idx :step-result body
                          :attributes {:source :raster.par/reduce}})}
              (update io :scalars set/union identity-scalars)))
