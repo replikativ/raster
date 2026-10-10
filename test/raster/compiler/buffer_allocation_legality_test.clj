@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.core]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.hoist :as hoist]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.scalar.buffer-fuse :as buffer-fuse]))
 
@@ -25,6 +26,9 @@
 
 (defn- call-form [op arguments]
   (list 'let* ['result (apply list op arguments)] 'result))
+
+(defn- error-of [f]
+  (try (f) nil (catch Throwable error error)))
 
 (deftest effectful-and-throwing-size-prefixes-are-not-replayed
   (with-source
@@ -78,7 +82,8 @@
               fused (:form (buffer-fuse/fuse-let original))
               calls @(ns-resolve source 'calls)]
           (is (some? (descriptor/resolve-buffer-semantics op)) "safe body still has an auto contract")
-          (is (= original fused) "complex actuals need evaluate-once bindings")
+          (is (= 1 (get-in (buffer-fuse/fuse-let original) [:stats :fresh-allocs]))
+              "actuals are transported in evaluate-once bindings")
           (doseq [form [original fused]]
             (reset! calls 0)
             (is (= 3 (alength ^doubles (eval form))))
@@ -145,7 +150,7 @@
         '(let [out (double-array n)] (change-global) (aset out 0 (double n)) out))
       (let [original (call-form (operation source "global" "long") '[global-size])
             result (buffer-fuse/fuse-let original)]
-        (is (= original (:form result)))
+        (is (= 1 (get-in result [:stats :fresh-allocs])))
         (doseq [form [original (:form result)]]
           (alter-var-root (ns-resolve source 'global-size) (constantly 3))
           (is (= [3.0 0.0 0.0] (vec (eval form)))))))))
@@ -180,11 +185,94 @@
       (let [original (list 'let* ['x 3 'result
                                   (list (operation source "local-name" "long") '(long x))] 'result)
             result (buffer-fuse/fuse-let original)]
-        (is (= original (:form result)) "expression actuals need typed evaluate-once transport")
+        (is (= 1 (get-in result [:stats :fresh-allocs])))
         (is (= (vec (eval original)) (vec (eval (:form result)))))))))
+
+(deftest bare-extents-execute-once-without-hoisting-permission
+  (with-source
+    (fn [source]
+      (eval '(raster.core/deftm extent-tick [n :- Long] :- Long (do (swap! calls inc) n)))
+      (eval '(raster.core/deftm extent-fail [n :- Long] :- Long (do (swap! calls inc) (throw failure))))
+      (doseq [helper '[extent-tick extent-fail]]
+        (define-allocator 'bare '[n :- Long] (list 'double-array (list helper 'n)))
+        (let [original (call-form (operation source "bare" "long") [3])
+              result (buffer-fuse/fuse-let original)
+              calls @(ns-resolve source 'calls)
+              failure @(ns-resolve source 'failure)
+              remarked (hoist/infer-hoistable (:form result) #{})
+              allocation (first (filter #(-> % first meta :raster.buffer/no-hoist)
+                                        (partition 2 (second remarked))))]
+          (is (= 1 (get-in result [:stats :fresh-allocs])))
+          (is (some? allocation))
+          (is (not (hoist/hoist-safe-pair? #{} allocation)))
+          (doseq [form [original (:form result)]]
+            (reset! calls 0)
+            (if (= helper 'extent-fail)
+              (is (identical? failure (error-of #(eval form))))
+              (is (= 3 (alength ^doubles (eval form)))))
+            (is (= 1 @calls))))))))
 
 (deftest replay-admission-requires-local-and-unshadowed-operation-evidence
   (is (not (effects/replay-safe-value? 'global-value)))
   (is (effects/replay-safe-value? 'local-value {'local-value nil}))
   (is (not (effects/replay-safe-value? '(long n) {'long nil 'n 'long})))
   (is (effects/replay-safe-value? '(long n) {'n 'long})))
+
+(deftest argument-frames-retain-order-unused-arguments-and-failures
+  (with-source
+    (fn [source]
+      (eval '(def order (atom [])))
+      (eval '(defn record-value [n] (swap! order conj n) n))
+      (eval '(defn record-failure [n] (swap! order conj n) (throw failure)))
+      (define-allocator 'ordered '[n :- Long unused :- Long] '(double-array n))
+      (doseq [second-argument '[(record-value 1) (record-failure 1)]]
+        (let [original (call-form (operation source "ordered" "long_long")
+                                  ['(record-value 3) second-argument])
+              result (buffer-fuse/fuse-let original)
+              order @(ns-resolve source 'order)
+              failure @(ns-resolve source 'failure)]
+          (is (= 1 (get-in result [:stats :fresh-allocs])))
+          (doseq [form [original (:form result)]]
+            (reset! order [])
+            (if (= 'record-failure (first second-argument))
+              (is (identical? failure (error-of #(eval form))))
+              (is (= 3 (alength ^doubles (eval form)))))
+            (is (= [3 1] @order))))))))
+
+(deftest global-extent-identity-is-not-caller-namespace-identity
+  (with-source
+    (fn [source]
+      (eval '(def global-width 3))
+      (define-allocator 'open-global '[unused :- Long] '(double-array (long global-width)))
+      ;; Some frontend paths already qualify the read. Exercise the still-open
+      ;; retained-source boundary explicitly, as cache tests do for source facts.
+      (alter-meta! (ns-resolve source 'open-global_m_long)
+                   assoc :raster.core/deftm-walked-body
+                   '[(double-array (long global-width))])
+      (is (nil? (descriptor/resolve-buffer-semantics (operation source "open-global" "long"))))
+      (define-allocator 'closed-global '[unused :- Long]
+        (list 'double-array (list 'long (symbol (str (ns-name source)) "global-width"))))
+      (let [caller (create-ns (gensym "raster.test.allocation_caller_"))
+            original (call-form (operation source "closed-global" "long") [0])
+            result (buffer-fuse/fuse-let original)]
+        (try
+          (binding [*ns* caller]
+            (refer 'clojure.core)
+            (eval '(def global-width 7))
+            (is (= 1 (get-in result [:stats :fresh-allocs])))
+            (is (= 3 (alength ^doubles (eval original))))
+            (is (= 3 (alength ^doubles (eval (:form result))))))
+          (finally (remove-ns (ns-name caller))))))))
+
+(deftest argument-frame-does-not-replace-arity-refusal
+  (with-source
+    (fn [source]
+      (define-allocator 'one '[n :- Long] '(double-array n))
+      (doseq [arguments [[] [3 1]]]
+        (let [original (call-form (operation source "one" "long") arguments)
+              result (buffer-fuse/fuse-let original)]
+          (is (= original (:form result)))
+          (let [original-error (error-of #(eval original))
+                transformed-error (error-of #(eval (:form result)))]
+            (is (some? original-error))
+            (is (= (class original-error) (class transformed-error)))))))))

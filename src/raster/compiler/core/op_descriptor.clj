@@ -106,27 +106,27 @@
         ;; Returns: just the pre-allocated buffer (no compute body)
         ;; (walked body is closed-core: let -> let*)
         (if (and (seq? body) (not (contains? #{'let 'let*} (first body))) (array-alloc-size body))
-          (let [param-set numeric-params
-                size (array-alloc-size body)]
+          (let [size (array-alloc-size body)]
             (when (and (not (contains? parameter-types (first body)))
-                       (param-derived? size param-set {} parameter-types))
-              (let [param-idx (into {} (map-indexed (fn [i p] [p i]) params))
-                    resolve-to-args
-                    (fn resolve-to-args [expr args]
-                      (cond
-                        (and (symbol? expr) (contains? param-idx expr))
-                        (nth args (get param-idx expr))
-                        (seq? expr)
-                        (with-meta
-                          (apply list (first expr) (map #(resolve-to-args % args) (rest expr)))
-                          (meta expr))
-                        :else expr))
-                    alloc-ctor (symbol "clojure.core" (name (first body)))]
+                       (when-let [tag ((requiring-resolve 'raster.compiler.core.inference/infer-arg-tag)
+                                      size parameter-types)]
+                         (.isAssignableFrom Number (types/tag->check-class tag)))
+                       ;; Bare constructor extents execute once, not replayed.
+                       ;; Unqualified globals must not acquire caller namespace
+                       ;; or lexical identity when the expression is transported.
+                       (with-bindings
+                         {(requiring-resolve 'raster.compiler.core.util/*shadowing-locals*)
+                          (into #{} (filter #(and (symbol? %) (nil? (namespace %))))
+                                (tree-seq coll? seq size))}
+                         (every? (set params)
+                                 ((requiring-resolve 'raster.compiler.core.util/free-syms) size))))
+              (let [alloc-ctor (symbol "clojure.core" (name (first body)))]
                 {:allocates? true
                  :auto-detected? true
+                 :parameters params
                  :in-place-arg nil
                  :alloc-form (fn [args _opts]
-                               (list alloc-ctor (resolve-to-args size args)))
+                               (list alloc-ctor (substitute (zipmap params args) size)))
                  :rewrite-fn (fn [_args buf-sym] buf-sym)})))
           ;; Case 2: body is a let form with alloc-return pattern
           ;; (walked body is closed-core: let -> let*)
@@ -205,6 +205,7 @@
                                          (list* 'let* (vec (mapcat identity other-pairs)) body-exprs))]
                       {:allocates? true
                        :auto-detected? true
+                       :parameters params
                        :in-place-arg nil
                        :alloc-form (fn [args _opts]
                                      (list (:ctor match) (resolve-to-args (:size match) args)))

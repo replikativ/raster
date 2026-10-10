@@ -2,7 +2,6 @@
   "Buffer reuse pass: rewrite allocating ops to reuse dead buffers."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
-            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.ir.form :as form]
             [raster.analysis.memory :as ma]))
 
@@ -57,18 +56,18 @@
                   resolved (when head (descriptor/resolve-buffer-semantics head))]
               (if-let [[entry _base-op] resolved]
                 (if (and (:allocates? entry)
-                         ;; Auto extraction substitutes actuals into multiple
-                         ;; fragments. Complex actuals need an evaluate-once SSA
-                         ;; prefix; do not duplicate or drop them here. Explicit
-                         ;; registered facets retain their independent authority.
                          (or (not (:auto-detected? entry))
-                             (every? #(and (not (seq? %))
-                                           (effects/replay-safe-value?
-                                       % (merge param-env
-                                                (zipmap (map first (take idx pairs))
-                                                        (repeat nil)))))
-                                     (call-args init))))
-                  (let [args (call-args init)
+                             (= (count (:parameters entry)) (count (call-args init)))))
+                  (let [original-args (call-args init)
+                        argument-pairs
+                        (when (:auto-detected? entry)
+                          (mapv (fn [argument]
+                                  (let [tag ((requiring-resolve 'raster.compiler.core.inference/infer-arg-tag)
+                                             argument param-env)]
+                                    [(with-meta (gensym "buffer_arg__")
+                                       (cond-> (meta argument) tag (assoc :raster.type/tag tag)))
+                                     argument])) original-args))
+                        args (if (:auto-detected? entry) (mapv first argument-pairs) original-args)
                         in-place-idx (:in-place-arg entry)]
                     (if (and in-place-idx
                              (< in-place-idx (count args))
@@ -107,11 +106,14 @@
                                            ;; Use :overwrite only when proven (par/map!, registered ops).
                                            :else :accumulate)
                               buf-sym (with-meta (gensym (str "buf_" (name sym) "_"))
-                                        {:raster.buffer/hoistable true :raster.buffer/write-mode write-mode})
+                                        {:raster.buffer/hoistable (not (:auto-detected? entry))
+                                         :raster.buffer/no-hoist (:auto-detected? entry)
+                                         :raster.buffer/write-mode write-mode})
                               alloc-expr (alloc-fn args {:dtype dtype})]
                           (swap! fresh-allocs inc)
-                          [[buf-sym alloc-expr]
-                           [sym ((:rewrite-fn entry) args buf-sym)]])
+                          (concat argument-pairs
+                                  [[buf-sym alloc-expr]
+                                   [sym ((:rewrite-fn entry) args buf-sym)]]))
                         (do (swap! unchanged inc)
                             [[sym init]]))))
                   (do (swap! unchanged inc)
