@@ -8,7 +8,9 @@
             [raster.gpu.link :as link]
             [raster.gpu.parallel-program :as program]))
 
-(defn- stub-program [id released]
+(defn- stub-program
+  ([id released] (stub-program id released (fn [handle] (swap! released conj [:run handle]))))
+  ([id released run!]
   ((ns-resolve 'raster.gpu.parallel-program 'own-prepared)
    (program/map->PreparedParallelProgram
    {:call {:id id :outputs {id id}
@@ -16,9 +18,19 @@
     :plan {:step-keys {0 id}}
     :handles {id id}
     :binding-order [id]
-    :run! (fn [handle] (swap! released conj [:run handle]))
+    :run! run!
     :release! (fn [handle] (swap! released conj [:release handle]))
-    :closed? (atom false)})))
+    :closed? (atom false)}))))
+
+(deftest invalid-math-request-rejects-before-graph-sequence-binding
+  (let [events (atom [])
+        touch (fn [& _] (swap! events conj :callback))]
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (program/prepare-sequence-with!
+                  [{:id :graph :kind :graph :call {}}]
+                  {:bind! touch :run! touch :release! touch}
+                  {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))
+    (is (empty? @events))))
 
 (deftest ordered-programs-bind-replay-report-and-release-together
   (let [events (atom [])
@@ -125,10 +137,10 @@
 (deftest later-replay-failure-does-not-publish-partial-outputs
   (let [events (atom [])
         first-program (stub-program :a events)
-        second-program (assoc (stub-program :b events)
-                              :run! (fn [_]
-                                      (throw (ex-info "second replay failed"
-                                                      {:reason :second-replay}))))
+        second-program (stub-program :b events
+                                     (fn [_]
+                                       (throw (ex-info "second replay failed"
+                                                       {:reason :second-replay}))))
         prepared ((ns-resolve 'raster.gpu.parallel-program 'own-prepared)
                   (program/map->PreparedParallelSequence
                   {:instances [{:id :first :program first-program}

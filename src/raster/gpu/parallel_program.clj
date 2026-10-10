@@ -8,6 +8,7 @@
   (:require [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
 
@@ -37,6 +38,35 @@
   (and value (= "raster.gpu.parallel_program.PreparedParallelProgram"
                 (.getName (class value)))))
 
+(def ^:private prepared-request-token (Object.))
+
+(defn- prepared-request-seal [reference request]
+  (fn [candidate]
+    (when (identical? candidate (.get ^java.lang.ref.WeakReference @reference))
+      [prepared-request-token request])))
+
+(def ^:private prepared-request-seal-class
+  (class (prepared-request-seal nil nil)))
+
+(defn- seal-prepared-request [prepared caller-options]
+  (let [policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
+        request (when (some? caller-options) {:scalar-math policy})
+        reference (volatile! nil)
+        sealed (assoc prepared ::request-seal (prepared-request-seal reference request))]
+    (vreset! reference (java.lang.ref.WeakReference. sealed))
+    sealed))
+
+(defn- prepared-request! [prepared]
+  (let [seal (::request-seal prepared)
+        result (when (.isInstance ^Class prepared-request-seal-class seal) (seal prepared))]
+    (when-not (identical? prepared-request-token (first result))
+      (throw (ex-info "prepared program lost its exact request owner"
+                      {:reason :parallel-program-request-owner})))
+    (second result)))
+
+(defn- attach-prepared-owner [prepared owner]
+  (assoc prepared ::cleanup/owner owner ::active-uses (volatile! 0)))
+
 (defn- own-prepared
   "Completed prepared values retain one cleanup plan across every close attempt."
   ([prepared]
@@ -56,7 +86,10 @@
                  (rseq (:binding-order prepared))))]
      (own-prepared prepared (cleanup/owner resources))))
   ([prepared owner]
-   (assoc prepared ::cleanup/owner owner ::active-uses (volatile! 0))))
+   (let [owned (attach-prepared-owner prepared owner)]
+     (if (prepared-parallel-program? owned)
+       (seal-prepared-request owned nil)
+       owned))))
 
 (defn- with-live-prepared
   [prepared operation use!]
@@ -65,6 +98,7 @@
     (throw (ex-info "Operation requires a prepared parallel program"
                     {:operation operation :actual (type prepared)})))
   (locking (:closed? prepared)
+    (when (prepared-parallel-program? prepared) (prepared-request! prepared))
     (when @(:closed? prepared)
       (throw (ex-info "Prepared parallel program is closed"
                       {:reason :parallel-program-closed :operation operation})))
@@ -76,7 +110,8 @@
       (throw (ex-info "Prepared program has lost its use-scope state"
                       {:reason :parallel-program-use-state-missing})))
     (vswap! (::active-uses prepared) inc)
-    (try (use!) (finally (vswap! (::active-uses prepared) dec)))))
+    (try (program-call/without-validation-context use!)
+         (finally (vswap! (::active-uses prepared) dec)))))
 
 (defn straight-line-call?
   "Whether an emitted call has one statically ordered graph sequence. Host equations are
@@ -97,7 +132,7 @@
   prepared)
 
 (defn- loop-staging-plan
-  [step execution-id step-index]
+  [step execution-id step-index caller-options]
   (when (and (get-in step [:scalars :iteration]) (> (:trip-count step) 1))
     (throw (ex-info
             "stage-once execution cannot freeze a changing loop induction scalar"
@@ -110,7 +145,10 @@
   ;; before the first launch—the exact failure bounded replay exists to avoid.
   (reduce
    (fn [{:keys [bindings entries] :as state} iteration]
-     (let [{:keys [buffers scalar-values]} (loop-call/iteration-binding step iteration)
+     (let [{:keys [buffers scalar-values]}
+           (if (nil? caller-options)
+             (loop-call/iteration-binding step iteration)
+             (loop-call/iteration-binding step iteration caller-options))
            binding [buffers scalar-values]]
        (if (contains? bindings binding)
          state
@@ -130,7 +168,7 @@
    (range (min 3 (:trip-count step)))))
 
 (defn- preparation-plan
-  [call execution-id]
+  [call execution-id caller-options]
   (let [program-scalars (:scalar-values call)
         plan
         (reduce
@@ -149,7 +187,7 @@
 
              (loop-call/structured-loop-call? step)
              (let [{:keys [bindings] loop-entries :entries}
-                   (loop-staging-plan step execution-id step-index)]
+                   (loop-staging-plan step execution-id step-index caller-options)]
                {:entries (into entries loop-entries)
                 :step-keys (assoc step-keys step-index bindings)})))
          {:entries [] :step-keys {}}
@@ -163,15 +201,22 @@
                              (fn [local] (merge program-scalars local)))
                     entries)))))
 
-(defn staging-plan
+(defn- staging-plan-for-request
   "Return the bounded set of distinct graph bindings to prepare without contacting a driver.
 
    The initial preserved carry may add one prologue variant to the two parity variants. Both the
    returned host data and the eventual driver bindings are therefore constant rather than
    proportional to trip count; replay order is streamed separately by `run-with!`."
-  [call execution-id]
-  (let [call (program-call/validate! call)]
-    (:entries (preparation-plan call execution-id))))
+  [call execution-id caller-options]
+  (let [call (if (nil? caller-options)
+               (program-call/validate! call)
+               (program-call/validate! call caller-options))]
+    (:entries (preparation-plan call execution-id caller-options))))
+
+(defn staging-plan
+  "Return bounded graph bindings under independent caller math intent, without driver work."
+  ([call execution-id] (staging-plan-for-request call execution-id nil))
+  ([call execution-id caller-options] (staging-plan-for-request call execution-id caller-options)))
 
 (defn- validate-executor! [executor]
   (doseq [operation [:bind! :run! :release!]]
@@ -200,7 +245,7 @@
                      owner))
      (:adopt-cleanup! executor))))
 
-(defn prepare-with!
+(defn- prepare-with-request!
   "Bind every distinct graph/carry variant once and return a reusable prepared program.
 
    A failed binding attempts earlier handle releases in reverse order. Failed cleanup remains
@@ -210,8 +255,10 @@
    constant in the loop trip count. Calls with logical result views additionally require the
    executor's `:buffer-view` resolver from a buffer token to its checked live BufferView; exact
    logical extent and prefix aliasing are checked before the first bind."
-  [call {:keys [bind! run! release! buffer-view] :as executor}]
-  (let [call (program-call/validate! call)]
+  [call {:keys [bind! run! release! buffer-view] :as executor} caller-options]
+  (let [call (if (nil? caller-options)
+               (program-call/validate! call)
+               (program-call/validate! call caller-options))]
     (doseq [step (:steps call)
             [result physical] (:result-views step)]
       (when-not (ifn? buffer-view)
@@ -233,30 +280,41 @@
     (validate-executor! executor)
     (let [handles (volatile! {})
           binding-order (volatile! [])
-          plan (preparation-plan call (random-uuid))
+          plan (preparation-plan call (random-uuid) caller-options)
           owner (cleanup/owner
                  (mapv (fn [{:keys [key]}]
                          {:id [:graph key]
                           :release #(when (contains? @handles key)
                                       (release! (get @handles key)))})
                        (rseq (:entries plan))))]
-      (cleanup/build!
+      (seal-prepared-request
+       (cleanup/build!
        owner
        (fn []
          (doseq [{:keys [key graph buffers scalar-values]} (:entries plan)]
            (let [handle (bind! key graph buffers scalar-values)]
              (vswap! handles assoc key handle)
              (vswap! binding-order conj key)))
-         (own-prepared
+         (attach-prepared-owner
           (->PreparedParallelProgram call plan @handles @binding-order run! release! (atom false))
           owner))
-       (:adopt-cleanup! executor)))))
+        (:adopt-cleanup! executor))
+       caller-options))))
 
-(defn prepare-sequence-with!
+(defn prepare-with!
+  "Prepare bounded graph bindings and retain validated math intent with their exact owner.
+   Executor callbacks receive neither compiler proof scopes nor policy authority."
+  ([call executor]
+   (program-call/without-validation-context #(prepare-with-request! call executor nil)))
+  ([call executor caller-options]
+   (program-call/without-validation-context #(prepare-with-request! call executor caller-options))))
+
+(defn- prepare-sequence-with-request!
   "Prepare ordered emitted programs and direct graphs over one shared resident binding.
    A later binding failure attempts earlier program cleanup before their storage may be freed.
    Unresolved cleanup is adopted through the executor or retained on the thrown exception."
-  [instances executor]
+  [instances executor caller-options]
+  (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
   (when-not (and (vector? instances) (seq instances)
                  (every? #(and (contains? % :id) (contains? % :call)
                                (contains? #{nil :program :graph} (:kind %))) instances)
@@ -280,9 +338,19 @@
          (vswap! prepared conj {:id id :program
                                 (if (= :graph kind)
                                   (prepare-graph-with! id call executor)
-                                  (prepare-with! call executor))}))
+                                  (if (nil? caller-options)
+                                    (prepare-with! call executor)
+                                    (prepare-with! call executor caller-options)))}))
        (own-prepared (->PreparedParallelSequence @prepared (atom false)) owner))
      (:adopt-cleanup! executor))))
+
+(defn prepare-sequence-with!
+  "Prepare ordered instances under one independent caller math request."
+  ([instances executor]
+   (program-call/without-validation-context #(prepare-sequence-with-request! instances executor nil)))
+  ([instances executor caller-options]
+   (program-call/without-validation-context
+    #(prepare-sequence-with-request! instances executor caller-options))))
 
 (defn- visit-handles!
   [prepared operation visit!]
@@ -291,7 +359,8 @@
     (throw (ex-info "prepared program handle visitor must be callable"
                     {:reason :parallel-program-handle-visitor
                      :operation operation :actual (type visit!)})))
-  (let [{:keys [call plan handles]} prepared
+  (let [caller-options (prepared-request! prepared)
+        {:keys [call plan handles]} prepared
         results (volatile! (transient []))
         visit-key! (fn [key]
                      (vswap! results conj! (visit! (get handles key))))]
@@ -306,7 +375,9 @@
         (loop-call/structured-loop-call? step)
         (doseq [iteration (range (:trip-count step))]
           (let [{:keys [buffers scalar-values]}
-                (loop-call/iteration-binding step iteration)
+                (if (nil? caller-options)
+                  (loop-call/iteration-binding step iteration)
+                  (loop-call/iteration-binding step iteration caller-options))
                 key (get-in plan [:step-keys step-index [buffers scalar-values]])]
             (when-not key
               (throw (ex-info
@@ -411,11 +482,13 @@
     :else
     (do
       (ensure-prepared! prepared :execution-order)
-      (program-call/execution-order
-       (:call prepared)
-       (fn [step-index _]
-         (let [key (get-in prepared [:plan :step-keys step-index])]
-           (graph-order (get (:handles prepared) key))))))))
+      (let [caller-options (prepared-request! prepared)
+            observer (fn [step-index _]
+                       (let [key (get-in prepared [:plan :step-keys step-index])]
+                         (graph-order (get (:handles prepared) key))))]
+        (if (nil? caller-options)
+          (program-call/execution-order (:call prepared) observer)
+          (program-call/execution-order (:call prepared) observer caller-options))))))
 
 (defn- execution-info-unlocked
   "Describe each distinct prepared graph binding once, in binding order. Structured-loop carry
@@ -533,6 +606,7 @@
     (throw (ex-info "release-prepared! requires a prepared parallel program"
                     {:actual (type prepared)})))
   (locking (:closed? prepared)
+    (when (prepared-parallel-program? prepared) (prepared-request! prepared))
     (when-not (::cleanup/owner prepared)
       (throw (ex-info "Prepared program has lost its cleanup owner"
                       {:reason :missing-cleanup-owner})))
@@ -543,30 +617,42 @@
       (throw (ex-info "Cannot release a prepared program from its active use callback"
                       {:reason :parallel-program-in-use})))
     (when-not @(:closed? prepared) (reset! (:closed? prepared) true))
-    (cleanup/release! (::cleanup/owner prepared)))
+    (program-call/without-validation-context #(cleanup/release! (::cleanup/owner prepared))))
   nil)
 
-(defn run-with!
+(defn- run-with-request!
   "Bind the complete call, then execute it through an injected graph executor.
 
   `executor` contains `:bind!`, `:run!`, and `:release!`. A staging failure releases all prior
    handles without launching; an execution failure releases the entire staged program."
-  [call executor]
-  (let [prepared (prepare-with! call executor)]
+  [call executor caller-options]
+  (let [prepared (if (nil? caller-options)
+                   (prepare-with! call executor)
+                   (prepare-with! call executor caller-options))]
     (try
       (run-prepared! prepared)
       (finally
         (release-prepared! prepared)))))
 
-(defn run!
-  "Run a prepared emitted parallel program in one GPU session."
-  [session call]
+(defn run-with!
+  "Prepare, replay, and release a program under independent caller math intent."
+  ([call executor] (run-with-request! call executor nil))
+  ([call executor caller-options] (run-with-request! call executor caller-options)))
+
+(defn- run-session-with-request!
+  [session call caller-options]
   (let [bind-graph! (requiring-resolve 'raster.gpu.core/bind-kernel-graph!)
         run-graph! (requiring-resolve 'raster.gpu.core/run-kernel-graph!)
         release-graph! (requiring-resolve 'raster.gpu.core/release-kernel-graph!)]
-    (run-with!
+    (run-with-request!
      call
      {:bind! (fn [key graph buffers scalars]
                (bind-graph! session key graph buffers scalars))
       :run! (fn [handle] (run-graph! session handle))
-      :release! (fn [handle] (release-graph! session handle))})))
+      :release! (fn [handle] (release-graph! session handle))}
+     caller-options)))
+
+(defn run!
+  "Run an emitted parallel program in one GPU session under independent caller math intent."
+  ([session call] (run-session-with-request! session call nil))
+  ([session call caller-options] (run-session-with-request! session call caller-options)))

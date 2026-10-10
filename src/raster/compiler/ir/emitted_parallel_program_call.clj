@@ -159,6 +159,13 @@
 (def ^:dynamic ^:private *validated-boundary-projections* nil)
 (def ^:dynamic ^:private *validated-projection-policy* nil)
 
+(defn ^:no-doc without-validation-context
+  "Invoke runtime/user code without inheriting synchronous compiler projection authority."
+  [invoke]
+  (binding [*validated-boundary-projections* nil
+            *validated-projection-policy* nil]
+    (invoke)))
+
 (defn- same-projection-request? [caller-options]
   (= (numerics/validate-scalar-math-policy! *validated-projection-policy*)
      (numerics/validate-scalar-math-policy! (:scalar-math caller-options))))

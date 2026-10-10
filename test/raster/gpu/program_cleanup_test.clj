@@ -421,12 +421,20 @@
       (is (= 1 @closes)))))
 
 (deftest missing-cleanup-owners-decline-before-close-state-mutation
-  (doseq [[p close!] [[(dissoc (prepared [:a] identity identity) ::cleanup/owner)
-                      program/release-prepared!]
-                     [(dissoc (linked true) ::cleanup/owner) link/close!]]]
-    (is (= :missing-cleanup-owner
-           (try (close! p) (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (is (false? @(:closed? p)))))
+  ;; A changed prepared record loses its exact request seal before cleanup-owner checks.
+  ;; Linked executables do not carry that seal and still diagnose the absent cleanup owner.
+  (let [releases (atom [])]
+    (doseq [[original close! expected]
+            [[(prepared [:a] identity #(swap! releases conj %))
+              program/release-prepared! :parallel-program-request-owner]
+             [(linked true) link/close! :missing-cleanup-owner]]]
+      (let [p (dissoc original ::cleanup/owner)]
+        (is (= expected
+               (try (close! p) (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+        (is (false? @(:closed? p)))
+        (is (false? @(:closed? original)))
+        (is (= :live (:phase (cleanup/status (::cleanup/owner original)))))))
+    (is (empty? @releases))))
 
 (deftest linked-live-operations-require-a-live-cleanup-owner
   (let [p (linked true) unowned (dissoc p ::cleanup/owner)]

@@ -13,12 +13,14 @@
             [raster.compiler.ir.structured-loop-call :as loop-call]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.gpu.structured-loop :as loop-runtime]
+            [raster.gpu.parallel-program :as program-runtime]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (defn- loop-program
   ([] (loop-program false))
   ([chained?] (loop-program chained? false))
-  ([chained? math?]
+  ([chained? math?] (loop-program chained? math? true))
+  ([chained? math? induction?]
    (let [extent (av/tensor {:dtype :int :shape []})
          trip-index (av/tensor {:dtype :long :shape []})
          scalar (av/tensor {:dtype :float :shape []})
@@ -28,12 +30,15 @@
          equation
          (list '= 'advance '[u-next]
                (list 'map {:index 'i :extent 'n-in}
-                     '[u-in] '[alpha-in iteration]
+                     '[u-in] (if induction? '[alpha-in iteration] '[alpha-in])
                      (soac/lambda-form
-                      '[u-value alpha-value iteration-value]
-                      (if math?
-                        '[(Math/tanh (+ u-value alpha-value (* 0.0 iteration-value)))]
-                        '[(+ u-value alpha-value (* 0.0 iteration-value))]))))
+                      (if induction? '[u-value alpha-value iteration-value] '[u-value alpha-value])
+                      (if induction?
+                        (if math?
+                          '[(Math/tanh (+ u-value alpha-value (* 0.0 iteration-value)))]
+                          '[(+ u-value alpha-value (* 0.0 iteration-value))])
+                        (if math? '[(Math/tanh (+ u-value alpha-value))]
+                            '[(+ u-value alpha-value)])))))
          first-equation (assoc (vec equation) 1 'advance-first 2 [first-result])
          first-equation (apply list first-equation)
          second-equation
@@ -51,7 +56,7 @@
                 {:values {'iteration trip-index 'n-in extent 'alpha-in scalar
                           'u-in inner-tensor 'u-temporary inner-tensor
                           'u-next inner-tensor}
-                 :inputs '[iteration n-in alpha-in u-in]
+                 :inputs (if induction? '[iteration n-in alpha-in u-in] '[n-in alpha-in u-in])
                  :equations equation-facts})
                equations '[u-next])]
      (control/make
@@ -105,6 +110,80 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (emitted-program/retained-validation? program default-proof
                                                        {:scalar-math {:overrides {[:tanh :double] :f64-target-library-rte-f32}}})))))
+
+(deftest prepared-loop-replay-retains-exact-independent-math-owner
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        scheduled (lower/schedule (loop-program true true false) {:target-device :cpu:0 :dtype :float})
+        certificates (into {} (map (fn [node]
+                                    [(:id node) (segmap-body/schedule
+                                                 (:operation node)
+                                                 (assoc request :scalar-types {'alpha-in :float 'n-in :int}
+                                                        :array-types {'u-in :float 'u-temporary :float 'u-next :float}))]))
+                           (get-in scheduled [:graph :nodes]))
+        graph (opencl/generate-kernel-graph (:graph scheduled)
+                                           :scalar-types {'alpha-in :float 'n-in :int}
+                                           :scheduled-bodies certificates)
+        emitted (emitted-loop/make scheduled graph {} request)
+        call (program-call/make
+              (enclosing-loop-program emitted)
+              {'u0 :initial 'u-final :output}
+              {'steps {:type :long :value 5} 'n {:type :int :value 64}
+               'alpha {:type :float :value 0.25}}
+              {'u-final :scratch} nil {} nil request)
+        events (atom [])
+        projection-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*)
+        policy-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*)
+        scopes (atom [])
+        observe #(vector (var-get projection-var) (var-get policy-var))
+        record-scope #(swap! scopes conj (observe) @(future (observe)))
+        foreign (fn [invoke]
+                  (with-bindings {projection-var (java.util.IdentityHashMap.)
+                                  policy-var (:scalar-math request)} (invoke)))
+        executor {:bind! (fn [key _ buffers scalars]
+                           (record-scope)
+                           (swap! events conj [:bind buffers scalars]) key)
+                  :run! (fn [handle] (record-scope) (swap! events conj [:run handle]))
+                  :release! (fn [handle] (record-scope) (swap! events conj [:release handle]))}]
+    (is (thrown? clojure.lang.ExceptionInfo (program-runtime/prepare-with! call executor)))
+    (is (empty? @events))
+    (is (thrown? clojure.lang.ExceptionInfo (program-runtime/staging-plan call :execution)))
+    (is (= 3 (count (program-runtime/staging-plan call :execution request))))
+    (let [prepared (foreign #(program-runtime/prepare-with! call executor request))]
+      (try
+        (is (= 3 (count (filter #(= :bind (first %)) @events))))
+        (dotimes [_ 2]
+          (is (= (:outputs call) (foreign #(program-runtime/run-prepared! prepared)))))
+        (is (= 10 (count (filter #(= :run (first %)) @events))))
+        (let [before @events
+              genuine ((:raster.gpu.parallel-program/request-seal prepared) prepared)]
+          (doseq [forged [(assoc prepared :call (assoc call :attributes {:scalar-math (:scalar-math request)}))
+                          (with-meta prepared {:scalar-math (:scalar-math request)})
+                          (assoc prepared :raster.gpu.parallel-program/request-seal (fn [_] genuine))]]
+            (is (= :parallel-program-request-owner
+                   (try (program-runtime/run-prepared! forged) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+            (is (= :parallel-program-request-owner
+                   (try (program-runtime/release-prepared! forged) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+          (is (= before @events) "forged owners reject before executor callbacks")
+          (is (false? @(:closed? prepared)) "forged release cannot close the genuine owner")
+          (is (= (:outputs call) (foreign #(program-runtime/run-prepared! prepared)))))
+        (let [report (foreign #(program-runtime/profile-prepared!
+                               prepared (fn [handle]
+                                          (record-scope)
+                                          {:profile [{:phase handle}] :kernel-total-ms 0.1 :device-wall-ms 0.2})))]
+          (is (= 5 (:program-graph-count report))))
+        (finally (foreign #(program-runtime/release-prepared! prepared)))))
+    (is (= 3 (count (filter #(= :release (first %)) @events))))
+    (let [sequence (foreign #(program-runtime/prepare-sequence-with!
+                             [{:id :selected :call call}] executor request))]
+      (try
+        (is (= {:selected (:outputs call)}
+               (foreign #(program-runtime/run-prepared! sequence))))
+        (finally (foreign #(program-runtime/release-prepared! sequence)))))
+    (is (seq @scopes))
+    (is (every? #(= [nil nil] %) @scopes)
+        "bind, replay, profile, release callbacks and their futures cannot inherit proof scopes")))
 
 (deftest structured-loop-scalar-math-consent-is-independent
   (let [scheduled (lower/schedule (loop-program true true) {:target-device :cpu:0 :dtype :float})
