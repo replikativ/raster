@@ -266,14 +266,6 @@
 ;; Pass functions — each takes (form, opts) → form or {:form :stats}
 ;; ================================================================
 
-(defn- effect-bindings-for
-  "Bind each effect statement to a fresh effectful throwaway, preserving order.
-   (effect1) (effect2) → [_eff1 (effect1) _eff2 (effect2)]"
-  [effects]
-  (vec (mapcat (fn [eff]
-                 [(with-meta (gensym "_eff_") {:raster.effect/effectful true}) eff])
-               effects)))
-
 (defn- normalize-let-body
   "Normalize a body to a single-result let* form, lifting statement effects into
    effectful bindings (so order/effects survive DCE and the let*-only dialects).
@@ -284,24 +276,7 @@
    `(dotimes ...) ret`); without this it reaches the :fixpointed dialect as a bare
    `do` and fails the let* check (compile-aot of any multi-form kernel)."
   [form]
-  (cond
-    ;; (do e1 ... ret) — multi-statement do → let* with effect bindings
-    (and (seq? form) (= 'do (first form)))
-    (let [body-exprs (rest form)]
-      (cond
-        (empty? body-exprs) form
-        (= 1 (count body-exprs)) (recur (first body-exprs))   ; (do x) → normalize x
-        :else (list 'let* (effect-bindings-for (butlast body-exprs)) (last body-exprs))))
-
-    (not (form/binding-form? form)) form
-
-    :else
-    (let [[_head bindings & body-exprs] form]
-      (if (<= (count body-exprs) 1)
-        form ;; Already single-body — leave as-is
-        ;; Multi body — lift effects into bindings
-        (list 'let* (vec (concat bindings (effect-bindings-for (butlast body-exprs))))
-              (last body-exprs))))))
+  (util/normalize-let-body form))
 
 (defn- tag-expr-types
   "Recursively attach :tag metadata to expressions whose type is inferrable.

@@ -51,12 +51,18 @@
   "C ABI length parameters keyed by their source array symbol."
   {})
 
+(def ^:dynamic *host-value-remap*
+  "Exact lexical host IDs before and after the final C source alpha normalization."
+  {})
+
 (declare alength-call? alength-arg)
 
 (defn- operations-at-site
   [site]
   (when *scheduled-program*
-    (:operations (some #(when (= site (:site %)) %)
+    (:operations (some #(when (= site (if (= :binding (first (:site %)))
+                                      (update (:site %) 1 (fn [id] (get *host-value-remap* id id)))
+                                      (:site %))) %)
                        (:equations *scheduled-program*)))))
 
 (defn- bound-segop
@@ -70,7 +76,7 @@
        (if (alength-call? expression)
          (get *length-syms* (alength-arg expression) expression)
          expression))
-     operation)))
+     (segop/substitute-host-values *host-value-remap* operation))))
 
 (defn- compatibility-segop
   "Schedule an uncovered nested C host site at the shared middle-end boundary.
@@ -306,6 +312,28 @@
              :else f))
          form)]
     {:form rewritten :length-syms @length-syms}))
+
+(defn- canonical-host-projection
+  "Canonicalize source and retain its exact flat host-binding correspondence for schedules.
+   Alpha normalization only renames lexical IDs; it preserves binding order and count."
+  ([source scheduled-program] (canonical-host-projection source scheduled-program []))
+  ([source scheduled-program parameters]
+   (let [external-ids (vec (distinct (filter symbol? (concat parameters (:inputs scheduled-program)))))]
+     (binding [util/*shadowing-locals* (into util/*shadowing-locals* external-ids)]
+       (let [canonical (second (util/alpha-normalize [external-ids source]))
+             original-ids (when (form/binding-form? source) (vec (take-nth 2 (second source))))
+             canonical-ids (when (form/binding-form? canonical) (vec (take-nth 2 (second canonical))))]
+         (when (and scheduled-program
+                    (or (not= (count original-ids) (count canonical-ids))
+                        (not (every? symbol? original-ids))
+                        (not (every? symbol? canonical-ids))
+                        (not= (count original-ids) (count (distinct original-ids)))
+                        (not= (count canonical-ids) (count (distinct canonical-ids)))))
+           (throw (ex-info "C host alpha normalization requires an unambiguous binding correspondence"
+                           {:reason :raster/bug :stage :c-host-alpha-normalization
+                            :original-bindings original-ids :canonical-bindings canonical-ids})))
+         {:form canonical
+          :host-value-remap (if scheduled-program (zipmap original-ids canonical-ids) {})})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Host function emission.
@@ -694,7 +722,8 @@
         ;; closed-core program before deriving its ABI and C source so equivalent
         ;; compilations receive byte-identical source and can share native cache
         ;; artifacts across calls and JVM processes.
-        nform (util/alpha-normalize nform)
+        {nform :form host-value-remap :host-value-remap}
+        (canonical-host-projection nform parallel-program params)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
         ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
         ;; r = (let* [..writes buf..] buf) from inlining residual-add, where r feeds a
@@ -724,7 +753,8 @@
                                      buffers))
         local-set     (set (map first local-buffers))
         heap-buffers  (filterv #(not (local-set (first %))) buffers)
-        src (binding [*scheduled-program* parallel-program]
+        src (binding [*scheduled-program* parallel-program
+                      *host-value-remap* host-value-remap]
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
                          length-syms stripped))
         so  (cpu/compile-source! src)

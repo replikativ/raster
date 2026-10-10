@@ -106,6 +106,141 @@
   [segred]
   (reduction/scalar-op (:reduction segred)))
 
+(defn- region-source [region]
+  (when region
+    (list 'let* (:bindings region) (:results region))))
+
+(defn- restore-region [region source]
+  (when region
+    (assoc region :bindings (second source) :results (nth source 2))))
+
+(defn- canonical-owner-substitution [substitutions binders body host-free-ids]
+  (let [scope (util/subst-scoped substitutions binders body)
+        ;; The source scope engine canonicalizes every owner/local together, while reserving
+        ;; free host IDs. Collision avoidance must not introduce per-compilation C cache misses.
+        ;; Outside extents/outputs can collide even when they do not occur in the lane body.
+        ;; Keep their free IDs OUTSIDE the synthetic scope so alpha-normalize reserves them.
+        canonical (second (util/alpha-normalize
+                           [(vec (sort-by str host-free-ids))
+                            (list 'fn* (:binders scope) (:body scope))]))]
+    {:binders (second canonical) :body (nth canonical 2)}))
+
+(defn substitute-host-values
+  "Instantiate a rank-one SegMap/scalar-fold SegRed at a renamed CPU host boundary.
+
+   Owner-stored indices, accumulators and scalar SSA locals are lexical binders, not host values.
+   Transport their scopes through the shared source scope engine; neutral values, output IDs,
+   extents and launch operands remain outside those scopes. No algebra is re-inferred here.
+   Element/combine product owners have different accumulator scopes and are not admitted."
+  [substitutions operation]
+  (when-not (or (instance? SegMap operation) (instance? SegRed operation))
+    (throw (ex-info "host value substitution requires a supported SegOp scope owner"
+                    {:reason :raster/bug :stage :segop-host-value-substitution
+                     :operation operation})))
+  (when-not (= 1 (count (get-in operation [:space :dims])))
+    (throw (ex-info "host value substitution requires one segmented dimension"
+                    {:reason :raster/bug :stage :segop-host-value-substitution
+                     :operation operation})))
+  (when (and (instance? SegRed operation)
+             (not (and (reduction/product-reduction? (:reduction operation))
+                       (reduction/scalar? (:reduction operation))
+                       (reduction/region? (get-in operation [:reduction :step]))
+                       (nil? (get-in operation [:reduction :element]))
+                       (nil? (get-in operation [:reduction :combine])))))
+    (throw (ex-info "host value substitution requires a scalar fold reduction scope"
+                    {:reason :raster/bug :stage :segop-host-value-substitution
+                     :operation operation})))
+  (binding [util/*shadowing-locals*
+            (into util/*shadowing-locals*
+                  (filter symbol?
+                          (concat (keys substitutions) (vals substitutions)
+                                  (:inputs operation) (:outputs operation) (:scalars operation)
+                                  (map :bound (get-in operation [:space :dims]))
+                                  (map :neutral (get-in operation [:reduction :components]))
+                                  (map :result (get-in operation [:reduction :components])))))]
+    (if (empty? substitutions)
+      operation
+      (let [red (:reduction operation)
+            region (:scalar-region operation)
+            outer (util/subst-syms substitutions
+                                  (assoc (reduce (fn [value field]
+                                                   (if (contains? value field) (assoc value field nil) value))
+                                                 operation [:lambda :reduction :scalar-region])
+                                         :space (assoc (:space operation) :flat-idx nil
+                                                       :dims (mapv #(assoc % :name nil)
+                                                                   (get-in operation [:space :dims])))))
+            host-free-ids
+            (util/free-syms
+             [outer (vec (vals substitutions))
+              (util/subst-syms substitutions
+                               [(mapv #(select-keys % [:neutral :result]) (:components red))
+                                (dissoc (:attributes red) :result-region)
+                                (get-in red [:attributes :result-region :operands])
+                                (vec (rest (get-in red [:attributes :result-region :parameters])))])])
+            indices (vec (distinct (filter symbol? (concat [(get-in operation [:space :flat-idx])]
+                                                           (map :name (get-in operation [:space :dims]))
+                                                           (when red [(:index red)])))))
+            binders (into indices (when red (reduction/accumulators red)))
+            result-region (get-in red [:attributes :result-region])
+            next-result-region
+            (when result-region
+              (let [parameter (first (:parameters result-region))
+                    scope (canonical-owner-substitution substitutions [parameter]
+                                                         [(:expression result-region)] host-free-ids)]
+                (assoc (util/subst-syms substitutions result-region)
+                       :parameters (into (:binders scope)
+                                         (map #(util/subst-syms substitutions %)
+                                              (rest (:parameters result-region))))
+                       :expression (first (:body scope)))))
+            scoped-red (when red
+                         (-> red
+                             (assoc :attributes nil)
+                             (update :components #(mapv (fn [component]
+                                                          (assoc component :neutral nil :result nil)) %))
+                             (assoc :step (region-source (:step red)))))
+            scalar-source (when region
+                            (list 'let* (vec (mapcat (juxt :id :init) (:locals region)))
+                                  (dissoc region :locals)))
+            scope (canonical-owner-substitution substitutions binders
+                                     [{:indices indices :lambda (:lambda operation)
+                                       :reduction scoped-red :scalar-region scalar-source}]
+                                                host-free-ids)
+            payload (first (:body scope))
+            next-indices (:indices payload)
+            names (zipmap indices next-indices)
+            next-red (:reduction payload)
+            next-red (when red
+                       (-> next-red
+                           (assoc :attributes
+                                  (cond-> (util/subst-syms substitutions (:attributes red))
+                                    result-region (assoc :result-region next-result-region))
+                                  :step (restore-region (:step red) (:step next-red)))
+                           (update :algebra
+                                   #(cond-> %
+                                      (contains? (:algebra red) :init)
+                                      (assoc :init (util/subst-syms substitutions
+                                                                  (get-in red [:algebra :init])))))
+                           (update :components
+                                   #(mapv (fn [component original]
+                                            (assoc component
+                                                   :neutral (util/subst-syms substitutions (:neutral original))
+                                                   :result (util/subst-syms substitutions (:result original))))
+                                          % (:components red)))))
+            next-region (when region
+                          (let [[_ bindings body] (:scalar-region payload)]
+                            (assoc body :locals
+                                   (mapv (fn [local [id init]] (assoc local :id id :init init))
+                                         (:locals region) (partition 2 bindings)))))]
+        (cond-> (-> outer
+                    (assoc :lambda (:lambda payload))
+                    (assoc-in [:space :flat-idx] (get names (get-in operation [:space :flat-idx])))
+                    (assoc-in [:space :dims]
+                              (mapv (fn [dimension original]
+                                      (assoc dimension :name (get names (:name original))))
+                                    (get-in outer [:space :dims]) (get-in operation [:space :dims]))))
+          red (assoc :reduction (reduction/validate! next-red))
+          region (assoc :scalar-region next-region))))))
+
 (defrecord SegContract
            [id          ;; int
             facts       ;; contraction-facts — the recorded semantic plan (ir/contraction_facts)

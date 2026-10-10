@@ -386,7 +386,9 @@
     (is (= 'storage (get-in (dialect/facts scheduled) [:attributes :allocations 0 :destination])))
     (is (= 'length (get-in (dialect/facts scheduled) [:attributes :allocations 0 :extent])))
     (is (= #{'storage} (get-in (dialect/facts scheduled) [:attributes :host-read-sites 0 :values])))
-    (is (= '[output written] (get-in (dialect/facts scheduled) [:attributes :source-bindings])))
+    (is (= '[storage written] (get-in (dialect/facts scheduled) [:attributes :source-bindings])))
+    (is (= '[output written] (get-in (dialect/facts original) [:attributes :source-bindings]))
+        "remapping updates the retained definition IDs without mutating the original facts")
     (is (= 1 (:initialization-full-overwrites stats)))))
 
 (deftest allocation-extent-normalization-is-hygienic-and-precedes-allocation

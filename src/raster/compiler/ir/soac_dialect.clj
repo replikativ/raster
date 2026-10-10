@@ -2729,6 +2729,8 @@
                               :values values
                               :inputs (mapv rename (:inputs source-facts))
                               :equations equation-facts)
+                 (seq (get-in source-facts [:attributes :source-bindings]))
+                 (update-in [:attributes :source-bindings] #(mapv rename %))
                  (seq (get-in source-facts [:attributes :host-read-values]))
                  (update-in [:attributes :host-read-values]
                             #(vec (distinct (map rename %))))

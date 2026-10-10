@@ -352,11 +352,19 @@
       (is (= 1 (:ze-maps (:stats result))))
       (is (= 1 (count (:kernels result))))
       (is (kart/kernel-artifact? (first (:kernels result))))
-      ;; Check the marker form
+      ;; The preceding body statement is normalized into an ordered effect binding.
+      ;; Check that exact slot, not a marker somewhere inside an unrelated subtree.
       (let [transformed (:form result)
-            body (nth transformed 2)] ;; body of let*
-        (is (and (seq? body)
-                 (= 'raster.gpu.ze-runtime/invoke-registered-kernel (first body))))))))
+            pairs (mapv vec (partition 2 (second transformed)))
+            [effect invocation] (second pairs)]
+        (is (= 2 (count pairs)))
+        (is (= '[out (double-array n)] (first pairs)))
+        (is (true? (:raster.effect/effectful (meta effect))))
+        (is (= (list 'raster.gpu.ze-runtime/invoke-registered-kernel
+                     (:kernel-name (first (:kernels result))) '[a b] 'out [] 'n)
+               invocation))
+        (is (= 'out (nth transformed 2)))
+        (is (= 3 (count transformed)))))))
 
 (deftest opencl-pass-map-void-marker-follows-abi-test
   (testing "the compatibility marker is projected from the ordered ABI"

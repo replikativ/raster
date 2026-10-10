@@ -427,6 +427,26 @@
       (with-meta (apply list children) m)
       (apply list children))))
 
+(defn normalize-let-body
+  "Preserve statement order while exposing one final result to let-only passes."
+  [expression]
+  (let [effect-bindings (fn [effects]
+                          (vec (mapcat #(vector (with-meta (gensym "_eff_")
+                                                  {:raster.effect/effectful true}) %)
+                                       effects)))]
+    (cond
+      (and (seq? expression) (= 'do (first expression)))
+      (let [body (rest expression)]
+        (cond (empty? body) expression
+              (= 1 (count body)) (recur (first body))
+              :else (remake expression 'let* (effect-bindings (butlast body)) (last body))))
+      (not (form/binding-form? expression)) expression
+      :else
+      (let [[_ bindings & body] expression]
+        (if (<= (count body) 1) expression
+            (remake expression 'let* (vec (concat bindings (effect-bindings (butlast body))))
+                    (last body)))))))
+
 (defn postwalk-preserving-meta
   "Bottom-up tree rewrite that preserves metadata on every rebuilt collection.
 

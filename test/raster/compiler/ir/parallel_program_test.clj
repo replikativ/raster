@@ -115,17 +115,26 @@
           (is (= :parallel-program-host-only-operations
                  (:reason (ex-data exception)))))))))
 
-(deftest source-shaped-bound-expressions-stay-on-the-compatibility-route
+(deftest source-shaped-bound-expressions-retain-the-complete-typed-packet
   (let [source '(raster.par/reduce acc 0.0 i (clojure.core/alength values)
                                    (+ acc (clojure.core/aget values i)))
         p (:form (segop-lower/segop-lower-pass
                   (list 'let* ['total source] 'total)
                   {:target-device :cpu:0 :dtype :double
                    :array-types {'values :double}}))
-        equation (first (:equations p))]
-    (is (nil? (:algorithm equation)))
+        prefix (first (:equations p))
+        equation (second (:equations p))
+        pairs (mapv vec (partition 2 (second (:source p))))]
+    (is (= 2 (count (:equations p))))
+    (is (true? (get-in prefix [:attributes :host-only])))
+    (is (empty? (:operations prefix)))
+    (is (every? :algorithm (:equations p)))
+    (is (= :long (get-in p [:values (first (:results prefix)) :dtype])))
+    (is (= (:source prefix) (second (first pairs))))
+    (is (some (set (:results prefix)) (:operands equation)))
     (is (seq (:operations equation)))
-    (is (= [:binding 'total] (:site equation)))))
+    (is (= [:binding 'total] (:site equation)))
+    (is (= p (program/validate! p)))))
 
 (deftest parallel-program-enforces-ordered-logical-ssa
   (testing "external inputs and earlier results are the only available operands"

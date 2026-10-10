@@ -20,7 +20,6 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
-            [raster.compiler.passes.parallel.typed-soac-frontend :as typed-frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
@@ -83,29 +82,11 @@
 
         :else
         (let [legacy-node (:ok soac)
-              typed? (and (soac/soac-reduce? legacy-node)
-                          (empty? (:segment-axes legacy-node))
-                          (reduction/scalar? (:reduction legacy-node))
-                          ;; TypedSOAC deliberately names extents with stable values (or static
-                          ;; literals). Older source-shaped bounds such as `(alength x)` remain on
-                          ;; the compatibility route until bound expressions have their own SSA
-                          ;; equation; do not smuggle executable host forms into the typed dialect.
-                          (soac-dialect/extent? (:bound legacy-node)))
-              algorithm (when typed?
-                          (typed-frontend/form->program
-                           (list 'let* [sym form] sym)
-                           {:dtype (or dtype :double)
-                            :array-types array-types
-                            :scalar-types scalar-types}))
-              segops (attempt #(if algorithm
-                                 (soac-lower/lower-typed-reduce
-                                  algorithm (or device-id :cpu:0) :dtype (or dtype :double)
-                                  :target-descriptor target-descriptor)
-                                 (soac-lower/lower-soac legacy-node (or device-id :cpu:0)
-                                                        :dtype (or dtype :double))))]
+              segops (attempt #(soac-lower/lower-soac legacy-node (or device-id :cpu:0)
+                                                     :dtype (or dtype :double)))]
           (cond
             (:err segops) (decline :segop (:err segops))
-            (seq (:ok segops)) (cond-> {:soac legacy-node :algorithm algorithm :segops (:ok segops)}
+            (seq (:ok segops)) (cond-> {:soac legacy-node :segops (:ok segops)}
                                  (soac-lower/scan-soac? legacy-node)
                                  (assoc :kernel-graph
                                         (soac-lower/scan-kernel-graph
@@ -273,7 +254,7 @@
   (let [{:keys [equations values]}
         (reduce
          (fn [{:keys [environment] :as state}
-              {:keys [equation operand-values result-values]}]
+              {:keys [equation operand-values result-values physical-values]}]
            (let [source-results (:results equation)
                  operands (mapv #(get environment % %) (:operands equation))
                  ;; Source binders and pre-existing buffers may share a spelling in imperative IR.
@@ -298,7 +279,7 @@
                                                           :equation-source (:source equation)})
                                  values)
                              (merge-values values {value-id (get operand-values source-id)})))
-                         (:values state)
+                         (merge-values (:values state) (or physical-values {}))
                          (map vector (:operands equation) operands))
                  values-with-results
                  (reduce (fn [values [source-id value-id]]
@@ -352,6 +333,107 @@
                              (soac-dialect/physical-results facts equation))))
               (soac-dialect/equations algorithm))]
     (mapv producers (soac-dialect/outputs algorithm))))
+
+(declare segop-lower-pass)
+
+(defn- reduction-packet
+  "Admit, freshen and schedule the complete typed singleton, including host SSA."
+  [result source opts used]
+  (when (par/par-reduce-form? source)
+    (let [attempt (typed-route/attempt
+                   (list 'let* [result source] result)
+                   (or (:dtype opts) :double) (:array-types opts)
+                   {:scalar-types (:scalar-types opts)
+                    :resident-reductions? (true? (:resident-reductions? opts))})]
+      (if (:declined attempt)
+        {:declined (:declined attempt)}
+        (let [packet (:program attempt)
+              _ (when-not (and (program/parallel-program? packet)
+                               (= :typed-soac (:dialect packet))
+                               (seq (:equations packet)))
+                  (throw (ex-info "typed reduction admission requires a complete packet"
+                                  {:reason :raster/bug :stage :typed-reduction-packet
+                                   :source source})))
+              _ (program/validate! packet)
+              source-form (:source packet)
+              _ (when-not (and (form/binding-form? source-form)
+                               (vector? (second source-form))
+                               (even? (count (second source-form)))
+                               (seq (nnext source-form))
+                               (every? symbol? (take-nth 2 (second source-form))))
+                  (throw (ex-info "typed reduction packet requires its ordered source realization"
+                                  {:reason :raster/bug :stage :typed-reduction-source
+                                   :source source})))
+              source-pairs (mapv vec (partition 2 (second source-form)))
+              source-bindings (into {} source-pairs)
+              _ (doseq [equation (:equations packet)]
+                  (let [[kind binding] (:site equation)]
+                    (when-not (and (= :binding kind)
+                                   (contains? source-bindings binding)
+                                   (= (:source equation) (get source-bindings binding)))
+                      (throw (ex-info "typed reduction equation lacks its exact source witness"
+                                      {:reason :raster/bug :stage :typed-reduction-source
+                                       :equation (:id equation) :site (:site equation)
+                                       :source source})))))
+              locals (disj (set (concat (map first source-pairs)
+                                       (mapcat :results (:equations packet)))) result)
+              fresh (fn [id]
+                      (loop [candidate (with-meta (gensym (str (name id) "_")) (meta id))]
+                        (if (contains? @used candidate) (recur (gensym (str (name id) "_")))
+                            (do (swap! used conj candidate) candidate))))
+              rename (into {} (map #(vector % (fresh %))) locals)
+              rename-id #(get rename % %)
+              pairs (mapv (fn [[id expression]]
+                            ;; The realization owns source hints (in particular the absence of
+                            ;; primitive :tag on let binders), not the value contract's metadata.
+                            [(with-meta (rename-id id) (meta id))
+                             (util/subst-syms rename expression)])
+                          source-pairs)
+              body (mapv #(util/subst-syms rename %) (nnext source-form))
+              bindings (into {} pairs)
+              equations
+              (mapv (fn [equation]
+                      (let [algorithm (soac-dialect/remap-values (:algorithm equation) rename)
+                            site (update (:site equation) 1 rename-id)]
+                        (-> equation
+                            (assoc :site site :source (get bindings (second site))
+                                   :operands (mapv rename-id (:operands equation))
+                                   :results (mapv rename-id (:results equation))
+                                   :algorithm algorithm
+                                   :operations (vec (soac-dialect/equations algorithm)))
+                            (update :attributes #(util/subst-syms rename %)))))
+                    (:equations packet))
+              values (reduce merge-values {} (map #(-> % :algorithm soac-dialect/facts :values) equations))
+              packet (assoc packet :source (apply util/remake source-form 'let*
+                                                 (vec (mapcat identity pairs)) body)
+                                   :values values :inputs (mapv rename-id (:inputs packet))
+                                   :outputs (mapv rename-id (:outputs packet)) :equations equations)
+              scheduled (:form (segop-lower-pass packet opts))
+              primary (some #(when (and (= [result] (:results %))
+                                        (= 'reduce (soac-dialect/operation-kind
+                                                    (first (soac-dialect/equations (:algorithm %)))))) %)
+                            (:equations scheduled))]
+          (when-not (and primary
+                         (= 'reduce (soac-dialect/operation-kind
+                                     (first (soac-dialect/equations (:algorithm primary)))))
+                         (= [result] (:results primary)))
+            (throw (ex-info "typed reduction packet lost its result equation"
+                            {:reason :raster/bug :stage :typed-reduction-packet :source source})))
+          {:program scheduled :pairs pairs :body body :primary primary})))))
+
+(defn- packet-equations
+  [packet primary-site ids]
+  (let [scheduled (:program packet)
+        values (:values scheduled)
+        produced (set (mapcat :results (:equations scheduled)))]
+    (mapv (fn [equation]
+            {:equation (-> equation
+                           (assoc :id (swap! ids inc))
+                           (update :provenance assoc :compatibility-source-site primary-site))
+             :operand-values (select-keys values (:operands equation))
+             :result-values (select-keys values (:results equation))
+             :physical-values (select-keys values (set/intersection produced (set (:results equation))))})
+          (:equations scheduled))))
 
 (defn segop-lower-pass
   "Pipeline pass: convert par forms in let* bindings to SegOp records.
@@ -505,7 +587,13 @@
     (if-not (form/binding-form? form)
       {:form (build-program form [] [] (:target-device opts) (:dtype opts))
        :stats {:segops-lowered 0 :kernel-graphs-lowered 0}}
-      (let [[let-sym bindings-vec & body-exprs] form
+      (let [original-source form
+            original-binding-count (quot (count (second original-source)) 2)
+            original-body-count (count (nnext original-source))
+            form (->> form
+                      util/normalize-let-body
+                      util/uniquify-rebindings)
+            [let-sym bindings-vec & body-exprs] form
             pairs (partition 2 bindings-vec)
             device-id (:target-device opts)
             target-descriptor (:target-descriptor opts)
@@ -524,36 +612,70 @@
           ;; stderr as `WARNING: …` and vanished — invisible to stats, to explain-pipeline, and to
           ;; anyone diagnosing why a kernel took the legacy path.
             declined (atom [])
-            attempt (fn [sym init]
+            attempt (fn [sym init current-scalar-types]
                       (let [r (lower-attempt sym init device-id target-descriptor dtype
-                                             array-types scalar-types)]
+                                             array-types current-scalar-types)]
                         (when-let [d (:declined r)] (swap! declined conj d))
                         (when (:segops r) r)))
-            binding-equations
-            (keep-indexed
-             (fn [idx [sym init]]
-               (when-let [lowered-values (attempt sym init)]
-                 (swap! lowered inc)
-                 (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
-                 (equation idx [:binding sym] sym init lowered-values
-                           dtype array-types scalar-types)))
-             pairs)
-          ;; Also check body expressions for par forms
-            body-equations
-            (keep-indexed
-             (fn [idx expr]
-               (let [tmp-sym (symbol (str "body_parallel_" idx))]
-                 (when-let [lowered-values (attempt tmp-sym expr)]
-                   (swap! lowered inc)
-                   (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
-                   (equation (+ (count pairs) idx) [:body idx] tmp-sym expr
-                             lowered-values dtype array-types scalar-types))))
-             body-exprs)
-            equations (vec (concat binding-equations body-equations))]
-        {:form (build-program (list* let-sym bindings-vec body-exprs)
-                              equations @declined device-id dtype)
+            used (atom (set (filter symbol? (tree-seq coll? seq form))))
+            ids (atom -1)
+            typed-count (atom 0)
+            scalar-count (atom 0)
+            process
+            (fn [{:keys [options] :as state} [site sym expression original-site]]
+              (let [packet (reduction-packet sym expression options used)]
+                (if (:program packet)
+                  (let [rows (packet-equations packet original-site ids)
+                        packet-pairs (:pairs packet)
+                        body? (= :body (first site))
+                        packet-body (:body packet)]
+                    (swap! lowered inc)
+                    (swap! typed-count inc)
+                    (swap! scalar-count + (count (filter #(get-in % [:equation :attributes :host-only]) rows)))
+                    (-> state
+                        (update :pairs into packet-pairs)
+                        (cond-> body? (update :body into packet-body))
+                        (update :equations into rows)
+                        (update-in [:options :scalar-types] merge
+                                   (into {} (keep (fn [[id value]]
+                                                    (when (= [] (:shape value))
+                                                      [id (:dtype value)])))
+                                         (:values (:program packet))))))
+                  (let [_ (when-let [refusal (:declined packet)]
+                            (swap! declined conj (assoc refusal :stage :typed-admission
+                                                      :sym sym :source expression)))
+                        current-scalar-types (:scalar-types options)
+                        lowered-values (attempt sym expression current-scalar-types)
+                        row (when lowered-values
+                              (swap! lowered inc)
+                              (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
+                              (equation (swap! ids inc) site sym expression lowered-values
+                                        dtype array-types current-scalar-types))]
+                    (-> state
+                        (cond-> (= :binding (first site)) (update :pairs conj [sym expression])
+                                (= :body (first site)) (update :body conj expression)
+                                row (update :equations conj row)))))))
+            state (reduce process
+                          {:options (assoc opts :scalar-types scalar-types)
+                           :pairs [] :body [] :equations []}
+                          (concat (map-indexed
+                                   (fn [idx [sym expression]]
+                                     [[:binding sym] sym expression
+                                      (if (< idx original-binding-count)
+                                        [:binding sym]
+                                        [:body (- idx original-binding-count)])]) pairs)
+                                  (map-indexed (fn [idx expression]
+                                                 [[:body idx] (gensym "body_parallel_") expression
+                                                  [:body (+ (max 0 (dec original-body-count)) idx)]])
+                                               body-exprs)))
+            source (with-meta (list* let-sym (vec (mapcat identity (:pairs state))) (:body state))
+                     (meta form))
+            result (build-program source (:equations state) @declined device-id dtype)]
+        {:form (update result :provenance assoc :original-source original-source)
          :stats (cond-> {:segops-lowered @lowered
-                         :kernel-graphs-lowered @graphs-lowered}
+                         :kernel-graphs-lowered @graphs-lowered
+                         :typed-soac-reused @typed-count
+                         :typed-scalar-equations @scalar-count}
                   (seq @declined) (assoc :segops-declined @declined))}))))
 
 (defn- schedule-direct-program
