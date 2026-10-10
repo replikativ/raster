@@ -1595,17 +1595,26 @@
   (let [compilation (equation-first/compile
                      #'nn/dense-backward-db {:target cuda-target :dtype :float})
         plan (equation-first/lower compilation [(float-array [1.0 2.0 3.0])])
-        validate-call! program-call/validate!
+        validate-program! emitted-program/validate-with-physical-results!
+        validate-call! program-call/validate-with-retained-program!
+        programs (atom 0)
         calls (atom 0)]
-    (with-redefs [program-call/validate!
-                  (fn [call]
+    (with-redefs [emitted-program/validate-with-physical-results!
+                  (fn [& arguments]
+                    (swap! programs inc)
+                    (apply validate-program! arguments))
+                  program-call/validate-with-retained-program!
+                  (fn [& arguments]
                     (swap! calls inc)
-                    (validate-call! call))]
+                    (apply validate-call! arguments))]
       (is (link-plan/link-plan? (link-plan/validate! plan)))
       (is (= 1 @calls) "structure and effect derivation share one exact-object check")
+      (is (= 1 @programs) "the public check independently validates the static program")
       (reset! calls 0)
+      (reset! programs 0)
       (is (link-plan/link-plan? (link-plan/validate! plan)))
-      (is (= 1 @calls) "a new public validation independently checks the program"))
+      (is (= 1 @calls) "a new public validation independently checks the call")
+      (is (= 1 @programs) "a new public validation does not reuse the previous static proof"))
     (let [forged (assoc-in plan [:instances 0 :call :program :dialect] :hip-parallel)
           reason (try (link-plan/validate! forged)
                       nil

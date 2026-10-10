@@ -65,13 +65,19 @@
 
 (defn- seal-effect-evidence
   "Authorize exact plan/evidence reuse only under the independently checked math request."
-  [plan evidence caller-options]
+  ([plan evidence caller-options] (seal-effect-evidence plan evidence caller-options nil))
+  ([plan evidence caller-options program-validations]
   (let [plan-ref (java.lang.ref.WeakReference. plan)
         owner (volatile! nil)
         policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
-        sealed (with-meta evidence {::validation-seal (effect-evidence-seal plan-ref owner policy)})]
+        proofs (when program-validations
+                 (java.util.Collections/unmodifiableMap
+                  (java.util.IdentityHashMap. ^java.util.Map program-validations)))
+        sealed (with-meta evidence
+                 {::validation-seal (effect-evidence-seal plan-ref owner policy)
+                  ::program-validations proofs})]
     (vreset! owner sealed)
-    sealed))
+    sealed)))
 
 (defn- retained-effect-evidence-for-request?
   "True only for an exact plan/evidence pair returned by this process's LinkPlan validator."
@@ -86,6 +92,16 @@
   "Check exact plan/evidence ownership and independent caller math intent."
   ([plan evidence] (retained-effect-evidence-for-request? plan evidence nil))
   ([plan evidence caller-options] (retained-effect-evidence-for-request? plan evidence caller-options)))
+
+(defn ^:no-doc retained-program-validations!
+  "Read immutable static-program proofs only from an exact checked effect owner/request.
+   Certified-effect-only composition has no such proofs and returns nil. Neither effects
+   nor this projection certify a changed call's concrete bindings or runtime storage."
+  [plan evidence caller-options]
+  (when-not (retained-effect-evidence-for-request? plan evidence caller-options)
+    (throw (ex-info "program proof projection requires exact LinkPlan effect ownership"
+                    {:reason :link-retained-program-validations})))
+  (::program-validations (meta evidence)))
 
 (defn link-node? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkNode" (.getName (class x)))))
@@ -378,8 +394,15 @@
                      :instance instance :actual (type instance)})))
   (let [{:keys [id call roles attributes]} instance
         validation (when *retained-program-validations*
-                     (.get ^java.util.IdentityHashMap *retained-program-validations*
-                           (:program call)))
+                     (or (.get ^java.util.IdentityHashMap *retained-program-validations*
+                               (:program call))
+                         (let [proof (if (nil? *caller-options*)
+                                       (emitted-program/validate-with-physical-results! (:program call))
+                                       (emitted-program/validate-with-physical-results!
+                                        (:program call) *caller-options*))]
+                           (.put ^java.util.IdentityHashMap *retained-program-validations*
+                                 (:program call) proof)
+                           proof)))
         call (if validation
                (if (nil? *caller-options*)
                  (program-call/validate-with-retained-program! call validation)
@@ -1337,7 +1360,7 @@
           :effect-evidence
           (seal-effect-evidence
            plan (->LinkEffectEvidence :link-plan :link-effects (:id plan) (:target plan)
-                                     step-facts initialization) caller-options)}))))
+                                     step-facts initialization) caller-options validations)}))))
 
 (defn ^:no-doc validate-with-effect-evidence!
   "Derive exact effect evidence under independent caller intent. Retained program proof is optional."

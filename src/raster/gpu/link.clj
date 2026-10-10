@@ -223,6 +223,9 @@
                        "mixed descriptor/program recording requires static emitted graph order"
                        {:reason :link-runtime-dynamic-mixed-order
                         :instance (:id instance)}))))
+         program-validations (when (some link-plan/program-link-instance? program-instances)
+                               (link-plan/retained-program-validations!
+                                plan (:effect-evidence validated) caller-options))
          target (:target plan)
          owns-session? (nil? session)
          execution-id (random-uuid)
@@ -338,9 +341,15 @@
                                          :release! #(gpu/release-kernel-graph! session %)}]
                            (if (and (not mixed?) (= 1 (count program-instances))
                                     (link-plan/program-link-instance? (first program-instances)))
-                             (if (nil? caller-options)
-                               (parallel-program/prepare-with! (:call (first program-instances)) executor)
-                               (parallel-program/prepare-with! (:call (first program-instances)) executor caller-options))
+                             (let [call (:call (first program-instances))
+                                   proof (when program-validations
+                                           (.get ^java.util.Map program-validations (:program call)))]
+                               (if proof
+                                 (parallel-program/prepare-with-retained-program!
+                                  call executor proof caller-options)
+                                 (if (nil? caller-options)
+                                   (parallel-program/prepare-with! call executor)
+                                   (parallel-program/prepare-with! call executor caller-options))))
                              (let [instances (mapv (fn [instance]
                                       {:id (:id instance)
                                        :kind (if (link-plan/graph-link-instance? instance)
@@ -349,9 +358,12 @@
                                                (select-keys instance [:graph :bindings :scalar-values])
                                                (:call instance))})
                                     program-instances)]
-                               (if (nil? caller-options)
-                                 (parallel-program/prepare-sequence-with! instances executor)
-                                 (parallel-program/prepare-sequence-with! instances executor caller-options)))))))))
+                               (if program-validations
+                                 (parallel-program/prepare-sequence-with-retained-programs!
+                                  instances executor program-validations caller-options)
+                                 (if (nil? caller-options)
+                                   (parallel-program/prepare-sequence-with! instances executor)
+                                   (parallel-program/prepare-sequence-with! instances executor caller-options))))))))))
                    (when (or static-programs? (empty? program-instances))
                      (timed-phase!
                       timings :binding
