@@ -14,6 +14,7 @@
   (let [v (intern namespace 'allocate (fn [_] :not-executed))]
     (alter-meta! v assoc :raster.core/deftm true
                  :raster.core/deftm-params '[n]
+                 :raster.core/deftm-tags '[long]
                  :raster.core/deftm-walked-body [body])
     v))
 

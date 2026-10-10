@@ -2,6 +2,8 @@
   "Buffer reuse pass: rewrite allocating ops to reuse dead buffers."
   (:require [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.ir.form :as form]
             [raster.analysis.memory :as ma]))
 
@@ -35,9 +37,27 @@
 (def ^:private call-head util/call-head)
 (def ^:private call-args util/call-args)
 
+(defn- known-argument-tag
+  "Use the existing result-alternative authority; one branch is not admission."
+  [expression environment]
+  (let [tags (inference/infer-result-tags expression environment *ns*)]
+    (when (= 1 (count tags)) (first tags))))
+
+(defn- same-parameter-carrier?
+  "Removing a specialization call must not remove a coercion or check.
+   Require known equal carriers; Object fallback is not type evidence."
+  [actual declared source-ns]
+  (when (and actual declared)
+    (let [actual-class (types/tag->check-class actual)
+          declared-class (binding [*ns* (or source-ns *ns*)]
+                           (types/tag->check-class declared))]
+      (and (= actual-class declared-class)
+           (or (not= Object actual-class)
+               (= 'Object actual declared))))))
+
 (defn fuse-let
   "Fuse buffer allocations in a (let* [...] body) form."
-  [let-form & {:keys [dtype]}]
+  [let-form & {:keys [dtype param-env]}]
   (let [analysis (ma/analyze-sexp-let let-form)
         [_ bindings-vec & body-exprs] let-form
         pairs (vec (partition 2 bindings-vec))
@@ -49,11 +69,34 @@
         (vec
          (mapcat
           (fn [[idx [sym init]]]
+            (binding [util/*shadowing-locals*
+                      (into util/*shadowing-locals*
+                            (concat (keys param-env) (map first (take idx pairs))))]
             (let [head (call-head init)
-                  resolved (when head (descriptor/resolve-buffer-semantics head))]
+                  resolved (when head (descriptor/resolve-buffer-semantics head))
+                  actual-tags (when (:auto-detected? (first resolved))
+                                ;; Keeping the original prefix here retains
+                                ;; alternatives of prior locals instead of
+                                ;; resurrecting a single stale metadata tag.
+                                (mapv #(known-argument-tag
+                                        (list 'let* (vec (mapcat identity (take idx pairs))) %)
+                                        (or param-env {}))
+                                      (call-args init)))]
               (if-let [[entry _base-op] resolved]
-                (if (:allocates? entry)
-                  (let [args (call-args init)
+                (if (and (:allocates? entry)
+                         (or (not (:auto-detected? entry))
+                             (and (= (count (:parameters entry)) (count (call-args init))
+                                     (count (:parameter-tags entry)))
+                                  (every? true? (map #(same-parameter-carrier? %1 %2 (:source-ns entry))
+                                                     actual-tags (:parameter-tags entry))))))
+                  (let [original-args (call-args init)
+                        argument-pairs
+                        (when (:auto-detected? entry)
+                          (mapv (fn [argument tag]
+                                    [(with-meta (gensym "buffer_arg__")
+                                       (cond-> (meta argument) tag (assoc :raster.type/tag tag)))
+                                     argument]) original-args actual-tags))
+                        args (if (:auto-detected? entry) (mapv first argument-pairs) original-args)
                         in-place-idx (:in-place-arg entry)]
                     (if (and in-place-idx
                              (< in-place-idx (count args))
@@ -92,17 +135,20 @@
                                            ;; Use :overwrite only when proven (par/map!, registered ops).
                                            :else :accumulate)
                               buf-sym (with-meta (gensym (str "buf_" (name sym) "_"))
-                                        {:raster.buffer/hoistable true :raster.buffer/write-mode write-mode})
+                                        {:raster.buffer/hoistable (not (:auto-detected? entry))
+                                         :raster.buffer/no-hoist (:auto-detected? entry)
+                                         :raster.buffer/write-mode write-mode})
                               alloc-expr (alloc-fn args {:dtype dtype})]
                           (swap! fresh-allocs inc)
-                          [[buf-sym alloc-expr]
-                           [sym ((:rewrite-fn entry) args buf-sym)]])
+                          (concat argument-pairs
+                                  [[buf-sym alloc-expr]
+                                   [sym ((:rewrite-fn entry) args buf-sym)]]))
                         (do (swap! unchanged inc)
                             [[sym init]]))))
                   (do (swap! unchanged inc)
                       [[sym init]]))
                 (do (swap! unchanged inc)
-                    [[sym init]]))))
+                    [[sym init]])))))
           (map-indexed vector pairs)))
         all-bindings (vec (mapcat identity new-pairs))
         new-form (let [r (list* 'let* all-bindings body-exprs)]

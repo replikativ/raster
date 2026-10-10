@@ -304,3 +304,23 @@
        (symbol? (first expr))
        (not (descriptor/alloc-op? (form/effective-op expr)))
        (removable-expr? expr)))
+
+(defn replay-safe-value?
+  "Stable scalar/identity operands safe to repeat or omit during substitution.
+   This is not general purity or hoisting: open helpers, reads and arithmetic
+   require an evaluate-once prefix. Only closed, proven-total source casts may
+   wrap stable operands. Qualified Vars are not immutable local values."
+  ([expression] (replay-safe-value? expression {}))
+  ([expression environment]
+   (let [expression (walk/postwalk
+                     #(if-let [tag (and (symbol? %) (get environment %))]
+                        (vary-meta % assoc :raster.type/tag tag) %) expression)]
+     (or (nil? expression) (number? expression) (boolean? expression)
+         (string? expression) (char? expression) (keyword? expression)
+         (and (symbol? expression) (contains? environment expression))
+         (and (seq? expression)
+              (not (contains? environment (first expression)))
+              (descriptor/cast-op? (descriptor/semantic-op expression))
+              (some? (closed-registry-proof expression))
+              (proven-total-cast? expression)
+              (replay-safe-value? (first (descriptor/call-args expression)) environment))))))

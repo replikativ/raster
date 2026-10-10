@@ -177,6 +177,7 @@
    with a vector of expressions)."
   [params-set [sym alloc-expr]]
   (and (:raster.buffer/hoistable (meta sym))
+       (not (:raster.buffer/no-hoist (meta sym)))
        ;; Reject allocations with vector/collection args (computed content, not just size)
        (not (and (seq? alloc-expr)
                  (some vector? (rest alloc-expr))))
@@ -269,7 +270,8 @@
           ;; Mark alloc bindings as hoistable if size is param-derived
           new-bindings
           (vec (mapcat (fn [[sym expr]]
-                         (let [is-hoistable-alloc (and (alloc-expr? expr)
+                         (let [is-hoistable-alloc (and (not (:raster.buffer/no-hoist (meta sym)))
+                                                       (alloc-expr? expr)
                                                        (every? param-derived (free-dep-syms expr)))
                                sym (cond-> sym
                                      (and is-hoistable-alloc (not (:raster.buffer/hoistable (meta sym))))

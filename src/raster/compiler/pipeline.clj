@@ -805,7 +805,7 @@
   Returns {:form :stats}."
   [form opts]
   (if (form/binding-form? form)
-    (let [result (buffer-fuse/fuse-let form :dtype (:dtype opts))
+    (let [result (buffer-fuse/fuse-let form :dtype (:dtype opts) :param-env (:param-env opts))
           resolved (inline/resolve-generic-deftm-calls (:form result) (:param-env opts))]
       (assoc result :form resolved))
     {:form form :stats {:fused 0 :fresh-allocs 0 :unchanged 0}}))
