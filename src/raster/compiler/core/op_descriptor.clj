@@ -178,7 +178,8 @@
 (defn resolve-buffer-semantics
   "Resolve the buffer facet, handling mangled/unqualified names.
   Falls back to auto-detection from the deftm walked body when no
-  manual registration exists.
+  manual registration exists. Auto-detection caches are valid only for the
+  same resolved Var, root and retained metadata, including cached misses.
   Returns [buffer-facet base-op] or nil."
   [op-sym]
   (or
@@ -186,19 +187,36 @@
    (when-let [[descriptor base-op] (resolve-op-descriptor op-sym)]
      (when-let [buffer (:buffer descriptor)]
        [buffer base-op]))
-   ;; 2. Auto-detection from walked body (cached)
+   ;; 2. Auto-detection from walked body. The operation symbol is a lookup
+   ;; address, not a definition identity: REPL publication can replace its Var,
+   ;; root or retained body without registering a manual descriptor.
    (when (and (symbol? op-sym) (namespace op-sym))
-     (let [cached (get @auto-buffer-cache op-sym ::miss)]
-       (if (not= cached ::miss)
-         cached
-         (let [result (try
-                        (when-let [v (resolve op-sym)]
-                          (when (and (var? v) (:raster.core/deftm (meta v)))
-                            (when-let [bs (detect-auto-buffer-semantics v)]
-                              [bs op-sym])))
-                        (catch Exception _ nil))]
-           (swap! auto-buffer-cache assoc op-sym result)
-           result))))))
+     (try
+       (let [v (resolve op-sym)]
+         (if-not (var? v)
+           (do (swap! auto-buffer-cache dissoc op-sym) nil)
+           (let [root (.getRawRoot ^clojure.lang.Var v)
+                 metadata (meta v)
+                 cached (get @auto-buffer-cache op-sym)]
+             (if (and (identical? v (:var cached))
+                      (identical? root (:root cached))
+                      (identical? metadata (:metadata cached)))
+               (:result cached)
+               (let [result (when (:raster.core/deftm metadata)
+                              (when-let [bs (detect-auto-buffer-semantics v)]
+                                [bs op-sym]))]
+                 ;; Walking can publish metadata. Do not stamp a result from
+                 ;; an earlier snapshot with evidence observed after analysis.
+                 ;; A changed definition is reanalyzed on the next lookup.
+                 (if (and (identical? root (.getRawRoot ^clojure.lang.Var v))
+                          (identical? metadata (meta v)))
+                   (swap! auto-buffer-cache assoc op-sym
+                          {:var v :root root :metadata metadata :result result})
+                   (swap! auto-buffer-cache dissoc op-sym))
+                 result)))))
+       (catch Exception _
+         (swap! auto-buffer-cache dissoc op-sym)
+         nil)))))
 
 (defn registered-op-descriptors
   "Return the set of ops with any registered descriptor facets."
