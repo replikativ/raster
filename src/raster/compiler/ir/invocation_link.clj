@@ -390,7 +390,7 @@
                    (update-in [:storage token :compiler-values] conj result))))))
        state (:results equation)))))
 
-(defn- lower-for-request
+(defn- lower-in-context
   "Lower one specialized invocation and matching emitted program into a validated LinkPlan.
 
    `evaluate-host` is passed unchanged to EmittedParallelProgramCall for closed, effect-free host
@@ -536,6 +536,12 @@
       (if (nil? caller-options)
         (link/make-with-final-projection request project retained-validation)
         (link/make-with-final-projection request project retained-validation caller-options)))))
+
+(defn- lower-for-request
+  [materialized parallel-program target evaluate-host project retained-validation caller-options]
+  (link/without-validation-context
+   #(lower-in-context materialized parallel-program target evaluate-host project
+                      retained-validation caller-options)))
 
 (defn lower
   "Lower a specialized invocation under independent caller math intent, without driver allocation."
