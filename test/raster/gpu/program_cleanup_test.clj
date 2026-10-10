@@ -5,6 +5,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
+            [raster.gpu.measurement :as measurement]
             [raster.gpu.parallel-program :as program]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.value :as value]))
@@ -22,6 +23,49 @@
     {:session ::session :owns-session? owns? :graph-key :recording :phases [:a :b]
      :allocation-keys [:x :y] :closed? (atom false) :lifetime-lock (Object.)
      :output-leases (atom 0) :execution-state (atom {:value-epoch 0})})))
+
+(deftest linked-runtime-callbacks-cannot-inherit-compiler-proof-scopes
+  (let [scope-vars (mapv (fn [[n s]] (ns-resolve n s))
+                         [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                          ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                          ['raster.compiler.ir.link-plan '*caller-options*]
+                          ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                          ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+        observed (atom [])
+        observe #(mapv var-get scope-vars)
+        record! (fn [stage]
+                  (swap! observed conj [stage (observe)] [stage @(future (observe))]))
+        foreign (fn [f] (with-bindings (zipmap scope-vars (repeat (Object.))) (f)))
+        p (assoc (linked true) :pending-inputs (atom #{}) :plan {:nodes {}}
+                 :output-ready? (atom false) :completed-replays (atom 0) :profile? true)]
+    (add-watch (:execution-state p) ::proof-scopes
+               (fn [& _] (record! :mutation-watch)))
+    (try
+      (with-redefs-fn
+        {#'gpu/replay! (fn [& _] (record! :replay))
+         #'gpu/close-session! (fn [_] (record! :release))
+         (ns-resolve 'raster.gpu.link 'profile-replay!)
+         (fn [_] (record! :profile) {:device-wall-ms 0.1})
+         #'measurement/measure!
+         (fn [sample! & options]
+           (let [options (apply hash-map options)]
+             (when-let [flush! (:flush-fn options)] (flush!))
+             {:sample-ns (sample!)}))}
+        (fn []
+          (foreign #(link/with-unleased-execution! p :test (fn [] (record! :user))))
+          (foreign #(link/run! p))
+          (foreign #(link/profile! p))
+          (foreign #(link/measure! p :before-sample! (fn [] (record! :restore))
+                                  :flush-fn (fn [] (record! :flush))))
+          (foreign #(link/close! p))))
+      (is (= #{:user :replay :profile :restore :flush :release :mutation-watch}
+             (set (map first @observed))))
+      (is (every? #(= (vec (repeat (count scope-vars) nil)) (second %)) @observed)
+          "runtime callbacks, owner watches and inherited futures have no compiler authority")
+      (is (= 3 @(:completed-replays p)))
+      (is (true? @(:closed? p)))
+      (is (zero? @(::link/active-uses p)))
+      (finally (remove-watch (:execution-state p) ::proof-scopes)))))
 
 (deftest partial-program-construction-retains-failed-cleanup
   ;; Stub only compiler validation/staging: this oracle concerns returned runtime handles,
