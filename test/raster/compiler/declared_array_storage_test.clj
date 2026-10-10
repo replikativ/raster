@@ -6,6 +6,10 @@
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.dl.loss :as loss]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
             [raster.hardware-fixture :as hardware-fixture]
@@ -38,6 +42,57 @@
                 (remove #(= :scalar (:kind %)) (:abi artifact))))
     (is (= :double (:dtype (first (filter #(= 'coefficient (:name %))
                                         (:abi artifact))))))))
+
+(deftest float-loss-seed-retains-declared-double-scale-on-both-public-verticals
+  (let [eq (equation-first/compile #'loss/mse-grad {:target target :dtype :float})
+        resident (pipeline/compile-gpu-program #'loss/mse-grad target :dtype :float)
+        artifacts (concat (:kernels eq) (map :artifact (:steps resident)))]
+    (is (= 2 (count artifacts)))
+    (doseq [artifact artifacts]
+      (let [scale (first (filter #(= 'scale (:name %)) (:abi artifact)))]
+        (is (= :double (:dtype scale)))
+        (is (= :double (:kernel-dtype scale)))
+        (is (str/includes? (:source artifact) "double scale"))))
+    (is (= :double (get-in eq [:options :scalar-types 'scale])))
+    (is (seq (:kernels eq)))
+    (is (seq (:steps resident)))))
+
+(deftest chain-host-binding-uses-emitted-scalar-abi-not-wrapper-tags
+  (let [compilation (equation-first/compile #'loss/mse-grad {:target target :dtype :float})
+        artifact (first (:kernels compilation))
+        bind-scalars (deref (ns-resolve 'raster.gpu.core 'typed-scalars-for))
+        scale (/ 2.0 1280)
+        bound (bind-scalars #'loss/mse-grad artifact {'scale scale} :float)]
+    (is (not= scale (double (float scale))))
+    (is (= [{:type :double :value scale}] bound))
+    (is (= :chain-scalar-abi
+           (try (bind-scalars #'loss/mse-grad (assoc artifact :abi []) {'scale scale} :float)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest chain-physical-scalar-conversion-is-checked-before-preparation
+  (let [artifact (kart/make
+                  {:kernel-name "scalar_binding" :target :opencl-c
+                   :source "__kernel void scalar_binding(__global float* out, int s, long _n_bound) { out[0] = (float)s; }"
+                   :abi [(kabi/slot 'out :output :float :role :result)
+                         (kabi/slot 's :scalar :long :kernel-dtype :int :role :parameter)
+                         (kabi/slot '_n_bound :scalar :long :role :bound)]
+                   :arguments '[out s n] :attributes {:scalar-params '[s]}
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+        bind-scalars (deref (ns-resolve 'raster.gpu.core 'typed-scalars-for))
+        prepare (deref (ns-resolve 'raster.gpu.core 'preparation-call))
+        runtime-resolver (ns-resolve 'raster.gpu.core 'rt-resolve)
+        typed (bind-scalars #'loss/mse-grad artifact {'s (long 7)} :float)]
+    (is (= [{:type :int :value (int 7)}] typed))
+    (with-redefs-fn
+      {runtime-resolver (fn [& _] (fn [_ value] [value]))}
+      #(let [call (prepare target artifact [:mock-output] typed 1)]
+         (is (= [:mock-output {:type :int :value (int 7)} {:type :long :value (long 1)}]
+                (:arguments call)))))
+    (is (thrown? ArithmeticException
+                 (bind-scalars #'loss/mse-grad artifact {'s (inc (long Integer/MAX_VALUE))} :float)))
+    (is (= :kernel-executable-integral-scalar
+           (try (bind-scalars #'loss/mse-grad artifact {'s 1.5} :float)
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
 (deftest projected-scalar-reduction-retains-its-typed-boundary
   ;; Final parameter projection follows existing SSA aliases to the carried source
@@ -72,7 +127,7 @@
     (is (= (opencl-pass/derive-param-types params tags :double)
            (opencl-pass/derive-param-types params tags :double
                                           {:preserve-declared-array-storage? false})))
-    (is (= {:scalar-types {'n :long 'scale :float}
+    (is (= {:scalar-types {'n :long 'scale :double}
             :array-types {'weights :float 'state :double}}
            (opencl-pass/derive-param-types params tags :float policy)))
     (is (= {:scalar-types {'n :long 'scale :double}

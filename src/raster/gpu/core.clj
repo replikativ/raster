@@ -2703,26 +2703,28 @@
 ;; ----------------------------------------------------------------
 
 (defn- typed-scalars-for
-  "Build the ordered, typed scalar arg list for a chain step from the kernel's :scalar-params and
-   the deftm's DECLARED scalar types — so hand-wiring can't mis-order or mis-type. :scalar-params
+  "Build the ordered, typed scalar arg list for a chain step from the kernel's actual ABI.
+   :scalar-params
    EXCLUDES the par bound (it becomes the work-item count _n_bound, passed separately as :n), and
-   the declared type is what the kernel actually emits (e.g. a Double `scale` is emitted float at
-   :float dtype). scalars = {param-name → value} from the caller, in any order. Mirrors
-   compile-gpu-program's scalar typing (same derive-param-types) — not a special case."
-  [op ki scalars dtype]
+   resolved scalar tags retain their width independently of tensor storage dtype.
+   scalars = {param-name → value} from the caller, in any order. Do not re-derive types from
+   a parametric wrapper or default a missing scalar fact to Float."
+  [op ki scalars _dtype]
   (let [v (or (resolve-deftm-var op) op)
         scalar-params (or (:scalar-params ki) (get-in ki [:attributes :scalar-params]))
-        types (:scalar-types (opencl-pass/derive-param-types
-                              (:raster.core/deftm-params (meta v))
-                              (:raster.core/deftm-tags (meta v)) dtype))]
+        slots (into {} (keep (fn [slot]
+                              (when (= :scalar (:kind slot))
+                                [(:name slot) slot]))) (:abi ki))]
     (mapv (fn [sp]
-            (let [t (get types sp :float)
+            (let [slot (or (get slots sp)
+                        (throw (ex-info "chain scalar has no kernel ABI dtype"
+                                        {:reason :chain-scalar-abi :scalar sp :abi (:abi ki)})))
                   raw (if (contains? scalars (name sp)) (get scalars (name sp))
                           (if (contains? scalars sp) (get scalars sp)
                               (throw (ex-info (str "chain step for " (:name (meta v))
                                                    " missing scalar: " sp)
                                               {:need scalar-params :have (keys scalars)}))))]
-              {:type t :value (case t :int (int raw) :long (long raw) :double (double raw) (float raw))}))
+              (kexec/physical-runtime-scalar slot raw)))
           scalar-params)))
 
 (def ^:private valid-chain-roles

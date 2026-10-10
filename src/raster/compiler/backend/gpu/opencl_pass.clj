@@ -112,15 +112,14 @@
     :else nil))
 
 (defn binder-scalar-types
-  "Walker-stamped scalar dtypes of every `let`/`loop`/`dotimes` binder in `form`, projected the
-   way `derive-param-types` projects declared params: integral tags keep their width, floating
-   tags take the kernel dtype. Untagged integer-arithmetic locals (which the fixpoint census
+  "Walker-stamped scalar dtypes of every `let`/`loop`/`dotimes` binder in `form`. Resolved
+   scalar tags retain their width independently of tensor storage dtype, as in
+   `derive-param-types`. Untagged integer-arithmetic locals (which the fixpoint census
    exempts from tags) are typed from their operands' declared dtypes. A hoisted host scalar that
    a kernel captures therefore has the same declared dtype on the host and in the kernel ABI; no
    emitter guesses it from its name."
-  [form kernel-dtype declared]
-  (let [kernel-dtype (dtype/canon (or kernel-dtype :float))
-        found (atom (or declared {}))]
+  [form _kernel-dtype declared]
+  (let [found (atom (or declared {}))]
     (walk/prewalk
      (fn [x]
        (when (and (seq? x)
@@ -133,8 +132,7 @@
              (when-let [inferred (or (some-> (types/sym-type-tag binder) dtype/dtype-for-scalar-tag)
                                      (counted-loop-index-dtype x binder init)
                                      (when (integral-expression? init @found) :long))]
-               (swap! found assoc binder
-                      (if (dtype/fp-dtype? inferred) kernel-dtype inferred))))))
+               (swap! found assoc binder inferred)))))
        x)
      form)
     (apply dissoc @found (keys (or declared {})))))
@@ -142,8 +140,8 @@
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
   (the typed-dispatch system already knows these — we read them instead of letting the emitter
-  guess from parameter names). Scalar params retain their declared integral width; floating
-  scalars specialize to the selected kernel dtype. Physical narrowing belongs to a scheduled
+  guess from parameter names). Scalar params retain their resolved declared width, including
+  Float and Double independently of the selected tensor dtype. Physical narrowing belongs to a scheduled
   ABI conversion with a range check, not source type derivation.
   Array params: the tag's element dtype, with float-family (float/double)
   mapped to a floating-point KERNEL dtype (a single-precision kernel reads float buffers regardless of a
@@ -160,8 +158,7 @@
                                     (case (dtype/dtype-for-scalar-tag t)
                                       :long [p :long]
                                       :int [p :int]
-                                      (:double :float) [p (if (dtype/fp-dtype? dtype)
-                                                           dtype (dtype/dtype-for-scalar-tag t))]
+                                      (:double :float) [p (dtype/dtype-for-scalar-tag t)]
                                       nil))
                                   (map vector params tags)))
      :array-types (into {} (keep (fn [[p t]]
