@@ -115,6 +115,23 @@
                  (assoc-in certified [:plan :device-plans :gpu-1 :target] :other-physical)) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
+(deftest explicit-physical-placement-cannot-have-a-nil-target
+  (let [base (training-plan)
+        certified (distributed/certify base)
+        implicit (assoc base :device-plans {:gpu-0 {} :gpu-1 {}})]
+    (is (= (distributed/simulate base) (distributed/simulate implicit))
+        "absent placement retains the logical worker's own compute lane")
+    (doseq [worker [:gpu-0 :gpu-1]
+            :let [candidate (assoc-in implicit [:device-plans worker :target] nil)]
+            check [#(distributed/validate! candidate)
+                   #(distributed/simulate candidate)
+                   #(distributed/certify candidate)
+                   #(distributed/verify! (assoc certified :plan candidate))]]
+      (is (= :distributed-compute-physical-target
+             (try (check) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "an explicit missing physical identity cannot become a resource lane"))))
+
 (deftest topology-revalidates-modified-physical-facts
   (let [base (training-plan)
         certified (distributed/certify base)]
