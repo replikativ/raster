@@ -2458,39 +2458,44 @@
               (cond
                 (device-buffer? value) (:n-elements ^DeviceBuffer value)
                 (instance? MemorySegment value)
-                (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))))
-        ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
-         {:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
-         cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
-     (cleanup/construct!
-      :kernel #(create-kernel-fresh module entry-name)
-      (fn [kernel]
-        (when async?
-          (ze-call! "zeCommandListHostSynchronize" @h-zeCommandListHostSynchronize
-                    [cmd-list (long -1)]))
-        (destroy-kernel! kernel))
-      (fn [kernel owner]
-        (let [kernel-handle (:handle kernel)
-              native-args (mapv (fn [[slot value]]
-                                  (if (= :scalar (:kind slot))
-                                    value
-                                    (if (device-buffer? value)
-                                      (:segment ^DeviceBuffer value)
-                                      value)))
-                                pairs)
-              bound (bind-kernel! kernel-handle workgroup-size native-args cmd-list)
-              ^MemorySegment gc (:gc-seg bound)]
-          (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
-            (.set gc I32 (long (* axis 4)) (int count)))
-          {:bound bound
-           ::cleanup/owner owner
-          ;; Geometry is already baked into gc-seg. record-graph! must not reinterpret X specially.
-           :group-count nil
-           :kernel-name kernel-name
-           :async? (boolean async?)
-           :kernel-call call
-           :binding-plan plan}))
-      adopt-cleanup!))))
+                (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))))]
+     ;; Keep the validated registration current through independent kernel creation.
+     ;; Loading by name outside this monitor could acquire a replacement's module.
+     (locking kernel-registry
+       (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+       ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
+       (let [{:keys [module entry-name]} (ensure-kernel-loaded! kernel-name)
+             cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
+         (cleanup/with-registry-use kernel-registry
+           (cleanup/construct!
+            :kernel #(create-kernel-fresh module entry-name)
+            (fn [kernel]
+              (when async?
+                (ze-call! "zeCommandListHostSynchronize" @h-zeCommandListHostSynchronize
+                          [cmd-list (long -1)]))
+              (destroy-kernel! kernel))
+            (fn [kernel owner]
+              (let [kernel-handle (:handle kernel)
+                    native-args (mapv (fn [[slot value]]
+                                        (if (= :scalar (:kind slot))
+                                          value
+                                          (if (device-buffer? value)
+                                            (:segment ^DeviceBuffer value)
+                                            value)))
+                                      pairs)
+                    bound (bind-kernel! kernel-handle workgroup-size native-args cmd-list)
+                    ^MemorySegment gc (:gc-seg bound)]
+                (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
+                  (.set gc I32 (long (* axis 4)) (int count)))
+                {:bound bound
+                 ::cleanup/owner owner
+                 ;; Geometry is already baked into gc-seg; do not reinterpret X specially.
+                 :group-count nil
+                 :kernel-name kernel-name
+                 :async? (boolean async?)
+                 :kernel-call call
+                 :binding-plan plan}))
+            adopt-cleanup!)))))))
 
 (defn launch-registered-bound!
   "Dispatch a pre-bound kernel. A KernelCall has its complete geometry baked into :gc-seg;

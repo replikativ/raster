@@ -11,6 +11,35 @@
 
 (defn- error-of [f] (try (f) nil (catch Throwable error error)))
 
+(deftest both-binders-reject-registration-replacement-before-native-loading
+  (doseq [[namespace bind!] [['raster.gpu.ze-runtime ze/bind-kernel-call]
+                           ['raster.gpu.ocl-runtime ocl/bind-kernel-call]]]
+    (let [v #(ns-resolve namespace %)
+          artifact (probe/emit-artifact :float :opencl-portable)
+          kernel-call (call/make artifact [(MemorySegment/ofArray (float-array 2))])
+          registry (atom {(:kernel-name artifact) artifact})
+          replacement (update artifact :source str "\n// another module generation")
+          loads (atom 0)
+          creates (atom 0)
+          validate! call/validate-registered!]
+      (with-redefs-fn
+        {(v 'kernel-registry) registry
+         #'call/validate-registered!
+         (fn [call registered]
+           (validate! call registered)
+           ;; Deterministic interleaving: replacement after validation but before load.
+           (swap! registry assoc (:kernel-name artifact) replacement))
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! loads inc) {})
+         (v 'create-kernel-fresh) (fn [& _]
+                                  (swap! creates inc)
+                                  (throw (ex-info "unexpected native acquisition" {})))}
+        #(do
+           (is (= :registry-generation-changed
+                  (:reason (ex-data (error-of (fn [] (bind! kernel-call)))))))
+           (is (zero? @loads))
+           (is (zero? @creates))
+           (is (identical? replacement (get @registry (:kernel-name artifact)))))))))
+
 (deftest ze-recording-reserves-ownership-before-every-native-acquisition
   (doseq [failure-point [nil "zeCommandQueueCreate" "zeCommandListCreate"
                          "zeEventPoolCreate" "zeEventCreate"
