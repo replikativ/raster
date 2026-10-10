@@ -69,6 +69,49 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar precondition failed"
                             (graph-call/temporary-specs graph {'n {:type :int :value 32}}))))))
 
+(deftest temporary-storage-projection-shares-runtime-extents
+  (let [graph (emitted-graph)
+        scalars {'n {:type :int :value 1025}}
+        storage (graph-call/temporary-storage-plan graph scalars)
+        specs (graph-call/temporary-specs graph scalars)]
+    (is (= :graph-temporaries-until-unbind (:model storage)))
+    (is (= (set (map :id (:temporaries graph))) (set (keys (:allocations storage)))))
+    (is (= specs (into {} (map (fn [[id {:keys [dtype elements]}]]
+                                [id [dtype elements nil]])) (:allocations storage))))
+    (is (= 20 (:resident-bytes storage)))
+    (is (= #{20} (set (map :byte-size (vals (:allocations storage))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (graph-call/temporary-storage-plan graph {'n {:type :int :value -1}})))))
+
+(deftest temporary-byte-extents-are-checked-without-overflow
+  (let [graph (emitted-graph) scalars {'n {:type :int :value 1025}}
+        size-graph (fn [n] (update graph :temporaries
+                                  #(mapv (fn [buffer] (assoc buffer :elements n)) %)))]
+    (is (zero? (:resident-bytes (graph-call/temporary-storage-plan (size-graph 0) scalars))))
+    (is (= (*' 4 (quot Long/MAX_VALUE 4))
+           (:resident-bytes (graph-call/temporary-storage-plan
+                             (size-graph (quot Long/MAX_VALUE 4)) scalars))))
+    (doseq [n [(inc (quot Long/MAX_VALUE 4)) Long/MAX_VALUE]]
+      (doseq [size-fn [graph-call/temporary-storage-plan graph-call/temporary-specs]]
+        (is (= :kernel-graph-temporary-bytes
+               (try (size-fn (size-graph n) scalars) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (doseq [size-fn [graph-call/temporary-storage-plan graph-call/temporary-specs]]
+      (is (thrown? IllegalArgumentException
+                   (size-fn (size-graph (inc (bigint Long/MAX_VALUE))) scalars))
+          "the canonical extent resolver already rejects integers outside signed 64-bit"))
+    (let [large (size-graph (quot Long/MAX_VALUE 4))
+          additional (assoc (first (:temporaries large)) :id 'reserved-scratch)
+          both (update large :temporaries conj additional)
+          storage (graph-call/temporary-storage-plan both scalars)]
+      (is (= 2 (count (:allocations storage))))
+      (is (= (*' 8 (quot Long/MAX_VALUE 4)) (:resident-bytes storage)))
+      (is (> (:resident-bytes storage) Long/MAX_VALUE)
+          "aggregate requirements remain exact even when each allocation fits"))
+    (is (= :kernel-graph-temporary-extent
+           (try (graph-call/temporary-storage-plan (size-graph -1) scalars) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest graph-preconditions-compare-symbolic-capacities-before-temporary-sizing
   (let [required 'n
         capacity (launch/product 4 (launch/floor-div 'n 4))

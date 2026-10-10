@@ -5,6 +5,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link]))
@@ -111,6 +112,63 @@
     (is (= #{:out} (get-in (link/initialization-contract plan) [:writes])))
     (is (= {'x :input 'w :constant 'y :output}
            (link/instance-roles plan direct)))))
+
+(defn- scratch-graph []
+  (-> (emitted-graph)
+      (assoc-in [:nodes 0 :operation :kernel-name] "link_axpy_scratch")
+      (update-in [:nodes 0 :operation :source]
+                 #(.replace ^String % "link_axpy" "link_axpy_scratch"))
+      (assoc :effects (:effects kernel) :attributes {:strategy :scratch})
+      (assoc :temporaries [(kgraph/buffer 'private-scratch :half
+                                         (launch/product 3 'n) :device :temporary)])))
+
+(deftest linked-scratch-bounds-include-nonselected-dispatch-alternatives
+  (let [choice (dispatch/make {:id "scratch-choice" :alternatives [kernel (scratch-graph)]
+                               :default-strategy :reference
+                               :selector {:kind :fixed-strategy :strategy :reference}})
+        plan (assoc-in (valid-plan) [:instances 0 :descriptor :steps 0 :dispatch] choice)
+        storage (link/temporary-storage-plan plan)]
+    (is (= :prepared-link-plan-graph-temporaries (:model storage)))
+    (is (= :ze:0 (:target storage)))
+    (is (= 96 (:resident-bytes storage)) "16 elements times 3 times Half storage width")
+    (is (= [96 0] (mapv :resident-bytes (:bindings storage))))
+    (is (= :all-alternatives-upper-bound (get-in storage [:bindings 0 :mode])))
+    (is (= [0 96] (mapv :resident-bytes (get-in storage [:bindings 0 :alternatives]))))
+    (is (= 48 (get-in storage [:bindings 0 :alternatives 1 :allocations 'private-scratch :elements])))
+    (is (= 0 (:resident-bytes (link/temporary-storage-plan (valid-plan)))))
+    (is (thrown? clojure.lang.ExceptionInfo (link/temporary-storage-plan {})))))
+
+(deftest separately-prepared-graphs-do-not-deduplicate-their-private-scratch
+  (let [graph (assoc-in (scratch-graph) [:temporaries 0 :elements]
+                        (launch/product 3 (list 'extent 'x)))
+        direct (fn [id] (link/graph-instance {:id id :graph graph
+                                             :bindings {'x :x 'w :w 'y :out}
+                                             :scalar-values {'n {:type :long :value 16}}}))
+        plan (link/make {:id :two-scans :target :ze:0
+                         :nodes [(n :x :input (float-array 16))
+                                 (n :w :constant (float-array 16)) (n :out :output)]
+                         :instances [(direct :first) (direct :second)] :outputs [:out]})
+        storage (link/temporary-storage-plan plan)]
+    (is (= 192 (:resident-bytes storage)))
+    (is (= [:first :second] (mapv :instance (:bindings storage))))
+    (is (= [96 96] (mapv :resident-bytes (:bindings storage))))))
+
+(deftest unresolved-alternative-scratch-is-not-reported-as-zero
+  (let [guarded (assoc-in (scratch-graph) [:nodes 0 :operation :preconditions]
+                         [{:expression 'n :op :>= :value 32}])
+        choice (dispatch/make {:id "guarded-scratch" :alternatives [kernel guarded]
+                               :default-strategy :reference
+                               :selector {:kind :fixed-strategy :strategy :reference}})
+        plan (assoc-in (valid-plan) [:instances 0 :descriptor :steps 0 :dispatch] choice)]
+    (is (link/link-plan? (link/validate! plan)))
+    (is (thrown? clojure.lang.ExceptionInfo (link/temporary-storage-plan plan)))))
+
+(deftest descriptor-scratch-does-not-invent-an-unbound-physical-extent
+  (let [graph (assoc-in (scratch-graph) [:temporaries 0 :elements]
+                        (launch/product 3 (list 'extent 'x)))
+        plan (assoc-in (valid-plan) [:instances 0 :descriptor :steps 0 :artifact] graph)]
+    (is (link/link-plan? (link/validate! plan)))
+    (is (thrown? clojure.lang.ExceptionInfo (link/temporary-storage-plan plan)))))
 
 (deftest direct-graph-instance-rejects-incomplete-and-mismatched-boundaries
   (let [graph (emitted-graph)

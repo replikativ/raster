@@ -1,5 +1,22 @@
 # Compiler unification campaign
 
+### October 9 physical compute lanes follow explicit worker placement
+
+A reproduced simulator gap gave independent compute lanes to logical workers
+explicitly placed on the same physical target. Compute steps and transfer
+`:serialized-on` claims now share one nonrecursive worker-to-target projection.
+Claims resolving to the same lane are deduplicated. Unplaced workers and
+topology-only relay identities retain their original lanes; distinct physical
+targets remain independent. Route-resource certificate witnesses use the same
+projection and reject placement changes even when makespan is unchanged.
+
+Logical compute totals, transfer bytes and per-worker peak-memory reports remain
+unchanged. `:physical-compute-ns` additionally reports accumulated compute service
+by physical target, not transfer-inclusive busy time. Physical memory-capacity
+aggregation, link-sharing discovery and actual asynchronous distributed execution
+remain separate obligations. This changes planning resource accounting, not the
+surface numerical program, kernel emission or source arithmetic.
+
 ### October 9 explicit empirical route-cost simulation
 
 The existing simulator now accepts optional live route context, supplied profile
@@ -3910,3 +3927,122 @@ are not compiler scalar dtypes, even though Half uses JVM short-array storage.
 No surface dtype was added or removed. The focused hardware, roofline and
 calibration-admission suites pass 18 tests / 154 assertions in the warm REPL;
 full CI and exact-head review remain separate gates.
+
+### Shared physical resident-root accounting
+
+`distributed-plan/resident-storage-plan` now owns the finite distributed runtime's
+existing root-pool projection. Runtime allocation and optional simulator capacity
+reporting consume the same independently validated bindings, exact root contracts
+and overflow-safe physical budgets. Repeated calls share identical allocation
+roots; co-located workers retain separate shard buffers and can share private
+weights. Remapped workers require an explicit aggregate target budget. Distinct
+shards still cannot silently alias storage; a test fixture attempting that was
+rejected and corrected without weakening admission.
+
+This models owned LinkPlan roots retained until owner close, not total physical
+peak memory. KernelGraph scratch, backend temporaries, host staging, driver
+allocations, available VRAM and lifetime reuse remain outside its scope. Default
+analytical simulation and certificates are unchanged. The helper may retain
+source-bearing LinkPlans and is not a portable report or allocation authority.
+
+Focused planner/storage/cost/compute checks pass 71 tests / 552 assertions.
+Existing actual AD -> all-reduce -> SGD checks pass on OpenCL and Level Zero
+(2 tests / 154 assertions), including runtime-versus-simulator budget equality.
+These are warm-REPL results; fresh CI and independent exact-head review remain
+separate gates. The original real-model training numerical acceptance remains
+open and is not replaced by these small distributed fixtures.
+
+### Canonical graph-owned temporary storage requirements
+
+`kernel-graph-call/temporary-storage-plan` now projects declared graph scratch
+through the existing graph/scalar preflight and extent algebra. Runtime
+`temporary-specs` delegates to this projection, rather than having a separate
+planning evaluator. Each byte extent is checked against signed 64-bit storage
+before allocation; aggregate requirements use exact arithmetic. Existing
+out-of-range element values still fail in the canonical extent resolver.
+
+The model counts all declared temporaries until graph unbind. It excludes
+external roots, backend temporaries, host staging, alignment/driver overhead and
+available device memory. It does not infer live-range reuse or grant allocation
+authority. Distributed root budgets do not yet include these requirements;
+binding/dispatch lifetime-aware aggregation is the remaining integration work.
+
+Focused graph-call, GEMM and SegOp checks pass 87 tests / 1,605 assertions.
+Existing native inclusive-scan tests pass on OpenCL and Level Zero (2 tests /
+14 assertions), comparing planned allocation identities/byte sizes/totals with
+actual private buffers as well as numerical output. These are warm-REPL checks;
+fresh CI and independent exact-head review remain separate gates.
+
+### One compiler-owned stage-once binding plan
+
+The bounded graph/carry-variant calculation now lives in
+`emitted-parallel-program-call/preparation-plan`; the runtime delegates to it.
+This is the existing staging algorithm, not a new loop interpretation: zero-trip
+loops bind no body variant, preserved initial carries plus parity rotation need
+at most three body variants, and changing induction scalars still explicitly
+decline stage-once preparation. Program-wide shape scalars and local physical
+scalar overrides retain their existing merge order. Pure planning exposes the
+same graph/scalar/buffer tuples that runtime binding consumes.
+
+Runtime preparation validates the call once through this entry before acquiring
+resources. Stage-once declines now precede invalid resolver/executor diagnostics;
+accepted program arithmetic and surface semantics are unchanged. Existing
+cleanup ownership and reverse rollback remain runtime responsibilities.
+
+This supplies a shared input to upcoming memory accounting: local prepared
+variants coexist, whereas the current synchronous distributed runner releases
+each local LinkPlan after its compute action. A physical scratch peak must not
+sum all distributed actions or count only a default dispatch alternative.
+No distributed scratch-capacity admission is enabled by this extraction.
+
+Focused cleanup and staging checks pass 35 tests / 233 assertions, including
+compiler-plan versus runtime-bind comparisons and unchanged rollback behavior.
+Actual co-located AD/all-reduce/SGD checks pass on OpenCL and Level Zero (2 tests /
+154 assertions). Warm-REPL checks do not replace fresh CI or the original
+real-model training numerical acceptance, which remains open.
+
+### Dispatch-aware linked scratch and serial physical budgets
+
+`LinkPlan/temporary-storage-plan` uses the same descriptor ABI binding facts,
+linked physical extent facts, graph sizing and program staging as execution.
+Separately prepared variants retain separate scratch even when their graph is
+identical. Descriptor steps conservatively take the maximum across all declared
+alternatives, not only the preferred/default schedule. Inapplicable or unresolved
+alternative sizing refuses this optional report rather than silently contributing
+zero; it does not change ordinary dispatch admission or claim exact selection.
+
+Optional `:include-graph-temporaries? true` joins these requirements to the shared
+DistributedPlan resident-root accounting, simulator report and runtime admission.
+All roots remain resident, while the current synchronous runner releases each
+local executable after its compute action: physical root bytes plus the maximum
+local prepared scratch requirement is checked against the declared capacity.
+The default remains the explicitly roots-only budget; no surface arithmetic or
+ordinary execution behavior changes. Backend temporaries, host staging,
+alignment/driver overhead and available VRAM remain excluded, so this is still
+not a complete total-device memory proof or an asynchronous lifetime model.
+
+Focused LinkPlan/distributed checks pass 94 tests / 677 assertions, with the
+structured program check adding 1 test / 11 assertions. They cover a nonselected
+scratch alternative, Half storage width, physical extent binding, private scratch
+duplication, the three coexisting 512-byte loop variants, and serial max rather
+than scratch sum. Native AD/all-reduce/SGD checks with the stronger optional
+budget pass on OpenCL and Level Zero (2 tests / 154 assertions). These are
+warm-REPL results; fresh CI and exact-head review remain separate gates. The
+opt-in projection repeats structural validation; no preparation-time or kernel
+performance improvement is claimed. The original real-model gate remains open.
+
+Review caught a planner/runtime extent-environment mismatch for descriptor
+scratch. The projection now preserves the current binder distinction: descriptor
+scratch resolves only actual ABI scalars, while direct graphs/programs receive
+linked view extents. A regression rejects invented descriptor `(extent x)`
+values; the Half descriptor test sizes from its real `n` scalar, and the direct
+graph test independently exercises physical view extents. Generalizing this
+runtime boundary remains a separate task, not an inferred precision/shape fact.
+
+Hardware-free runtime admission regressions additionally exercise the public
+`instantiate!` entry with initialized inputs. Insufficient root or opt-in scratch
+budgets reject before session creation, allocation or upload; exact-fit budgets
+reach the deliberately stopped session boundary. Default roots-only behavior and
+malformed scratch options are checked independently. The admission and storage
+planner namespaces pass together (9 tests / 47 assertions). These boundary tests
+do not execute their synthetic kernel or establish total physical memory safety.

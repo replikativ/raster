@@ -141,12 +141,13 @@
    Co-located workers declare :target in each device-plan, use :transport :resident-copy, and
    supply an aggregate physical :device-capacities budget (bytes) for remapped targets. Local
    copies still execute; logical topology predictions are not physical runtime cost evidence.
+   Budgets cover declared owned LinkPlan roots. Optional :include-graph-temporaries? includes
+   conservative graph scratch bounds for this serial runner, not total driver memory.
    Source objects must remain valid and stable through this synchronous initialization."
   ([plan] (instantiate! plan {}))
-  ([plan {:keys [transport max-staging-bytes device-capacities]
-          :or {max-staging-bytes 1048576 device-capacities {}}}]
+  ([plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
+          :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false}}]
    (let [ready (distributed/check-readiness plan)
-         {:keys [bindings]} (distributed/compute-bindings plan)
          schedule (schedule plan)
          _ (when-not (contains? #{nil :host-staged :resident-copy} transport)
              (throw (ex-info "unsupported distributed transport"
@@ -163,43 +164,10 @@
                             (get-in action [:writes 0 :allocation :device]))
                  (throw (ex-info "resident-copy requires co-located physical endpoints"
                                  {:reason :distributed-runtime-resident-copy :step (:id action)})))))
-         _ (when-not (map? device-capacities)
-             (throw (ex-info "physical device capacities must be a map"
-                             {:reason :distributed-runtime-physical-budget})))
-         remapped-targets (into #{} (keep (fn [[worker local]]
-                                            (let [target (get local :target worker)]
-                                              (when (not= worker target) target)))) (:device-plans plan))
+         {:keys [bindings specs allocation-budgets]}
+         (distributed/resident-storage-plan plan {:device-capacities device-capacities
+                                                 :include-graph-temporaries? include-graph-temporaries?})
          projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %)))
-         specs (reduce
-                (fn [specs [_ {:keys [link-plan]}]]
-                  (reduce
-                   (fn [specs [_ {:keys [view]}]]
-                     (let [a (:allocation view) device (:device a) id (:id a) dt (dtype/canon (:dtype view))
-                           bytes (dtype/bytes-of dt) key [device id]]
-                       (when-not (and (= :owned (:ownership a)) (= device (:target link-plan))
-                                      (zero? (mod (:byte-size a) bytes)))
-                         (throw (ex-info "distributed owner needs explicit owned device storage"
-                                         {:reason :distributed-runtime-allocation :allocation a})))
-                       (when-let [previous (get specs key)]
-                         (when-not (= previous {:allocation a :dtype dt})
-                           (throw (ex-info "one resident allocation needs one exact storage contract"
-                                           {:reason :distributed-runtime-storage-contract :allocation key
-                                            :previous previous :actual {:allocation a :dtype dt}}))))
-                       (assoc specs key {:allocation a :dtype dt})))
-                   specs (:nodes link-plan))) {} bindings)
-         allocation-budgets
-         (into {} (for [[device entries] (group-by (comp first key) specs)]
-             (let [bytes (reduce +' 0 (map (comp :byte-size :allocation val) entries))
-                   capacity (get device-capacities device
-                                 (when-not (contains? remapped-targets device)
-                                   (get-in plan [:topology :devices device :memory-capacity-bytes])))]
-               (when-not (and (integer? capacity) (<= 0 capacity Long/MAX_VALUE))
-                 (throw (ex-info "remapped devices require an explicit aggregate physical budget"
-                                 {:reason :distributed-runtime-physical-budget :device device :capacity capacity})))
-               (when (> bytes capacity)
-                 (throw (ex-info "resident allocation pool exceeds the declared device budget"
-                                 {:reason :distributed-runtime-memory :device device :bytes bytes :capacity capacity})))
-               [device {:capacity-bytes capacity :resident-bytes bytes}])))
          _ (doseq [[index action] (map-indexed vector (:actions ready))
                    :when (contains? (set (:outputs plan)) (:id action))
                    :let [local (get-in bindings [(:id action) :link-plan])]
