@@ -29,6 +29,12 @@
 
 (defvalue Dual (All [T]) [v :- T, partials :- (Array T)])
 
+(defn ^:no-doc identity-double-conversion
+  "Carrier adapter for a statically certified Double-to-Double source cast.
+   This is not a rounding or straight-through derivative rule."
+  [value]
+  (if (instance? Dual value) value (double value)))
+
 (def ^:const DEFAULT_CHUNK 8)
 
 (deftm dual

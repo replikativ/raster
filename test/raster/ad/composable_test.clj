@@ -17,6 +17,76 @@
 (r/deftm quad-loss [x :- Double, y :- Double] :- Double
   (raster.numeric/+ (raster.numeric/* x x) (raster.numeric/* y y)))
 
+(r/deftm forward-rounded-primal [x :- Double] :- Double (double (float x)))
+(r/deftm forward-integral-primal [x :- Double] :- Double (double (long x)))
+(r/deftm forward-qualified-rounded-primal [x :- Double] :- Double
+  (clojure.core/double (clojure.core/float x)))
+(r/deftm forward-double-identity [x :- Double] :- Double (double x))
+(r/deftm forward-aliased-rounded-primal [x :- Double] :- Double
+  (let [alias x] (double (float alias))))
+(r/deftm forward-inactive-rounded-primal [x :- Double n :- Long] :- Double
+  (let [rounded (float n)]
+    (raster.numeric/+ (raster.numeric/* x x) (double rounded))))
+(r/deftm forward-inactive-checked-primal [x :- Double n :- Long] :- Double
+  (let [narrowed (int n)]
+    (raster.numeric/+ (raster.numeric/* x x) (double narrowed))))
+(r/deftm forward-shadowed-primal [x :- Double n :- Long] :- Double
+  (let [x n] (double x)))
+(r/deftm forward-conditional-rounded-primal [x :- Double] :- Double
+  (if (> x 0.0) (double (float x)) x))
+(r/deftm forward-carried-rounded-primal [x :- Double] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i 2) (recur (inc i) (double (float x))) acc)))
+(r/deftm forward-transferred-carry-primal [x :- Double] :- Double
+  (loop [a x b 0.0 i 0]
+    (if (< i 2) (recur a a (inc i)) (double (float b)))))
+
+(deftest forward-conversions-retain-primal-semantics
+  (testing "active rounding and discrete conversions decline before execution"
+    (doseq [v [#'forward-rounded-primal #'forward-integral-primal
+               #'forward-qualified-rounded-primal #'forward-aliased-rounded-primal
+               #'forward-conditional-rounded-primal #'forward-carried-rounded-primal
+               #'forward-transferred-carry-primal]]
+      (let [coverage (rev/forward-coverage v)]
+        (is (false? (:admissible? coverage)))
+        (is (seq (:conversion-declines coverage)))
+        (is (thrown? clojure.lang.ExceptionInfo (rev/value+grad v :mode :forward)))))
+    (is (= 16777216.0 (forward-rounded-primal 16777217.0)))
+    (is (= 3.0 (forward-integral-primal 3.7))))
+  (testing "auto excludes the unsupported Dual interpretation and retains source primals"
+    (is (= (forward-rounded-primal 16777217.0)
+           (first ((rev/value+grad #'forward-rounded-primal :mode :auto) 16777217.0))))
+    (is (= (forward-integral-primal 3.7)
+           (first ((rev/value+grad #'forward-integral-primal :mode :auto) 3.7)))))
+  (testing "certified Double identity retains primal and partial"
+    (is (= [3.7 1.0] ((rev/value+grad #'forward-double-identity :mode :forward) 3.7))))
+  (testing "inactive Float rounding is real, not erased alongside active arithmetic"
+    (let [vg (rev/value+grad #'forward-inactive-rounded-primal :mode :forward)]
+      (is (= [(forward-inactive-rounded-primal 3.0 16777217) 6.0 nil]
+             (vg 3.0 16777217)))))
+  (testing "inactive checked narrowing retains its failure"
+    (let [vg (rev/value+grad #'forward-inactive-checked-primal :mode :forward)]
+      (is (= [12.0 6.0 nil] (vg 3.0 3)))
+      (is (thrown? ArithmeticException (forward-inactive-checked-primal 3.0 2147483648)))
+      (is (thrown? ArithmeticException (vg 3.0 2147483648)))))
+  (testing "lexical shadowing does not inherit the outer seeded carrier"
+    (let [vg (rev/value+grad #'forward-shadowed-primal :mode :forward)]
+      (is (= [(forward-shadowed-primal 3.0 9007199254740993) 0.0 nil]
+             (vg 3.0 9007199254740993))))))
+
+(deftest forward-conversion-semantic-call-representation
+  ;; Semantic operation metadata is authoritative even before undevirtualization.
+  (let [plan @(ns-resolve 'raster.ad.reverse 'forward-conversion-plan)
+        call (with-meta '(.invk fake-cast-implementation x) {:raster.op/original 'float})
+        result (plan call '[x] '[double] *ns*)]
+    (is (= :float (get-in result [:declines 0 :target-dtype])))
+    (is (= call (:body result)))
+    (is (= (meta call) (meta (:body result)))))
+  (let [plan @(ns-resolve 'raster.ad.reverse 'forward-conversion-plan)]
+    (doseq [body ['{:value (float x)} '#{(float x)}
+                 '(letfn* [f (fn* [] (float x))] (f))]]
+      (is (seq (:declines (plan body '[x] '[double] *ns*))) (pr-str body)))))
+
 (r/deftm cubic-fn [x :- Double] :- Double
   (raster.numeric/* x (raster.numeric/* x x)))
 
