@@ -5,11 +5,12 @@
             [raster.compiler.ir.buffer-view :as view]
             [raster.gpu.core :as gpu]
             [raster.gpu.distributed :as runtime]
-            [raster.gpu.link :as link])
+            [raster.gpu.link :as link]
+            [raster.gpu.test-lifecycle :as lifecycle])
   (:import [java.lang.foreign MemorySegment]))
 
 (defn owner []
-  (runtime/map->DistributedExecutable
+  (lifecycle/distributed-executable
    {:plan {:id :test-plan} :state (atom :ready)
     :sessions {:physical (atom {:session-id :test-session :device-id :physical-device})}
     :readiness {:actions []}
@@ -54,7 +55,8 @@
         (is (= :complete @(:state executable)))
         (is (thrown? clojure.lang.ExceptionInfo (runtime/run! executable)))
         (is (= [:profile :profile] @calls)))))
-  (is (thrown? clojure.lang.ExceptionInfo (runtime/profile! (owner)))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (runtime/profile! (runtime/map->DistributedExecutable (into {} (owner)))))
       "a constructed owner cannot publish an authentic observation"))
 
 (deftest normal-run-stays-unprofiled-and-failures-poison-the-one-shot-owner
@@ -101,7 +103,7 @@
         (is (= [16 16 16 16 4 4] (mapv :bytes legs)))
         (is (= [0 0 4 4 8 8] (mapv :element-offset legs)))
         (is (every? #(= :test-events (get-in % [:measurement :timing-source])) legs))
-        (runtime/close! (runtime/map->DistributedExecutable
+        (runtime/close! (lifecycle/distributed-executable
                          {:state (atom :complete) :sessions {} :staging staging}))))
     (is (= 6 (count @calls)))
     (is (every? #(not (.isAlive (.scope ^MemorySegment %))) @segments))))
@@ -137,7 +139,7 @@
           v (fn [id device]
               (view/view (view/allocation {:id id :device device :byte-size 16 :memory-space :device})
                          {:dtype :float :shape [4]}))
-          executable (runtime/map->DistributedExecutable
+          executable (lifecycle/distributed-executable
                       {:state (atom :failed) :sessions {:a :source-session :b :target-session}
                        :staging staging})]
       (with-redefs [gpu/buffer-view (fn [_ _ opts] opts)
@@ -183,7 +185,7 @@
 
 (deftest shared-cleanup-errors-do-not-stop-independent-session-teardown
   (let [failure (ex-info "shared teardown failure" {}) calls (atom [])
-        executable (runtime/map->DistributedExecutable
+        executable (lifecycle/distributed-executable
                     {:state (atom :failed) :sessions {:a :a :b :b :c :c}})]
     (with-redefs [gpu/close-session! (fn [session] (swap! calls conj session) (throw failure))]
       (is (identical? failure (try (runtime/close! executable) (catch Throwable e e))))

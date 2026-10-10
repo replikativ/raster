@@ -25,3 +25,11 @@
     (merge {:closed? (atom false) :lifetime-lock (Object.)
             :execution-state (atom {:value-epoch 0})}
            fields))))
+
+(defn distributed-executable
+  "Synthetic original runtime owner for lifecycle doubles, not compiler/completion evidence.
+   Tests must still supply states and mock release operations; record copies remain unissued."
+  [fields]
+  (let [constructor (requiring-resolve 'raster.gpu.distributed/map->DistributedExecutable)
+        seal (ns-resolve 'raster.gpu.distributed 'seal-runtime-value)]
+    (seal (constructor fields))))

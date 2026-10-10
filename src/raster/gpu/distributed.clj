@@ -30,6 +30,12 @@
   [value]
   (and (instance? DistributedExecutable value) ((:authentic? runtime-issuer) value)))
 
+(defn- require-original-owner! [executable]
+  (when-not (original-executable? executable)
+    (throw (ex-info "distributed operations require the original runtime owner"
+                    {:reason :distributed-runtime-owner})))
+  executable)
+
 (defrecord ResidentRepresentationEvidence [data executable session session-id provenance-seal]
   clojure.lang.IDeref
   (deref [this]
@@ -234,6 +240,7 @@
     (route-context executable (device-observations executable))))
 
 (defn- execute! [executable profile?]
+  (require-original-owner! executable)
   (locking (:state executable)
     (when-not (= :ready @(:state executable))
       (throw (ex-info "distributed execution is not ready" {:reason :distributed-runtime-state :state @(:state executable)})))
@@ -332,6 +339,7 @@
    Views borrow the enclosing execution lifetime and are available only after successful completion.
    A transfer-only completion has no local logical output values."
   [executable]
+  (require-original-owner! executable)
   (locking (:state executable)
     (when-not (= :complete @(:state executable))
       (throw (ex-info "distributed outputs require completed execution"
@@ -448,6 +456,7 @@
       @fact)))
 
 (defn close! [executable]
+  (require-original-owner! executable)
   (locking (:state executable)
     (when (= :reading-outputs @(:state executable))
       (throw (ex-info "distributed output read scope retains the owner lifetime"

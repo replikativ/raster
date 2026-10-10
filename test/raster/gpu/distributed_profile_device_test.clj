@@ -5,7 +5,8 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.distributed :as runtime]
             [raster.gpu.device-probe :as opencl]
-            [raster.dl.gpu-grad-parity :as ze]))
+            [raster.dl.gpu-grad-parity :as ze]
+            [raster.gpu.test-lifecycle :as lifecycle]))
 
 (defn- check-staged! [device timing-source]
   (let [source-session (gpu/make-session device)]
@@ -16,7 +17,7 @@
           (gpu/alloc! target-session {:target [:float 9 nil]})
           (let [source (float-array (range 9)) target (float-array 9)
                 staging (atom nil)
-                owner (runtime/map->DistributedExecutable
+                owner (lifecycle/distributed-executable
                        {:state (atom :ready) :staging staging
                         :sessions {:source-worker source-session :target-worker target-session}})
                 make-view (fn [id worker]
