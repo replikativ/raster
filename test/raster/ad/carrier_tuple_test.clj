@@ -60,6 +60,7 @@
 (deftm date-consumer [x :- Dual d :- java.sql.Date] :- Dual (n/+ x 3.0))
 (deftm qualified-result [x :- Double] :- Double
   (date-consumer x (result-source/date-result x)))
+(deftm uncovered-producer [x :- Double] :- Double (n/* x (Math/expm1 x)))
 (deftm loop-as-operand [x :- Double count :- Long] :- Double
   (n/+ x (loop [i 0 a 0.0]
            (if (< i count) (recur (inc i) (n/+ a x)) a))))
@@ -139,6 +140,13 @@
 (deftest result-class-resolves-in-defining-namespace
   (is (:admissible? (reverse/forward-coverage #'qualified-result)))
   (is (= [5.0 1.0] ((reverse/value+grad #'qualified-result :mode :forward) 2.0))))
+
+(deftest uncovered-producer-does-not-mislabel-a-lifted-consumer
+  (let [coverage (reverse/forward-coverage #'uncovered-producer)]
+    (is (false? (:admissible? coverage)))
+    (is (= '[Math/expm1] (:uncovered-ops coverage)))
+    (is (some #(= 'raster.numeric/* (:operation %)) (:call-declines coverage))
+        "unknown-result propagation remains a refusal with full diagnostic evidence")))
 
 (deftest derived-body-sees-post-promotion-argument-facts
   (binding [*ns* (the-ns 'raster.ad.carrier-tuple-test)]

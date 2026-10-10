@@ -4904,6 +4904,9 @@
                                 (when (= :none (:kind (tangent/tangent-kind (nth tags i nil))))
                                   p)) params))
         uncovered (->> (:call-declines conversion-plan)
+                       ;; Unknown operand facts are propagated refusals, not
+                       ;; evidence that an otherwise lifted consumer lacks a lift.
+                       (filter #(seq (:argument-tuples %)))
                        (keep :operation)
                        (filter symbol?) distinct
                        sort
