@@ -2319,8 +2319,9 @@
             (throw (ex-info "staging scalar reduction requires a one-dimensional artifact launch"
                             {:kernel-name kernel-name :geometry geometry})))
         wg (long (first (:workgroup-size geometry)))
-        group-count (long (first (:group-count geometry)))
-        ;; Native driver/loading begins only after every ABI/value/launch check above.
+        group-count (long (first (:group-count geometry)))]
+    (with-admitted-registration kernel-name registered
+      (let [;; Native driver/loading begins only after every ABI/value/launch check above.
         loaded (ensure-kernel-loaded! kernel-name)
         kernel-handle (:kernel-handle loaded)
         dtype-size (long (get dtype-byte-sizes result-dtype))
@@ -2349,15 +2350,16 @@
                   (= :scalar (:kind slot)) (scalar-arg slot value)
                   :else (get staged-inputs slot)))
               pairs)]
-    (launch! kernel-handle group-count wg all-args)
-    (if (= group-count 1)
+    (cleanup/with-registry-use kernel-registry
+      (launch! kernel-handle group-count wg all-args)
+      (if (= group-count 1)
       (double (.get dev-partial value-layout 0))
       (double
        (combine-scalar-partials
         result-dtype c-op identity-val
         (map (fn [i]
                (.get dev-partial value-layout (* (long i) dtype-size)))
-             (range group-count)))))))
+             (range group-count))))))))))
 
 ;; ================================================================
 ;; Void-map kernel invocation (side-effect-only kernels)
