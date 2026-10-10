@@ -25,6 +25,24 @@
   (ftm [z :- Double, theta :- Double] :- Double
        (n/* theta (n// z (n/+ 1.0 (n/* z z))))))
 
+(def affine-g (ftm [z :- Double theta :- Double] :- Double
+                  (n/+ (n/* 0.5 z) theta)))
+(def singular-g (ftm [z :- Double theta :- Double] :- Double (n/+ z theta)))
+(def near-singular-g
+  (ftm [z :- Double theta :- Double] :- Double
+       (n/+ (n/* 0.9999999999999995 z) theta)))
+(def nonfinite-derivative-g
+  (ftm [z :- Double theta :- Double] :- Double (n/+ (Math/sqrt z) theta)))
+
+(defn- error-of [f]
+  (try (f) nil (catch clojure.lang.ExceptionInfo error error)))
+
+(deftm budgeted-affine [z0 :- Double theta :- Double budget :- Long] :- Double
+  (fp/fixed-point-solve affine-g z0 theta 1e-12 budget))
+
+(deftm singular-solution [theta :- Double] :- Double
+  (fp/fixed-point-solve singular-g 0.0 theta 1e-12 (long 1)))
+
 ;; ================================================================
 ;; Forward solve tests
 ;; ================================================================
@@ -44,13 +62,34 @@
       (is (approx= z* (n/* theta (n// z* (n/+ 1.0 (n/* z* z*)))) 1e-6)
           "Fixed point residual should be near zero"))))
 
-(deftest fixed-point-early-termination-test
-  (testing "returns best guess when maxiter reached"
-    (let [slow-g (ftm [z :- Double, theta :- Double] :- Double
-                      (n/* theta (Math/cos z)))
-          z* (fp/fixed-point-solve slow-g 0.1 1.0 1e-20 3)]
-      (is (Double/isFinite z*))
-      (is (< (Math/abs z*) 2.0)))))
+(deftest fixed-point-budget-is-not-a-convergence-witness-test
+  (doseq [budget [0 1 3]]
+    (let [updates (atom 0)
+          ;; Effectful diagnostic fixture counts evaluations only; it is not
+          ;; submitted to AD and is outside the pure mathematical-g premise.
+          g (ftm [z :- Double theta :- Double] :- Double
+                 (do (swap! updates inc) (n/+ (n/* 0.5 z) theta)))
+          error (error-of #(fp/fixed-point-solve g 3.0 1.0 1e-20 budget))]
+      (is (= :fixed-point-not-converged (:reason (ex-data error))))
+      (is (= budget (:iterations (ex-data error))))
+      (is (= budget @updates) "Exhaustion does not evaluate g an extra time")))
+  (is (= :fixed-point-not-converged
+         (:reason (ex-data (error-of #(fp/fixed-point-solve affine-g 2.0 1.0 1e-12 0)))))
+      "An initially fixed point still needs an update to establish the stopping test")
+  (is (= 2.0 (fp/fixed-point-solve affine-g 2.0 1.0 1e-12 1))
+      "Convergence on the final permitted update succeeds")
+  (is (= 2.5 (fp/fixed-point-solve affine-g 3.0 1.0 0.6 1))
+      "A nonzero accepted update on the final iteration also succeeds"))
+
+(deftest fixed-point-options-and-nonfinite-iterates-test
+  (doseq [[tol budget] [[0.0 1] [-1.0 1] [Double/NaN 1]
+                        [Double/POSITIVE_INFINITY 1] [1e-12 -1]]]
+    (is (= :invalid-fixed-point-options
+           (:reason (ex-data (error-of #(fp/fixed-point-solve affine-g 3.0 1.0 tol budget)))))))
+  (is (= :nonfinite-fixed-point-iterate
+         (:reason (ex-data (error-of #(fp/fixed-point-solve
+                                      (ftm [z :- Double theta :- Double] :- Double Double/NaN)
+                                      0.0 0.0 1e-12 1)))))))
 
 ;; ================================================================
 ;; IFT backward tests (direct, no rrule)
@@ -84,37 +123,62 @@
 (deftm sqrt-via-fp [theta :- Double] :- Double
   (fp/fixed-point-solve sqrt-g 1.0 theta 1e-12 (long 100)))
 
-;; Note: rrule tests use the direct IFT backward since the runtime
-;; value+grad eval path has issues with test-namespace var resolution.
-;; The compiled path (compile-aot on a deftm calling value+grad
-;; of sqrt-via-fp) works correctly — tested in pipeline_e2e_test.
+(deftm square-of-sqrt-via-fp [theta :- Double] :- Double
+  (let [z (fp/fixed-point-solve sqrt-g 1.0 theta 1e-12 (long 100))]
+    (n/* z z)))
 
-(deftest rrule-sqrt-gradient-direct-test
-  (testing "IFT backward gives correct gradient for multiple theta values"
+(deftm sqrt-derivative-via-fp [theta :- Double] :- Double
+  (nth ((rev/value+grad #'sqrt-via-fp :mode :reverse) theta) 1))
+
+(deftest registered-sqrt-gradient-test
+  (testing "The registered reverse rule gives the accepted solution's IFT gradient"
     (doseq [theta [1.0 4.0 9.0 16.0]]
-      (let [z* (fp/fixed-point-solve sqrt-g 1.0 theta 1e-12 100)
-            grad (fp/fixed-point-backward sqrt-g z* theta 1.0)
+      (let [[z* grad] ((rev/value+grad #'sqrt-via-fp :mode :reverse) theta)
             expected-grad (/ 1.0 (* 2.0 (Math/sqrt theta)))]
         (is (approx= (Math/sqrt theta) z*)
             (str "sqrt(" theta ") value"))
         (is (approx= grad expected-grad 1e-6)
             (str "d(sqrt(" theta "))/dtheta"))))))
 
-(deftest rrule-chain-rule-test
-  (testing "chain rule: d(z*^2)/dtheta = 2*z* * dz*/dtheta = 1"
+(deftest registered-implicit-rule-composes-test
+  (let [gradient (rev/value+grad #'square-of-sqrt-via-fp :mode :reverse)]
     (doseq [theta [2.0 4.0 9.0]]
-      (let [z* (fp/fixed-point-solve sqrt-g 1.0 theta 1e-12 100)
-            dz (fp/fixed-point-backward sqrt-g z* theta 1.0)
-            dloss (* 2.0 z* dz)]
-        (is (approx= dloss 1.0 1e-3)
-            (str "d(z*^2)/dtheta at theta=" theta))))))
+      (let [[value dtheta] (gradient theta)]
+        (is (approx= value theta 1e-10))
+        (is (approx= dtheta 1.0 1e-10))))))
+
+(deftest registered-rule-rejects-budgeted-iterates-test
+  (let [gradient (rev/value+grad #'budgeted-affine :mode :reverse :wrt [0 1])]
+    (doseq [budget [0 1]]
+      (is (= :fixed-point-not-converged
+             (:reason (ex-data (error-of #(gradient 3.0 1.0 budget)))))))
+    (let [[value dz0 dtheta dbudget] (gradient 3.0 1.0 100)]
+      (is (approx= value 2.0 1e-11))
+      (is (= 0.0 dz0) "IFT does not differentiate initial-state iteration history")
+      (is (= 2.0 dtheta))
+      (is (nil? dbudget)))))
+
+(deftest implicit-derivative-conditioning-is-explicit-test
+  (doseq [g [singular-g near-singular-g]]
+    (is (= :ill-conditioned-fixed-point
+           (:reason (ex-data (error-of #(fp/fixed-point-backward g 0.0 0.0 1.0)))))))
+  (is (= :ill-conditioned-fixed-point
+         (:reason (ex-data (error-of #((rev/value+grad #'singular-solution :mode :reverse) 0.0)))))
+      "The registered rule must also reject an accepted but non-isolated solution")
+  (is (= :nonfinite-fixed-point-gradient
+         (:reason (ex-data (error-of #(fp/fixed-point-backward nonfinite-derivative-g 0.0 0.0 1.0))))))
+  (is (= :nonfinite-fixed-point-gradient
+         (:reason (ex-data (error-of #(fp/fixed-point-backward affine-g 2.0 1.0 Double/MAX_VALUE))))))
+  (is (= :nonfinite-fixed-point-gradient
+         (:reason (ex-data (error-of #(fp/fixed-point-backward affine-g 2.0 1.0 Double/NaN))))))
+  (is (= 6.0 (fp/fixed-point-backward affine-g 2.0 1.0 3.0))))
 
 (deftest rrule-gradient-vs-fd-test
   (testing "IFT gradient matches finite difference of forward solve"
     (let [h 1e-5]
       (doseq [theta [2.0 4.0 9.0]]
         (let [z* (fp/fixed-point-solve sqrt-g 1.0 theta 1e-12 100)
-              grad (fp/fixed-point-backward sqrt-g z* theta 1.0)
+              grad (second ((rev/value+grad #'sqrt-via-fp :mode :reverse) theta))
               fd (/ (- (fp/fixed-point-solve sqrt-g 1.0 (+ theta h) 1e-12 100)
                        (fp/fixed-point-solve sqrt-g 1.0 (- theta h) 1e-12 100))
                     (* 2.0 h))]

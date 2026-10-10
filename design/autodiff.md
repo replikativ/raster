@@ -348,7 +348,22 @@ mode over `Sym` carriers. `sym/differentiate` (the calculus table) and `Dual{Sym
 
 `fixed-point-solve` finds z* = g(z*, θ) and carries an rrule that applies the
 Implicit Function Theorem — dz*/dθ = (∂g/∂θ)/(1 − ∂g/∂z) — instead of unrolling
-the iteration. Exact at convergence, O(1) memory:
+the iteration, using O(1) iteration memory. It evaluates IFT at the accepted
+numerical solution; it does not differentiate the finite stopping algorithm.
+
+`fixed-point-solve` now throws `:fixed-point-not-converged` on budget exhaustion
+instead of returning a best guess. Zero budget evaluates no updates, even if
+the initial value happens to be a fixed point. The existing iterate-change
+stopping test is preserved; convergence on the final permitted update succeeds.
+Tolerance must be positive and finite, and the budget nonnegative. Nonfinite
+updates fail explicitly.
+
+The function `g` must be pure/deterministic and define a locally isolated,
+differentiable branch. Numerical stopping does not prove contraction, uniqueness,
+or mathematical convergence. Backward rejects nonfinite derivatives/results and
+denominators with magnitude below `1e-15`; the cutoff is an ill-conditioning
+guard, not proof of exact singularity. General budgeted iteration requires its
+own finite-iteration derivative and is not covered by this implicit rule.
 
 ```clojure
 (require '[raster.ad.fixed-point :as fp] '[raster.core :refer [ftm]])
