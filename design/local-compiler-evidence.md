@@ -57,6 +57,19 @@ widening policy correctly, and public target tests check that projection.
 This reporting correction changes neither KernelBody arithmetic nor defaults.
 Counts describe admission records, not unique kernels or replay invocations.
 
+The widened layer-1 Ak trace preserves all fifteen untapped outputs bit-for-bit.
+Its activation matches the CPU activation exactly, while the incoming cotangent
+differs by at most 4.85778e-6 (coordinate-relative 0.00448483). The final device
+gradient matches an independent ordered Double-FMA/Float-result oracle bit-for-bit
+for all 10,240 elements. Native CPU multiplication on those captured operands
+reproduces the approximately 0.32009 gradient discrepancy against the original
+CPU model, whereas substituting only the device activation changes nothing.
+This localizes this boundary's substantial discrepancy upstream of the final
+gradient contraction; it does not diagnose every failing adapter. Diagnostic
+provenance is `/tmp/raster-wide-layer1-gradient-trace.clj` and
+`/tmp/raster-bound-layer1-ak-device-trace.clj`; these are local scratch scripts,
+not committed regression tests or portable acceptance artifacts.
+
 ## SIMD retained-operation precision — 2026-10-09
 
 A surface `deftm` mapping a Float array with a Double scalar and the expression
