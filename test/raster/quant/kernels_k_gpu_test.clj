@@ -86,7 +86,7 @@
 (deftest rms-norm-gpu-lowers
   (when (gpu-available?)
     (testing "the existing typed library deftm rms-norm! lowers to a correct OpenCL kernel"
-      ;; The float specialization retains Float scalar storage for eps/gain-offset while
+      ;; The Float array specialization retains declared Double eps/gain-offset while
       ;; features retains its declared Long ABI; it also types loop recur
       ;; counters from var-types (int, not float), and enables fp64 when the body uses double.
       ;; A real library op (par/map-void! over rows, reduce+map inside), not a hand-shaped kernel.
@@ -98,7 +98,7 @@
           (gpu/compile! sess :rn #'nn/rms-norm!)
           (gpu/alloc! sess {:x [:float (alength x) x] :w [:float feat w] :out [:float (* rows feat) nil]})
           (gpu/prepare! sess :rn {"x" :x "weight" :w "out" :out}
-                        [{:type :float :value 1.0e-6} {:type :long :value feat} {:type :float :value 1.0}]
+                        [{:type :double :value 1.0e-6} {:type :long :value feat} {:type :double :value 1.0}]
                         rows {:kernel-phase :rn})  ; scalars ordered by name: eps, features, gain-offset
           (gpu/invoke-bound! sess :rn)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-3))
@@ -129,10 +129,10 @@
                                                   :target-device :ze:0 :dtype :float))]
     (is (= 1 (count kernels)))
     (is (= '[[positions :input :int] [x :input :float] [out :output :float]
-             [head-dim :scalar :long] [heads :scalar :long] [theta :scalar :float]
+             [head-dim :scalar :long] [heads :scalar :long] [theta :scalar :double]
              [_n_bound :scalar :long]]
            (mapv (juxt :name :kind :dtype) (:abi (first kernels))))
-        "KernelBody orders inputs, outputs, then scalars; row count is specialized out"))
+        "KernelBody retains declared Double theta independently of Float storage; row count is specialized out"))
   (when (gpu-available?)
     (testing "buffered RoPE lowers one independent position per row"
       (let [nrows 3 heads 8 hd 64 theta 10000.0 positions (int-array [0 5 29])
@@ -151,7 +151,7 @@
                             :positions [:int nrows positions]})
           ;; scalars by name: head-dim heads theta; nrows is represented in the launch bound.
           (gpu/prepare! sess :rope {"x" :x "out" :out "positions" :positions}
-                        [{:type :long :value hd} {:type :long :value heads} {:type :float :value theta}]
+                        [{:type :long :value hd} {:type :long :value heads} {:type :double :value theta}]
                         (* nrows heads (quot hd 2)) {:kernel-phase :rope})
           (gpu/invoke-bound! sess :rope)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
@@ -172,7 +172,7 @@
           ;; scalars by name: cache-len group head-dim n-kv scale ; par bound = n-q
           (gpu/prepare! sess :at {"q" :q "k" :k "v" :v "out" :out "sc" :sc}
                         [{:type :long :value cl} {:type :long :value group} {:type :long :value hd}
-                         {:type :long :value nkv} {:type :float :value scale}]
+                         {:type :long :value nkv} {:type :double :value scale}]
                         nq {:kernel-phase :at})
           (gpu/invoke-bound! sess :at)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
