@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as opencl]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.emitted-structured-loop :as emitted-loop]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.emitted-parallel-program-call :as program-call]
@@ -198,7 +199,14 @@
             observe #(mapv var-get (into [projection-var policy-var] compiler-vars))
             observe-driver! #(swap! driver-scopes conj (observe) @(future (observe)))]
         (with-redefs [gpu/alloc! (fn [_ specs] (observe-driver!) (swap! driver-events conj [:allocate (count specs)]))
-                      gpu/buffer-view (fn [_ key view] {:key key :view view})
+                      gpu/buffer-view
+                      (fn [_ key view]
+                        (let [original (first (keep (fn [[_ node]]
+                                                      (when (= (:id view) (get-in node [:view :id]))
+                                                        (:view node)))
+                                                    (:nodes runtime-plan)))]
+                          (assert original "mock binding must name a planned physical view")
+                          {:key key :view (bview/view (assoc (:allocation original) :id key) view)}))
                       gpu/upload-range! (fn [& _] (swap! driver-events conj [:upload]))
                       gpu/bind-kernel-graph! (fn [_ key _ _ _ _]
                                                (swap! driver-events conj [:bind]) {:handle key})

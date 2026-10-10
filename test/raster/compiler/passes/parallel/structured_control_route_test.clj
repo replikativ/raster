@@ -6,6 +6,7 @@
             [raster.compiler.backend.jvm.typed-scalar :as typed-scalar]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -679,7 +680,14 @@
     (let [session (atom {:device-id :ze:debug :closed? false})
           events (atom [])]
       (with-redefs [gpu/alloc! (fn [_ specs] (swap! events conj [:allocate (set (keys specs))]))
-                    gpu/buffer-view (fn [_ key view] {:key key :view view})
+                    gpu/buffer-view
+                    (fn [_ key view]
+                      (let [original (first (keep (fn [[_ node]]
+                                                    (when (= (:id view) (get-in node [:view :id]))
+                                                      (:view node)))
+                                                  (:nodes linked-plan)))]
+                        (assert original "mock binding must name a planned physical view")
+                        {:key key :view (bview/view (assoc (:allocation original) :id key) view)}))
                     gpu/upload-range! (fn [_ view _source spec]
                                         (swap! events conj [:upload (:key view) spec]))
                     gpu/bind-kernel-graph! (fn [_ key _graph bindings _scalars _options]
