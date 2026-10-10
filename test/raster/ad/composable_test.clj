@@ -20,6 +20,44 @@
 (r/deftm cubic-fn [x :- Double] :- Double
   (raster.numeric/* x (raster.numeric/* x x)))
 
+(r/deftm flagged-quadratic [x :- Double flag :- Boolean] :- Double
+  (if flag (raster.numeric/* x x) (raster.numeric/+ x x)))
+
+(r/deftm quadratic-with-unused-control [x :- Double flag :- Boolean count :- Long] :- Double
+  (raster.numeric/* x x))
+
+(r/deftm integer-scaled-quadratic [x :- Double count :- Long] :- Double
+  (raster.numeric/* count (raster.numeric/* x x)))
+
+(r/deftm discrete-only-value [flag :- Boolean count :- Long] :- Long
+  (if flag count (unchecked-inc count)))
+
+(r/deftm quadratic-with-array-control [x :- Double values :- (Array double)] :- Double
+  (raster.numeric/* x x))
+
+(deftest forward-mode-preserves-discrete-primals-and-gradient-slots
+  (is (= [0] (:active-indices (rev/forward-coverage #'quadratic-with-unused-control))))
+  (is (= '[flag count] (:constant-params (rev/forward-coverage #'quadratic-with-unused-control))))
+  (let [coverage (rev/forward-coverage #'quadratic-with-array-control)]
+    (is (= [0] (:active-indices coverage)))
+    (is (empty? (:constant-params coverage)) "An array tangent is unsupported, not discrete")
+    (is (= '[values] (:array-params coverage)))
+    (is (false? (:admissible? coverage)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"array-typed params"
+                          (rev/value+grad #'quadratic-with-array-control :mode :forward))))
+  (doseq [mode [:forward :auto]]
+    (let [unused (rev/value+grad #'quadratic-with-unused-control :mode mode)
+          flagged (rev/value+grad #'flagged-quadratic :mode mode)
+          scaled (rev/value+grad #'integer-scaled-quadratic :mode mode)
+          discrete (rev/value+grad #'discrete-only-value :mode mode)]
+      (doseq [x [3.0 -2.0] flag [true false]]
+        (is (= [(* x x) (* 2.0 x) nil nil] (unused x flag Long/MAX_VALUE)))
+        (is (= (if flag [(* x x) (* 2.0 x) nil] [(+ x x) 2.0 nil])
+               (flagged x flag)))
+        (is (= [(* 3.0 x x) (* 6.0 x) nil] (scaled x 3))))
+      (is (= [Long/MAX_VALUE nil nil] (discrete true Long/MAX_VALUE)))
+      (is (= [9007199254740994 nil nil] (discrete false 9007199254740993))))))
+
 ;; Function with nested let in call args (tests let-hoisting)
 (r/deftm nested-let-fn [x :- Double, y :- Double] :- Double
   (raster.numeric/+ (let [a (raster.numeric/* x x)] a)

@@ -4655,6 +4655,8 @@
 
   Returns {:admissible?   bool
            :uncovered-ops sorted vector of op symbols without a Dual lift
+           :active-indices scalar tangent parameter positions
+           :constant-params parameters with no tangent space
            :array-params  params whose type is an array (forward mode is
                           scalar-only — arrays have no Dual seeding)}"
   [f-var]
@@ -4670,12 +4672,22 @@
                                                    (and (seq? tag) (= 'Array (first tag))))
                                            p))
                                        params (concat tags (repeat nil)))))
+        active-indices (vec (keep-indexed
+                             (fn [i _]
+                               (when (= :scalar (:kind (tangent/tangent-kind (nth tags i nil))))
+                                 i)) params))
+        constant-params (vec (keep-indexed
+                              (fn [i p]
+                                (when (= :none (:kind (tangent/tangent-kind (nth tags i nil))))
+                                  p)) params))
         uncovered (->> (collect-op-heads (first walked-body))
                        (filter #(= :uncovered (forward-op-status %)))
                        sort
                        vec)]
     {:admissible? (and (empty? uncovered) (empty? array-params))
      :uncovered-ops uncovered
+     :active-indices active-indices
+     :constant-params constant-params
      :array-params array-params}))
 
 (defn forward-admissible?
@@ -4752,6 +4764,8 @@
 
   Options:
     :mode  - :reverse (default), :forward, or :auto
+             Forward seeds only scalar tangent parameters. Discrete controls
+             retain their primal values and occupy nil gradient slots, as in reverse.
     :wrt   - distinct zero-based parameter indices to differentiate in reverse
              mode; other gradient slots are nil (e.g. :wrt [0 3 4] keeps an
              observation array at index 1 constant)
@@ -4826,11 +4840,9 @@
                         :uncovered-ops (:uncovered-ops cov)
                         :array-params (:array-params cov)})))
            resolved (resolve-deftm-var f-var)
-           m (meta resolved)
            params (deftm-params-or-throw f-var resolved)
            walked-body (or (rcore/ensure-walked-body! resolved)
                            (throw (ex-info "No walked body on var" {:var f-var})))
-           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
            ;; Build a generic-dispatch version of the walked body
            generic-body (undevirtualize (first walked-body))
            ;; Strip primitive casts — Dual numbers aren't primitives
@@ -4838,6 +4850,8 @@
            active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
            generic-fn (eval (list 'fn active-params clean-body))
            n (count params)
+           active-indices (:active-indices cov)
+           active-set (set active-indices)
            make-dual fwd/->Dual
            dual-class (Class/forName "raster.ad.forward.Dual")
            get-v (fn [d] (.get (.getField dual-class "v") d))
@@ -4845,23 +4859,26 @@
        (fn [& args]
          (let [arg-vec (vec args)
                value (apply generic-fn arg-vec)
-               grads (double-array n)]
-           ;; One forward pass per parameter, seeding with Dual(val, 1.0)
-           (dotimes [i n]
-             (let [dual-args (into []
-                                   (map-indexed
-                                    (fn [j a]
-                                      (if (== j i)
-                                        (make-dual (double a) (double-array [1.0]))
-                                        (make-dual (double a) (double-array [0.0]))))
-                                    arg-vec))
-                   result (apply generic-fn dual-args)
-                   deriv (if (.isInstance dual-class result)
-                           (clojure.core/aget ^doubles (get-partials result) 0)
-                           0.0)]
-               (clojure.core/aset grads i deriv)))
+               grads (reduce
+                      (fn [grads i]
+                        (let [dual-args (into []
+                                              (map-indexed
+                                               (fn [j a]
+                                                 ;; A zero tangent is not a Double conversion.
+                                                 (if (contains? active-set j)
+                                                   (make-dual (double a)
+                                                              (double-array [(if (== j i) 1.0 0.0)]))
+                                                   a))
+                                               arg-vec))
+                              result (apply generic-fn dual-args)
+                              deriv (if (.isInstance dual-class result)
+                                      (clojure.core/aget ^doubles (get-partials result) 0)
+                                      0.0)]
+                          (assoc grads i deriv)))
+                      (vec (repeat n nil))
+                      active-indices)]
            (vec (cons (if (.isInstance dual-class value) (get-v value) value)
-                      (seq grads)))))))
+                      grads))))))
 
      :auto
      ;; Mode selection = argmin cost over ADMISSIBLE interpretations
