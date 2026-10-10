@@ -214,10 +214,15 @@
   (testing "a violated invariant is not a missing lowering rule. Recording one as a conversion
             decline would let the pipeline continue on the legacy path with the bug intact — the
             loud-to-silent trade this change exists to prevent"
-    (let [fatal (var-get (requiring-resolve
-                          'raster.compiler.passes.parallel.segop-lower-pass/fatal-reasons))]
-      (is (contains? fatal :raster/fatal))
-      (is (contains? fatal :raster/bug)))))
+    (doseq [reason [:raster/fatal :raster/bug]]
+      (let [failure (ex-info "injected compiler invariant" {:reason reason})
+            observed
+            (with-redefs [soac/par-form->soac (fn [& _] (throw failure))]
+              (try (stats-of '(let* [o (raster.par/map! O i 256 nil i)] o))
+                   nil
+                   (catch clojure.lang.ExceptionInfo exception exception)))]
+        (is (identical? failure observed)
+            "The invariant escapes the actual lowering boundary unchanged")))))
 
 (deftest implementation-exceptions-are-not-conversion-declines
   (testing "an implementation bug in par→SOAC escapes instead of silently selecting a fallback"
