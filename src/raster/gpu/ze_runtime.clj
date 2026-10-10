@@ -1960,7 +1960,36 @@
         (throw (ex-info "1-D kernel path received a multidimensional launch contract"
                         {:kernel-name (:kernel-name kernel-info) :launch launch})))
       (first workgroup))
-    (long (or (:workgroup-size kernel-info) 256))))
+    (first (:workgroup-size
+            (klaunch/geometry {:workgroup-size [(or (:workgroup-size kernel-info) 256)]
+                               :group-count [1]})))))
+
+(defn- direct-map-geometry
+  "Realize the compiler's complete launch, or check the remaining 1-D compatibility contract.
+   Workgroup overrides cannot invalidate an artifact's emitted static assumptions."
+  [registered arguments bound opts]
+  (let [default-workgroup (registered-1d-workgroup-size registered)
+        workgroup (first (:workgroup-size
+                          (klaunch/geometry
+                           {:workgroup-size [(get opts :workgroup-size default-workgroup)]
+                            :group-count [1]})))
+        geometry
+        (if (kart/kernel-artifact? registered)
+          (do
+            (when-not (= default-workgroup workgroup)
+              (throw (ex-info "direct map override differs from the emitted workgroup"
+                              {:reason :kernel-workgroup-override
+                               :kernel-name (:kernel-name registered)
+                               :expected default-workgroup :actual workgroup})))
+            (kcall/realize-launch registered arguments))
+          (klaunch/geometry
+           {:workgroup-size [workgroup]
+            :group-count [(klaunch/resolve-expression
+                           identity (klaunch/ceil-div bound workgroup))]}))]
+    (when-not (= 1 (klaunch/dimensions geometry))
+      (throw (ex-info "direct map requires a one-dimensional launch"
+                      {:reason :kernel-launch-dimensionality :launch geometry})))
+    geometry))
 
 (defn- kernel-info-value
   "Read a compiler-owned emitter attribute from an artifact or a remaining specialized entry."
@@ -2195,8 +2224,9 @@
         _ (when-not bound-pair
             (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
         n (long (:value (second bound-pair)))
-        wg (registered-1d-workgroup-size registered)
-        group-count (long (Math/ceil (/ (double n) wg)))]
+        geometry (direct-map-geometry registered (mapv second pairs) n {})
+        wg (first (:workgroup-size geometry))
+        group-count (first (:group-count geometry))]
     (with-admitted-registration kernel-name registered
       (let [;; Loading/compilation may touch the native driver. Every ABI check above deliberately
         ;; runs first, so a malformed marker fails deterministically even on a machine without
@@ -2385,7 +2415,8 @@
 
   Options:
     :workgroup-size  Override registry workgroup-size for this call only.
-                     Used by the autotuner for wg-sweep benchmarking."
+                     Plain compatibility entries support wg-sweep benchmarking. A canonical
+                     artifact accepts only its emitted static workgroup; tuning requires re-emission."
   ([^String kernel-name arrays scalar-args n]
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
@@ -2406,11 +2437,10 @@
                                  (:scalar-slots split-binding) scalar-args))
          checked-bound (if split-binding
                          (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
-                         {:type :int :value (Math/toIntExact (long n))})
+                         (kexec/physical-runtime-scalar
+                          (kabi/slot 'n :scalar :int :role :bound) n))
          dtype (kernel-info-value registered :dtype :float)
-         workgroup-size (long (get opts :workgroup-size
-                                   (registered-1d-workgroup-size registered)))
-         n (long n)
+         n (long (:value checked-bound))
          default-dtype-size (long (get dtype-byte-sizes dtype 4))
          scalar-type (if (= dtype :float) :float :double)
          scalar-kernel-args (or checked-scalars
@@ -2421,8 +2451,11 @@
                                           :value (if (= scalar-type :float)
                                                    (float v) (double v))}))
                                      scalar-args))
-         wg (long (or workgroup-size 256))
-         group-count (long (Math/ceil (/ (double n) wg)))]
+         geometry (direct-map-geometry registered
+                                       (vec (concat arrays scalar-kernel-args [checked-bound]))
+                                       n opts)
+         wg (first (:workgroup-size geometry))
+         group-count (first (:group-count geometry))]
      (with-admitted-registration kernel-name registered
        (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         ;; Determine per-array byte size from actual array type

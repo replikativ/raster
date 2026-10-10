@@ -134,6 +134,95 @@
                                           (abi/slot 'n :scalar :long :role :bound)]))]
     {:name name :registration registration :registry (atom {name registration})}))
 
+(deftest direct-map-geometry-uses-exact-integer-ceiling
+  (doseq [[n wg expected] [[1 4 1] [9 4 3]
+                           [9007199254740993 2 4503599627370497]
+                           [Long/MAX_VALUE 2 4611686018427387904]]]
+    (let [geometry (#'ze/direct-map-geometry {:workgroup-size wg} [] n {})]
+      (is (= [wg] (:workgroup-size geometry)))
+      (is (= [expected] (:group-count geometry)))))
+  (doseq [wg [0 -1 1.5 :invalid nil]]
+    (is (some? (error-of #(#'ze/direct-map-geometry {:workgroup-size 4} [] 2
+                                                   {:workgroup-size wg})))))
+  (is (some? (error-of #(#'ze/direct-map-geometry {:workgroup-size 4} [] 0 {}))))
+  (is (= [2] (:workgroup-size
+              (#'ze/direct-map-geometry {:workgroup-size 4} [] 9 {:workgroup-size 2})))))
+
+(deftest direct-map-artifact-retains-full-launch-contract
+  (let [a (artifact/make
+           {:kernel-name "bounded_direct_map" :target :opencl-c
+            :source "__kernel void bounded_direct_map(__global float *x, long n) {}"
+            :abi [(abi/slot 'x :inout :float) (abi/slot 'n :scalar :long :role :bound)]
+            :arguments '[x n]
+            :launch (launch/spec
+                     {:workgroup-size [4]
+                      :group-count [(launch/minimum (launch/ceil-div 'n 4) 3)]})})
+        args [(float-array 1) {:type :long :value 100}]]
+    (is (= [3] (:group-count (#'ze/direct-map-geometry a args 100 {}))))
+    (is (= [3] (:group-count (#'ze/direct-map-geometry a args 100 {:workgroup-size 4}))))
+    (is (= :kernel-workgroup-override
+           (:reason (ex-data (error-of #(#'ze/direct-map-geometry a args 100
+                                                                    {:workgroup-size 2}))))))
+    (let [host (float-array 100)
+          staged (float-array 100)
+          seen (atom [])]
+      (with-redefs-fn
+        {#'ze/kernel-registry (atom {(:kernel-name a) a})
+         (ns-resolve 'raster.gpu.ze-runtime 'ensure-kernel-loaded!)
+         (fn [_] {:kernel-handle :artifact})
+         (ns-resolve 'raster.gpu.ze-runtime 'ensure-seg)
+         (fn [_ _ ^long bytes]
+           (is (= 400 bytes))
+           (MemorySegment/ofArray staged))
+         #'ze/launch! (fn [handle ^long groups ^long wg values]
+                        (swap! seen conj [handle groups wg (vec (rest values))])
+                        (aset staged 0 (float 7.0)))}
+        #(do
+           (is (nil? (ze/invoke-registered-map-void-kernel
+                      (:kernel-name a) [host] [] {:type :long :value 100})))
+           (is (= [[:artifact 3 4 [{:type :long :value 100}]]] @seen))
+           (is (= 7.0 (double (aget host 0)))))))
+    (let [masked (assoc a :launch (launch/spec {:workgroup-size [4] :group-count [1]}))]
+      (is (= [1] (:group-count (#'ze/direct-map-geometry
+                               masked [(float-array 1) {:type :long :value 0}] 0 {})))
+          "zero semantic bounds remain legal with an explicit positive masked launch"))))
+
+(deftest direct-map-invalid-geometry-precedes-all-native-contact
+  (doseq [typed? [false true]
+          [bound opts default-wg] [[-1 {} 4] [1.5 {} 4] [0 {} 4]
+                                  [2 {:workgroup-size 0} 4]
+                                  [2 {:workgroup-size -1} 4]
+                                  [2 {:workgroup-size 1.5} 4]
+                                  [2 {} 0] [2 {} -1] [2 {} 1.5]]]
+    (let [{:keys [name registration]} (void-map-fixture typed?)
+          registry (atom {name (assoc registration :workgroup-size default-wg)})
+          seen (atom [])]
+      (with-redefs-fn
+        {#'ze/kernel-registry registry
+         (ns-resolve 'raster.gpu.ze-runtime 'ensure-kernel-loaded!)
+         (fn [& _] (swap! seen conj :load))
+         (ns-resolve 'raster.gpu.ze-runtime 'ensure-seg)
+         (fn [& _] (swap! seen conj :stage))
+         #'ze/launch! (fn [& _] (swap! seen conj :launch))}
+        #(do
+           (is (some? (error-of
+                       (fn [] (ze/invoke-registered-map-void-kernel
+                               name [(float-array 2) (float-array 2)] [2.0] bound opts)))))
+           (is (empty? @seen))))))
+  (doseq [[bound workgroup] [[-1 4] [1.5 4] [0 4] [2 0] [2 -1] [2 1.5]]]
+    (let [{:keys [name registration]} (map-fixture)
+          seen (atom [])]
+      (with-redefs-fn
+        {#'ze/kernel-registry (atom {name (assoc registration :workgroup-size workgroup)})
+         (ns-resolve 'raster.gpu.ze-runtime 'ensure-kernel-loaded!)
+         (fn [& _] (swap! seen conj :load))
+         (ns-resolve 'raster.gpu.ze-runtime 'ensure-seg)
+         (fn [& _] (swap! seen conj :stage))}
+        #(do
+           (is (some? (error-of (fn [] (ze/invoke-registered-kernel
+                                      name [(float-array 2)] (float-array 2) [2.0] bound)))))
+           (is (empty? @seen)))))))
+
 (deftest void-map-replacement-after-pure-admission-precedes-native-use
   (doseq [typed? [false true]]
     (let [{:keys [name registration registry]} (void-map-fixture typed?)
