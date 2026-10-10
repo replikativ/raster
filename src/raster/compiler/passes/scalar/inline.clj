@@ -1541,7 +1541,7 @@
   (cond
     ;; Resolve constant var references (plain values like neg-inf, pi)
     ;; Skip: functions, generic dispatch vars, deftm impl singletons
-    (and (symbol? expr) (namespace expr) (not (get env expr)))
+    (and (symbol? expr) (namespace expr) (not (contains? env expr)))
     (or (try (when-let [v (resolve expr)]
                (let [val @v]
                  (when (and (var? v)
@@ -1562,19 +1562,17 @@
     (vector? expr)
     (let [r (mapv #(resolve-dispatch-walk % env) expr)]
       (if-let [m (meta expr)] (with-meta r m) r))
-    (not (seq? expr)) expr
+    (not (seq? expr)) (inf/mask-unknown-local expr env)
     ;; Loop/loop*: propagate init types for loop vars into body
     (contains? #{'loop 'loop*} (first expr))
     (let [[head bindings-vec & body] expr
           pairs (partition 2 bindings-vec)
-          loop-env (reduce (fn [e [sym init]]
-                             (let [resolved (resolve-dispatch-walk init e)
-                                   tag (inf/infer-arg-tag resolved e)]
-                               (if tag (assoc e sym tag) e)))
-                           env pairs)
-          new-bindings (vec (mapcat (fn [[sym init]]
-                                      [sym (resolve-dispatch-walk init env)])
-                                    pairs))
+          [loop-env new-bindings]
+          (reduce (fn [[e bindings] [sym init]]
+                    (let [resolved (resolve-dispatch-walk init e)
+                          tag (or (inf/hint-tag sym) (inf/infer-arg-tag resolved e))]
+                      [(assoc e sym tag) (conj bindings sym resolved)]))
+                  [env []] pairs)
           new-body (map #(resolve-dispatch-walk % loop-env) body)]
       (let [r (apply list head new-bindings new-body)]
         (if-let [m (meta expr)] (with-meta r m) r)))
@@ -1585,8 +1583,8 @@
           [let-env new-bindings]
           (reduce (fn [[e acc] [sym init]]
                     (let [resolved (resolve-dispatch-walk init e)
-                          tag (inf/infer-arg-tag resolved e)]
-                      [(if tag (assoc e sym tag) e)
+                          tag (or (inf/hint-tag sym) (inf/infer-arg-tag resolved e))]
+                      [(assoc e sym tag)
                        (conj acc sym resolved)]))
                   [env []] pairs)
           new-body (map #(resolve-dispatch-walk % let-env) body)
@@ -1627,8 +1625,7 @@
          (contains? #{'raster.par/reduce 'par/reduce} (first expr)))
     (let [[head acc init idx bound & body-forms] expr
           acc-tag (inf/infer-arg-tag init env)
-          par-env (cond-> (assoc env idx 'long)
-                    acc-tag (assoc acc acc-tag))
+          par-env (assoc env idx 'long acc acc-tag)
           resolved-init (resolve-dispatch-walk init env)
           resolved-bound (resolve-dispatch-walk bound env)
           new-body (map #(resolve-dispatch-walk % par-env) body-forms)
@@ -1641,24 +1638,24 @@
            element-bindings element-results combine-parameters
            combine-bindings combine-results algebra] expr
           acc-env (reduce (fn [e [acc init _dtype]]
-                            (if-let [tag (inf/infer-arg-tag init env)] (assoc e acc tag) e))
+                            (assoc e acc (or (inf/hint-tag acc) (inf/infer-arg-tag init env))))
                           env components)
           index-env (into (assoc acc-env idx 'long) (map (fn [[segment _]] [segment 'long]) segment-axes))
           [element-env element-bindings']
           (reduce (fn [[e bindings] [sym init]]
                     (let [resolved (resolve-dispatch-walk init e)
-                          tag (inf/infer-arg-tag resolved e)]
-                      [(if tag (assoc e sym tag) e) (conj bindings sym resolved)]))
+                          tag (or (inf/hint-tag sym) (inf/infer-arg-tag resolved e))]
+                      [(assoc e sym tag) (conj bindings sym resolved)]))
                   [index-env []] (partition 2 element-bindings))
           combine-env (reduce (fn [e [[left right] [acc _ _]]]
-                                (if-let [tag (get acc-env acc)]
-                                  (assoc e left tag right tag) e))
+                                (let [tag (inf/infer-arg-tag acc acc-env)]
+                                  (assoc e left tag right tag)))
                               env (map vector combine-parameters components))
           [combine-result-env combine-bindings']
           (reduce (fn [[e bindings] [sym init]]
                     (let [resolved (resolve-dispatch-walk init e)
-                          tag (inf/infer-arg-tag resolved e)]
-                      [(if tag (assoc e sym tag) e) (conj bindings sym resolved)]))
+                          tag (or (inf/hint-tag sym) (inf/infer-arg-tag resolved e))]
+                      [(assoc e sym tag) (conj bindings sym resolved)]))
                   [combine-env []] (partition 2 combine-bindings))
           r (list head outputs
                   (mapv (fn [[acc init dtype]]
@@ -1730,14 +1727,14 @@
            [env new-pairs]
            (reduce (fn [[env acc] [sym expr]]
                      (let [resolved (resolve-dispatch-walk expr env)
-                           tag (or (:tag (meta sym))
+                           tag (or (inf/hint-tag sym)
                                    (inf/infer-arg-tag resolved env))
                           ;; Stamp inferred tag on binding symbol so downstream
                           ;; passes (closure extraction, bytecode) see it
                            sym (if (and tag (not (:tag (meta sym))))
                                  (vary-meta sym assoc :tag tag :raster.type/tag tag)
                                  sym)]
-                       [(if tag (assoc env sym tag) env)
+                       [(assoc env sym tag)
                         (conj acc [sym resolved])]))
                    [(or param-env {}) []] pairs)
            new-body (map #(resolve-dispatch-walk % env) body)

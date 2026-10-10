@@ -309,7 +309,7 @@
    and loop forms. Does not descend into opaque calls."
   [expr env]
   (cond
-    (not (seq? expr)) expr
+    (not (seq? expr)) (inf/mask-unknown-local expr env)
     ;; let/let*: tag binding symbols + recurse into init exprs and body
     (form/binding-form? expr)
     (let [[head bindings-vec & body] expr
@@ -318,12 +318,12 @@
           (reduce
            (fn [[env acc] [sym init-expr]]
              (let [tagged-init (tag-expr-types init-expr env)
-                   tag (inf/infer-arg-tag tagged-init env)
+                   tag (or (inf/hint-tag sym) (inf/infer-arg-tag tagged-init env))
                    tagged-sym (cond-> sym
                                 tag (vary-meta assoc :tag tag :raster.type/tag tag)
                                 (util/void-form? tagged-init)
                                 (vary-meta assoc :raster.effect/effectful true))
-                   new-env (if tag (assoc env sym tag) env)]
+                   new-env (assoc env sym tag)]
                [new-env (conj acc tagged-sym tagged-init)]))
            [env []]
            pairs)
