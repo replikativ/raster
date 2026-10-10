@@ -97,9 +97,9 @@
 (deftest coordinate-diagnostics-are-total-and-do-not-truncate-or-hide-nonfinite-inputs
   (let [summary (#'acceptance/difference-summary [3.0 -2.0 6.0] [1.0 0.0 5.0])]
     (is (= 3 (:length summary)))
-    (is (= 2.0 (:max-finite-absolute-error summary)))
+    (is (= 2.0 (:max-absolute-error-of-finite-inputs summary)))
     (is (= {:index 0 :actual 3.0 :expected 1.0 :absolute-error 2.0}
-           (:worst-finite-absolute-coordinate summary)))
+           (:worst-finite-input-coordinate summary)))
     (is (zero? (:nonfinite-coordinate-count summary))))
   (let [summary (#'acceptance/difference-summary
                  [Double/NaN 3.0 Double/POSITIVE_INFINITY]
@@ -107,10 +107,15 @@
     (is (= 2 (:nonfinite-coordinate-count summary)))
     (is (= 0 (get-in summary [:first-nonfinite-coordinate :index])))
     (is (Double/isNaN (get-in summary [:first-nonfinite-coordinate :actual])))
-    (is (= 1 (get-in summary [:worst-finite-absolute-coordinate :index]))))
+    (is (= 1 (get-in summary [:worst-finite-input-coordinate :index]))))
+  (let [summary (#'acceptance/difference-summary [Double/MAX_VALUE] [(- Double/MAX_VALUE)])]
+    (is (= Double/POSITIVE_INFINITY (:max-absolute-error-of-finite-inputs summary)))
+    (is (= Double/POSITIVE_INFINITY
+           (get-in summary [:worst-finite-input-coordinate :absolute-error])))
+    (is (zero? (:nonfinite-coordinate-count summary))))
   (let [summary (#'acceptance/difference-summary [] [])]
     (is (zero? (:length summary)))
-    (is (nil? (:worst-finite-absolute-coordinate summary)))
+    (is (nil? (:worst-finite-input-coordinate summary)))
     (is (nil? (:first-nonfinite-coordinate summary))))
   (is (= :external-training-shape
          (try (#'acceptance/difference-summary [1.0] []) nil

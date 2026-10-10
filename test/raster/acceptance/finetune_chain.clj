@@ -99,7 +99,8 @@
   ((oracle 'worst-rel) actual expected))
 
 (defn- difference-summary
-  "Diagnostic only: never substitutes for the pinned oracle's componentwise error."
+  "Diagnostic only: never substitutes for the pinned oracle's componentwise error.
+   Finite-input subtraction may overflow; retain that infinite error rather than hide it."
   [actual expected]
   (when-not (= (count actual) (count expected))
     (throw (ex-info "diagnostic array lengths differ"
@@ -110,18 +111,18 @@
                   finite? (and (Double/isFinite a) (Double/isFinite b))
                   absolute (Math/abs (- a b))]
               (if finite?
-                (cond-> (update summary :max-finite-absolute-error max absolute)
-                  (or (nil? (:worst-finite-absolute-coordinate summary))
-                      (> absolute (get-in summary [:worst-finite-absolute-coordinate
+                (cond-> (update summary :max-absolute-error-of-finite-inputs max absolute)
+                  (or (nil? (:worst-finite-input-coordinate summary))
+                      (> absolute (get-in summary [:worst-finite-input-coordinate
                                                    :absolute-error])))
-                  (assoc :worst-finite-absolute-coordinate
+                  (assoc :worst-finite-input-coordinate
                          {:index index :actual a :expected b :absolute-error absolute}))
                 (-> summary
                     (update :nonfinite-coordinate-count inc)
                     (update :first-nonfinite-coordinate
                             #(or % {:index index :actual a :expected b}))))))
-          {:length (count actual) :max-finite-absolute-error 0.0
-           :worst-finite-absolute-coordinate nil :nonfinite-coordinate-count 0
+          {:length (count actual) :max-absolute-error-of-finite-inputs 0.0
+           :worst-finite-input-coordinate nil :nonfinite-coordinate-count 0
            :first-nonfinite-coordinate nil}
           (map vector (range) actual expected)))
 
