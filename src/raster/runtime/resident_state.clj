@@ -300,21 +300,43 @@
      :producer {:field-id id :step step :entry entry :key key :value (first values) :node node
                 :physical-dtype (:dtype physical) :physical-shape (:shape physical)}}))
 
-(defn- distributed-field [executable producers outputs facts spec]
+(defn- distributed-field-spec! [spec]
   (when-not (map? spec)
     (fail! "distributed capture field must be a map" :resident-state-field {}))
   (exact-keys! "distributed capture field" :resident-state-field-keys spec
                #{:id :step :key :value :coordinate-space :attributes})
+  (av/validate! (:value spec))
+  spec)
+
+(defn- portable-distributed-options [opts]
+  ;; Malformed option envelopes remain the common engine's admission obligation.
+  ;; Only this generic adapter requires placement/sharding-free semantic values.
+  (if (and (map? opts) (vector? (:fields opts)))
+    (update opts :fields
+            (fn [fields]
+              (mapv (fn [spec]
+                      (distributed-field-spec! spec)
+                      (when-not (plain-portable-tensor? (:value spec))
+                        (fail! "generic distributed capture requires a plain portable tensor"
+                               :resident-state-distributed-field (select-keys spec [:id :step :key])))
+                      (assoc spec :value (av/tensor {:dtype (dtype/canon (get-in spec [:value :dtype]))
+                                                    :shape (get-in spec [:value :shape])}))) fields)))
+    opts))
+
+(defn- distributed-field [executable producers outputs facts spec]
+  (distributed-field-spec! spec)
   (let [{:keys [id step key value coordinate-space attributes]
          :or {coordinate-space {} attributes {}}} spec
         {:keys [physical target producer]} (distributed-field-source (:plan executable) producers spec)
         dt (when (keyword? (:dtype value)) (dtype/canon (:dtype value)))
-        _ (av/validate! value)
         width (when dt (long (dtype/bytes-of dt)))
         bytes (when width
                 (reduce #(Math/multiplyExact (long %1) (long %2)) width (:shape value)))]
     (when-not (and (contains? (get outputs step) (:value producer))
-                   (plain-portable-tensor? value) (= dt (:dtype physical))
+                   (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
+                   (nil? (:logical-layout value))
+                   (seq (:shape value)) (every? pos-int? (:shape value))
+                   (= dt (:dtype physical))
                    (= (reduce *' (:shape value)) (reduce *' (:shape physical)))
                    (= bytes (:byte-length physical)))
       (fail! "distributed capture requires one retained public whole dense output leaf"
@@ -338,7 +360,7 @@
           address (content/content-address-from-reader bytes reader)
           shape (:shape value)
           field (state/field
-                 {:id id :value (av/tensor {:dtype dt :shape shape})
+                 {:id id :value value
                   :coordinate-space coordinate-space :attributes attributes :chunk-shape shape
                   :chunks [(state/chunk {:id 0 :offsets (vec (repeat (count shape) 0)) :shape shape
                                          :logical-byte-length bytes :stored-byte-length bytes
@@ -348,23 +370,16 @@
        :representation representation :validate-storage! validate-storage!
        :producer (assoc producer :content address)})))
 
-(defn capture-distributed!
-  "Capture retained whole outputs of an original completed DistributedExecutable.
-
-   prepared-entries maps [logical-worker entry] to every original sealed source Prepared.
-   facts maps [physical-target canonical-dtype] to original owner-bound storage observations.
-   Ordered field specs name :id, retained :step and public output :key, a plain portable :value,
-   and optional :coordinate-space/:attributes. Equal-volume dense reshape is explicit in the
-   semantic value; the physical shape is independently retained in producer provenance.
-
-   Identity is entry-scoped, not a fingerprint of host initializers or the whole communication
-   history. Field meanings, coordinates and numerical policy remain application declarations.
-   Retain the owner's output scope through bounded downloads, hashing and synchronous ingestion.
-   Certify all fields before writes and recheck representation after every provider callback,
-   including the final one. Capture is not durable publication: finalize-state-availability!
-   must independently verify/promote content before publishing metadata. Failure may orphan blobs.
-   Composite, aliased public ports and strided/packed fields require an explicit codec vertical."
-  [executable prepared-entries facts provider target-tier opts]
+(defn ^:no-doc capture-distributed-with-manifest!
+  "Internal physical capture engine shared by checked semantic adapters.
+   The manifest builder receives only completed field/provenance data, never readers,
+   resident views or owner tokens. It must preserve exactly the derived fields. Certify
+   the final manifest and revalidate storage before any writes and after every callback.
+   Adapters remain responsible for their independent geometry/temporal/lineage proofs."
+  [executable prepared-entries facts provider target-tier opts manifest-builder]
+  (when-not (ifn? manifest-builder)
+    (fail! "distributed capture requires an internal manifest builder"
+           :resident-state-manifest-builder {}))
   (when-not (and (map? opts) (map? facts))
     (fail! "distributed capture requires options and representation facts"
            :resident-state-options {}))
@@ -389,10 +404,14 @@
                          :programs programs
                          :field-producers (mapv :producer entries)
                          :representations (mapv :representation entries)}
-             certified (state/certify
-                        (state/manifest (assoc (dissoc opts :fields) :fields (mapv :field entries)
-                                               :provenance provenance)))
+             fields (mapv :field entries)
+             manifest (manifest-builder {:fields fields :provenance provenance})
+             _ (when-not (= fields (:fields manifest))
+                 (fail! "capture manifest must retain exactly its derived physical fields"
+                        :resident-state-manifest-fields {}))
+             certified (state/certify manifest)
              revalidate! #(doseq [{:keys [validate-storage!]} entries] (validate-storage!))
+             _ (revalidate!)
              placements (mapv (fn [{:keys [field reader bytes address]}]
                                 (let [placement (content/ingest-content! provider address target-tier
                                                                           bytes reader)]
@@ -400,6 +419,29 @@
                                   {:field-id (:id field) :chunk-id 0 :placement placement})) entries)]
          (revalidate!)
          {:state certified :placements placements})))))
+
+(defn capture-distributed!
+  "Capture retained whole outputs of an original completed DistributedExecutable.
+
+   prepared-entries maps [logical-worker entry] to every original sealed source Prepared.
+   facts maps [physical-target canonical-dtype] to original owner-bound storage observations.
+   Ordered field specs name :id, retained :step and public output :key, a plain portable :value,
+   and optional :coordinate-space/:attributes. Equal-volume dense reshape is explicit in the
+   semantic value; the physical shape is independently retained in producer provenance.
+
+   Identity is entry-scoped, not a fingerprint of host initializers or the whole communication
+   history. Field meanings, coordinates and numerical policy remain application declarations.
+   Retain the owner's output scope through bounded downloads, hashing and synchronous ingestion.
+   Certify all fields before writes and recheck representation after every provider callback,
+   including the final one. Capture is not durable publication: finalize-state-availability!
+   must independently verify/promote content before publishing metadata. Failure may orphan blobs.
+   Composite, aliased public ports and strided/packed fields require an explicit codec vertical."
+  [executable prepared-entries facts provider target-tier opts]
+  (let [opts (portable-distributed-options opts)]
+    (capture-distributed-with-manifest!
+     executable prepared-entries facts provider target-tier opts
+     (fn [{:keys [fields provenance]}]
+       (state/manifest (assoc (dissoc opts :fields) :fields fields :provenance provenance))))))
 
 (defn verify-distributed-restore!
   "Check entry-scoped captured producer/encoding consistency before any provider access.
