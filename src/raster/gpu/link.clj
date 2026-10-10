@@ -1374,6 +1374,33 @@
     (throw (ex-info "linked executable was not instantiated with profiling enabled"
                     {:reason :link-profiling-disabled}))))
 
+(defn validate-profile-request!
+  "Check profiling configuration under the lifetime guard without refreshing storage.
+   Input readiness is checked separately after a Compiled caller's validated refresh."
+  [executable]
+  (with-unleased-execution! executable :validate-profile-request!
+    #(do (require-profiling! executable) executable)))
+
+(defn validate-measure-request!
+  "Check device measurement options and required restoration before input mutation.
+   Does not run hooks, samples or refreshes; readiness remains a replay-time contract."
+  [executable opts]
+  (with-unleased-execution!
+   executable :validate-measure-request!
+   (fn []
+     (require-profiling! executable)
+     (doseq [[option callback] [[:before-sample! (:before-sample! opts)] [:flush-fn (:flush-fn opts)]]]
+       (when-not (or (nil? callback) (ifn? callback))
+         (throw (ex-info "measurement callbacks must be callable" {:option option}))))
+     (let [state-nodes (into #{} (keep (fn [[id node]] (when (= :state (:role node)) id)))
+                            (get-in executable [:plan :nodes]))]
+       (when (and (seq state-nodes) (nil? (:before-sample! opts)))
+         (throw (ex-info "stateful linked executables require :before-sample! restoration"
+                         {:reason :link-stateful-measurement :state-nodes state-nodes}))))
+     ;; Link's event clock is authoritative; callers cannot relabel it.
+     (measurement/validate-options! (assoc (dissoc opts :before-sample!) :timing-source :device-event))
+     executable)))
+
 (defn profile!
   "Profile one synchronous replay with stable source attribution and completion bookkeeping.
    A failed execution poisons the executable; close and reinstantiate rather than replaying
@@ -1381,7 +1408,7 @@
   [executable]
   (with-unleased-execution! executable :profile!
     #(do (require-ready-inputs! executable)
-         (require-profiling! executable)
+         (validate-profile-request! executable)
          (execute-once! executable :profile! (fn [] (profile-replay! executable))))))
 
 (defn measure!
@@ -1390,20 +1417,11 @@
    Stateful plans require :before-sample! restoration. Failed replay or restoration poisons
    the executable. Caller callbacks run outside the measured device interval."
   [executable & {:keys [before-sample!] :as opts}]
-  (let [executable (ensure-live! executable :measure!)
-        state-nodes (into #{} (keep (fn [[node-id node]]
-                                      (when (= :state (:role node)) node-id)))
-                          (get-in executable [:plan :nodes]))]
+  (let [executable (ensure-live! executable :measure!)]
     (with-unleased-execution! executable :measure!
       (fn []
         (require-ready-inputs! executable)
-        (require-profiling! executable)
-        (doseq [[option callback] [[:before-sample! before-sample!] [:flush-fn (:flush-fn opts)]]]
-          (when-not (or (nil? callback) (ifn? callback))
-            (throw (ex-info "measurement callbacks must be callable" {:option option}))))
-        (when (and (seq state-nodes) (nil? before-sample!))
-          (throw (ex-info "stateful linked executables require :before-sample! restoration"
-                          {:reason :link-stateful-measurement :state-nodes state-nodes})))
+        (validate-measure-request! executable opts)
         (let [timing-scope (volatile! nil)
                 sample! (fn []
                           (execute-once!

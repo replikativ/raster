@@ -1940,6 +1940,7 @@
   (gpu-link/with-unleased-execution!
    (:executable c) :profile
    (fn []
+     (gpu-link/validate-profile-request! (:executable c))
      (refresh-captured-inputs! c)
      (let [profile-result (gpu-link/profile! (:executable c))
            result (into {} (map (fn [{:keys [key node]}]
@@ -1957,6 +1958,7 @@
   (gpu-link/with-unleased-execution!
    (:executable c) :measure
    (fn []
+     (gpu-link/validate-measure-request! (:executable c) opts)
      (refresh-captured-inputs! c)
      (apply gpu-link/measure! (:executable c) (mapcat identity opts)))))
 

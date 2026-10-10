@@ -162,6 +162,31 @@
                                  :warmup-iterations warmup-rounds
                                  :timing-source timing-source :cv-threshold cv-threshold)]))})))
 
+(defn validate-options!
+  "Validate sampling options without running callbacks; return their existing defaults.
+   Runtime admission and the sampler share this one option contract."
+  [options]
+  (let [{:keys [warmup-iterations budget-ms min-samples max-samples cv-threshold flush-fn
+               cold-warm compile-ms hashes timing-source] :as options}
+        (merge {:warmup-iterations 3 :budget-ms 100 :min-samples 3 :max-samples 10000
+                :cv-threshold 0.05 :cold-warm :warm :compile-ms 0.0 :hashes {}
+                :timing-source :device-event} options)]
+    (doseq [[field value] [[:warmup-iterations warmup-iterations]
+                          [:min-samples min-samples] [:max-samples max-samples]]]
+      (when-not (and (integer? value) (<= 0 value Long/MAX_VALUE))
+        (throw (ex-info "measurement iteration bounds must be non-negative integers"
+                        {:field field :value value}))))
+    (when-not (and (finite-nonnegative? budget-ms) (pos? (double budget-ms)))
+      (throw (ex-info "measurement budget-ms must be finite and positive" {:budget-ms budget-ms})))
+    (when (or (zero? (long min-samples)) (< (long max-samples) (long min-samples)))
+      (throw (ex-info "measurement requires 0 < min-samples <= max-samples"
+                      {:min-samples min-samples :max-samples max-samples})))
+    (validate-summary-options! cv-threshold warmup-iterations budget-ms cold-warm
+                               timing-source compile-ms hashes)
+    (when-not (or (nil? flush-fn) (ifn? flush-fn))
+      (throw (ex-info "measurement sample and optional flush callbacks must be callable" {})))
+    options))
+
 (defn measure!
   "Measure an explicit device-sample function under a bounded, do_bench-style discipline.
 
@@ -172,36 +197,15 @@
 
    Options: :warmup-iterations (3), :budget-ms (100), :min-samples (3), :max-samples (10000),
    :cv-threshold (0.05), :flush-fn, :cold-warm, :compile-ms, :hashes, :timing-source."
-  [sample-fn & {:keys [warmup-iterations budget-ms min-samples max-samples cv-threshold flush-fn
-                       cold-warm compile-ms hashes timing-source]
-                :or {warmup-iterations 3
-                     budget-ms 100
-                     min-samples 3
-                     max-samples 10000
-                     cv-threshold 0.05
-                     cold-warm :warm
-                     compile-ms 0.0
-                     hashes {}
-                     timing-source :device-event}}]
-  (doseq [[field value] [[:warmup-iterations warmup-iterations]
-                         [:min-samples min-samples]
-                         [:max-samples max-samples]]]
-    (when-not (and (integer? value) (<= 0 value Long/MAX_VALUE))
-      (throw (ex-info "measurement iteration bounds must be non-negative integers"
-                      {:field field :value value}))))
-  (when-not (and (finite-nonnegative? budget-ms) (pos? (double budget-ms)))
-    (throw (ex-info "measurement budget-ms must be finite and positive" {:budget-ms budget-ms})))
-  (when (or (zero? (long min-samples)) (< (long max-samples) (long min-samples)))
-    (throw (ex-info "measurement requires 0 < min-samples <= max-samples"
-                    {:min-samples min-samples :max-samples max-samples})))
-  (validate-summary-options! cv-threshold warmup-iterations budget-ms cold-warm
-                             timing-source compile-ms hashes)
-  (when-not (and (ifn? sample-fn) (or (nil? flush-fn) (ifn? flush-fn)))
-    (throw (ex-info "measurement sample and optional flush callbacks must be callable" {})))
-  (dotimes [_ (long warmup-iterations)]
-    (checked-sample! sample-fn :warmup))
-  (let [probe (mapv (fn [_] (checked-sample! sample-fn :probe)) (range 5))]
-    (let [estimate (max 1.0 (reduce + 0.0 (map #(/ % (double (count probe))) probe)))
+  [sample-fn & {:as options}]
+  (let [{:keys [warmup-iterations budget-ms min-samples max-samples cv-threshold flush-fn
+               cold-warm compile-ms hashes timing-source]} (validate-options! options)]
+    (when-not (ifn? sample-fn)
+      (throw (ex-info "measurement sample and optional flush callbacks must be callable" {})))
+    (dotimes [_ (long warmup-iterations)]
+      (checked-sample! sample-fn :warmup))
+    (let [probe (mapv (fn [_] (checked-sample! sample-fn :probe)) (range 5))
+          estimate (max 1.0 (reduce + 0.0 (map #(/ % (double (count probe))) probe)))
           ;; Bound in floating space before conversion: even a finite budget can overflow
           ;; when converted to nanoseconds. The explicit callback cap still owns admission.
           wanted (if (>= (/ (* (double budget-ms) 1.0e6) estimate) (double max-samples))

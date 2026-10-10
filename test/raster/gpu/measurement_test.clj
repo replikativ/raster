@@ -22,6 +22,20 @@
     (is (= 4 (:n m)))
     (is (= {:artifact "abc"} (:hashes m)))))
 
+(deftest sampling-option-admission-is-pure-and-shared
+  (let [calls (atom 0)
+        flush #(swap! calls inc)]
+    (is (= 3 (:warmup-iterations (measurement/validate-options! {}))))
+    (is (identical? flush (:flush-fn (measurement/validate-options! {:flush-fn flush}))))
+    (is (zero? @calls))
+    (doseq [options [{:budget-ms 0} {:min-samples 0} {:warmup-iterations nil}
+                     {:max-samples 1 :min-samples 2} {:flush-fn 42}]]
+      (let [error (fn [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (ex-data e))))]
+        (is (= (error #(measurement/validate-options! options))
+               (error #(apply measurement/measure! (fn [] (swap! calls inc) 1.0)
+                              (mapcat identity options)))))))
+    (is (zero? @calls))))
+
 (deftest stationarity-is-explicit
   (is (:stationary? (measurement/summarize [100 101 99] :cv-threshold 0.02)))
   (is (false? (:stationary? (measurement/summarize [1 100 1] :cv-threshold 0.02)))))

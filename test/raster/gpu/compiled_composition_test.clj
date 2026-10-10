@@ -248,7 +248,7 @@
         output (value/wrap-external-view
                 {:id :output :dtype :float :n-elements 4 :byte-size 16} :ze:0 view)
         executable (raster.gpu.test-lifecycle/linked-executable
-                    {:plan {:id :profile-lease :target :ze:0
+                    {:profile? true :plan {:id :profile-lease :target :ze:0
                             :nodes {:input (link-plan/node {:id :input :dtype :float :shape [4]
                                                             :device :ze:0 :role :input})}}
                      :session ::session :closed? (atom false) :lifetime-lock (Object.)
@@ -296,6 +296,72 @@
     (is (not= first second))
     (is (= :first (get {first :first} same)))
     (is (nil? (get {first :first} second)))))
+
+(deftest profiling-request-errors-reject-before-refresh-or-output-retirement
+  (doseq [[operation profiling? state? options expected-data]
+          [[:profile false false {} {:reason :link-profiling-disabled}]
+           [:measure false false {} {:reason :link-profiling-disabled}]
+           [:measure true true {} {:reason :link-stateful-measurement}]
+           [:measure true false {:before-sample! 42} {:option :before-sample!}]
+           [:measure true false {:flush-fn 42} {:option :flush-fn}]
+           [:measure true false {:budget-ms 0} {:budget-ms 0}]
+           [:measure true false {:warmup-iterations -1} {:field :warmup-iterations}]
+           [:measure true false {:min-samples 0} {:min-samples 0}]
+           [:measure true false {:cv-threshold Double/NaN} {}]]]
+    (let [view (bview/view (bview/allocation {:id :storage :byte-size 16 :memory-space :device
+                                            :device :ze:0 :ownership :owned})
+                           {:dtype :float :shape [4]})
+          input (link-plan/node {:id :input :view view :role :input})
+          buffer {:id :storage :dtype :float :n-elements 4 :byte-size 16}
+          output (value/wrap-external-view buffer :ze:0 view)
+          executable (raster.gpu.test-lifecycle/linked-executable
+                       {:profile? profiling?
+                        :plan {:id :profile-request :target :ze:0
+                               :nodes (cond-> {:input input}
+                                        state? (assoc :state (assoc input :id :state :role :state)))}
+                        :session ::session :output-leases (atom 0)
+                        :pending-inputs (atom #{:input}) :tainted-inputs (atom #{})})
+          artifact (compiled/map->Compiled
+                    {:executable executable :in-tree [{:key :x :node :input :role :input
+                                                       :default (float-array 4)}]
+                     :out-tree [] :live-outputs (atom [output])})
+          calls (atom [])]
+      (with-redefs [gpu-link/write! (fn [& _] (swap! calls conj :write))
+                    gpu-link/profile! (fn [& _] (swap! calls conj :profile))
+                    gpu-link/measure! (fn [& _] (swap! calls conj :measure))]
+        (let [error (try (if (= :profile operation)
+                          (compiled/profile artifact)
+                          (apply compiled/measure artifact (mapcat identity options)))
+                        (catch Throwable error error))]
+          (is (instance? clojure.lang.ExceptionInfo error))
+          (is (= expected-data (select-keys (ex-data error) (keys expected-data))))))
+      (is (empty? @calls))
+      (is (value/live? output))
+      (is (= #{:input} @(:pending-inputs executable)))
+      (is (= 0 (:value-epoch @(:execution-state executable)))))))
+
+(deftest profiling-request-admission-does-not-require-inputs-before-refresh
+  (let [view (bview/view (bview/allocation {:id :input :byte-size 16 :memory-space :device
+                                          :device :ze:0 :ownership :owned})
+                         {:dtype :float :shape [4]})
+        executable (raster.gpu.test-lifecycle/linked-executable
+                     {:profile? true :session ::session
+                      :plan {:id :refresh :target :ze:0
+                             :nodes {:input (link-plan/node {:id :input :view view :role :input})}}
+                      :node-views {:input (gpu/->ResidentBufferView ::session :input view)}
+                      :pending-inputs (atom #{:input}) :tainted-inputs (atom #{})
+                      :output-ready? (atom false) :output-leases (atom 0)})
+        artifact (compiled/map->Compiled
+                  {:executable executable :in-tree [{:key :x :node :input :role :input
+                                                     :default (float-array 4)}]
+                   :out-tree [] :live-outputs (atom nil)})
+        writes (atom 0)]
+    (with-redefs [gpu/upload-range! (fn [& _] (swap! writes inc))
+                  gpu-link/profile! (fn [& _]
+                                      (is (empty? @(:pending-inputs executable)))
+                                      {:profile []})]
+      (is (= {:profile [] :result {}} (compiled/profile artifact)))
+      (is (= 1 @writes)))))
 
 (defn component [_x _w _n])
 
