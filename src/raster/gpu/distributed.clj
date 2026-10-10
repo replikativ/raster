@@ -241,6 +241,30 @@
                             (hardware/descriptor-for (:device-id @session)))}]))
         (:sessions executable)))
 
+(defn- route-context [executable devices]
+  {:devices (update-vals devices #(dissoc % :session-id))
+   :transport (:transport executable)
+   :max-staging-bytes (:staging-bytes executable)
+   :transfer-layouts
+   (into {} (for [action (get-in executable [:readiness :actions])
+                  :when (= :transfer (:kind action))]
+              [(:id action) {:source (distributed/route-layout-description (first (:reads action)))
+                            :target (distributed/route-layout-description (first (:writes action)))}]))})
+
+(defn cost-context
+  "Snapshot live physical context for explicit empirical route-cost simulation.
+   Requires the original ready owner; does not execute it or admit measurements.
+   Session identities are deliberately excluded so fresh owners can share matching context."
+  [executable]
+  (when-not (original-executable? executable)
+    (throw (ex-info "route cost context requires the original ready distributed owner"
+                    {:reason :distributed-runtime-owner})))
+  (locking (:state executable)
+    (when-not (= :ready @(:state executable))
+      (throw (ex-info "route cost context requires a ready distributed owner"
+                      {:reason :distributed-runtime-owner})))
+    (route-context executable (device-observations executable))))
+
 (defn- execute! [executable profile?]
   (locking (:state executable)
     (when-not (= :ready @(:state executable))
@@ -248,6 +272,7 @@
     (reset! (:state executable) :running)
     (try
       (let [start (when profile? (System/nanoTime))
+            observed-at (when profile? {:clock :unix-epoch-ms :value (System/currentTimeMillis)})
             before (when profile? (device-observations executable))
             actions (into {} (map (juxt :id identity)) (get-in executable [:readiness :actions]))
             observations (volatile! [])
@@ -301,6 +326,7 @@
               report (when profile?
                        {:plan (:plan executable) :execution-model :synchronous-serialized
                         :calibration? false :devices-before before
+                        :observed-at observed-at :route-cost-context (route-context executable before)
                         :transport (:transport executable)
                         :max-staging-bytes (:staging-bytes executable)
                         :allocation-budgets (:allocation-budgets executable)

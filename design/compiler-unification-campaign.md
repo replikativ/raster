@@ -1,5 +1,36 @@
 # Compiler unification campaign
 
+### October 9 explicit empirical route-cost simulation
+
+The existing simulator now accepts optional live route context, supplied profile
+reports and an explicit admission policy. Matching includes physical endpoint
+placement, device/hardware signatures, directed route facts, bytes, realized
+layout (not allocation identity), transport and staging budget. Evidence must
+have consistent before/after snapshots, fresh endpoint sessions, finite positive
+whole-step durations and bounded Unix-epoch age. The shared Measurement summary
+supplies CV/spread and median costs. Insufficient, inconsistent, stale, repeated
+or noisy evidence leaves an explicit per-route analytical fallback.
+The policy's `:cold-warm` label is caller-declared summary metadata; these
+observations do not independently establish sample warmness.
+
+This is a pure diagnostic projection, not a new compiler cache or authority:
+the original one-argument simulator and all plan certificates remain analytical.
+Supplied reports are not authenticated, synchronous timings include observation
+overhead, and admitted durations neither prove overlap nor model congestion.
+Native fresh-owner OpenCL/Level Zero controls compare projected durations with
+the actual captured samples using a deliberately permissive spread policy for
+nonflaky plumbing coverage, not a production calibration claim. Production
+stationarity, load-regime validation and overlap-conditioned route costs remain
+open, along with the unchanged real-model training acceptance.
+
+Focused simulator, compute-binding, AMR-plan and profile regression suites pass
+80 tests / 625 assertions. The native route-admission control passes on both
+local backends (1 test / 34 assertions); it checks projection of observed sample
+medians, not held-out predictive accuracy. Reports can be supplied to
+`simulate` with `:route-context` obtained from `raster.gpu.distributed/cost-context`
+on a fresh ready owner and an explicit `:route-policy` containing `:now-ms` and
+`:cold-warm`. Existing certificates never inherit these simulation options.
+
 ### October 9 distributed profiling hardware-evidence context
 
 Distributed profiling now retains the existing HardwareDescriptor evidence
