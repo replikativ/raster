@@ -1529,6 +1529,11 @@
                          :instances [instance] :outputs [output-id]})]
     (is (link/program-link-instance? instance))
     (is (link/link-plan? plan))
+    (let [storage (link/temporary-storage-plan plan)]
+      (is (= 4 (count (:bindings storage))) "three carry variants plus the suffix coexist")
+      (is (= 1536 (:resident-bytes storage)) "three body variants each retain 64 Double scratch elements")
+      (is (= [512 512 512 0] (mapv :resident-bytes (:bindings storage))))
+      (is (every? #(= :prepared-graph (:mode %)) (:bindings storage))))
     (with-redefs [gpu-link/instantiate!
                   (fn [& _] (throw (AssertionError. "loop proof must decline before allocation")))]
       (is (= :parallel-program-structured-execution-order

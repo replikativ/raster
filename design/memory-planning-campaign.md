@@ -73,6 +73,16 @@ Unknown or inapplicable size facts must remain explicit; they cannot count as
 zero scratch. Backend temporaries, staging, alignment and driver overhead remain
 separate exclusions until their own contracts are joined to the budget.
 
+The first join is opt-in: `resident-storage-plan`, `simulate` and the serial
+distributed runtime accept `:include-graph-temporaries? true`. LinkPlan's scratch
+projection adds separately prepared variants and bounds descriptor alternatives
+conservatively. Inapplicable or unresolved alternative sizing refuses this report;
+it is not credited as zero or used to change ordinary dispatch selection.
+Descriptor scratch currently consumes only its actual ABI scalar environment;
+direct graphs/programs also receive linked view extent facts. The projection must
+preserve that runtime distinction until a tested common binding contract replaces
+it. Default roots-only budgets are unchanged and explicitly incomplete.
+
 ### Certified independent forward/VJP state
 
 The explicit composition contract is implemented. The concrete acceptance case is a generated

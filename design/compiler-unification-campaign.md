@@ -4000,3 +4000,49 @@ compiler-plan versus runtime-bind comparisons and unchanged rollback behavior.
 Actual co-located AD/all-reduce/SGD checks pass on OpenCL and Level Zero (2 tests /
 154 assertions). Warm-REPL checks do not replace fresh CI or the original
 real-model training numerical acceptance, which remains open.
+
+### Dispatch-aware linked scratch and serial physical budgets
+
+`LinkPlan/temporary-storage-plan` uses the same descriptor ABI binding facts,
+linked physical extent facts, graph sizing and program staging as execution.
+Separately prepared variants retain separate scratch even when their graph is
+identical. Descriptor steps conservatively take the maximum across all declared
+alternatives, not only the preferred/default schedule. Inapplicable or unresolved
+alternative sizing refuses this optional report rather than silently contributing
+zero; it does not change ordinary dispatch admission or claim exact selection.
+
+Optional `:include-graph-temporaries? true` joins these requirements to the shared
+DistributedPlan resident-root accounting, simulator report and runtime admission.
+All roots remain resident, while the current synchronous runner releases each
+local executable after its compute action: physical root bytes plus the maximum
+local prepared scratch requirement is checked against the declared capacity.
+The default remains the explicitly roots-only budget; no surface arithmetic or
+ordinary execution behavior changes. Backend temporaries, host staging,
+alignment/driver overhead and available VRAM remain excluded, so this is still
+not a complete total-device memory proof or an asynchronous lifetime model.
+
+Focused LinkPlan/distributed checks pass 94 tests / 677 assertions, with the
+structured program check adding 1 test / 11 assertions. They cover a nonselected
+scratch alternative, Half storage width, physical extent binding, private scratch
+duplication, the three coexisting 512-byte loop variants, and serial max rather
+than scratch sum. Native AD/all-reduce/SGD checks with the stronger optional
+budget pass on OpenCL and Level Zero (2 tests / 154 assertions). These are
+warm-REPL results; fresh CI and exact-head review remain separate gates. The
+opt-in projection repeats structural validation; no preparation-time or kernel
+performance improvement is claimed. The original real-model gate remains open.
+
+Review caught a planner/runtime extent-environment mismatch for descriptor
+scratch. The projection now preserves the current binder distinction: descriptor
+scratch resolves only actual ABI scalars, while direct graphs/programs receive
+linked view extents. A regression rejects invented descriptor `(extent x)`
+values; the Half descriptor test sizes from its real `n` scalar, and the direct
+graph test independently exercises physical view extents. Generalizing this
+runtime boundary remains a separate task, not an inferred precision/shape fact.
+
+Hardware-free runtime admission regressions additionally exercise the public
+`instantiate!` entry with initialized inputs. Insufficient root or opt-in scratch
+budgets reject before session creation, allocation or upload; exact-fit budgets
+reach the deliberately stopped session boundary. Default roots-only behavior and
+malformed scratch options are checked independently. The admission and storage
+planner namespaces pass together (9 tests / 47 assertions). These boundary tests
+do not execute their synthetic kernel or establish total physical memory safety.
