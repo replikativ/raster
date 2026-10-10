@@ -50,6 +50,9 @@
         (vec
          (mapcat
           (fn [[idx [sym init]]]
+            (binding [util/*shadowing-locals*
+                      (into util/*shadowing-locals*
+                            (concat (keys param-env) (map first (take idx pairs))))]
             (let [head (call-head init)
                   resolved (when head (descriptor/resolve-buffer-semantics head))]
               (if-let [[entry _base-op] resolved]
@@ -59,10 +62,11 @@
                          ;; prefix; do not duplicate or drop them here. Explicit
                          ;; registered facets retain their independent authority.
                          (or (not (:auto-detected? entry))
-                             (every? #(effects/replay-safe-value?
+                             (every? #(and (not (seq? %))
+                                           (effects/replay-safe-value?
                                        % (merge param-env
                                                 (zipmap (map first (take idx pairs))
-                                                        (repeat nil))))
+                                                        (repeat nil)))))
                                      (call-args init))))
                   (let [args (call-args init)
                         in-place-idx (:in-place-arg entry)]
@@ -113,7 +117,7 @@
                   (do (swap! unchanged inc)
                       [[sym init]]))
                 (do (swap! unchanged inc)
-                    [[sym init]]))))
+                    [[sym init]])))))
           (map-indexed vector pairs)))
         all-bindings (vec (mapcat identity new-pairs))
         new-form (let [r (list* 'let* all-bindings body-exprs)]

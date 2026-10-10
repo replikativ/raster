@@ -166,6 +166,23 @@
           (is (= [3.0 0.0 0.0] (vec (eval form))))
           (is (zero? @calls)))))))
 
+(deftest core-named-caller-values-preserve-lexical-identity
+  (with-source
+    (fn [source]
+      (define-allocator 'local-name '[n :- Long]
+        '(let [out (double-array n)] (let [long 2] (aset out 0 (double n))) out))
+      (let [op (operation source "local-name" "long")
+            original (list 'let* ['long 3 'result (list op 'long)] 'result)
+            result (buffer-fuse/fuse-let original)]
+        (is (= 1 (get-in result [:stats :fresh-allocs])))
+        (is (= [3.0 0.0 0.0] (vec (eval original))))
+        (is (= (vec (eval original)) (vec (eval (:form result))))))
+      (let [original (list 'let* ['x 3 'result
+                                  (list (operation source "local-name" "long") '(long x))] 'result)
+            result (buffer-fuse/fuse-let original)]
+        (is (= original (:form result)) "expression actuals need typed evaluate-once transport")
+        (is (= (vec (eval original)) (vec (eval (:form result)))))))))
+
 (deftest replay-admission-requires-local-and-unshadowed-operation-evidence
   (is (not (effects/replay-safe-value? 'global-value)))
   (is (effects/replay-safe-value? 'local-value {'local-value nil}))
