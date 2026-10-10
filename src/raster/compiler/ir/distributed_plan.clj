@@ -1343,6 +1343,26 @@
   [plan]
   (readiness/check (validate! plan)))
 
+(defn check-retained-output-readiness
+  "Check startup readiness and preserve every retained output through the complete schedule.
+   A retained compute output may pass through initialized bytes, but no later compute or transfer
+   may write an overlapping physical range. This is a pure conservative final-frontier check,
+   not evidence of actual execution, authentication or temporal/communication lineage."
+  [plan]
+  (let [ready (check-readiness plan)
+        bindings (:bindings (compute-bindings plan))]
+    (doseq [[index action] (map-indexed vector (:actions ready))
+            :when (contains? (set (:outputs plan)) (:id action))
+            :let [local (get-in bindings [(:id action) :link-plan])]
+            node-id (:outputs local)
+            later (drop (inc index) (:actions ready))
+            write (:writes later)]
+      (when (buffer-view/overlaps? (get-in local [:nodes node-id :view]) write)
+        (fail! "a retained distributed output is overwritten before completion"
+               :distributed-runtime-output-overwritten
+               {:step (:id action) :node node-id :writer (:id later)})))
+    ready))
+
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
            halos device-plans copy-bindings refinements steps outputs attributes]

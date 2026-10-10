@@ -5,10 +5,14 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as view]
+            [raster.compiler.ir.distributed-plan :as distributed-plan]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-state :as state]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.validate :refer [exact-keys! fail! unique-by!]]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
+            [raster.gpu.distributed :as distributed]
             [raster.gpu.link :as link]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.runtime.numerical-content :as content]))
@@ -241,3 +245,226 @@
            (throw (ex-info "capture retains unresolved lease cleanup"
                            {::cleanup/unresolved owner} error))))
     (dissoc result ::cleanup/owner)))
+
+(defn- distributed-producers [plan prepared-entries]
+  (when-not (map? prepared-entries)
+    (fail! "distributed capture requires original Prepared entries"
+           :resident-state-distributed-producers {}))
+  (distributed-plan/check-retained-output-readiness plan)
+  (let [{:keys [bindings unbound]} (distributed-plan/compute-bindings plan)
+        steps (filterv #(= :compute (:kind %)) (:steps plan))
+        pairs (mapv (fn [step] [(:device step) (:entry (get bindings (:id step)))]) steps)
+        entries (vec (distinct pairs))]
+    (when-not (and (empty? unbound)
+                   (= (set entries) (set (keys prepared-entries))))
+      (fail! "distributed capture requires exact current bindings and every producing entry"
+             :resident-state-distributed-bindings {}))
+    (into {}
+          (map (fn [[worker entry :as key]]
+                 (let [prepared (get prepared-entries key)
+                       identity (compiled/execution-identity prepared)
+                       interface (compiled/producer-interface prepared)
+                       local (get-in plan [:device-plans worker :entries entry :link-plan])]
+                   (when-not (and (compiled/prepared? prepared)
+                                  (= local (compiled/plan prepared)))
+                     (fail! "distributed entry differs from its sealed source Prepared"
+                            :resident-state-distributed-producer {:entry key}))
+                   [key {:program (select-keys identity [:scope :fingerprint])
+                         :interface interface :plan local}])))
+          entries)))
+
+(defn- distributed-programs [plan producers]
+  (mapv (fn [entry] {:entry entry :program (:program (get producers entry))})
+        (distinct (map (fn [step]
+                         [(:device step) (get-in plan [:device-plans (:device step) :steps (:id step) :entry])])
+                       (filter #(= :compute (:kind %)) (:steps plan))))))
+
+(defn- distributed-field-source [plan producers {:keys [id step key]}]
+  (let [action (some #(when (= step (:id %)) %) (:steps plan))
+        entry [(:device action) (get-in plan [:device-plans (:device action) :steps step :entry])]
+        {:keys [interface] local :plan} (get producers entry)
+        ports (filterv #(= key (:key %)) (:outputs interface))
+        port (first ports)
+        node (:node port)
+        values (filterv #(= [node] (link-plan/value-node-ids local %))
+                        (link-plan/output-value-ids local))
+        physical (get-in local [:nodes node :view])]
+    (when-not (and (= :compute (:kind action)) (contains? (set (:outputs plan)) step)
+                   (= 1 (count ports))
+                   (= 1 (count (filter #(= node (:node %)) (:outputs interface))))
+                   (= 1 (count values)) (= (:dtype physical) (:dtype port))
+                   (= (:shape physical) (:shape port)) (view/contiguous? physical))
+      (fail! "distributed capture requires one retained public whole dense output leaf"
+             :resident-state-distributed-field {:field id :step step :key key}))
+    {:physical physical :target (:target local)
+     :producer {:field-id id :step step :entry entry :key key :value (first values) :node node
+                :physical-dtype (:dtype physical) :physical-shape (:shape physical)}}))
+
+(defn- distributed-field [executable producers outputs facts spec]
+  (when-not (map? spec)
+    (fail! "distributed capture field must be a map" :resident-state-field {}))
+  (exact-keys! "distributed capture field" :resident-state-field-keys spec
+               #{:id :step :key :value :coordinate-space :attributes})
+  (let [{:keys [id step key value coordinate-space attributes]
+         :or {coordinate-space {} attributes {}}} spec
+        {:keys [physical target producer]} (distributed-field-source (:plan executable) producers spec)
+        dt (when (keyword? (:dtype value)) (dtype/canon (:dtype value)))
+        _ (av/validate! value)
+        width (when dt (long (dtype/bytes-of dt)))
+        bytes (when width
+                (reduce #(Math/multiplyExact (long %1) (long %2)) width (:shape value)))]
+    (when-not (and (contains? (get outputs step) (:value producer))
+                   (plain-portable-tensor? value) (= dt (:dtype physical))
+                   (= (reduce *' (:shape value)) (reduce *' (:shape physical)))
+                   (= bytes (:byte-length physical)))
+      (fail! "distributed capture requires one retained public whole dense output leaf"
+             :resident-state-distributed-field {:field id :step step :key key}))
+    (let [validate-storage! #(distributed/storage-representation-description
+                              executable target dt (get facts [target dt]))
+          representation (validate-storage!)
+          byte-order (if (= :order-invariant (:byte-order representation))
+                       :little-endian (:byte-order representation))
+          _ (when-not (contains? state/byte-orders byte-order)
+              (fail! "distributed capture requires measured byte order"
+                     :resident-state-representation {:field id}))
+          value-id (:value producer)
+          resident (get-in outputs [step value-id])
+          reader (content/element-byte-reader
+                  bytes width
+                  (fn [start elements destination]
+                    (validate-storage!)
+                    (gpu/download-range! (get (:sessions executable) target) resident destination
+                                         {:src-element start :elements elements})))
+          address (content/content-address-from-reader bytes reader)
+          shape (:shape value)
+          field (state/field
+                 {:id id :value (av/tensor {:dtype dt :shape shape})
+                  :coordinate-space coordinate-space :attributes attributes :chunk-shape shape
+                  :chunks [(state/chunk {:id 0 :offsets (vec (repeat (count shape) 0)) :shape shape
+                                         :logical-byte-length bytes :stored-byte-length bytes
+                                         :content address :storage {:format :raw-array
+                                                                  :byte-order byte-order}})]})]
+      {:field field :reader reader :bytes bytes :address address
+       :representation representation :validate-storage! validate-storage!
+       :producer (assoc producer :content address)})))
+
+(defn capture-distributed!
+  "Capture retained whole outputs of an original completed DistributedExecutable.
+
+   prepared-entries maps [logical-worker entry] to every original sealed source Prepared.
+   facts maps [physical-target canonical-dtype] to original owner-bound storage observations.
+   Ordered field specs name :id, retained :step and public output :key, a plain portable :value,
+   and optional :coordinate-space/:attributes. Equal-volume dense reshape is explicit in the
+   semantic value; the physical shape is independently retained in producer provenance.
+
+   Identity is entry-scoped, not a fingerprint of host initializers or the whole communication
+   history. Field meanings, coordinates and numerical policy remain application declarations.
+   Retain the owner's output scope through bounded downloads, hashing and synchronous ingestion.
+   Certify all fields before writes and recheck representation after every provider callback,
+   including the final one. Capture is not durable publication: finalize-state-availability!
+   must independently verify/promote content before publishing metadata. Failure may orphan blobs.
+   Composite, aliased public ports and strided/packed fields require an explicit codec vertical."
+  [executable prepared-entries facts provider target-tier opts]
+  (when-not (and (map? opts) (map? facts))
+    (fail! "distributed capture requires options and representation facts"
+           :resident-state-options {}))
+  (exact-keys! "distributed capture options" :resident-state-option-keys opts
+               #{:id :parents :logical-coordinate :fields :numerical-contract :attributes})
+  (when-not (and (vector? (:fields opts)) (seq (:fields opts)))
+    (fail! "distributed capture requires ordered field specifications" :resident-state-fields {}))
+  (unique-by! "distributed capture fields" :resident-state-field-identities :id (:fields opts))
+  (when-not (distributed/original-executable? executable)
+    (fail! "distributed capture requires its original execution owner" :distributed-runtime-owner {}))
+  (when-not (= (:bindings executable) (:bindings (distributed-plan/compute-bindings (:plan executable))))
+    (fail! "distributed capture bindings differ from the retained plan" :resident-state-distributed-bindings {}))
+  (let [producers (distributed-producers (:plan executable) prepared-entries)]
+    (distributed/with-output-values!
+     executable
+     (fn [outputs]
+       (let [entries (mapv #(distributed-field executable producers outputs facts %) (:fields opts))
+             programs (distributed-programs (:plan executable) producers)
+             provenance {:scope :completed-distributed-entry-outputs
+                         :semantic-authority :application-declared
+                         :program-fingerprint (fingerprint/fingerprint programs)
+                         :programs programs
+                         :field-producers (mapv :producer entries)
+                         :representations (mapv :representation entries)}
+             certified (state/certify
+                        (state/manifest (assoc (dissoc opts :fields) :fields (mapv :field entries)
+                                               :provenance provenance)))
+             revalidate! #(doseq [{:keys [validate-storage!]} entries] (validate-storage!))
+             placements (mapv (fn [{:keys [field reader bytes address]}]
+                                (let [placement (content/ingest-content! provider address target-tier
+                                                                          bytes reader)]
+                                  (revalidate!)
+                                  {:field-id (:id field) :chunk-id 0 :placement placement})) entries)]
+         (revalidate!)
+         {:state certified :placements placements})))))
+
+(defn verify-distributed-restore!
+  "Check entry-scoped captured producer/encoding consistency before any provider access.
+   The source plan and original Prepared entries are independent expectations; the old owner
+   need not be alive. Ordered field specs contain :id, :step and public :key. expected-semantics
+   independently checks the complete fields, coordinates and numerical policy. This is not
+   authentication, input/communication history, temporal lineage, parent existence or byte
+   integrity. Reopen and verify content separately, then use freshly measured target storage.
+   Shared source-binding admission is identical to capture; no ABI-name or first-output guessing."
+  [certified expected-semantics source-plan prepared-entries field-specs]
+  (state/verify-restore-semantics! certified expected-semantics)
+  (when-not (and (vector? field-specs) (seq field-specs) (every? map? field-specs))
+    (fail! "distributed restore requires ordered source field specifications"
+           :resident-state-producer-fields {}))
+  (doseq [spec field-specs]
+    (exact-keys! "distributed restore field source" :resident-state-producer-field-keys spec #{:id :step :key}))
+  (unique-by! "distributed restore fields" :resident-state-field-identities :id field-specs)
+  (let [sources (distributed-producers source-plan prepared-entries)
+        programs (distributed-programs source-plan sources)
+        bindings (mapv #(distributed-field-source source-plan sources %) field-specs)
+        manifest (:manifest certified)
+        provenance (:provenance manifest)
+        actual (:field-producers provenance)
+        representations (:representations provenance)
+        fields (:fields manifest)]
+    (exact-keys! "distributed captured provenance" :resident-state-provenance provenance
+                 #{:scope :semantic-authority :program-fingerprint :programs :field-producers :representations})
+    (when-not (and (= :completed-distributed-entry-outputs (:scope provenance))
+                   (= :application-declared (:semantic-authority provenance))
+                   (fingerprint/equivalent? programs (:programs provenance))
+                   (= (fingerprint/fingerprint programs) (:program-fingerprint provenance)))
+      (fail! "distributed captured state differs from its independently supplied entry programs"
+             :resident-state-producer-program {}))
+    (when-not (and (vector? actual) (vector? representations)
+                   (= (count fields) (count actual) (count representations) (count bindings))
+                   (= (mapv :id fields) (mapv :id field-specs)))
+      (fail! "distributed captured field order or coverage differs from its source bindings"
+             :resident-state-producer-bindings {}))
+    (doseq [[binding producer field representation] (map vector bindings actual fields representations)]
+      (exact-keys! "distributed captured field producer" :resident-state-producer-bindings producer
+                   #{:field-id :step :entry :key :value :node :physical-dtype :physical-shape :content})
+      (when-not (fingerprint/equivalent? (:producer binding) (dissoc producer :content))
+        (fail! "distributed captured field differs from its exact source port"
+               :resident-state-producer-bindings {:field (:id field)}))
+      (let [value (:value field) shape (:shape value)
+            physical (:physical binding) dt (:dtype physical)
+            bytes (reduce #(Math/multiplyExact (long %1) (long %2))
+                          (long (dtype/bytes-of dt)) shape)
+            chunks (:chunks field) chunk (first chunks)
+            byte-order (if (= :order-invariant (:byte-order representation))
+                         :little-endian (:byte-order representation))]
+        (when-not (and (= :raster.distributed/resident-representation-v1 (:kind representation))
+                       (= dt (:dtype representation)) (= (:target binding) (:target representation))
+                       (contains? state/byte-orders byte-order)
+                       (= byte-order (get-in chunk [:storage :byte-order])))
+          (fail! "distributed captured representation disagrees with its field storage"
+                 :resident-state-representation {:field (:id field)}))
+        (when-not (and (plain-portable-tensor? value) (= dt (:dtype value))
+                       (= (reduce *' shape) (reduce *' (:shape physical)))
+                       (= 1 (count chunks)) (= 0 (:id chunk))
+                       (= shape (:chunk-shape field) (:shape chunk))
+                       (= (vec (repeat (count shape) 0)) (:offsets chunk))
+                       (= bytes (:byte-length physical) (:logical-byte-length chunk) (:stored-byte-length chunk))
+                       (= {:format :raw-array :byte-order byte-order} (:storage chunk))
+                       (= (:content chunk) (:content producer)))
+          (fail! "distributed captured chunk disagrees with its whole dense source field"
+                 :resident-state-producer-content {:field (:id field)}))))
+    certified))

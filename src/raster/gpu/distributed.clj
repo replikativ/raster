@@ -153,7 +153,7 @@
   ([plan] (instantiate! plan {}))
   ([plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
           :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false}}]
-   (let [ready (distributed/check-readiness plan)
+   (let [ready (distributed/check-retained-output-readiness plan)
          schedule (schedule plan)
          _ (when-not (contains? #{nil :host-staged :resident-copy} transport)
              (throw (ex-info "unsupported distributed transport"
@@ -174,16 +174,6 @@
          (distributed/resident-storage-plan plan {:device-capacities device-capacities
                                                  :include-graph-temporaries? include-graph-temporaries?})
          projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %)))
-         _ (doseq [[index action] (map-indexed vector (:actions ready))
-                   :when (contains? (set (:outputs plan)) (:id action))
-                   :let [local (get-in bindings [(:id action) :link-plan])]
-                   node-id (:outputs local)
-                   later (drop (inc index) (:actions ready))
-                   write (:writes later)]
-             (when (view/overlaps? (get-in local [:nodes node-id :view]) write)
-               (throw (ex-info "a retained distributed output is overwritten before completion"
-                               {:reason :distributed-runtime-output-overwritten :step (:id action)
-                                :node node-id :writer (:id later)}))))
          sessions (atom {})]
      (try
        (doseq [[device entries] (sort-by (comp pr-str key) (group-by (comp first key) specs))]
