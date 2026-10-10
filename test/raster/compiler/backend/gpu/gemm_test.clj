@@ -112,6 +112,15 @@
         (is (= used? (contains? (body/required-scalar-dtypes (get-in selected [:body :operations])) :double)))
         (is (= selected (mixed-body/schedule-for-node node g {:scalar-math policy})))
         (when used?
+          (let [emitted (gemm/emit-scheduled-stage-graph
+                         g {:scalar-math policy :prefix "selected_matrix_math"})
+                emitted-node (first (filter #(= (:id node) (:id %)) (:nodes emitted)))
+                certificate (artifact/attribute (:operation emitted-node) :scheduled-kernel-body)]
+            (is (= policy (get-in certificate [:numerics :scalar-math])))
+            (is (contains? (body/required-scalar-dtypes (get-in certificate [:body :operations])) :double))
+            (is (identical? certificate (scheduled-body/validate-against-math-policy! certificate policy)))
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (scheduled-body/validate-against-math-policy! certificate nil))))
           (is (not= (:body ordinary) (:body selected)))
           (is (thrown? clojure.lang.ExceptionInfo
                        (scheduled-body/validate! (update selected :numerics dissoc :scalar-math)))))))))

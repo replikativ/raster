@@ -349,19 +349,23 @@
                         scheduled-equation-body]
                  :or {kernel-name-prefix "segmented_fold_map"
                       target-dialect :opencl-intel
-                      scalar-types {} array-types {}}}]
+                      scalar-types {} array-types {}} :as opts}]
   (let [scheduled
         (segfoldmap-body/schedule
-         segfoldmap {:workgroup-size workgroup-size
-                     :scalar-types scalar-types :array-types array-types})
+         segfoldmap (merge {:workgroup-size workgroup-size
+                           :scalar-types scalar-types :array-types array-types}
+                          (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))
             (throw (ex-info "fold-map graph certification requires both node and graph"
                             {:reason :segfoldmap-graph-context
                              :graph-node graph-node :kernel-graph kernel-graph})))
         _ (when graph-node
-            (segfoldmap-body/validate-against-node!
-             scheduled graph-node kernel-graph
-             scheduled-equation-algorithm scheduled-equation-body))
+            (if (contains? opts :scalar-math)
+              (segfoldmap-body/validate-against-node!
+               scheduled graph-node kernel-graph scheduled-equation-algorithm scheduled-equation-body
+               (select-keys opts [:scalar-math]))
+              (segfoldmap-body/validate-against-node!
+               scheduled graph-node kernel-graph scheduled-equation-algorithm scheduled-equation-body)))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
     artifact))
@@ -372,7 +376,7 @@
                    graph-node kernel-graph]
              :or {kernel-name-prefix "segmap"
                   target-dialect :opencl-intel workgroup-size 256
-                  scalar-types {} array-types {}}}]
+                  scalar-types {} array-types {}} :as opts}]
   (when (not= (some? graph-node) (some? kernel-graph))
     (throw (ex-info "map graph certification requires both node and graph"
                     {:reason :segmap-graph-context
@@ -393,9 +397,10 @@
                     segmap)
         scheduled
         (segmap-body/schedule projected
-                              {:workgroup-size workgroup-size
+                              (merge {:workgroup-size workgroup-size
                                :scalar-types scalar-types :array-types array-types
-                               :array-shapes array-shapes})
+                               :array-shapes array-shapes}
+                                     (select-keys opts [:scalar-math])))
         ;; The projected operation is private schedule input. ScheduledKernelBody remains a
         ;; refinement of the exact semantic graph node, which is what later binding validates.
         scheduled (if graph-node (assoc scheduled :source segmap) scheduled)
@@ -411,12 +416,13 @@
                      graph-node kernel-graph]
               :or {kernel-name-prefix "segstencil"
                    target-dialect :opencl-intel
-                   scalar-types {} array-types {}}}]
+                   scalar-types {} array-types {}} :as opts}]
   (let [workgroup-size (or workgroup-size (get-in stencil [:grid :block-size]) 256)
         scheduled
         (segstencil-body/schedule
-         stencil {:workgroup-size workgroup-size
-                  :scalar-types scalar-types :array-types array-types})
+         stencil (merge {:workgroup-size workgroup-size
+                         :scalar-types scalar-types :array-types array-types}
+                        (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))
             (throw (ex-info "stencil graph certification requires both node and graph"
                             {:reason :segstencil-graph-context
@@ -441,19 +447,23 @@
                             graph-node kernel-graph coordinate-proof
                             scheduled-equation-algorithm scheduled-equation-body]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
-                          array-types {} target-dialect :opencl-intel}}]
+                          array-types {} target-dialect :opencl-intel} :as opts}]
   (let [scheduled
         (segred-body/schedule segred out-sym
-                             {:dtype dtype :array-types array-types
-                              :scalar-types scalar-types :coordinate-proof coordinate-proof})
+                             (merge {:dtype dtype :array-types array-types
+                                     :scalar-types scalar-types :coordinate-proof coordinate-proof}
+                                    (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))
             (throw (ex-info "scalar reduction graph certification requires both node and graph"
                             {:reason :segred-graph-context
                              :graph-node graph-node :kernel-graph kernel-graph})))
         _ (when graph-node
-            (segred-body/validate-against-node! scheduled graph-node kernel-graph
-                                               scheduled-equation-algorithm
-                                               scheduled-equation-body))
+            (if (contains? opts :scalar-math)
+              (segred-body/validate-against-node! scheduled graph-node kernel-graph
+                                                scheduled-equation-algorithm scheduled-equation-body
+                                                (select-keys opts [:scalar-math]))
+              (segred-body/validate-against-node! scheduled graph-node kernel-graph
+                                                scheduled-equation-algorithm scheduled-equation-body)))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         output (some #(when (= :result (:role %)) (:id %))
                      (get-in scheduled [:body :parameters]))
@@ -475,13 +485,14 @@
   [operation & {:keys [dtype kernel-name-prefix scalar-types array-types array-shapes target-dialect
                       graph-node kernel-graph]
                 :or {kernel-name-prefix "segmap" scalar-types {} array-types {}
-                     target-dialect :opencl-intel}}]
+                     target-dialect :opencl-intel} :as opts}]
   (let [dtype (or (:dtype operation) dtype :double)]
-    (generate-segmap-kernel-body
-     operation :dtype dtype :scalar-types scalar-types :array-types array-types
-     :array-shapes array-shapes
-     :graph-node graph-node :kernel-graph kernel-graph
-     :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix)))
+    (apply generate-segmap-kernel-body operation
+           (mapcat identity
+                   (merge {:dtype dtype :scalar-types scalar-types :array-types array-types
+                           :array-shapes array-shapes :graph-node graph-node :kernel-graph kernel-graph
+                           :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix}
+                          (select-keys opts [:scalar-math]))))))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
@@ -493,19 +504,21 @@
                             graph-node kernel-graph coordinate-proof
                             scheduled-equation-algorithm scheduled-equation-body]
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
-                          array-types {} target-dialect :opencl-intel}}]
+                          array-types {} target-dialect :opencl-intel} :as opts}]
   (when (seq (segop/seg-space-segment-dims (:space segred)))
     (throw (ex-info
             "segmented reductions require a verified contraction schedule"
             {:reason :segmented-reduction-requires-contraction-schedule
              :operation (:id segred) :fallback :none})))
   (try
-    (generate-segred-kernel-body
-     segred out-sym :dtype dtype :kernel-name-prefix kernel-name-prefix
-     :scalar-types scalar-types :array-types array-types :target-dialect target-dialect
-     :graph-node graph-node :kernel-graph kernel-graph :coordinate-proof coordinate-proof
-     :scheduled-equation-algorithm scheduled-equation-algorithm
-     :scheduled-equation-body scheduled-equation-body)
+    (apply generate-segred-kernel-body segred out-sym
+           (mapcat identity
+                   (merge {:dtype dtype :kernel-name-prefix kernel-name-prefix
+                           :scalar-types scalar-types :array-types array-types :target-dialect target-dialect
+                           :graph-node graph-node :kernel-graph kernel-graph :coordinate-proof coordinate-proof
+                           :scheduled-equation-algorithm scheduled-equation-algorithm
+                           :scheduled-equation-body scheduled-equation-body}
+                          (select-keys opts [:scalar-math]))))
     (catch clojure.lang.ExceptionInfo exception
       (when-not (segred-body/declined? exception) (throw exception))
       (let [decline (assoc (ex-data exception) :fallback :none)]
@@ -551,7 +564,7 @@
    HIP consume the same scheduled bodies; this boundary contains no source-template fallback."
   [graph & {:keys [kernel-name-prefix scalar-types array-types target-dialect]
             :or {kernel-name-prefix "segscan" scalar-types {} array-types {}
-                 target-dialect :opencl-intel}}]
+                 target-dialect :opencl-intel} :as opts}]
   (let [graph (kgraph/validate! graph)
         algebra (get-in graph [:attributes :scan-algebra])
         scan-mode (or (get-in graph [:attributes :scan-mode]) :inclusive)
@@ -573,7 +586,8 @@
          graph
          (fn [{:keys [id] :as node}]
            (let [scheduled (segscan-body/schedule-for-node
-                            node graph {:scalar-types scalar-types})
+                            node graph (merge {:scalar-types scalar-types}
+                                              (select-keys opts [:scalar-math])))
                  phase (get-in scheduled [:attributes :phase])
                  kernel-name (str kernel-name-prefix "_" (str/replace (name phase) "-" "_")
                                   "_" (gensym ""))
@@ -588,7 +602,7 @@
 
 (defn- generate-elementwise-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect]
-          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel} :as opts}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
         scalar-types (merge scalar-types
                             (into {} (map (juxt :id :dtype)) (:scalars graph)))
@@ -606,21 +620,20 @@
          (fn [{:keys [id operation] :as node}]
            (cond
              (segop/seg-map? operation)
-             (generate-scheduled-segmap-kernel
-              operation :dtype (:dtype operation)
-              :scalar-types scalar-types :array-types array-types
-              :array-shapes static-shapes
-              :graph-node node :kernel-graph graph
-              :target-dialect target-dialect
-              :kernel-name-prefix "graph_segmap")
+             (apply generate-scheduled-segmap-kernel operation
+                    (mapcat identity
+                            (merge {:dtype (:dtype operation) :scalar-types scalar-types :array-types array-types
+                                    :array-shapes static-shapes :graph-node node :kernel-graph graph
+                                    :target-dialect target-dialect :kernel-name-prefix "graph_segmap"}
+                                   (select-keys opts [:scalar-math]))))
 
              (segop/seg-stencil? operation)
-             (generate-segstencil-kernel-body
-              operation :scalar-types scalar-types :array-types array-types
-              :target-dialect target-dialect
-              :kernel-name-prefix "graph_segstencil"
-              :graph-node node
-              :kernel-graph graph)
+             (apply generate-segstencil-kernel-body operation
+                    (mapcat identity
+                            (merge {:scalar-types scalar-types :array-types array-types
+                                    :target-dialect target-dialect :kernel-name-prefix "graph_segstencil"
+                                    :graph-node node :kernel-graph graph}
+                                   (select-keys opts [:scalar-math]))))
 
              :else
              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
@@ -633,7 +646,7 @@
                  contraction-facts schedule
                  scheduled-equation-algorithm scheduled-equation-body]
           :or {scalar-types {} array-types {} target-dialect :opencl-intel
-               contraction-facts {}}}]
+               contraction-facts {}} :as opts}]
   (let [array-types (graph-array-types graph array-types)
         emitted
         (kgraph/map-operations
@@ -642,8 +655,10 @@
            (if (= :product (:phase operation))
              (kernel-body-target/emit-artifact
               (str "graph_product_" (gensym ""))
-              (product-body/schedule-for-node node graph scheduled-equation-algorithm
-                                               scheduled-equation-body)
+              (if (contains? opts :scalar-math)
+                (product-body/schedule-for-node node graph scheduled-equation-algorithm
+                                               scheduled-equation-body (select-keys opts [:scalar-math]))
+                (product-body/schedule-for-node node graph scheduled-equation-algorithm scheduled-equation-body))
               target-dialect)
              (let [outputs (vec (:outputs operation))]
              (when-not (= 1 (count outputs))
@@ -659,20 +674,21 @@
                      descriptor (or target-descriptor (hw/descriptor-for target-device))
                      scheduled (contraction-schedule/schedule-for-node
                                 node graph facts descriptor
-                                {:array-types array-types :scalar-types scalar-types
-                                 :schedule schedule})]
+                                (merge {:array-types array-types :scalar-types scalar-types
+                                        :schedule schedule}
+                                       (select-keys opts [:scalar-math])))]
                  (kernel-body-target/emit-artifact
                   (str "graph_contraction_" (gensym "")) scheduled target-dialect))
                ;; Scalar reductions are certified against their complete graph context before
                ;; projection. Do not add the older artifact-only operation wrapper outside it.
-               (generate-segred-kernel
-                operation (first outputs)
-                :dtype (:dtype operation)
-                :scalar-types scalar-types :array-types array-types
-                :target-dialect target-dialect
-                :scheduled-equation-algorithm scheduled-equation-algorithm
-                :scheduled-equation-body scheduled-equation-body
-                :graph-node node :kernel-graph graph))))))]
+               (apply generate-segred-kernel operation (first outputs)
+                      (mapcat identity
+                              (merge {:dtype (:dtype operation) :scalar-types scalar-types :array-types array-types
+                                      :target-dialect target-dialect
+                                      :scheduled-equation-algorithm scheduled-equation-algorithm
+                                      :scheduled-equation-body scheduled-equation-body
+                                      :graph-node node :kernel-graph graph}
+                                     (select-keys opts [:scalar-math])))))))))]
     (finalize-emitted-graph
      emitted
      (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
@@ -681,7 +697,7 @@
 (defn- generate-fold-map-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect scheduled-equation-algorithm
                  scheduled-equation-body]
-          :or {scalar-types {} array-types {} target-dialect :opencl-intel}}]
+          :or {scalar-types {} array-types {} target-dialect :opencl-intel} :as opts}]
   (let [target (kernel-body-c-dialect/resolve! target-dialect)
         array-types (graph-array-types graph array-types)
         emitted
@@ -689,14 +705,14 @@
          graph
          (fn [{:keys [operation] :as node}]
            (try
-             (generate-segfoldmap-kernel
-              operation :scalar-types scalar-types :array-types array-types
-              :target-dialect target-dialect
-              :kernel-name-prefix "graph_segmented_fold_map"
-              :graph-node node
-              :kernel-graph graph
-              :scheduled-equation-algorithm scheduled-equation-algorithm
-              :scheduled-equation-body scheduled-equation-body)
+             (apply generate-segfoldmap-kernel operation
+                    (mapcat identity
+                            (merge {:scalar-types scalar-types :array-types array-types
+                                    :target-dialect target-dialect :kernel-name-prefix "graph_segmented_fold_map"
+                                    :graph-node node :kernel-graph graph
+                                    :scheduled-equation-algorithm scheduled-equation-algorithm
+                                    :scheduled-equation-body scheduled-equation-body}
+                                   (select-keys opts [:scalar-math]))))
              (catch clojure.lang.ExceptionInfo exception
                (if (and (not (kernel-body-c-dialect/opencl? target))
                         (segfoldmap-body/declined? exception))
@@ -717,14 +733,16 @@
 (defn- generate-staged-contraction-graph
   [graph {:keys [target-dialect scalar-types scheduled-equation-algorithm
                  scheduled-equation-body]
-          :or {target-dialect :opencl-intel scalar-types {}}}]
+          :or {target-dialect :opencl-intel scalar-types {}} :as opts}]
   (let [emitted (kgraph/map-operations
                  graph
                  (fn [node]
                    (kernel-body-target/emit-artifact
                     (str "graph_staged_" (gensym ""))
-                    (staged-body/schedule-for-node node graph scheduled-equation-algorithm
-                                                   scheduled-equation-body)
+                    (if (contains? opts :scalar-math)
+                      (staged-body/schedule-for-node node graph scheduled-equation-algorithm
+                                                    scheduled-equation-body (select-keys opts [:scalar-math]))
+                      (staged-body/schedule-for-node node graph scheduled-equation-algorithm scheduled-equation-body))
                     target-dialect)))]
     (finalize-emitted-graph emitted
                             (kernel-body-c-dialect/target
@@ -734,7 +752,7 @@
 (defn- generate-certified-body-graph
   "Project already scheduled bodies without recognizing their operation families again."
   [graph {:keys [scheduled-bodies scalar-types target-dialect]
-          :or {scalar-types {} target-dialect :opencl-intel}}]
+          :or {scalar-types {} target-dialect :opencl-intel} :as opts}]
   (when-not (and (seq (:nodes graph))
                  (map? scheduled-bodies)
                  (= (set (map :id (:nodes graph))) (set (keys scheduled-bodies))))
@@ -746,8 +764,9 @@
         (kgraph/map-operations
          graph
          (fn [node]
-           (let [certificate (scheduled-body/validate-against-node!
-                              (get scheduled-bodies (:id node)) node graph)]
+           (let [certificate (scheduled-body/validate-against-math-policy!
+                              (get scheduled-bodies (:id node)) (:scalar-math opts))
+                 certificate (scheduled-body/validate-against-node! certificate node graph)]
              (kernel-body-target/emit-artifact
               (str "graph_scheduled_" (gensym "")) certificate target-dialect))))
         strategies (set (map (comp :strategy :attributes)

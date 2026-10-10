@@ -2587,6 +2587,8 @@
                     :grf-bytes-per-lane 256 :machine-lanes 8192 :shared-local-memory 131072}
         plan (mixed-candidate/plan algorithm source descriptor {:precision :mixed-f16-f32})
         policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
+        selected-plan (mixed-candidate/plan algorithm source descriptor
+                                            {:precision :mixed-f16-f32 :scalar-math policy})
         ordinary (mixed-validation/validate-reconstruction! algorithm source (:refinement plan))
         selected (mixed-validation/validate-reconstruction!
                   algorithm source (:refinement plan) {:scalar-math policy})
@@ -2594,6 +2596,10 @@
                                          (:nodes (:graph selected))))
         certificate (nth (:stage-bodies selected) matrix-index)]
     (is (:ok plan))
+    (is (:ok selected-plan))
+    (is (= (:graph selected) (:graph selected-plan)))
+    (is (= (:stage-bodies selected) (:stage-bodies selected-plan)))
+    (is (= (:numerical-model selected) (:numerical-model selected-plan)))
     (is (= (:graph ordinary) (:graph selected)))
     (is (= (:complete-write-domains ordinary) (:complete-write-domains selected)))
     (is (= (get-in ordinary [:numerical-model :contract])
@@ -2604,6 +2610,24 @@
     (is (not= (:stage-bodies ordinary) (:stage-bodies selected)))
     (is (thrown? clojure.lang.ExceptionInfo
                  (scheduled-body/validate! (update certificate :numerics dissoc :scalar-math))))
+    (let [node (first (:nodes source))
+          request {:scalar-math policy}
+          options (merge request
+                         {:target-dialect :opencl-intel :target-descriptor descriptor
+                          :array-types {'A :float 'B :float 'C :float}
+                          :scalar-types {'m :int 'n :int 'k :int}
+                          :contraction-facts {(:id (:operation node))
+                                              (:facts (contraction-context/validate-semantic!
+                                                       algorithm (:operation node)))}
+                          :scheduled-equation-algorithm algorithm :scheduled-equation-body (:body derived)})
+          plain (segop-opencl/generate-kernel-graph source options)
+          reference (emitted-equation/make algorithm (:body derived) plain {} request)
+          candidate (c-family/emit-mixed-contraction-alternative
+                     reference (merge options {:schedule {:precision :mixed-f16-f32}}))]
+      (is (:ok candidate))
+      (is (identical? (:candidate candidate)
+                      (emitted-equation/validate! (:candidate candidate) request)))
+      (is (thrown? clojure.lang.ExceptionInfo (emitted-equation/validate! (:candidate candidate)))))
     (let [emitted (update (:graph selected) :nodes
                           #(mapv (fn [index node stage]
                                    (assoc node :operation
