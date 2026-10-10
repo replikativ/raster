@@ -112,6 +112,43 @@
                               {'x :float})
               nil))))))
 
+(deftest horizontal-candidate-enumeration-checks-each-map-once
+  (let [program (source-program
+                 '(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))
+                         v (raster.par/pmap j m float (+ (aget b j) 2.0))
+                         w (raster.par/pmap k k-size float (+ (aget c k) 3.0))
+                         z (raster.par/pmap l l-size float (+ (aget d l) 4.0))]
+                        [u v w z])
+                 {'a :float 'b :float 'c :float 'd :float}
+                 {'n :long 'm :long 'k-size :long 'l-size :long})
+        calls (atom [])
+        proof-var #'typed-fusion/exceptional-conversion-region?
+        original @proof-var]
+    (is (nil? (with-redefs-fn
+                {proof-var (fn [p map-info]
+                             (swap! calls conj (:id map-info))
+                             (original p map-info))}
+                #(#'typed-fusion/horizontal-candidate program))))
+    (is (= 4 (count @calls)))
+    (is (every? #(= 1 %) (vals (frequencies @calls))))
+    (reset! calls [])
+    ;; A fresh enumeration does not reuse the prior nontrapping result. Short-circuiting
+    ;; rejects each pair at its left operand, so the final map needs no check at all.
+    (is (nil? (with-redefs-fn
+                {proof-var (fn [_ map-info] (swap! calls conj (:id map-info)) true)}
+                #(#'typed-fusion/horizontal-candidate program))))
+    (is (= 3 (count @calls)))
+    (is (every? #(= 1 %) (vals (frequencies @calls))))
+    (is (nil? (with-redefs-fn
+                {proof-var (fn [& _] (throw (ex-info "unpaired map proof was forced" {})))}
+                #(#'typed-fusion/horizontal-candidate
+                  (source-program '(let* [u (raster.par/pmap i n float (aget a i))] u)
+                                  {'a :float}))))))
+  (let [program (source-program horizontal-map-source {'a :float 'b :float})]
+    (is (= {:left-index 0 :right-index 1}
+           (select-keys (#'typed-fusion/horizontal-candidate program)
+                        [:left-index :right-index])))))
+
 (deftest horizontal-fusion-preserves-checked-map-completion-order
   (let [source '(let* [u (raster.par/map! left i n int
                                            (clojure.core/aget long-input i))
