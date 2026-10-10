@@ -24,7 +24,8 @@
    without a cycle."
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.buffer-view :as bview]
-            [raster.gpu.runtime-backend :as runtime-backend])
+            [raster.gpu.runtime-backend :as runtime-backend]
+            [raster.runtime.artifact-provenance :as provenance])
   (:import [java.lang.ref Cleaner]
            [java.util.concurrent.atomic AtomicBoolean]))
 
@@ -239,9 +240,15 @@
         ((rt-fn (:device da) "free-buffer!") (:buffer da)))))
   nil)
 
-(defrecord DonatedBuffer [buffer device view owner claimed])
+(defrecord DonatedBuffer [buffer device view owner])
 
-(defn donated-buffer? [x] (instance? DonatedBuffer x))
+(defonce ^:private donation-issuer (provenance/issuer))
+(defonce ^:private donation-state-key (Object.))
+
+(defn donated-buffer?
+  "True only for the original token issued by consume!, not a copied record."
+  [x]
+  (and (instance? DonatedBuffer x) ((:authentic? donation-issuer) x)))
 
 (defn consume!
   "Consume a DeviceArray for donation and return a single-use DonatedBuffer token carrying its
@@ -257,7 +264,12 @@
       (throw (ex-info "DeviceArray consumed concurrently"
                       {:owner (:owner da) :shape (:shape da)})))
     (let [claimed (AtomicBoolean. false)
-          donation (->DonatedBuffer (:buffer da) (:device da) (:view da) (:owner da) claimed)]
+          donation ((:seal donation-issuer)
+                    (assoc (->DonatedBuffer (:buffer da) (:device da) (:view da) (:owner da))
+                           ;; The authoritative CAS state is shared with the Cleaner,
+                           ;; but not exposed as caller-resettable record data.
+                           :claim-state (fn [key]
+                                          (when (identical? key donation-state-key) claimed))))]
       ;; Ownership must remain reclaimable while it is between the consumed input and output.
       (arm-cleaner! donation claimed (:buffer da) (:device da) (= ::owned (:owner da)))
       donation)))
@@ -280,7 +292,8 @@
                             {:dtype dtype :buffer-dtype (get-in donation [:view :dtype])})))
         view (bview/subview (:view donation) {:dtype dtype :shape (vec shape)})
         _ (validate-device-view! (:buffer donation) (:device donation) dtype shape view)]
-    (when-not (.compareAndSet ^AtomicBoolean (:claimed donation) false true)
+    ;; Issuance admission above precedes invocation of any token-held closure.
+    (when-not (.compareAndSet ^AtomicBoolean ((:claim-state donation) donation-state-key) false true)
       (throw (ex-info "donated buffer token was already claimed" {})))
     (make-device-array (:buffer donation) (:device donation) dtype shape owner nil view)))
 
