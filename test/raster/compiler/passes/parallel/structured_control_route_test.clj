@@ -785,7 +785,28 @@
     (is (some? first-layer-rows))
     (is (every? #(contains? (:scalar-values %) first-layer-rows) staging)
         "program shape facts remain available when a later kernel has no ABI use for them")
-    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))))
+    (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))
+    (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+          emitted (:emitted compilation)
+          materialized (materialization/materialize invocation-plan arguments evaluate-test-scalar)
+          proof (emitted-program/validate-with-physical-results! emitted request)
+          projected (invocation-link/lower materialized emitted :ze:0 nil
+                                           (fn [plan] {:plan plan}) proof request)
+          certified (invocation-link/certify-final-projection projected request)
+          checked (invocation-link/certify (:plan projected) nil request)]
+      (is (= (set (:outputs linked-plan)) (set (get-in projected [:plan :outputs]))))
+      (is (= 0 (get-in projected [:plan :attributes :driver-allocations])))
+      (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected) request))
+      (is (not (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected))))
+      (is (identical? certified (invocation-link/verify! certified request)))
+      (is (identical? checked (invocation-link/verify! checked request)))
+      (is (= (get-in projected [:plan :id]) (:plan (invocation-link/memory-witness certified request))))
+      (is (thrown? clojure.lang.ExceptionInfo (invocation-link/certify-final-projection projected)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (invocation-link/lower materialized emitted :ze:0 nil
+                                          (fn [plan] {:plan plan}) proof)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (invocation-link/certify (:plan projected) [] request))))))
 
 (deftest allocation-shape-definition-remains-an-ordered-host-equation
   (let [source '(let* [size (clojure.core/* nrows width)
@@ -1726,6 +1747,43 @@
                    [output])]
     (program/->ProgramEquation [id] [:test id] nil [input] [output] algorithm [] #{}
                               {:source :test} {:host-only true})))
+
+(deftest invocation-host-evaluators-and-futures-do-not-inherit-link-proof-scopes
+  (let [value (av/tensor {:dtype :double :shape []})
+        array-value (av/tensor {:dtype :double :shape [2] :representation {:kind :plain}})
+        emitted (program/make
+                 {:dialect :opencl-parallel :values {'input value 'answer value 'xs array-value}
+                  :inputs '[input xs] :outputs '[answer xs]
+                  :equations [(host-identity-equation 'host 'input 'answer value)]})
+        plan (invocation/from-prefix
+              {:id :host-proof-isolation :parameters '[input xs]
+               :parameter-values {'input value 'xs array-value} :bindings [] :binding-values {}
+               :program-values {'input value 'answer value 'xs array-value}
+               :program-inputs '[input xs] :program-outputs '[answer xs]})
+        materialized (materialization/materialize plan [2.0 (double-array [3.0 4.0])] nil)
+        request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        scope-vars (mapv (fn [[n s]] (ns-resolve n s))
+                         [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                          ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                          ['raster.compiler.ir.link-plan '*caller-options*]
+                          ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                          ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+        observe #(mapv var-get scope-vars)
+        observed (atom [])
+        evaluate (fn [equation {:keys [operands]}]
+                   (swap! observed conj (observe) @(future (observe)))
+                   {(first (:results equation)) (get operands (first (:operands equation)))})]
+    (doseq [caller-options [nil request]]
+      (let [proof (emitted-program/validate-with-physical-results! emitted caller-options)
+            projected (with-bindings (zipmap scope-vars (repeat (Object.)))
+                        (invocation-link/lower materialized emitted :ocl:0 evaluate
+                                               (fn [p] {:plan p}) proof caller-options))]
+        (is (= 0 (get-in projected [:plan :attributes :driver-allocations])))
+        (is (link/retained-effect-evidence? (:plan projected) (:effect-evidence projected)
+                                           caller-options))))
+    (is (= 4 (count @observed)) "each independently requested lowering evaluates the host once")
+    (is (every? #(= (vec (repeat (count scope-vars) nil)) %) @observed)
+        "host scalar evaluators and their futures cannot inherit outer compiler authority")))
 
 (deftest host-evaluators-and-futures-do-not-inherit-request-proof-scopes
   (let [value (av/tensor {:dtype :double :shape []})
