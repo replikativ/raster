@@ -2346,19 +2346,15 @@
                        (get-in entry [:kernel-call :artifact]))]
     (assoc (kexec/description executable) :selection :fixed :admission [])))
 
-(defn submit-kernel-graph!
-  "Submit a bound graph without waiting and return a session-owned GPUEvent.
-
-   One submission per graph may be in flight. This common guarantee matches Level Zero's
-   replayable command-list ownership and remains correct on OpenCL's in-order queue. Await or
-   release the prior event before submitting the same graph again."
-  [sess handle]
-  (with-session-use sess
+(defn- submit-resolved-kernel-graph!
+  "Submit an admitted entry while the caller holds the session-use monitor.
+   The entry is request-local evidence, never a cached replacement for handle admission."
+  [sess handle entry]
     (let [{:keys [device-id session-id closed? events]} @sess]
       (when closed?
         (throw (ex-info "cannot submit a kernel graph in a closed GPU session" {:handle handle})))
       (let [{:keys [runtime-graph outputs execution-plan resident-footprint]}
-            (resolve-kernel-graph-entry sess handle)
+            entry
             pending (some (fn [[_ entry]]
                             (when (and (= (:key handle) (:graph-key entry))
                                        (= :pending (:status entry)))
@@ -2392,15 +2388,25 @@
                          :backend-event backend-event
                          :value outputs}
                         resident-footprint))
-          event)))))
+          event))))
+
+(defn submit-kernel-graph!
+  "Submit a bound graph without waiting and return a session-owned GPUEvent.
+
+   One submission per graph may be in flight. This common guarantee matches Level Zero's
+   replayable command-list ownership and remains correct on OpenCL's in-order queue. Await or
+   release the prior event before submitting the same graph again."
+  [sess handle]
+  (with-session-use sess
+    (submit-resolved-kernel-graph! sess handle (resolve-kernel-graph-entry sess handle))))
 
 (defn run-kernel-graph!
   "Submit a bound graph, wait for completion, and return its resident output buffers."
   [sess handle]
   (with-session-use sess
     (let [{:keys [device-id]} @sess
-          {:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)
-          event (submit-kernel-graph! sess handle)]
+          {:keys [runtime-graph profile?] :as entry} (resolve-kernel-graph-entry sess handle)
+          event (submit-resolved-kernel-graph! sess handle entry)]
       (try
         (let [outputs (await-event! sess event)]
         ;; A validation replay of a profiled graph intentionally discards its timestamps. Reset
