@@ -8,6 +8,7 @@
   (:require [raster.compiler.ir.emitted-parallel-program-call :as program-call]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.compiler.ir.structured-loop-call :as loop-call]))
@@ -110,7 +111,7 @@
       (throw (ex-info "Prepared program has lost its use-scope state"
                       {:reason :parallel-program-use-state-missing})))
     (vswap! (::active-uses prepared) inc)
-    (try (program-call/without-validation-context use!)
+    (try (link-plan/without-validation-context use!)
          (finally (vswap! (::active-uses prepared) dec)))))
 
 (defn straight-line-call?
@@ -237,14 +238,14 @@
   "Prepare bounded graph bindings and retain validated math intent with their exact owner.
    Executor callbacks receive neither compiler proof scopes nor policy authority."
   ([call executor]
-   (program-call/without-validation-context #(prepare-with-request! call executor nil nil)))
+   (link-plan/without-validation-context #(prepare-with-request! call executor nil nil)))
   ([call executor caller-options]
-   (program-call/without-validation-context #(prepare-with-request! call executor caller-options nil))))
+   (link-plan/without-validation-context #(prepare-with-request! call executor caller-options nil))))
 
 (defn ^:no-doc prepare-with-retained-program!
   "Internal exact-program proof reuse; concrete bindings, live views and callbacks remain fresh."
   [call executor retained-validation caller-options]
-  (program-call/without-validation-context
+  (link-plan/without-validation-context
    #(prepare-with-request! call executor caller-options retained-validation)))
 
 (defn- prepare-sequence-with-request!
@@ -289,16 +290,16 @@
 (defn prepare-sequence-with!
   "Prepare ordered instances under one independent caller math request."
   ([instances executor]
-   (program-call/without-validation-context #(prepare-sequence-with-request! instances executor nil nil)))
+   (link-plan/without-validation-context #(prepare-sequence-with-request! instances executor nil nil)))
   ([instances executor caller-options]
-   (program-call/without-validation-context
+   (link-plan/without-validation-context
     #(prepare-sequence-with-request! instances executor caller-options nil))))
 
 (defn ^:no-doc prepare-sequence-with-retained-programs!
   "Internal sequence preparation with independently authenticated exact-program proofs.
    Direct graphs and absent proofs retain their ordinary preparation checks."
   [instances executor retained-program-validations caller-options]
-  (program-call/without-validation-context
+  (link-plan/without-validation-context
    #(prepare-sequence-with-request! instances executor caller-options retained-program-validations)))
 
 (defn- visit-handles!
@@ -566,7 +567,7 @@
       (throw (ex-info "Cannot release a prepared program from its active use callback"
                       {:reason :parallel-program-in-use})))
     (when-not @(:closed? prepared) (reset! (:closed? prepared) true))
-    (program-call/without-validation-context #(cleanup/release! (::cleanup/owner prepared))))
+    (link-plan/without-validation-context #(cleanup/release! (::cleanup/owner prepared))))
   nil)
 
 (defn- run-with-request!

@@ -163,6 +163,44 @@
               (is (= 3 @checks) "a missing proof falls back to independent validation")
               (finally (runtime-program/release-prepared! fallback)))))))))
 
+(deftest retained-selected-policy-clears-foreign-proof-scopes-at-runtime
+  (register-target!)
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        plan (equation-first/compile-link-plan
+              #'contractions/fixed-matmul [(float-array 15) (float-array 21)]
+              (merge request {:target target :dtype :float}))
+        call (get-in plan [:instances 0 :call])
+        evidence (:effect-evidence (link-plan/validate-with-effect-evidence! plan nil request))
+        proofs (link-plan/retained-program-validations! plan evidence request)
+        proof (.get ^java.util.Map proofs (:program call))
+        scopes (mapv (fn [[n s]] (ns-resolve n s))
+                     [['raster.compiler.ir.link-plan '*validated-program-instances*]
+                      ['raster.compiler.ir.link-plan '*retained-program-validations*]
+                      ['raster.compiler.ir.link-plan '*caller-options*]
+                      ['raster.compiler.ir.emitted-parallel-program-call '*validated-boundary-projections*]
+                      ['raster.compiler.ir.emitted-parallel-program-call '*validated-projection-policy*]])
+        foreign (fn [f] (with-bindings (zipmap scopes (repeat (Object.))) (f)))
+        observed (atom [])
+        observe! (fn [stage]
+                   (swap! observed conj [stage (mapv var-get scopes)]
+                          [stage @(future (mapv var-get scopes))]))
+        executor {:bind! (fn [key & _] (observe! :bind) key)
+                  :run! (fn [_] (observe! :run))
+                  :release! (fn [_] (observe! :release))}]
+    (is (= (program-call/preparation-plan call :selected request)
+           (program-call/preparation-plan-with-retained-program call :selected proof request)))
+    (is (= :emitted-parallel-program-retained-validation
+           (reason #(runtime-program/prepare-with-retained-program! call executor proof nil))))
+    (is (empty? @observed) "default intent cannot inherit the selected policy")
+    (let [prepared (foreign #(runtime-program/prepare-with-retained-program!
+                             call executor proof request))]
+      (try
+        (foreign #(runtime-program/run-prepared! prepared))
+        (finally (foreign #(runtime-program/release-prepared! prepared)))))
+    (is (= #{:bind :run :release} (set (map first @observed))))
+    (is (every? #(= [nil nil nil nil nil] (second %)) @observed)
+        "callbacks and inherited futures cannot observe any compiler proof scope")))
+
 (deftest approximate-modes-require-paired-reconstructed-models
   (let [check (ns-resolve 'raster.compiler.ir.emitted-equation-dispatch
                          'validate-model-pair!)
