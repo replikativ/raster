@@ -28,6 +28,9 @@
             [raster.compiler.ad.flatten :as ad-flatten]
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.ad.reverse.normalize :as anf]
             [raster.ad.tangent :as tangent]
             [raster.compiler.ir.form :as form]
@@ -4121,25 +4124,6 @@
 
     :else form))
 
-(defn- strip-primitive-casts
-  "Remove (double x), (float x) etc. casts that would fail on Dual numbers.
-  Dual dispatch handles type propagation instead."
-  [form]
-  (cond
-    (and (seq? form) (= 2 (count form))
-         (contains? #{'double 'float 'long 'int
-                      'clojure.core/double 'clojure.core/float
-                      'clojure.core/long 'clojure.core/int} (first form)))
-    (strip-primitive-casts (second form))
-
-    (seq? form)
-    (with-meta (apply list (map strip-primitive-casts form)) (meta form))
-
-    (vector? form)
-    (mapv strip-primitive-casts form)
-
-    :else form))
-
 ;; alpha-conversion (hygienic rename of every bound var before splicing a form
 ;; alongside structurally identical siblings — unrolled fold iterations) is the
 ;; unified `util/alpha-convert`, generic over form/scope-info. Unlike the former
@@ -4647,7 +4631,93 @@
 (def ^:private array-param-tags
   '#{doubles floats ints longs shorts bytes booleans chars objects})
 
-(defn forward-coverage
+(defn- forward-conversion-plan
+  "Retain source conversions; adapt only certified Double identities for Dual.
+   Dependency is lexical seed dependence, not a claim that a discrete cast has
+   a derivative. Binder structure and primal types come from compiler owners."
+  [body params tags source-ns]
+  (let [declines (volatile! [])
+        initial-types (into {} (map (fn [p tag] [p {:tag tag}]) params tags))
+        initial-active (set (keep (fn [[p tag]]
+                                   (when (= :scalar (:kind (tangent/tangent-kind tag))) p))
+                                 (map vector params tags)))]
+    (letfn [(dependent? [expr active]
+              (binding [util/*shadowing-locals* (into util/*shadowing-locals* active)]
+                (boolean (seq (set/intersection active (util/free-syms expr))))))
+            (tag-of [expr env]
+              (or (types/sym-type-tag expr)
+                  (inf/infer-expr-tag expr env source-ns)))
+            (go [expr env active]
+              (cond
+                (and (seq? expr) (= 'quote (first expr))) expr
+                (seq? expr)
+                (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
+                  (let [scopes'
+                        (mapv
+                         (fn [{:keys [binders inits body] :as region}]
+                           ;; Recurrences can acquire seed dependence on later iterations.
+                           ;; Conservatively retain it for all carries, never assume init-only activity.
+                           (let [recurrence? (= :scope (:kind (form/form-info expr)))
+                                 [env' active' inits']
+                                 (reduce
+                                  (fn [[e a transformed] [binder init]]
+                                    (let [init-env (if (or sequential? rec?) e env)
+                                          init-active (if (or sequential? rec?) a active)
+                                          transformed-init (go init init-env init-active)
+                                          tag (or (types/sym-type-tag binder)
+                                                  (tag-of init init-env))
+                                          dep? (dependent? init init-active)]
+                                      [(assoc e binder {:tag tag})
+                                       ((if dep? conj disj) a binder)
+                                       (conj transformed transformed-init)]))
+                                  [(if rec? (reduce #(assoc %1 %2 {:tag (types/sym-type-tag %2)}) env binders) env)
+                                   (if rec? (into active binders) active) []]
+                                  (map vector binders inits))
+                                 ;; Uninitialized binders shadow outer symbols. Their carrier
+                                 ;; is not established here, so do not certify casts on them.
+                                 uninitialized (drop (count inits) binders)
+                                 env' (reduce #(assoc %1 %2 {:tag (types/sym-type-tag %2)}) env' uninitialized)
+                                 active' (into active' uninitialized)
+                                 active' (if (and recurrence?
+                                                  (or (some active' binders)
+                                                      (some #(dependent? % active') body)))
+                                           (into active' binders) active')]
+                             (assoc region :inits inits'
+                                    :body (mapv #(go % env' active') body)))) scopes)]
+                    (rebuild scopes' (mapv #(go % env active) outer)))
+                  (let [semantic-op (op/semantic-op expr)
+                        args (op/call-args expr)]
+                    (if (and (op/cast-op? semantic-op) (= 1 (count args))
+                             (dependent? (first args) active))
+                      (let [operand (first args)
+                            source (some-> (tag-of operand env) dtype/dtype-for-scalar-tag)
+                            target (some-> semantic-op op/cast-result-tag dtype/dtype-for-scalar-tag)
+                            policy (when (and source target)
+                                     (conversion/policy source target
+                                                        (case (op/cast-integral-narrowing semantic-op)
+                                                          :wrap :wrap :trap)))
+                            adapted-operand (go operand env active)]
+                        (if (and (= :double source target) (= [:exact :exact] policy))
+                          (with-meta (list 'raster.ad.forward/identity-double-conversion adapted-operand)
+                            (meta expr))
+                          (do (vswap! declines conj
+                                      {:reason :unsupported-forward-conversion
+                                       :operation semantic-op :source-dtype source :target-dtype target
+                                       :policy policy :form expr})
+                              (with-meta (if (= '.invk (first expr))
+                                           (list '.invk (second expr) adapted-operand)
+                                           (list (first expr) adapted-operand))
+                                (meta expr)))))
+                      (with-meta (apply list (map #(go % env active) expr)) (meta expr)))))
+                (vector? expr) (with-meta (mapv #(go % env active) expr) (meta expr))
+                (map? expr) (with-meta (into (empty expr)
+                                            (map (fn [[k v]] [(go k env active) (go v env active)])) expr)
+                             (meta expr))
+                (set? expr) (with-meta (into (empty expr) (map #(go % env active)) expr) (meta expr))
+                :else expr))]
+      {:body (go body initial-types initial-active) :declines @declines})))
+
+(defn- forward-preparation
   "Queryable Dual-carrier coverage for a deftm var (framework §4a/§11).
   Walks the deftm's walked body, collects semantic op heads, and checks
   each op that would execute on the Dual carrier against the dispatch
@@ -4666,6 +4736,8 @@
                         (throw (ex-info "No walked body on var" {:var f-var})))
         params (or (:raster.core/deftm-params m) [])
         tags (or (:raster.core/deftm-tags m) [])
+        conversion-plan (forward-conversion-plan (first walked-body) params tags
+                                                 (or (some-> (:raster.core/deftm-source-ns m) the-ns) *ns*))
         array-params (vec (remove nil?
                                   (map (fn [p tag]
                                          (when (or (contains? array-param-tags tag)
@@ -4684,11 +4756,21 @@
                        (filter #(= :uncovered (forward-op-status %)))
                        sort
                        vec)]
-    {:admissible? (and (empty? uncovered) (empty? array-params))
-     :uncovered-ops uncovered
-     :active-indices active-indices
-     :constant-params constant-params
-     :array-params array-params}))
+    {:resolved resolved :params params :walked-body walked-body
+     :conversion-plan conversion-plan
+     :coverage {:admissible? (and (empty? uncovered) (empty? array-params) (empty? (:declines conversion-plan)))
+                :conversion-declines (:declines conversion-plan)
+                :uncovered-ops uncovered
+                :active-indices active-indices
+                :constant-params constant-params
+                :array-params array-params}}))
+
+(defn forward-coverage
+  "Queryable Dual-carrier admission derived from the retained body and compiler
+   type/conversion contracts. Includes uncovered ops, conversion declines,
+   array parameters, and scalar tangent/constant parameter classification."
+  [f-var]
+  (:coverage (forward-preparation f-var)))
 
 (defn forward-admissible?
   "True when forward mode (the Dual carrier) is admissible for f-var:
@@ -4822,7 +4904,8 @@
      ;; Un-devirtualize .invk → generic dispatch so Dual numbers propagate.
      ;; Admissibility is checked at CONSTRUCTION time (framework §11): fail
      ;; with the uncovered ops named, never a No-matching-method at call time.
-     (let [cov (forward-coverage f-var)
+     (let [preparation (forward-preparation f-var)
+           cov (:coverage preparation)
            _ (when-not (:admissible? cov)
                (throw (ex-info
                        (str "value+grad :mode :forward is not admissible for `"
@@ -4833,22 +4916,25 @@
                             (when (seq (:array-params cov))
                               (str "array-typed params (forward mode is scalar-only): "
                                    (str/join ", " (:array-params cov)) ". "))
+                            (when (seq (:conversion-declines cov))
+                              (str "source conversions without a faithful Dual interpretation: "
+                                   (pr-str (:conversion-declines cov)) ". "))
                             "Mode selection is constrained by carrier coverage "
                             "(framework §11): use :mode :reverse, or add the "
                             "missing Dual overloads in raster.ad.forward.")
                        {:var f-var
                         :uncovered-ops (:uncovered-ops cov)
+                        :conversion-declines (:conversion-declines cov)
                         :array-params (:array-params cov)})))
-           resolved (resolve-deftm-var f-var)
+           resolved (:resolved preparation)
            params (deftm-params-or-throw f-var resolved)
-           walked-body (or (rcore/ensure-walked-body! resolved)
-                           (throw (ex-info "No walked body on var" {:var f-var})))
+           walked-body (:walked-body preparation)
            ;; Build a generic-dispatch version of the walked body
            generic-body (undevirtualize (first walked-body))
-           ;; Strip primitive casts — Dual numbers aren't primitives
-           clean-body (strip-primitive-casts generic-body)
+           conversion-plan (:conversion-plan preparation)
            active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
-           generic-fn (eval (list 'fn active-params clean-body))
+           generic-fn (eval (list 'fn active-params generic-body))
+           tangent-fn (eval (list 'fn active-params (undevirtualize (:body conversion-plan))))
            n (count params)
            active-indices (:active-indices cov)
            active-set (set active-indices)
@@ -4870,7 +4956,7 @@
                                                               (double-array [(if (== j i) 1.0 0.0)]))
                                                    a))
                                                arg-vec))
-                              result (apply generic-fn dual-args)
+                              result (apply tangent-fn dual-args)
                               deriv (if (.isInstance dual-class result)
                                       (clojure.core/aget ^doubles (get-partials result) 0)
                                       0.0)]

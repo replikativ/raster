@@ -298,6 +298,19 @@ alternatives:
 O1. Forward is the right choice for few inputs / many outputs, and its Dual
 comparison overloads let it flow through `if` branches (a.e.-correct):
 
+Source conversions are retained, not erased to accommodate the carrier.
+Inactive conversions execute their original rounding, narrowing and failure
+behavior. Active Double-to-Double identities are supported; active Float
+rounding, integer conversion, and conversions without a certified operand
+dtype currently decline at construction. `forward-coverage` reports these in
+`:conversion-declines`, including the operation, source/target dtypes and
+primal conversion policy. A primal policy is not itself an AD rule:
+Float-to-Double widening is not admitted merely because widening is exact,
+since prior Float arithmetic must also be represented faithfully by the
+carrier. No straight-through rounding gradient is implied. `:auto` excludes
+this unsupported forward interpretation and uses its existing mode-selection
+fallback (which can itself decline if reverse rules are unavailable).
+
 ```clojure
 (deftm docfwd [x :- Double] :- Double (n/+ (n/* x (m/sin x)) (m/exp x)))
 [(nth ((rev/value+grad #'docfwd :mode :forward) 1.3) 1)
