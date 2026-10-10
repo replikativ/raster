@@ -1,6 +1,7 @@
 (ns raster.compiler.pe-test
   (:require [clojure.test :refer [deftest testing is are]]
             [raster.compiler.passes.scalar.pe :as pe]
+            [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]))
 
 ;; ================================================================
@@ -68,6 +69,31 @@
 ;; ================================================================
 ;; Do form simplification
 ;; ================================================================
+
+(deftest falsy-branch-values-test
+  (doseq [condition [true false nil 0 0.0]
+          branches [[false] [nil] []]]
+    (let [source (apply list 'if condition 1 branches)]
+      (is (= (eval source) (pe/pe source)) (pr-str source))))
+  (doseq [branches [[false] [nil] []]]
+    (let [source (apply list 'if 'flag 1 branches)
+          optimized (pe/pe source)]
+      (is (= source optimized))
+      (doseq [flag [true false nil]]
+        (is (= (eval (list 'let ['flag flag] source))
+               (eval (list 'let ['flag flag] optimized)))))))
+  (is (= '(if flag 1 false)
+         (pe/pe '(if flag 1 (let* [answer false] answer)))))
+  (let [source (with-meta '(if flag 1 false) {:line 17 :tag 'Boolean})]
+    (is (= (meta source) (meta (pe/pe source))))))
+
+(deftm falsy-branch-numeric-consumer [value :- Long] :- Long
+  (if (if (> value 0) true false) 7 9))
+
+(deftest compiled-falsy-branch-consumer-test
+  (let [compiled (pipeline/compile-aot #'falsy-branch-numeric-consumer)]
+    (doseq [value [-1 0 1]]
+      (is (= (falsy-branch-numeric-consumer value) (compiled value))))))
 
 (deftest do-simplification-test
   (testing "single-form do unwrapped"

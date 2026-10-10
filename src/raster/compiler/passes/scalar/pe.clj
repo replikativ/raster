@@ -217,28 +217,22 @@
   - Simplify when both branches are equal"
   [form const-env pe-fn]
   (let [[_ test then else] form
+        else-present? (= 4 (count form))
         pe-test (pe-fn test const-env)]
     (cond
-      ;; Constant true — take then branch
-      (and (constant? pe-test) pe-test (not (and (number? pe-test) (zero? pe-test))))
-      (pe-fn then const-env)
-
-      ;; Constant false/nil — take else branch
-      (or (nil? pe-test) (false? pe-test)
-          (and (number? pe-test) (zero? pe-test) (not (number? pe-test))))
-      ;; Actually only nil and false are falsy in Clojure
-      (if (or (nil? pe-test) (false? pe-test))
-        (if else (pe-fn else const-env) nil)
-        ;; Non-nil, non-false constants are truthy
-        (pe-fn then const-env))
+      ;; Only nil and false are falsy in Clojure; zero is truthy.
+      (constant? pe-test)
+      (if pe-test
+        (pe-fn then const-env)
+        (if else-present? (pe-fn else const-env) nil))
 
       ;; Both branches same — just use one (still eval test for side effects)
       ;; Skip this if test might have side effects (conservative)
 
       :else
       (let [pe-then (pe-fn then const-env)
-            pe-else (when else (pe-fn else const-env))
-            r (if (some? pe-else)
+            pe-else (when else-present? (pe-fn else const-env))
+            r (if else-present?
                 (list 'if pe-test pe-then pe-else)
                 (list 'if pe-test pe-then))]
         (if-let [m (meta form)] (with-meta r m) r)))))
