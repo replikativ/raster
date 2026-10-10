@@ -2,6 +2,9 @@
 # Four complete shard reports;80 unique measured namespaces. Includes capability skips.
 # Load cost is order-sensitive; these are scheduling weights, not performance acceptance.
 # Missing/new namespaces retain the planner's source-size estimate; no tests are excluded.
+# Training partition rows below are scheduling seeds from job25271's per-var
+# sums plus the old namespace load cost charged independently to both pieces.
+# They are projections, not measured post-split namespace costs; refresh after CI.
 test/raster/compiler/backend/gpu/java_round_test.clj	9311
 test/raster/compiler/backend/gpu/kernel_body_shift_test.clj	7542
 test/raster/compiler/backend/gpu/kernel_body_workgroup_device_test.clj	8537
@@ -51,7 +54,8 @@ test/raster/gpu/device_timing_test.clj	1992
 test/raster/gpu/dispatch_benchmark_device_test.clj	2367
 test/raster/gpu/distributed_cost_device_test.clj	48230
 test/raster/gpu/distributed_profile_device_test.clj	68
-test/raster/gpu/distributed_training_device_test.clj	440243
+test/raster/compiler/ir/distributed_training_test.clj	214389
+test/raster/gpu/distributed_training_device_test.clj	226699
 test/raster/gpu/indexed_attention_device_test.clj	2352
 test/raster/gpu/kernel_body_graph_test.clj	582
 test/raster/gpu/kernel_graph_device_test.clj	4362

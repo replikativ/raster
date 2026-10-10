@@ -329,3 +329,9 @@ test/raster/types/int8_test.clj	358
 test/raster/types/number_types_test.clj	217
 test/raster/types/promote_test.clj	371
 test/raster/types/traits_test.clj	847
+# Training partition scheduling seeds from general-suite job25327, revisiona65e0b56.
+# Per-var sums plus the old namespace load cost charged to each piece; not measured
+# post-split namespace costs. Native branches skipped there; use OpenCL lane weights
+# separately and refresh these projections after comparable general-suite CI.
+test/raster/compiler/ir/distributed_training_test.clj	222698
+test/raster/gpu/distributed_training_device_test.clj	1145

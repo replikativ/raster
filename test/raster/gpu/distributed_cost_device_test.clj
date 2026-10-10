@@ -3,7 +3,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.distributed-plan :as plan]
             [raster.gpu.distributed :as runtime]
-            [raster.gpu.distributed-training-device-test :as fixture]
+            [raster.compiler.fixtures.distributed-training :as fixture]
             [raster.gpu.device-probe :as opencl]
             [raster.dl.gpu-grad-parity :as ze]))
 
