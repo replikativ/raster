@@ -2996,8 +2996,15 @@
         out-elems (long (if (number? out-elems-expr)
                           out-elems-expr
                           (kcall/resolve-value call out-elems-expr)))
-        {:keys [workgroup-size group-count]} (kcall/binding-plan call)
-        input-index (volatile! -1)
+        {:keys [workgroup-size group-count]} (kcall/binding-plan call)]
+    ;; Admit the exact validated snapshot before staging or loading by name.
+    ;; Staging/loading helpers guard their own acquisitions; the surrounding
+    ;; monitor keeps those phases in one registration generation. Do not nest
+    ;; their registry-use guards, which deliberately reject reentrant use.
+    (cleanup/assert-registry-mutable! kernel-registry)
+    (locking kernel-registry
+      (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+      (let [input-index (volatile! -1)
         output (volatile! nil)
         output-seg (volatile! nil)
         all-args
@@ -3043,10 +3050,11 @@
         {:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         out @output
         [out-seg out-half? out-esize] @output-seg]
-    (launch-geometry! kernel-handle workgroup-size group-count all-args)
-    (when-not (device-buffer? out)
-      (readback-operand! out-seg out out-elems out-half? out-esize))
-    out))
+        (cleanup/with-registry-use kernel-registry
+          (launch-geometry! kernel-handle workgroup-size group-count all-args)
+          (when-not (device-buffer? out)
+            (readback-operand! out-seg out out-elems out-half? out-esize))
+          out)))))
 
 (defn invoke-registered-contraction-dispatch!
   "Select one ABI-compatible contraction artifact from concrete scalar values, then use the
