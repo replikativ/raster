@@ -2625,6 +2625,14 @@
           reference (emitted-equation/make algorithm (:body derived) plain {} request)
           candidate (c-family/emit-mixed-contraction-alternative
                      reference (merge options {:schedule {:precision :mixed-f16-f32}}))]
+      (with-redefs [hardware/descriptor-for
+                    (fn [_] (assoc-in descriptor [:execution :scalar-dtype-support :double] :unknown))]
+        (try
+          (segop-opencl/generate-kernel-graph
+           source (-> options (dissoc :target-descriptor) (assoc :target-device :synthetic-math-device)))
+          (is false "resolved target-device capability must reach contraction source emission")
+          (catch clojure.lang.ExceptionInfo error
+            (is (= :kernel-body-target-math-capability (:reason (ex-data error)))))))
       (is (:ok candidate))
       (is (identical? (:candidate candidate)
                       (emitted-equation/validate! (:candidate candidate) request)))
