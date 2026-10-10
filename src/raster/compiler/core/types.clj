@@ -531,6 +531,21 @@
         (var? resolved) (let [v @resolved] (when (class? v) v))
         :else nil))))
 
+(defn boxed-return-incompatible?
+  "A known primitive result cannot box into an unrelated declared reference.
+   Primitive return coercions remain the backend's existing contract. Unknown
+   tags/classes are not compatibility evidence and do not establish a conflict."
+  [actual declared]
+  (when (and (contains? primitive-info actual)
+             ;; Small integer stack values may box as Integer rather than their
+             ;; source wrapper. They need the backend's exact return-stack proof.
+             (not (contains? #{'byte 'short 'char} actual))
+             (not (contains? primitive-info declared)))
+    (let [target (tag->check-class declared)
+          boxed (get primitive-info actual)]
+      (and (not= Object target)
+           (not (.isAssignableFrom ^Class target ^Class boxed))))))
+
 ;; ================================================================
 ;; Warning system
 ;; ================================================================

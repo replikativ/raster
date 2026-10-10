@@ -16,6 +16,7 @@
     {sym → {:tag dispatch-tag, :fn-info map?, :element dispatch-tag?}}
   This is the walker's canonical type representation."
   (:require [clojure.string :as str]
+            [clojure.walk]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
@@ -2202,3 +2203,47 @@ stable physical-leaf order on every backend."}
                                     (:tag (meta mv)))))))))))
               (catch Exception _ nil))
             :else nil)))))
+
+(defn infer-result-tags
+  "Retain alternatives at result positions instead of choosing one branch's tag.
+   Leaf typing delegates to infer-arg-tag. Unknowns remain nil; loop carries need
+   their own fixed-point evidence and are not inferred from initializers here."
+  [expression environment source-ns]
+  (binding [*ns* source-ns]
+    (letfn [(result-tags [expression env alternatives]
+              (cond
+                (symbol? expression)
+                (or (get alternatives expression) [(infer-arg-tag expression env)])
+                (not (seq? expression)) [(infer-arg-tag expression env)]
+                :else
+                (let [[head & args] expression]
+                  (cond
+                    (= 'if head)
+                    (case (form/constant-if-branch (first args))
+                      :then (result-tags (second args) env alternatives)
+                      :else (result-tags (nth args 2 nil) env alternatives)
+                      (into (result-tags (second args) env alternatives)
+                            (result-tags (nth args 2 nil) env alternatives)))
+                    (= 'do head) (result-tags (last args) env alternatives)
+                    (contains? form/let-heads head)
+                    (let [[bindings & body] args
+                          [env alternatives]
+                          (reduce (fn [[env alternatives] [id init]]
+                                    (let [tags (vec (distinct (result-tags init env alternatives)))
+                                          env (if (and (= 1 (count tags)) (first tags))
+                                                (assoc env id (first tags)) (dissoc env id))]
+                                      [env (assoc alternatives id tags)]))
+                                  [env alternatives] (partition 2 bindings))]
+                      (result-tags (last body) env alternatives))
+                    (or (contains? form/loop-heads head) (= 'recur head)) [nil]
+                    :else
+                    (let [unknowns (set (for [[id tags] alternatives
+                                             :when (or (not= 1 (count tags)) (nil? (first tags)))] id))
+                          ;; Retained metadata cannot resurrect an unknown/shadowed
+                          ;; local inside a leaf call after its environment fact was removed.
+                          expression (clojure.walk/postwalk
+                                      #(if (and (symbol? %) (contains? unknowns %))
+                                         (vary-meta % dissoc :tag :raster.type/tag) %) expression)]
+                      [(or (infer-arg-tag expression env)
+                           (infer-rewritten-tag expression nil env))])))))]
+      (vec (distinct (result-tags expression environment {}))))))
