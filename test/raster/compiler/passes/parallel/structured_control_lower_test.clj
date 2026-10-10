@@ -12,6 +12,7 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-loop-call :as loop-call]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
+            [raster.gpu.structured-loop :as loop-runtime]
             [raster.compiler.passes.parallel.structured-control-lower :as lower]))
 
 (defn- loop-program
@@ -149,6 +150,30 @@
           proof (emitted-program/validate-with-physical-results! program request)
           prepared (program-call/make program buffers scalars scratch nil {} proof request)]
       (is (= call (loop-call/validate! call request)))
+      (let [events (atom [])
+            executor {:bind! (fn [key graph bindings values]
+                               (swap! events conj [:bind bindings values])
+                               {:key key :graph graph})
+                      :run! (fn [_] (swap! events conj [:run]))
+                      :release! (fn [_] (swap! events conj [:release]))}]
+        (is (thrown? clojure.lang.ExceptionInfo (loop-runtime/run-with! call executor)))
+        (is (empty? @events) "mismatched math intent rejects before binding")
+        (is (= (:outputs call) (loop-runtime/run-with! call executor request)))
+        (is (= [:bind :run :release :bind :run :release :bind :run :release]
+               (mapv first @events)))
+        (is (= (mapv #(select-keys (loop-call/iteration-binding call % request)
+                                  [:buffers :scalar-values]) (range 3))
+               (mapv (fn [[_ bindings values]] {:buffers bindings :scalar-values values})
+                     (filter #(= :bind (first %)) @events))))
+        (reset! events [])
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"execution probe"
+                             (loop-runtime/run-with!
+                              call (assoc executor :run! (fn [_]
+                                                          (swap! events conj [:run])
+                                                          (throw (ex-info "execution probe" {}))))
+                              request)))
+        (is (= [:bind :run :release] (mapv first @events))
+            "selected math keeps failed iteration cleanup"))
       (is (= call (loop-call/validate-in-context! call buffers scalars scratch request)))
       (is (= {'u-in :initial-buffer 'u-next :output-buffer}
              (:buffers (loop-call/iteration-binding call 0 request))))
