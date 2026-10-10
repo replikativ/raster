@@ -46,12 +46,21 @@
       (if-not (= :supported (get-in (hardware/descriptor-for device)
                                    [:execution :scalar-dtype-support :double]))
         (skip! (str "explicit widened projection requires declared Double support on " device))
-        (doseq [layout [:nn :nt :tn] policy [:decomposed :fused]]
-          (let [m 2 n 3 k 3
+        (doseq [layout [:nn :nt :tn] policy [:decomposed :fused] k [3 513]]
+          (let [m 2 n 3
                 activation (fn [middle]
-                             (float-array (if (= layout :tn)
-                                            [1.0e8 1.0e8 middle middle -1.0e8 -1.0e8]
-                                            [1.0e8 middle -1.0e8 1.0e8 middle -1.0e8])))
+                             ;; The long case crosses many reduction tiles and leaves a
+                             ;; masked final tile. A Float carry loses the middle term;
+                             ;; widening only the final result cannot recover it.
+                             (float-array
+                               (for [index (range (* m k))
+                                     :let [p (if (= layout :tn)
+                                               (quot index m) (mod index k))]]
+                                 (cond
+                                   (zero? p) 1.0e8
+                                   (= p (quot k 2)) middle
+                                   (= p (dec k)) -1.0e8
+                                   :else 0.0))))
                 a (activation 1.0)
                 b (float-array (repeat (* k n) 1.0))
                 source (case layout :nn #'contractions/projected-nn
@@ -68,7 +77,8 @@
               (doseq [middle [1.0 2.0]]
                 (let [actual (value/->host (:result (live {:a (activation middle)})))]
                   (is (= (bits (repeat (* m n) middle)) (bits actual))
-                      (str device " " layout " " policy " preserves cancellation"))))
+                      (str device " " layout " " policy " k=" k
+                           " preserves cancellation across reduction tiles"))))
               (let [actual (value/->host
                             (:result (live {:a (float-array (repeat (* m k) Float/MAX_VALUE))
                                             :b (float-array (repeat (* k n) Float/MAX_VALUE))})))]
