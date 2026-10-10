@@ -114,7 +114,11 @@
   (->DeviceResource id memory-capacity-bytes descriptor attributes))
 
 (defn link
-  "Construct one directed topology link. Bidirectional fabrics use two directed links."
+  "Construct one directed topology link. Bidirectional fabrics use two directed links.
+
+   Optional attributes :serialization-domains is a vector of distinct keyword identities.
+   Links sharing a domain occupy the same exclusive physical service lane during transfer;
+   this conservative model does not predict bandwidth sharing or congestion."
   [{:keys [id source target kind bandwidth-bytes-s latency-ns attributes]
     :or {kind :interconnect attributes {}}}]
   (when (or (nil? id) (nil? source) (nil? target) (= source target))
@@ -133,6 +137,12 @@
   (when-not (map? attributes)
     (fail! "topology link attributes must be a map"
            :distributed-link-attributes {:link id :attributes attributes}))
+  (when (contains? attributes :serialization-domains)
+    (let [domains (:serialization-domains attributes)]
+      (when-not (and (vector? domains) (every? keyword? domains)
+                     (= (count domains) (count (distinct domains))))
+        (fail! "link serialization domains must be distinct keyword identities in a vector"
+               :distributed-link-serialization-domains {:link id :domains domains}))))
   (->TopologyLink id source target kind bandwidth-bytes-s latency-ns attributes))
 
 (defn topology
@@ -1423,11 +1433,23 @@
           :device-plans {} :steps []} requests)]
     (plan (merge fields context))))
 
+(defn- transfer-resources
+  [topology step]
+  (vec (distinct
+        (concat (map (fn [link-id] [:link link-id]) (:route step))
+                (mapcat (fn [link-id]
+                          (map (fn [domain] [:serialization-domain domain])
+                               (get-in topology [:links link-id :attributes :serialization-domains])))
+                        (:route step))
+                (map (fn [device] [:compute device])
+                     (get-in step [:attributes :serialized-on]))))))
+
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
 
    Compute steps serialize on their device compute lane. Transfers serialize on every directed
-   link in their route. The two resource classes are independent, so communication and compute
+   link in their route and on explicitly shared serialization domains. Absent endpoint claims,
+   communication and compute resource classes are independent, so communication and compute
    overlap whenever dependencies permit. The result is deterministic and suitable as an analytic
    seed/pruner; measured costs should replace durations before production selection."
   [plan]
@@ -1449,9 +1471,7 @@
                  ;; capability, carried as `:serialized-on`) occupies that compute lane too
                  resources (case (:kind step)
                              :compute [[:compute (:device step)]]
-                             :transfer (into (mapv (fn [link-id] [:link link-id]) (:route step))
-                                             (map (fn [device] [:compute device]))
-                                             (get-in step [:attributes :serialized-on])))
+                             :transfer (transfer-resources topology step))
                  resource-ready (reduce max 0 (map #(get-in state [:resource-free %] 0)
                                                    resources))
                  start (max dependency-ready resource-ready)
@@ -1459,6 +1479,9 @@
                             :compute (long (Math/ceil (double (:duration-ns step))))
                             :transfer (transfer-duration-ns topology step))
                  finish (+ start duration)
+                 state (reduce (fn [state resource]
+                                 (assoc-in state [:resource-free resource] finish))
+                               state resources)
                  state (-> state
                            (assoc-in [:finish-by-step (:id step)] finish)
                            (assoc-in [:timeline (:id step)]
@@ -1470,21 +1493,15 @@
                (-> state
                    (update-in [:device-compute-ns (:device step)] (fnil + 0) duration)
                    (update-in [:peak-memory-by-device (:device step)]
-                              (fnil max 0) (:peak-memory-bytes step))
-                   (assoc-in [:resource-free [:compute (:device step)]] finish))
+                              (fnil max 0) (:peak-memory-bytes step)))
 
                :transfer
-               (as-> state state
-                 (reduce (fn [state link-id]
-                           (-> state
-                               (assoc-in [:resource-free [:link link-id]] finish)
-                               (update-in [:link-transfer-bytes link-id]
-                                          (fnil + 0) (:bytes step))
-                               (update-in [:link-busy-ns link-id] (fnil + 0) duration)))
-                         state (:route step))
-                 (reduce (fn [state device]
-                           (assoc-in state [:resource-free [:compute device]] finish))
-                         state (get-in step [:attributes :serialized-on]))))))
+               (reduce (fn [state link-id]
+                         (-> state
+                             (update-in [:link-transfer-bytes link-id]
+                                        (fnil + 0) (:bytes step))
+                             (update-in [:link-busy-ns link-id] (fnil + 0) duration)))
+                       state (:route step)))))
          initial (:steps plan))
         makespan (reduce max 0 (vals (:finish-by-step state)))
         transferred-bytes (reduce + 0 (map :bytes (filter #(= :transfer (:kind %))
@@ -1522,6 +1539,7 @@
         (keep (fn [step]
                 (when (= :transfer (:kind step))
                   [(:id step) {:route (:route step) :bytes (:bytes step)
+                               :resources (transfer-resources (:topology plan) step)
                                :duration-ns (transfer-duration-ns (:topology plan) step)}])))
         (:steps plan)))
 
