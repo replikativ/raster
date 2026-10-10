@@ -615,14 +615,22 @@
     (is (= 1 (count (filter invocation/shape-projection? (:steps invocation-plan)))))
     (is (= 1 (count (filter invocation/buffer-clone? (:steps invocation-plan)))))
     (is (= 4 (count (filter invocation/buffer-allocation? (:steps invocation-plan)))))
-    (is (= 4 (count (filter invocation/value-alias? (:steps invocation-plan)))))
+    (let [aliases (filter invocation/value-alias? (:steps invocation-plan))
+          allocation-ids (set (map :id (filter invocation/buffer-allocation?
+                                               (:steps invocation-plan))))
+          input-id (:id (first (:parameters invocation-plan)))]
+      ;; Evaluate-once call frames add aliases of u0. Keep the original
+      ;; four allocation aliases as an independent coverage requirement.
+      (is (= 4 (count (filter #(allocation-ids (:source %)) aliases))))
+      (is (= 4 (count (filter #(= input-id (:source %)) aliases))))
+      (is (= 8 (count aliases))))
     (is (= 3 (count (filter invocation/scalar-compute? (:steps invocation-plan)))))
     (is (every? #(not (contains? % :expression)) (:steps invocation-plan)))
     (is (= (set (:inputs semantic))
            (set (concat (keys (:program-buffers materialized))
                         (keys (:program-scalars materialized))))))
     (is (= 0 (get-in materialized [:attributes :driver-allocations])))
-    (let [alias (first (filter invocation/value-alias? (:steps invocation-plan)))]
+    (doseq [alias (filter invocation/value-alias? (:steps invocation-plan))]
       (is (identical? (get-in materialized [:values (:id alias)])
                       (get-in materialized [:values (:source alias)]))))
     (let [public-nsteps (:id (first (filter #(= 'nsteps (:symbol %))

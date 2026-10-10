@@ -124,6 +124,8 @@
                 {:allocates? true
                  :auto-detected? true
                  :parameters params
+                 :parameter-tags (:raster.core/deftm-tags m)
+                 :source-ns (:ns m)
                  :in-place-arg nil
                  :alloc-form (fn [args _opts]
                                (list alloc-ctor (substitute (zipmap params args) size)))
@@ -206,6 +208,8 @@
                       {:allocates? true
                        :auto-detected? true
                        :parameters params
+                       :parameter-tags (:raster.core/deftm-tags m)
+                       :source-ns (:ns m)
                        :in-place-arg nil
                        :alloc-form (fn [args _opts]
                                      (list (:ctor match) (resolve-to-args (:size match) args)))

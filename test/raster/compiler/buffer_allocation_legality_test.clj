@@ -25,7 +25,52 @@
   (eval (list 'raster.core/deftm name params ':- '(Array double) body)))
 
 (defn- call-form [op arguments]
-  (list 'let* ['result (apply list op arguments)] 'result))
+  ;; These fixture operations return the supplied Long, and global-size is
+  ;; published only as a Long. Retain that source fact as the typed pipeline
+  ;; does; unknown carriers are tested separately below.
+  (let [arguments (map #(if (or (= 'global-size %)
+                               (and (seq? %) (contains? '#{tick record-value record-failure} (first %))))
+                         (with-meta % (assoc (meta %) :raster.type/tag 'long)) %) arguments)]
+    (list 'let* ['result (apply list op arguments)] 'result)))
+
+(deftest specialization-carrier-admission-is-not-removed
+  (with-source
+    (fn [source]
+      (define-allocator 'carrier '[n :- Long]
+        '(let [out (double-array n)] (aset out 0 (double n)) out))
+      (let [original (call-form (operation source "carrier" "long") [3.5])
+            result (buffer-fuse/fuse-let original)]
+        (is (= original (:form result)))
+        (is (= [3.0 0.0 0.0] (vec (eval original))))
+        (is (= (vec (eval original)) (vec (eval (:form result))))))
+      (define-allocator 'array-carrier '[a :- (Array double)] '(double-array (alength a)))
+      (define-allocator 'reference-carrier '[unused :- String n :- Long] '(double-array n))
+      (doseq [[name tags arguments]
+              [["array-carrier" "doubles" '[(float-array 3)]]
+               ["reference-carrier" "String_long" [3 3]]]]
+        (let [op (operation source name tags)
+              original (call-form op arguments)
+              result (buffer-fuse/fuse-let original)]
+          (is (some? (descriptor/resolve-buffer-semantics op)))
+          (is (= original (:form result)))
+          (let [before (try (eval original) nil (catch Throwable error error))
+                after (try (eval (:form result)) nil (catch Throwable error error))]
+            (is (some? before))
+            (is (= (class before) (class after))))))
+      (let [op (operation source "carrier" "long")
+            source-form (list 'let* ['n 3 'alias 'n 'result (list op 'alias)] 'result)
+            result (buffer-fuse/fuse-let source-form)]
+        (is (= 1 (get-in result [:stats :fresh-allocs])))
+        (is (= (vec (eval source-form)) (vec (eval (:form result))))))
+      (let [original (call-form (operation source "carrier" "long") '[unknown])]
+        (is (= original (:form (buffer-fuse/fuse-let original)))))
+      (let [original (list 'let* ['n '(if flag 3 3.5)
+                                  'result (list (operation source "carrier" "long") 'n)] 'result)]
+        (is (= original (:form (buffer-fuse/fuse-let original :param-env {'flag 'boolean})))
+            "all reachable carriers must agree, including earlier locals"))
+      (let [original (call-form (operation source "carrier" "long") '[n])
+            result (buffer-fuse/fuse-let original :param-env {'n 'long})]
+        (is (= 1 (get-in result [:stats :fresh-allocs])))))))
 
 (defn- error-of [f]
   (try (f) nil (catch Throwable error error)))
