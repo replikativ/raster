@@ -1404,6 +1404,10 @@
   [program]
   (let [equations (dialect/equations program)
         infos (mapv equation-info equations)
+        ;; Each check depends on one equation and this immutable program, not its partner.
+        ;; Preserve admission/short-circuit order by forcing only at the original guard;
+        ;; a later enumeration or fixpoint iteration must derive fresh evidence.
+        exceptional (mapv #(delay (exceptional-conversion-region? program %)) infos)
         producer-index (into {}
                              (mapcat (fn [[index info]]
                                        (map (fn [result] [result index]) (:results info)))
@@ -1423,8 +1427,8 @@
            :when (= :map (:kind left) (:kind right))
            ;; Horizontal fusion interleaves independent maps lane-by-lane. A trapping conversion
            ;; on either side therefore retains its source equation-completion boundary.
-           :when (not (or (exceptional-conversion-region? program left)
-                          (exceptional-conversion-region? program right)))
+           :when (not (or @(nth exceptional left-index)
+                          @(nth exceptional right-index)))
            :when left-boundary
            :when right-boundary
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))
