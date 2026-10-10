@@ -48,6 +48,12 @@ The training compiler companion uses it so repartitioning loses no OpenCL-job co
 Recollect namespace weights after splitting: previous per-var timings explain the partition,
 but are not fresh namespace costs or measured speedups.
 
+The initial split seeds are lane-specific: general-suite job 25327 and OpenCL job 25271.
+Each seed sums that lane's original test-var durations and conservatively charges the old
+namespace load cost to both pieces. General-suite native branches skipped, so those weights
+must not be used as OpenCL execution costs. The TSV comments distinguish these projections
+from measured namespace rows. Fresh comparable reports should replace the seeds after CI.
+
 Landing order:
 
 1. Collect load/test timings without dropping coverage.
