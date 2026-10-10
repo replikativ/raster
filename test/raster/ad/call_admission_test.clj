@@ -14,8 +14,8 @@
   (double (float x)))
 
 (defn identity-helper [x] x)
-(defn inactive-rounding-helper [x] (double (float x)))
-(defn exact-integer-helper [x] (if (= x 9007199254740993) 2.0 9.0))
+(defn ^{:tag 'double} inactive-rounding-helper [x] (double (float x)))
+(defn ^{:tag 'double} exact-integer-helper [x] (if (= x 9007199254740993) 2.0 9.0))
 (defn mutating-implementation [x] (swap! helper-calls inc) x)
 
 (r/deftm active-narrowing [x :- Double] :- Double (narrowing-helper x))
