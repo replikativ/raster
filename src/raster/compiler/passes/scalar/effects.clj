@@ -14,6 +14,7 @@
    The raster context pre-registers raster.numeric and raster.math vars
    as :pure so beichte doesn't need to analyze their source each time."
   (:require [beichte.core :as b]
+            [beichte.registry :as beichte-registry]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.numeric-constant :as numeric-constant]
@@ -104,7 +105,8 @@
   nil)
 
 (defn get-raster-context
-  "Return the shared Raster Beichte context."
+  "Return the declared Raster Beichte context. Its registry contains trusted
+   contracts; mutable helper analysis must use a fresh context."
   []
   @raster-context)
 
@@ -132,9 +134,9 @@
   (:effect (descriptor expr)))
 
 (defn analyze-var-effect
-  "Analyze a var and return its effect level."
+  "Analyze a var and return its effect level using fresh source evidence."
   [v]
-  (b/analyze-var v @raster-context))
+  (b/analyze-var v (b/make-context {:registry (:registry @raster-context)})))
 
 (defn- semantic-calls
   "Restore walker-devirtualized calls to the source-level operation recorded in
@@ -214,6 +216,29 @@
 
 (declare analyze-descriptor)
 
+(defn- closed-registry-proof
+  "Exact operation identities for expressions closed over declared contracts.
+   Ordinary helpers, macros, special forms and interop need fresh analysis:
+   Beichte's analyzed-Var cache is not a complete dependency footprint."
+  [expr]
+  (let [registry (:registry @raster-context)]
+    (letfn [(proof [node]
+              (cond
+                (seq? node)
+                (let [head (first node)
+                      v (when (symbol? head) (resolve head))]
+                  (when (and (var? v) (not (:macro (meta v)))
+                             (some? (beichte-registry/lookup registry v)))
+                    (let [children (mapv proof (rest node))]
+                      (when (every? some? children)
+                        (into [v] (mapcat identity children))))))
+
+                ;; Collections may contain executable expressions, so their
+                ;; analysis is deliberately not certified by a leaf proof.
+                (coll? node) nil
+                :else []))]
+      (proof (semantic-calls expr)))))
+
 (defn descriptor
   "Return the effect descriptor for a compiler IR expression.
 
@@ -222,12 +247,17 @@
 
    Conservative default: if beichte fails, returns {:effect :io :flags #{}}
    (assumed effectful). Only proven-pure expressions get :pure. Results are
-   memoized by expression and metadata; the analysis context is fixed once
-   initialized."
+   memoized only for closed declared-registry expressions, by metadata and
+   exact resolved operation identities. Open expressions use a fresh Beichte
+   context; cached source analysis must not survive helper redefinition."
   [expr]
   (if (not (seq? expr))
     {:effect :pure :flags #{}}
-    (if-let [k (try (descriptor-key expr) (catch StackOverflowError _ nil))]
+    (if-let [k (try
+                 (when-let [proof (closed-registry-proof expr)]
+                   [(descriptor-key expr) proof])
+                 (catch Exception _ nil)
+                 (catch StackOverflowError _ nil))]
       (or (.get ^java.util.Map descriptor-cache k)
           (let [result (analyze-descriptor expr)]
             (.put ^java.util.Map descriptor-cache k result)
@@ -239,7 +269,8 @@
   (try
     (let [semantic-expr (semantic-calls expr)
           locals (collect-locals semantic-expr)
-          result (b/analyze-full semantic-expr @raster-context locals)
+          context (b/make-context {:registry (:registry @raster-context)})
+          result (b/analyze-full semantic-expr context locals)
           result (if (map? result)
                    (update result :flags #(or % #{}))
                    {:effect (or result :io) :flags #{}})]
