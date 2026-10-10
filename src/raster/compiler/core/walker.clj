@@ -408,10 +408,7 @@
   Resolves namespace-aliased symbols to fully qualified names."
   [form ctx]
   (let [;; An explicitly unknown local masks type evidence from an earlier scope.
-        form (if (and (symbol? form) (contains? (:type-env ctx) form)
-                      (nil? (get-in (:type-env ctx) [form :tag])))
-               (vary-meta form dissoc :tag :raster.type/tag :raster.type/element :raster.type/fn-info)
-               form)
+        form (inf/mask-unknown-local form (:type-env ctx))
         ;; Resolve namespace-aliased symbols to fully qualified names
         form (if (and (symbol? form) (namespace form) (not (ctx-get-tag ctx form)))
                (resolve-aliased-symbol form (:source-ns ctx))
@@ -776,7 +773,7 @@
                                                                 :element-dtype (:element-dtype ctx)})
                                    esym (if etag (stamp-type-meta esym etag) esym)]
                                [(conj binds esym einit)
-                                (if etag (ctx-assoc-type ctx esym etag) ctx)]))
+                                (ctx-assoc-type ctx esym etag)]))
                            [binds ctx]
                            (partition 2 extra-binds))
                    [binds ctx])
@@ -808,8 +805,7 @@
                  hint (inf/compute-binding-hint tag sym)
                  sym (stamp-type-meta sym (or hint tag) elem-tag)]
              [(conj binds sym rewritten-init)
-              (cond-> ctx
-                tag (ctx-assoc-type sym tag)
+              (cond-> (ctx-assoc-type ctx sym tag)
                 elem-tag (update-in [:type-env sym] assoc :element elem-tag))]))
          [[] ctx]
          (partition 2 bindings))]

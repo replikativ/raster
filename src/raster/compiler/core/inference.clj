@@ -1975,6 +1975,16 @@ stable physical-leaf order on every backend."}
   (let [entry (get env sym)]
     (when (map? entry) (:element entry))))
 
+(defn mask-unknown-local
+  "Remove stale use-site type metadata only for an explicitly unknown lexical local.
+   Shares the walker's policy across rich and compact compiler environments."
+  [expression environment]
+  (if (and (symbol? expression) (contains? environment expression)
+           (nil? (late-env-tag environment expression)))
+    (vary-meta expression dissoc :tag :raster.type/tag
+               :raster.type/element :raster.type/fn-info)
+    expression))
+
 (defn infer-scalar-intrinsic-dtype
   "Infer a fixed-arity value intrinsic result from independently proved operand dtypes.
    JVM-representable operands use the ordinary dispatch inference. Homogeneous half
@@ -2019,10 +2029,13 @@ stable physical-leaf order on every backend."}
    Metadata-based inference is the primary mechanism."
   [expr env]
   (cond
-    (symbol? expr) (or (late-env-tag env expr)
-                       (:raster.type/tag (meta expr))
-                       (:tag (meta expr))
-                       (when (namespace expr) (var-ref-tag expr)))
+    ;; A present local with unknown type masks outer/retained evidence, exactly as
+    ;; the walker masks nil-tag local records. Absence and unknown are not the same.
+    (symbol? expr) (if (contains? env expr)
+                     (late-env-tag env expr)
+                     (or (:raster.type/tag (meta expr))
+                         (:tag (meta expr))
+                         (when (namespace expr) (var-ref-tag expr))))
     (number? expr) (condp instance? expr
                      Double 'double
                      Float 'float
@@ -2035,6 +2048,8 @@ stable physical-leaf order on every backend."}
         (:tag (meta expr))
         (let [head (first expr)]
           (cond
+            ;; A lexical operator is not its same-named global/cast descriptor.
+            (contains? env head) nil
             (and (not (contains? env head))
                  (descriptor/cast-result-tag head))
             (descriptor/cast-result-tag head)
@@ -2139,9 +2154,7 @@ stable physical-leaf order on every backend."}
             (let [bindings (second expr)
                   pairs (partition 2 bindings)
                   let-env (reduce (fn [e [sym init]]
-                                    (if-let [t (infer-arg-tag init e)]
-                                      (assoc e sym t)
-                                      e))
+                                    (assoc e sym (or (hint-tag sym) (infer-arg-tag init e))))
                                   env pairs)
                   body (drop 2 expr)
                   last-body (last body)]
@@ -2151,9 +2164,7 @@ stable physical-leaf order on every backend."}
             (let [bindings (second expr)
                   pairs (partition 2 bindings)
                   loop-env (reduce (fn [e [sym init]]
-                                     (if-let [t (infer-arg-tag init e)]
-                                       (assoc e sym t)
-                                       e))
+                                     (assoc e sym (or (hint-tag sym) (infer-arg-tag init e))))
                                    env pairs)
                   body (drop 2 expr)
                   last-body (last body)]
@@ -2231,19 +2242,17 @@ stable physical-leaf order on every backend."}
                           (reduce (fn [[env alternatives] [id init]]
                                     (let [tags (vec (distinct (result-tags init env alternatives)))
                                           env (if (and (= 1 (count tags)) (first tags))
-                                                (assoc env id (first tags)) (dissoc env id))]
+                                                (assoc env id (first tags)) (assoc env id nil))]
                                       [env (assoc alternatives id tags)]))
                                   [env alternatives] (partition 2 bindings))]
                       (result-tags (last body) env alternatives))
                     (or (contains? form/loop-heads head) (= 'recur head)) [nil]
                     :else
-                    (let [unknowns (set (for [[id tags] alternatives
-                                             :when (or (not= 1 (count tags)) (nil? (first tags)))] id))
-                          ;; Retained metadata cannot resurrect an unknown/shadowed
-                          ;; local inside a leaf call after its environment fact was removed.
+                    (let [;; Retained metadata cannot resurrect unknown/shadowed
+                          ;; locals inside a leaf call; lexical nil masks remain in env.
                           expression (clojure.walk/postwalk
-                                      #(if (and (symbol? %) (contains? unknowns %))
-                                         (vary-meta % dissoc :tag :raster.type/tag) %) expression)]
+                                      #(mask-unknown-local % env) expression)]
                       [(or (infer-arg-tag expression env)
-                           (infer-rewritten-tag expression nil env))])))))]
+                           (when-not (contains? env head)
+                             (infer-rewritten-tag expression nil env)))])))))]
       (vec (distinct (result-tags expression environment {}))))))
