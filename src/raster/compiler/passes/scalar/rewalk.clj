@@ -29,7 +29,9 @@
   "PE+CSE fixpoint plus re-walk to devirtualize scalar arithmetic.
 
   Returns {:form :stats} when enabled, or the original form when simplify is
-  disabled in opts, matching the surrounding pipeline pass convention."
+  disabled in opts, matching the surrounding pipeline pass convention.
+  Walking failures propagate: an unsuccessful type-directed walk is not a
+  verified optimization decline and cannot certify the retained expression."
   [form opts]
   (if-not (:simplify? opts)
     form
@@ -70,17 +72,12 @@
           ;; TC binding tags: run TC once on the post-AD form for systematic
           ;; type inference of all let bindings.
           tc-binding-tags (inf/tc-infer-binding-tags param-env optimized)
-          rewalked (try
-                     (walker/walk-body optimized
-                                       (cond-> {:type-env type-env}
-                                         (:source-ns opts) (assoc :source-ns (:source-ns opts))
-                                         (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
-                                         ;; AOT monomorphization dtype → contextual literal typing (B)
-                                         (#{:float :double} current-dtype) (assoc :element-dtype current-dtype)))
-                     (catch Exception e
-                       (binding [*out* *err*]
-                         (println (str "WARNING: rewalk failed, passing through: " (.getMessage e))))
-                       optimized))
+          rewalked (walker/walk-body optimized
+                                    (cond-> {:type-env type-env}
+                                      (:source-ns opts) (assoc :source-ns (:source-ns opts))
+                                      (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
+                                      ;; AOT monomorphization dtype → contextual literal typing (B)
+                                      (#{:float :double} current-dtype) (assoc :element-dtype current-dtype)))
           orig-bindings (when (form/binding-form? form)
                           (count (partition 2 (second form))))
           final-bindings (when (form/binding-form? rewalked)
