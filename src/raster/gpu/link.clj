@@ -322,11 +322,11 @@
                                                               buffers)
                                                         extent-scalars
                                                         (into {}
-                                                              (keep (fn [[compiler-value resident]]
-                                                                      (when-let [extent (first (get-in resident [:view :shape]))]
-                                                                        [(list 'extent compiler-value)
-                                                                         {:type :long :value extent}])))
-                                                              resident-buffers)]
+                                                              (map (fn [[expression extent]]
+                                                                     [expression {:type :long :value extent}]))
+                                                              (bview/first-dimension-extents
+                                                               (map (fn [[id resident]] [id (:view resident)])
+                                                                    resident-buffers)))]
                                                     (gpu/bind-kernel-graph!
                                                      session [::program-graph execution-id key] graph
                                                      resident-buffers (merge extent-scalars scalars)

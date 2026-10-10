@@ -7,6 +7,26 @@
                     :device :ze:0 :alignment 64 :coherence :host-coherent
                     :ownership :owned}))
 
+(deftest bound-first-dimension-extents-are-not-storage-size-or-cached-facts
+  (let [matrix (view/view allocation {:id :matrix :dtype :float :shape [4 8]})
+        scalar (view/view allocation {:id :scalar :dtype :float :shape []})
+        empty (view/view allocation {:id :empty :dtype :float :shape [0 8]})
+        bindings {'x matrix 's scalar 'z empty}
+        expected {'(extent x) 4 '(extent z) 0}]
+    (is (= expected (view/first-dimension-extents bindings)))
+    (is (= expected (view/first-dimension-extents (seq bindings))))
+    (is (= {} (view/first-dimension-extents {})))
+    (is (= {'(extent x) 2}
+           (view/first-dimension-extents
+            {'x (view/subview matrix {:id :short :shape [2 8]})})))
+    (is (= 4 (get (view/first-dimension-extents bindings) '(extent x)))
+        "later projections do not retain the shortened binding")
+    (is (= 99 (get (merge (view/first-dimension-extents bindings) {'(extent x) 99}) '(extent x)))
+        "explicit scalar precedence remains a caller decision")
+    (is (= :bound-view-extent
+           (try (view/first-dimension-extents {'x {:shape [4 8]}}) nil
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest shaped-views-have-stable-byte-ranges
   (let [whole (view/view allocation {:id :whole :dtype :float :shape [16 64]})
         prefix (view/subview whole {:id :prefix :dtype :float :shape [4 64]})

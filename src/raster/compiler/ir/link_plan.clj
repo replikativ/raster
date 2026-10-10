@@ -1007,14 +1007,11 @@
       (program-value-node! nodes values id compiler-value value-id))))
 
 (defn- program-extent-values [nodes values instance-id buffers]
-  (into {}
-              (keep (fn [[compiler-value value-id]]
-                      (let [node (program-value-node!
-                                  nodes values instance-id compiler-value value-id)
-                            shape (get-in node [:view :shape])]
-                        (when (seq shape)
-                          [(list 'extent compiler-value) (first shape)]))))
-              buffers))
+  (bview/first-dimension-extents
+   (map (fn [[compiler-value value-id]]
+          [compiler-value (:view (program-value-node!
+                                 nodes values instance-id compiler-value value-id))])
+        buffers)))
 
 (defn- program-graph-fact
   [nodes values instance-id step-id phase graph buffers program-scalars scalar-values]
@@ -1403,11 +1400,8 @@
 
 (defn- linked-graph-temporary-storage
   [graph scalar-values buffer-nodes]
-  (let [extents (into {}
-                      (keep (fn [[id node]]
-                              (when-let [dimension (first (get-in node [:view :shape]))]
-                                [(list 'extent id) dimension])))
-                      buffer-nodes)]
+  (let [extents (bview/first-dimension-extents
+                 (map (fn [[id node]] [id (:view node)]) buffer-nodes))]
     (kgcall/temporary-storage-plan graph (merge extents scalar-values))))
 
 (defn temporary-storage-plan
