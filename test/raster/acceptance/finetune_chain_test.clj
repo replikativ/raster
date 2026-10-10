@@ -2,7 +2,11 @@
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is]]
-            [raster.acceptance.finetune-chain :as acceptance]))
+            [raster.acceptance.finetune-chain :as acceptance]
+            [raster.ad.reverse :as reverse]
+            [raster.dl.loss :as loss]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.value :as value]))
 
 (deftest source-check-compares-the-pinned-file-before-evaluation
   (let [file (java.io.File/createTempFile "raster-external-source-" ".clj")
@@ -112,3 +116,70 @@
     (is (= 2.0 (:reference-max summary)))
     (is (= 2.0 (:error-l2 summary)))
     (is (= (Math/sqrt 5.0) (:reference-l2 summary)))))
+
+(deftest difference-diagnostics-retain-coordinates-and-do-not-hide-nonfinite-values
+  (let [summary (#'acceptance/difference-summary [3.0 -2.0 6.0] [1.0 0.0 5.0])]
+    (is (= {:index 0 :actual 3.0 :expected 1.0 :absolute-error 2.0}
+           (:worst-finite-absolute-coordinate summary)))
+    (is (zero? (:nonfinite-coordinate-count summary))))
+  (let [summary (#'acceptance/difference-summary [Double/NaN 3.0 Double/POSITIVE_INFINITY]
+                                                 [0.0 1.0 Double/POSITIVE_INFINITY])]
+    (is (= 2 (:nonfinite-coordinate-count summary)))
+    (is (= 1 (get-in summary [:worst-finite-absolute-coordinate :index])))
+    (is (Double/isNaN (:max-absolute summary))))
+  (is (nil? (:worst-finite-absolute-coordinate (#'acceptance/difference-summary [] []))))
+  (is (= :external-training-shape
+         (try (#'acceptance/difference-summary [1.0] []) nil
+              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+
+(deftest bound-schedules-survive-parity-failure-without-leaking-the-artifact
+  (let [keys (mapv #(keyword (str "adapter" %)) (range 14))
+        gradients (zipmap keys (repeat (float-array [1])))
+        model {'adapter-keys (atom keys) 'layer-theta (fn [& _] {})}
+        oracle {'layer-arrs (fn [& _] []) 'ref-loss2 (fn [& _] 0.0)
+                'adapter-pos (atom (zipmap keys (range)))
+                'recovered-grads (fn [& _] gradients) 'worst-rel (fn [& _] 0.0)}
+        case {:cfg {:bs 1 :seq 1 :d 1} :weights [{} {}]
+              :adapters [gradients gradients] :input (float-array [0])
+              :target (float-array [0]) :replay-count 1}
+        outputs (into {:prediction (float-array [0]) :dx0 (float-array [1])}
+                      (for [layer [0 1] key keys] [[layer key] (gradients key)]))
+        live (fn [_] outputs)
+        closed (atom [])
+        inspected (atom [])
+        info [{:instance :matrix
+               :executable {:selection :fixed :entry-points ["actual_leaf"]}}]
+        expected (into [0.0 (float-array [1])] (repeat 54 (float-array [1])))
+        predicted (atom 0.0)]
+    (with-redefs-fn
+      {#'acceptance/prepare-chain (fn [& _] :prepared)
+       #'compiled/instantiate! (fn [_] live)
+       #'compiled/plan (fn [_] {:instances []})
+       #'compiled/execution-info (fn [artifact] (swap! inspected conj artifact) info)
+       #'compiled/close! (fn [artifact] (swap! closed conj artifact))
+       #'reverse/value+grad (fn [_] (fn [& _] expected))
+       #'value/->host identity
+       #'loss/mse-loss (fn [& _] @predicted)}
+      (fn []
+        (let [result (acceptance/run-loaded! {:train model :oracle oracle} :ocl:0 case)]
+          (is (= info (:bound-schedules result)))
+          (is (= 1 (count (:replays result)))))
+        (reset! predicted 1.0)
+        (let [data (try (acceptance/run-loaded! {:train model :oracle oracle} :ocl:0 case)
+                        nil (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+          (is (= :external-training-parity (:reason data)))
+          (is (= info (:bound-schedules data)))
+          (is (= 1.0 (:loss-error data)))
+          (is (= 28 (count (:adapter-errors data)))))))
+    (is (= [live live] @inspected))
+    (is (= [live live] @closed))
+    (reset! closed [])
+    (with-redefs-fn
+      {#'acceptance/prepare-chain (fn [& _] :prepared)
+       #'compiled/instantiate! (fn [_] live)
+       #'compiled/execution-info (fn [_] (throw (ex-info "inspection failed" {:reason :inspection})))
+       #'compiled/close! (fn [artifact] (swap! closed conj artifact))}
+      #(is (= :inspection
+              (try (acceptance/run-loaded! {:train model :oracle oracle} :ocl:0 case)
+                   nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (is (= [live] @closed))))

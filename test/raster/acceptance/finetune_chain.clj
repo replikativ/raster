@@ -99,14 +99,25 @@
   ((oracle 'worst-rel) actual expected))
 
 (defn- difference-summary [actual expected]
-  (let [[maximum reference-maximum error-squared reference-squared]
-        (reduce (fn [[maximum reference-maximum error-squared reference-squared] [a b]]
-                  (let [a (double a) b (double b) error (- a b)]
-                    [(max maximum (Math/abs error)) (max reference-maximum (Math/abs b))
-                     (+ error-squared (* error error)) (+ reference-squared (* b b))]))
-                [0.0 0.0 0.0 0.0] (map vector actual expected))]
+  (when-not (= (count actual) (count expected))
+    (throw (ex-info "diagnostic array lengths differ"
+                    {:reason :external-training-shape
+                     :actual (count actual) :expected (count expected)})))
+  (let [[maximum reference-maximum error-squared reference-squared worst nonfinite]
+        (reduce (fn [[maximum reference-maximum error-squared reference-squared worst nonfinite]
+                     [index a b]]
+                  (let [a (double a) b (double b) error (- a b)
+                        absolute (Math/abs error)
+                        finite? (and (Double/isFinite a) (Double/isFinite b))]
+                    [(max maximum absolute) (max reference-maximum (Math/abs b))
+                     (+ error-squared (* error error)) (+ reference-squared (* b b))
+                     (if (and finite? (or (nil? worst) (> absolute (:absolute-error worst))))
+                       {:index index :actual a :expected b :absolute-error absolute} worst)
+                     (+ nonfinite (if finite? 0 1))]))
+                [0.0 0.0 0.0 0.0 nil 0] (map vector (range) actual expected))]
     {:max-absolute maximum :reference-max reference-maximum
-     :error-l2 (Math/sqrt error-squared) :reference-l2 (Math/sqrt reference-squared)}))
+     :error-l2 (Math/sqrt error-squared) :reference-l2 (Math/sqrt reference-squared)
+     :worst-finite-absolute-coordinate worst :nonfinite-coordinate-count nonfinite}))
 
 (defn- prepare-chain [train target-device cfg weights adapters input target]
   (let [n (* (:seq cfg) (:d cfg))
@@ -169,7 +180,8 @@
 (defn run-loaded!
   "Run two full resident updates against the unchanged CPU monolithic AD oracle.
    An explicit case supplies model arrays/configuration and a positive replay count.
-   Downloads are oracle reads only. Every native artifact closes, including on mismatch."
+   Downloads are oracle reads only. Reports retain binding-time admission, not proof of replay
+   or timing. Every native artifact closes, including on mismatch or failed inspection."
   ([{:keys [train oracle] :as loaded} target-device]
    (let [cfg @(oracle 'chain-cfg) n (* (:seq cfg) (:d cfg))]
      (run-loaded! loaded target-device
@@ -196,8 +208,10 @@
         live (compiled/instantiate! prepared)
         binding-ns (- (System/nanoTime) started)]
     (try
-      {:revision source-revision :target target-device :config cfg
+      (let [bound-schedules (compiled/execution-info live)]
+        {:revision source-revision :target target-device :config cfg
        :preparation-ns preparation-ns :binding-ns binding-ns
+       :bound-schedules bound-schedules
        :numerical-calls (mapv #(count (filter :graph (get-in % [:call :steps])))
                              (:instances (compiled/plan prepared)))
        :replays
@@ -238,6 +252,7 @@
                                {:reason :external-training-parity :iteration iteration
                                 :predicted-loss predicted-loss :reference-loss reference-loss
                                 :loss-error loss-error :dx-error dx-error :adapter-errors errors
+                                :bound-schedules bound-schedules
                                 :adapter-diagnostics
                                 (vec (for [layer [0 1]
                                            [index key] (map-indexed vector @(train 'adapter-keys))
@@ -250,7 +265,7 @@
              (recur (inc iteration) updated outputs
                     (conj results {:loss predicted-loss :reference-loss reference-loss
                                    :loss-error loss-error :dx-error dx-error
-                                   :adapter-count (count errors) :adapter-max-error (apply max errors)})))))}
+                                   :adapter-count (count errors) :adapter-max-error (apply max errors)})))))})
       (finally (compiled/close! live))))))
 
 (defn run! [{:keys [source-root targets] :or {targets [:ocl:0 :ze:0]}}]
