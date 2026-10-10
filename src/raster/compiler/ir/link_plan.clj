@@ -1404,7 +1404,7 @@
                  (map (fn [[id node]] [id (:view node)]) buffer-nodes))]
     (kgcall/temporary-storage-plan graph (merge extents scalar-values))))
 
-(defn temporary-storage-plan
+(defn- temporary-storage-plan-in-context
   "Independently project a LinkPlan's declared prepared graph scratch without driver contact.
    All separately prepared graph/carry variants coexist until local release. Descriptor dispatch
    uses the maximum over every declared alternative, including fallback; this conservative bound
@@ -1415,7 +1415,7 @@
    excluded. Source and specialization objects must stay stable; this report is not authority
    to allocate, skip runtime admission, or infer lifetime reuse."
   [plan]
-  (let [{:keys [nodes values instances target]} (validate! plan)
+  (let [{:keys [nodes values instances target]} (validate-plan-for-current-request! plan)
         graph-storage
         (fn [instance-id graph buffers scalars]
           (linked-graph-temporary-storage
@@ -1453,7 +1453,7 @@
               (mapv (fn [{:keys [key graph buffers scalar-values]}]
                       (assoc (graph-storage id graph buffers scalar-values)
                              :instance id :binding key :mode :prepared-graph))
-                    (:entries (program-call/preparation-plan (:call instance) id)))
+                    (:entries (program-call/preparation-plan (:call instance) id *caller-options*)))
 
               (graph-link-instance? instance)
               [(assoc (graph-storage id (:graph instance) (:bindings instance) (:scalar-values instance))
@@ -1461,6 +1461,12 @@
     {:model :prepared-link-plan-graph-temporaries
      :target target :bindings bindings
      :resident-bytes (reduce +' 0 (map :resident-bytes bindings))}))
+
+(defn temporary-storage-plan
+  "Project declared prepared graph scratch under independent caller math intent."
+  ([plan] (with-independent-request nil #(temporary-storage-plan-in-context plan)))
+  ([plan caller-options]
+   (with-independent-request caller-options #(temporary-storage-plan-in-context plan))))
 
 (defn- initialization-contract-in-context
   "Validate and derive conservative node-level initialization pre/postconditions from ordered ABI facts.

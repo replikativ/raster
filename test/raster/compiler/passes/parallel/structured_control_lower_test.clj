@@ -166,6 +166,18 @@
       (is (= #{:output} (:outputs (link/initialization-contract plan request))))
       (is (contains? (link/value-accesses plan request) :initial))
       (is (= (:id plan) (:plan (link/memory-report plan request))))
+      (let [storage (link/temporary-storage-plan plan request)
+            compiler-plan (program-call/preparation-plan call :selected request)]
+        (is (= 3 (count (:bindings storage)))
+            "initial carry and both rotations retain separately prepared graph scratch")
+        (is (pos? (:resident-bytes storage)))
+        (is (= (:resident-bytes storage)
+               (reduce + (map :resident-bytes (:bindings storage)))))
+        (is (= (:entries compiler-plan)
+               (program-runtime/staging-plan call :selected request)))
+        (is (thrown? clojure.lang.ExceptionInfo (link/temporary-storage-plan plan)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (link/temporary-storage-plan plan {:scalar-math {:overrides {}}}))))
       (is (link/link-plan? (:plan (link/borrow-owned-storage plan request))))
       (is (= #{:state} (set (vals (link/instance-roles plan instance request)))))
       (doseq [query [#(link/initialization-contract plan) #(link/value-accesses plan)
