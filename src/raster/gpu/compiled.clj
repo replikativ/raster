@@ -336,13 +336,16 @@
    (get-in key [:semantic-request :target :descriptor-fingerprint])})
 
 (defn- resolve-compilation-template
-  [key compiler thunk persistent-report]
+  [key compiler thunk persistent-report caller-options]
   (let [persistent? (and (= :equation-first compiler)
                          (:persistent-cache-eligible? key))
         identity (when persistent? (persistent-artifact-identity key))
         loaded (when persistent?
-                 (equation-artifact-store/load-artifact
-                  *equation-artifact-store* (:semantic-fingerprint key) identity))]
+                 (if (nil? caller-options)
+                   (equation-artifact-store/load-artifact
+                    *equation-artifact-store* (:semantic-fingerprint key) identity)
+                   (equation-artifact-store/load-artifact
+                    *equation-artifact-store* (:semantic-fingerprint key) identity caller-options)))]
     (if (= :hit (:status loaded))
       (do (reset! persistent-report (dissoc loaded :value))
           (:value loaded))
@@ -360,8 +363,11 @@
             stored
             (when persistent?
               (try
-                (equation-artifact-store/store-artifact!
-                 *equation-artifact-store* (:semantic-fingerprint key) identity value)
+                (if (nil? caller-options)
+                  (equation-artifact-store/store-artifact!
+                   *equation-artifact-store* (:semantic-fingerprint key) identity value)
+                  (equation-artifact-store/store-artifact!
+                   *equation-artifact-store* (:semantic-fingerprint key) identity value caller-options))
                 (catch Exception error
                   {:status :write-failed :error-class (.getName (class error))})))]
         (reset! persistent-report
@@ -377,7 +383,7 @@
   (let [math-policy (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
         validation-options (when (some? caller-options) {:scalar-math math-policy})
         persistent-report (atom nil)
-        value (delay (resolve-compilation-template key compiler thunk persistent-report))
+        value (delay (resolve-compilation-template key compiler thunk persistent-report validation-options))
         candidate
         {:compiler compiler
          :value value
@@ -885,6 +891,8 @@
                 :or {target :ze:0 dtype :float}
                 :as opts}]
   (let [preparation-started (System/nanoTime)
+        caller-math-options (when (contains? opts :scalar-math)
+                              {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math opts))})
         template-report (atom nil)
         template-owner (atom nil)
         target-descriptor (equation-first/validate-target-description!
@@ -893,7 +901,7 @@
         compilation-options (apply dissoc opts
                                    [:compiler :donate :constants :outputs :taps :roles
                                     :profile? :on-non-resident])
-        compilation-options (assoc compilation-options :target target :dtype dtype)
+        compilation-options (merge compilation-options caller-math-options {:target target :dtype dtype})
         compilation-options (cond-> compilation-options
                               (contains? compilation-options :schedule)
                               (update :schedule gpu-schedule/normalize-override))
@@ -908,23 +916,27 @@
            (weak-identity @#'equation-first/compile)))
         compilation (binding [*compilation-template-observer* #(reset! template-report %)
                               *compilation-template-owner* template-owner]
-                      (stable-compilation-template
-                       template-key :equation-first
-                       #(equation-first/compile fn-var compilation-options target-descriptor)))
+                      (let [compile-template #(equation-first/compile fn-var compilation-options target-descriptor)]
+                        (if caller-math-options
+                          (stable-compilation-template template-key :equation-first compile-template caller-math-options)
+                          (stable-compilation-template template-key :equation-first compile-template))))
         lowering-started (System/nanoTime)
-        retained-validation (owned-emitted-validation @template-owner compilation)
+        retained-validation (if caller-math-options
+                              (owned-emitted-validation @template-owner compilation caller-math-options)
+                              (owned-emitted-validation @template-owner compilation))
         equation-lower-phases (atom nil)
         projection-ns (atom 0)
         result (binding [equation-first/*lower-observer*
                          #(reset! equation-lower-phases %)]
-                 (equation-first/lower
-                  compilation args
-                  (fn [plan]
+                 (let [project
+                       (fn [plan]
                     (let [started (System/nanoTime)
                           projected (project-equation-first-boundary plan compilation args opts)]
                       (reset! projection-ns (- (System/nanoTime) started))
-                      projected))
-                  retained-validation))
+                      projected))]
+                   (if caller-math-options
+                     (equation-first/lower compilation args project retained-validation caller-math-options)
+                     (equation-first/lower compilation args project retained-validation))))
         equation-lower-ns (- (System/nanoTime) lowering-started @projection-ns)
         plan (:plan result)
         {:keys [in-tree out-tree]} (:projection result)
@@ -939,7 +951,9 @@
                                       (get logical-binding symbol symbol))))
         public-array-set (set public-arrays)
         certification-started (System/nanoTime)
-        lowering (invocation-link/certify-final-projection result)
+        lowering (if caller-math-options
+                   (invocation-link/certify-final-projection result caller-math-options)
+                   (invocation-link/certify-final-projection result))
         invocation-certification-ns (- (System/nanoTime) certification-started)
         lowering-ns (- (System/nanoTime) lowering-started)
         steps (mapv (fn [index kernel]
@@ -970,7 +984,8 @@
                 :nodes (count (get-in lowering [:plan :nodes]))
                 :instances (count (get-in lowering [:plan :instances]))}]
     (seal-artifact
-     (->Prepared lowering in-tree out-tree donated schedule target descriptor args report nil))))
+     (cond-> (->Prepared lowering in-tree out-tree donated schedule target descriptor args report nil)
+       caller-math-options (assoc :math-request caller-math-options)))))
 
 (defn lower
   "Lower a deftm Var into an allocation-free `Prepared` artifact.
@@ -980,11 +995,38 @@
    equation-first compiler never falls back to a resident descriptor after a coverage failure."
   [fn-var args {:keys [compiler] :or {compiler :resident-descriptor} :as opts}]
   (case compiler
-    :resident-descriptor (lower-resident-descriptor fn-var args opts)
+    :resident-descriptor
+    (do
+      (when (contains? opts :scalar-math)
+        (throw (ex-info "scalar math intent requires the equation-first vertical"
+                        {:reason :compiled-resident-math-request})))
+      (lower-resident-descriptor fn-var args opts))
     :equation-first (lower-equation-first fn-var args opts)
     (throw (ex-info "unknown compiled lowering vertical"
                     {:reason :compiled-compiler :compiler compiler
                      :allowed #{:resident-descriptor :equation-first}}))))
+
+(defn- instantiation-options-for-owner
+  "Only the exact privately sealed Prepared may carry its original caller's math request."
+  [prepared opts]
+  (if (sealed-artifact? prepared)
+    (let [owned-request (:math-request prepared)
+          owned-policy (numerics/validate-scalar-math-policy! (:scalar-math owned-request))]
+      (when (and (contains? opts :scalar-math)
+                 (not= owned-policy (numerics/validate-scalar-math-policy! (:scalar-math opts))))
+        (throw (ex-info "runtime math request differs from original Prepared intent"
+                        {:reason :compiled-prepared-math-request
+                         :expected owned-policy :actual (:scalar-math opts)})))
+      (merge opts owned-request))
+    ;; A copied artifact must obtain permission independently, never from retained metadata.
+    (do
+      (when (and (some? (:math-request prepared))
+                 (not (contains? opts :scalar-math)))
+        (throw (ex-info "copied Prepared requires independent caller math intent"
+                        {:reason :compiled-prepared-math-owner})))
+      (cond-> opts
+        (contains? opts :scalar-math)
+        (update :scalar-math numerics/validate-scalar-math-policy!)))))
 
 (defn instantiate!
   "Instantiate one pure Prepared artifact as a callable Compiled value. All component plans have
@@ -994,11 +1036,15 @@
    (when-not (prepared? prepared)
      (throw (ex-info "instantiate! requires an allocation-free Prepared artifact"
                      {:reason :compiled-prepared-type :actual (type prepared)})))
-   (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args
+   (let [opts (instantiation-options-for-owner prepared opts)
+         caller-math-options (when (contains? opts :scalar-math) (select-keys opts [:scalar-math]))
+         {:keys [lowering in-tree out-tree donated schedule target descriptor args
                  preparation-report]} prepared
          evidence (get-in lowering [:certificate :effect-evidence])
          executable (if (and (sealed-artifact? prepared)
-                             (link-plan/retained-effect-evidence? (:plan lowering) evidence))
+                             (if caller-math-options
+                               (link-plan/retained-effect-evidence? (:plan lowering) evidence caller-math-options)
+                               (link-plan/retained-effect-evidence? (:plan lowering) evidence)))
                       (gpu-link/instantiate-certified! lowering opts)
                       (gpu-link/instantiate! (:plan lowering) opts))]
      (seal-artifact
@@ -1016,7 +1062,8 @@
   (:preparation-report artifact))
 
 (defn- exact-artifact-evidence
-  [lowering report]
+  ([lowering report] (exact-artifact-evidence lowering report nil))
+  ([lowering report caller-options]
   (case (:kind report)
     :equation-first
     (let [{:keys [persistent-cache-eligible? persistence-blockers source-dependency-blockers
@@ -1033,25 +1080,29 @@
                          :persistence-blockers persistence-blockers
                          :source-dependency-blockers source-dependency-blockers
                          :retained-artifact? (boolean (seq retained-artifact))})))
-      (invocation-link/verify! lowering)
+      (if caller-options
+        (invocation-link/verify! lowering caller-options)
+        (invocation-link/verify! lowering))
       {:identity persistent-artifact-identity :artifact retained-artifact})
 
     :composition
     (let [components (:components lowering)
           reports (:components report)]
-      (link-composition/verify! lowering)
+      (if caller-options
+        (link-composition/verify! lowering caller-options)
+        (link-composition/verify! lowering))
       (when-not (= (mapv :id components) (mapv :id reports))
         (throw (ex-info "composition reports must follow their exact certified components"
                         {:reason :compiled-execution-identity-components})))
       {:components (mapv (fn [component component-report]
                            {:id (:id component)
                             :artifact (exact-artifact-evidence
-                                       (:lowering component) (:report component-report))})
+                                       (:lowering component) (:report component-report) caller-options)})
                          components reports)
        :specification (:specification lowering)})
 
     (throw (ex-info "exact program evidence requires the equation-first vertical"
-                    {:reason :compiled-execution-identity-vertical :kind (:kind report)}))))
+                    {:reason :compiled-execution-identity-vertical :kind (:kind report)})))))
 
 (defn execution-identity
   "Identify one exact retained, specialized Prepared or Compiled without input-byte lineage.
@@ -1069,7 +1120,8 @@
         _ (when-not (and (prepared? prepared) (sealed-artifact? prepared))
             (throw (ex-info "compiled evidence requires its original compiler-owned Prepared"
                             {:reason :compiled-execution-identity-owner})))
-        artifact (exact-artifact-evidence (:lowering prepared) (:preparation-report prepared))
+        artifact (exact-artifact-evidence (:lowering prepared) (:preparation-report prepared)
+                                          (:math-request prepared))
         plan (:plan (:lowering prepared))
         boundary #(mapv (fn [entry] (dissoc entry :default)) %)
         projection {:kind :raster.compiled/exact-bound-program-v1
@@ -1080,7 +1132,9 @@
                     :inputs (boundary (:in-tree prepared))
                     :outputs (boundary (:out-tree prepared))
                     :donated (:donated prepared) :schedule (:schedule prepared)
-                    :target (:target prepared)}]
+                    :target (:target prepared)}
+        projection (cond-> projection
+                     (:math-request prepared) (assoc :math-request (:math-request prepared)))]
     {:scope :exact-bound-program
      :fingerprint (semantic-fingerprint/fingerprint projection)
      :data-slots (mapv #(select-keys % [:key :node :dtype :shape :role]) (:in-tree prepared))
@@ -1107,7 +1161,7 @@
                        :available (mapv :key entries)})))
     (first matches)))
 
-(defn compose
+(defn- compose-for-request
   "Compose independently lowered Prepared artifacts through semantic boundary keys.
 
    Request shape:
@@ -1126,8 +1180,10 @@
    refresh, and exports its final state. Constants cannot be mutable borrowers; ranged views and
    escaped earlier aliases remain rejected. One linked executable owns replay and output leases."
   [{:keys [id components connections shares mutable-shares outputs attributes]
-    :or {connections [] shares [] mutable-shares [] attributes {}}}]
+    :or {connections [] shares [] mutable-shares [] attributes {}}} options]
   (let [preparation-started (System/nanoTime)
+        caller-options (when (contains? options :scalar-math)
+                         {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math options))})
         components (mapv (fn [component]
                            (when-not (and (map? component) (contains? component :id)
                                           (prepared? (:program component)))
@@ -1135,6 +1191,17 @@
                                      "each compiled component requires :id and a Prepared :program"
                                      {:reason :compiled-composition-component
                                       :component component})))
+                           (when (and (some? (:math-request (:program component))) (nil? caller-options))
+                             (throw (ex-info "contextual composition requires independent caller math intent"
+                                             {:reason :compiled-composition-math-request
+                                              :component (:id component)})))
+                           (when (and caller-options (sealed-artifact? (:program component))
+                                      (not= (:scalar-math caller-options)
+                                            (numerics/validate-scalar-math-policy!
+                                             (get-in component [:program :math-request :scalar-math]))))
+                             (throw (ex-info "composition caller intent differs from original component intent"
+                                             {:reason :compiled-composition-math-request
+                                              :component (:id component)})))
                            component)
                          components)
         component-map (into {} (map (juxt :id :program)) components)
@@ -1203,10 +1270,15 @@
                             {:reason :compiled-composition-donation
                              :expected component-donations :owners donation-owners})))
         prevalidated? (every? (comp sealed-artifact? :program) components)
+        compose-lowering (if prevalidated?
+                           link-composition/compose-prevalidated
+                           link-composition/compose)
+        compose-lowering-for-request (fn [request]
+                                       (if caller-options
+                                         (compose-lowering request caller-options)
+                                         (compose-lowering request)))
         low-level
-        ((if prevalidated?
-           link-composition/compose-prevalidated
-           link-composition/compose)
+        (compose-lowering-for-request
          {:id id
           :components (mapv (fn [{:keys [id program]}]
                               {:id id :lowering (:lowering program)})
@@ -1275,10 +1347,19 @@
                 :nodes (count (get-in low-level [:plan :nodes]))
                 :instances (count (get-in low-level [:plan :instances]))}]
     (seal-artifact
-     (->Prepared low-level in-tree out-tree
+     (cond-> (->Prepared low-level in-tree out-tree
                  (into {} (map (juxt :owner :output-key)) resolved-mutable-shares)
                  schedules (:target (:plan low-level))
-                 descriptor [] report nil))))
+                 descriptor [] report nil)
+       caller-options (assoc :math-request caller-options)))))
+
+(defn compose
+  "Compose semantic Prepared boundaries before allocation. The optional second argument supplies
+   independent :scalar-math intent; contextual components never authorize it themselves. Every
+   original component must agree, copied components are independently reconstructed, and the
+   exact resulting Prepared retains this caller intent for instantiation and evidence queries."
+  ([request] (compose-for-request request nil))
+  ([request options] (compose-for-request request options)))
 
 (defn compile
   "Lower and instantiate a deftm as one callable Compiled artifact. Use `lower`, `compose`, then
@@ -1612,9 +1693,13 @@
            :inputs (project (:inputs data)) :outputs (project (:outputs data))
            :post-state (project (:post-state data))})))))
 
-(defn- certified-byte-frontier! [plan evidence]
+(defn- certified-byte-frontier!
+  ([plan evidence] (certified-byte-frontier! plan evidence nil))
+  ([plan evidence caller-options]
   (let [initialization (:initialization evidence)
-        _ (when-not (link-plan/retained-effect-evidence? plan evidence)
+        _ (when-not (if caller-options
+                      (link-plan/retained-effect-evidence? plan evidence caller-options)
+                      (link-plan/retained-effect-evidence? plan evidence))
             (throw (ex-info "compiled byte frontier requires retained initialization evidence"
                             {:reason :compiled-evidence-initialization})))
         roots (set/union (:requires initialization) (:initializers initialization))
@@ -1623,7 +1708,7 @@
         state (into #{} (filter (fn [node]
                                   (some #(bview/overlaps? (get-in plan [:nodes node :view]) %)
                                         written))) roots)]
-    {:roots roots :outputs outputs :state state}))
+    {:roots roots :outputs outputs :state state})))
 
 (defn- require-dense-byte-frontier! [plan {:keys [roots outputs] :as frontier}]
   (doseq [node (set/union roots outputs)]
@@ -1648,7 +1733,8 @@
   (let [identity (execution-identity prepared)
         plan (get-in prepared [:lowering :plan])
         frontier (require-dense-byte-frontier!
-                  plan (certified-byte-frontier! plan (get-in prepared [:lowering :certificate :effect-evidence])))
+                  plan (certified-byte-frontier! plan (get-in prepared [:lowering :certificate :effect-evidence])
+                                                 (:math-request prepared)))
         ports (fn [entries nodes]
                 (mapv #(select-keys % [:key :node :dtype :shape])
                       (filter #(contains? nodes (:node %)) entries)))]
@@ -1667,7 +1753,10 @@
                          (every? #(= :owned (get-in % [:view :allocation :ownership]))
                                  (vals (:nodes plan))))
             (fail :compiled-evidence-ownership))
-        frontier (certified-byte-frontier! plan evidence)
+        prepared (:prepared c)
+        caller-options (when (and (sealed-artifact? c) (sealed-artifact? prepared))
+                         (:math-request prepared))
+        frontier (certified-byte-frontier! plan evidence caller-options)
         _ (require-no-evidence-events! executable)
         _ (when (seq (:record-time-prologue (gpu-link/execution-order executable)))
             (fail :compiled-evidence-record-time-prologue))]

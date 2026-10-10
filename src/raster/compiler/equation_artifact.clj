@@ -10,6 +10,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint])
   (:import [clojure.lang IObj]
            [java.security MessageDigest]))
@@ -124,7 +125,11 @@
            :equation-artifact-identity {:identity identity :required identity-fields}))
   identity)
 
-(defn- validate-compilation! [compilation]
+(defn- caller-math-options [caller-options]
+  (when (some? caller-options)
+    {:scalar-math (numerics/validate-scalar-math-policy! (:scalar-math caller-options))}))
+
+(defn- validate-compilation! [compilation caller-options]
   (when-not (equation-first/equation-first-compilation? compilation)
     (fail! "artifact payload must be an EquationFirstCompilation"
            :equation-artifact-payload-type {:actual (type compilation)}))
@@ -137,7 +142,9 @@
            {:function (:function compilation) :target (:target compilation)
             :dtype (:dtype compilation) :source-ns (:source-ns compilation)}))
   (invocation/validate! (get-in compilation [:semantic :attributes :invocation-plan]))
-  (emitted-program/validate! (:emitted compilation))
+  (if (nil? caller-options)
+    (emitted-program/validate! (:emitted compilation))
+    (emitted-program/validate! (:emitted compilation) caller-options))
   (doseq [kernel (:kernels compilation)] (kernel-artifact/validate! kernel))
   compilation)
 
@@ -149,10 +156,13 @@
     (str "sha256:" (apply str (map #(format "%02x" (bit-and 0xff %)) digest)))))
 
 (defn seal
-  "Seal a compiled equation-first value under an already certified persistent identity."
-  [identity compilation]
-  (let [identity (validate-identity! identity)
-        compilation (validate-compilation! compilation)
+  "Seal under a certified persistent identity and independently supplied caller math intent.
+   Serialized compilation options are not permission to select their own numerical policy."
+  ([identity compilation] (seal identity compilation nil))
+  ([identity compilation caller-options]
+  (let [caller-options (caller-math-options caller-options)
+        identity (validate-identity! identity)
+        compilation (validate-compilation! compilation caller-options)
         compilation-fingerprint (semantic-fingerprint/fingerprint compilation)
         payload (boring/encode (prepare-sequences compilation) compiler-cbor-options)]
     {:schema-version schema-version
@@ -161,7 +171,7 @@
      :identity identity
      :compilation-fingerprint compilation-fingerprint
      :payload-fingerprint (byte-fingerprint payload)
-     :payload payload}))
+     :payload payload})))
 
 (defn validate-envelope!
   "Validate the outer envelope and payload digest without constructing compiler records."
@@ -199,9 +209,12 @@
   "Authenticate and reconstruct an equation-first compilation.
 
    `expected-identity` comes from current request/build/source/target certification. It is checked
-   before the payload decoder can invoke any constructor in the fixed compiler-record registry."
-  [expected-identity envelope]
-  (let [expected-identity (validate-identity! expected-identity)
+   before the payload decoder can invoke any constructor in the fixed compiler-record registry.
+   Caller math intent is independent of the decoded payload and is validated before decoding."
+  ([expected-identity envelope] (open expected-identity envelope nil))
+  ([expected-identity envelope caller-options]
+  (let [caller-options (caller-math-options caller-options)
+        expected-identity (validate-identity! expected-identity)
         envelope (validate-envelope! envelope)]
     (when-not (= expected-identity (:identity envelope))
       (fail! "equation artifact identity does not match the current compilation request"
@@ -216,13 +229,13 @@
                               {:reason :equation-artifact-payload-decode
                                :artifact :equation-first}
                               error))))
-          compilation (validate-compilation! compilation)
+          compilation (validate-compilation! compilation caller-options)
           actual (semantic-fingerprint/fingerprint compilation)]
       (when-not (= (:compilation-fingerprint envelope) actual)
         (fail! "decoded equation compilation differs from its semantic fingerprint"
                :equation-artifact-semantic-integrity
                {:expected (:compilation-fingerprint envelope) :actual actual}))
-      compilation)))
+      compilation))))
 
 (defn encode
   "Encode a validated envelope as archival CBOR. Identity never depends on these transport bytes."

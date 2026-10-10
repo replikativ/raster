@@ -367,7 +367,8 @@
               (segfoldmap-body/validate-against-node!
                scheduled graph-node kernel-graph scheduled-equation-algorithm scheduled-equation-body)))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
+        artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect
+                                                 (select-keys opts [:target-descriptor :scalar-math]))]
     artifact))
 
 (defn generate-segmap-kernel-body
@@ -408,7 +409,8 @@
             (segmap-body/validate-static-graph-capacities! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ]
-    (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)))
+    (kernel-body-target/emit-artifact kernel-name scheduled target-dialect
+                                    (select-keys opts [:target-descriptor :scalar-math]))))
 
 (defn generate-segstencil-kernel-body
   "Schedule and emit one certified SegStencil through portable KernelBody."
@@ -430,7 +432,8 @@
         _ (when graph-node
             (scheduled-body/validate-against-node! scheduled graph-node kernel-graph))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect)]
+        artifact (kernel-body-target/emit-artifact kernel-name scheduled target-dialect
+                                                 (select-keys opts [:target-descriptor :scalar-math]))]
     artifact))
 
 ;; ================================================================
@@ -474,7 +477,9 @@
                                (get-in scheduled [:body :parameters]))
                          {output "output" '_n_bound "_n_bound"})]
     (kernel-body-target/emit-artifact
-     kernel-name scheduled target-dialect {:parameter-names parameter-names})))
+     kernel-name scheduled target-dialect
+     (merge {:parameter-names parameter-names}
+            (select-keys opts [:target-descriptor :scalar-math])))))
 
 (defn generate-scheduled-segmap-kernel
   "Emit one scheduled SegMap through the single target-neutral KernelBody boundary.
@@ -492,7 +497,7 @@
                    (merge {:dtype dtype :scalar-types scalar-types :array-types array-types
                            :array-shapes array-shapes :graph-node graph-node :kernel-graph kernel-graph
                            :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix}
-                          (select-keys opts [:scalar-math]))))))
+                          (select-keys opts [:scalar-math :target-descriptor]))))))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
@@ -518,7 +523,7 @@
                            :graph-node graph-node :kernel-graph kernel-graph :coordinate-proof coordinate-proof
                            :scheduled-equation-algorithm scheduled-equation-algorithm
                            :scheduled-equation-body scheduled-equation-body}
-                          (select-keys opts [:scalar-math]))))
+                          (select-keys opts [:scalar-math :target-descriptor]))))
     (catch clojure.lang.ExceptionInfo exception
       (when-not (segred-body/declined? exception) (throw exception))
       (let [decline (assoc (ex-data exception) :fallback :none)]
@@ -597,7 +602,8 @@
                                        (get-in scheduled [:body :parameters]))]
              (kernel-body-target/emit-artifact
               kernel-name scheduled target-dialect
-              {:parameter-names parameter-names :provenance {:graph-node id}}))))]
+              (merge {:parameter-names parameter-names :provenance {:graph-node id}}
+                     (select-keys opts [:target-descriptor :scalar-math]))))))]
     (finalize-emitted-graph emitted target-module scalar-types)))
 
 (defn- generate-elementwise-kernel-graph
@@ -625,7 +631,7 @@
                             (merge {:dtype (:dtype operation) :scalar-types scalar-types :array-types array-types
                                     :array-shapes static-shapes :graph-node node :kernel-graph graph
                                     :target-dialect target-dialect :kernel-name-prefix "graph_segmap"}
-                                   (select-keys opts [:scalar-math]))))
+                                   (select-keys opts [:scalar-math :target-descriptor]))))
 
              (segop/seg-stencil? operation)
              (apply generate-segstencil-kernel-body operation
@@ -633,7 +639,7 @@
                             (merge {:scalar-types scalar-types :array-types array-types
                                     :target-dialect target-dialect :kernel-name-prefix "graph_segstencil"
                                     :graph-node node :kernel-graph graph}
-                                   (select-keys opts [:scalar-math]))))
+                                   (select-keys opts [:scalar-math :target-descriptor]))))
 
              :else
              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
@@ -659,7 +665,7 @@
                 (product-body/schedule-for-node node graph scheduled-equation-algorithm
                                                scheduled-equation-body (select-keys opts [:scalar-math]))
                 (product-body/schedule-for-node node graph scheduled-equation-algorithm scheduled-equation-body))
-              target-dialect)
+              target-dialect (select-keys opts [:target-descriptor :scalar-math]))
              (let [outputs (vec (:outputs operation))]
              (when-not (= 1 (count outputs))
                (throw (ex-info "scalar SegRed graph node requires exactly one scheduled output"
@@ -678,7 +684,8 @@
                                         :schedule schedule}
                                        (select-keys opts [:scalar-math])))]
                  (kernel-body-target/emit-artifact
-                  (str "graph_contraction_" (gensym "")) scheduled target-dialect))
+                  (str "graph_contraction_" (gensym "")) scheduled target-dialect
+                  (assoc (select-keys opts [:scalar-math]) :target-descriptor descriptor)))
                ;; Scalar reductions are certified against their complete graph context before
                ;; projection. Do not add the older artifact-only operation wrapper outside it.
                (apply generate-segred-kernel operation (first outputs)
@@ -688,7 +695,7 @@
                                       :scheduled-equation-algorithm scheduled-equation-algorithm
                                       :scheduled-equation-body scheduled-equation-body
                                       :graph-node node :kernel-graph graph}
-                                     (select-keys opts [:scalar-math])))))))))]
+                                     (select-keys opts [:scalar-math :target-descriptor])))))))))]
     (finalize-emitted-graph
      emitted
      (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
@@ -712,7 +719,7 @@
                                     :graph-node node :kernel-graph graph
                                     :scheduled-equation-algorithm scheduled-equation-algorithm
                                     :scheduled-equation-body scheduled-equation-body}
-                                   (select-keys opts [:scalar-math]))))
+                                   (select-keys opts [:scalar-math :target-descriptor]))))
              (catch clojure.lang.ExceptionInfo exception
                (if (and (not (kernel-body-c-dialect/opencl? target))
                         (segfoldmap-body/declined? exception))
@@ -743,7 +750,7 @@
                       (staged-body/schedule-for-node node graph scheduled-equation-algorithm
                                                     scheduled-equation-body (select-keys opts [:scalar-math]))
                       (staged-body/schedule-for-node node graph scheduled-equation-algorithm scheduled-equation-body))
-                    target-dialect)))]
+                    target-dialect (select-keys opts [:target-descriptor :scalar-math]))))]
     (finalize-emitted-graph emitted
                             (kernel-body-c-dialect/target
                              (kernel-body-c-dialect/resolve! target-dialect))
@@ -768,7 +775,8 @@
                               (get scheduled-bodies (:id node)) (:scalar-math opts))
                  certificate (scheduled-body/validate-against-node! certificate node graph)]
              (kernel-body-target/emit-artifact
-              (str "graph_scheduled_" (gensym "")) certificate target-dialect))))
+              (str "graph_scheduled_" (gensym "")) certificate target-dialect
+              (select-keys opts [:target-descriptor :scalar-math])))))
         strategies (set (map (comp :strategy :attributes)
                              (vals scheduled-bodies)))
         strategy (when (and (= 1 (count (:nodes graph))) (= 1 (count strategies)))

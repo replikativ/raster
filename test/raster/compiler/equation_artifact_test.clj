@@ -11,7 +11,9 @@
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.link-composition :as link-composition]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as gpu-link]
@@ -144,6 +146,118 @@
         (with-open [paths (Files/walk directory (make-array java.nio.file.FileVisitOption 0))]
           (doseq [^Path path (iterator-seq (.iterator (.sorted paths (Comparator/reverseOrder))))]
             (Files/deleteIfExists path)))))))
+
+(deftest selected-artifact-requires-independent-math-request
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        original (equation-first/compile #'artifact-map (merge {:target target :dtype :float} request))
+        envelope (artifact/seal identity original request)
+        restored (artifact/open identity (artifact/decode (artifact/encode envelope)) request)
+        decodes (atom 0)]
+    (is (= original restored))
+    (is (identical? (:emitted restored) (emitted-program/validate! (:emitted restored) request)))
+    (is (thrown? clojure.lang.ExceptionInfo (artifact/seal identity original)))
+    (is (thrown? clojure.lang.ExceptionInfo (artifact/open identity envelope))
+        "serialized options cannot grant their own math permission")
+    (with-redefs [boring/decode (fn [& _] (swap! decodes inc)
+                                (throw (ex-info "unexpected payload decode" {})))]
+      (is (= :scalar-math-policy
+             (reason-of #(artifact/open identity envelope
+                                        {:scalar-math {:overrides {} :unknown true}})))))
+    (is (zero? @decodes))))
+
+(deftest selected-template-survives-process-cache-clear-under-same-request
+  (with-temporary-directory
+    (fn [directory]
+      (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+            original (equation-first/compile #'artifact-map (merge {:target target :dtype :float} request))
+            cache (store/make-store {:root (.toFile directory)})
+            key {:semantic-fingerprint (:semantic-request-fingerprint identity)
+                 :persistent-cache-eligible? true
+                 :semantic-request {:compiler-build-fingerprint (:compiler-build-fingerprint identity)
+                                    :source {:source-dependency-fingerprint (:source-dependency-fingerprint identity)}
+                                    :target {:descriptor-fingerprint (:target-descriptor-fingerprint identity)}}}
+            report (atom nil)
+            calls (atom 0)
+            resolve! (fn []
+                       (binding [compiled/*equation-artifact-store* cache
+                                 compiled/*compilation-template-observer* #(reset! report %)]
+                         (#'compiled/cached-compilation-template
+                          key :equation-first #(do (swap! calls inc) original) request)))]
+        (compiled/clear-compilation-cache!)
+        (try
+          (is (= original (resolve!)))
+          (is (= :stored (get-in @report [:persistent-artifact :status])))
+          (is (= :miss (:status (store/load-artifact cache (:semantic-request-fingerprint identity) identity))))
+          (is (= :hit (:status (store/load-artifact cache (:semantic-request-fingerprint identity) identity request))))
+          (compiled/clear-compilation-cache!)
+          (is (= original (resolve!)))
+          (is (= :hit (get-in @report [:persistent-artifact :status])))
+          (is (= 1 @calls) "same-request durable reload must not recompile")
+          (finally (compiled/clear-compilation-cache!)))))))
+
+(deftest prepared-math-intent-is-owned-and-checked-before-instantiation
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        prepared (compiled/lower #'artifact-map [(float-array 4) 4]
+                                 (merge {:compiler :equation-first :target target :dtype :float} request))
+        copied (assoc prepared :args [])
+        calls (atom [])]
+    (is (= request (:math-request prepared)))
+    (with-redefs [gpu-link/instantiate-certified!
+                  (fn [_ opts] (swap! calls conj [:certified opts]) ::executable)
+                  gpu-link/instantiate!
+                  (fn [_ opts] (swap! calls conj [:independent opts]) ::executable)]
+      (is (compiled/compiled? (compiled/instantiate! prepared)))
+      (is (= request (select-keys (second (first @calls)) [:scalar-math])))
+      (is (compiled/compiled? (compiled/instantiate! prepared request)))
+      (is (= :compiled-prepared-math-request
+             (reason-of #(compiled/instantiate! prepared {:scalar-math {:overrides {}}}))))
+      (is (= :compiled-prepared-math-owner
+             (reason-of #(compiled/instantiate! copied))))
+      (is (= 2 (count @calls)))
+      (is (compiled/compiled? (compiled/instantiate! copied request)))
+      (is (= [:independent request] (last @calls))))
+    (is (= :compiled-composition-math-request
+           (reason-of #(compiled/compose {:id :contextual :components [{:id :a :program prepared}]}))))
+    (let [specification {:id :contextual
+                         :components [{:id :a :program prepared}]
+                         :outputs [{:key :result :from [:a (:key (first (:out-tree prepared)))]}]}
+          composite (compiled/compose specification request)
+          independently-checked (compiled/compose
+                                 (assoc-in specification [:components 0 :program] copied) request)]
+      (is (= request (:math-request composite)))
+      (is (= request (:math-request independently-checked)))
+      (is (= :compiled-composition-math-request
+             (reason-of #(compiled/compose specification {:scalar-math {:overrides {}}}))))
+      (with-redefs [gpu-link/instantiate-certified! (fn [_ opts] (swap! calls conj [:composite opts]) ::executable)]
+        (is (compiled/compiled? (compiled/instantiate! composite)))
+        (is (= [:composite request] (last @calls)))))
+    (is (= :compiled-resident-math-request
+           (reason-of #(compiled/lower #'artifact-map []
+                                      {:compiler :resident-descriptor :scalar-math {:overrides {}}}))))))
+
+(deftest composition-certificate-requires-independent-math-intent
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        prepared (compiled/lower #'artifact-map [(float-array 4) 4]
+                                 (merge {:compiler :equation-first :target target :dtype :float} request))
+        lowering (:lowering prepared)
+        output (first (link-plan/output-value-ids (:plan lowering)))
+        specification {:id :selected-composition
+                       :components [{:id :a :lowering lowering}]
+                       :outputs [[:a output]]}
+        composition (link-composition/compose specification request)]
+    (is (identical? composition (link-composition/verify! composition request)))
+    (is (thrown? clojure.lang.ExceptionInfo (link-composition/verify! composition)))
+    (is (thrown? clojure.lang.ExceptionInfo (link-composition/compose specification)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (link-composition/verify! (assoc-in composition [:specification :attributes :scalar-math]
+                                                     (:scalar-math request)))))
+    (let [nested (link-composition/compose
+                  {:id :selected-nested-composition
+                   :components [{:id :outer :lowering composition}]
+                   :outputs [[:outer (first (link-plan/output-value-ids (:plan composition)))]]}
+                  request)]
+      (is (identical? nested (link-composition/verify! nested request)))
+      (is (thrown? clojure.lang.ExceptionInfo (link-composition/verify! nested))))))
 
 (deftest equation-compilation-round-trips-and-remains-lowerable
   (let [original @compilation
@@ -362,6 +476,26 @@
                 (is (= :exact-bound-program (:scope a)))
                 (is (string? (:fingerprint a)))
                 (is (= a b) "host array identity and contents are deliberately not attested")
+                (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+                      selected (compiled/lower #'artifact-map [(float-array 4) 4]
+                                               (merge options request))
+                      selected-id (compiled/execution-identity selected)]
+                  (is (= :exact-bound-program (:scope selected-id)))
+                  (is (= (select-keys selected-id [:scope :fingerprint])
+                         (:program (compiled/producer-interface selected))))
+                  (let [composite (compiled/compose
+                                   {:id :selected-identity-composition
+                                    :components [{:id :a :program selected}]
+                                    :outputs [{:key :result :from [:a (:key (first (:out-tree selected)))]}]}
+                                   request)
+                        identity (compiled/execution-identity composite)]
+                    (is (= :exact-bound-program (:scope identity)))
+                    (is (= (select-keys identity [:scope :fingerprint])
+                           (:program (compiled/producer-interface composite)))))
+                  (is (not= (:fingerprint a) (:fingerprint selected-id))
+                      "even an unused policy is part of the exact caller compilation identity")
+                  (is (= :compiled-execution-identity-owner
+                         (reason-of #(compiled/execution-identity (dissoc selected :math-request))))))
                 (let [interface (compiled/producer-interface p)
                       updated (compiled/lower #'artifact-state! [(:default (first (:in-tree p))) 4]
                                               (assoc options :donate '[state]))

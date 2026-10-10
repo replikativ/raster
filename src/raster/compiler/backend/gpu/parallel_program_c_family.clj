@@ -93,7 +93,8 @@
         (let [original (get-in reference [:graph :nodes 0 :operation])
               artifact (body-target/emit-artifact
                         (str (:kernel-name original) "_register_tiled")
-                        (:scheduled planned) target-dialect)
+                        (:scheduled planned) target-dialect
+                        (select-keys opts [:target-descriptor :scalar-math]))
               candidate (make-emitted-equation
                          algorithm (:body reference)
                          (-> (:graph reference)
@@ -130,7 +131,7 @@
                         :prefix (str (get-in reference [:graph :nodes 0 :operation :kernel-name])
                                      "_mixed")
                         :refinement (:refinement planned)}
-                              (select-keys opts [:scalar-math])))
+                              (select-keys opts [:scalar-math :target-descriptor])))
               candidate (make-emitted-equation
                          algorithm (:body reference) emitted
                          {:refinement (:refinement planned)
@@ -257,7 +258,10 @@
                  (product-consumer-route/schedule plan target-description))
         kernel-name (str "rstr_product_consumer_" (:region-ordinal plan))
         {:keys [emitted refinement]} (product-consumer-route/emit
-                                      kernel-name routed target-dialect)
+                                      kernel-name routed target-dialect
+                                      (cond-> (select-keys opts [:scalar-math])
+                                        (or (contains? opts :target-descriptor) (some? target-device))
+                                        (assoc :target-descriptor target-description)))
         algorithm (get-in plan [:source :algorithm])
         body (get-in plan [:source :body])
         facts (soac/facts algorithm)

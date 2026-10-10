@@ -53,6 +53,21 @@
        (catch clojure.lang.ExceptionInfo exception
          (:reason (ex-data exception)))))
 
+(deftest public-reduction-dispatch-retains-independent-math-request
+  (register-target!)
+  (let [request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        options (merge request {:target target :dtype :float
+                                :schedule {:segmented-weighted-reduction
+                                           {:strategy :dispatch-reassociated}}})
+        compiled (equation-first/compile #'indexed-fixture/resident-indexed-attention-probe options)
+        program (:emitted compiled)
+        operation (-> program :equations last :operations first)]
+    (is (= (:scalar-math request) (get-in compiled [:options :scalar-math])))
+    (is (= 2 (count (:kernels compiled))))
+    (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (is (identical? operation (equation-dispatch/validate! operation request)))
+    (is (identical? program (emitted-program/validate! program request)))))
+
 (deftest approximate-modes-require-paired-reconstructed-models
   (let [check (ns-resolve 'raster.compiler.ir.emitted-equation-dispatch
                          'validate-model-pair!)

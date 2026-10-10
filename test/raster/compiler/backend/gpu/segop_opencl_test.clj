@@ -73,7 +73,20 @@
     (is (= #{:float} (kernel-body/required-scalar-dtypes
                       (get-in ordinary [:body :operations]))))
     (is (= #{:float :double} (kernel-body/required-scalar-dtypes
-                              (get-in selected [:body :operations]))))))
+                              (get-in selected [:body :operations]))))
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (let [descriptor {:execution {:scalar-dtype-support {:double :supported}}}
+            artifact (sg/generate-scheduled-segmap-kernel
+                      operation :array-types (:array-types options) :scalar-math policy
+                      :target-descriptor descriptor :target-dialect dialect)]
+        (is (= policy (get-in artifact [:provenance :scheduled-operation :numerics :scalar-math]))))
+      (try
+        (sg/generate-scheduled-segmap-kernel
+         operation :array-types (:array-types options) :scalar-math policy
+         :target-descriptor {} :target-dialect dialect)
+        (is false "map wrapper must preserve caller hardware admission context")
+        (catch clojure.lang.ExceptionInfo error
+          (is (= :kernel-body-target-math-capability (:reason (ex-data error)))))))))
 
 (deftest portable-map-empty-extent-has-a-masked-valid-launch
   (let [operation (segop/->SegMap
@@ -909,6 +922,22 @@
     (let [emitted (sg/generate-kernel-graph graph :scheduled-bodies {:reduction selected}
                                            :scalar-math policy :target-dialect :opencl-portable)]
       (is (= policy (get-in emitted [:nodes 0 :operation :provenance :scheduled-operation :numerics :scalar-math]))))
+    (doseq [dialect [:opencl-portable :cuda :hip]]
+      (let [supported {:device-id :synthetic-test-device
+                       :execution {:scalar-dtype-support {:double :supported}}}
+            emitted (sg/generate-kernel-graph
+                     graph :scheduled-bodies {:reduction selected} :scalar-math policy
+                     :target-descriptor supported :target-dialect dialect)]
+        (is (= policy (get-in emitted [:nodes 0 :operation :provenance
+                                      :scheduled-operation :numerics :scalar-math]))))
+      (doseq [descriptor [{} {:execution {:scalar-dtype-support {:double :unsupported}}}]]
+        (try
+          (sg/generate-kernel-graph graph :scheduled-bodies {:reduction selected}
+                                   :scalar-math policy :target-descriptor descriptor
+                                   :target-dialect dialect)
+          (is false "certified graph must admit selected evaluation against supplied hardware")
+          (catch clojure.lang.ExceptionInfo error
+            (is (= :kernel-body-target-math-capability (:reason (ex-data error))))))))
     (doseq [candidate [graph (assoc-in graph [:attributes :scalar-math] policy)]]
       (is (thrown? clojure.lang.ExceptionInfo
                    (sg/generate-kernel-graph candidate :scheduled-bodies {:reduction selected}

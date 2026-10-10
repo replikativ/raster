@@ -130,19 +130,21 @@
       :attributes {:strategy :f32-scalar :variant variant :precision :f32}})))
 
 (defn- convert-artifact
-  [kernel-name stage phase target-dialect scalar-types]
+  [kernel-name stage phase target-dialect scalar-types caller-options]
   (kernel-body-target/emit-artifact
    (c-emit/c-symbol kernel-name) (mixed-body/schedule-cast stage phase scalar-types)
    target-dialect
-   {:parameter-names {(:input stage) "input" (:output stage) "output" :layout-elements "n"}}))
+   (merge {:parameter-names {(:input stage) "input" (:output stage) "output" :layout-elements "n"}}
+          (select-keys caller-options [:target-descriptor :scalar-math]))))
 
 (defn- transpose-artifact
-  [kernel-name stage phase target-dialect scalar-types]
+  [kernel-name stage phase target-dialect scalar-types caller-options]
   (kernel-body-target/emit-artifact
    (c-emit/c-symbol kernel-name) (mixed-body/schedule-transpose stage phase scalar-types)
    target-dialect
-   {:parameter-names {(:input stage) "input" (:output stage) "output"
-                      :layout-rows "rows" :layout-cols "cols"}}))
+   (merge {:parameter-names {(:input stage) "input" (:output stage) "output"
+                            :layout-rows "rows" :layout-cols "cols"}}
+          (select-keys caller-options [:target-descriptor :scalar-math]))))
 
 
 
@@ -203,7 +205,9 @@
   (let [kernel-name (c-emit/c-symbol kernel-name)
         scheduled (mixed-body/schedule-matrix (assoc spec :kernel-name kernel-name))]
     (kernel-body-target/emit-artifact
-     kernel-name scheduled target-dialect {:parameter-names parameter-names})))
+     kernel-name scheduled target-dialect
+     (merge {:parameter-names parameter-names}
+            (select-keys spec [:target-descriptor :scalar-math])))))
 
 (defn- gemm-artifact
   [stage kernel-name phase target-dialect scalar-types caller-options]
@@ -216,7 +220,7 @@
     (emit-scheduled-matrix-artifact
      (merge (assoc spec :kernel-name kernel-name :target-dialect target-dialect
                         :parameter-names parameter-names)
-            (select-keys caller-options [:scalar-math])))))
+            (select-keys caller-options [:scalar-math :target-descriptor])))))
 
 (defn emit-split-k-combine-kernel
   "Lower C[i] = sum_s partials[s, i] through the generic portable contraction schedule."
@@ -232,12 +236,13 @@
      {:kernel-name kernel-name :source source :kernel-body kernel-body :workgroup-size 256})))
 
 (defn- combine-artifact
-  [kernel-name operation partials c mn splits target-dialect scalar-types]
+  [kernel-name operation partials c mn splits target-dialect scalar-types caller-options]
   (kernel-body-target/emit-artifact
    (c-emit/c-symbol kernel-name)
    (mixed-body/schedule-combine operation partials c mn splits scalar-types)
    target-dialect
-   {:parameter-names {'partials "partials" 'C "C" 'mn "mn" 'splits "splits" '_nseg "_nseg"}}))
+   (merge {:parameter-names {'partials "partials" 'C "C" 'mn "mn" 'splits "splits" '_nseg "_nseg"}}
+          (select-keys caller-options [:target-descriptor :scalar-math]))))
 
 (defn split-factor-strategy
   "Stable strategy identity for one explicit split-K candidate."
@@ -255,9 +260,9 @@
       (layout-stage/layout-stage? operation)
       (case (:operation operation)
         :cast (convert-artifact (str prefix "_" (name phase)) operation
-                                phase target-dialect scalar-types)
+                                phase target-dialect scalar-types caller-options)
         :transpose (transpose-artifact (str prefix "_" (name phase)) operation
-                                       phase target-dialect scalar-types))
+                                       phase target-dialect scalar-types caller-options))
 
       (matrix-stage/matrix-stage? operation)
       (gemm-artifact operation (str prefix "_" (name phase))
@@ -266,7 +271,7 @@
       (segop/seg-red? operation)
       (let [{:keys [partials output mn splits]} (mixed-body/split-combine-values operation)]
         (combine-artifact (str prefix "_" (name phase)) operation
-                          partials output mn splits target-dialect scalar-types))
+                          partials output mn splits target-dialect scalar-types caller-options))
 
       :else
       (throw (ex-info "GEMM stage has no ScheduledKernelBody lowering"
@@ -292,7 +297,7 @@
          stage-graph
          (fn [node]
            (let [artifact (emit-stage-artifact target-dialect prefix scalar-types node
-                                               (select-keys opts [:scalar-math]))
+                                               (select-keys opts [:scalar-math :target-descriptor]))
                  scheduled (kart/attribute artifact :scheduled-kernel-body)]
              (scheduled-body/validate-against-node! scheduled node stage-graph)
              (scheduled-body/validate-artifact-projection! scheduled artifact)

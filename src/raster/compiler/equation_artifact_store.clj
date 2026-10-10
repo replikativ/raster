@@ -67,13 +67,17 @@
   "Load and authenticate one exact artifact.
 
    Returns `{:status :hit :value compilation}` or a source-free miss report."
-  [store semantic-request-fingerprint expected-identity]
+  ([store semantic-request-fingerprint expected-identity]
+   (load-artifact store semantic-request-fingerprint expected-identity nil))
+  ([store semantic-request-fingerprint expected-identity caller-options]
   (let [file (entry-file store semantic-request-fingerprint)]
     (if-not (.isFile file)
       {:status :miss :reason :not-found}
       (try
         (let [envelope (artifact/decode (Files/readAllBytes (.toPath file)))
-              compilation (artifact/open expected-identity envelope)]
+              compilation (if (nil? caller-options)
+                            (artifact/open expected-identity envelope)
+                            (artifact/open expected-identity envelope caller-options))]
           ;; A read-only cache remains usable; inability to refresh approximate LRU state must not
           ;; turn a valid artifact into a compiler miss.
           (try
@@ -86,17 +90,21 @@
           {:status :miss :reason :invalid-entry
            :error-class (.getName (class error))
            :artifact-reason (when (instance? clojure.lang.ExceptionInfo error)
-                              (:reason (ex-data error)))})))))
+                              (:reason (ex-data error)))}))))))
 
 (defn store-artifact!
   "Atomically publish and retain a bounded artifact entry. Returns a compact write report."
-  [store semantic-request-fingerprint identity compilation]
+  ([store semantic-request-fingerprint identity compilation]
+   (store-artifact! store semantic-request-fingerprint identity compilation nil))
+  ([store semantic-request-fingerprint identity compilation caller-options]
   (when-not (= semantic-request-fingerprint (:semantic-request-fingerprint identity))
     (throw (ex-info "artifact store key must equal the sealed semantic request identity"
                     {:reason :equation-artifact-store-key-identity})))
   (let [directory (.toPath ^java.io.File (:root store))
         target (.toPath (entry-file store semantic-request-fingerprint))
-        envelope (artifact/seal identity compilation)
+        envelope (if (nil? caller-options)
+                   (artifact/seal identity compilation)
+                   (artifact/seal identity compilation caller-options))
         bytes (artifact/encode envelope)]
     (when (< (:max-bytes store) (alength ^bytes bytes))
       (throw (ex-info "equation artifact exceeds the complete store byte budget"
@@ -123,4 +131,4 @@
           (Files/deleteIfExists temporary))))
     (trim! store (.toFile target))
     (merge {:status :stored :bytes (alength ^bytes bytes) :file (.getName (.toFile target))}
-           (select-keys envelope [:compilation-fingerprint :payload-fingerprint]))))
+           (select-keys envelope [:compilation-fingerprint :payload-fingerprint])))))
