@@ -188,18 +188,28 @@
       (fn []
         (let [transfer (g/submit-upload-ranges!
                         session [[:shared source {:elements 8}]])]
-          (is (= :graph-pending-transfer
-                 (try (g/submit-kernel-graph! session handle)
-                      (catch clojure.lang.ExceptionInfo error
-                        (:reason (ex-data error))))))
+          (doseq [status [:pending :awaited]]
+            (swap! session assoc-in [:events (:id transfer) :status] status)
+            (is (= :graph-pending-transfer
+                   (try (g/submit-kernel-graph! session handle)
+                        (catch clojure.lang.ExceptionInfo error
+                          (:reason (ex-data error))))))
+            (is (= :buffer-pending-transfer
+                   (try (g/free-buffer! session :shared)
+                        (catch clojure.lang.ExceptionInfo error
+                          (:reason (ex-data error)))))))
+          (swap! session assoc-in [:events (:id transfer) :status] :pending)
           (g/await-event! session transfer)
           (let [graph (g/submit-kernel-graph! session handle)]
             (is (= :graph (get-in @session [:events (:id graph) :kind])))
-            (is (= :transfer-pending-graph
-                   (try (g/submit-upload-ranges!
-                         session [[:shared source {:elements 8}]])
-                        (catch clojure.lang.ExceptionInfo error
-                          (:reason (ex-data error))))))
+            (doseq [status [:pending :awaited]]
+              (swap! session assoc-in [:events (:id graph) :status] status)
+              (is (= :transfer-pending-graph
+                     (try (g/submit-upload-ranges!
+                           session [[:shared source {:elements 8}]])
+                          (catch clojure.lang.ExceptionInfo error
+                            (:reason (ex-data error)))))))
+            (swap! session assoc-in [:events (:id graph) :status] :pending)
             (g/await-event! session graph)
             (g/release-event! session graph))
           (g/release-event! session transfer)
@@ -208,8 +218,9 @@
             (g/release-event! session next-transfer))
           (let [independent-transfer (g/submit-upload-ranges!
                                       session [[:independent source {:elements 8}]])
+                _ (swap! session assoc-in [:events (:id independent-transfer) :status] :awaited)
                 graph (g/submit-kernel-graph! session handle)]
-            (is (= :pending (get-in @session [:events (:id independent-transfer) :status])))
+            (is (= :awaited (get-in @session [:events (:id independent-transfer) :status])))
             (is (= :pending (get-in @session [:events (:id graph) :status])))
             (g/release-event! session graph)
             (g/release-event! session independent-transfer)))))))
