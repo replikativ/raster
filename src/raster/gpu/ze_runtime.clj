@@ -1782,6 +1782,17 @@
       (cleanup/assert-live! owner)))
   info)
 
+(defn- assert-registration-payload! [info]
+  ;; Only registration-supplied SPIR-V has this witness. Source compilation
+  ;; remains owned by the compiler/module cache. Check before lazy acquisition,
+  ;; not on each replay of an already installed native kernel.
+  (when-let [expected (::registration-payload-identity info)]
+    (when-not (= expected (when-let [payload (:spv-bytes info)] (bytes-digest payload)))
+      (throw (ex-info "Registered Level Zero executable payload changed before loading"
+                      {:reason :registration-payload-mutated
+                       :kernel-name (:kernel-name info)}))))
+  info)
+
 (defn- reserve-registration [info compiler-info]
   (let [kernel (cleanup/acquisition-slot) context (volatile! nil)
         root-lease (cleanup/acquisition-slot)
@@ -1916,9 +1927,13 @@
 
 (defn kernel-registry-entry
   "Return compiler registration metadata, never native handles or cleanup authority.
-   The resident compiler may retain/re-register this exact artifact without importing runtime state."
+   The resident compiler may retain/re-register this artifact without importing runtime state.
+   Mutable precompiled SPIR-V is a defensive snapshot, never operational storage."
   [kernel-name]
-  (get-in @kernel-registry [kernel-name ::registration :artifact]))
+  (when-let [artifact (get-in @kernel-registry [kernel-name ::registration :artifact])]
+    (if-let [payload (:spv-bytes artifact)]
+      (assoc artifact :spv-bytes (aclone ^bytes payload))
+      artifact)))
 
 (defn register-kernel-dispatch!
   ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))
@@ -2011,6 +2026,8 @@
                         {:kernel-name kernel-name
                          :registered (keys @kernel-registry)})))
       (assert-registration-live! info)
+      (when-not (:kernel-handle info)
+        (assert-registration-payload! info))
       (ensure-init!)
       (if (:kernel-handle info)
         info

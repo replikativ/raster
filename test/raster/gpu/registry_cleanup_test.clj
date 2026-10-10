@@ -80,6 +80,43 @@
 (defn- spec [name] {:kernel-name name :source "source" :spv-bytes (byte-array [1 2])})
 (defn- releases [calls] (mapv second (filter #(= :release (first %)) @calls)))
 
+(deftest ze-precompiled-payload-is-isolated-from-caller-and-exported-metadata
+  (with-backend :ze {}
+    (fn [{:keys [register! load! close! registry state v]}]
+      (let [name "payload_snapshot"
+            input (spec name)
+            read! @(v 'kernel-registry-entry)
+            loaded-bytes (atom nil)]
+        (register! name input :fixture)
+        (let [owner (::cleanup/owner (get @registry name))
+              exported (read! name)]
+          (aset-byte ^bytes (:spv-bytes input) 0 (byte 9))
+          (is (= [1 2] (vec (:spv-bytes (read! name)))))
+          (aset-byte ^bytes (:spv-bytes exported) 0 (byte 8))
+          (is (= [1 2] (vec (:spv-bytes (read! name)))))
+          (is (not (identical? (:spv-bytes exported) (:spv-bytes (read! name)))))
+          (register! name (read! name) :fixture)
+          (is (identical? owner (::cleanup/owner (get @registry name))))
+          (with-redefs-fn {(v 'load-module!)
+                          (fn [payload] (reset! loaded-bytes (vec payload)) MemorySegment/NULL)}
+            #(load! name))
+          (is (= [1 2] @loaded-bytes))
+          (close! :fixture)
+          (is (zero? (root/lease-count state))))))))
+
+(deftest ze-precompiled-payload-drift-fails-before-native-loading
+  (with-backend :ze {}
+    (fn [{:keys [register! load! close! registry state calls]}]
+      (let [name "payload_drift"]
+        (register! name (spec name) :fixture)
+        ;; Fault injection into private operational storage, not a public API.
+        (aset-byte ^bytes (:spv-bytes (get @registry name)) 0 (byte 8))
+        (is (= :registration-payload-mutated
+               (:reason (ex-data (error-of #(load! name))))))
+        (is (empty? @calls) "No module or kernel may be acquired after payload drift")
+        (is (zero? (root/lease-count state)))
+        (close! :fixture)))))
+
 (deftest registration-remains-lazy-and-loaded-generations-have-one-balanced-root-pin
   (doseq [backend [:ocl :ze]]
     (with-backend backend {}
@@ -157,7 +194,12 @@
                 owner (::cleanup/owner (get @registry name))]
             (load! name)
             (stage! name :input 16)
-            (is (identical? metadata (read! name)) "loading/staging cannot pollute compiler metadata")
+            (if (= :ze backend)
+              (let [snapshot (read! name)]
+                (is (= (dissoc metadata :spv-bytes) (dissoc snapshot :spv-bytes)))
+                (is (= (vec (:spv-bytes metadata)) (vec (:spv-bytes snapshot))))
+                (is (not (identical? (:spv-bytes metadata) (:spv-bytes snapshot)))))
+              (is (identical? metadata (read! name))))
             (is (kart/kernel-artifact? metadata))
             (is (= (select-keys artifact [:source :abi :arguments :launch :effects :attributes])
                    (select-keys metadata [:source :abi :arguments :launch :effects :attributes])))
