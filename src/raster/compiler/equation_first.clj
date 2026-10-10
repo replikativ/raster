@@ -25,6 +25,7 @@
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.kernel-dispatch :as kernel-dispatch]
             [raster.compiler.ir.kernel-executable :as kernel-executable]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
@@ -512,7 +513,7 @@
        :emission (:stats emission)
        :fallback :none}))))
 
-(defn- lower-for-request
+(defn- lower-in-context
   "Specialize a compiled equation-first program against ordered public arguments.
 
    Returns a validated, allocation-free LinkPlan. Public buffers retain their stable host source
@@ -557,6 +558,11 @@
                          (- (System/nanoTime) construction-started @projection-ns)}))
     result))
 
+(defn- lower-for-request
+  [compilation arguments project retained-validation caller-options]
+  (link-plan/without-validation-context
+   #(lower-in-context compilation arguments project retained-validation caller-options)))
+
 (defn lower
   "Specialize under independently supplied caller math intent, not compilation metadata.
 
@@ -572,6 +578,9 @@
    (lower-for-request compilation arguments project retained-validation caller-options)))
 
 (defn compile-link-plan
-  "Convenience composition of `compile` and `lower`; still performs no runtime allocation."
+  "Compose `compile` and `lower` without runtime allocation, preserving explicit math intent."
   [f-var arguments options]
-  (lower (compile f-var options) arguments))
+  (let [compilation (compile f-var options)]
+    (if (contains? options :scalar-math)
+      (:plan (lower compilation arguments (fn [plan] {:plan plan}) nil options))
+      (lower compilation arguments))))
