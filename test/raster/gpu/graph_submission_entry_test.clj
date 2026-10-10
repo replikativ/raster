@@ -1,6 +1,7 @@
 (ns raster.gpu.graph-submission-entry-test
   (:require [clojure.test :refer [deftest is]]
             [raster.gpu.core :as gpu]
+            [raster.gpu.invocation-observation :as observation]
             [raster.gpu.resource-cleanup :as cleanup]))
 
 (defn- fixture []
@@ -43,6 +44,66 @@
           (is (= 2 @resolutions))
           (gpu/release-event! session event))))))
 
+(deftest replay-details-do-not-double-count-or-add-backend-operations
+  (doseq [profile? [false true]]
+    (with-runtime
+      (fn [calls resolutions]
+        (let [{:keys [session handle]} (fixture)
+              _ (swap! session assoc-in [:kernel-graphs :graph :profile?] profile?)
+              {:keys [outputs report]}
+              (observation/observe
+               #(observation/phase :replay-host (gpu/run-kernel-graph! session handle)))]
+          (is (= {'out :resident} outputs))
+          (is (= 1 @resolutions))
+          (is (= (cond-> ["submit-graph!" "await-event!" "release-event!"]
+                   profile? (conj "reset-graph-events!")) @calls))
+          (is (empty? (:events @session)))
+          (is (= (cond-> #{:graph-resolution :submission :await :event-release}
+                   profile? (conj :profile-reset)) (set (keys (:replay-detail-ns report)))))
+          (is (every? #(<= 0 %) (vals (:replay-detail-ns report))))
+          (is (<= (reduce + 0 (vals (:replay-detail-ns report)))
+                  (get-in report [:phases-ns :replay-host])))
+          (is (= (:total-ns report)
+                 (+ (:unpartitioned-ns report) (reduce + 0 (vals (:phases-ns report))))))
+          (is (nil? observation/*collector*)))))))
+
+(deftest recorded-replay-reports-its-opaque-synchronous-boundary
+  (with-runtime
+    (fn [calls _]
+      (let [{:keys [session]} (fixture)
+            _ (swap! session assoc :graphs {:recorded :runtime-graph})
+            {:keys [report]}
+            (observation/observe
+             #(observation/phase :replay-host (gpu/replay! session :recorded)))]
+        (is (= ["replay-graph!"] @calls))
+        (is (= #{:graph-resolution :synchronous-backend-replay}
+               (set (keys (:replay-detail-ns report)))))
+        (is (<= (reduce + 0 (vals (:replay-detail-ns report)))
+                (get-in report [:phases-ns :replay-host])))
+        (is (= (:total-ns report)
+               (+ (:unpartitioned-ns report) (reduce + 0 (vals (:phases-ns report))))))
+        (gpu/replay! session :recorded)
+        (is (= ["replay-graph!" "replay-graph!"] @calls))))))
+
+(deftest recorded-replay-observation-preserves-backend-exception
+  (doseq [observed? [false true]]
+    (let [{:keys [session]} (fixture)
+          _ (swap! session assoc :graphs {:recorded :runtime-graph})
+          failure (ex-info "recorded replay failed" {})
+          calls (atom 0)
+          collector (when observed? (volatile! {:phases-ns {} :replay-detail-ns {}}))]
+      (with-redefs-fn
+        {(ns-resolve 'raster.gpu.core 'rt-resolve)
+         (fn [_ name]
+           (is (= "replay-graph!" name))
+           (fn [_] (swap! calls inc) (throw failure)))}
+        #(binding [observation/*collector* collector]
+           (is (identical? failure (error-of (fn [] (gpu/replay! session :recorded)))))))
+      (is (= 1 @calls))
+      (when observed?
+        (is (= #{:graph-resolution :synchronous-backend-replay}
+               (set (keys (:replay-detail-ns @collector)))))))))
+
 (deftest foreign-stale-and-closed-handles-reject-before-backend-contact
   (doseq [operation [gpu/run-kernel-graph! gpu/submit-kernel-graph!]
           [change expected] [[#(assoc % :session-id :foreign) :foreign-graph-handle]
@@ -72,11 +133,13 @@
         (is (= {'out :resident} (gpu/run-kernel-graph! session handle)))))))
 
 (deftest synchronous-failures-preserve-identity-and-event-drain
-  (doseq [failure-phase ["submit-graph!" "await-event!" "reset-graph-events!"]]
+  (doseq [failure-phase ["submit-graph!" "await-event!" "reset-graph-events!"]
+          observed? [false true]]
     (let [{:keys [session handle]} (fixture)
           failure (ex-info "injected runtime failure" {:phase failure-phase})
           failed? (atom false)
-          calls (atom [])]
+          calls (atom [])
+          collector (when observed? (volatile! {:phases-ns {} :replay-detail-ns {}}))]
       (with-redefs-fn
         {(ns-resolve 'raster.gpu.core 'rt-resolve)
          (fn [_ name]
@@ -86,7 +149,12 @@
                (throw failure))
              (when (= name "submit-graph!") :backend-event)))}
         (fn []
-          (is (identical? failure (error-of #(gpu/run-kernel-graph! session handle))))
+          (is (identical? failure
+                          (binding [observation/*collector* collector]
+                            (error-of #(gpu/run-kernel-graph! session handle)))))
+          (when observed?
+            (is (contains? (:replay-detail-ns @collector) :submission))
+            (is (every? #(<= 0 %) (vals (:replay-detail-ns @collector)))))
           (is (empty? (:events @session)))
           (is (= (if (= failure-phase "submit-graph!") 0 1)
                  (count (filter #{"release-event!"} @calls))))

@@ -39,6 +39,12 @@
             (is (= 1 @calls))
             (is (= (vec expected) (vec (value/->host (first (vals outputs))))))
             (is (= {:host-upload {:operations 1 :logical-bytes 16}} (:input-refresh report)))
+            (is (= #{:graph-resolution :synchronous-backend-replay}
+                   (set (keys (:replay-detail-ns report)))))
+            (is (<= (reduce + 0 (vals (:replay-detail-ns report)))
+                    (get-in report [:phases-ns :replay-host])))
+            (is (= (:total-ns report)
+                   (+ (:unpartitioned-ns report) (reduce + 0 (vals (:phases-ns report))))))
             (let [normal (artifact {:x next-input})]
               (is (= [5.0 6.0 7.0 8.0] (vec (value/->host (first (vals normal))))))
               (is (not (value/live? (first (vals outputs)))))))
