@@ -63,7 +63,7 @@
             (binding [*out* *err*]
               (println "Could not write CI timing diagnostics:" (.getMessage error)))))))))
 
-(defn -main [& args]
+(defn- cli-status [args]
   (let [{:keys [options errors]} (cli/parse-opts args runner/cli-options)
         report (or (System/getenv "RASTER_TEST_TIMING_REPORT")
                    "test-results/timings.edn")]
@@ -71,5 +71,10 @@
       (throw (ex-info "invalid timed CI runner arguments" {:errors errors})))
     (try
       (let [{:keys [fail error]} (run-timed! options report)]
-        (System/exit (if (zero? (+ fail error)) 0 1)))
+        (if (zero? (+ fail error)) 0 1))
       (finally (shutdown-agents)))))
+
+(defn -main [& args]
+  ;; System/exit does not unwind finally blocks. Complete executor shutdown
+  ;; before requesting process termination; never turn a native exit into success.
+  (System/exit (cli-status args)))
