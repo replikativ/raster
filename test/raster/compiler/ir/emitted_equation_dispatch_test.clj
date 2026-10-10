@@ -21,6 +21,7 @@
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.measurement :as measurement]
+            [raster.gpu.parallel-program :as runtime-program]
             [raster.runtime.hardware :as hardware]))
 
 (def ^:private target :ocl:certified-equation-dispatch-test)
@@ -67,6 +68,100 @@
     (is (equation-dispatch/emitted-equation-dispatch? operation))
     (is (identical? operation (equation-dispatch/validate! operation request)))
     (is (identical? program (emitted-program/validate! program request)))))
+
+(deftest linked-preparation-reuses-only-exact-static-program-proof
+  (register-target!)
+  (let [compiled (equation-first/compile #'contractions/fixed-matmul
+                                        {:target target :dtype :float})
+        plan (equation-first/lower compiled [(float-array 15) (float-array 21)])
+        call (get-in plan [:instances 0 :call])
+        owner (:program call)
+        checks (atom 0)
+        original emitted-program/validate-with-physical-results!
+        requested {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}]
+    (with-redefs [emitted-program/validate-with-physical-results!
+                  (fn [program & [options]]
+                    (when (identical? owner program) (swap! checks inc))
+                    (original program options))]
+      (let [{:keys [effect-evidence]} (link-plan/validate-with-effect-evidence! plan)
+            proofs (link-plan/retained-program-validations! plan effect-evidence nil)
+            proof (.get ^java.util.Map proofs owner)]
+        (is (= 1 @checks) "one independent static check supplies this plan's proof")
+        (is (some? proof))
+        (is (thrown? UnsupportedOperationException (.clear ^java.util.Map proofs)))
+        (is (= :link-retained-program-validations
+               (reason #(link-plan/retained-program-validations!
+                         (with-meta plan {:copy true}) effect-evidence nil))))
+        (is (= :link-retained-program-validations
+               (reason #(link-plan/retained-program-validations!
+                         plan (with-meta effect-evidence (meta effect-evidence)) nil))))
+        (is (= :link-retained-program-validations
+               (reason #(link-plan/retained-program-validations! plan effect-evidence requested))))
+        (let [retained (program-call/preparation-plan-with-retained-program call :same proof nil)]
+          (is (= 1 @checks))
+          (is (= retained (program-call/preparation-plan call :same)))
+          (is (= 2 @checks) "public preparation still independently validates"))
+        (doseq [[changed changed-proof options]
+                [[(assoc call :outputs {}) proof nil]
+                 [(assoc call :program (with-meta owner {:copy true})) proof nil]
+                 [call (with-meta proof (assoc (meta proof) :copy true)) nil]
+                 [call proof requested]]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (program-call/preparation-plan-with-retained-program
+                        changed :invalid changed-proof options))))
+        (let [scopes (mapv #(ns-resolve 'raster.compiler.ir.emitted-parallel-program-call %)
+                          '[*validated-boundary-projections* *validated-projection-policy*])
+              observed (atom [])
+              released (atom [])
+              prepared (runtime-program/prepare-with-retained-program!
+                        call
+                        {:bind! (fn [key & _]
+                                  (swap! observed conj (mapv var-get scopes)
+                                         @(future (mapv var-get scopes)))
+                                  key)
+                         :run! identity :release! #(swap! released conj %)}
+                        proof nil)]
+          (try
+            (is (seq @observed))
+            (is (every? #(= [nil nil] %) @observed))
+            (is (= 2 @checks) "retained runtime preparation does not redo static analysis")
+            (finally (runtime-program/release-prepared! prepared)))
+          (is (seq @released)))
+        (let [step (last (:steps call))
+              instances [{:id :first :kind :program :call call}
+                         {:id :direct :kind :graph
+                          :call {:graph (:graph step) :bindings (:buffers step)
+                                 :scalar-values (:scalar-values step)}}
+                         {:id :second :kind :program :call call}]
+              released (atom [])
+              bound (atom 0)
+              executor {:bind! (fn [& _] (swap! bound inc))
+                        :run! identity :release! #(swap! released conj %)}
+              prepared (runtime-program/prepare-sequence-with-retained-programs!
+                        instances executor proofs nil)]
+          (try
+            (is (= 3 @bound) "program proofs coexist with ordinary direct-graph binding")
+            (is (= 2 @checks) "two instances share only immutable static program analysis")
+            (finally (runtime-program/release-prepared! prepared)))
+          (is (= [3 2 1] @released))
+          (reset! bound 0)
+          (reset! released [])
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (runtime-program/prepare-sequence-with-retained-programs!
+                        instances
+                        (assoc executor :bind! (fn [& _]
+                                                (let [handle (swap! bound inc)]
+                                                  (if (= 3 handle)
+                                                    (throw (ex-info "third bind fails" {}))
+                                                    handle))))
+                        proofs nil)))
+          (is (= [2 1] @released) "partial binding keeps reverse cleanup ownership")
+          (let [fallback (runtime-program/prepare-sequence-with-retained-programs!
+                          [{:id :missing-proof :kind :program :call call}]
+                          executor (java.util.IdentityHashMap.) nil)]
+            (try
+              (is (= 3 @checks) "a missing proof falls back to independent validation")
+              (finally (runtime-program/release-prepared! fallback)))))))))
 
 (deftest approximate-modes-require-paired-reconstructed-models
   (let [check (ns-resolve 'raster.compiler.ir.emitted-equation-dispatch

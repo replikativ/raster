@@ -186,8 +186,12 @@
    constant in the loop trip count. Calls with logical result views additionally require the
    executor's `:buffer-view` resolver from a buffer token to its checked live BufferView; exact
    logical extent and prefix aliasing are checked before the first bind."
-  [call {:keys [bind! run! release! buffer-view] :as executor} caller-options]
-  (let [plan (preparation-plan call (random-uuid) caller-options)]
+  [call {:keys [bind! run! release! buffer-view] :as executor} caller-options retained-validation]
+  (let [execution-id (random-uuid)
+        plan (if retained-validation
+               (program-call/preparation-plan-with-retained-program
+                call execution-id retained-validation caller-options)
+               (preparation-plan call execution-id caller-options))]
     (doseq [step (:steps call)
             [result physical] (:result-views step)]
       (when-not (ifn? buffer-view)
@@ -233,15 +237,21 @@
   "Prepare bounded graph bindings and retain validated math intent with their exact owner.
    Executor callbacks receive neither compiler proof scopes nor policy authority."
   ([call executor]
-   (program-call/without-validation-context #(prepare-with-request! call executor nil)))
+   (program-call/without-validation-context #(prepare-with-request! call executor nil nil)))
   ([call executor caller-options]
-   (program-call/without-validation-context #(prepare-with-request! call executor caller-options))))
+   (program-call/without-validation-context #(prepare-with-request! call executor caller-options nil))))
+
+(defn ^:no-doc prepare-with-retained-program!
+  "Internal exact-program proof reuse; concrete bindings, live views and callbacks remain fresh."
+  [call executor retained-validation caller-options]
+  (program-call/without-validation-context
+   #(prepare-with-request! call executor caller-options retained-validation)))
 
 (defn- prepare-sequence-with-request!
   "Prepare ordered emitted programs and direct graphs over one shared resident binding.
    A later binding failure attempts earlier program cleanup before their storage may be freed.
    Unresolved cleanup is adopted through the executor or retained on the thrown exception."
-  [instances executor caller-options]
+  [instances executor caller-options retained-program-validations]
   (numerics/validate-scalar-math-policy! (:scalar-math caller-options))
   (when-not (and (vector? instances) (seq instances)
                  (every? #(and (contains? % :id) (contains? % :call)
@@ -266,19 +276,30 @@
          (vswap! prepared conj {:id id :program
                                 (if (= :graph kind)
                                   (prepare-graph-with! id call executor)
-                                  (if (nil? caller-options)
-                                    (prepare-with! call executor)
-                                    (prepare-with! call executor caller-options)))}))
+                                  (if-let [proof (when retained-program-validations
+                                                   (.get ^java.util.Map retained-program-validations
+                                                         (:program call)))]
+                                    (prepare-with-retained-program! call executor proof caller-options)
+                                    (if (nil? caller-options)
+                                      (prepare-with! call executor)
+                                      (prepare-with! call executor caller-options))))}))
        (own-prepared (->PreparedParallelSequence @prepared (atom false)) owner))
      (:adopt-cleanup! executor))))
 
 (defn prepare-sequence-with!
   "Prepare ordered instances under one independent caller math request."
   ([instances executor]
-   (program-call/without-validation-context #(prepare-sequence-with-request! instances executor nil)))
+   (program-call/without-validation-context #(prepare-sequence-with-request! instances executor nil nil)))
   ([instances executor caller-options]
    (program-call/without-validation-context
-    #(prepare-sequence-with-request! instances executor caller-options))))
+    #(prepare-sequence-with-request! instances executor caller-options nil))))
+
+(defn ^:no-doc prepare-sequence-with-retained-programs!
+  "Internal sequence preparation with independently authenticated exact-program proofs.
+   Direct graphs and absent proofs retain their ordinary preparation checks."
+  [instances executor retained-program-validations caller-options]
+  (program-call/without-validation-context
+   #(prepare-sequence-with-request! instances executor caller-options retained-program-validations)))
 
 (defn- visit-handles!
   [prepared operation visit!]

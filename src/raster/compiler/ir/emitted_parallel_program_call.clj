@@ -878,17 +878,9 @@
    {:bindings {} :entries []}
    (range (min 3 (:trip-count step)))))
 
-(defn preparation-plan
-  "Independently validate and project the finite stage-once graph binding set and replay keys.
-   This is pure compiler data, not driver preparation or allocation authority. Initial carry
-   preservation may add a third variant to parity rotation; changing induction scalars remain
-   an explicit stage-once decline. Program-wide shape scalars remain available for sizing.
-   Caller options are independent math consent, including for every loop binding variant;
-   the two-argument arity always requests the default policy."
-  ([call execution-id] (preparation-plan call execution-id nil))
-  ([call execution-id caller-options]
-  (let [call (validate! call caller-options)
-        program-scalars (:scalar-values call)
+(defn- preparation-plan-from-checked-call
+  [call execution-id caller-options]
+  (let [program-scalars (:scalar-values call)
         plan
         (reduce
          (fn [{:keys [entries step-keys] :as plan} [step-index step]]
@@ -908,4 +900,23 @@
          (map-indexed vector (:steps call)))]
     (update plan :entries
             (fn [entries]
-              (mapv #(update % :scalar-values (fn [local] (merge program-scalars local))) entries))))))
+              (mapv #(update % :scalar-values (fn [local] (merge program-scalars local))) entries)))))
+
+(defn preparation-plan
+  "Independently validate and project the finite stage-once graph binding set and replay keys.
+   This is pure compiler data, not driver preparation or allocation authority. Initial carry
+   preservation may add a third variant to parity rotation; changing induction scalars remain
+   an explicit stage-once decline. Program-wide shape scalars remain available for sizing.
+   Caller options are independent math consent, including for every loop binding variant;
+   the two-argument arity always requests the default policy."
+  ([call execution-id] (preparation-plan call execution-id nil))
+  ([call execution-id caller-options]
+   (preparation-plan-from-checked-call (validate! call caller-options) execution-id caller-options)))
+
+(defn ^:no-doc preparation-plan-with-retained-program
+  "Internal static-proof path: authenticate exact program/request and recheck all call bindings.
+   No proof context escapes into the returned pure preparation plan."
+  [call execution-id retained-validation caller-options]
+  (preparation-plan-from-checked-call
+   (validate-with-retained-program! call retained-validation caller-options)
+   execution-id caller-options))
