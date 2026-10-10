@@ -3094,18 +3094,19 @@
               {:var f-var}))))
 
 (def ^:private vjp-cache
-  ;; A compiled VJP is a snapshot of every (including nested) template rule
-  ;; consulted by transform-body. Retain only the current registry generation;
+  ;; A compiled VJP snapshots nested template rules and compiler-visible
+  ;; definitions. Retain only the current generations;
   ;; a caller already holding a closure may continue to use that snapshot.
-  (atom {:registry-revision nil :entries {}}))
+  (atom {:registry-revision nil :definition-revision nil :entries {}}))
 
 (declare ad-prepare)
 
 (defn- get-vjp-fn
   "Get or compile the AD-transformed function for a deftm var.
-  Cached by [template-registry revision, var-identity, walked-body] to avoid
+  Cached by [template/definition revisions, var-identity, walked-body] to avoid
   recompiling on every call. A registry mutation conservatively starts a new
-  cache generation because transforms can depend on nested template rules.
+  cache generation because transforms can depend on nested template rules or
+  inlined deftm definitions, even when the parent's walked body is unchanged.
 
   Filters active params by tag (same rule as build-grad-walked-body): only
   doubles/floats are seeded as active. The pullback's output vector still has
@@ -3113,19 +3114,30 @@
   positional consumers don't shift."
   [resolved]
   (loop []
-    (let [m (meta resolved)
+    (let [registry-revision (tmpl/registry-revision)
+          definition-revision (dispatch/compiler-definition-revision)
+          m (meta resolved)
           params (or (:raster.core/deftm-params m)
                      (throw (ex-info "vjp requires a deftm var"
                                      {:var resolved})))
           walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body on var" {:var resolved})))
-          registry-revision (tmpl/registry-revision)
           cache-key [resolved walked-body]
           cache @vjp-cache
-          cached (when (= registry-revision (:registry-revision cache))
+          cached (when (and (= registry-revision (:registry-revision cache))
+                            (= definition-revision (:definition-revision cache)))
                    (get-in cache [:entries cache-key]))]
-      (or cached
-          (let [all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+      (cond
+        ;; Walking or metadata acquisition can itself span a redefinition.
+        ;; Do not return an old cache hit after observing that boundary drift.
+        (or (not= registry-revision (tmpl/registry-revision))
+            (not= definition-revision (dispatch/compiler-definition-revision)))
+        (recur)
+
+        cached cached
+
+        :else
+        (let [all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
               tags (or (:raster.core/deftm-tags m)
                        (vec (repeat (count params) 'double)))
               diff-active-params (vec (keep-indexed
@@ -3171,24 +3183,30 @@
             ;; A mutation during transformation may otherwise produce a closure
             ;; assembled from more than one registry snapshot. Do not publish or
             ;; return it: retry against the new monotonic revision instead.
-            (if (not= registry-revision (tmpl/registry-revision))
+            (if (or (not= registry-revision (tmpl/registry-revision))
+                    (not= definition-revision (dispatch/compiler-definition-revision)))
               (recur)
               (do
                 (swap! vjp-cache
                        (fn [cache]
-                         (let [cached-revision (:registry-revision cache)]
+                         (let [cached-revision (:registry-revision cache)
+                               cached-definition (:definition-revision cache)]
                            (cond
-                             (= registry-revision cached-revision)
+                             (and (= registry-revision cached-revision)
+                                  (= definition-revision cached-definition))
                              (assoc-in cache [:entries cache-key] compiled-fn)
 
                              ;; A compiler from an older generation must not
                              ;; evict entries already published by a newer one.
-                             (and cached-revision
-                                  (> cached-revision registry-revision))
+                             (or (and cached-revision
+                                      (> cached-revision registry-revision))
+                                 (and cached-definition
+                                      (> cached-definition definition-revision)))
                              cache
 
                              :else
                              {:registry-revision registry-revision
+                              :definition-revision definition-revision
                               :entries {cache-key compiled-fn}}))))
                 compiled-fn)))))))
 
