@@ -10,6 +10,8 @@ have consistent before/after snapshots, fresh endpoint sessions, finite positive
 whole-step durations and bounded Unix-epoch age. The shared Measurement summary
 supplies CV/spread and median costs. Insufficient, inconsistent, stale, repeated
 or noisy evidence leaves an explicit per-route analytical fallback.
+The policy's `:cold-warm` label is caller-declared summary metadata; these
+observations do not independently establish sample warmness.
 
 This is a pure diagnostic projection, not a new compiler cache or authority:
 the original one-argument simulator and all plan certificates remain analytical.

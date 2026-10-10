@@ -1566,6 +1566,7 @@
    Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
    empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
    :now-ms and :cold-warm; defaults are max-age-ms 60000, min-samples 3, cv-threshold 0.05.
+   :cold-warm is caller-declared summary metadata, not independently observed sample warmness.
    Reports are supplied evidence, not authenticated measurements. Results retain per-route
    admission/fallback reasons. Synchronous samples do not prove overlap or calibrate contention;
    this diagnostic projection does not alter the plan or its analytical certificate."
