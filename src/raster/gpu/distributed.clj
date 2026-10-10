@@ -3,6 +3,7 @@
    Logical workers have explicit physical targets; placement does not imply execution overlap."
   (:refer-clojure :exclude [run!])
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.buffer-view :as view]
             [raster.compiler.ir.distributed-plan :as distributed]
             [raster.compiler.ir.execution-plan :as execution]
@@ -234,7 +235,10 @@
 (defn- device-observations [executable]
   (into {} (map (fn [[target session]]
                   [target {:session-id (:session-id @session)
-                           :device (gpu/execution-device-info session)}]))
+                           :device (gpu/execution-device-info session)
+                           :hardware-evidence
+                           (hardware/evidence-signature
+                            (hardware/descriptor-for (:device-id @session)))}]))
         (:sessions executable)))
 
 (defn- execute! [executable profile?]
@@ -318,6 +322,9 @@
    Not an extra replay: consumes the same ready owner as run!, and leaves outputs available.
    Returns a complete observation only on success. Host step times include binding/cleanup;
    resident copies have host timing only. Host-staged legs retain their backend timing sources.
+   Before/after context includes the planner's hardware evidence signature, queried using the
+   physical session device, not the logical worker name. Calibration drift invalidates a report
+   just as live device/driver drift does; missing hardware facts remain absent.
    Logical route time is not attributed to individual topology links. This serialized execution
    observation neither proves overlap nor updates calibration or topology automatically."
   [executable]

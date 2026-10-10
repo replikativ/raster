@@ -23,6 +23,15 @@
                             (view/view
                              (view/allocation {:id id :device worker :byte-size 36 :memory-space :device})
                              {:dtype :float :shape [9]}))]
+            (let [context (#'runtime/device-observations owner)]
+              (is (= #{:source-worker :target-worker} (set (keys context))))
+              (is (not= (get-in context [:source-worker :session-id])
+                        (get-in context [:target-worker :session-id])))
+              (doseq [worker [:source-worker :target-worker]]
+                (is (= device (get-in context [worker :hardware-evidence :device-id]))))
+              (is (= (get-in context [:source-worker :hardware-evidence])
+                     (get-in context [:target-worker :hardware-evidence])))
+              (is (= context (#'runtime/device-observations owner))))
             (gpu/upload-range! source-session :source source {:elements 9})
             (let [legs (#'runtime/transfer-host-staged!
                         {:source-worker source-session :target-worker target-session}
