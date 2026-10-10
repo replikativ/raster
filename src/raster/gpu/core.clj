@@ -737,12 +737,16 @@
                   (registered-buffer-footprint sess (mapv #(get-in @sess [:buffers %]) keys))})))))
   nil)
 
+(defn- unresolved-event? [entry]
+  ;; Host visibility does not discharge native retirement or retained-resource ownership.
+  (contains? #{:pending :awaited} (:status entry)))
+
 (defn- pending-resident-events
   [events kind footprint]
   (->> events
        (keep (fn [[event-id entry]]
                (when (and (= kind (:kind entry))
-                          (= :pending (:status entry))
+                          (unresolved-event? entry)
                           (resident-footprints-overlap? footprint entry))
                  event-id)))
        vec))
@@ -1537,7 +1541,7 @@
              unwitnessed-graphs (->> (:events @sess)
                                      (keep (fn [[event-id entry]]
                                              (when (and (= :graph (:kind entry))
-                                                        (= :pending (:status entry))
+                                                        (unresolved-event? entry)
                                                         (nil? (:buffer-keys entry)))
                                                event-id)))
                                      vec)
@@ -1835,15 +1839,24 @@
             completed))
       ;; A successful status query is not necessarily a host memory-synchronization point
       ;; (notably in OpenCL). Await always calls the backend wait before releasing the token.
-        (let [backend-completion ((rt-resolve device-id "await-event!") backend-event)
+        (let [backend-completion (when-not (= :awaited status)
+                                   ((rt-resolve device-id "await-event!") backend-event))
               completed-ns (System/nanoTime)
-              measurement (when (= :transfer kind)
-                            (merge (when (map? backend-completion) backend-completion)
-                                   {:host-wall-ns (- completed-ns submitted-ns)
-                                    :submit-host-ns (- submit-return-ns submitted-ns)}))]
+              measurement (if (= :awaited status)
+                            (:measurement entry)
+                            (when (= :transfer kind)
+                              (merge (when (map? backend-completion) backend-completion)
+                                     {:host-wall-ns (- completed-ns submitted-ns)
+                                      :submit-host-ns (- submit-return-ns submitted-ns)})))
+              awaited (cond-> (assoc entry :status :awaited)
+                        measurement (assoc :measurement measurement))]
+          ;; Await establishes visibility; native retirement is a separate obligation. If release
+          ;; fails, keep the token and footprint, but never await a partially retired owner again.
+          ;; Its cleanup contract alone decides whether release may retry or remains indeterminate.
+          (swap! sess assoc-in [:events (:id event)] awaited)
           ((rt-resolve device-id "release-event!") backend-event)
           (let [release-errors (close-retained-resources retained-resources)
-                completed (cond-> (assoc entry
+                completed (cond-> (assoc awaited
                                          :status :complete
                                          :backend-event nil
                                          :retained-resources [])
@@ -1867,7 +1880,7 @@
           {:keys [status backend-event] :as entry} (resolve-event-entry sess event)]
       (when closed?
         (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
-      (or (= :complete status)
+      (or (contains? #{:awaited :complete} status)
           (if-let [transfer-state (::transfer-state entry)]
             (do
               (cleanup/assert-live! (::cleanup/owner entry))
@@ -2366,7 +2379,7 @@
             entry
             pending (some (fn [[_ entry]]
                             (when (and (= (:key handle) (:graph-key entry))
-                                       (= :pending (:status entry)))
+                                       (unresolved-event? entry))
                               (:event entry)))
                           events)]
         (when-not runtime-graph
@@ -2376,7 +2389,7 @@
           (throw (ex-info "kernel graph already has an in-flight submission"
                           {:handle handle :event pending})))
         (when (and (nil? resident-footprint)
-                   (some #(and (= :transfer (:kind %)) (= :pending (:status %)))
+                   (some #(and (= :transfer (:kind %)) (unresolved-event? %))
                          (vals events)))
           (throw (ex-info "kernel graph has no resident footprint for transfer ordering"
                           {:reason :graph-resident-footprint-missing :handle handle})))

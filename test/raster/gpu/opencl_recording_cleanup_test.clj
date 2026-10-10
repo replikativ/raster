@@ -36,6 +36,7 @@
        (v 'h-clGetEventProfilingInfo) (delay :fake)
        (v 'cl-call!) (fn [label _ args]
                        (swap! calls conj [label (first args)])
+                       (when-let [on-native (:on-native options)] (on-native label args))
                        (when-let [error (get (:failures options) label)] (throw error))
                        (when (= label "clReleaseEvent")
                          (when-let [error (get (:event-release-failures options)
@@ -58,6 +59,114 @@
   (ocl/record-graph! [{:bound {:wg 32} :group-count 1 :kernel-name "a"}
                       {:bound {:wg 32} :group-count 1 :kernel-name "b"}]
                      {:profile? profile?}))
+
+(deftest public-graph-retirement-keeps-await-progress-after-native-release-failure
+  (doseq [retry-safe? [true false]]
+    (let [failure (ex-info "event release failed" {:cleanup-retry-safe? retry-safe?})
+          release-count (atom 0)
+          closed (atom 0)]
+      (mocked-recording
+       {:on-native (fn [label _]
+                     (when (and (= "clReleaseEvent" label)
+                                (= 1 (swap! release-count inc)))
+                       (throw failure)))}
+       (fn [calls]
+         (let [graph (recording false)
+               session (atom {:device-id :ocl:0 :session-id :retirement-progress :closed? false
+                              :kernel-graphs {:graph {:generation 1 :runtime-graph graph
+                                                      :outputs {'out :resident}
+                                                      :execution-plan {:queues [{:class :compute}]}
+                                                      :resident-footprint {:allocation-ids #{:out}
+                                                                           :resident-buffers []}}}
+                              :events {}})
+               handle (gpu/->KernelGraphHandle :graph :retirement-progress 1)]
+           (with-redefs-fn
+             {(ns-resolve 'raster.gpu.core 'rt-resolve)
+              (fn [_ name]
+                (case name
+                  "submit-graph!" ocl/submit-graph!
+                  "await-event!" ocl/await-event!
+                  "release-event!" ocl/release-event!
+                  "event-complete?" ocl/event-complete?
+                  (throw (ex-info "unexpected runtime operation" {:name name}))))}
+             (fn []
+               (let [event (gpu/submit-kernel-graph! session handle)
+                     entry-path [:events (:id event)]
+                     lease (reify java.lang.AutoCloseable (close [_] (swap! closed inc)))]
+                 ;; Exercise retained-resource ordering on the same common event path.
+                 (swap! session assoc-in (conj entry-path :retained-resources) [lease])
+                 (is (identical? failure (error-of #(gpu/await-event! session event))))
+                 (is (= :awaited (:status (get-in @session entry-path))))
+                 (is (zero? @closed))
+                 (is (true? (gpu/event-complete? session event)))
+                 (is (re-find #"in-flight"
+                              (.getMessage ^Throwable
+                                           (error-of #(gpu/submit-kernel-graph! session handle)))))
+                 (if retry-safe?
+                   (do
+                     (is (nil? (gpu/release-event! session event)))
+                     (is (= 2 @release-count))
+                     (is (= 1 @closed))
+                     (is (empty? (:events @session)))
+                     (is (nil? @(:submission-state graph)))
+                     (ocl/destroy-graph! graph))
+                   (let [before @calls]
+                     (dotimes [_ 2]
+                       (is (identical? failure (error-of #(gpu/release-event! session event)))))
+                     (is (= before @calls) "indeterminate native release is never retried")
+                     (is (= 1 @release-count))
+                     (is (zero? @closed))
+                     (is (= :awaited (:status (get-in @session entry-path))))))
+               (is (= 1 (count (filter #(= "clWaitForEvents" (first %)) @calls)))))))))))))
+
+(deftest session-close-retirement-retry-does-not-repeat-await-or-descend-early
+  (doseq [retry-safe? [true false]]
+    (let [failure (ex-info "retirement failed" {:cleanup-retry-safe? retry-safe?})
+          releases (atom 0) retired (atom [])]
+      (mocked-recording
+       {:on-native (fn [label _]
+                     (when (and (= "clReleaseEvent" label) (= 1 (swap! releases inc)))
+                       (throw failure)))}
+       (fn [calls]
+         (let [graph (recording false)
+               graph-owner (cleanup/owner [{:id :graph :release #(do (ocl/destroy-graph! graph)
+                                                                    (swap! retired conj :graph))}])
+               session (atom {:device-id :ocl:0 :session-id :close-progress :closed? false
+                              :kernel-graphs {:graph {::cleanup/owner graph-owner :generation 1
+                                                      :runtime-graph graph :outputs {}
+                                                      :execution-plan {:queues [{:class :compute}]}
+                                                      :resident-footprint {:allocation-ids #{:out}
+                                                                           :resident-buffers []}}}
+                              :events {}})
+               handle (gpu/->KernelGraphHandle :graph :close-progress 1)]
+           (with-redefs-fn
+             {(ns-resolve 'raster.gpu.core 'rt-resolve)
+              (fn [_ name]
+                (case name
+                  "submit-graph!" ocl/submit-graph!
+                  "await-event!" ocl/await-event!
+                  "release-event!" ocl/release-event!
+                  "close-kernel-arena!" (fn [_] (swap! retired conj :arena))
+                  (throw (ex-info "unexpected teardown operation" {:name name}))))}
+             (fn []
+               (let [event (gpu/submit-kernel-graph! session handle)
+                     lease (reify java.lang.AutoCloseable (close [_] (swap! retired conj :lease)))]
+                 (swap! session assoc-in [:events (:id event) :retained-resources] [lease])
+                 (is (identical? failure (error-of #(gpu/close-session! session))))
+                 (is (= :releasing (:lifecycle @session)))
+                 (is (= :awaited (get-in @session [:events (:id event) :status])))
+                 (is (empty? @retired))
+                 (if retry-safe?
+                   (do (is (nil? (error-of #(gpu/close-session! session))))
+                       (is (= :closed (:lifecycle @session)))
+                       (is (= [:lease :graph :arena] @retired))
+                       (is (= 2 @releases)))
+                   (let [before @calls]
+                     (is (identical? failure (error-of #(gpu/close-session! session))))
+                     (is (= before @calls))
+                     (is (= 1 @releases))
+                     (is (empty? @retired))))
+                 (is (= 1 (count (filter #(= "clWaitForEvents" (first %)) @calls)))))))))))))
 
 (deftest recording-root-pin-outlives-submission-and-retires-with-graph
   (doseq [profile? [false true]]
