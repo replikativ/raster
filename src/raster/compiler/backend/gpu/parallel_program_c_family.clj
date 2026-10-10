@@ -259,7 +259,9 @@
         kernel-name (str "rstr_product_consumer_" (:region-ordinal plan))
         {:keys [emitted refinement]} (product-consumer-route/emit
                                       kernel-name routed target-dialect
-                                      (select-keys opts [:target-descriptor :scalar-math]))
+                                      (cond-> (select-keys opts [:scalar-math])
+                                        (or (contains? opts :target-descriptor) (some? target-device))
+                                        (assoc :target-descriptor target-description)))
         algorithm (get-in plan [:source :algorithm])
         body (get-in plan [:source :body])
         facts (soac/facts algorithm)
