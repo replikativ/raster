@@ -48,11 +48,14 @@ The training compiler companion uses it so repartitioning loses no OpenCL-job co
 Recollect namespace weights after splitting: previous per-var timings explain the partition,
 but are not fresh namespace costs or measured speedups.
 
-The initial split seeds are lane-specific: general-suite job 25327 and OpenCL job 25271.
-Each seed sums that lane's original test-var durations and conservatively charges the old
-namespace load cost to both pieces. General-suite native branches skipped, so those weights
-must not be used as OpenCL execution costs. The TSV comments distinguish these projections
-from measured namespace rows. Fresh comparable reports should replace the seeds after CI.
+The split's initial projected seeds are now replaced by actual post-partition measurements:
+general-suite job 25405 (all sixteen reports) and OpenCL job 25409 (all four reports), both at
+`2c4148f3`. Compiler/native namespace costs were 264086/414 ms in the general suite and
+254308/194740 ms in the OpenCL lane. General-suite native branches skipped, so those weights
+must not be used as OpenCL execution costs. All 81 selected OpenCL namespaces have fresh rows;
+all 525 selected general-suite namespaces also have fresh rows. These observations guide
+placement, not correctness selection or a stable speedup claim. Recollect after future source
+or ordering changes rather than treating namespace load attribution as intrinsic cost.
 
 Landing order:
 
