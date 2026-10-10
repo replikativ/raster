@@ -4,8 +4,9 @@
             [raster.gpu.distributed :as distributed]))
 
 (defn- owner [state]
-  (distributed/map->DistributedExecutable
-   {:plan {:outputs []} :sessions {} :state (atom state)}))
+  (#'distributed/seal-runtime-value
+   (distributed/map->DistributedExecutable
+    {:plan {:outputs []} :sessions {} :state (atom state)})))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))

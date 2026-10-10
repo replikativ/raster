@@ -1,5 +1,30 @@
 # Compiler unification campaign
 
+### October 10 explicit distributed math request
+
+Distributed construction, validation, compute/transfer binding, readiness,
+simulation, storage projection and certification now forward explicit caller
+`:scalar-math` intent through existing request-aware LinkPlan contracts. Selected
+math in a structured loop is no longer rejected by an intermediate default-only
+readiness or scratch query. Omitted intent remains default; artifact attributes
+and certificates cannot authorize selection. Empirical route policy is separate.
+
+Certificates retain the canonical request as structural identity and verification
+rederives it from independent caller options, including unused overrides. This
+adds a certificate field, not a new numerical surface operation or default
+arithmetic change. Empty explicit intent normalizes to the existing omitted
+default request, preserving exact refinement identity of default-compiled local
+reductions; certificates still report the canonical empty policy. Runtime owners
+retain admitted intent before sealing; only
+the exact issued owner can execute or expose outputs. Acquisition, execution,
+output callbacks and cleanup clear compiler proof scopes, including future
+inheritance. Structural output enumeration itself requires no policy argument.
+
+The selected five-trip loop is checked against an independent rounded scalar
+oracle on local OpenCL and Level Zero. This is policy/ownership integration,
+not physical fabric overlap, calibrated throughput, full memory accounting, or
+acceptance of the unchanged held real-weight training gate.
+
 ### October 9 physical compute lanes follow explicit worker placement
 
 A reproduced simulator gap gave independent compute lanes to logical workers
@@ -4073,3 +4098,48 @@ seven-argument program-call constructor. This is a mixed-revision diagnostic
 environment, not evidence of a production miscompile or a new numerical result.
 Rebuild a coherent compiler source set before continuing that comparison. The
 original componentwise real-model acceptance remains failed and unchanged.
+
+### Real-weight arithmetic localization — 2026-10-10
+
+The later coherent warm-classpath diagnostic supersedes the preceding incomplete
+preparation observation, not the external acceptance requirement. The classpath
+is `5b17e9967b3d27d4daec4588b4dc73f1f413dfa8`, with reviewed integration sources
+restored from `afe65b914c2dafb565559e6985a9d0e13027c5a1`; this does not attest that
+every loaded namespace belongs to that integration head. Original source,
+checkpoint, inputs, cotangents and CPU reference remain pinned and unchanged.
+
+The isolated layer-1 CPU VJP reproduces all fourteen adapter reference arrays
+bit for bit. With explicitly selected Float-storage/Double-arithmetic ordered
+FMA contractions and Double tanh, the isolated GPU VJP still fails two original
+adapter checks (Ak and Ag). This is not full-model acceptance. The last full
+run of that policy still failed eight of twenty-eight adapter checks while
+passing loss and input-gradient checks; the earlier eleven-failure result in
+the campaign table is a different recorded baseline, not a current pass count.
+
+On captured operands, all nine Q/K/V forward contractions and all twelve FFN
+forward/backward contractions match independent ordered Double FMA followed by
+Float rounding bit for bit. Frozen weights were independently read back for
+these controls; adapter controls use original CPU weights and do not claim
+adapter readback identity. The first Q/K/V projections receive inputs identical
+to the CPU reference yet differ from CPU BLAS, locating an early arithmetic-
+policy divergence. Traced RMSNorm, RoPE, attention dK/DW/denominator, and selected
+Double-tanh GELU controls likewise narrow the investigation; they do not prove
+all model operations correct. Every tapped run retains all fifteen original
+diagnostic outputs bit for bit.
+
+The final Ak discrepancy is reproduced by CPU BLAS using the captured GPU
+cotangent and original CPU activation. Small operand differences are amplified
+by cancellation, rather than an incorrect final Ak dot demonstrated by these
+controls. CPU-only Float FMA partitions with one, four, eight or sixteen
+interleaved lanes and left-fold or pairwise combination did not establish a
+consistently BLAS-compatible schedule. No provider-specific accumulation rule,
+default policy, oracle replacement or tolerance relaxation follows from this.
+
+PR #1171 adds bounded failure diagnostics (admitted schedules, error magnitudes,
+worst finite absolute-error coordinate and nonfinite-coordinate count). Its
+focused checks pass eleven tests / fifty assertions and exact-head static review
+approved `f688864bdea4f86ec6eb9b71fb3a0b0daf1840cf`; fresh CI remains separate.
+The original real-weight gate, end-to-end performance, and the eight-item
+campaign remain open. The next numerical change requires an explicit semantic
+contract plus independent validation against the unchanged external gate, not
+more schedule guesses inferred from local replay agreement.
