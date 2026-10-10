@@ -1,10 +1,12 @@
 (ns raster.gpu.distributed-output-scope-test
   "Hardware-free lifecycle checks; these do not fabricate compiler completion evidence."
   (:require [clojure.test :refer [deftest is]]
-            [raster.gpu.distributed :as distributed]))
+            [raster.gpu.distributed :as distributed]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.test-lifecycle :as lifecycle]))
 
 (defn- owner [state]
-  (distributed/map->DistributedExecutable
+  (lifecycle/distributed-executable
    {:plan {:outputs []} :sessions {} :state (atom state)}))
 
 (defn- reason [f]
@@ -65,3 +67,34 @@
     (is (= :complete @(:state executable)))
     (distributed/close! executable)
     (is (= :closed @(:state executable)))))
+
+(deftest copied-owner-cannot-bypass-a-live-output-scope-with-a-replacement-state
+  (let [executable (lifecycle/distributed-executable
+                    {:plan {:outputs []} :sessions {:unit :unit-session} :state (atom :complete)})
+        copies [(assoc executable :state (atom :ready))
+                (assoc executable :state (atom :complete))
+                (distributed/map->DistributedExecutable (into {} executable))]
+        closes (atom []) callbacks (atom 0)]
+    (with-redefs [gpu/close-session! (fn [session] (swap! closes conj session))]
+      (distributed/with-output-values!
+       executable
+       (fn [_]
+         (doseq [copy copies]
+           (is (not (distributed/original-executable? copy)))
+           (doseq [operation [#(distributed/run! copy)
+                              #(distributed/profile! copy)
+                              #(distributed/output-values copy)
+                              #(distributed/with-output-values! copy
+                                 (fn [_] (swap! callbacks inc)))
+                              #(distributed/close! copy)
+                              #(.close ^java.io.Closeable copy)]]
+             (is (= :distributed-runtime-owner (reason operation))))
+           (is (= :reading-outputs @(:state executable))))
+         (is (empty? @closes))
+         (is (zero? @callbacks))))
+      (is (= :complete @(:state executable)))
+      (distributed/close! executable)
+      (is (= [:unit-session] @closes))
+      (is (= :closed @(:state executable)))
+      (is (nil? (distributed/close! executable)))
+      (is (= [:unit-session] @closes)))))
