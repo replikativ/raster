@@ -3829,8 +3829,18 @@ contracts. It revalidates the exact compiler plan, pins its own output scope, an
 captures the two complete fields with bounded element-aligned downloads and SHA-256.
 The verified local domain explicitly relates a flat physical array to its dense
 patch shape; identical element counts and byte extent do not license arbitrary
-striding, packing or partial coverage. Storage evidence is checked before every
-download and after the final provider callback.
+striding, packing or partial coverage. Generic distributed and bounded AMR capture
+share one internal physical capture engine: storage evidence is checked before
+every download, after the metadata-only manifest builder, after each provider
+ingestion and at completion. The final manifest is certified before any provider
+write; the builder cannot replace the derived fields or obtain resident readers.
+
+Semantic admission remains adapter-specific. Generic capture still requires
+placement/sharding-free portable tensors and canonicalizes their dtype/shape.
+AMR retains its independently checked complete AbstractValues, including sharding,
+coordinates and attributes. Shared physical admission checks plain dense encoding,
+matching dtype, equal-volume shape and exact byte extent; it does not erase those
+semantic facets or replace AMR's geometry, temporal and lineage proofs.
 
 The captured manifest retains field geometry, numerical policy and producer-attested
 meaning, with an advanced synchronized coordinate and the input state's identity as

@@ -27,10 +27,16 @@
     (with-open [owner (runtime/instantiate! plan {:device-capacities {target 1048576}})]
       (runtime/run! owner)
       (let [fact (runtime/measure-storage-representation! owner target :double)]
-        (assoc (capture/capture! certified owner {target fact} provider :local
+        (let [captured (capture/capture! certified owner {target fact} provider :local
                                  {:id (keyword (str "step-" (inc (get initial :step 0))))
                                   :logical-coordinate {:step (inc (get initial :step 0)) :phase :synchronized}})
-               :source-certified certified)))))
+              source (get-in certified [:workload :plan :state :manifest :fields])]
+          (is (some #(some? (get-in % [:value :sharding])) source)
+              "this oracle exercises the independently checked partitioned AMR schema")
+          (is (= (mapv #(select-keys % [:value :coordinate-space :attributes]) source)
+                 (mapv #(select-keys % [:value :coordinate-space :attributes])
+                       (get-in captured [:state :manifest :fields]))))
+          (assoc captured :source-certified certified))))))
 
 (defn- decode-fields [captured provider]
   (let [source (get-in captured [:source-certified :workload :plan :state :manifest])
