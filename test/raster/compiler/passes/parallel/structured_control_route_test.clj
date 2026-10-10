@@ -1691,6 +1691,20 @@
         (is (= (count entries) (count (:handles prepared)))))))
   (is (thrown? clojure.lang.ExceptionInfo (program-call/preparation-plan {} :execution))))
 
+(deftest compiler-preparation-forwards-independent-intent-to-bounded-loop-variants
+  (let [call (:call (prepared-mixed-call 1000000000))
+        request {:scalar-math {:overrides {[:tanh :float] :f64-target-library-rte-f32}}}
+        original loop-call/iteration-binding
+        observed (atom [])]
+    (with-redefs [loop-call/iteration-binding
+                  (fn [step iteration options]
+                    (swap! observed conj [iteration options])
+                    (original step iteration options))]
+      (let [plan (program-call/preparation-plan call :execution request)]
+        (is (= 4 (count (:entries plan))))
+        (is (= [[0 request] [1 request] [2 request]] @observed))
+        (is (every? #(contains? (:scalar-values %) 'n) (:entries plan)))))))
+
 (deftest stage-once-declines-a-changing-induction-scalar
   (let [call (:call (prepared-mixed-call 3 (mixed-source)))]
     (is (= :parallel-program-dynamic-loop-binding
