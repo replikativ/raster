@@ -1923,9 +1923,12 @@
 (defn register-kernel-dispatch!
   ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))
   ([dispatch arena-id]
-   (let [dispatch (cond-> (kdispatch/validate! dispatch)
+   (let [dispatch (kdispatch/validate! dispatch)
+         dispatch (cond-> dispatch
+                    (contains? dispatch :arena-id) (dissoc :arena-id)
                     arena-id (assoc :arena-id arena-id))]
-     (swap! kernel-dispatch-registry assoc (:id dispatch) dispatch)
+     (swap! kernel-dispatch-registry update (:id dispatch)
+            kdispatch/admit-registration dispatch)
      dispatch)))
 
 (defn kernel-dispatch-registry-entry

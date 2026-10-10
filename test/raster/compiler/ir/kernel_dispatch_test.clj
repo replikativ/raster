@@ -624,12 +624,68 @@
            :selector (:selector dispatch)})))))
 
 (deftest both-resident-backends-register-the-same-pure-dispatch
-  (doseq [[register! entry] [[ze/register-kernel-dispatch!
-                              ze/kernel-dispatch-registry-entry]
-                             [ocl/register-kernel-dispatch!
-                              ocl/kernel-dispatch-registry-entry]]]
-    (register! dispatch)
-    (is (identical? dispatch (entry (:id dispatch))))))
+  (doseq [backend ['raster.gpu.ocl-runtime 'raster.gpu.ze-runtime]]
+    (with-redefs-fn {(ns-resolve backend 'kernel-dispatch-registry) (atom {})}
+      (fn []
+        ((ns-resolve backend 'register-kernel-dispatch!) dispatch nil)
+        (is (identical? dispatch
+                        ((ns-resolve backend 'kernel-dispatch-registry-entry) (:id dispatch))))))))
+
+(deftest dispatch-registration-cannot-redirect-an-existing-id-or-steal-its-arena
+  (doseq [backend ['raster.gpu.ocl-runtime 'raster.gpu.ze-runtime]]
+    (let [registry (atom {})
+          register! (ns-resolve backend 'register-kernel-dispatch!)
+          changed (kdispatch/with-selector
+                   dispatch {:kind :fixed-strategy :strategy :reference})]
+      (with-redefs-fn {(ns-resolve backend 'kernel-dispatch-registry) registry}
+        (fn []
+          (register! dispatch :first-arena)
+          (let [prior (get @registry (:id dispatch))]
+            (register! dispatch :first-arena)
+            (is (identical? prior (get @registry (:id dispatch)))
+                "an equal registration retains the original value")
+            (doseq [[candidate arena] [[changed :first-arena]
+                                       [dispatch :different-arena]
+                                       [dispatch nil]]]
+              (let [error (try (register! candidate arena) nil
+                               (catch clojure.lang.ExceptionInfo error error))]
+                (is (= :kernel-dispatch-registration-conflict (:reason (ex-data error))))
+                (is (= (:id dispatch) (:id (ex-data error))))
+                (is (identical? prior (get @registry (:id dispatch))))))
+            (is (= reference (kdispatch/select-alternative prior [:x :out 1])))))))))
+
+(deftest registration-normalizes-arena-and-compares-canonical-semantic-data
+  (doseq [backend ['raster.gpu.ocl-runtime 'raster.gpu.ze-runtime]]
+    (let [register! (ns-resolve backend 'register-kernel-dispatch!)]
+      (with-redefs-fn {(ns-resolve backend 'kernel-dispatch-registry) (atom {})}
+        (fn []
+          (let [injected (assoc dispatch :arena-id :foreign-arena)
+                registered (register! injected nil)]
+            (is (not (contains? registered :arena-id)))
+            (is (identical? registered
+                            ((ns-resolve backend 'kernel-dispatch-registry-entry) (:id dispatch)))))))
+      (doseq [[prior candidate]
+              [[(assoc-in dispatch [:attributes :zero] 0.0)
+                (assoc-in dispatch [:attributes :zero] -0.0)]
+               [dispatch (with-meta dispatch {:numerical-policy :changed})]
+               [dispatch (assoc-in dispatch [:alternatives 0 :attributes :compilation]
+                                   {:language-standard "CL3.0"})]
+               [dispatch (assoc dispatch :default-strategy :not-an-alternative)]]]
+        (let [registry (atom {})]
+          (with-redefs-fn {(ns-resolve backend 'kernel-dispatch-registry) registry}
+            (fn []
+              (register! prior nil)
+              (is (thrown? clojure.lang.ExceptionInfo (register! candidate nil)))
+              (is (identical? prior (get @registry (:id prior)))))))))))
+
+(deftest opaque-registration-payloads-require-the-original-dispatch-value
+  (let [opaque (assoc-in dispatch [:attributes :spv-bytes] (byte-array [1 2]))
+        fresh-copy (assoc opaque :attributes (:attributes opaque))]
+    (is (identical? opaque (kdispatch/admit-registration opaque opaque)))
+    (is (not (identical? opaque fresh-copy)))
+    (is (= opaque fresh-copy))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"different registration"
+                         (kdispatch/admit-registration opaque fresh-copy)))))
 
 (deftest staged-executable-normalizes-the-abi-and-uses-the-common-graph-runner
   (let [graph (staged-graph)

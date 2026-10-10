@@ -8,7 +8,8 @@
   (:require [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.kernel-precondition :as precondition]))
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]))
 
 (defrecord KernelDispatch
            [id
@@ -241,6 +242,32 @@
     :or {provenance {} attributes {}}}]
   (validate!
    (->KernelDispatch id alternatives default-strategy selector provenance attributes)))
+
+(defn admit-registration
+  "Admit a validated dispatch at one registry key without rebinding an existing call.
+   IDs are lookup handles, not proofs of executable equality. Identical or canonically equal registrations are
+   idempotent; different executable values or arena ownership under one ID fail closed.
+   Use inside the registry's atomic update so concurrent registrations cannot overwrite."
+  [prior candidate]
+  (when (and prior
+             (not (or (identical? prior candidate)
+                      (and (= prior candidate)
+                           ;; Clojure equality alone ignores semantic metadata and signed zero.
+                           ;; Unsupported opaque values cannot establish equality of fresh copies.
+                           (try
+                             (java.util.Arrays/equals
+                              ^bytes (fingerprint/canonical-bytes prior)
+                              ^bytes (fingerprint/canonical-bytes candidate))
+                             (catch clojure.lang.ExceptionInfo error
+                               (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+                                 false
+                                 (throw error))))))))
+    (throw (ex-info "kernel dispatch ID already names a different registration"
+                    {:reason :kernel-dispatch-registration-conflict
+                     :id (:id candidate)
+                     :registered-arena (:arena-id prior)
+                     :requested-arena (:arena-id candidate)})))
+  (or prior candidate))
 
 (defn alternative
   "Return the executable implementing `strategy`, or throw with the legal strategy set."
