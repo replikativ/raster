@@ -125,8 +125,8 @@
   (let [keys (mapv #(keyword (str "adapter" %)) (range 14))
         gradients (zipmap keys (repeat (float-array [1])))
         seeds (atom [])
-        model {'adapter-keys (atom keys) 'layer-theta (fn [& _] {})
-               'rand-weights (fn [_ seed] (swap! seeds conj [:weight seed]) {})
+        model {'adapter-keys (atom keys) 'weight-keys (atom [:w]) 'layer-theta (fn [& _] {})
+               'rand-weights (fn [_ seed] (swap! seeds conj [:weight seed]) {:w (float-array [seed])})
                'init-adapters (fn [_ seed scale]
                                 (swap! seeds conj [:adapter seed scale]) gradients)}
         relative-error (atom 0.0)
@@ -148,7 +148,8 @@
         expected (into [0.0 (float-array [1])] (repeat 54 (float-array [1])))
         predicted (atom 0.0)
         loaded {:train model :oracle oracle}
-        replacements {#'acceptance/prepare-chain (fn [& _] :prepared)
+        preparations (atom [])
+        replacements {#'acceptance/prepare-chain (fn [& args] (swap! preparations conj args) :prepared)
                       #'compiled/instantiate! (fn [_] live)
                       #'compiled/plan (fn [_] {:instances []})
                       #'compiled/execution-info (fn [artifact]
@@ -165,6 +166,24 @@
           (is (= 2 @calls))
           (is (= [[:weight 11] [:weight 12] [:adapter 21 0.02] [:adapter 22 0.02]
                   [:vector 1 31 0.5] [:vector 1 32 0.5]] @seeds)))
+        (reset! seeds [])
+        (let [cfg {:bs 1 :seq 1 :d 1}
+              input (float-array [7]) target (float-array [9])
+              weights [{:w (float-array [3])} {:w (float-array [4])}]
+              adapters [gradients gradients]
+              before @calls
+              result (acceptance/run-loaded! loaded :ocl:0
+                        {:cfg cfg :weights weights :adapters adapters
+                         :input input :target target :replay-count 1})
+              supplied (last @preparations)]
+          (is (= 1 (count (:replays result))))
+          (is (= (inc before) @calls))
+          (is (empty? @seeds))
+          (is (identical? cfg (nth supplied 2)))
+          (is (identical? weights (nth supplied 3)))
+          (is (identical? adapters (nth supplied 4)))
+          (is (identical? input (nth supplied 5)))
+          (is (identical? target (nth supplied 6))))
         (reset! predicted 1.0)
         (let [data (try (acceptance/run-loaded! loaded :ocl:0) nil
                         (catch clojure.lang.ExceptionInfo e (ex-data e)))]
@@ -183,8 +202,8 @@
           (is (= 0.02 (first (:adapter-errors data))))
           (is (= 0.02 (get-in data [:adapter-diagnostics 0 :oracle-relative-error])))
           (is (= 28 (count (:adapter-errors data)))))))
-    (is (= [live live live] @inspected))
-    (is (= [live live live] @closed))
+    (is (= [live live live live] @inspected))
+    (is (= [live live live live] @closed))
     (reset! closed [])
     (let [before @calls]
       (with-redefs-fn
@@ -195,3 +214,31 @@
                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
       (is (= before @calls))
       (is (= [live] @closed)))))
+
+(deftest malformed-explicit-cases-decline-before-preparation-or-native-contact
+  (let [loaded {:train {'weight-keys (atom [:w]) 'adapter-keys (atom [:a])}}
+        valid {:cfg {:bs 1 :seq 1 :d 1}
+               :weights [{:w (float-array 1)} {:w (float-array 1)}]
+               :adapters [{:a (float-array 1)} {:a (float-array 1)}]
+               :input (float-array 1) :target (float-array 1) :replay-count 1}
+        touched (atom [])]
+    (with-redefs-fn
+      {#'acceptance/prepare-chain (fn [& _] (swap! touched conj :prepare))
+       #'compiled/instantiate! (fn [& _] (swap! touched conj :instantiate))}
+      #(doseq [bad [nil {} (assoc valid :replay-count 0) (assoc valid :replay-count 1.5)
+                    (assoc-in valid [:cfg :bs] 2) (assoc-in valid [:cfg :d] -1)
+                    (assoc-in valid [:cfg :seq] (inc (long Integer/MAX_VALUE)))
+                    (assoc valid :weights [{}]) (assoc valid :adapters [{} {} {}])
+                    (assoc valid :weights [{} 2]) (assoc valid :input [0.0])
+                    (assoc valid :weights [{} {:w (float-array 1)}])
+                    (assoc valid :adapters [{} {:a (float-array 1)}])
+                    (assoc valid :tolerance 1.0) (assoc valid :provider :other)
+                    (assoc valid :source-revision "other")
+                    (assoc valid :input (double-array 1)) (assoc valid :target (float-array 2))
+                    (assoc-in valid [:adapters 1 :a] (double-array 1))
+                    (assoc-in valid [:weights 1 :w] (double-array 1))
+                    (assoc-in valid [:weights 1 :extra] (float-array 1))]]
+         (is (= :external-training-case
+                (try (acceptance/run-loaded! loaded :ocl:0 bad) nil
+                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+    (is (empty? @touched))))
