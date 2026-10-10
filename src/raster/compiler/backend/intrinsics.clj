@@ -22,7 +22,9 @@
      :wasm    {vt → encoder-opcode-keyword}  (vt ∈ #{:f64 :f32 :i32}); absent = unsupported
      :c       C/OpenCL form — infix string, or {:fn name} (GLSL fn override via :glsl)
      :wgsl    WGSL form — infix string or {:fn name}"
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [raster.compiler.core.op-descriptor :as operation]
+            [raster.compiler.support.mangled :as mangled]))
 
 ;; ---------------------------------------------------------------------------
 ;; The table — canonical op key → lowering facets
@@ -275,6 +277,53 @@
   {"_plus_" :+ "_minus_" :- "_star_" :* "_div_" :div
    "_lt_" :lt "_gt_" :gt "_lteq_" :le "_gteq_" :ge "_eq_" :eq})
 
+(def ^:private wrapping-arithmetic-names
+  #{"unchecked-add" "unchecked-add-int" "unchecked-subtract" "unchecked-subtract-int"
+    "unchecked-multiply" "unchecked-multiply-int"})
+
+;; Source identities are semantic assertions, not proofs about arbitrary helper bodies.
+;; Declare them once in the existing operation registry; consumers never guess by namespace.
+(doseq [[ns-name names]
+        {"clojure.core" '[+ - * / < > <= >= == = not= rem mod quot
+                          unchecked-add unchecked-add-int unchecked-subtract unchecked-subtract-int
+                          unchecked-multiply unchecked-multiply-int unchecked-remainder-int
+                          bit-and bit-or bit-xor bit-shift-left bit-shift-right unsigned-bit-shift-right
+                          abs min max]
+         "raster.numeric" '[+ - * / < > <= >= == rem mod quot abs min max sqrt pow clamp
+                            bit-and bit-or bit-xor bit-shift-left bit-shift-right unsigned-bit-shift-right]
+         "raster.math" '[sqrt floor ceil round trunc sin cos tan exp log pow fma
+                         asin acos atan atan2 sinh cosh tanh asinh acosh atanh cbrt log2 log10
+                         exp2 exp10 expm1 log1p hypot deg2rad rad2deg clamp signum copysign flipsign]
+         "Math" '[sqrt abs floor ceil round min max sin cos tan exp log pow fma asin acos atan
+                  atan2 sinh cosh tanh cbrt log10 expm1 log1p hypot clamp signum copySign]
+         "java.lang.Math" '[sqrt abs floor ceil round min max sin cos tan exp log pow fma asin acos atan
+                            atan2 sinh cosh tanh cbrt log10 expm1 log1p hypot clamp signum copySign]
+         "raster.par" '[dp4a]
+         "par" '[dp4a]}
+        source-name names
+        :let [spelling (name source-name) key (name->key spelling)]
+        :when key]
+  (operation/register-op-descriptor!
+   (symbol ns-name spelling)
+   {:intrinsic (cond-> {:key key}
+                 (and (= ns-name "clojure.core") (wrapping-arithmetic-names spelling))
+                 (assoc :source-overflow :wrap))}))
+
+(defn- source-contract [op]
+  (when (symbol? op)
+    (if (namespace op)
+      (let [exact (operation/get-op-descriptor op)]
+        (if (contains? exact :intrinsic)
+          (:intrinsic exact)
+          (when-let [base (mangled/impl->op op)]
+            (:intrinsic (operation/get-op-descriptor base)))))
+      (let [base (if (str/index-of (name op) "_m_")
+                   (mangled/unqualified-base-name op) (name op))
+            key (or (name->key base) (mangled-prefix->key base))]
+        (when key
+          (cond-> {:key key}
+            (wrapping-arithmetic-names base) (assoc :source-overflow :wrap)))))))
+
 (defn canonical
   "Normalize an op form to its canonical key, or nil if not a known intrinsic.
    Accepts a symbol (qualified/bare/Math), a string name, or a keyword."
@@ -282,9 +331,8 @@
   (cond
     (keyword? op) (when (contains? table op) op)
     (string? op)  (name->key op)
-    (symbol? op)  (or (name->key (name op))
-                      (when-let [i (clojure.string/index-of (name op) "_m_")]
-                        (mangled-prefix->key (subs (name op) 0 i))))
+    (symbol? op)  (let [key (:key (source-contract op))]
+                    (when (contains? table key) key))
     :else nil))
 
 (defn descriptor [op] (get table (canonical op)))
@@ -293,19 +341,13 @@
 ;; identity: JVM-width integral arithmetic wraps modulo 2^N.  Keep the distinction here, beside
 ;; canonicalization, so scalar frontends retain it in typed IR and target emitters never recover
 ;; it from a function name.
-(def ^:private wrapping-arithmetic-names
-  #{"unchecked-add" "unchecked-add-int"
-    "unchecked-subtract" "unchecked-subtract-int"
-    "unchecked-multiply" "unchecked-multiply-int"})
-
 (defn source-overflow-policy
   "Return the explicit overflow contract carried by source operation `op`, if any.
 
   This describes source semantics only. Callers still provide and verify the authoritative
   operand/result dtype before attaching the policy to typed IR."
   [op]
-  (when (and (symbol? op) (contains? wrapping-arithmetic-names (name op)))
-    :wrap))
+  (:source-overflow (source-contract op)))
 
 ;; Semantic scalar domains are centralized beside canonical operator identity.  Backend facets say
 ;; how an operation is spelled; they do not by themselves prove that (for example) sqrt accepts an
@@ -412,12 +454,10 @@
 (defn c-lowering
   "C lowering from a MANGLED devirtualized impl name — the fallback when no
   :raster.op/original metadata is present. Prefer op->c-lowering."
-  [mangled-name glsl?]
-  (when-let [i (str/index-of mangled-name "_m_")]
-    ;; prefix before `_m_` is an operator prefix (_star_, via mangled-prefix->key) or a
-    ;; function name (sqrt, via name->key in descriptor).
-    (let [prefix (subs mangled-name 0 i)]
-      (desc->c-shape (descriptor (or (mangled-prefix->key prefix) prefix)) glsl?))))
+  [implementation glsl?]
+  (let [identity (if (string? implementation) (symbol implementation) implementation)]
+    (when (and (symbol? identity) (str/index-of (name identity) "_m_"))
+      (desc->c-shape (descriptor identity) glsl?))))
 
 ;; ---------------------------------------------------------------------------
 ;; Vector (SIMD) facet — the lane-parallel analog of the :c facet, for the

@@ -55,7 +55,7 @@
                     {:id :matrix-widened-test :row 'a :col 'b :out 'c
                      :dimensions [128 128 64] :dimension-parameters ['m 'n 'k]
                      :tile tile :result-dtype :float
-                     :epilogue {:acc 'acc :expr (with-meta '(raster.numeric/tanh acc)
+                     :epilogue {:acc 'acc :expr (with-meta '(raster.math/tanh acc)
                                                  {:raster.type/tag 'float})}})
           widened (kernel-body/validate!
                    (walk/postwalk

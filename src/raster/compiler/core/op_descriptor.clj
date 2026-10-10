@@ -19,7 +19,19 @@
 (defn register-op-descriptor!
   "Merge descriptor facets for op-sym into the unified registry."
   [op-sym descriptor]
-  (swap! descriptor-registry update op-sym #(merge % descriptor))
+  (let [[before after] (swap-vals! descriptor-registry update op-sym #(merge % descriptor))]
+    (when (not= (select-keys (get before op-sym) [:intrinsic])
+                (select-keys (get after op-sym) [:intrinsic]))
+      ;; Initial declarations may load before dispatch itself. No compiled artifacts exist then.
+      ;; Runtime semantic changes use the existing compiler epoch, not an intrinsic cache epoch.
+      (when-let [dispatch-ns (find-ns 'raster.compiler.core.dispatch)]
+        (when-let [advance (ns-resolve dispatch-ns 'bump-compiler-definition-revision!)]
+          (when (bound? advance)
+            ;; A primitive contract changes semantics even when published while a derived
+            ;; specialization is being installed. Only method materialization is exempt.
+            (if-let [derived (ns-resolve dispatch-ns '*installing-derived-specialization*)]
+              (with-bindings {derived false} (advance))
+              (advance)))))))
   nil)
 
 (defn get-op-descriptor

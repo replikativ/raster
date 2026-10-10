@@ -32,7 +32,7 @@
                      {:overrides {[:tanh :double] :f64-target-library-rte-f32}}
                      {:overrides {[:+ :float] :f64-target-library-rte-f32}}
                      {:overrides {[:unknown :float] :f64-target-library-rte-f32}}
-                     {:overrides {['raster.numeric/tanh :float] :f64-target-library-rte-f32}}
+                     {:overrides {['raster.math/tanh :float] :f64-target-library-rte-f32}}
                      {:overrides {[:tanh :float] :correctly-rounded}}]]
       (is (= :scalar-math-policy
              (try (numerics/validate-scalar-math-policy! invalid)
@@ -58,7 +58,7 @@
            (get-in (expression selected :tanh :double) [:options :math-realization])))
     (is (= #{:float :double}
            (body/required-scalar-dtypes [(expression selected :tanh :float)])))
-    (let [tanh (with-meta '(raster.numeric/tanh x) {:raster.type/tag 'float})
+    (let [tanh (with-meta '(raster.math/tanh x) {:raster.type/tag 'float})
           isolated ((:lower selected) tanh :float {})
           fused ((:lower-region selected)
                  {:bindings ['t tanh]
@@ -221,7 +221,7 @@
    {'old-value :float 'old-index :int}))
 
 (deftest reduction-element-retains-selected-math
-  (let [expression (with-meta '(raster.numeric/tanh (aget x i)) {:raster.type/tag 'float})
+  (let [expression (with-meta '(raster.math/tanh (aget x i)) {:raster.type/tag 'float})
         options {:dtype :float :index 'i :coordinate 'i :arrays #{'x}
                  :array-types {'x :float} :scalars #{} :scalar-types {}}
         ordinary (segred/lower-element-operations expression options)
@@ -523,7 +523,7 @@
 
 (deftest result-region-retains-selected-math-without-changing-logical-types
   (let [region (body/->ScalarRegion
-                ['acc] (with-meta '(raster.numeric/tanh acc) {:raster.type/tag 'float})
+                ['acc] (with-meta '(raster.math/tanh acc) {:raster.type/tag 'float})
                 [] :float)
         options {:accumulator 'carry :accumulator-dtype :float :store-dtype :float
                  :parameters {} :indices []}

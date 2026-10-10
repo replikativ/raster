@@ -34,3 +34,17 @@
       (if ns-str
         (symbol ns-str base-name)
         (symbol base-name)))))
+
+(defn impl->op
+  "Recover a qualified source operation from a deftm implementation identity."
+  [sym]
+  (when (and (symbol? sym) (namespace sym)
+             (pos? (.indexOf ^String (name sym) "_m_")))
+    (let [base (unqualified-base-name sym)
+          decoded (reduce (fn [s [encoded original]]
+                            (.replace ^String s ^CharSequence encoded ^CharSequence original))
+                          base [["_plus_" "+"] ["_minus_" "-"] ["_star_" "*"]
+                                ["_div_" "/"] ["_lt_" "<"] ["_gt_" ">"]
+                                ["_lteq_" "<="] ["_gteq_" ">="] ["_eq_" "="]
+                                ["_bang" "!"] ["_qmark" "?"]])]
+      (symbol (namespace sym) decoded))))
