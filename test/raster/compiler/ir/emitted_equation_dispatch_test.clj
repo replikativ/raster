@@ -194,10 +194,14 @@
     (is (empty? @observed) "default intent cannot inherit the selected policy")
     (let [prepared (foreign #(runtime-program/prepare-with-retained-program!
                              call executor proof request))]
+      (add-watch (:closed? prepared) ::proof-scope
+                 (fn [& _] (observe! :closed-watch)))
       (try
         (foreign #(runtime-program/run-prepared! prepared))
-        (finally (foreign #(runtime-program/release-prepared! prepared)))))
-    (is (= #{:bind :run :release} (set (map first @observed))))
+        (finally
+          (try (foreign #(runtime-program/release-prepared! prepared))
+               (finally (remove-watch (:closed? prepared) ::proof-scope))))))
+    (is (= #{:bind :run :release :closed-watch} (set (map first @observed))))
     (is (every? #(= [nil nil nil nil nil] (second %)) @observed)
         "callbacks and inherited futures cannot observe any compiler proof scope")))
 

@@ -555,7 +555,8 @@
                 (prepared-kernel-graph? prepared))
     (throw (ex-info "release-prepared! requires a prepared parallel program"
                     {:actual (type prepared)})))
-  (locking (:closed? prepared)
+  (link-plan/without-validation-context
+   #(locking (:closed? prepared)
     (when (prepared-parallel-program? prepared) (prepared-request! prepared))
     (when-not (::cleanup/owner prepared)
       (throw (ex-info "Prepared program has lost its cleanup owner"
@@ -567,7 +568,7 @@
       (throw (ex-info "Cannot release a prepared program from its active use callback"
                       {:reason :parallel-program-in-use})))
     (when-not @(:closed? prepared) (reset! (:closed? prepared) true))
-    (link-plan/without-validation-context #(cleanup/release! (::cleanup/owner prepared))))
+    (cleanup/release! (::cleanup/owner prepared))))
   nil)
 
 (defn- run-with-request!
