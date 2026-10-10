@@ -19,6 +19,7 @@
   Size guard: skip SIMD for statically-known n < 8 (overhead > benefit).
   For dynamic sizes, emit both paths with runtime branch on n."
   (:require [raster.compiler.core.macroexpand :as macroexpand]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.backend.jvm.bytecode :as bc]
@@ -442,7 +443,9 @@
                                 (first (:operations scheduled)))
                               ;; A structured unsupported-form refusal may fall back to scalar code.
                               ;; Raw implementation exceptions must escape, as on the GPU boundary.
-                              (catch clojure.lang.ExceptionInfo _ nil))))
+                              (catch clojure.lang.ExceptionInfo e
+                                (util/rethrow-compiler-invariant! e)
+                                nil))))
           par->segred (fn [form]
                         (or (take-bound segop/seg-red?)
                             (try
@@ -454,7 +457,9 @@
                                      sym form {:target-device :cpu:0 :dtype dtype})]
                                 (swap! stats update :segop-relowered (fnil inc 0))
                                 (first (:operations scheduled)))
-                              (catch clojure.lang.ExceptionInfo _ nil))))
+                              (catch clojure.lang.ExceptionInfo e
+                                (util/rethrow-compiler-invariant! e)
+                                nil))))
           transform
           (fn transform [form]
             (cond

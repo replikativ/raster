@@ -13,7 +13,40 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower-pass]
             [raster.compiler.passes.parallel.materialize :as materialize]))
+
+(deftest compatibility-scheduling-distinguishes-refusals-from-invariant-failures
+  (doseq [source '[(raster.par/map! out i 100 double (+ (aget a i) 1.0))
+                  (raster.par/reduce acc 0.0 i 100 (+ acc (aget a i)))]]
+    (testing "ordinary coverage refusals still permit the scalar compatibility path"
+      (let [attempts (atom 0)
+            {:keys [stats]}
+            (with-redefs [segop-lower-pass/schedule-single-operation
+                          (fn [& _]
+                            (swap! attempts inc)
+                            (throw (ex-info "intentional unsupported form"
+                                            {:reason :no-lowering-rule})))]
+              (par-simd/simd-pass source :min-elements 0))]
+        (is (= 1 @attempts))
+        (is (= 1 (:fallback stats)))))
+    (doseq [reason [:raster/fatal :raster/bug]]
+      (let [failure (ex-info "injected compiler invariant" {:reason reason :probe :exact})
+            observed
+            (with-redefs [segop-lower-pass/schedule-single-operation
+                          (fn [& _] (throw failure))]
+              (try (par-simd/simd-pass source :min-elements 0)
+                   nil
+                   (catch clojure.lang.ExceptionInfo e e)))]
+        (is (identical? failure observed) "Do not replace a violated invariant with scalar code")))
+    (let [failure (NullPointerException. "raw implementation bug")
+          observed
+          (with-redefs [segop-lower-pass/schedule-single-operation
+                        (fn [& _] (throw failure))]
+            (try (par-simd/simd-pass source :min-elements 0)
+                 nil
+                 (catch NullPointerException e e)))]
+      (is (identical? failure observed)))))
 
 ;; ================================================================
 ;; Body analysis tests (segop-simd)

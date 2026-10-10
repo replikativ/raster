@@ -168,11 +168,6 @@
                                           dtype dt)]))
                                  (map vector params tags)))})))
 
-(def ^:private fatal-reasons
-  "A violated invariant is not \"the SegOp path does not cover this form\". Letting one fall through
-   to the legacy generator would run the pipeline on with the bug intact."
-  #{:raster/fatal :raster/bug})
-
 (defn- segop-attempt
   "Run a SegOp lowering `thunk`, returning the SegOp or nil and recording a structured decline.
    The caller decides whether that decline is an allowed scheduling fallback or an illegal
@@ -184,7 +179,7 @@
     (cond
       (:err r)
       (let [e (:err r)]
-        (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
+        (util/rethrow-compiler-invariant! e)
         (swap! stats update :segop-declined (fnil conj [])
                {:kind kind :op (when (seq? form) (first form))
                 :dtype (or dtype :double)

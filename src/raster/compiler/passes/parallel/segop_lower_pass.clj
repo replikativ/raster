@@ -27,12 +27,6 @@
 
 (def ^:private id-counter (atom 0))
 
-(def ^:private fatal-reasons
-  "A violated invariant is not a missing lowering rule. Recording one as a conversion decline would
-   let the pipeline continue on the legacy path with the bug intact — the loud-to-silent trade this
-   whole change exists to prevent."
-  #{:raster/fatal :raster/bug})
-
 (defn- diagnostic
   "The structured record north-star §3.5 asks for in place of a warning: WHICH operation, in which
    binding, for which target dialect and device, what rule was missing, and what happens instead."
@@ -70,7 +64,7 @@
   [sym form device-id target-descriptor dtype array-types scalar-types]
   (when (seq? form)
     (let [par? (par/par-form? form)
-          decline (fn [stage e] (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
+          decline (fn [stage e] (util/rethrow-compiler-invariant! e)
                     (when par? {:declined (diagnostic sym form stage e device-id dtype)}))
           ;; capture value-or-exception in one call: the alternative (catch a sentinel, then call
           ;; again to get the exception) re-runs a side-effecting conversion
