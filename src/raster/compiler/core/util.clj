@@ -6,6 +6,14 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]))
 
+(defn rethrow-compiler-invariant!
+  "A known compiler invariant failure is not a missing lowering rule.
+   All lowering boundaries use the same structured fatal reasons; callers may
+   record ordinary ExceptionInfo coverage refusals, but must not hide these."
+  [exception]
+  (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
+    (throw exception)))
+
 ;; ================================================================
 ;; Free variable analysis
 ;; ================================================================
