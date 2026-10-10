@@ -157,7 +157,7 @@
         executable (raster.gpu.test-lifecycle/linked-executable
                     {:plan {:id :failed-input :target :ze:0
                             :nodes {:a (link-plan/node {:id :a :view view :role :input})}}
-                     :session ::session
+                     :session ::session :profile? true
                      :node-views {:a (gpu/->ResidentBufferView ::session :a view)}
                      :closed? (atom false) :lifetime-lock (Object.) :output-leases (atom 0)
                      :pending-inputs (atom #{}) :tainted-inputs (atom #{})
