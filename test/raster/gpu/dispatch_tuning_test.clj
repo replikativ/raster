@@ -1,5 +1,6 @@
 (ns raster.gpu.dispatch-tuning-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.edn :as edn]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -38,6 +39,28 @@
     (is (= 1 (count (set (map :abi-hash signatures)))))
     (is (= (tuning/executable-signature reference)
            (tuning/executable-signature (assoc-in reference [:attributes :compilation] {}))))))
+
+(deftest tuning-uses-canonical-semantic-identity
+  (doseq [[left right]
+          [[(float 1.0) (double 1.0)]
+           [0.0 -0.0]
+           [(Double/longBitsToDouble 9221120237041090561)
+            (Double/longBitsToDouble 9221120237041090562)]
+           [(with-meta 'x {:tag 'float}) (with-meta 'x {:tag 'double})]
+           ['(x y) '[x y]]]]
+    (is (not= (tuning/cache-key {:value left}) (tuning/cache-key {:value right}))))
+  (is (= (tuning/cache-key {:a #{1 2} :b [3 4]})
+         (tuning/cache-key (array-map :b [3 4] :a #{2 1}))))
+  (is (= (tuning/cache-key {:value (with-meta 'x {:tag 'float :line 1 :file "a.clj"})})
+         (tuning/cache-key {:value (with-meta 'x {:tag 'float :line 20 :file "b.clj"})}))))
+
+(deftest executable-argument-metadata-is-not-a-printer-identity
+  (let [typed (fn [tag] (assoc reference :arguments
+                             [(with-meta 'x {:tag tag}) 'out 'width]))
+        float-signature (tuning/executable-signature (typed 'float))
+        double-signature (tuning/executable-signature (typed 'double))]
+    (is (not= (:arguments-hash float-signature) (:arguments-hash double-signature)))
+    (is (= (:source-hash float-signature) (:source-hash double-signature)))))
 
 (def ^:private dispatch
   (kdispatch/make
@@ -164,8 +187,17 @@
           data (tuning/tuning-data result)
           restored (tuning/restore-tuning fixed-dispatch data descriptor numerical-mode layout)]
       (is (= result restored))
+      (is (= result (tuning/restore-tuning fixed-dispatch (edn/read-string (pr-str data))
+                                          descriptor numerical-mode layout)))
       (is (map? data))
       (is (not (record? data)))
+      (testing "old printer-identity schema cannot restore or hit the cache"
+        (let [stale (assoc data :version 5)]
+          (is (= :transported-dispatch-tuning-identity
+                 (try (tuning/restore-tuning fixed-dispatch stale descriptor numerical-mode layout)
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+          (cache/write-entry! (:key result) stale)
+          (is (nil? (tuning/cache-get fixed-dispatch (:identity result))))))
       (testing "a selector without its evidence envelope is not restorable"
         (is (= :invalid-transported-dispatch-tuning-policy
                (try
@@ -204,6 +236,56 @@
                   data descriptor numerical-mode layout)
                  (catch clojure.lang.ExceptionInfo exception
                    (:reason (ex-data exception))))))))))
+
+(deftest metadata-losing-transport-cannot-restore-tuning-authority
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [semantic-layout (with-meta layout {:layout-contract :packed})
+          result (tuning/tune-fixed!
+                  fixed-dispatch descriptor #(validated-result % 10.0)
+                  :numerical-mode numerical-mode :layout semantic-layout)
+          data (tuning/tuning-data result)
+          transported (edn/read-string (pr-str data))]
+      (is (= result (tuning/restore-tuning fixed-dispatch data descriptor numerical-mode semantic-layout)))
+      (is (nil? (tuning/cache-get fixed-dispatch (:identity result)))
+          "EDN loses semantic metadata; that must cause a miss, not weaken identity")
+      (is (= :transported-dispatch-tuning-identity
+             (try (tuning/restore-tuning fixed-dispatch transported descriptor numerical-mode semantic-layout)
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest measured-selector-rejects-semantic-argument-drift
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [typed (fn [tag]
+                  (update fixed-dispatch :alternatives
+                          #(mapv (fn [a] (assoc a :arguments
+                                               [(with-meta 'x {:tag tag}) 'out 'width])) %)))
+          original (typed 'float)
+          changed (typed 'double)
+          result (tuning/tune-fixed! original descriptor
+                                     #(validated-result % 10.0)
+                                     :numerical-mode numerical-mode :layout layout)
+          changed-identity (assoc (:identity result) :alternatives
+                                  (mapv tuning/executable-signature (:alternatives changed)))]
+      (is (nil? (tuning/cache-get changed changed-identity)))
+      (is (= :transported-dispatch-tuning-identity
+             (try (tuning/restore-tuning changed (tuning/tuning-data result)
+                                        descriptor numerical-mode layout)
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (tuning/apply-tuning changed result descriptor numerical-mode layout))))))
+
+(deftest numeric-carrier-loss-cannot-restore-tuning-authority
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (doseq [value [(float 1.0) (Double/longBitsToDouble 9221120237041090561)]]
+      (let [numeric-layout (assoc layout :semantic-value value)
+            result (tuning/tune-fixed! fixed-dispatch descriptor
+                                       #(validated-result % 10.0)
+                                       :numerical-mode numerical-mode :layout numeric-layout)
+            transported (edn/read-string (pr-str (tuning/tuning-data result)))]
+        (is (nil? (tuning/cache-get fixed-dispatch (:identity result))))
+        (is (= :transported-dispatch-tuning-identity
+               (try (tuning/restore-tuning fixed-dispatch transported descriptor
+                                          numerical-mode numeric-layout)
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))))
 
 (deftest validated-device-measurements-produce-and-cache-piecewise-selection
   (binding [cache/*cache-root* (temporary-cache-root)]

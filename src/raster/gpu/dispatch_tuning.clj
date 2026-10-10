@@ -10,12 +10,11 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.gpu.measurement :as measurement]
-            [raster.gpu.tuning-cache :as cache])
-  (:import [java.nio.charset StandardCharsets]
-           [java.security MessageDigest]))
+            [raster.gpu.tuning-cache :as cache]))
 
-(def tuning-version 5)
+(def tuning-version 6)
 
 (defrecord DispatchTuning
            [key identity selector measurements])
@@ -24,23 +23,6 @@
   "Recognize tuning values across Typed Clojure child classloaders."
   [x]
   (and x (= "raster.gpu.dispatch_tuning.DispatchTuning" (.getName (class x)))))
-
-(defn- sha256
-  [value]
-  (let [digest (.digest (MessageDigest/getInstance "SHA-256")
-                        (.getBytes (str value) StandardCharsets/UTF_8))]
-    (apply str (map #(format "%02x" (bit-and 0xff (int %))) digest))))
-
-(defn- canonical-data
-  [value]
-  (cond
-    (map? value) (into (sorted-map-by #(compare (pr-str %1) (pr-str %2)))
-                       (map (fn [[key item]] [(canonical-data key) (canonical-data item)]))
-                       value)
-    (set? value) (mapv canonical-data (sort-by pr-str value))
-    (vector? value) (mapv canonical-data value)
-    (sequential? value) (mapv canonical-data value)
-    :else value))
 
 (defn executable-signature
   "Stable correctness/performance identity of one emitted executable alternative.
@@ -72,10 +54,10 @@
      :strategy (kdispatch/alternative-strategy executable)
      :target (kexec/target executable)
      :entry-points (kexec/entry-points executable)
-     :source-hash (sha256 (pr-str (canonical-data schedule)))
-     :abi-hash (sha256 (pr-str (canonical-data (kexec/abi executable))))
-     :arguments-hash (sha256 (pr-str (kexec/arguments executable)))
-     :effects-hash (sha256 (pr-str (canonical-data (kexec/effects executable))))}))
+     :source-hash (fingerprint/fingerprint schedule)
+     :abi-hash (fingerprint/fingerprint (kexec/abi executable))
+     :arguments-hash (fingerprint/fingerprint (kexec/arguments executable))
+     :effects-hash (fingerprint/fingerprint (kexec/effects executable))}))
 
 (defn tuning-identity
   "Build the complete identity that guards a dispatch tuning result.
@@ -91,8 +73,7 @@
       (throw (ex-info "dispatch tuning identity requires :numerical-mode" {})))
     (when (nil? layout)
       (throw (ex-info "dispatch tuning identity requires :layout" {})))
-    (canonical-data
-     {:version tuning-version
+    {:version tuning-version
       :dispatch-id (:id dispatch)
       :selector-argument (get-in dispatch [:selector :argument])
       :device (hardware/evidence-signature descriptor)
@@ -100,11 +81,11 @@
       :layout layout
       :policy {:runtime-values (vec runtime-values)
                :improvement-threshold (double improvement-threshold)}
-      :alternatives (mapv executable-signature (:alternatives dispatch))})))
+      :alternatives (mapv executable-signature (:alternatives dispatch))}))
 
 (defn cache-key
   [identity]
-  (sha256 (pr-str (canonical-data identity))))
+  (fingerprint/fingerprint identity))
 
 (declare validate-tuning-evidence!)
 
@@ -112,7 +93,7 @@
   [dispatch identity key data]
   (when (and (= tuning-version (:version data))
              (= key (:key data))
-             (= identity (:identity data))
+             (fingerprint/equivalent? identity (:identity data))
              (map? (:selector data))
              (vector? (:measurements data)))
     (kdispatch/with-selector dispatch (:selector data))
@@ -465,7 +446,7 @@
   (let [{:keys [runtime-values improvement-threshold]} (:policy (:identity tuning))
         identity (tuning-identity dispatch descriptor runtime-values numerical-mode layout
                                   improvement-threshold)]
-    (when-not (= identity (:identity tuning))
+    (when-not (fingerprint/equivalent? identity (:identity tuning))
       (throw (ex-info "dispatch tuning identity differs from the target dispatch"
                       {:expected identity :actual (:identity tuning)})))
     (kdispatch/with-selector dispatch (:selector tuning))))
