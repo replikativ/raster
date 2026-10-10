@@ -65,6 +65,53 @@
               :dependencies [:independent-gradient-1 :send-gradient]})]
     :outputs [:apply-gradient]}))
 
+(deftest public-witness-boundaries-validate-once-and-reject-drift
+  (let [plan (training-plan)
+        certified (distributed/certify plan)
+        original distributed/validate!
+        calls (atom 0)
+        checked (fn [operation]
+                  (reset! calls 0)
+                  (with-redefs [distributed/validate!
+                                (fn [candidate]
+                                  (swap! calls inc)
+                                  (original candidate))]
+                    (operation)))]
+    (doseq [operation [#(distributed/simulate plan)
+                       #(distributed/certify plan)
+                       #(distributed/verify! certified)]]
+      (checked operation)
+      (is (= 1 @calls) "one fresh structural validation at each public boundary"))
+    (is (= (:cost-vector (distributed/simulate plan))
+           (get-in certified [:certificate :cost-vector])))
+    (let [invalid (assoc-in plan [:steps 0 :dependencies] [:unknown-step])]
+      (doseq [operation [#(distributed/simulate invalid)
+                         #(distributed/certify invalid)
+                         #(distributed/verify! (assoc certified :plan invalid))]]
+        (is (thrown? clojure.lang.ExceptionInfo (checked operation)))
+        (is (= 1 @calls))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"certificate does not match"
+                         (checked #(distributed/verify!
+                                    (assoc-in certified [:certificate :plan-id] :forged)))))
+    (is (= 1 @calls))
+    (testing "simulation option rejection still precedes plan validation"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported distributed simulation options"
+                           (checked #(distributed/simulate nil {:unknown true}))))
+      (is (zero? @calls))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"empirical route policy must be a map"
+                           (checked #(distributed/simulate nil {:route-policy true}))))
+      (is (zero? @calls)))
+    (testing "advanced route options still follow fresh plan validation"
+      (let [options {:route-policy {}}]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                             #"explicit context, profiles and valid policy"
+                             (checked #(distributed/simulate plan options))))
+        (is (= 1 @calls))
+        (is (= :distributed-plan-type
+               (try (checked #(distributed/simulate nil options)) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+        (is (= 1 @calls))))))
+
 (deftest compute-lanes-follow-one-step-physical-placement
   (let [base (-> (training-plan)
                  (update :steps #(filterv (fn [s] (= :compute (:kind s))) %))

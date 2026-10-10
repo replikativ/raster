@@ -1626,41 +1626,11 @@
                :sample-owner-sessions (vec sample-owners)
                :timing-scope :binding-execution-and-release})))))))
 
-(defn simulate
-  "Simulate an explicit DistributedPlan schedule.
-
-   Compute steps serialize on their physical target compute lane, using the existing explicit
-   worker placement (otherwise worker identity). Transfers serialize on every directed
-   link in their route and on explicitly shared serialization domains. Absent endpoint claims,
-   communication and compute resource classes are independent, so communication and compute
-   overlap whenever dependencies permit. The result is deterministic and suitable as an analytic
-   seed/pruner; measured costs should replace durations before production selection.
-   Logical per-worker compute and peak-memory accounting is retained; physical-compute-ns
-   additionally aggregates compute service time by placed target. This does not aggregate
-   physical memory capacities or infer sharing between logical topology links.
-   Optional :device-capacities invokes the shared resident-storage-plan projection for fully
-   bound compute, exposing declared physical root budgets without changing logical peak estimates.
-   Optional :include-graph-temporaries? includes the current serial runtime's conservative prepared
-   graph scratch peak. This is not the memory model for a future prebound asynchronous runner.
-
-   Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
-   empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
-   :now-ms and :cold-warm; defaults are max-age-ms 60000, min-samples 3, cv-threshold 0.05.
-   :cold-warm is caller-declared summary metadata, not independently observed sample warmness.
-   Reports are supplied evidence, not authenticated measurements. Results retain per-route
-   admission/fallback reasons. Synchronous samples do not prove overlap or calibrate contention;
-   this diagnostic projection does not alter the plan or its analytical certificate."
-  ([plan] (simulate plan {}))
-  ([plan options]
-  (when-not (and (map? options)
-                 (set/subset? (set (keys options)) #{:route-context :profiles :route-policy :device-capacities
-                                                   :include-graph-temporaries?}))
-    (fail! "unsupported distributed simulation options" :distributed-cost-options {:options options}))
-  (when (and (some #(contains? options %) [:route-context :profiles :route-policy])
-             (not (map? (:route-policy options))))
-    (fail! "empirical route policy must be a map" :distributed-cost-options {:options options}))
-  (let [plan (validate! plan)
-        policy (merge {:max-age-ms 60000 :min-samples 3 :cv-threshold 0.05} (:route-policy options))
+(defn- simulate-validated
+  "Derive simulation facts after this call's public boundary validated the plan.
+   Never an externally supplied proof or a cache of runtime binding authority."
+  [plan options]
+  (let [policy (merge {:max-age-ms 60000 :min-samples 3 :cv-threshold 0.05} (:route-policy options))
         route-options (select-keys options [:route-context :profiles :route-policy])
         _ (when (seq route-options)
             (when-not (and (= #{:route-context :profiles :route-policy} (set (keys route-options)))
@@ -1765,7 +1735,42 @@
                                              :owned-roots-plus-serial-graph-temporaries
                                              :owned-link-plan-roots-until-close)
                                     :allocation-count (count (:specs pool))
-                                    :allocation-budgets (:allocation-budgets pool)})))))
+                                    :allocation-budgets (:allocation-budgets pool)}))))
+
+(defn simulate
+  "Simulate an explicit DistributedPlan schedule.
+
+   Compute steps serialize on their physical target compute lane, using the existing explicit
+   worker placement (otherwise worker identity). Transfers serialize on every directed
+   link in their route and on explicitly shared serialization domains. Absent endpoint claims,
+   communication and compute resource classes are independent, so communication and compute
+   overlap whenever dependencies permit. The result is deterministic and suitable as an analytic
+   seed/pruner; measured costs should replace durations before production selection.
+   Logical per-worker compute and peak-memory accounting is retained; physical-compute-ns
+   additionally aggregates compute service time by placed target. This does not aggregate
+   physical memory capacities or infer sharing between logical topology links.
+   Optional :device-capacities invokes the shared resident-storage-plan projection for fully
+   bound compute, exposing declared physical root budgets without changing logical peak estimates.
+   Optional :include-graph-temporaries? includes the current serial runtime's conservative prepared
+   graph scratch peak. This is not the memory model for a future prebound asynchronous runner.
+
+   Optional {:route-context live-context :profiles [...] :route-policy {...}} admits explicit
+   empirical whole-step costs for exact matching routes/layouts/transport/bytes. Policy requires
+   :now-ms and :cold-warm; defaults are max-age-ms 60000, min-samples 3, cv-threshold 0.05.
+   :cold-warm is caller-declared summary metadata, not independently observed sample warmness.
+   Reports are supplied evidence, not authenticated measurements. Results retain per-route
+   admission/fallback reasons. Synchronous samples do not prove overlap or calibrate contention;
+   this diagnostic projection does not alter the plan or its analytical certificate."
+  ([plan] (simulate plan {}))
+  ([plan options]
+   (when-not (and (map? options)
+                  (set/subset? (set (keys options)) #{:route-context :profiles :route-policy :device-capacities
+                                                    :include-graph-temporaries?}))
+     (fail! "unsupported distributed simulation options" :distributed-cost-options {:options options}))
+   (when (and (some #(contains? options %) [:route-context :profiles :route-policy])
+              (not (map? (:route-policy options))))
+     (fail! "empirical route policy must be a map" :distributed-cost-options {:options options}))
+   (simulate-validated (validate! plan) options)))
 
 (defn- shard-coverage
   [plan]
@@ -1787,7 +1792,7 @@
 
 (defn- derive-certificate
   [plan]
-  (let [simulation (simulate plan)]
+  (let [simulation (simulate-validated plan {})]
     (->DistributedPlanCertificate
      (:id plan)
      (mapv (juxt :name :size) (get-in plan [:mesh :axes]))
