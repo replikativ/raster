@@ -19,7 +19,7 @@
                     init-adapters rand-weights scalars fwd-args bwd-args}}
    {:path "test/finetune/gemma_resident_train_test.clj"
     :namespace 'finetune.gemma-resident-train-test
-    :definitions '#{ref-loss2 layer-arrs adapter-pos fvec worst-rel recovered-grads chain-cfg}}])
+    :definitions '#{ref-loss2 layer-arrs adapter-pos fvec worst-rel recovered-grads chain-cfg embed-rows}}])
 
 (defn- checked-source [root {:keys [path]}]
   (let [{:keys [exit out err]} (shell/sh "git" "--no-replace-objects" "-C" (str root) "show"
@@ -98,6 +98,16 @@
                      :actual (count actual) :expected (count expected)})))
   ((oracle 'worst-rel) actual expected))
 
+(defn- difference-summary [actual expected]
+  (let [[maximum reference-maximum error-squared reference-squared]
+        (reduce (fn [[maximum reference-maximum error-squared reference-squared] [a b]]
+                  (let [a (double a) b (double b) error (- a b)]
+                    [(max maximum (Math/abs error)) (max reference-maximum (Math/abs b))
+                     (+ error-squared (* error error)) (+ reference-squared (* b b))]))
+                [0.0 0.0 0.0 0.0] (map vector actual expected))]
+    {:max-absolute maximum :reference-max reference-maximum
+     :error-l2 (Math/sqrt error-squared) :reference-l2 (Math/sqrt reference-squared)}))
+
 (defn- prepare-chain [train target-device cfg weights adapters input target]
   (let [n (* (:seq cfg) (:d cfg))
         options {:compiler :equation-first :target target-device :dtype :float :inline? true}
@@ -158,13 +168,27 @@
 
 (defn run-loaded!
   "Run two full resident updates against the unchanged CPU monolithic AD oracle.
+   An explicit case supplies model arrays/configuration and a positive replay count.
    Downloads are oracle reads only. Every native artifact closes, including on mismatch."
-  [{:keys [train oracle]} target-device]
-  (let [cfg @(oracle 'chain-cfg)
-        n (* (:seq cfg) (:d cfg))
-        weights (mapv #((train 'rand-weights) cfg %) [11 12])
-        adapters (mapv #((train 'init-adapters) cfg % 0.02) [21 22])
-        input ((oracle 'fvec) n 31 0.5) target ((oracle 'fvec) n 32 0.5)
+  ([{:keys [train oracle] :as loaded} target-device]
+   (let [cfg @(oracle 'chain-cfg) n (* (:seq cfg) (:d cfg))]
+     (run-loaded! loaded target-device
+                  {:cfg cfg :weights (mapv #((train 'rand-weights) cfg %) [11 12])
+                   :adapters (mapv #((train 'init-adapters) cfg % 0.02) [21 22])
+                   :input ((oracle 'fvec) n 31 0.5) :target ((oracle 'fvec) n 32 0.5)
+                   :replay-count 2})))
+  ([{:keys [train oracle]} target-device
+    {:keys [cfg weights adapters input target replay-count]}]
+  (when-not (and (= 1 (:bs cfg)) (integer? replay-count) (pos? replay-count)
+                 (every? #(and (integer? %) (pos? %)) [(:seq cfg) (:d cfg)])
+                 (<= (*' (:seq cfg) (:d cfg)) Integer/MAX_VALUE)
+                 (vector? weights) (vector? adapters)
+                 (= 2 (count weights)) (= 2 (count adapters))
+                 (every? map? weights) (every? map? adapters)
+                 (= (*' (:seq cfg) (:d cfg)) (count input) (count target)))
+    (throw (ex-info "external training case requires two layers and matching dense inputs"
+                    {:reason :external-training-case})))
+  (let [n (* (:seq cfg) (:d cfg))
         started (System/nanoTime)
         prepared (prepare-chain train target-device cfg weights adapters input target)
         preparation-ns (- (System/nanoTime) started)
@@ -178,7 +202,7 @@
                              (:instances (compiled/plan prepared)))
        :replays
        (loop [iteration 0 current adapters previous nil results []]
-         (if (= iteration 2)
+         (if (= iteration replay-count)
            results
            (let [arguments (into (reference-args oracle cfg weights current input target)
                                  (map #((train 'layer-theta) cfg %) [0 1]))
@@ -212,12 +236,22 @@
                             (or (nil? previous) (not (value/live? (:prediction previous)))))
                (throw (ex-info "external chain differs from the monolithic CPU AD oracle"
                                {:reason :external-training-parity :iteration iteration
-                                :loss-error loss-error :dx-error dx-error :adapter-errors errors})))
+                                :predicted-loss predicted-loss :reference-loss reference-loss
+                                :loss-error loss-error :dx-error dx-error :adapter-errors errors
+                                :adapter-diagnostics
+                                (vec (for [layer [0 1]
+                                           [index key] (map-indexed vector @(train 'adapter-keys))
+                                           :when (not (< (nth errors (+ (* layer 14) index)) 2.0e-2))]
+                                       (assoc (difference-summary
+                                               ((recovered layer) key)
+                                               (nth vg (+ 2 (* layer 27)
+                                                          (get @(oracle 'adapter-pos) key))))
+                                              :layer layer :adapter key)))})))
              (recur (inc iteration) updated outputs
                     (conj results {:loss predicted-loss :reference-loss reference-loss
                                    :loss-error loss-error :dx-error dx-error
                                    :adapter-count (count errors) :adapter-max-error (apply max errors)})))))}
-      (finally (compiled/close! live)))))
+      (finally (compiled/close! live))))))
 
 (defn run! [{:keys [source-root targets] :or {targets [:ocl:0 :ze:0]}}]
   (when-not (and (string? source-root) (seq source-root) (vector? targets) (seq targets)
