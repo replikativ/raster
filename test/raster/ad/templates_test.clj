@@ -15,6 +15,92 @@
   [ctx]
   (partition 2 (:bindings ctx)))
 
+(defn- with-isolated-registry [f]
+  (with-redefs-fn {#'tmpl/template-registry (atom (tmpl/all-templates))} f))
+
+(deftest operation-resolution-preserves-namespaces-and-exact-registered-precedence
+  (with-isolated-registry
+    (fn []
+      (doseq [[expected spellings]
+              [['+ '[+ _plus__m_double_double]]
+               ['* '[_star__m_double_double-impl]]
+               ['Math/sin '[Math/sin java.lang.Math/sin sin_m_double]]
+               ['raster.numeric/+ '[raster.numeric/_plus__m_double_double-impl]]
+               ['raster.numeric/* '[raster.numeric/_star__m_double_double]]
+               ['raster.math/sin '[raster.math/sin_m_double-impl]]]]
+        (doseq [op spellings]
+          ;; Directly registered alias spellings legitimately retain their exact key.
+          (is (= expected (second (tmpl/resolve-template op))) (str op))))
+      (doseq [op '[example/sin_custom example/exp_helper example/min_value
+                    example/sin_custom_m_double-impl example/sin_m_double-impl
+                    sin_helper sin_helper_m_double sin_ _plus_helper]]
+        (is (nil? (tmpl/resolve-template op)) (str "must not guess builtin for " op)))
+      (let [factory (fn [& _] (fn [dy] [(* 7 dy)]))
+            override (fn [& _] (fn [dy] [(* 11 dy)]))]
+        (tmpl/register-template! 'example/sin {:pullback-factory factory})
+        (doseq [op '[example/sin example/sin_m_double example/sin_m_double-impl]]
+          (is (= 'example/sin (second (tmpl/resolve-template op))))
+          (is (identical? factory (tmpl/template-pullback op)))
+          (is (= [21] (((tmpl/template-pullback op) 0 1) 3))))
+        (tmpl/register-template! 'example/sin_m_double-impl {:pullback-factory override})
+        (is (identical? override (tmpl/template-pullback 'example/sin_m_double-impl)))))))
+
+(deftest pullback-uses-the-resolved-template-snapshot-including-legacy-factory
+  (with-isolated-registry
+    (fn []
+      (let [old (fn [& _] (fn [dy] [dy]))
+            replacement (fn [& _] (fn [dy] [(* 2 dy)]))
+            resolve tmpl/resolve-template]
+        (tmpl/register-template! 'example/custom {:pullback-factory old})
+        (tmpl/register-template! 'example/legacy {:closure old})
+        (is (identical? old (tmpl/template-pullback 'example/legacy_m_double-impl)))
+        (with-redefs [tmpl/resolve-template
+                      (fn [op]
+                        (let [resolved (resolve op)]
+                          (tmpl/register-template! 'example/custom {:pullback-factory replacement})
+                          resolved))]
+          (is (identical? old (tmpl/template-pullback 'example/custom))))
+        (is (identical? replacement (tmpl/template-pullback 'example/custom)))))))
+
+(deftest derived-jvp-publication-retries-public-registry-replacements
+  (doseq [mutation [:explicit :derived :unrelated]]
+    (with-isolated-registry
+      (fn []
+        (let [stale (fn [& _] :stale) fresh (fn [& _] :fresh)
+              attempts (atom [])]
+          (tmpl/register-template! 'example/race {:structure :before})
+          (with-redefs-fn
+            {#'tmpl/derive-jvp-fn
+             (fn [_ _ structure]
+               (swap! attempts conj structure)
+               (if (= 1 (count @attempts))
+                 (do
+                   (case mutation
+                     :explicit (tmpl/register-template! 'example/race {:jvp-fn fresh})
+                     :derived (tmpl/register-template! 'example/race {:structure :after})
+                     :unrelated (tmpl/register-template! 'example/other {:jvp-fn fresh}))
+                   stale)
+                 fresh))}
+            (fn []
+              (is (identical? fresh (tmpl/op-jvp-fn 'example/race_m_double-impl)))
+              (is (identical? fresh (:jvp-fn (tmpl/get-template 'example/race))))
+              (is (identical? fresh (tmpl/op-jvp-fn 'example/race)))
+              (is (= (case mutation :explicit [:before] :derived [:before :after]
+                           :unrelated [:before :before]) @attempts)))))))))
+
+(deftest derived-jvp-cache-does-not-advance-the-semantic-revision
+  (with-isolated-registry
+    (fn []
+      (let [f (fn [& _] :derived) calls (atom 0)]
+        (tmpl/register-template! 'example/cache {:structure :test})
+        (let [before (tmpl/registry-revision)]
+          (with-redefs-fn {#'tmpl/derive-jvp-fn (fn [& _] (swap! calls inc) f)}
+            (fn []
+              (is (identical? f (tmpl/op-jvp-fn 'example/cache)))
+              (is (identical? f (tmpl/op-jvp-fn 'example/cache_m_double-impl)))
+              (is (= 1 @calls))
+              (is (= before (tmpl/registry-revision))))))))))
+
 ;; ================================================================
 ;; Registry tests
 ;; ================================================================
