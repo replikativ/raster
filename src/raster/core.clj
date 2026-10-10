@@ -49,6 +49,7 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.specialize :as specialize]
             [raster.compiler.backend.jvm.valhalla :as valhalla]
@@ -322,6 +323,7 @@
   Julia model: type inference + devirtualization happens at first invocation,
   not at definition time. This gives TC-quality code in the JIT path."
   [source-body params tags annotations source-ns]
+  (binding [*ns* (or source-ns *ns*)]
   (let [type-env (build-walker-type-env params annotations)
         tc-binding-tags (inf/safe-tc-binding-tags '<jit> params annotations source-body source-ns)
         ;; Effective element dtype from the dispatch tags — the SAME rule as
@@ -334,7 +336,7 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
                     (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     ;; walk-body closes the core (macroexpand-core) at its single canonical point.
-    (mapv #(walker/walk-body % walk-opts) source-body)))
+    (mapv #(walker/walk-body % walk-opts) source-body))))
 
 (def ^:dynamic *jit-simd?*
   "Opt-in: vectorize par/map and par/reduce in the lazy-JIT bytecode upgrade via
@@ -370,24 +372,23 @@
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
   Julia model: re-walks from source body with TC at JIT time for
-  TC-quality devirtualization. Falls back to pre-walked body if
-  TC re-walk fails. Returns the compiled impl on success."
+  TC-quality devirtualization. Required source walking must succeed before
+  optional bytecode compilation; never uses a stale body after a failed walk."
   [impl-var mangled-sym params tags return-tag walked-body source-ns typed-iface-name
    & {:keys [annotations source-body]}]
-  (try
-    (let [;; Create compilation DCL if not already in a compilation scope
+  (let [;; Create compilation DCL if not already in a compilation scope.
+        ;; Required walking retains the same loader as subsequent emission.
           needs-cl? (nil? me/*compilation-classloader*)
           cl (when needs-cl?
                (clojure.lang.DynamicClassLoader.
                 (.getContextClassLoader (Thread/currentThread))))]
-      (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)]
+    (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)]
+      (let [fresh-body (if (and source-body annotations)
+                         (jit-walk-with-tc (vec source-body) params tags annotations source-ns)
+                         walked-body)]
+        (try
         (let [;; Re-walk from source body with TC for better devirtualization
-              effective-body (if (and source-body annotations)
-                               (try (jit-walk-with-tc (vec source-body) params tags
-                                                      annotations source-ns)
-                                    (catch Throwable _
-                                      walked-body))
-                               walked-body)
+              effective-body fresh-body
               ;; Use the same retained AD program as AOT, without expanding ordinary
               ;; helper boundaries or rewalking its typed conversions. Lazy resolution
               ;; avoids the scalar.inline -> raster.core namespace cycle.
@@ -441,8 +442,9 @@
                 (catch Exception e
               ;; Rollback var to old impl on dispatch table or callsite failure
                   (alter-var-root impl-var (constantly old-impl))
-                  (throw e))))))))
-    (catch Throwable e
+                  (throw e))))))
+    (catch Exception e
+      (util/rethrow-compiler-invariant! e)
       (if *jit-silent-fallback?*
         (do (when (System/getProperty "raster.debug")
               (println "WARN: bytecode compile failed for" mangled-sym
@@ -470,7 +472,7 @@
                            :params params
                            :tags tags
                            :return-tag return-tag}
-                          e)))))))
+                          e))))))))))
 
 ;; ================================================================
 ;; Walked body registry — avoids quoting large walked bodies into
@@ -508,22 +510,26 @@
   [v]
   (let [v (if (::deftm (meta v))
             v
-            (or (try (resolve-deftm-var v nil) (catch Exception _ nil)) v))]
+            (or (try (resolve-deftm-var v nil)
+                     (catch clojure.lang.ExceptionInfo e
+                       (util/rethrow-compiler-invariant! e)
+                       (when-not (= :ambiguous-deftm-overload (:reason (ex-data e)))
+                         (throw e)))) v))]
     (or (seq (::deftm-walked-body (meta v)))
         (locking v
           (or (seq (::deftm-walked-body (meta v)))
               (when-let [src (::deftm-source-body (meta v))]
                 (let [m (meta v)
-                      walked (try (jit-walk-with-tc (vec src)
-                                                    (::deftm-params m)
-                                                    (::deftm-tags m)
-                                                    (::deftm-annotations m)
-                                                    (try (the-ns (::deftm-source-ns m))
-                                                         (catch Exception _ *ns*)))
-                                  (catch Throwable _
-                                  ;; Fallback: walk without TC
-                                    (let [te (build-walker-type-env (::deftm-params m) (::deftm-annotations m))]
-                                      (mapv #(walker/walk-body % {:type-env te :source-ns *ns*}) (vec src)))))]
+                      source-ns (some-> (::deftm-source-ns m) find-ns)
+                      _ (when-not source-ns
+                          (throw (ex-info "Retained source namespace is unavailable"
+                                          {:reason :missing-deftm-source-namespace
+                                           :var v :source-ns (::deftm-source-ns m)})))
+                      walked (jit-walk-with-tc (vec src)
+                                               (::deftm-params m)
+                                               (::deftm-tags m)
+                                               (::deftm-annotations m)
+                                               source-ns)]
                   (alter-meta! v assoc ::deftm-walked-body (vec walked))
                   (vec walked))))))))
 
@@ -1956,7 +1962,8 @@
                                              (count all-methods) " overloads"
                                              (when ambiguity-hint (str ". " ambiguity-hint))
                                              "\nAvailable: " (mapv :tags all-methods))
-                                        {:var f-var :methods (mapv :tags all-methods)})))))]
+                                        {:reason :ambiguous-deftm-overload
+                                         :var f-var :methods (mapv :tags all-methods)})))))]
              (ns-resolve ns-obj (types/mangle fn-name (:tags method)))))))
        ;; no dispatch table
        (case on-miss :self f-var nil)))))
