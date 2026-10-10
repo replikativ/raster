@@ -51,7 +51,7 @@
                     user.helpers/sqrt user.helpers/sqrt_m_double-impl
                     user.helpers/unchecked-add user.helpers/unchecked-add_m_long_long-impl
                     user.helpers/_plus__m_double_double-impl clojure.core/sin
-                    raster.numeric/sin Math/asinh Math/log2 raster.quant.kernels/wi8-dot
+                    raster.numeric/sin raster.numeric/tanh Math/asinh Math/log2 raster.quant.kernels/wi8-dot
                     sin-impl sqrt-impl unchecked-add-impl]]
     (is (nil? (intrinsic/canonical identity)) (str identity))
     (is (nil? (intrinsic/source-overflow-policy identity)) (str identity)))

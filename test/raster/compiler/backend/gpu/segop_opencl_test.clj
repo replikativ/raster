@@ -60,7 +60,7 @@
 (deftest portable-map-retains-selected-math-consent
   (let [operation (segop/->SegMap
                    903 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
-                   (with-meta '(raster.numeric/tanh (clojure.core/aget input i))
+                   (with-meta '(raster.math/tanh (clojure.core/aget input i))
                      {:raster.type/tag 'float})
                    nil #{'input} #{'output} #{}
                    (segop/->KernelGrid 1 32 0) :float 'output nil)
@@ -278,7 +278,7 @@
 (deftest stencil-retains-selected-math-consent
   (let [operation (segop/->SegStencil
                    905 (segop/make-seg-space 'i 32) (segop/->SegLevel :thread :virtual)
-                   (with-meta '(raster.numeric/tanh (clojure.core/aget input i))
+                   (with-meta '(raster.math/tanh (clojure.core/aget input i))
                      {:raster.type/tag 'float})
                    #{'input} #{'output} #{} (segop/->KernelGrid 1 32 0)
                    :float 'output 1 :dirichlet nil :no-write-alias)
@@ -901,7 +901,7 @@
         base (first (lower/lower-reduce (soac/par-form->soac 'result form 904 :dtype :float)
                                         nil :dtype :float))
         transform (kernel-body/->ScalarRegion
-                   '[completed] (with-meta '(raster.numeric/tanh completed)
+                   '[completed] (with-meta '(raster.math/tanh completed)
                                    {:raster.type/tag 'float}) [] :float)
         operation (assoc-in base [:reduction :attributes :result-region] transform)
         node (kgraph/->ScheduledKernel
