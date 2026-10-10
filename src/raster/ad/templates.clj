@@ -344,75 +344,45 @@
 ;; Mangled name resolution
 ;; ================================================================
 
-(defn- extract-base-op
-  "Extract the base operation name from a mangled symbol."
-  [sym]
-  (when (symbol? sym)
-    (let [n (name sym)]
-      (cond
-        (.startsWith n "_plus_")  '+
-        (.startsWith n "_minus_") '-
-        (.startsWith n "_star_")  '*
-        (.startsWith n "_div_")   '/
-        (.startsWith n "sin_")    'Math/sin
-        (.startsWith n "cos_")    'Math/cos
-        (.startsWith n "exp_")    'Math/exp
-        (.startsWith n "log_")    'Math/log
-        (.startsWith n "sqrt_")   'Math/sqrt
-        (.startsWith n "pow_")    'Math/pow
-        (.startsWith n "abs_")    'Math/abs
-        (.startsWith n "tan_")    'Math/tan
-        (.startsWith n "asin_")   'Math/asin
-        (.startsWith n "acos_")   'Math/acos
-        (.startsWith n "atan2_")  'Math/atan2
-        (.startsWith n "atan_")   'Math/atan
-        (.startsWith n "min_")    'Math/min
-        (.startsWith n "max_")    'Math/max
-        (.startsWith n "fma_")    'Math/fma
-        :else nil))))
-
-(defn- extract-deftm-base
-  "Extract the base qualified symbol from a deftm-mangled name.
-  E.g. raster.nn/dense_m_Object_Object_Object → raster.nn/dense"
-  [op]
-  (mangled/extract-deftm-base op))
-
 (defn- normalize-op
-  "Reduce any op symbol to its canonical template key.
-  Handles: -impl suffix stripping, qualified→base mapping,
-  mangled arithmetic names, deftm _m_ mangled names."
-  [op]
+  "Resolve spelling against one registry snapshot without discarding a user's namespace.
+   Legacy bare generated math/arithmetic names require the actual _m_ separator."
+  [registry op]
   (when (symbol? op)
-    (let [n (name op)
+    (let [n (mangled/strip-impl-suffix (name op))
           ns-str (namespace op)
-          ;; Strip -impl suffix first (from .invk calls)
-          [n ns-str] (if (.endsWith ^String n "-impl")
-                       [(mangled/strip-impl-suffix n) ns-str]
-                       [n ns-str])
-          reconstructed (if ns-str (symbol ns-str n) (symbol n))]
-      ;; 1. Direct lookup key
-      (or (when (get-template reconstructed) reconstructed)
-          ;; Source qualification spells Java's Math statics with their full
-          ;; class name. Keep one AD rule for both legal spellings.
-          (when (= ns-str "java.lang.Math")
-            (let [short-op (symbol "Math" n)]
-              (when (get-template short-op) short-op)))
-          ;; 2. Qualified numeric op → base (raster.numeric/* → *)
-          (get qualified->base-op reconstructed)
-          ;; 3. Mangled arithmetic/math name (_plus_m_... → '+, sin_m_... → 'Math/sin)
-          (extract-base-op (symbol n))
-          ;; 4. deftm mangled name (ns/foo_m_double_double → ns/foo)
-          (extract-deftm-base reconstructed)
-          ;; 5. As-is (already canonical)
-          reconstructed))))
+          reconstructed (if ns-str (symbol ns-str n) (symbol n))
+          decoded (or (util/impl->op reconstructed)
+                      (mangled/extract-deftm-base reconstructed))
+          alias (fn [candidate]
+                  (or (get qualified->base-op candidate)
+                      (when (= "java.lang.Math" (namespace candidate))
+                        (symbol "Math" (name candidate)))))
+          bare-generated? (and (nil? ns-str) (pos? (.indexOf ^String n "_m_")))]
+      (or (when (contains? registry op) op)
+          (when (contains? registry reconstructed) reconstructed)
+          (when (contains? registry decoded) decoded)
+          (alias reconstructed)
+          (alias decoded)
+          ;; Reuse the compiler's decoder only for an explicitly bare legacy spelling.
+          ;; A qualified user identity must never be retried as a builtin basename.
+          (when bare-generated?
+            (let [numeric (util/impl->op (symbol "raster.numeric" n))
+                  arithmetic (get qualified->base-op numeric)
+                  math (symbol "Math" (name decoded))]
+              (or arithmetic (when (contains? registry math) math))))
+          decoded))))
+
+(defn- resolve-template-in [registry op]
+  (when-let [canonical (normalize-op registry op)]
+    (when-let [template (get registry canonical)]
+      [template canonical])))
 
 (defn resolve-template
   "Look up a template by normalizing the op to its canonical form.
   Returns [template canonical-op] or nil."
   [op]
-  (when-let [canonical (normalize-op op)]
-    (when-let [t (get-template canonical)]
-      [t canonical])))
+  (resolve-template-in @template-registry op))
 
 (defn template-pullback
   "Return a runtime pullback for an op from its single available gradient
@@ -424,7 +394,7 @@
   rearrange, solve-effort, pack/unpack-heads), fall back to it. Returns
   (fn [result & args] -> (fn [adjoint] -> [grad ...])) or nil if no rule exists."
   [op]
-  (if-let [[template _] (resolve-template op)]
+  (when-let [[template _] (resolve-template op)]
     (if (:grads-fn template)
       (fn [result & args]
         (fn [adjoint]
@@ -437,8 +407,7 @@
                               (list 'let* (vec (:bindings ctx'))
                                     (vec grad-syms))))]
             (apply f (concat args [result adjoint])))))
-      (get-pullback-factory op))
-    (get-pullback-factory op)))
+      (or (:pullback-factory template) (:closure template)))))
 
 (defn has-reverse-rule?
   "True if op has a REVERSE-mode AD rule: a static :grads/:grads-fn template OR a
@@ -1496,24 +1465,33 @@
   variants, …) were value-copied at registration BEFORE structure tagging, so
   a structureless alias falls back to its canonical base key."
   [op]
-  (when-let [[template canonical] (resolve-template op)]
-    (or (:jvp-fn template)
-        (when-let [st (:structure template)]
-          (let [f (derive-jvp-fn canonical template st)]
-            (swap! template-registry assoc-in [canonical :jvp-fn] f)
-            f))
-        ;; alias → base fallbacks
-        (when-let [base (get qualified->base-op canonical)]
-          (op-jvp-fn base))
-        (when (and (qualified-symbol? canonical)
-                   (= "raster.math" (namespace canonical)))
-          (let [interop (symbol "Math" (name canonical))]
-            (when (get-template interop) (op-jvp-fn interop))))
-        (when (and (qualified-symbol? canonical)
-                   (= "clojure.core" (namespace canonical))
-                   (not= canonical (symbol (name canonical))))
-          (let [bare (symbol (name canonical))]
-            (when (get-template bare) (op-jvp-fn bare)))))))
+  (loop []
+    (let [registry @template-registry]
+      (when-let [[template canonical] (resolve-template-in registry op)]
+        (cond
+          (:jvp-fn template) (:jvp-fn template)
+          (:structure template)
+          (let [f (derive-jvp-fn canonical template (:structure template))]
+            ;; Never attach or return a derived rule after its registry snapshot was replaced.
+            ;; Cache insertion preserves the semantic revision; public mutations advance it.
+            (if (compare-and-set! template-registry registry
+                                  (assoc-in registry [canonical :jvp-fn] f))
+              f
+              (recur)))
+          :else
+          (or
+            ;; alias → base fallbacks
+            (when-let [base (get qualified->base-op canonical)]
+              (op-jvp-fn base))
+            (when (and (qualified-symbol? canonical)
+                       (= "raster.math" (namespace canonical)))
+              (let [interop (symbol "Math" (name canonical))]
+                (when (get-template interop) (op-jvp-fn interop))))
+            (when (and (qualified-symbol? canonical)
+                       (= "clojure.core" (namespace canonical))
+                       (not= canonical (symbol (name canonical))))
+              (let [bare (symbol (name canonical))]
+                (when (get-template bare) (op-jvp-fn bare))))))))))
 
 ;; ================================================================
 ;; §13 A4 — explicit :jvp-fn for backward kernels whose Jacobian structure
