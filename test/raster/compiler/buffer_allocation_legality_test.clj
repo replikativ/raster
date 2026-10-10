@@ -127,7 +127,7 @@
                ['capture '(let [out (double-array n)]
                             (let [m 2] (aset out 0 (double n))) out) 3.0]
                ['quoted '(let [out (double-array n)]
-                           (aset out 0 (if (= 'n 'n) 1.0 2.0)) out) 1.0]]]
+                           (aset out 0 (if (= 'n (symbol "n")) 1.0 2.0)) out) 1.0]]]
         (define-allocator name '[n :- Long] body)
         (let [op (operation source (str name) "long")
               original (list 'let* ['m 3 'result (list op 'm)] 'result)
@@ -149,6 +149,22 @@
         (doseq [form [original (:form result)]]
           (alter-var-root (ns-resolve source 'global-size) (constantly 3))
           (is (= [3.0 0.0 0.0] (vec (eval form)))))))))
+
+(deftest caller-cast-names-cannot-capture-helper-operations
+  (with-source
+    (fn [source]
+      (define-allocator 'casted '[n :- Long]
+        '(let [m (long n) out (double-array m)] (aset out 0 (double n)) out))
+      (let [original (list 'let* ['long '(fn [x] (tick x))
+                                 'double '(fn [x] (tick x))
+                                 'result (list (operation source "casted" "long") 3)] 'result)
+            result (buffer-fuse/fuse-let original)
+            calls @(ns-resolve source 'calls)]
+        (is (= 1 (get-in result [:stats :fresh-allocs])))
+        (doseq [form [original (:form result)]]
+          (reset! calls 0)
+          (is (= [3.0 0.0 0.0] (vec (eval form))))
+          (is (zero? @calls)))))))
 
 (deftest replay-admission-requires-local-and-unshadowed-operation-evidence
   (is (not (effects/replay-safe-value? 'global-value)))

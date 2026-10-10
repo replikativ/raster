@@ -32,7 +32,7 @@
   [op-sym]
   (get-in (get-op-descriptor op-sym) [:buffer]))
 
-(declare resolve-op-descriptor alloc-ops)
+(declare resolve-op-descriptor alloc-ops cast-ops)
 
 (defn- replay-safe-value? [expression environment]
   ;; Effects depends on this descriptor namespace; analyze only after loading
@@ -89,7 +89,19 @@
                              (map vector params (:raster.core/deftm-tags m))))]
     (binding [*ns* (or (:ns m) *ns*)]
     (when (and walked-body params (= 1 (count walked-body)))
-      (let [body (first walked-body)]
+      (let [substitute (requiring-resolve 'raster.compiler.core.util/subst-syms)
+            ;; Primitive cast walking retains source spelling. Freeze verified
+            ;; core operation identity before inserting this body into a caller
+            ;; whose lexical bindings may have those names. Scope substitution
+            ;; preserves helper-local binders and quoted data.
+            core-casts (into {} (keep (fn [op]
+                                       (when (and (nil? (namespace op))
+                                                  (not (contains? parameter-types op))
+                                                  (identical? (resolve op)
+                                                              (ns-resolve 'clojure.core op)))
+                                         [op (symbol "clojure.core" (name op))])))
+                             (keys cast-ops))
+            body (substitute core-casts (first walked-body))]
         ;; Case 1: body is a direct pure alloc call (zeros-like, double-array)
         ;; Returns: just the pre-allocated buffer (no compute body)
         ;; (walked body is closed-core: let -> let*)
@@ -109,7 +121,7 @@
                           (apply list (first expr) (map #(resolve-to-args % args) (rest expr)))
                           (meta expr))
                         :else expr))
-                    alloc-ctor (first body)]
+                    alloc-ctor (symbol "clojure.core" (name (first body)))]
                 {:allocates? true
                  :auto-detected? true
                  :in-place-arg nil
@@ -153,7 +165,8 @@
                                                      (param-derived? size param-set
                                                                 (into {} (map vec (take i pairs)))
                                                                 (nth environments i)))
-                                            {:idx i :sym sym :size size :ctor (first init)}))))
+                                            {:idx i :sym sym :size size
+                                             :ctor (symbol "clojure.core" (name (first init)))}))))
                                     pairs)))]
                 (when (and match
                            ;; This old fragment adapter has no alpha-renaming
