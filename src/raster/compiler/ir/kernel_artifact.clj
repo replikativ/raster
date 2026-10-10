@@ -101,6 +101,11 @@
         (throw (ex-info (str "kernel artifact " k " must be a map")
                         {:kernel-name kernel-name k value}))))
     (compilation artifact)
+    (when (and (contains? artifact :spv-bytes)
+               (not (and (bytes? (:spv-bytes artifact))
+                         (pos? (alength ^bytes (:spv-bytes artifact))))))
+      (throw (ex-info "kernel artifact SPIR-V payload must be a non-empty byte array"
+                      {:reason :kernel-artifact-spirv-payload :kernel-name kernel-name})))
     artifact))
 
 (defn make

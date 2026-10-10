@@ -939,7 +939,10 @@
            (doseq [k kernels]
              (register! (:kernel-name k) k)))
          (catch Exception e
-           (println "Warning: could not register GPU kernels:" (.getMessage e))))))))
+           (throw (ex-info "GPU kernel registration failed"
+                           {:reason :gpu-kernel-registration :device-id device-id
+                            :backend ns-sym}
+                           e))))))))
 
 (defn- register-gpu-dispatches!
   "Register pure multi-artifact dispatch values beside their target backend's kernel registry."
@@ -953,7 +956,10 @@
         (let [register! (resolve (symbol (str ns-sym) "register-kernel-dispatch!"))]
           (doseq [dispatch dispatches] (register! dispatch)))
         (catch Exception e
-          (println "Warning: could not register GPU kernel dispatches:" (.getMessage e)))))))
+          (throw (ex-info "GPU kernel dispatch registration failed"
+                          {:reason :gpu-dispatch-registration :device-id device-id
+                           :backend ns-sym}
+                          e)))))))
 
 (declare gpu-resident-emission-passes)
 

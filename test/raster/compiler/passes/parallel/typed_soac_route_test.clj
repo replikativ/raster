@@ -1028,7 +1028,7 @@
     (is (= 'raster.compiler.pipeline/invoke-scheduled-executable!
            (first binding-expr)))
     (is (= :ocl:0 (nth binding-expr 1)))
-    (is (= (:id dispatch) (nth binding-expr 2)))
+    (is (= (kdispatch/registration-key dispatch) (nth binding-expr 2)))
     (is (= (:arguments executable) (nth binding-expr 3)))
     (is (= 4 (count binding-expr))
         "the emitted form carries no duplicate sequential source implementation")))

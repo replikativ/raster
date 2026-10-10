@@ -5,10 +5,12 @@
    scheduling value above both: every alternative implements the same logical call and differs
    only in its emitted schedule. Selection is pure data evaluated after symbolic ABI scalars
    become concrete and before a backend binder sees the selected executable."
-  (:require [raster.compiler.ir.kernel-artifact :as kart]
+  (:require [clojure.walk :as walk]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.kernel-precondition :as precondition]))
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]))
 
 (defrecord KernelDispatch
            [id
@@ -242,6 +244,72 @@
   (validate!
    (->KernelDispatch id alternatives default-strategy selector provenance attributes)))
 
+(defn- registration-data
+  "Canonical compiler data, with the sole native compiler payload encoded by content.
+   This is not a general runtime-array serializer. Preserve semantic metadata at every level."
+  [value]
+  (let [value (if (kart/kernel-artifact? value)
+                (do (kart/validate! value)
+                    (if (contains? value :spv-bytes)
+                      (assoc value :spv-bytes
+                             {::spirv-bytes (vec (:spv-bytes value))})
+                      value))
+                value)
+        walked (walk/walk registration-data identity value)]
+    (if (instance? clojure.lang.IObj walked)
+      (with-meta walked (meta value))
+      walked)))
+
+(defn- executable-registration-key [dispatch]
+  (str (:id dispatch) "@"
+       (fingerprint/fingerprint
+        (registration-data (dissoc dispatch :registration-key :arena-id)))))
+
+(defn with-registration-key
+  "Seal an emitted executable's lookup identity separately from its stable tuning-family ID.
+   Call after final target emission and ABI projection. Ownership remains a runtime admission."
+  [dispatch]
+  (let [dispatch (validate! dispatch)]
+    (assoc dispatch :registration-key (executable-registration-key dispatch))))
+
+(defn registration-key
+  "Return the verified emitted lookup key, or the explicit ID of an unsealed manual dispatch.
+   A copied key is not authority to mutate a previously sealed executable."
+  [dispatch]
+  (let [dispatch (validate! dispatch)]
+    (if (contains? dispatch :registration-key)
+      (let [key (:registration-key dispatch)]
+        (when-not (= key (executable-registration-key dispatch))
+          (throw (ex-info "kernel dispatch registration key does not match its executable"
+                          {:reason :kernel-dispatch-registration-key :id (:id dispatch)})))
+        key)
+      (:id dispatch))))
+
+(defn admit-registration
+  "Admit a validated dispatch at one registry key without rebinding an existing call.
+   Lookup keys are not proofs of executable equality. Identical or canonically equal registrations
+   are idempotent; different executable values or arena ownership under one key fail closed.
+   Use inside the registry's atomic update so concurrent registrations cannot overwrite."
+  [prior candidate]
+  (when (and prior
+             (not (or (identical? prior candidate)
+                      ;; Clojure equality ignores semantic metadata and signed zero.
+                      ;; Unsupported opaque values cannot establish equality of fresh copies.
+                      (try
+                        (java.util.Arrays/equals
+                         ^bytes (fingerprint/canonical-bytes (registration-data prior))
+                         ^bytes (fingerprint/canonical-bytes (registration-data candidate)))
+                        (catch clojure.lang.ExceptionInfo error
+                          (if (= :semantic-fingerprint-unsupported (:reason (ex-data error)))
+                            false
+                            (throw error)))))))
+    (throw (ex-info "kernel dispatch ID already names a different registration"
+                    {:reason :kernel-dispatch-registration-conflict
+                     :id (:id candidate)
+                     :registered-arena (:arena-id prior)
+                     :requested-arena (:arena-id candidate)})))
+  (or prior candidate))
+
 (defn alternative
   "Return the executable implementing `strategy`, or throw with the legal strategy set."
   [dispatch strategy]
@@ -261,7 +329,10 @@
   "Return `dispatch` with a replacement selector, revalidating it against the common ABI and
    available strategies. Used to bake an offline tuning result into otherwise identical IR."
   [dispatch selector]
-  (validate! (assoc (validate! dispatch) :selector selector)))
+  (let [updated (validate! (assoc (validate! dispatch) :selector selector))]
+    (if (contains? dispatch :registration-key)
+      (with-registration-key updated)
+      updated)))
 
 (defn specialize-fixed
   "Bake a fixed selector into `dispatch` and discard every unselected executable.
@@ -280,9 +351,12 @@
   (let [dispatch (with-selector dispatch selector)
         strategy (:strategy selector)
         selected (alternative dispatch strategy)]
-    (validate! (assoc dispatch
-                      :alternatives [selected]
-                      :default-strategy strategy))))
+    (let [updated (validate! (assoc dispatch
+                                   :alternatives [selected]
+                                   :default-strategy strategy))]
+      (if (contains? dispatch :registration-key)
+        (with-registration-key updated)
+        updated))))
 
 (defn- runtime-number
   [value]
