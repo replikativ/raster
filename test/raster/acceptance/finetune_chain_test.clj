@@ -117,6 +117,21 @@
     (is (= 2.0 (:error-l2 summary)))
     (is (= (Math/sqrt 5.0) (:reference-l2 summary)))))
 
+(deftest difference-diagnostics-retain-coordinates-and-do-not-hide-nonfinite-values
+  (let [summary (#'acceptance/difference-summary [3.0 -2.0 6.0] [1.0 0.0 5.0])]
+    (is (= {:index 0 :actual 3.0 :expected 1.0 :absolute-error 2.0}
+           (:worst-finite-absolute-coordinate summary)))
+    (is (zero? (:nonfinite-coordinate-count summary))))
+  (let [summary (#'acceptance/difference-summary [Double/NaN 3.0 Double/POSITIVE_INFINITY]
+                                                 [0.0 1.0 Double/POSITIVE_INFINITY])]
+    (is (= 2 (:nonfinite-coordinate-count summary)))
+    (is (= 1 (get-in summary [:worst-finite-absolute-coordinate :index])))
+    (is (Double/isNaN (:max-absolute summary))))
+  (is (nil? (:worst-finite-absolute-coordinate (#'acceptance/difference-summary [] []))))
+  (is (= :external-training-shape
+         (try (#'acceptance/difference-summary [1.0] []) nil
+              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+
 (deftest bound-schedules-survive-parity-failure-without-leaking-the-artifact
   (let [keys (mapv #(keyword (str "adapter" %)) (range 14))
         gradients (zipmap keys (repeat (float-array [1])))
