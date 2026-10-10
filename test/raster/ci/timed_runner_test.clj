@@ -48,3 +48,23 @@
         (is (thrown-with-msg? Exception #"original failure"
                               (timed/run-timed! options impossible-report))))
       (finally (io/delete-file file)))))
+
+(deftest cli-completes-executor-shutdown-before-returning-exit-status
+  (doseq [[summary status] [[{:fail 0 :error 0} 0]
+                           [{:fail 1 :error 0} 1]
+                           [{:fail 0 :error 1} 1]]]
+    (let [events (atom [])]
+      (with-redefs [timed/run-timed! (fn [& _] (swap! events conj :tests) summary)
+                    clojure.core/shutdown-agents #(swap! events conj :shutdown)]
+        (is (= status (#'timed/cli-status ["-n" "raster.ci.timed-runner-test"])))
+        (swap! events conj :returned))
+      (is (= [:tests :shutdown :returned] @events))))
+  (let [failure (Exception. "load failed")
+        events (atom [])
+        observed (with-redefs [timed/run-timed! (fn [& _] (throw failure))
+                              clojure.core/shutdown-agents #(swap! events conj :shutdown)]
+                   (try (#'timed/cli-status ["-n" "raster.ci.timed-runner-test"])
+                        nil
+                        (catch Exception error error)))]
+    (is (identical? failure observed))
+    (is (= [:shutdown] @events))))
