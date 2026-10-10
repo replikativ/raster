@@ -1646,7 +1646,8 @@
         typed-iface-name (symbol (.getName ^Class (:iface-class iface-info)))
         ;; Run TC on the specialized body for binding type inference —
         ;; same as prepare-typed-body does for normal deftm
-        tc-binding-tags (inf/safe-tc-binding-tags fn-name params concrete-anns body-forms source-ns)
+        tc-analysis (inf/tc-analyze-deftm-body fn-name params concrete-anns body-forms source-ns)
+        tc-binding-tags (:binding-tags tc-analysis)
         ;; Walk the body — same as deftm macro does
         type-env (build-walker-type-env params concrete-anns)
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} type-env)
@@ -1657,6 +1658,20 @@
                     ;; untyped floating literal to it. Only float/double matter.
                     (#{'float 'double} elem-prim) (assoc :element-dtype (keyword (str elem-prim))))
         walked-body (mapv #(walker/walk-body % walk-opts) body-forms)
+        ;; Declaration substitution does not prove that the concrete body returns
+        ;; the substituted carrier. Reject established boxing incompatibilities
+        ;; before creating placeholder Vars or emitting/verifying bytecode. Keep
+        ;; all reachable result alternatives: one acceptable branch is not proof.
+        result-tags (inf/infer-result-tags (last walked-body)
+                                          (zipmap params tags) source-ns)
+        _ (when-let [actual (binding [*ns* source-ns]
+                             (some #(when (types/boxed-return-incompatible? % ret-tag) %)
+                                   result-tags))]
+            (throw (ex-info "specialized body cannot return its declared reference carrier"
+                            {:reason :specialization-return-incompatible
+                             :operation fn-name :argument-tags tags
+                             :declared-return ret-tag :actual-return actual
+                             :result-tags result-tags :tc-return (:ret-tag tc-analysis)})))
         ;; Collect defvalue forms for parametric value types
         body-str (str body)
         ann-str (str annotations)
