@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.gpu.core :as gpu]
             [raster.gpu.ocl-runtime]
             [raster.gpu.ze-runtime]))
@@ -56,6 +57,131 @@
     (is (= 1 @compilations) "the complete compiled result is cached once")
     (is (= (:dispatches compiled) (get-in @session [:dispatches :first])))
     (is (= (:dispatches compiled) (get-in @session [:dispatches :second])))))
+
+(deftest compile-cache-includes-the-effective-source-routing-threshold
+  (let [session (atom {:device-id :ze:0})
+        calls (atom [])]
+    (with-redefs-fn
+      {#'raster.gpu.core/compile-deftm-internal!
+       (fn [_ _ opts]
+         (swap! calls conj opts)
+         {:kernels [(get opts :min-elements 0)] :dispatches []})}
+      #(do
+         (is (= [0] (gpu/compile! session :default #'identity)))
+         (is (= [0] (gpu/compile! session :explicit-default #'identity {:min-elements 0})))
+         (is (= [64] (gpu/compile! session :threshold #'identity {:min-elements 64})))
+         (is (= [64] (gpu/compile! session :same-threshold #'identity {:min-elements 64})))
+         (is (= [nil] (gpu/compile! session :explicit-nil #'identity {:min-elements nil})))
+         (is (= [0] (gpu/compile! session :declared-storage #'identity
+                                 {:preserve-declared-array-storage? true})))))
+    (is (= [{} {:min-elements 64} {:min-elements nil}
+            {:preserve-declared-array-storage? true}] @calls)
+        "absent/zero share a cache identity, but explicit nil is not silently defaulted")))
+
+(deftest compile-cache-preserves-revision-invalidation-and-unstable-acquisition
+  (let [session (atom {:device-id :ze:0})
+        revision (atom :first)
+        calls (atom 0)
+        unstable? (atom false)]
+    (with-redefs-fn
+      {#'dispatch/compiler-definition-revision #(deref revision)
+       #'raster.gpu.core/compile-deftm-internal!
+       (fn [_ _ _]
+         (let [number (swap! calls inc)]
+           (when @unstable? (swap! revision #(keyword (str (name %) "-changed"))))
+           {:kernels [number] :dispatches []}))}
+      #(do
+         (is (= [1] (gpu/compile! session :first #'identity)))
+         (is (= [1] (gpu/compile! session :cached #'identity)))
+         (reset! revision :second)
+         (is (= [2] (gpu/compile! session :new-revision #'identity)))
+         (reset! unstable? true)
+         (reset! revision :unstable)
+         (is (= [3] (gpu/compile! session :unstable #'identity)))
+         (reset! unstable? false)
+         (is (= [4] (gpu/compile! session :retry #'identity)))
+         (is (= [4] (gpu/compile! session :retry-cached #'identity)))))))
+
+(deftest compile-acquisition-rejects-closed-releasing-and-reentrant-retirement
+  (let [calls (atom 0)]
+    (with-redefs-fn
+      {#'raster.gpu.core/compile-deftm-internal!
+       (fn [_ _ _] (swap! calls inc) {:kernels [] :dispatches []})}
+      #(doseq [state [{:closed? true} {:lifecycle :releasing}]]
+         (is (= :session-releasing
+                (try (gpu/compile! (atom (assoc state :device-id :ze:0)) :phase #'identity)
+                     nil
+                     (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))))
+    (is (zero? @calls)))
+  (let [session (atom {:device-id :ze:0})
+        failure (atom nil)]
+    (with-redefs-fn
+      {#'raster.gpu.core/compile-deftm-internal!
+       (fn [_ _ _]
+         (reset! failure (try (gpu/close-session! session) nil
+                             (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+         {:kernels [:compiled] :dispatches []})}
+      #(is (= [:compiled] (gpu/compile! session :phase #'identity))))
+    (is (= :reentrant-root-lifecycle @failure))
+    (is (not (:closed? @session)))))
+
+(deftest compile-acquisition-finishes-before-a-requested-session-close
+  (let [session (atom {:device-id :ze:0 :arena-id ::arena})
+        entered (promise) finish (promise) close-requested (promise)
+        calls (atom [])
+        compiling (atom nil) closing (atom nil)]
+    (with-redefs-fn
+      {#'raster.gpu.core/compile-deftm-internal!
+       (fn [_ _ _]
+         (deliver entered true)
+         (when (= ::timeout (deref finish 5000 ::timeout))
+           (throw (ex-info "compile fixture timed out" {})))
+         (swap! calls conj :register)
+         (is (not (:closed? @session)))
+         {:kernels [:compiled] :dispatches [:dispatch]})
+       #'raster.gpu.core/rt-resolve
+       (fn [_ operation]
+         (case operation
+           "close-kernel-arena!"
+           (fn [arena]
+             (is (= ::arena arena))
+             (is (= [:compiled] (get-in @session [:kernels :phase])))
+             (is (= [:dispatch] (get-in @session [:dispatches :phase])))
+             (swap! calls conj :close-arena))
+           (throw (ex-info "unexpected backend operation" {:operation operation}))))}
+      #(try
+         (reset! compiling (future (gpu/compile! session :phase #'identity)))
+         (is (= true (deref entered 5000 ::timeout)))
+         (reset! closing (future (deliver close-requested (Thread/currentThread))
+                                 (gpu/close-session! session)))
+         (let [close-thread (deref close-requested 5000 nil)
+               deadline (+ (System/nanoTime) 5000000000)]
+           ;; Observe an actual close request blocked at the existing session monitor, not an
+           ;; arbitrary sleep that could pass before the closing future even starts.
+           (when close-thread
+             (loop []
+               (when (and (not= java.lang.Thread$State/BLOCKED (.getState ^Thread close-thread))
+                          (not (realized? @closing)) (< (System/nanoTime) deadline))
+                 (Thread/yield)
+                 (recur))))
+           (is (some? close-thread))
+           (is (and close-thread (= java.lang.Thread$State/BLOCKED (.getState ^Thread close-thread))))
+           (is (empty? @calls)))
+         (deliver finish true)
+         (is (= [:compiled] (deref @compiling 5000 ::timeout)))
+         (let [closed-result (deref @closing 5000 ::timeout)]
+           (is (not= ::timeout closed-result))
+           (is (= :closed (:lifecycle closed-result))))
+         (is (= [:register :close-arena] @calls))
+         (is (= :closed (:lifecycle @session)))
+         (is (empty? (:kernels @session)))
+         (is (empty? (:dispatches @session)))
+         (finally
+           (deliver finish true)
+           ;; Retain and join both futures before the temporary resolver/compiler roots leave
+           ;; scope. Cleanup must not replace an unexpected primary fixture exception.
+           (doseq [task [@compiling @closing] :when task]
+             (try (deref task 5000 ::timeout) (catch Throwable _ nil))))))))
 
 (deftest scan-invocation-binds-the-retained-ordered-executable-abi
   (let [dispatch (scan-dispatch)

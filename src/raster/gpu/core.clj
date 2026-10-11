@@ -536,36 +536,38 @@
    opts: {:dtype :float, :min-elements 0, :preserve-declared-array-storage? false}"
   ([sess phase-key v] (compile! sess phase-key v {}))
   ([sess phase-key v opts]
-   (assert-session-open! sess)
-   (let [device-id (:device-id @sess)
-         ;; Dedup generation by (op, dtype): compile-deftm-internal! emits a gensym-named kernel
-         ;; each call, so without this N phases of the SAME deftm produce N distinct kernel SOURCES
-         ;; → N SPIR-V compiles (ocloc) at first prepare!, even though the bodies are identical.
-         ;; Caching the generated kernel-vec per (op, dtype) makes those phases SHARE one kernel
-         ;; name → one SPIR-V compile. The bound path already mints a fresh handle per binding from
-         ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
-         ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
-         semantic-key (cond-> [v (get opts :dtype :float)]
-                     (:preserve-declared-array-storage? opts)
-                     (conj {:preserve-declared-array-storage? true}))
-         cached (get-in @sess [:kernel-cache semantic-key])
-         revision (dispatch/compiler-definition-revision)
-         compiled (or (when (= (:revision cached) revision)
-                        (:compiled cached))
-                      (let [result (compile-deftm-internal! v device-id opts)]
-                        ;; Never relabel an artifact across a semantic change during compilation.
-                        ;; An unstable interval is returned uncached; the next acquisition retries.
-                        ;; Bound phases remain snapshots and stale acquisition epochs do not grow.
-                        (when (= revision (dispatch/compiler-definition-revision))
-                          (swap! sess assoc-in [:kernel-cache semantic-key]
-                                 {:revision revision :compiled result}))
-                        result))
-         kernels (:kernels compiled)]
-     (swap! sess (fn [state]
-                   (-> state
-                       (assoc-in [:kernels phase-key] kernels)
-                       (assoc-in [:dispatches phase-key] (:dispatches compiled)))))
-     kernels)))
+   (with-session-use sess
+     (let [device-id (:device-id @sess)
+           ;; Dedup generation by (op, dtype): compile-deftm-internal! emits a gensym-named kernel
+           ;; each call, so without this N phases of the SAME deftm produce N distinct kernel SOURCES
+           ;; → N SPIR-V compiles (ocloc) at first prepare!, even though the bodies are identical.
+           ;; Caching the generated kernel-vec per (op, dtype) makes those phases SHARE one kernel
+           ;; name → one SPIR-V compile. The bound path already mints a fresh handle per binding from
+           ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
+           ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
+           ;; The source compatibility threshold changes GPU/host route selection. Its default
+           ;; matches compile-deftm-internal!; an explicit nil retains its existing invalid behavior.
+           semantic-key (cond-> [v (get opts :dtype :float) (get opts :min-elements 0)]
+                          (:preserve-declared-array-storage? opts)
+                          (conj {:preserve-declared-array-storage? true}))
+           cached (get-in @sess [:kernel-cache semantic-key])
+           revision (dispatch/compiler-definition-revision)
+           compiled (or (when (= (:revision cached) revision)
+                          (:compiled cached))
+                        (let [result (compile-deftm-internal! v device-id opts)]
+                          ;; Never relabel an artifact across a semantic change during compilation.
+                          ;; An unstable interval is returned uncached; the next acquisition retries.
+                          ;; Bound phases remain snapshots and stale acquisition epochs do not grow.
+                          (when (= revision (dispatch/compiler-definition-revision))
+                            (swap! sess assoc-in [:kernel-cache semantic-key]
+                                   {:revision revision :compiled result}))
+                          result))
+           kernels (:kernels compiled)]
+       (swap! sess (fn [state]
+                     (-> state
+                         (assoc-in [:kernels phase-key] kernels)
+                         (assoc-in [:dispatches phase-key] (:dispatches compiled)))))
+       kernels))))
 
 (defn compile-phases!
   "Compile multiple deftm vars into the session. Returns {key → kernel-info-vec}.
