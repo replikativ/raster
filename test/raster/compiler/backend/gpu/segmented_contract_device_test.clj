@@ -6,7 +6,10 @@
    This is the golden correctness gate for the emit path — contention-insensitive."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.passes.parallel.contract-lower :as cl]
-            [raster.compiler.backend.gpu.segop-opencl :as sco]))
+            [raster.compiler.passes.parallel.contract-route :as route]
+            [raster.compiler.backend.gpu.segop-opencl :as sco]
+            [raster.gpu.runtime-backend :as backend]
+            [raster.gpu.device-probe :as opencl]))
 
 (def ^:private gpu?
   (delay (try (require 'raster.gpu.ze-runtime)
@@ -25,6 +28,62 @@
     C))
 
 (defn- approx= [a b] (< (Math/abs (- (double a) (double b))) 1.0e-9))
+
+(defn- repeated-dense-map-form [same-coordinate?]
+  (list 'raster.par/contract 'C '[[i 2] [j 5]] []
+        (list 'clojure.core/+ '(clojure.core/aget A i)
+              (list 'clojure.core/aget 'A (if same-coordinate? 'i 'j)))))
+
+(defn- check-repeated-dense-map! [device]
+  (let [runtime (backend/runtime-namespace device)
+        runtime-var #(requiring-resolve (symbol (str runtime) %))
+        arena ((runtime-var "make-kernel-arena!"))]
+    (try
+      (with-bindings {(runtime-var "*current-arena*") arena}
+        (doseq [same-coordinate? [false true]]
+          (let [form (repeated-dense-map-form same-coordinate?)
+                routed (route/route-contraction form :dtype :double)
+                artifact (:artifact routed)
+                required (if same-coordinate? 2 5)]
+            (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+            (is (= [required]
+                   (:shape (first (filter #(= 'A (:id %))
+                                          (:parameters (:kernel-body routed)))))))
+            ((runtime-var "register-kernel!") (:kernel-name artifact) artifact)
+            ;; The ten-element output leaves a partial workgroup. Reuse the same registered
+            ;; artifact with changed inputs; no shape inflation or handwritten native binder.
+            (doseq [values [(take required [1.25 -3.5 7.0 8.0 0.125])
+                           (take required [-8.0 2.0 0.5 -1.0 16.0])]]
+              (let [input (double-array values)
+                    before (vec input)
+                    output (double-array 10)
+                    expected (vec (for [i (range 2) j (range 5)]
+                                    (+ (nth values i)
+                                       (nth values (if same-coordinate? i j)))))]
+                ((runtime-var "invoke-registered-map-void-kernel")
+                 (:kernel-name artifact) [input output] [] 10)
+                (is (= expected (vec output)))
+                (is (= before (vec input)))))
+            ;; Required capacity must be rejected before staging/native contact, not padded
+            ;; into a different mathematical operation or left to an out-of-bounds device read.
+            (try
+              ((runtime-var "invoke-registered-map-void-kernel")
+               (:kernel-name artifact)
+               [(double-array (dec required)) (double-array 10)] [] 10)
+              (is false "known undersized input must fail at retained capacity admission")
+              (catch clojure.lang.ExceptionInfo error
+                (is (= :kernel-body-buffer-capacity (:reason (ex-data error))))
+                (is (= required (:required-elements (ex-data error))))
+                (is (= (dec required) (:buffer-elements (ex-data error)))))))))
+      (finally ((runtime-var "close-kernel-arena!") arena)))))
+
+(deftest repeated-dense-map-reads-match-independent-coordinates-on-both-backends
+  (if @opencl/opencl-available?
+    (check-repeated-dense-map! :ocl:0)
+    (opencl/opencl-skip! "zero-contract repeated dense reads"))
+  (if @gpu?
+    (check-repeated-dense-map! :ze:0)
+    (println "[skip] zero-contract repeated dense reads: no Level Zero device available")))
 
 (deftest segmented-contraction-matches-cpu-on-device
   (if-not @gpu?

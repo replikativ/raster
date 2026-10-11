@@ -63,12 +63,6 @@
                         (segop/seg-space-segment-dims space))
         reduced-dim (when-not map-only? (segop/seg-space-reduced-dim space))
         _ (when (and map-only?
-                     (some #(> (count (set (map :idx %))) 1)
-                           (vals (group-by :sym (:operands contract-facts)))))
-            (decline! :map-multiple-accesses
-                      "initial map capacity proof requires one index expression per input"
-                      {:operands (:operands contract-facts)}))
-        _ (when (and map-only?
                      (not (every? #(and (integer? (:bound %)) (pos? (:bound %))) segment-dims)))
             (decline! :map-domain
                       "initial zero-reduction schedule requires positive static axis extents"
@@ -153,10 +147,26 @@
                       {:dtype dtype :arrays arrays :array-types array-types
                        :scalars scalars :scalar-types scalar-types
                        :workgroup-size workgroup-size}))
-        operand-maps (into {}
+        ;; A physical input can have several independently certified dense reads. Their
+        ;; coordinates stay in the element region; storage needs the union of those read
+        ;; domains, not the output domain or the first read's shape. This map-only family
+        ;; already requires positive static axes, so exact host products/maxima suffice.
+        map-read-maps (when (and map-only? (seq arrays))
+                        (facts/dense-operand-read-maps contract-facts))
+        _ (when (and map-only? (seq arrays) (nil? map-read-maps))
+            (decline! :operand-layout
+                      "portable map could not prove every dense operand read domain"
+                      {:indices (mapv (juxt :sym :idx) (:operands contract-facts))}))
+        map-input-extents
+        (when map-only?
+          (reduce (fn [extents {:keys [sym] amap :map}]
+                    (let [extent (reduce *' 1 (mapcat #(map second %) (:groups amap)))]
+                      (update extents sym #(if % (max % extent) extent))))
+                  {} map-read-maps))
+        operand-maps (when-not map-only? (into {}
                            (map (fn [array]
                                   [array (facts/operand-axis-map contract-facts array)]))
-                           arrays)
+                           arrays))
         _ (when-let [missing (seq (keep (fn [[array amap]] (when-not amap array)) operand-maps))]
             (decline! :operand-layout
                       "portable contraction could not prove a dense physical map for every operand"
@@ -224,7 +234,8 @@
         ;; Operand indices in the certified contraction body are already the authoritative
         ;; physical coordinate expressions.  `operand-maps` prove those expressions and provide
         ;; storage extents; they are not a wrapper around the expression handed back by
-        ;; `lower-element-operations`.
+        ;; `lower-element-operations`. For a map, every read has its own map and the
+        ;; physical input extent covers their union; neither case rewrites load coordinates.
         element-coordinate-lower #(lower-index % index-scope)
         epilogue-coordinate-lower #(lower-index (axis-map/index-expr %) index-scope)
         {:keys [operations result]}
@@ -246,7 +257,9 @@
         reduction-result (if map-only? result 'segment-result)
         physical-extent
         (fn [array]
-          (lower-index (axis-map/n-elements (get operand-maps array)) index-scope))
+          (if map-only?
+            (get map-input-extents array)
+            (lower-index (axis-map/n-elements (get operand-maps array)) index-scope)))
         transform-operand-parameters
         (mapv (fn [{:keys [sym dtype map]}]
                 (let [dtype (dtype/canon dtype)
