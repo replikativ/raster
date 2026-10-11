@@ -154,8 +154,8 @@
                       (.withField cb fname fcd (int 0x0002))) ;; PRIVATE
               ;; initFn field: holds the Clojure fn that allocates buffers
                     (.withField cb "initFn" obj-cd (int 0x0002)) ;; PRIVATE
-              ;; initialized flag
-                    (.withField cb "initialized" Z-cd (int 0x0002)) ;; PRIVATE
+              ;; Release/acquire publication for the lock-free initialized path.
+                    (.withField cb "initialized" Z-cd (int 0x0042)) ;; PRIVATE + VOLATILE
 
               ;; Constructor: takes initFn only
                     (let [ctor-mt (MethodTypeDesc/of void-cd (into-array ClassDesc [obj-cd]))]
@@ -177,9 +177,17 @@
 
               ;; doInit: call initFn(args...), extract results, store in fields
               ;; initFn returns a seq/vector of buffer arrays
-                    (.withMethodBody cb "doInit" init-mt (int 0x0002) ;; PRIVATE
+                    (.withMethodBody cb "doInit" init-mt (int 0x0022) ;; PRIVATE + SYNCHRONIZED
                                      (reify java.util.function.Consumer
                                        (accept [_ code]
+                    ;; A caller may have observed false before another caller
+                    ;; initialized. Recheck under the monitor before reading initFn.
+                                         (.aload code 0)
+                                         (.getfield code wrapper-cd "initialized" Z-cd)
+                                         (let [initialize (.newLabel code)]
+                                           (.ifeq code initialize)
+                                           (.return_ code)
+                                           (.labelBinding code initialize))
                     ;; Call initFn with all args
                                          (.aload code 0)
                                          (.getfield code wrapper-cd "initFn" obj-cd)
@@ -233,14 +241,15 @@
                                                  (.putfield code wrapper-cd fname fcd))))
                       ;; Pop remaining dup if last nth consumed it
                                            )
-                    ;; Set initialized = true
-                                         (.aload code 0)
-                                         (.ldc code (int 1))
-                                         (.putfield code wrapper-cd "initialized" Z-cd)
                     ;; Clear initFn to allow GC
                                          (.aload code 0)
                                          (.aconst_null code)
                                          (.putfield code wrapper-cd "initFn" obj-cd)
+                    ;; Publish only after all fields and lifecycle cleanup are
+                    ;; complete. Failure leaves initialized false for retry.
+                                         (.aload code 0)
+                                         (.ldc code (int 1))
+                                         (.putfield code wrapper-cd "initialized" Z-cd)
                                          (.return_ code))))
 
               ;; Typed invk: check initialized, load params + fields, invokestatic compute
