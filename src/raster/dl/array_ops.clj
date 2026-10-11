@@ -26,7 +26,7 @@
   Domain ops (kept for complex patterns):
     flat-embed-op    - value + space embedding
     dot-rows         - per-row dot product (unembed)
-    masked-mse-loss  - MSE on non-observed variables"
+    masked-mse-loss  - MSE on the latent variables (state 0)"
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :refer [deftm ftm broadcast]]
             [raster.arrays :refer [aget aset alength aclone acopy! alloc-like]]
@@ -1126,7 +1126,9 @@
                        (+ acc (aget dy v)))))
 
 ;; ================================================================
-;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]!=1)
+;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]=0)
+;; Only latent variables (GSDM state 0) are predicted: observed (1) and
+;; intervened (3) values are given, marginalized (2) ones are absent.
 ;; ================================================================
 
 (deftm masked-mse-loss-into!
@@ -1146,7 +1148,7 @@
      [[sum 0.0 :double] [count (long 0) :long]]
      [[segment 1]]
      i n
-     [active (long (if (not= (aget states i) 1) 1 0))
+     [active (long (if (== (aget states i) 0) 1 0))
       diff (- (aget pred i) (aget target i))]
      [(if (== active 1) (* diff diff) 0.0) active]
      [[left-sum right-sum] [left-count right-count]]
@@ -1171,7 +1173,7 @@
 
 (deftm masked-mse-loss-backward
   "Backward for pred in masked-mse-loss.
-  d_pred[i] = 2*(pred[i]-target[i])/cnt * dy where states[i]!=1, else 0."
+  d_pred[i] = 2*(pred[i]-target[i])/cnt * dy where states[i]=0, else 0."
   [dy :- Double pred :- (Array double) target :- (Array double)
    states :- (Array long) n :- Long]
   :- (Array double)
@@ -1182,7 +1184,7 @@
      [[count (long 0) :long]]
      [[segment 1]]
      i n
-     [active (long (if (not= (aget states i) 1) 1 0))]
+     [active (long (if (== (aget states i) 0) 1 0))]
      [active]
      [[left-count right-count]]
      []
@@ -1193,7 +1195,7 @@
      out i n double
      (let [count (aget counts 0)]
        (if (> count 0)
-         (if (not= (aget states i) 1)
+         (if (== (aget states i) 0)
            (* (/ (* 2.0 dy) (double count))
               (- (aget pred i) (aget target i)))
            0.0)

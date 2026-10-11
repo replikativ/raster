@@ -1,6 +1,7 @@
 (ns raster.dl.gsdm-test
   (:require [raster.compiler.reference.gemm-opencl :as gemm-oracle]
             [clojure.test :refer [deftest testing is use-fixtures]]
+            [raster.dl.array-ops :as array-ops]
             [raster.dl.gsdm :as gsdm]
             [raster.dl.nn :as nn]
             [raster.dl.diffusion :as diff]
@@ -60,10 +61,27 @@
       (is (= 3 (:n-vars mg)))
       (is (= [1.0 3.0 4.0] (vec (:values mg))))
       (is (= [gsdm/LATENT gsdm/OBSERVED gsdm/LATENT] (vec (:states mg))))
-      ;; Edges touching var 1 removed: only 2→3 (→ 1→2) and 3→0 (→ 2→0)
-      (is (= 2 (:n-edges mg)))
+      ;; Edges touching var 1 removed, 2→3 (→ 1→2) and 3→0 (→ 2→0) kept, and
+      ;; 0→1→2 filled in as 0→2 (→ 0→1)
+      (is (= [[1 2] [2 0] [0 1]] (mapv vector (:src-edges mg) (:dst-edges mg))))
       ;; Original indices
       (is (= [0 2 3] (vec (:original-indices mg))))))
+
+  (testing "fill-in follows elimination: a chain 0→1→2→3 with 1 and 2 marginalized"
+    (let [mg (gsdm/marginalize-graph (double-array 4) (long-array 4)
+                                     (long-array [gsdm/LATENT gsdm/MARGINALIZED gsdm/MARGINALIZED gsdm/LATENT])
+                                     (long-array [0 1 2]) (long-array [1 2 3]) 4 3)]
+      ;; eliminating 1 adds 0→2, eliminating 2 then adds 0→3
+      (is (= [[0 1]] (mapv vector (:src-edges mg) (:dst-edges mg))))))
+
+  (testing "fill-in adds no self-loops and no duplicates"
+    (let [{:keys [src-edges dst-edges n-edges]} (gsdm/fully-connected-edges 3)
+          mg (gsdm/marginalize-graph (double-array 3) (long-array 3)
+                                     (long-array [gsdm/LATENT gsdm/MARGINALIZED gsdm/LATENT])
+                                     src-edges dst-edges 3 n-edges)]
+      ;; the fully connected graph on {0, 2}, self-loops included, as before
+      (is (= #{[0 0] [0 1] [1 0] [1 1]} (set (mapv vector (:src-edges mg) (:dst-edges mg)))))
+      (is (= 4 (:n-edges mg)))))
 
   (testing "all marginalized — empty graph"
     (let [values (double-array [1.0 2.0])
@@ -552,3 +570,14 @@
       (is (< (last losses) (first losses))
           (format "loss[5]=%.4f should be < loss[1]=%.4f"
                   (last losses) (first losses))))))
+
+(deftest only-latent-variables-are-in-the-loss
+  ;; observed (1) and intervened (3) values are given, not predicted
+  (let [pred (double-array [1.0 5.0 7.0 2.0])
+        target (double-array [0.0 0.0 0.0 0.0])
+        states (long-array [gsdm/LATENT gsdm/INTERVENED gsdm/OBSERVED gsdm/LATENT])]
+    (is (== 2.5 (array-ops/masked-mse-loss pred target states 4)))
+    (is (= [1.0 0.0 0.0 2.0] (vec (array-ops/masked-mse-loss-backward 1.0 pred target states 4)))))
+  (is (gsdm/clamped? gsdm/OBSERVED))
+  (is (gsdm/clamped? gsdm/INTERVENED))
+  (is (not (gsdm/clamped? gsdm/LATENT))))

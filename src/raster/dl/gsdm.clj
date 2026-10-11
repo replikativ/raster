@@ -18,12 +18,17 @@
     edges, so variables only attend to their Markov blanket.
 
   Variable states:
-    LATENT (0)       — denoised by the model
+    LATENT (0)       — denoised by the model, the only ones in the loss
     OBSERVED (1)     — clamped, provides conditioning signal
     MARGINALIZED (2) — excluded from representation and graph
-    INTERVENED (3)   — for causal do-calculus reasoning
+    INTERVENED (3)   — clamped to the intervention's value like an observation,
+                       with its own state embedding (do-calculus). Cutting
+                       the information flow to the intervened variable's
+                       parents needs the graph's parent structure, which the
+                       edge list does not carry.
 
-  Reference: 'Graphically Structured Diffusion Models' (Gruber et al.)"
+  Reference: Weilbach, Harvey & Wood, 'Graphically Structured Diffusion
+  Models', ICML 2023."
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :as core :refer [deftm ftm]]
             [raster.arrays :refer [aget aset alength aclone alloc-like]]
@@ -49,23 +54,63 @@
 (def ^:const INTERVENED 3)
 (def ^:const N-STATES 4)
 
+(defn clamped?
+  "Whether a variable in `state` keeps its given value: an observation or an
+  intervention."
+  [state]
+  (or (== OBSERVED state) (== INTERVENED state)))
+
 ;; ================================================================
 ;; Marginalization: remove variables from graph and reindex
 ;; ================================================================
 
+(defn- elimination-fill-in
+  "Edges [a b] (a ≠ b) that eliminating the MARGINALIZED variables adds
+  between the variables that remain, in a deterministic order. Variables are
+  eliminated in index order: removing m connects every a with a → m to every
+  b with m → b, so information that flowed through m keeps a path. Fill-in
+  between variables marginalized later carries forward to the remaining
+  ones (variable elimination)."
+  [states src-edges dst-edges n-vars n-edges]
+  (let [marginalized? (fn [i] (== MARGINALIZED (aget states i)))
+        [ins outs] (loop [e 0 ins {} outs {}]
+                     (if (< e n-edges)
+                       (let [s (aget src-edges e) d (aget dst-edges e)]
+                         (if (== s d)
+                           (recur (inc e) ins outs)
+                           (recur (inc e) (update ins d (fnil conj #{}) s) (update outs s (fnil conj #{}) d))))
+                       [ins outs]))
+        original (set (map (fn [e] [(aget src-edges e) (aget dst-edges e)]) (range n-edges)))
+        [_ _ added]
+        (reduce (fn [[ins outs added] m]
+                  (let [as (disj (get ins m #{}) m)
+                        bs (disj (get outs m #{}) m)
+                        new (for [a as b bs :when (not= a b)] [a b])
+                        ins (reduce (fn [ins [a b]] (update ins b (fnil conj #{}) a)) ins new)
+                        outs (reduce (fn [outs [a b]] (update outs a (fnil conj #{}) b)) outs new)
+                        ;; m leaves the graph
+                        ins (reduce (fn [ins b] (update ins b disj m)) (dissoc ins m) bs)
+                        outs (reduce (fn [outs a] (update outs a disj m)) (dissoc outs m) as)]
+                    [ins outs (into added new)]))
+                [ins outs (sorted-set)]
+                (filter marginalized? (range n-vars)))]
+    (vec (remove (fn [[a b]] (or (marginalized? a) (marginalized? b) (contains? original [a b]))) added))))
+
 (defn marginalize-graph
-  "Remove MARGINALIZED variables from the graph, filter edges, and reindex.
+  "Remove MARGINALIZED variables from the graph and reindex.
 
   Variables with state=MARGINALIZED are excluded from the flat representation.
-  Edges touching marginalized nodes are removed. Remaining edges are reindexed
-  to the compact representation.
+  Edges touching marginalized nodes are removed, and the remaining variables
+  that were connected through them are connected directly
+  (`elimination-fill-in`, as GSDM's reference implementation does): without
+  it, marginalizing a variable that separates two others would cut the path
+  between them. Kept edges stay in their order; fill-in edges follow.
 
   Returns {:values double[], :spaces long[], :states long[],
            :src-edges long[], :dst-edges long[],
            :n-vars long, :n-edges long,
            :original-indices long[] (old index for each new index)}"
-  [^doubles values ^longs spaces ^longs states
-   ^longs src-edges ^longs dst-edges n-vars n-edges]
+  [values spaces states src-edges dst-edges n-vars n-edges]
   (let [n-vars (int n-vars)
         n-edges (int n-edges)
         ;; Build compact index: old -> new (-1 for marginalized)
@@ -92,29 +137,16 @@
                     (aset orig-indices j (long i))
                     (recur (inc i) (inc j)))
                 (recur (inc i) j))))
-        ;; Count valid edges first
-        new-n-edges (loop [e 0 cnt 0]
-                      (if (< e n-edges)
-                        (let [s (aget src-edges e)
-                              d (aget dst-edges e)]
-                          (if (and (>= (aget idx-map s) 0)
-                                   (>= (aget idx-map d) 0))
-                            (recur (inc e) (inc cnt))
-                            (recur (inc e) cnt)))
-                        cnt))
+        kept (filterv (fn [[s d]] (and (>= (aget idx-map s) 0) (>= (aget idx-map d) 0)))
+                      (map (fn [e] [(aget src-edges e) (aget dst-edges e)]) (range n-edges)))
+        edges (into kept (elimination-fill-in states src-edges dst-edges n-vars n-edges))
+        new-n-edges (count edges)
         new-src (long-array new-n-edges)
-        new-dst (long-array new-n-edges)
-        _ (loop [e 0 j 0]
-            (when (< e n-edges)
-              (let [s (aget src-edges e)
-                    d (aget dst-edges e)
-                    ns (aget idx-map s)
-                    nd (aget idx-map d)]
-                (if (and (>= ns 0) (>= nd 0))
-                  (do (aset new-src j ns)
-                      (aset new-dst j nd)
-                      (recur (inc e) (inc j)))
-                  (recur (inc e) j)))))]
+        new-dst (long-array new-n-edges)]
+    (dotimes [j new-n-edges]
+      (let [[s d] (nth edges j)]
+        (aset new-src j (aget idx-map s))
+        (aset new-dst j (aget idx-map d))))
     {:values new-values :spaces new-spaces :states new-states
      :src-edges new-src :dst-edges new-dst
      :n-vars (long new-n) :n-edges (long new-n-edges)
@@ -895,26 +927,26 @@
         mg-values (if mg-normalizer
                     (normalize-2pass mg-values mg-normalizer mg-n-vars)
                     mg-values)
-        ;; Start from pure noise for latent, observed values for observed
+        ;; Start from pure noise for latent, the given values for clamped ones
         x (double-array mg-n-vars)]
     (dotimes [i mg-n-vars]
       (aset x i
-            (if (== (aget mg-states i) OBSERVED)
+            (if (clamped? (aget mg-states i))
               (aget mg-values i)
               (.nextGaussian ^java.util.Random rng))))
     ;; Reverse diffusion loop
     (loop [step (dec (int timesteps))]
       (when (>= step 0)
-        (let [;; Clamp observed before prediction
+        (let [;; Clamp observed and intervened values before prediction
               _ (dotimes [i mg-n-vars]
-                  (when (== (aget mg-states i) OBSERVED)
+                  (when (clamped? (aget mg-states i))
                     (aset x i (aget mg-values i))))
               ;; Predict x0 from current x_t
               pred-x0 (gsdm-forward-dynamic weights config x mg-spaces mg-states
                                             (double step) mg-src mg-dst mg-n-vars mg-n-edges)
-              ;; Clamp prediction at observed positions
+              ;; Clamp the prediction at clamped positions
               _ (dotimes [i mg-n-vars]
-                  (when (== (aget mg-states i) OBSERVED)
+                  (when (clamped? (aget mg-states i))
                     (aset ^doubles pred-x0 i (aget mg-values i))))
               ;; DDPM reverse step coefficients
               alpha-t (aget ^doubles alphas-cumprod step)
@@ -925,7 +957,7 @@
               ;; fixedlarge variance (DDPM Table 2): sigma^2 = beta_t
               sigma (if (pos? step) (Math/sqrt beta-t) 0.0)]
           (dotimes [i mg-n-vars]
-            (when (not= (aget mg-states i) OBSERVED)
+            (when (not (clamped? (aget mg-states i)))
               (let [mean (+ (* coeff-x0 (aget ^doubles pred-x0 i))
                             (* coeff-xt (aget x i)))
                     noise-i (if (pos? step) (* sigma (.nextGaussian ^java.util.Random rng)) 0.0)]
