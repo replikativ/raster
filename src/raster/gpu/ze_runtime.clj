@@ -1965,6 +1965,12 @@
             (klaunch/geometry {:workgroup-size [(or (:workgroup-size kernel-info) 256)]
                                :group-count [1]})))))
 
+(defn- known-direct-capacity [value _slot]
+  (cond
+    (device-buffer? value) (:n-elements (assert-buffer-live! value))
+    (instance? MemorySegment value) nil
+    (dt/dtype-for-jvm-array value) (java.lang.reflect.Array/getLength value)))
+
 (defn- direct-map-geometry
   "Realize the compiler's complete launch, or check the remaining 1-D compatibility contract.
    Workgroup overrides cannot invalidate an artifact's emitted static assumptions."
@@ -2229,6 +2235,9 @@
             (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
         n (long (:value (second bound-pair)))
         geometry (direct-map-geometry registered (mapv second pairs) n {})
+        _ (when geometry
+            (kcall/validate-retained-input-capacities!
+             registered (mapv second pairs) known-direct-capacity))
         wg (first (:workgroup-size geometry))
         group-count (first (:group-count geometry))]
     (with-admitted-registration kernel-name registered
@@ -2460,6 +2469,9 @@
          geometry (direct-map-geometry registered
                                        (vec (concat arrays scalar-kernel-args [checked-bound]))
                                        n opts)
+         _ (when geometry
+             (kcall/validate-retained-input-capacities!
+              registered (vec (concat arrays scalar-kernel-args [checked-bound])) known-direct-capacity))
          wg (first (:workgroup-size geometry))
          group-count (first (:group-count geometry))]
      (with-admitted-registration kernel-name registered
@@ -3061,7 +3073,8 @@
         out-elems (long (if (number? out-elems-expr)
                           out-elems-expr
                           (kcall/resolve-value call out-elems-expr)))
-        {:keys [workgroup-size group-count]} (kcall/binding-plan call)]
+        {:keys [workgroup-size group-count] :as plan} (kcall/binding-plan call)
+        _ (kcall/validate-resident-output-capacities! call plan registered known-direct-capacity)]
     ;; Admit the exact validated snapshot before staging or loading by name.
     ;; Staging/loading helpers guard their own acquisitions; the surrounding
     ;; monitor keeps those phases in one registration generation. Do not nest

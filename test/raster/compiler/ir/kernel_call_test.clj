@@ -7,8 +7,10 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.core.layout :as layout]
             [raster.gpu.dispatch-tuning :as tuning]
             [raster.gpu.ocl-runtime :as ocl]
+            [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.resident-value :as resident-value]
             [raster.gpu.ze-runtime :as ze]))
 
@@ -26,6 +28,252 @@
 
 (def ^:private args
   [:resident-x :resident-out {:type :float :value 2.0} {:type :int :value 513}])
+
+(defn- retained-capacity-artifact
+  ([shape] (retained-capacity-artifact shape (layout/row-major shape :float)))
+  ([shape storage-layout]
+   (let [launch (klaunch/spec {:workgroup-size [4] :group-count [1]})
+         kernel (body/make
+                 {:id :retained-capacity
+                  :parameters [(body/->KernelParameter 'x :input :float shape :global storage-layout :operand)
+                               (body/->KernelParameter 'out :output :float [1] :global
+                                                       (layout/row-major [1] :float) :result)
+                               (body/->KernelParameter 'n :scalar :int [] nil nil :bound)]
+                  :launch launch})]
+     (kart/make {:kernel-name "retained_capacity_test"
+                 :source "__kernel void retained_capacity_test(__global const float* x, __global float* out, int n) {}"
+                 :abi [(kabi/slot 'x :input :float :role :operand)
+                       (kabi/slot 'out :output :float :role :result)
+                       (kabi/slot 'n :scalar :int :role :bound)]
+                 :arguments '[x out n] :launch launch :attributes {:kernel-body kernel}}))))
+
+(defn- host-capacity [value _slot]
+  (java.lang.reflect.Array/getLength value))
+
+(deftest retained-body-capacity-uses-storage-extents-and-exact-projection
+  (doseq [[required supplied] [[5 4] [2 1]]]
+    (let [kernel (retained-capacity-artifact [required])
+          arguments [(float-array supplied) (float-array 1) {:type :int :value 1}]]
+      (try
+        (kcall/validate-retained-input-capacities! kernel arguments host-capacity)
+        (is false "an undersized retained input must decline")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :kernel-body-buffer-capacity (:reason (ex-data e))))
+          (is (= required (:required-elements (ex-data e))))
+          (is (= supplied (:buffer-elements (ex-data e)))))))
+    (let [kernel (retained-capacity-artifact [required])]
+      (is (identical? kernel
+                      (kcall/validate-retained-input-capacities!
+                       kernel [(float-array required) (float-array 1) {:type :int :value 1}]
+                       host-capacity)))))
+  (let [kernel (retained-capacity-artifact ['n])
+        arguments [(float-array 4) (float-array 1) {:type :int :value 5}]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                         (kcall/validate-retained-input-capacities! kernel arguments host-capacity)))
+    (is (identical? kernel (kcall/validate-retained-input-capacities! kernel arguments (constantly nil))))
+    (doseq [bad [(assoc-in kernel [:attributes :kernel-body :parameters 0 :id] 'other)
+                 (update-in kernel [:attributes :kernel-body :parameters] pop)]]
+      (try
+        (kcall/validate-retained-input-capacities! bad arguments host-capacity)
+        (is false "a stale projection cannot supply storage authority")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :kernel-body-capacity-projection (:reason (ex-data e))))))))
+  (let [kernel (retained-capacity-artifact [Long/MAX_VALUE 2])]
+    (is (thrown? ArithmeticException
+                 (kcall/validate-retained-input-capacities!
+                  kernel [(float-array 1) (float-array 1) {:type :int :value 1}] host-capacity))))
+  (let [kernel (retained-capacity-artifact [2 3]
+                                          (assoc (layout/row-major [2 3] :float) :strides [5 1]))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                         (kcall/validate-retained-input-capacities!
+                          kernel [(float-array 7) (float-array 1) {:type :int :value 1}] host-capacity)))
+    (is (identical? kernel
+                    (kcall/validate-retained-input-capacities!
+                     kernel [(float-array 8) (float-array 1) {:type :int :value 1}] host-capacity))))
+  (let [plain {:kernel-name "legacy" :workgroup-size 4}
+        capacity-calls (atom 0)]
+    (is (identical? plain (kcall/validate-retained-input-capacities!
+                          plain [] (fn [& _] (swap! capacity-calls inc)))))
+    (is (zero? @capacity-calls))))
+
+(deftest retained-input-capacity-declines-public-direct-routes-before-native-contact
+  (doseq [required [5 2]
+          [registry invoke] [[ocl/kernel-registry ocl/invoke-registered-map-void-kernel]
+                             [ze/kernel-registry ze/invoke-registered-map-void-kernel]
+                             [ocl/kernel-registry (fn [name arrays _ n]
+                                                    (ocl/invoke-registered-kernel name [(first arrays)] (second arrays) [] n))]
+                             [ze/kernel-registry (fn [name arrays _ n]
+                                                   (ze/invoke-registered-kernel name [(first arrays)] (second arrays) [] n))]
+                             [ze/kernel-registry (fn [name arrays _ n]
+                                                   (ze/invoke-registered-contraction! name (conj arrays n)))]]]
+    (let [kernel (assoc-in (retained-capacity-artifact [required]) [:attributes :out-elems] 1)
+          native-calls (atom 0)]
+      (with-redefs [ocl/ensure-kernel-loaded! (fn [& _] (swap! native-calls inc) (throw (ex-info "unexpected native loading" {})))
+                    ze/ensure-kernel-loaded! (fn [& _] (swap! native-calls inc) (throw (ex-info "unexpected native loading" {})))]
+        (let [prior @registry]
+          (try
+            (reset! registry (assoc prior (:kernel-name kernel) kernel))
+            (try
+              (invoke (:kernel-name kernel) [(float-array (dec required)) (float-array 1)] [] 1)
+              (is false "known undersized input must fail before loading or allocation")
+              (catch clojure.lang.ExceptionInfo e
+                (is (= :kernel-body-buffer-capacity (:reason (ex-data e))))
+                (is (= required (:required-elements (ex-data e))))
+                (is (= (dec required) (:buffer-elements (ex-data e))))))
+            (is (zero? @native-calls))
+            (finally (reset! registry prior))))))))
+
+(deftest retained-input-capacity-declines-both-resident-binders-before-loading
+  (doseq [required [5 2]
+          [registry bind make-buffer context-key runtime-state]
+          [[ocl/kernel-registry ocl/bind-kernel-call
+            (fn [segment count] (ocl/->OclBuffer segment segment count (* count 4) :float 64))
+            :raster.gpu.ocl-runtime/allocation-context (var-get (ns-resolve 'raster.gpu.ocl-runtime 'state))]
+           [ze/kernel-registry ze/bind-kernel-call
+            (fn [segment count] (ze/->DeviceBuffer segment count (* count 4) :float))
+            :raster.gpu.ze-runtime/allocation-context (var-get (ns-resolve 'raster.gpu.ze-runtime 'state))]]]
+    (let [kernel (retained-capacity-artifact [required])
+          owned (fn [count]
+                  (assoc (make-buffer (java.lang.foreign.MemorySegment/ofArray (float-array count)) count)
+                         ::cleanup/owner (cleanup/owner []) context-key (:context @runtime-state)))
+          call (kcall/make kernel [(owned (dec required)) (owned 1) {:type :int :value 1}])
+          native-calls (atom 0)
+          prior @registry]
+      (with-redefs [ocl/ensure-kernel-loaded! (fn [& _] (swap! native-calls inc) (throw (ex-info "unexpected native loading" {})))
+                    ze/ensure-kernel-loaded! (fn [& _] (swap! native-calls inc) (throw (ex-info "unexpected native loading" {})))]
+        (try
+          (reset! registry (assoc prior (:kernel-name kernel) kernel))
+          (try
+            (bind call)
+            (is false "the resident binder must check retained input storage before native loading")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= :kernel-body-buffer-capacity (:reason (ex-data e))))
+              (is (= required (:required-elements (ex-data e))))
+              (is (= (dec required) (:buffer-elements (ex-data e))))))
+          (is (zero? @native-calls))
+          (finally (reset! registry prior)))))))
+
+(deftest retained-pitched-storage-preserves-zero-and-checked-stride-arithmetic
+  (let [make-kernel #(retained-capacity-artifact %1 (assoc (layout/row-major %1 :float) :strides %2))
+        arguments [(float-array 0) (float-array 1) {:type :int :value 0}]
+        empty-kernel (make-kernel ['n 3] [5 1])]
+    (is (identical? empty-kernel
+                    (kcall/validate-retained-input-capacities! empty-kernel arguments host-capacity)))
+    (is (thrown? ArithmeticException
+                 (kcall/validate-retained-input-capacities!
+                  (make-kernel [3 3] [Long/MAX_VALUE 1]) arguments host-capacity)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"strides must be non-negative"
+                         (kcall/validate-retained-input-capacities!
+                          (make-kernel [2 3] [-1 1]) arguments host-capacity)))))
+
+(deftest retained-storage-capacity-preserves-packed-byte-units-and-known-ze-ranges
+  (let [kernel (-> (retained-capacity-artifact [5])
+                   (assoc :source "__kernel void retained_capacity_test(__global const int* x, __global float* out, int n) {}")
+                   (assoc-in [:abi 0] (kabi/slot 'x :input :byte :kernel-dtype :int :role :operand))
+                   (assoc-in [:attributes :kernel-body :parameters 0 :dtype] :byte)
+                   (assoc-in [:attributes :kernel-body :parameters 0 :layout] (layout/row-major [5] :byte)))
+        arguments [(byte-array 5) (float-array 1) {:type :int :value 1}]]
+    (is (identical? kernel (kcall/validate-retained-input-capacities! kernel arguments host-capacity)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                         (kcall/validate-retained-input-capacities!
+                          kernel (assoc arguments 0 (byte-array 4)) host-capacity))))
+  (let [kernel (retained-capacity-artifact [5])
+        call (kcall/make kernel [(java.lang.foreign.MemorySegment/ofArray (float-array 4))
+                                (java.lang.foreign.MemorySegment/ofArray (float-array 1))
+                                {:type :int :value 1}])
+        prior @ze/kernel-registry
+        native-calls (atom 0)]
+    (with-redefs [ze/ensure-kernel-loaded! (fn [& _] (swap! native-calls inc) (throw (ex-info "unexpected native loading" {})))]
+      (try
+        (reset! ze/kernel-registry (assoc prior (:kernel-name kernel) kernel))
+        (try
+          (ze/bind-kernel-call call)
+          (is false "a known ZE memory range must retain its physical byte-derived capacity")
+          (catch clojure.lang.ExceptionInfo e
+            (is (= :kernel-body-buffer-capacity (:reason (ex-data e))))
+            (is (= 5 (:required-elements (ex-data e))))
+            (is (= 4 (:buffer-elements (ex-data e))))))
+        (is (zero? @native-calls))
+        (finally (reset! ze/kernel-registry prior))))))
+
+(deftest plain-direct-map-admission-does-not-acquire-retained-body-authority
+  (doseq [[registry invoke] [[ocl/kernel-registry ocl/invoke-registered-map-void-kernel]
+                             [ze/kernel-registry ze/invoke-registered-map-void-kernel]]]
+    (let [name "plain_capacity_boundary" prior @registry
+          load-failure (ex-info "loader boundary reached" {})
+          loads (atom 0)
+          loader (fn [& _] (swap! loads inc) (throw load-failure))]
+      (with-redefs [ocl/ensure-kernel-loaded! loader ze/ensure-kernel-loaded! loader]
+        (try
+          (reset! registry (assoc prior name {:kernel-name name :workgroup-size 4 :dtype :float}))
+          (try (invoke name [(float-array 1)] [] 1)
+               (is false "the existing plain positive route must reach its normal loader")
+               (catch Throwable e (is (identical? load-failure e))))
+          (is (= 1 @loads))
+          (doseq [bound [-1 1.5]]
+            (is (thrown? clojure.lang.ExceptionInfo (invoke name [(float-array 1)] [] bound))))
+          (is (= 1 @loads) "existing plain bound validation still precedes driver contact")
+          (finally (reset! registry prior)))))))
+
+(deftest retained-input-check-preserves-realized-output-authority-and-inout-reads
+  (let [launch (klaunch/spec {:workgroup-size [4] :group-count [8]})
+        kernel (-> (retained-capacity-artifact [5])
+                   (assoc :launch launch :effects {:kind :scalar-reduction-phase})
+                   (assoc-in [:attributes :kernel-body :launch] launch)
+                   (assoc-in [:attributes :kernel-body :parameters 1 :shape] [8])
+                   (assoc-in [:attributes :kernel-body :parameters 1 :layout] (layout/row-major [8] :float)))
+        arguments [(float-array 5) (float-array 1) {:type :int :value 1}]
+        call (kcall/make kernel arguments {:group-count [1]})
+        plan (kcall/binding-plan call)]
+    (is (= [1] (:group-count plan)))
+    (is (identical? plan (kcall/validate-resident-output-capacities! call plan kernel host-capacity))
+        "the actual one-group phase requires one output, not eight default-group outputs")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than its retained"
+                         (kcall/validate-resident-output-capacities!
+                          call (assoc plan :arguments (assoc arguments 0 (float-array 4))) kernel host-capacity)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scheduled group count"
+                         (kcall/validate-resident-output-capacities!
+                          call (assoc plan :pointer-pairs [[(second (:abi kernel)) (float-array 0)]])
+                          kernel host-capacity))))
+  (let [kernel (-> (retained-capacity-artifact [1])
+                   (assoc :source "__kernel void retained_capacity_test(__global const float* x, __global float* out, int n) {}")
+                   (assoc-in [:abi 1] (kabi/slot 'out :inout :float :role :result))
+                   (assoc-in [:attributes :kernel-body :parameters 1 :kind] :inout)
+                   (assoc-in [:attributes :kernel-body :parameters 1 :shape] [5])
+                   (assoc-in [:attributes :kernel-body :parameters 1 :layout] (layout/row-major [5] :float)))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than its retained"
+                         (kcall/validate-retained-input-capacities!
+                          kernel [(float-array 1) (float-array 4) {:type :int :value 1}] host-capacity)))))
+
+(deftest raw-ze-contraction-preserves-shared-output-capacity-for-both-effect-tags
+  (doseq [kind [:pure-contraction :tensor-contraction]]
+    (let [kernel (-> (retained-capacity-artifact [2])
+                     (assoc :effects {:kind kind})
+                     (assoc-in [:attributes :out-elems] 2))
+          owned (fn [count]
+                  (assoc (ze/->DeviceBuffer (java.lang.foreign.MemorySegment/ofArray (float-array count))
+                                            count (* count 4) :float)
+                         ::cleanup/owner (cleanup/owner [])
+                         :raster.gpu.ze-runtime/allocation-context
+                         (:context @(var-get (ns-resolve 'raster.gpu.ze-runtime 'state)))))
+          input (owned 2) prior @ze/kernel-registry
+          loads (atom 0) loader-failure (ex-info "native loading boundary" {})]
+      (with-redefs [ze/ensure-kernel-loaded! (fn [& _] (swap! loads inc) (throw loader-failure))]
+        (try
+          (reset! ze/kernel-registry (assoc prior (:kernel-name kernel) kernel))
+          (try
+            (ze/invoke-registered-contraction! (:kernel-name kernel) [input (owned 1) 1])
+            (is false "both emitted contraction tags must reject known undersized outputs")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= 2 (:out-elems (ex-data e))))
+              (is (= 1 (:buffer-elements (ex-data e))))))
+          (is (zero? @loads))
+          (try
+            (ze/invoke-registered-contraction! (:kernel-name kernel) [input (owned 2) 1])
+            (is false "sufficient known input/output storage must reach the existing loader")
+            (catch Throwable e (is (identical? loader-failure e))))
+          (is (= 1 @loads))
+          (finally (reset! ze/kernel-registry prior)))))))
 
 (deftest checked-preconditions-do-not-repeat-synchronous-artifact-validation
   (let [call (kcall/make artifact args)

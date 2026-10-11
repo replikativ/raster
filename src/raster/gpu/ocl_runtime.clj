@@ -1308,6 +1308,12 @@
         (throw primary)))
     nil))
 
+(defn- known-direct-capacity [value _slot]
+  (cond
+    (device-buffer? value) (:n-elements (assert-buffer-live! value))
+    (instance? MemorySegment value) nil
+    (dt/dtype-for-jvm-array value) (java.lang.reflect.Array/getLength value)))
+
 (defn invoke-registered-map-void-kernel
   "Invoke a compiled map-void kernel. Mirrors ze-runtime API.
   arrays: vector of OclBuffers or JVM arrays
@@ -1345,6 +1351,10 @@
          empty? (compatibility-map/empty-map? registered
                                              (vec (concat arrays (or checked-scalars scalar-args)
                                                           [checked-bound])) n)]
+     (when-not empty?
+       (kcall/validate-retained-input-capacities!
+        registered (vec (concat arrays (or checked-scalars scalar-args) [checked-bound]))
+        known-direct-capacity))
      (if empty?
        (do
          (cleanup/assert-registry-mutable! kernel-registry)

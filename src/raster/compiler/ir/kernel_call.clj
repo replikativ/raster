@@ -19,6 +19,9 @@
 (def ^:private body-launch-validator
   (delay (requiring-resolve 'raster.compiler.ir.kernel-body/validate-launch-index-ranges!)))
 
+(def ^:private body-capacity-contracts
+  (delay (requiring-resolve 'raster.compiler.ir.kernel-body-abi/retained-buffer-contracts)))
+
 (defn- validate-body-launch! [artifact geometry]
   (when-let [kernel-body (get-in artifact [:attributes :kernel-body])]
     (@body-launch-validator kernel-body geometry))
@@ -352,6 +355,50 @@
      :group-count (:group-count geometry)
      :shared-memory-bytes (:shared-memory-bytes geometry)}))
 
+(defn validate-retained-input-capacities!
+  "Preflight known read-capable storage against the exact retained KernelBody projection.
+   Opaque native handles remain caller-owned obligations; nil capacity never means zero.
+   Existing scalar algebra resolves shapes, including body parameter names whose compiler
+   argument spelling differs. Capacity is in ABI storage elements, never kernel view elements.
+   Output-only capacities remain governed by the existing realized binding-plan rules."
+  [artifact arguments capacity-of]
+  (when (kart/kernel-artifact? artifact)
+    (let [artifact (kart/validate! artifact)
+          arguments (kabi/validate-arguments! (:abi artifact) arguments)]
+      (when-let [body (get-in artifact [:attributes :kernel-body])]
+        (let [parameters (@body-capacity-contracts (:abi artifact) body)
+            scalars (into {} (keep (fn [[parameter value]]
+                                    (when (= :scalar (:kind parameter))
+                                      [(:id parameter) (runtime-number value)])))
+                          (map vector parameters arguments))
+            resolve-argument (argument-resolver artifact arguments)
+            resolve-scalar #(if (contains? scalars %) (get scalars %) (resolve-argument %))]
+        (doseq [[slot parameter value] (map vector (:abi artifact) parameters arguments)
+                :when (contains? #{:input :inout} (:kind slot))
+                :let [shape (mapv #(klaunch/resolve-expression resolve-scalar %) (:shape parameter))
+                      _ (when (some neg? shape)
+                          (throw (ex-info "retained storage extent must be non-negative"
+                                          {:reason :kernel-body-capacity-extent :slot slot :shape shape})))
+                      strides (some->> (get-in parameter [:layout :strides])
+                                       (mapv #(klaunch/resolve-expression resolve-scalar %)))
+                      _ (when (some neg? strides)
+                          (throw (ex-info "retained storage strides must be non-negative"
+                                          {:reason :kernel-body-capacity-layout :slot slot :strides strides})))
+                      required (cond
+                                 (some zero? shape) 0
+                                 strides (reduce (fn [span [extent stride]]
+                                                   (Math/addExact
+                                                    (long span)
+                                                    (Math/multiplyExact (long (dec extent)) (long stride))))
+                                                 1 (map vector shape strides))
+                                 :else (reduce #(Math/multiplyExact (long %1) (long %2)) 1 shape))
+                      capacity (capacity-of value slot)]
+                :when (and (some? capacity) (< (long capacity) required))]
+          (throw (ex-info "kernel buffer is smaller than its retained storage extent"
+                          {:reason :kernel-body-buffer-capacity :kernel-name (:kernel-name artifact)
+                           :slot slot :required-elements required :buffer-elements capacity})))))))
+  artifact)
+
 (defn validate-resident-output-capacities!
   "Check artifact-declared result extents before a backend contacts its driver.
 
@@ -359,6 +406,7 @@
    for an opaque external handle. The backend decides which handles carry trustworthy
    capacity facts; the artifact/launch rule is shared across backends."
   [call plan registered capacity-of]
+  (validate-retained-input-capacities! registered (:arguments plan) capacity-of)
   (let [{:keys [kernel-name pointer-pairs group-count]} plan
         results (filterv (fn [[slot _]] (= :result (:role slot))) pointer-pairs)
         kind (get-in registered [:effects :kind])]
@@ -371,7 +419,7 @@
           (throw (ex-info "resident reduction result buffer is smaller than its scheduled group count"
                           {:kernel-name kernel-name :slot slot
                            :required-elements required :buffer-elements capacity})))))
-    (when (= :tensor-contraction kind)
+    (when (contains? #{:pure-contraction :tensor-contraction} kind)
       (let [extent-expr (kart/attribute registered :out-elems)
             out-elems (long (if (number? extent-expr)
                               extent-expr
