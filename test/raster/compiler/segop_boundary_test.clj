@@ -100,11 +100,16 @@
                   result)
            {})
         p (:form r)
+        certified-source (get (into {} (map vec (partition 2 (second (program/source-form p)))))
+                              'result)
         scheduled (program/kernel-graph-for-binding
-                   p 'result '(raster.par/scan out acc 0.0 i n double
-                                               (+ acc (aget values i))))]
+                   p 'result certified-source)]
     (is (= 1 (get-in r [:stats :segops-lowered])))
     (is (= 1 (get-in r [:stats :kernel-graphs-lowered])))
+    (is (nil? (program/kernel-graph-for-binding
+               p 'result '(raster.par/scan out acc 0.0 i n double
+                                           (+ acc (aget values i)))))
+        "a certificate belongs to the retained canonical source, not its earlier spelling")
     (is (kernel-graph/kernel-graph? scheduled))
     (is (= 3 (count (:nodes scheduled))))
     (is (= [:intra-block :block-scan nil]
@@ -116,9 +121,16 @@
                                            (Math/tanh (+ (* w h) (aget values i))))]
                   result)
            {})
-        d (first (get-in r [:stats :segops-declined]))]
+        declines (get-in r [:stats :segops-declined])
+        typed-decline (first declines)
+        d (first (filter #(= :segop (:stage %)) declines))]
     (is (zero? (get-in r [:stats :segops-lowered])))
     (is (zero? (get-in r [:stats :kernel-graphs-lowered])))
+    (is (= 2 (count declines)))
+    (is (= :typed-admission (:stage typed-decline)))
+    (is (= :scan-not-associative (:reason typed-decline)))
+    (is (= (get (into {} (map vec (partition 2 (second (program/source-form (:form r)))))) 'result)
+           (:source typed-decline)))
     (is (= :segop (:stage d)))
     (is (= :scan-not-associative (:reason d)))
     (is (= :backend-relowers-or-uses-specialized-codegen (:fallback d)))))
