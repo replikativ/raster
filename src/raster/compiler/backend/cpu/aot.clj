@@ -706,6 +706,56 @@
   (when-let [n (const-int-size size)]
     (when (and (<= n sroa-local-max) (not (contains? result-set sym))) n)))
 
+(defn- size-binding-plan
+  "Retain only ordered scalar bindings needed transitively by heap extents."
+  [heap-buffers scalar-bindings]
+  (second
+   (reduce (fn [[needed selected] [sym init :as binding]]
+             (if (contains? needed sym)
+               [(into (disj needed sym) (util/free-syms init)) (cons binding selected)]
+               [needed selected]))
+           [(into #{} (mapcat #(util/free-syms (second %)) heap-buffers)) ()]
+           (reverse scalar-bindings))))
+
+(defn- native-call-wrapper
+  "Compile immutable argument/result selectors once. Invocation scratch stays local."
+  [native params array-params scalar-params len-order heap-buffers scalar-bindings
+   result-shape result-syms reuse-buffers?]
+  (let [param-index (zipmap params (range))
+        buffer-index (zipmap (map first heap-buffers) (range))
+        array-indices (mapv #(param-index (first %)) array-params)
+        scalar-indices (mapv #(param-index (first %)) scalar-params)
+        length-plan (mapv (fn [[arr ls]] [(param-index arr) ls]) len-order)
+        size-bindings (vec (size-binding-plan heap-buffers scalar-bindings))
+        needed (into #{} (mapcat util/free-syms)
+                     (concat (map second heap-buffers) (map second size-bindings)))
+        size-params (filterv (fn [[p _]] (contains? needed p)) (vec param-index))
+        result-plan (mapv (fn [s]
+                            (cond (contains? param-index s) [:input (param-index s)]
+                                  (contains? buffer-index s) [:buffer (buffer-index s)]
+                                  :else [:absent nil])) result-syms)
+        cache (when reuse-buffers? (volatile! nil))]
+    (fn [& args]
+      (let [args (vec args)
+            lengths (mapv #(count (nth args (first %))) length-plan)
+            env (reduce (fn [m [[_ ls] n]] (assoc m ls n))
+                        (into {} (map (fn [[p i]] [p (nth args i)]) size-params))
+                        (map vector length-plan lengths))
+            env (reduce (fn [m [sym init]] (assoc m sym (resolve-int-expr init m)))
+                        env size-bindings)
+            sizes (mapv #(long (resolve-int-expr (second %) env)) heap-buffers)
+            cached (some-> cache deref)
+            bufs (if (and cached (= (:sizes cached) sizes))
+                   (:bufs cached)
+                   (let [b (mapv (fn [[_ _ elem] n] (alloc-array elem n)) heap-buffers sizes)]
+                     (some-> cache (vreset! {:sizes sizes :bufs b})) b))
+            arguments (into (into (mapv #(nth args %) array-indices) bufs)
+                            (into (mapv #(nth args %) scalar-indices) lengths))]
+        (apply native arguments)
+        (let [results (mapv (fn [[kind i]]
+                              (case kind :input (nth args i) :buffer (nth bufs i) nil)) result-plan)]
+          (if (= :vector result-shape) results (first results)))))))
+
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
   backend. Returns a fn of the deftm's args that allocates output buffers, calls
@@ -761,38 +811,9 @@
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count heap-buffers))
                                 scalar-ffm)
-        buf-syms (mapv first heap-buffers)
-        ;; Buffers are allocated per call unless :reuse-buffers? (compile-aot's
-        ;; contract): then they are kept across calls, keyed by the resolved size
-        ;; signature, and the returned buffer is overwritten on the next call.
-        cache (when reuse-buffers? (volatile! nil))]
+        wrapper (native-call-wrapper native params array-params scalar-params len-order
+                                     heap-buffers scalar-bindings result-shape result-syms
+                                     reuse-buffers?)]
     (with-meta
-      (fn [& args]
-        (let [base-env (zipmap params args)
-              len-env (reduce (fn [m [arr ls]] (assoc m ls (count (get base-env arr))))
-                              base-env len-order)
-              ;; scalar-bindings are candidate buffer-size contributors. Only the
-              ;; integer index/size expressions resolve here; value computations that
-              ;; happen to be non-loop scalars (e.g. inv = 1/sqrt(ms+eps)) are not
-              ;; size-relevant and are skipped — buffer sizes never reference them.
-              env (reduce (fn [m [sym init]]
-                            (if-let [v (try (resolve-int-expr init m) (catch Exception _ nil))]
-                              (assoc m sym v) m))
-                          len-env scalar-bindings)
-              sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) heap-buffers)
-              c (some-> cache deref)
-              buf-arrs (if (and c (= (:sizes c) sizes))
-                         (:bufs c)
-                         (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) heap-buffers sizes)]
-                           (some-> cache (vreset! {:sizes sizes :bufs b}))
-                           b))
-              in-arrs  (map (comp base-env first) array-params)
-              scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
-              lengths  (map (fn [[_ ls]] (get env ls)) len-order)]
-          (apply native (concat in-arrs buf-arrs scalars lengths))
-          ;; result may be an allocated buffer OR an in-place output param (passed in)
-          (let [sym->arr (merge (zipmap buf-syms buf-arrs) base-env)]
-            (case result-shape
-              :vector (mapv sym->arr result-syms)
-              (sym->arr (first result-syms))))))
+      wrapper
       {:c-source src :kernel-name kernel-name})))
