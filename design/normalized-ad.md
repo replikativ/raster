@@ -119,6 +119,26 @@ after inlining or materialization to recover semantics lost by an earlier pass.
 
 ## Linearization and transposition
 
+The map migration starts at its typed element region. `linearize-map-element` accepts one
+validated pure functional map with one homogeneous plain Float/Double array and one result.
+The element parameter is active; scalar captures are inactive. Ordered local definitions
+retain their declared dtypes and are checked before scalar projection can repair a widening.
+The importer uses the existing scalar program entry, derivative rules, bundle and validators;
+it does not rewalk source or infer types from output storage. Known empty frontend storage
+facets are admitted; effects, aliases, storage-backed outputs, unknown numerical facets,
+mixed precision and index dependence refuse. Retained calls must already have canonical
+identities, not unresolved source aliases.
+The shared scalar call check rejects a callee owned by the current value environment before
+global intrinsic/rule lookup, even if no source lexical marker was supplied. A scalar capture
+named `double` therefore cannot acquire the global cast rule; a qualified core cast is distinct.
+
+This entry returns a **scalar element bundle**, not a whole-array pullback. The next step is
+lifting those ordinary primal/linear/transpose programs into checked map equations. Element
+coefficients needed later must be captured into fresh owned residual arrays at primal
+execution; a mutable input array is not a snapshot. Inactive scalar captures can remain scalar
+residuals. Array transposition needs an explicit cotangent array and must not silently sum an
+array output through `value+grad`. This slice does not close the training/model acceptance gate.
+
 The next arithmetic slice admits binary division through the same operation descriptors and
 templates. Generated nested rule terms are flattened by the existing AD ANF normalizer;
 temporary contracts come from the rule's declared homogeneous scalar space and are checked

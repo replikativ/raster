@@ -43,7 +43,10 @@
     (some-> (get values expression) scalar-dtype!)
     (literal-dtype expression)))
 
-(defn- call! [expression]
+(defn- call! [values expression]
+  (let [callee (:implementation-op (descriptor/call-description expression))]
+    (when (contains? values callee)
+      (fail! :ad-normalized-callee {:expression expression :lexical-callee callee})))
   (let [{:keys [operation lexical-callee arguments] :as call}
         (descriptor/call-description expression)
         [template template-identity] (templates/resolve-template operation)
@@ -113,7 +116,7 @@
                  (expression-dtype values expression)
 
                  (seq? expression)
-                 (let [{:keys [arguments cast-tag] :as call} (call! expression)
+                 (let [{:keys [arguments cast-tag] :as call} (call! values expression)
                        arg-types (mapv #(expression-dtype values %) arguments)]
                    (when (some nil? arg-types)
                      (fail! :ad-normalized-unknown-type {:binding binding :expression expression}))
@@ -135,7 +138,7 @@
         (reduce (fn [{:keys [values equations]} [binding expression]]
                   (when (contains? values binding)
                     (fail! :ad-normalized-redefinition {:binding binding}))
-                  (when (seq? expression) (call! expression))
+                  (when (seq? expression) (call! values expression))
                   (let [binding (if (and (nil? (types/sym-type-tag binding))
                                          (literal-dtype expression))
                                   (tagged binding (literal-dtype expression)) binding)
@@ -191,33 +194,33 @@
     (doseq [[_ value] values] (scalar-dtype! value))
     (let [classes
           (reduce
-     (fn [classes [result expression]]
-       (binding-dtype! values result expression)
-       (let [class (if (seq? expression)
-                    (let [{:keys [canonical cast-tag arguments]} (call! expression)
-                          kinds (mapv #(if (number? %) (if (zero? %) :zero :coefficient)
-                                           (get classes % :coefficient)) arguments)
-                          linear? (some #{:linear} kinds)]
-                      (when (and (= '* canonical) (every? #{:linear} kinds))
-                        (fail! :ad-normalized-nonlinear {:result result :expression expression}))
-                      (when (and (= '/ canonical) (= :linear (second kinds)))
-                        (fail! :ad-normalized-nonlinear {:result result :expression expression}))
-                      (when (and cast-tag linear?
-                                 (not= (expression-dtype values (first arguments))
-                                       (:dtype (get values result))))
-                        (fail! :ad-normalized-active-conversion {:expression expression}))
-                      (when (and (contains? '#{+ -} canonical) linear?
-                                 (some #{:coefficient} kinds))
-                        (fail! :ad-normalized-affine-offset {:expression expression}))
-                      (cond linear? :linear
-                            (and (not (contains? '#{* /} canonical)) (every? #{:zero} kinds)) :zero
-                            :else :coefficient))
-                    (if (number? expression) (if (zero? expression) :zero :coefficient)
-                        (get classes expression :coefficient)))]
-         (assoc classes result class)))
-     (into (zipmap coefficient-ids (repeat :coefficient))
-           (zipmap tangent-ids (repeat :linear)))
-     (partition 2 (bindings program)))]
+           (fn [classes [result expression]]
+             (binding-dtype! values result expression)
+             (let [class (if (seq? expression)
+                           (let [{:keys [canonical cast-tag arguments]} (call! values expression)
+                                 kinds (mapv #(if (number? %) (if (zero? %) :zero :coefficient)
+                                                  (get classes % :coefficient)) arguments)
+                                 linear? (some #{:linear} kinds)]
+                             (when (and (= '* canonical) (every? #{:linear} kinds))
+                               (fail! :ad-normalized-nonlinear {:result result :expression expression}))
+                             (when (and (= '/ canonical) (= :linear (second kinds)))
+                               (fail! :ad-normalized-nonlinear {:result result :expression expression}))
+                             (when (and cast-tag linear?
+                                        (not= (expression-dtype values (first arguments))
+                                              (:dtype (get values result))))
+                               (fail! :ad-normalized-active-conversion {:expression expression}))
+                             (when (and (contains? '#{+ -} canonical) linear?
+                                        (some #{:coefficient} kinds))
+                               (fail! :ad-normalized-affine-offset {:expression expression}))
+                             (cond linear? :linear
+                                   (and (not (contains? '#{* /} canonical)) (every? #{:zero} kinds)) :zero
+                                   :else :coefficient))
+                           (if (number? expression) (if (zero? expression) :zero :coefficient)
+                               (get classes expression :coefficient)))]
+               (assoc classes result class)))
+           (into (zipmap coefficient-ids (repeat :coefficient))
+                 (zipmap tangent-ids (repeat :linear)))
+           (partition 2 (bindings program)))]
       (when-not (every? #(contains? #{:linear :zero} (get classes %)) (soac/outputs program))
         (fail! :ad-normalized-nonlinear-output {:outputs (soac/outputs program)}))
       (into #{} (keep (fn [[id class]] (when (= :linear class) id))) classes))))
@@ -239,7 +242,7 @@
 (defn- linearize [primal active-inputs fresh]
   (let [values (:values (soac/facts primal))
         tangent-inputs (mapv (fn [id] (tagged (gensym (str (name id) "__tangent_"))
-                                            (:dtype (get values id)))) active-inputs)
+                                              (:dtype (get values id)))) active-inputs)
         {:keys [emitted tangents]}
         (reduce
          (fn [{:keys [emitted tangents]} [result expression]]
@@ -249,7 +252,7 @@
                                                  (assoc result (get tangents expression)))}
              (number? expression) {:emitted emitted :tangents tangents}
              :else
-             (let [{:keys [template operation cast-tag arguments]} (call! expression)
+             (let [{:keys [template operation cast-tag arguments]} (call! values expression)
                    seeded (keep-indexed (fn [i argument]
                                           (when-let [seed (get tangents argument)] [i seed])) arguments)]
                (if (empty? seeded)
@@ -285,7 +288,7 @@
         defined (set (take-nth 2 emitted))
         external (set/difference (set (mapcat util/free-syms (take-nth 2 (rest emitted)))) defined)
         coefficients (vec (filter external (concat (:inputs (soac/facts primal))
-                                                    (take-nth 2 (bindings primal)))))
+                                                   (take-nth 2 (bindings primal)))))
         input-values (into (array-map) (map (fn [id] [id (get values id)]) coefficients))
         input-values (into input-values (map (fn [id tangent] [tangent (get values id)])
                                              active-inputs tangent-inputs))
@@ -309,7 +312,7 @@
                      [[] [expression] [adjoint]]
                      (if (number? expression)
                        [[] [] []]
-                       (let [{:keys [template arguments cast-tag]} (call! expression)]
+                       (let [{:keys [template arguments cast-tag]} (call! values expression)]
                          (if cast-tag
                            [[] arguments [adjoint]]
                            (let [[ctx grads] (templates/instantiate-template-ctx
@@ -335,7 +338,7 @@
         outputs (mapv (fn [_] (fresh "gradient")) tangent-inputs)
         zero (if (= :float (:dtype (get values output))) '(clojure.core/float 0.0) 0.0)
         emitted (into emitted (mapcat (fn [input result] [result (get adjoints input zero)])
-                                     tangent-inputs outputs))
+                                      tangent-inputs outputs))
         emitted (anf/anf-normalize-bindings emitted fresh)
         input-values (into (array-map) (map (fn [id] [id (get values id)]) coefficients))]
     {:program (program (assoc input-values seed (get values output)) emitted outputs)
@@ -374,54 +377,60 @@
    This detects stale or changed producer data; it is not a proof of custom derivative math."
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
            cotangent-seed source-ns] :as bundle}]
-  (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
-    (fail! :ad-normalized-stale-rules {:expected (select-keys bundle [:template-revision :compiler-revision])
-                                     :actual (revisions)}))
-  (validate-primal! primal params tags)
-  (doseq [p [linear transpose]] (soac/validate! p))
-  (when-not (and (set/subset? (set (:inputs (soac/facts primal))) (set params))
-                 (instance? clojure.lang.Namespace source-ns)
-                 (every? #(contains? (:values (soac/facts primal)) %) params)
-                 (= (count params) (count tags))
-                 (= (count active-inputs) (count tangent-inputs) (count (soac/outputs transpose)))
-                 (= (count active-inputs) (count (distinct active-inputs)))
-                 (set/subset? (set active-inputs) (set params))
-                 (= 1 (count (soac/outputs primal)) (count (soac/outputs linear))))
-    (fail! :ad-normalized-bundle-interface {:params params :active active-inputs}))
-  (validate-linear! linear tangent-inputs residuals)
-  (validate-linear! transpose [cotangent-seed] residuals)
-  (let [primal-values (:values (soac/facts primal))
-        linear-values (:values (soac/facts linear))
-        transpose-values (:values (soac/facts transpose))]
-    (doseq [id residuals]
-      (when-not (and (get primal-values id)
-                     (= (get primal-values id) (get linear-values id) (get transpose-values id)))
-        (fail! :ad-normalized-residual-interface {:value id})))
-    (doseq [[p t g] (map vector active-inputs tangent-inputs (soac/outputs transpose))]
-      (when-not (= (get primal-values p) (get linear-values t) (get transpose-values g))
-        (fail! :ad-normalized-tangent-interface {:primal p :tangent t :cotangent g}))))
-  (when-not (= (:certificate bundle) (certificate bundle))
-    (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
-  bundle)
+  (when-not (instance? clojure.lang.Namespace source-ns)
+    (fail! :ad-normalized-bundle-interface {:source-ns source-ns}))
+  (binding [*ns* source-ns]
+    (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
+      (fail! :ad-normalized-stale-rules {:expected (select-keys bundle [:template-revision :compiler-revision])
+                                         :actual (revisions)}))
+    (validate-primal! primal params tags)
+    (doseq [p [linear transpose]] (soac/validate! p))
+    (when-not (and (set/subset? (set (:inputs (soac/facts primal))) (set params))
+                   (instance? clojure.lang.Namespace source-ns)
+                   (every? #(contains? (:values (soac/facts primal)) %) params)
+                   (= (count params) (count tags))
+                   (= (count active-inputs) (count tangent-inputs) (count (soac/outputs transpose)))
+                   (= (count active-inputs) (count (distinct active-inputs)))
+                   (set/subset? (set active-inputs) (set params))
+                   (= 1 (count (soac/outputs primal)) (count (soac/outputs linear))))
+      (fail! :ad-normalized-bundle-interface {:params params :active active-inputs}))
+    (validate-linear! linear tangent-inputs residuals)
+    (validate-linear! transpose [cotangent-seed] residuals)
+    (let [primal-values (:values (soac/facts primal))
+          linear-values (:values (soac/facts linear))
+          transpose-values (:values (soac/facts transpose))]
+      (doseq [id residuals]
+        (when-not (and (get primal-values id)
+                       (= (get primal-values id) (get linear-values id) (get transpose-values id)))
+          (fail! :ad-normalized-residual-interface {:value id})))
+      (doseq [[p t g] (map vector active-inputs tangent-inputs (soac/outputs transpose))]
+        (when-not (= (get primal-values p) (get linear-values t) (get transpose-values g))
+          (fail! :ad-normalized-tangent-interface {:primal p :tangent t :cotangent g}))))
+    (when-not (= (:certificate bundle) (certificate bundle))
+      (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
+    bundle))
 
 (defn- build-bundle [primal {:keys [params tags active-inputs source-ns]} revision]
-  (validate-primal! primal params tags)
-  (when-not (and (instance? clojure.lang.Namespace source-ns)
-                 (vector? active-inputs)
-                 (= (count active-inputs) (count (distinct active-inputs)))
-                 (set/subset? (set active-inputs) (set params)))
-    (fail! :ad-normalized-program-interface
-           {:params params :active-inputs active-inputs :source-ns source-ns}))
-  (let [fresh (typed-gensym (:dtype (get-in (soac/facts primal) [:values (first params)])))
-        {:keys [program tangent-inputs coefficients]} (linearize primal active-inputs fresh)
-        transposed (transpose program tangent-inputs coefficients fresh)
-        _ (when-not (= revision (revisions))
-            (fail! :ad-normalized-stale-rules {:before revision :after (revisions)}))
-        bundle (merge revision {:primal primal :linear program :transpose (:program transposed)
-                               :params params :tags tags :active-inputs active-inputs
-                               :tangent-inputs tangent-inputs :residuals coefficients
-                               :cotangent-seed (:seed transposed) :source-ns source-ns})]
-    (validate! (assoc bundle :certificate (certificate bundle)))))
+  (when-not (instance? clojure.lang.Namespace source-ns)
+    (fail! :ad-normalized-program-interface {:source-ns source-ns}))
+  (binding [*ns* source-ns]
+    (validate-primal! primal params tags)
+    (when-not (and (instance? clojure.lang.Namespace source-ns)
+                   (vector? active-inputs)
+                   (= (count active-inputs) (count (distinct active-inputs)))
+                   (set/subset? (set active-inputs) (set params)))
+      (fail! :ad-normalized-program-interface
+             {:params params :active-inputs active-inputs :source-ns source-ns}))
+    (let [fresh (typed-gensym (:dtype (get-in (soac/facts primal) [:values (first params)])))
+          {:keys [program tangent-inputs coefficients]} (linearize primal active-inputs fresh)
+          transposed (transpose program tangent-inputs coefficients fresh)
+          _ (when-not (= revision (revisions))
+              (fail! :ad-normalized-stale-rules {:before revision :after (revisions)}))
+          bundle (merge revision {:primal primal :linear program :transpose (:program transposed)
+                                  :params params :tags tags :active-inputs active-inputs
+                                  :tangent-inputs tangent-inputs :residuals coefficients
+                                  :cotangent-seed (:seed transposed) :source-ns source-ns})]
+      (validate! (assoc bundle :certificate (certificate bundle))))))
 
 (defn linearize-program
   "Build checked scalar primal/linear/transpose programs from an existing TypedSOAC program.
@@ -429,6 +438,86 @@
    This compiler entry never walks source, resolves a deftm Var or re-infers its types."
   [primal interface]
   (build-bundle primal interface (revisions)))
+
+(defn linearize-map-element
+  "Linearize the typed scalar region of one pure, homogeneous functional map.
+
+   This returns the existing scalar bundle, not an executable array pullback. One array
+   element is active; scalar captures are inactive. Local dtypes come from the validated
+   region, not the result storage precision. Array scheduling and coefficient snapshots
+   remain downstream obligations; retaining an input array is not a residual snapshot."
+  [map-program source-ns]
+  (soac/validate! map-program)
+  (when-not (= 1 (count (soac/equations map-program)))
+    (fail! :ad-normalized-map-boundary {:equations (count (soac/equations map-program))}))
+  (let [equations (soac/equations map-program)
+        equation (first equations)
+        {:keys [kind attributes arrays captures lambda]} (soac/operation-parts equation)
+        results (nth equation 2)
+        facts (soac/facts map-program)
+        equation-facts (get-in facts [:equations (second equation)])
+        values (:values facts)]
+    (when-not (and (= 'map kind)
+                   (= 1 (count arrays)) (= 1 (count results))
+                   (= results (soac/outputs map-program))
+                   (empty? (:effects facts)) (empty? (:aliases facts))
+                   (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
+                   (empty? (:attributes equation-facts))
+                   (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
+                   (or (nil? (get-in facts [:attributes :source-arithmetic]))
+                       (= numerics/retained-source-arithmetic
+                          (get-in facts [:attributes :source-arithmetic])))
+                   (set/subset? (set (keys attributes)) #{:index :extent :attributes})
+                   (set/subset? (set (keys (:attributes attributes)))
+                                #{:stable-array-captures :pointwise-storage-inputs})
+                   (every? empty? (vals (:attributes attributes)))
+                   (empty? (soac/result-storage map-program (second equation)))
+                   (nil? (:result-transform attributes))
+                   (empty? (get-in attributes [:attributes :stable-array-captures]))
+                   (instance? clojure.lang.Namespace source-ns))
+      (fail! :ad-normalized-map-boundary {:equation equation}))
+    (let [array-value (get values (first arrays))
+          result-value (get values (first results))
+          dt (:dtype array-value)
+          operand-values (mapv values (concat arrays captures results))
+          {:keys [parameters locals body-results]} (soac/lambda-parts lambda)]
+      (when-not (and (contains? #{:float :double} dt)
+                     (= (:shape array-value) (:shape result-value))
+                     (every? (fn [value]
+                               (and (= :tensor (:kind value)) (= dt (:dtype value))
+                                    (= {:kind :plain} (:representation value))
+                                    (nil? (:logical-layout value)) (empty? (:effects value))
+                                    (empty? (:attributes value))))
+                             operand-values)
+                     (every? #(= [] (:shape (get values %))) captures)
+                     (every? #(= dt (:dtype %)) locals))
+        (fail! :ad-normalized-map-space {:equation equation :values operand-values
+                                         :locals locals}))
+      ;; Check rather than overwrite contradictory retained binder evidence. The explicit
+      ;; local-value dtype is authoritative when the source symbol has no metadata.
+      (doseq [id (concat parameters (map :id locals))
+              :let [retained (types/sym-type-tag id)]
+              :when (and retained (not= dt (dtype/dtype-for-scalar-tag retained)))]
+        (fail! :ad-normalized-map-space {:binding id :retained retained :dtype dt}))
+      (binding [*ns* source-ns]
+        (let [params (mapv #(tagged % dt) parameters)
+              output ((typed-gensym dt) "map_element_output")
+              input-values (into (array-map)
+                                 (map (fn [id] [id (av/tensor {:dtype dt :shape []})])) params)
+              local-bindings (vec (mapcat (fn [{:keys [id dtype init]}]
+                                            [(tagged id dtype) init]) locals))
+            ;; Check initializers at their retained dtype before scalar-equation's exact
+            ;; widening repair. Projection must not manufacture conversion evidence.
+              _ (reduce (fn [known [id expression]]
+                          (let [known (assoc known id (av/tensor {:dtype dt :shape []}))]
+                            (binding-dtype! known id expression)
+                            known))
+                        input-values (partition 2 (into local-bindings
+                                                        [output (first body-results)])))
+              scalar (program input-values
+                              (into local-bindings [output (first body-results)]) [output])]
+          (linearize-program scalar {:params params :tags (vec (repeat (count params) (tag dt)))
+                                     :active-inputs [(first params)] :source-ns source-ns}))))))
 
 (defn prepare
   "Build one validated primal/linear/transpose bundle for a resolved scalar deftm Var.
@@ -456,7 +545,7 @@
         (if (and (seq? alpha) (contains? '#{let let*} (first alpha)))
           [(second alpha) (nnext alpha)] [[] [alpha]])
         [source-bindings output] (anf/normalize-for-ad source-bindings body-expressions
-                                                     #(gensym (str % "__primal_")))
+                                                       #(gensym (str % "__primal_")))
         ;; Always give the output an equation identity, including an input alias.
         primal-output (fresh "primal_output")
         source-bindings (into (vec source-bindings) [primal-output output])
@@ -487,7 +576,7 @@
                            (:params bundle) (:tags bundle))]
     (assoc body :walked-body
            [(list 'let* (into (bindings (:primal bundle))
-                             (concat [seed (if (= :float dt) '(clojure.core/float 1.0) 1.0)]
-                                     (bindings (:transpose bundle))))
+                              (concat [seed (if (= :float dt) '(clojure.core/float 1.0) 1.0)]
+                                      (bindings (:transpose bundle))))
                   (into [(first (soac/outputs (:primal bundle)))]
                         (map gradients (:params bundle))))])))
