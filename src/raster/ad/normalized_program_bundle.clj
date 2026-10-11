@@ -1,5 +1,5 @@
 (ns raster.ad.normalized-program-bundle
-  "Canonical TypedSOAC program envelope for checked homogeneous maps and ordered map sums.
+  "Canonical TypedSOAC program envelope for checked maps, ordered map sums and indexed maps.
    Scalar derivation evidence remains nested; no rules, evaluator, cache or source importer
    are added. This migration adapter does not compose equations or add runtime support."
   (:require [raster.ad.normalized-scalar :as scalar]
@@ -10,13 +10,20 @@
   (throw (ex-info "Invalid normalized program bundle" (assoc data :reason reason))))
 
 (defn- checked-evidence! [bundle kind]
+  (when (and (= :checked-scalar-indexed-map kind)
+             (or (contains? bundle :map-programs) (contains? bundle :sum-programs)))
+    (fail! :ad-program-bundle-scope {}))
   (scalar/validate! bundle)
-  (when-not (and (:map-programs bundle)
-                 (case kind
-                   :checked-scalar-map (not (contains? bundle :sum-programs))
-                   :checked-scalar-map-sum (some? (:sum-programs bundle))
-                   false)
-                 (not (contains? bundle :gather-programs)))
+  (when-not (case kind
+              :checked-scalar-map (and (:map-programs bundle)
+                                      (not (contains? bundle :sum-programs))
+                                      (not (contains? bundle :gather-programs)))
+              :checked-scalar-map-sum (and (:map-programs bundle) (:sum-programs bundle)
+                                          (not (contains? bundle :gather-programs)))
+              :checked-scalar-indexed-map (and (:gather-programs bundle)
+                                              (not (contains? bundle :map-programs))
+                                              (not (contains? bundle :sum-programs)))
+              false)
     (fail! :ad-program-bundle-scope {}))
   bundle)
 
@@ -27,17 +34,33 @@
   "Pure fixed-ID projection of already checked evidence. It generates no derivative code."
   [bundle kind]
   (let [sum? (= :checked-scalar-map-sum kind)
-        {:keys [source primal linear transpose]} (if sum? (:sum-programs bundle) (:map-programs bundle))
+        indexed? (= :checked-scalar-indexed-map kind)
+        programs (cond indexed? (:gather-programs bundle)
+                       sum? (:sum-programs bundle) :else (:map-programs bundle))
+        {:keys [source primal linear transpose required-zero-gradient]} programs
         {:keys [active-array tangent-input tangent-output cotangent-input gradient-output
                 residual-arrays scalar-captures]} (get-in bundle [:map-programs :interface])
+        indexed-interface (:interface programs)
+        source-parts (when indexed? (soac/operation-parts (first (soac/equations source))))
+        index-input (when indexed? (first (:arrays source-parts)))
+        active-array (if indexed? (first (:captures source-parts)) active-array)
+        tangent-input (if indexed? (:tangent-input indexed-interface) tangent-input)
+        gradient-output (if indexed? (:gradient-output indexed-interface) gradient-output)
         tangent-output (if sum? (get-in bundle [:sum-programs :interface :tangent-result]) tangent-output)
+        tangent-output (if indexed? (:tangent-output indexed-interface) tangent-output)
         cotangent-input (if sum? (get-in bundle [:sum-programs :interface :seed]) cotangent-input)
+        cotangent-input (if indexed? (:cotangent-input indexed-interface) cotangent-input)
         inputs (:inputs (soac/facts source))
         result (first (soac/outputs source))
         producer (second (first (soac/equations primal)))
         source-equation (second (first (soac/equations source)))
         residual-bindings
-        (into {}
+        (if indexed?
+          {index-input {:id (:index-snapshot indexed-interface) :storage :owned-array
+                        :producer {:equation producer :result (:index-snapshot indexed-interface)}
+                        :origin {:equation source-equation :input index-input}
+                        :value (get-in (soac/facts primal) [:values (:index-snapshot indexed-interface)])}}
+          (into {}
               (concat
                (map (fn [[coefficient id]]
                       [coefficient {:id id :storage :owned-array
@@ -50,7 +73,16 @@
                                     :producer {:input id}
                                     :origin {:equation source-equation :scalar-value coefficient}
                                     :value (get-in (soac/facts source) [:values id])}])
-                    scalar-captures)))]
+                    scalar-captures))))
+        physical-bindings
+        (if indexed?
+          (let [id (:value required-zero-gradient)
+                equation (second (first (soac/equations transpose)))]
+            {id {:value (get-in (soac/facts transpose) [:values id])
+                 :requirement required-zero-gradient
+                 :consumer {:equation equation :destination id :result gradient-output
+                            :alias (get-in (soac/facts transpose) [:equations equation :aliases gradient-output])}}})
+          {})]
     {:source source :primal primal :linear linear :transpose transpose
      :interface {:inputs (mapv #(value-interface source % %) inputs)
                  :active-inputs [active-array]
@@ -59,7 +91,7 @@
                  :tangent-result (value-interface linear tangent-output result)
                  :cotangent-input (value-interface transpose cotangent-input result)
                  :cotangent-result (value-interface transpose gradient-output active-array)}
-     :residual-bindings residual-bindings :physical-bindings {}
+     :residual-bindings residual-bindings :physical-bindings physical-bindings
      :derivation {:kind kind :bundle bundle}
      :source-ns (:source-ns bundle)}))
 
@@ -85,14 +117,15 @@
   "Check the original scalar authority and fixed-ID source/program/interface correspondence.
    This is not independent proof of custom-rule mathematics or floating reassociation."
   [{:keys [source-ns derivation] :as bundle}]
-  (when-not (and (contains? #{:checked-scalar-map :checked-scalar-map-sum} (:kind derivation))
+  (when-not (and (contains? #{:checked-scalar-map :checked-scalar-map-sum :checked-scalar-indexed-map}
+                            (:kind derivation))
                  (map? (:bundle derivation)))
     (fail! :ad-program-bundle-derivation {}))
   (namespace! bundle)
   (let [kind (:kind derivation)
         evidence (checked-evidence! (:bundle derivation) kind)
         expected (program-envelope evidence kind)]
-    ;; Existing scalar validation already reconstructs map/sum lifts with fixed interface IDs and
+    ;; Existing scalar validation already reconstructs all admitted lifts with fixed interface IDs and
     ;; validates each SOAC. Compare the canonical projection, not a newly generated derivative.
     (when-not (fingerprint/equivalent? (pure-envelope expected) (pure-envelope bundle))
       (fail! :ad-program-bundle-correspondence {}))
@@ -117,5 +150,16 @@
    composition, rules, reassociation permission, physical obligations or runtime mode is added."
   [bundle]
   (let [kind :checked-scalar-map-sum
+        result (program-envelope (checked-evidence! bundle kind) kind)]
+    (validate! (assoc result :certificate (certificate result)))))
+
+(defn adapt-indexed-map
+  "Project existing checked functional indexed-map programs without changing execution.
+   Index snapshots originate in the excluded index input, not a scalar derivative coefficient.
+   Physical bindings preserve a required fresh/exclusive typed-zero gradient and its ordered
+   destination/result alias; they are obligations, never allocation or initialization receipts.
+   Data and result extents remain distinct. Map/sum mixtures refuse."
+  [bundle]
+  (let [kind :checked-scalar-indexed-map
         result (program-envelope (checked-evidence! bundle kind) kind)]
     (validate! (assoc result :certificate (certificate result)))))

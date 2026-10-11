@@ -18,6 +18,23 @@ floating-point policy and AD operation coverage do not change.
 
 ## Canonical program-envelope pilot
 
+`normalized-program-bundle/adapt-indexed-map` also projects the already-checked functional
+indexed-map programs, without changing importer or runtime admission. Its one active data
+array has independent capacity from the excluded Int/Long index array and output extent.
+The owned index snapshot is identified by its exact primal producer and excluded source-input
+origin, not as a scalar derivative coefficient. Shape-only capacity AV facts remain in the
+programs without becoming executable inputs.
+
+Unlike pure map/sum envelopes, indexed envelopes have a physical binding: the exact required
+owned/exclusive typed-zero gradient contract, retained destination AV and transpose
+destination/result alias. This is an unsatisfied allocation/initialization requirement,
+**not** a receipt or a claim that the effect equation allocates storage. The cotangent result
+interface describes the data-shaped gradient even though the logical host effect binding
+is nil; existing host materialization returns the explicitly supplied physical owner.
+Sequential ordered updates, original Float checkpoints and source/rule/Namespace validation
+are unchanged. Map/sum mixtures refuse. No canonical indexed runtime migration, device
+execution, new derivative rule or equation composition is enabled by this adapter.
+
 `normalized-program-bundle/adapt-map` projects exactly one already-admitted homogeneous map
 into a canonical envelope: top-level source/primal/linear/transpose fields are actual TypedSOAC
 programs, never scalar lane programs with changed field meanings. Ordered retained-ID/AV
