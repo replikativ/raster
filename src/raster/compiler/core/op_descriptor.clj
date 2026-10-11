@@ -1117,8 +1117,7 @@
    symbol suitable for splicing into generated code. Throws for ops without a
    registered monoid — an unregistered reduction must fail loud, not seed 0."
   [op-sym dtype]
-  (let [base (symbol (name op-sym))                 ; spelling-collapse
-        a    (algebra-facet base)]
+  (let [a (algebra-facet op-sym)]
     (when-not a
       (throw (ex-info (str "no :algebra facet for reduction op " op-sym
                            " — register it (op-descriptor) before reducing with it")
@@ -1126,21 +1125,26 @@
     (let [dtype (dtype/canon dtype)
           floating? (not (dtype/integral? dtype))
           float-width? (contains? #{:half :float} dtype)
-          limits (:limits (dtype/info dtype))]
-      (case base
-        (min Math/min) (if floating?
-                         (if float-width? 'Float/POSITIVE_INFINITY 'Double/POSITIVE_INFINITY)
-                         (:max limits))
-        (max Math/max) (if floating?
-                         (if float-width? 'Float/NEGATIVE_INFINITY 'Double/NEGATIVE_INFINITY)
-                         (:min limits))
+          limits (:limits (dtype/info dtype))
+          id (:identity a)
+          ;; Intrinsics depends on this descriptor namespace. Resolve its existing exact
+          ;; identity authority only at invocation, and only for a nil-identity primitive.
+          ;; A custom qualified monoid's explicit identity never inherits builtin extrema.
+          primitive (when (nil? id)
+                      ((requiring-resolve 'raster.compiler.backend.intrinsics/canonical) op-sym))]
+      (case primitive
+        :min (if floating?
+               (if float-width? 'Float/POSITIVE_INFINITY 'Double/POSITIVE_INFINITY)
+               (:max limits))
+        :max (if floating?
+               (if float-width? 'Float/NEGATIVE_INFINITY 'Double/NEGATIVE_INFINITY)
+               (:min limits))
         ;; numeric monoids: type the abstract identity for the dtype
-        (let [id (:identity a)]
-          (cond
-            (nil? id) (throw (ex-info (str "op " op-sym " has no identity") {:op op-sym}))
-            (contains? #{:int :long :byte} dtype) id
-            float-width? (list 'float (double id))
-            :else     (double id)))))))
+        (cond
+          (nil? id) (throw (ex-info (str "op " op-sym " has no identity") {:op op-sym}))
+          (contains? #{:int :long :byte} dtype) id
+          float-width? (list 'float (double id))
+          :else (double id))))))
 
 ;; --- Analytic cost (:cost facet; hardware-guided fusion profitability) ---
 

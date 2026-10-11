@@ -2,6 +2,47 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
+(deftest reduction-identities-retain-exact-qualified-algebra
+  (let [original descriptor/get-op-descriptor
+        monoid {:associative? true :commutative? true :identity 42}
+        custom {'test.reduction/min {:algebra monoid}
+                'test.reduction/+ {:algebra monoid}
+                'test.reduction/empty-min {:algebra (assoc monoid :identity nil)}}]
+    (with-redefs [descriptor/get-op-descriptor #(or (get custom %) (original %))]
+      (is (nil? (descriptor/algebra-facet 'test.unregistered/+)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (descriptor/typed-reduce-identity 'test.unregistered/+ :double)))
+      (doseq [op '[test.reduction/min test.reduction/+]]
+        (is (= 42 (descriptor/typed-reduce-identity op :long)))
+        (is (= 42.0 (descriptor/typed-reduce-identity op :double)))
+        (is (= '(float 42.0) (descriptor/typed-reduce-identity op :float))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (descriptor/typed-reduce-identity 'test.reduction/empty-min :double)))
+      (with-redefs [descriptor/get-op-descriptor
+                    #(if (= 'test.reduction/min %)
+                       {:algebra (assoc monoid :identity nil)} (original %))]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (descriptor/typed-reduce-identity 'test.reduction/min :double)))))))
+
+(deftest builtin-reduction-identities-preserve-typed-extrema
+  (doseq [[op expected] [['+ 0] ['clojure.core/+ 0] ['raster.numeric/+ 0]
+                         ['unchecked-add 0] ['clojure.core/unchecked-add 0]
+                         ['* 1] ['clojure.core/* 1] ['raster.numeric/* 1]]]
+    (is (= expected (descriptor/typed-reduce-identity op :long)))
+    (is (= (double expected) (descriptor/typed-reduce-identity op :double))))
+  (doseq [op '[min clojure.core/min raster.numeric/min Math/min]]
+    (is (= Integer/MAX_VALUE (descriptor/typed-reduce-identity op :int)))
+    (is (= Long/MAX_VALUE (descriptor/typed-reduce-identity op :long)))
+    (is (= 'Double/POSITIVE_INFINITY (descriptor/typed-reduce-identity op :double)))
+    (doseq [dtype [:float :half]]
+      (is (= 'Float/POSITIVE_INFINITY (descriptor/typed-reduce-identity op dtype)))))
+  (doseq [op '[max clojure.core/max raster.numeric/max Math/max]]
+    (is (= Integer/MIN_VALUE (descriptor/typed-reduce-identity op :int)))
+    (is (= Long/MIN_VALUE (descriptor/typed-reduce-identity op :long)))
+    (is (= 'Double/NEGATIVE_INFINITY (descriptor/typed-reduce-identity op :double)))
+    (doseq [dtype [:float :half]]
+      (is (= 'Float/NEGATIVE_INFINITY (descriptor/typed-reduce-identity op dtype))))))
+
 (deftest allocation-initialization-contracts
   (is (= :zero (descriptor/allocation-initialization 'double-array)))
   (is (= :zero (descriptor/allocation-initialization 'raster.arrays/zeros-like_m_double)))

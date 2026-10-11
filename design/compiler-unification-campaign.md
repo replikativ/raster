@@ -1,5 +1,19 @@
 # Compiler unification campaign
 
+### Qualified reduction algebra identity
+
+`typed-reduce-identity` now queries the exact declared operator rather than
+discarding its namespace. Previously an unregistered qualified `+` inherited
+the builtin zero identity, contradicting the shared algebra authority. Explicit
+custom monoid identities remain authoritative, including custom operators named
+`min`. Only a nil abstract identity consults the existing canonical intrinsic
+authority for builtin min/max dtype extrema; a custom nil-identity operator
+without that intrinsic declines. No new alias registry or source arithmetic
+policy is introduced. Focused descriptor, scan, SOAC, product-consumer and
+integral-reduction tests pass 46 tests / 506 assertions in the warm REPL.
+This does not repair the separate mangled-descriptor basename compatibility
+path, certify all reductions, or resolve the failed real-model training gate.
+
 ### October 10 non-executing call-signature evidence
 
 The compiler's registered-method selection now exposes a non-executing tag-tuple
