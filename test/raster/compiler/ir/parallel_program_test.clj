@@ -76,12 +76,60 @@
       (is (nil? (meta (first (second (:source p)))))))))
 
 (deftest equation-consumption-is-invalidated-by-a-source-rewrite
-  (let [p (lowered-program)]
-    (is (seq (program/operations-for-binding p 'total reduce-source)))
+  (let [p (lowered-program)
+        retained-source (:source (first (:equations p)))]
+    ;; The lowering retains semantic type evidence on the expression. An
+    ;; unannotated spelling is not a certificate for that analyzed expression.
+    (is (seq (program/operations-for-binding p 'total retained-source)))
     (is (nil? (program/operations-for-binding
                p 'total
                '(raster.par/reduce acc 1.0 i n
                                    (clojure.core/+ acc (clojure.core/aget values i))))))))
+
+(deftest source-certification-retains-semantic-metadata-and-bits
+  (let [p (lowered-program)
+        original (first (:equations p))
+        typed-source (with-meta reduce-source {:raster.type/tag 'double :line 1})
+        variants
+        [(with-meta typed-source {:raster.type/tag 'float :line 1})
+         (with-meta (list* (first typed-source)
+                           (with-meta (second typed-source) {:raster.type/tag 'float})
+                           (nnext typed-source))
+           (meta typed-source))]]
+    (doseq [[site lookup] [[[:binding 'total] #(program/equation-for-binding % 'total %2)]
+                          [[:body 0] program/equation-for-source]]]
+      (let [equation (assoc original :site site :source typed-source)
+            retained (assoc p :equations [equation])]
+        (is (= equation (lookup retained typed-source)))
+        (is (= equation (lookup retained
+                                (with-meta typed-source
+                                  {:raster.type/tag 'double :file "new.clj" :line 90
+                                   :column 8 :end-line 91 :end-column 12}))))
+        (doseq [changed variants]
+          (is (= typed-source changed) "ordinary equality cannot certify these changes")
+          (is (nil? (lookup retained changed))))
+        (let [plus (last typed-source)
+              changed (with-meta
+                        (apply list (concat (butlast typed-source)
+                                            [(with-meta plus {:raster.op/original 'raster.numeric/-})]))
+                        (meta typed-source))]
+          (is (= typed-source changed))
+          (is (nil? (lookup retained changed))))
+        (let [positive-zero (assoc equation :source (list 'identity 0.0))
+              positive-program (assoc p :equations [positive-zero])]
+          (is (= (list 'identity 0.0) (list 'identity -0.0)))
+          (is (nil? (lookup positive-program (list 'identity -0.0)))))
+        (is (= :semantic-fingerprint-unsupported
+               (reason-of #(lookup retained
+                                  (with-meta typed-source {:opaque (Object.)})))))))))
+
+(deftest body-source-semantic-identity-still-refuses-ambiguity
+  (let [p (lowered-program)
+        original (assoc (first (:equations p)) :site [:body 0])
+        second-site (assoc original :id 1 :site [:body 1]
+                           :source (with-meta (:source original) {:line 44}))]
+    (is (nil? (program/equation-for-source
+                (assoc p :equations [original second-site]) reduce-source)))))
 
 (deftest dialect-validation-is-a-full-conversion
   (let [p (lowered-program)]

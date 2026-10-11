@@ -6,7 +6,8 @@
    calls, but scheduled operations live in equations, never in Clojure symbol metadata.  As more
    scalar control becomes explicit, `source` can shrink without changing value or operation IDs."
   (:require [clojure.set :as set]
-            [raster.compiler.ir.abstract-value :as av]))
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]))
 
 (defrecord ProgramEquation
            [id site source operands results algorithm operations effects provenance attributes])
@@ -219,15 +220,18 @@
 
 (defn equation-for-binding
   "Find the equation for a binding only when the current source still matches its certified source.
-   This equality guard invalidates scheduled operations if a later backend-local fusion rewrites the
-   binding before consumption."
+   Semantic equality preserves retained operation/type metadata and floating-point bits while
+   ignoring source locations. A backend-local rewrite must not reuse the prior certificate."
   [program sym source]
-  (some #(when (and (= [:binding sym] (:site %)) (= source (:source %))) %) (:equations program)))
+  (some #(when (and (= [:binding sym] (:site %))
+                   (semantic-fingerprint/equivalent? source (:source %))) %)
+        (:equations program)))
 
 (defn equation-for-source
   "Find an unambiguous body-position equation for an exact source expression."
   [program source]
-  (let [matches (filterv #(and (= :body (first (:site %))) (= source (:source %)))
+  (let [matches (filterv #(and (= :body (first (:site %)))
+                              (semantic-fingerprint/equivalent? source (:source %)))
                          (:equations program))]
     (when (= 1 (count matches)) (first matches))))
 
