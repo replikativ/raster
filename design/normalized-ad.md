@@ -17,9 +17,17 @@ through it. Transpose is a sequential effect-map with ordered read/add/write che
 `:required-zero-gradient` contract requires a fresh, exclusive, typed-zero data-length physical binding;
 the effect equation does **not** allocate or initialize this destination. Construction validates
 source/interface/program correspondences, retained physical facts and the owned snapshot.
-No host adapter, runtime ownership enforcement, device execution, gather→sum or public-engine
-integration is provided by this checkpoint. The existing homogeneous map importer remains
-unchanged. These construction controls do not close the unchanged failed real-weight training gate.
+The opt-in host consumer now reuses shared source realization for these programs. Its distinct
+indexed projector admits the mixed integral snapshot and stable array capture without widening
+the existing homogeneous pure-map projector. Ordered effects keep their nil logical bindings;
+the host result is the validated physical destination supplied separately from semantic inputs.
+The runtime checks every original-width index before primal allocation, ties shape-only capacity
+to the actual data array length, and saves only a private index snapshot and immutable extent
+facts. Every pullback allocates a new typed-zero data-length gradient and uses the sequential
+ordered write checkpoints, including empty output extents. Caller arrays cannot be concurrently
+mutated during acquisition. Device execution, gather→sum and public-engine integration remain
+separate gates. The unchanged real-weight Gemma gate remains FAILED (11/28); host indexed-map
+controls are not model or exact SFT acceptance.
 
 Status: architecture assessed against Raster main
 `642b5f0c0aad7c49f223357a796ce09c900e7c1c`, with an initial opt-in scalar implementation.
