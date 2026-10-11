@@ -15,13 +15,15 @@
   Bindings use LP64 integers; advertised ILP64 OpenBLAS builds are rejected.
 
   All public functions accept flat double[] in row-major order.
-  All native calls use critical(true) for zero-copy heap array pinning."
+  Numerical calls use ordinary downcalls with scoped native staging for heap arrays.
+  Workspace-query and INFO writes are published before their values are interpreted."
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset]]
             [raster.linalg.native-library :as native-library]
             [raster.math :as m]
-            [raster.numeric :as n])
+            [raster.numeric :as n]
+            [raster.runtime.native-call :as native-call])
   (:import [java.lang.foreign
             FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout]))
@@ -57,12 +59,8 @@
                     {:searched lib-paths}))))
 
 ;; ================================================================
-;; MethodHandle creation with critical(true)
+;; Ordinary numerical downcalls with explicit pointer access contracts
 ;; ================================================================
-
-(def ^:private ^"[Ljava.lang.foreign.Linker$Option;"
-  critical-opts
-  (into-array Linker$Option [(Linker$Option/critical true)]))
 
 (defn- lookup-symbol ^MemorySegment [^SymbolLookup lib ^String name]
   (let [opt (.find lib name)]
@@ -71,14 +69,19 @@
     (.get opt)))
 
 (defn- make-handle
-  [^SymbolLookup lib ^String symbol-name ^FunctionDescriptor fd]
+  [^SymbolLookup lib ^String symbol-name ^FunctionDescriptor fd pointer-access]
   (when-not lib
     (throw (ex-info (str "No LAPACK library found for " symbol-name ". Install OpenBLAS.")
                     {:symbol symbol-name :searched lib-paths})))
-  (.downcallHandle (Linker/nativeLinker)
-                   (lookup-symbol lib symbol-name)
-                   fd
-                   critical-opts))
+  (native-call/prepare-call
+   (.downcallHandle (Linker/nativeLinker)
+                    (lookup-symbol lib symbol-name)
+                    fd
+                    (into-array Linker$Option []))
+   pointer-access))
+
+(defn- invoke-native! [prepared arguments]
+  (prepared arguments))
 
 ;; ================================================================
 ;; Helpers for Fortran pass-by-reference
@@ -182,7 +185,10 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/ADDRESS
                 ValueLayout/ADDRESS ValueLayout/ADDRESS])))
 
-(def ^:private dgesdd-mh (delay (make-handle (:lookup @openblas) "dgesdd_" dgesdd-fd)))
+(def ^:private dgesdd-mh
+  (delay (make-handle (:lookup @openblas) "dgesdd_" dgesdd-fd
+                      [:read :read :read :read-write :read :write :write :read
+                       :write :read :read-write :read :read-write :write])))
 
 (deftm dgesdd!
   "Thin SVD via divide-and-conquer. A is [m,n] row-major, overwritten.
@@ -204,9 +210,9 @@
         work-query (double-array 1)
         iwork (int-array (* 8 k))
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgesdd-mh]
+        mh @dgesdd-mh]
     ;; Workspace query
-    (.invokeWithArguments mh
+    (invoke-native! mh
                           [(byte-seg (int \S))
                            (int-seg m) (int-seg n)                               ;; original dims
                            (MemorySegment/ofArray A-col) (int-seg m)             ;; lda = m (col-major)
@@ -218,7 +224,7 @@
                            (MemorySegment/ofArray info-out)])
     (let [lwork (long (m/ceil (aget work-query 0)))
           work (double-array lwork)]
-      (.invokeWithArguments mh
+      (invoke-native! mh
                             [(byte-seg (int \S))
                              (int-seg m) (int-seg n)
                              (MemorySegment/ofArray A-col) (int-seg m)
@@ -253,9 +259,9 @@
         work-query (double-array 1)
         iwork (int-array (* 8 k))
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgesdd-mh]
+        mh @dgesdd-mh]
     ;; Workspace query
-    (.invokeWithArguments mh
+    (invoke-native! mh
                           [(byte-seg (int \N))
                            (int-seg m) (int-seg n)
                            (MemorySegment/ofArray A-col) (int-seg m)
@@ -267,7 +273,7 @@
                            (MemorySegment/ofArray info-out)])
     (let [lwork (long (m/ceil (aget work-query 0)))
           work (double-array lwork)]
-      (.invokeWithArguments mh
+      (invoke-native! mh
                             [(byte-seg (int \N))
                              (int-seg m) (int-seg n)
                              (MemorySegment/ofArray A-col) (int-seg m)
@@ -291,7 +297,10 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/ADDRESS
                 ValueLayout/ADDRESS ValueLayout/ADDRESS])))
 
-(def ^:private dsyevd-mh (delay (make-handle (:lookup @openblas) "dsyevd_" dsyevd-fd)))
+(def ^:private dsyevd-mh
+  (delay (make-handle (:lookup @openblas) "dsyevd_" dsyevd-fd
+                      [:read :read :read :read-write :read :write
+                       :read-write :read :read-write :read :write])))
 
 (deftm dsyevd!
   "Symmetric eigendecomposition. A is [n,n] row-major symmetric,
@@ -305,9 +314,9 @@
         info-out (int-array 1)
         work-query (double-array 1)
         iwork-query (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dsyevd-mh]
+        mh @dsyevd-mh]
     ;; Workspace query
-    (.invokeWithArguments mh
+    (invoke-native! mh
                           [(byte-seg (int \V)) (byte-seg (int \U))
                            (int-seg n)
                            (MemorySegment/ofArray A) (int-seg n)
@@ -319,7 +328,7 @@
           liwork (long (clojure.core/aget iwork-query 0))
           work (double-array lwork)
           iwork (int-array liwork)]
-      (.invokeWithArguments mh
+      (invoke-native! mh
                             [(byte-seg (int \V)) (byte-seg (int \U))
                              (int-seg n)
                              (MemorySegment/ofArray A) (int-seg n)
@@ -343,13 +352,15 @@
                [ValueLayout/JAVA_INT ValueLayout/JAVA_INT ValueLayout/JAVA_INT
                 ValueLayout/ADDRESS  ValueLayout/JAVA_INT ValueLayout/ADDRESS])))
 
-(def ^:private dgeqrf-mh (delay (make-handle (:lookup @lapacke) "LAPACKE_dgeqrf" dgeqrf-fd)))
+(def ^:private dgeqrf-mh
+  (delay (make-handle (:lookup @lapacke) "LAPACKE_dgeqrf" dgeqrf-fd
+                      [:read-write :write])))
 
 (deftm dgeqrf!
   "QR factorization via LAPACKE (row-major). A[m,n] overwritten with
   R (upper) and Householder reflectors (lower). tau[min(m,n)]."
   [A :- (Array double) tau :- (Array double) m :- Long n :- Long] :- Long
-  (long (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgeqrf-mh
+  (long (invoke-native! @dgeqrf-mh
                               [LAPACK_ROW_MAJOR (int m) (int n)
                                (MemorySegment/ofArray A) (int n)
                                (MemorySegment/ofArray tau)])))
@@ -362,13 +373,15 @@
                 ValueLayout/JAVA_INT ValueLayout/ADDRESS  ValueLayout/JAVA_INT
                 ValueLayout/ADDRESS])))
 
-(def ^:private dorgqr-mh (delay (make-handle (:lookup @lapacke) "LAPACKE_dorgqr" dorgqr-fd)))
+(def ^:private dorgqr-mh
+  (delay (make-handle (:lookup @lapacke) "LAPACKE_dorgqr" dorgqr-fd
+                      [:read-write :read])))
 
 (deftm dorgqr!
   "Generate thin Q[m,n] from Householder reflectors via LAPACKE (row-major)."
   [A :- (Array double) tau :- (Array double)
    m :- Long n :- Long k :- Long] :- Long
-  (long (.invokeWithArguments ^java.lang.invoke.MethodHandle @dorgqr-mh
+  (long (invoke-native! @dorgqr-mh
                               [LAPACK_ROW_MAJOR (int m) (int n) (int k)
                                (MemorySegment/ofArray A) (int n)
                                (MemorySegment/ofArray tau)])))
@@ -393,7 +406,9 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; B, LDB
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgesv-mh (delay (make-handle (:lookup @openblas) "dgesv_" dgesv-fd)))
+(def ^:private dgesv-mh
+  (delay (make-handle (:lookup @openblas) "dgesv_" dgesv-fd
+                      [:read :read :read-write :read :write :read-write :read :write])))
 
 (deftm dgesv!
   "Solve Ax=B via LU factorization. A[n,n] and B[n,nrhs] row-major,
@@ -407,8 +422,8 @@
         B-col (double-array (* n nrhs))
         _ (transpose-to-col! B B-col n nrhs)
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgesv-mh]
-    (.invokeWithArguments mh
+        mh @dgesv-mh]
+    (invoke-native! mh
                           [(int-seg n) (int-seg nrhs)
                            (MemorySegment/ofArray A-col) (int-seg n)
                            (MemorySegment/ofArray ipiv)
@@ -430,7 +445,9 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; A, LDA
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dpotrf-mh (delay (make-handle (:lookup @openblas) "dpotrf_" dpotrf-fd)))
+(def ^:private dpotrf-mh
+  (delay (make-handle (:lookup @openblas) "dpotrf_" dpotrf-fd
+                      [:read :read :read-write :read :write])))
 
 (deftm dpotrf!
   "Cholesky factorization of symmetric positive definite matrix.
@@ -439,8 +456,8 @@
   [A :- (Array double) n :- Long] :- Long
   (let [_ @_init
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dpotrf-mh]
-    (.invokeWithArguments mh
+        mh @dpotrf-mh]
+    (invoke-native! mh
                           [(byte-seg (int \L)) (int-seg n)
                            (MemorySegment/ofArray A) (int-seg n)
                            (MemorySegment/ofArray info-out)])
@@ -462,7 +479,9 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; B, LDB
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dpotrs-mh (delay (make-handle (:lookup @openblas) "dpotrs_" dpotrs-fd)))
+(def ^:private dpotrs-mh
+  (delay (make-handle (:lookup @openblas) "dpotrs_" dpotrs-fd
+                      [:read :read :read :read :read :read-write :read :write])))
 
 (deftm dpotrs!
   "Solve Ax=B using Cholesky factor L (from dpotrf!).
@@ -472,10 +491,10 @@
    n :- Long nrhs :- Long] :- Long
   (let [_ @_init
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dpotrs-mh]
+        mh @dpotrs-mh]
     (if (== nrhs 1)
       ;; nrhs=1: column vector is identical in row/col-major, skip transpose
-      (do (.invokeWithArguments mh
+      (do (invoke-native! mh
                                 [(byte-seg (int \L)) (int-seg n)
                                  (int-seg 1)
                                  (MemorySegment/ofArray A) (int-seg n)
@@ -485,7 +504,7 @@
       ;; nrhs>1: need transpose for column-major layout
       (let [B-col (double-array (* n nrhs))
             _ (transpose-to-col! B B-col n nrhs)]
-        (.invokeWithArguments mh
+        (invoke-native! mh
                               [(byte-seg (int \L)) (int-seg n)
                                (int-seg nrhs)
                                (MemorySegment/ofArray A) (int-seg n)
@@ -502,10 +521,10 @@
    n :- Long nrhs :- Long] :- Long
   (let [_ @_init
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dpotrs-mh]
+        mh @dpotrs-mh]
     (if (== nrhs 1)
       ;; nrhs=1: column vector is identical in row/col-major, skip transpose
-      (do (.invokeWithArguments mh
+      (do (invoke-native! mh
                                 [(byte-seg (int \U)) (int-seg n)
                                  (int-seg 1)
                                  (MemorySegment/ofArray A) (int-seg n)
@@ -515,7 +534,7 @@
       ;; nrhs>1: need transpose for column-major layout
       (let [B-col (double-array (* n nrhs))
             _ (transpose-to-col! B B-col n nrhs)]
-        (.invokeWithArguments mh
+        (invoke-native! mh
                               [(byte-seg (int \U)) (int-seg n)
                                (int-seg nrhs)
                                (MemorySegment/ofArray A) (int-seg n)
@@ -538,7 +557,9 @@
                 ValueLayout/ADDRESS                      ;; IPIV
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgetrf-mh (delay (make-handle (:lookup @openblas) "dgetrf_" dgetrf-fd)))
+(def ^:private dgetrf-mh
+  (delay (make-handle (:lookup @openblas) "dgetrf_" dgetrf-fd
+                      [:read :read :read-write :read :write :write])))
 
 (deftm dgetrf!
   "LU factorization with partial pivoting. A[m,n] row-major,
@@ -550,8 +571,8 @@
         A-col (double-array (* m n))
         _ (transpose-to-col! A A-col m n)
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgetrf-mh]
-    (.invokeWithArguments mh
+        mh @dgetrf-mh]
+    (invoke-native! mh
                           [(int-seg m) (int-seg n)
                            (MemorySegment/ofArray A-col) (int-seg m)
                            (MemorySegment/ofArray ipiv)
@@ -576,7 +597,9 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; B, LDB
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgetrs-mh (delay (make-handle (:lookup @openblas) "dgetrs_" dgetrs-fd)))
+(def ^:private dgetrs-mh
+  (delay (make-handle (:lookup @openblas) "dgetrs_" dgetrs-fd
+                      [:read :read :read :read :read :read :read-write :read :write])))
 
 (deftm dgetrs!
   "Solve Ax=B using LU factors (from dgetrf!).
@@ -591,8 +614,8 @@
         B-col (double-array (* n nrhs))
         _ (transpose-to-col! B B-col n nrhs)
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgetrs-mh]
-    (.invokeWithArguments mh
+        mh @dgetrs-mh]
+    (invoke-native! mh
                           [(byte-seg (int \N)) (int-seg n)
                            (int-seg nrhs)
                            (MemorySegment/ofArray A-col) (int-seg n)
@@ -618,7 +641,9 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; WORK, LWORK
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgetri-mh (delay (make-handle (:lookup @openblas) "dgetri_" dgetri-fd)))
+(def ^:private dgetri-mh
+  (delay (make-handle (:lookup @openblas) "dgetri_" dgetri-fd
+                      [:read :read-write :read :read :read-write :read :write])))
 
 (deftm dgetri!
   "Compute matrix inverse from LU factors (from dgetrf!).
@@ -630,9 +655,9 @@
         _ (transpose-to-col! A A-col n n)
         work-query (double-array 1)
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgetri-mh]
+        mh @dgetri-mh]
     ;; Workspace query
-    (.invokeWithArguments mh
+    (invoke-native! mh
                           [(int-seg n)
                            (MemorySegment/ofArray A-col) (int-seg n)
                            (MemorySegment/ofArray ipiv)
@@ -640,7 +665,7 @@
                            (MemorySegment/ofArray info-out)])
     (let [lwork (long (m/ceil (aget work-query 0)))
           work (double-array lwork)]
-      (.invokeWithArguments mh
+      (invoke-native! mh
                             [(int-seg n)
                              (MemorySegment/ofArray A-col) (int-seg n)
                              (MemorySegment/ofArray ipiv)
@@ -666,7 +691,10 @@
                 ValueLayout/ADDRESS ValueLayout/ADDRESS  ;; WORK, LWORK
                 ValueLayout/ADDRESS])))                  ;; INFO
 
-(def ^:private dgels-mh (delay (make-handle (:lookup @openblas) "dgels_" dgels-fd)))
+(def ^:private dgels-mh
+  (delay (make-handle (:lookup @openblas) "dgels_" dgels-fd
+                      [:read :read :read :read :read-write :read :read-write :read
+                       :read-write :read :write])))
 
 (deftm dgels!
   "Least squares solve via QR/LQ. A[m,n] row-major, B[max(m,n),nrhs].
@@ -682,9 +710,9 @@
         _ (transpose-to-col! B B-col ldb nrhs)
         work-query (double-array 1)
         info-out (int-array 1)
-        ^java.lang.invoke.MethodHandle mh @dgels-mh]
+        mh @dgels-mh]
     ;; Workspace query
-    (.invokeWithArguments mh
+    (invoke-native! mh
                           [(byte-seg (int \N)) (int-seg m)
                            (int-seg n) (int-seg nrhs)
                            (MemorySegment/ofArray A-col) (int-seg m)
@@ -693,7 +721,7 @@
                            (MemorySegment/ofArray info-out)])
     (let [lwork (long (m/ceil (aget work-query 0)))
           work (double-array lwork)]
-      (.invokeWithArguments mh
+      (invoke-native! mh
                             [(byte-seg (int \N)) (int-seg m)
                              (int-seg n) (int-seg nrhs)
                              (MemorySegment/ofArray A-col) (int-seg m)

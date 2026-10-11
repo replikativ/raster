@@ -1222,7 +1222,11 @@ invent another staging implementation. BLAS numerical handles now use ordinary
 downcalls and explicit per-pointer roles; all six batch entry points share one
 staging scope around both optional strided and per-head fallback paths. Packed
 native operands retain their caller-owned lifetime. LAPACK numerical handles
-still need migration; BLAS migration is not a global native-call safety claim.
+also use that owner: Fortran reference arguments and LAPACKE's interleaved scalar
+ABI retain explicit access roles. Workspace queries and nonzero INFO statuses
+publish native output before wrapper interpretation; a numerical status is not
+a thrown downcall. This does not establish arbitrary native-helper safety or
+performance equivalence to critical heap pinning.
 
 General AOT functions use ordinary FFM downcalls, not critical calls inferred from syntax or
 input size. Heap arrays use invocation-owned staging; copyback follows the same

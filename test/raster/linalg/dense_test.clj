@@ -9,6 +9,29 @@
 
 (def ^:const EPS 1e-6)
 
+(deftest ordinary-lapack-status-and-read-authority-test
+  (testing "a successful native return publishes positive INFO and factorization writes"
+    (let [a (double-array [4.0 0.0 0.0 -1.0])]
+      (is (= 2 (lapack/dpotrf! a 2)))
+      (is (= 2.0 (aget a 0)) "the completed first pivot is copied back"))
+    (let [a (double-array [1.0 2.0 2.0 4.0])
+          b (double-array [1.0 2.0])
+          pivots (int-array 2)]
+      (is (pos? (lapack/dgesv! a b pivots 2 1)))
+      (is (every? pos? (seq pivots)) "pivot output survives a singular solve")))
+  (testing "read-only factor and pivot roles retain their values after an ordinary solve"
+    (let [a (double-array [2.0 1.0 1.0 3.0])
+          pivots (int-array 2)
+          b (double-array [5.0 7.0])]
+      (is (zero? (lapack/dgetrf! a pivots 2 2)))
+      (let [factor-before (vec a)
+            pivots-before (vec pivots)]
+        (is (zero? (lapack/dgetrs! a pivots b 2 1)))
+        (is (= factor-before (vec a)))
+        (is (= pivots-before (vec pivots)))
+        (is (< (Math/abs (- 1.6 (aget b 0))) EPS))
+        (is (< (Math/abs (- 1.8 (aget b 1))) EPS))))))
+
 (defn- approx=
   ([^double a ^double b] (< (Math/abs (- a b)) EPS))
   ([^double a ^double b ^double tol] (< (Math/abs (- a b)) tol)))
