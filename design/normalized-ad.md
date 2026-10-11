@@ -435,8 +435,28 @@ fresh interfaces and construction correspondence, including semantic metadata an
 owned residuals. Known frontend binding bookkeeping is projected only after its
 complete two-binding envelope and absent host activity have been checked; unknown
 attributes are not stripped. No derivative rules or numerical interpreter are added.
-This checkpoint does not execute sums: the one-map runtime explicitly refuses a sum
-bundle until shared host materialization and execution are extended. Nonzero or
+The existing host consumer now chooses the checked sum programs when present. Shared
+host materialization assembles the tuple map and original reduction in equation order,
+with one exact-ID source transport; it adds no numerical evaluator or reduction loop.
+The generated reduction projects only the exact frontend prefix bookkeeping already
+checked against the retained original source. Its step, dtype, identity and numerical
+facets are unchanged. Physical placement and unknown use-side facets still refuse.
+Matching retained Float/Double scalar JVM local hints are omitted only in this host
+projection: Clojure's local carrier need not equal the retained Float operation dtype.
+Semantic dtype, selected implementation receivers and primitive array hints are preserved;
+this neither widens the selected arithmetic nor changes its rounding checkpoints.
+
+For a sum, `:vjp` returns a scalar output and a pullback taking an explicit scalar seed
+of exactly the retained Float/Double type; `:jvp` still takes a tangent array but returns
+a scalar tangent. Positional excluded cotangents stay nil. The private residual arrays
+have the same primal-time snapshot ownership as the map consumer, including required
+excluded-array elements. Scalar outputs and seeds are immutable; returned gradients
+are fresh and may be mutated without changing later pullbacks. Caller data cannot be
+mutated concurrently with primal acquisition. Empty extents return the original typed
+zero, and identity transposes use the existing extent/capture map with no fake array.
+Independent ordinary-primal finite differences and strict ordered-cancellation checks
+are separate from producer certification; no floating reassociation is implied.
+Nonzero or
 negative-zero initialization, arbitrary folds, transforms, stored results, effects,
 mixed precision and reassociated/device execution remain separate gates. The unchanged
 real-weight Gemma gate remains FAILED (11/28 adapter components), and exact SFT remains

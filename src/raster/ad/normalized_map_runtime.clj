@@ -1,5 +1,5 @@
 (ns raster.ad.normalized-map-runtime
-  "Opt-in CPU execution of an already checked, single homogeneous map AD bundle.
+  "Opt-in CPU execution of a checked homogeneous map or ordered map→sum AD bundle.
   This owns no compiler cache, derivative rules, source importer or GPU session."
   (:require [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -10,7 +10,8 @@
                   (assoc data :reason reason))))
 
 (defn- executable [program source-ns]
-  (let [projection (route/materialize-host-map program)]
+  (let [projection ((if (= 2 (count (soac/equations program)))
+                      route/materialize-host-map-reduce route/materialize-host-map) program)]
     (assoc projection :execute
            (binding [*ns* source-ns]
              (eval (list 'fn (:parameters projection) (:body projection)))))))
@@ -26,24 +27,31 @@
                                  :actual-class (some-> value class .getName)}))
   value)
 
+(defn- scalar! [value dt role]
+  (when-not (case dt :float (instance? Float value) :double (instance? Double value) false)
+    (fail! :ad-map-runtime-scalar {:role role :dtype dt :actual-class (some-> value class .getName)}))
+  value)
+
 (defn prepare
   "Compile existing primal/linear/transpose host projections once.
 
   Returns {:inputs ordered-source-ids :vjp fn :jvp fn}. (:vjp prepared) takes
   an ordered argument vector and returns [output pullback]; pullback takes an
-  explicit dy array and returns positional cotangents (nil for excluded arrays and scalar inputs).
+  explicit dy array (map) or exactly typed scalar seed (sum), and returns positional cotangents
+  (nil for excluded arrays and scalar inputs).
   (:jvp prepared) takes the argument vector and an explicit dx array and returns
-  [output tangent]. Data must not be mutated concurrently with primal execution.
+  [output tangent], both scalar for a sum. Data must not be mutated concurrently with primal execution.
   Pullbacks privately own fresh coefficient snapshots, including required excluded-array
   elements, not any mutable source array. Exactly one source array is active.
   This is not implicit-seed value+grad, device execution, or general loop AD."
   [bundle]
   (normalized/validate! bundle)
-  (when (contains? bundle :sum-programs)
-    (fail! :ad-map-runtime-sum-not-materialized {}))
   (when-not (:map-programs bundle)
     (fail! :ad-map-runtime-bundle {}))
-  (let [{:keys [source interface primal linear transpose]} (:map-programs bundle)
+  (let [sum? (contains? bundle :sum-programs)
+        {:keys [interface]} (:map-programs bundle)
+        {:keys [source primal linear transpose]} (if sum? (:sum-programs bundle) (:map-programs bundle))
+        seed-id (if sum? (get-in bundle [:sum-programs :interface :seed]) (:cotangent-input interface))
         {:keys [arrays captures attributes]} (soac/operation-parts (first (soac/equations source)))
         inputs (:inputs (soac/facts source))
         values (:values (soac/facts source))
@@ -92,8 +100,8 @@
          [output
           (fn [dy]
             (normalized/validate! bundle)
-            (array! dy dt extent :cotangent)
-            (let [gradient (first (invoke pull (assoc saved (:cotangent-input interface) dy)))]
+            (if sum? (scalar! dy dt :cotangent) (array! dy dt extent :cotangent))
+            (let [gradient (first (invoke pull (assoc saved seed-id dy)))]
               (mapv #(when (= active %) gradient) inputs)))]))
      :jvp
      (fn [arguments dx]

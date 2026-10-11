@@ -814,7 +814,11 @@
       {:values (select-keys values (concat inputs (mapcat #(nth % 2) equations)))
        :inputs inputs
        :equations {(second map-equation) (get-in (soac/facts map-program) [:equations (second map-equation)])
-                   (second reduction) (get-in (soac/facts source) [:equations (second reduction)])}
+                   ;; The original checked envelope remains in :sum-programs/:source. This
+                   ;; generated program has no scalar prefix to stage: omit only the exact
+                   ;; frontend bookkeeping facet already checked by sum-source-map.
+                   (second reduction) (assoc (get-in (soac/facts source) [:equations (second reduction)])
+                                             :attributes {})}
        :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
      equations outputs)))
 

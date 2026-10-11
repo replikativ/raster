@@ -92,7 +92,7 @@
       (is (= seed (last captures)))
       (is (= (:cotangent-seed bundle) (last (:parameters (soac/lambda-parts lambda)))))
       (is (= (set arrays) (set (vals (get-in bundle [:map-programs :interface :residual-arrays])))))
-      (is (= :ad-map-runtime-sum-not-materialized (reason #(runtime/prepare bundle)))))))
+      (is (= #{:inputs :vjp :jvp} (set (keys (runtime/prepare bundle))))))))
 
 (deftest real-surface-frontend-retains-the-exact-two-operation-objective
   (doseq [[v dt array] [[#'weighted-double-sum :double double-array]

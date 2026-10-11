@@ -511,26 +511,44 @@
          :site [:binding result]
          :source source}))))
 
-(defn materialize-host-map
-  "Project one pure functional map to ordinary host source using the production materializer.
+(defn- project-host-scalar-hints
+  "Retained scalar dtype is semantic; primitive JVM local hints are not.
+   Clojure can use a double local carrier for Float loop results, so a Float
+   use-site hint conflicts even when the selected arithmetic remains Float.
+   Only matching retained Float/Double scalar hints are removed. Array and
+   implementation receiver hints, and all retained semantic metadata, survive."
+  [expression]
+  (util/postwalk-preserving-meta
+   (fn [node]
+     (if (symbol? node)
+       (let [retained (dtype/dtype-for-scalar-tag (:raster.type/tag (meta node)))
+             hint (dtype/dtype-for-scalar-tag (:tag (meta node)))]
+         (if (and (contains? #{:float :double} retained) (= retained hint))
+           (vary-meta node dissoc :tag)
+           node))
+       node))
+   expression))
 
-   Returns ordered logical :inputs/:outputs, fresh :parameters, a :value-symbols transport and
-   a retained :body returning a vector of fresh primitive result arrays. This constructs source
-   only: callers own compilation, argument shape checks, execution and result lifetimes.
-   Device placement, stored/aliased results and unknown semantic facets are not erased."
-  [program]
+(defn- materialize-host-program
+  [program reduce?]
   (dialect/validate! program)
   (let [facts (dialect/facts program)
         equations (dialect/equations program)
         equation (first equations)
         {:keys [kind attributes arrays captures]} (when equation
                                                     (dialect/operation-parts equation))
+        map-results (when equation (nth equation 2))
+        reduction (second equations)
+        reduction-parts (when reduction (dialect/operation-parts reduction))
+        reduction-facts (get-in facts [:equations (second reduction)])
+        reduction-results (when reduction (nth reduction 2))
+        reduction-attributes (:attributes reduction-parts)
         equation-facts (get-in facts [:equations (second equation)])
         inputs (:inputs facts)
         outputs (dialect/outputs program)
         extent (:extent attributes)
         extent-value (get-in facts [:values extent])
-        operands (concat arrays captures outputs)
+        operands (concat arrays captures map-results reduction-results)
         plain-host? (fn [value]
                       (and (= :tensor (:kind value))
                            (= {:kind :plain} (:representation value))
@@ -538,8 +556,8 @@
                            (contains? #{nil :host} (:memory-space value))
                            (nil? (:placement value)) (nil? (:sharding value))
                            (empty? (:effects value)) (empty? (:attributes value))))]
-    (when-not (and (= 1 (count equations)) (= 'map kind)
-                   (= outputs (nth equation 2))
+    (when-not (and (= (if reduce? 2 1) (count equations)) (= 'map kind)
+                   (= outputs (if reduce? (into (vec reduction-results) (rest map-results)) map-results))
                    (empty? (:effects facts)) (empty? (:aliases facts))
                    (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
                    (empty? (:attributes equation-facts))
@@ -552,6 +570,28 @@
                                 #{:stable-array-captures :pointwise-storage-inputs})
                    (every? empty? (vals (:attributes attributes)))
                    (empty? (dialect/result-storage program (second equation)))
+                   (or (not reduce?)
+                       (and (= 'reduce (:kind reduction-parts))
+                            (= [(first map-results)] (:arrays reduction-parts))
+                            (empty? (:captures reduction-parts))
+                            (= 1 (count reduction-results)
+                               (count (:accumulators reduction-attributes)))
+                            (semantic/equivalent? extent (:extent reduction-attributes))
+                            (empty? (:effects reduction-facts)) (empty? (:aliases reduction-facts))
+                            (empty? (:attributes reduction-facts))
+                            (empty? (dialect/result-storage program (second reduction)))
+                            (set/subset? (set (keys reduction-attributes))
+                                         #{:index :extent :attributes :accumulators :identities
+                                           :dtypes :algebra :source-arithmetic})
+                            (set/subset? (set (keys (:attributes reduction-attributes)))
+                                         #{:stable-array-captures :pointwise-storage-inputs})
+                            (every? empty? (vals (:attributes reduction-attributes)))
+                            (or (nil? (:source-arithmetic reduction-attributes))
+                                (= numerics/retained-source-arithmetic (:source-arithmetic reduction-attributes)))
+                            (= (:dtypes reduction-attributes)
+                               [(get-in facts [:values (first map-results) :dtype])]
+                               (mapv #(get-in facts [:values % :dtype]) reduction-results))
+                            (= [] (get-in facts [:values (first reduction-results) :shape]))))
                    (or (integer? extent)
                        (and (plain-host? extent-value) (= [] (:shape extent-value))
                             (dtype/known? (:dtype extent-value))
@@ -561,17 +601,18 @@
                                (and (plain-host? value)
                                     (contains? #{:float :double} (:dtype value))))) operands)
                    (every? #(= (dialect/extent-shape extent) (get-in facts [:values % :shape]))
-                           (concat arrays outputs))
+                           (concat arrays map-results))
                    (every? #(= [] (get-in facts [:values % :shape])) captures)
-                   (every? #(contains? #{nil :owned} (get-in facts [:values % :ownership])) outputs)
+                   (every? #(contains? #{nil :owned} (get-in facts [:values % :ownership]))
+                           (concat map-results reduction-results))
                    (= (set inputs) (set (concat arrays captures
                                                 (when (dialect/value-id? extent) [extent])))))
-      (throw (ex-info "map cannot be materialized as fresh host primitive arrays"
+      (throw (ex-info "program cannot be materialized as fresh host primitive values"
                       {:reason :typed-soac-host-map-boundary :equation equation})))
     ;; The dialect validator already rejects locals shadowing the operation index. The host
     ;; materializer also introduces a bare cast under that index: refuse that additional
     ;; collision rather than duplicating scoped substitution here.
-    (when (contains? '#{float double} (:index attributes))
+    (when (some #(contains? '#{float double} %) [(:index attributes) (:index reduction-attributes)])
       (throw (ex-info "map host projection requires capture-safe internal binders"
                       {:reason :typed-soac-host-map-binder-collision
                        :index (:index attributes)})))
@@ -590,13 +631,29 @@
           ;; Placement here is a host-source ordering site, not hardware placement. It belongs
           ;; only to this projection copy; the logical program and its provenance stay intact.
           projected (dialect/make
-                     (assoc-in (dialect/facts projected)
-                               [:equations (second equation) :provenance :source-binding-id] 0)
+                     (reduce (fn [facts [index equation]]
+                               (assoc-in facts [:equations (second equation) :provenance :source-binding-id] index))
+                             (dialect/facts projected) (map-indexed vector (dialect/equations projected)))
                      (dialect/equations projected) (dialect/outputs projected))
-          {:keys [pairs]} (realize-equation projected (first (dialect/equations projected)))]
+          pairs (mapcat #(:pairs (realize-equation projected %)) (dialect/equations projected))]
       {:inputs inputs :outputs outputs :parameters (mapv symbols inputs)
        :value-symbols symbols
-       :body (list 'let* (vec (mapcat identity pairs)) (mapv symbols outputs))})))
+       :body (project-host-scalar-hints
+              (list 'let* (vec (mapcat identity pairs)) (mapv symbols outputs)))})))
+
+(defn materialize-host-map
+  "Project one pure functional map to fresh host primitive arrays using existing realization.
+   Returns ordered :inputs/:outputs, :parameters, exact :value-symbols and retained :body.
+   This constructs source, not execution; placement, storage and unknown facets refuse."
+  [program]
+  (materialize-host-program program false))
+
+(defn materialize-host-map-reduce
+  "Project one pure map followed by one certified scalar reduction in original source order.
+   Tuple map results may retain fresh residual arrays beside the scalar result. Numerical AD
+   admission belongs to its checked bundle, not this structural host/source materializer."
+  [program]
+  (materialize-host-program program true))
 
 (defn- required-host-bindings
   "Return the transitive source bindings needed by host materialization.
