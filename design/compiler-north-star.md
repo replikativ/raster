@@ -1213,8 +1213,15 @@ graph:
 - graph instantiation/linking without recompiling shared kernels;
 - serialization of all non-live-resource state.
 
-Native CPU invocation also has a scheduling/ownership contract. General AOT
-functions use ordinary FFM downcalls, not critical calls inferred from syntax or
+Native CPU invocation also has a scheduling/ownership contract.
+Pointer conversion, access validation, alias admission, staging and cleanup have
+one dependency-light owner in `raster.runtime.native-call`; compiler adapters
+retain library lookup, descriptors, scalar ABI and arity validation. Numerical
+library adapters must share this owner rather than depend on compiler code or
+invent another staging implementation. Their existing critical downcalls still
+need migration; this ownership extraction does not make BLAS/LAPACK safe.
+
+General AOT functions use ordinary FFM downcalls, not critical calls inferred from syntax or
 input size. Heap arrays use invocation-owned staging; copyback follows the same
 write authority as C constness, and opaque helpers conservatively retain writes
 until per-argument effects are certified. Caller-owned native segments avoid

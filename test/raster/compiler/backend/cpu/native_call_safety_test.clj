@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.cpu.aot :as aot]
-            [raster.compiler.backend.gpu.c-emit :as c-emit])
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
+            [raster.runtime.native-call :as native-call])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]
            [java.lang.invoke MethodHandles MethodType]))
 
@@ -75,7 +76,7 @@
                                      (MethodType/methodType Object (into-array Class [Object])))
                         callback)
         x (double-array [2.0])
-        invoke (ns-resolve 'raster.compiler.backend.cpu.codegen 'invoke-ordinary)]
+        invoke native-call/invoke-ordinary!]
     (is (thrown? IllegalStateException
                  (invoke handle (object-array [(MemorySegment/ofArray x)])
                          1 [:read-write] false)))

@@ -1,9 +1,10 @@
 (ns raster.compiler.backend.cpu.native-marshalling-test
   (:require [clojure.test :refer [deftest is]]
-            [raster.compiler.backend.cpu.codegen :as cpu]))
+            [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.runtime.native-call :as native-call]))
 
 (deftest primitive-storage-conversion-retains-width-and-alias
-  (let [convert (ns-resolve 'raster.compiler.backend.cpu.codegen 'array-segment)]
+  (let [convert native-call/array-segment]
     (doseq [[array width] [[(byte-array 3) 1] [(short-array 3) 2]
                            [(char-array 3) 2] [(int-array 3) 4]
                            [(long-array 3) 8] [(float-array 3) 4]
