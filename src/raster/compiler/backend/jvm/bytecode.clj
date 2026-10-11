@@ -282,6 +282,9 @@
   "Structural fallback of infer-arg-stack-type for UNTAGGED seq forms."
   [form h locals]
   (cond
+    ;; A lexical callee is not a primitive operation, even when its spelling
+    ;; coincides with a core cast/arithmetic function. Unknown return stays unknown.
+    (contains? locals h) nil
     ;; Only the explicit closed-core intrinsic is authority here. A bare `aget`
     ;; may be a local or source-namespace function; this helper has no source
     ;; context and must not resolve it using the caller's ambient namespace.
@@ -2647,9 +2650,16 @@
   "Emit bytecode for function calls (Java static, deftm, sibling, var, local IFn)."
   [code head head-name args locals ctx]
   ;; Try clojure.core intrinsic first (returns nil for unhandled fns → fallthrough)
-  (or (when (is-clojure-core? head ctx)
+  (or (when (and (not (contains? locals head)) (is-clojure-core? head ctx))
         (emit-core-intrinsic code head-name args locals ctx))
       (cond
+        ;; Lexical scope wins over namespace resolution, including core Vars.
+        (and (symbol? head) (contains? locals head))
+        (let [{:keys [slot]} (get locals head)]
+          (.aload code slot)
+          (.checkcast code ifn-cd)
+          (emit-boxed-ifn-call code args locals ctx))
+
     ;; .method sugar → rewrite to (. obj method args...) and recurse
         (and (symbol? head) (.startsWith (str head) ".") (not= (str head) "."))
         (let [meth-sym (symbol (subs (str head) 1))
@@ -2827,15 +2837,6 @@
                         (ns-resolve ns-obj (symbol (name head))))))]
           (emit-var-constant! code (str (.name (.ns ^clojure.lang.Var v))) (str (.sym ^clojure.lang.Var v)))
           (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
-          (.checkcast code ifn-cd)
-          (emit-boxed-ifn-call code args locals ctx))
-
-    ;; ---- Local variable as IFn (including Fn-typed params) ----
-    ;; Uses boxed IFn.invoke to handle both typed ftm and plain defn callers.
-    ;; C2 profiles monomorphic call sites and devirtualizes after warmup.
-        (and (symbol? head) (get locals head))
-        (let [{:keys [slot]} (get locals head)]
-          (.aload code slot)
           (.checkcast code ifn-cd)
           (emit-boxed-ifn-call code args locals ctx))
 

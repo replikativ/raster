@@ -686,6 +686,9 @@
     (seq? x)
     (let [h (first x)]
       (cond
+        ;; Return stamps above remain authoritative, but a lexical callee's
+        ;; name cannot supply a primitive cast/arithmetic result proof.
+        (contains? type-env h) nil
         (contains? '#{long int double float} h) h
         (contains? '#{clojure.core/long clojure.core/int
                       clojure.core/double clojure.core/float} h)
