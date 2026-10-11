@@ -747,12 +747,14 @@
   "The semantic operator of a call form. For a walker-devirtualized
    (.invk impl args...) form, returns the original op from :raster.op/original
    metadata (the sanctioned way to recover meaning — never parse mangled names).
-   Otherwise returns (first form). nil if form is not a call/seq."
+   Otherwise returns (first form). A retained lexical receiver has no global
+   semantic operation. nil if form is not a call/seq."
   [form]
   (when (seq? form)
-    (if (= '.invk (first form))
-      (:raster.op/original (meta form))
-      (first form))))
+    (when-not (:raster.op/lexical-callee (meta form))
+      (if (= '.invk (first form))
+        (:raster.op/original (meta form))
+        (first form)))))
 
 (defn call-args
   "The semantic arguments of a call form, skipping the impl receiver for
@@ -765,16 +767,22 @@
   "Decompose retained call syntax without conflating meaning with implementation.
    :semantic-op is the sanctioned source identity; :recorded-op also retains legacy :op
    metadata for AD compatibility. :operation falls back to the concrete implementation for
-   rule lookup only. None of these identities certifies purity or carrier support."
+   rule lookup only. Lexical dispatch instead carries :lexical-callee and no
+   global operation; its receiver follows executable scope substitution.
+   None of these identities certifies purity or carrier support."
   [form]
   (when (seq? form)
     (let [dispatch? (= '.invk (first form))
+          implementation (if dispatch? (second form) (first form))
+          ;; Scope substitution transports the executable receiver. The proof
+          ;; marker must not retain a stale pre-alpha activity symbol.
+          lexical (when (:raster.op/lexical-callee (meta form)) implementation)
           semantic (semantic-op form)
-          recorded (or semantic (when dispatch? (:op (meta form))))
-          implementation (if dispatch? (second form) (first form))]
-      {:dispatch? dispatch? :semantic-op semantic :recorded-op recorded
-       :implementation-op implementation :operation (or recorded implementation)
-       :arguments (vec (call-args form))})))
+          recorded (when-not lexical (or semantic (when dispatch? (:op (meta form)))))]
+      (cond-> {:dispatch? dispatch? :semantic-op semantic :recorded-op recorded
+               :implementation-op implementation :operation (when-not lexical (or recorded implementation))
+               :arguments (vec (call-args form))}
+        lexical (assoc :lexical-callee lexical)))))
 
 (defn- unwrap-array-arg
   "Unwrap a cast wrapper around an array argument — (double arr) → arr,
