@@ -1213,6 +1213,20 @@ graph:
 - graph instantiation/linking without recompiling shared kernels;
 - serialization of all non-live-resource state.
 
+Native CPU invocation also has a scheduling/ownership contract. General AOT
+functions use ordinary FFM downcalls, not critical calls inferred from syntax or
+input size. Heap arrays use invocation-owned staging; copyback follows the same
+write authority as C constness, and opaque helpers conservatively retain writes
+until per-argument effects are certified. Caller-owned native segments avoid
+staging but must remain live and accessible throughout the synchronous call.
+Writable overlap is rejected when the emitted ABI uses `restrict`. Heap segment
+views are not admitted without a range/alias contract. Failed calls do not
+publish staged writes; mutations of caller-owned native storage are not rolled
+back. A critical call is a separate, explicit caller guarantee of extremely
+short bounded execution in all cases with no upcalls, never the general default.
+Benchmarks must distinguish ordinary resident, staged, and explicitly critical
+boundaries; a tiny critical probe does not establish workload speed or safety.
+
 Execution scheduling is a distinct backend-neutral lowering. An `ExecutionPlan`
 assigns operations to logical queue classes and connects them with logical
 wait/completion events. Compiler events are stable identities, never OpenCL,

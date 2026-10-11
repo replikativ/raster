@@ -6,7 +6,7 @@
   emits the WHOLE body as a single C host function — control flow and all — via
   the shared expression/statement emitter (raster.compiler.backend.gpu.c-emit)
   under the native-C config. Compiles at -O3 -march=native and loads via Panama
-  FFM (zero-copy on-heap arrays). One native call per compiled function: no
+  FFM (ordinary calls with owned heap staging). One native call per compiled function: no
   per-op JVM dispatch, no per-kernel orchestration.
 
   This is the path to fast quantized inference: the layer is composed from
@@ -569,6 +569,16 @@
      form)
     @acc))
 
+(defn- written-pointer-syms [stripped scheduled-program array-syms]
+  ;; One authority for C constness and ordinary-call copyback permissions.
+  ;; Opaque helper calls currently lack per-argument certified write effects.
+  ;; Conservatively preserve every array's mutations rather than silently
+  ;; treating unobserved helper writes as read-only. Refine only with evidence.
+  (into (if (seq (ce/collect-gpu-fn-calls stripped)) (set array-syms) #{})
+        (concat (written-array-syms stripped)
+                (mapcat segop/operation-outputs
+                        (mapcat :operations (:equations scheduled-program))))))
+
 (defn- helper-c-defs
   "C function definitions for any ^:no-inline deftm helpers called in `stripped` (these
   stay as calls instead of being inlined). Reuses the GPU helper machinery to translate a
@@ -621,9 +631,7 @@
         ;; Scheduled stores are authoritative even when the host projection retains par/map!
         ;; rather than an aset spelling. Explicit host writes still count outside those regions.
         ;; Use the same physical-output projection as graph consumers, not a C-only op registry.
-        written (into (written-array-syms stripped)
-                      (mapcat segop/operation-outputs)
-                      (mapcat :operations (:equations *scheduled-program*)))
+        written (written-pointer-syms stripped *scheduled-program* array-syms)
         ;; param order: input arrays, output buffers, scalar params, array lengths —
         ;; each array gets ITS OWN element type (e.g. float in, int8_t out for quant).
         param-strs (concat
@@ -780,7 +788,10 @@
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
   backend. Returns a fn of the deftm's args that allocates output buffers, calls
-  the native code (zero-copy), and returns the result buffer.
+  the native code with ordinary FFM calls, and returns the result buffer.
+  Heap arrays are staged in invocation-owned native storage; read-only inputs
+  are not copied back. Writable argument aliases violate the emitted restrict
+  ABI and are rejected before invocation.
 
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
@@ -838,12 +849,19 @@
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
                          length-syms stripped :return-type (or return-type :void)))
         so  (cpu/compile-source! src)
+        written (written-pointer-syms stripped parallel-program
+                                      (concat (map first array-params) (map first heap-buffers)))
+        pointer-access (into (mapv (fn [[sym _]] (if (written sym) :read-write :read))
+                                   array-params)
+                             (repeat (count heap-buffers) :read-write))
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count heap-buffers))
-                                scalar-ffm (or return-type :void))
+                                scalar-ffm (or return-type :void)
+                                {:pointer-access pointer-access :no-alias? true})
         wrapper (native-call-wrapper native params array-params scalar-params len-order
                                      heap-buffers scalar-bindings result-shape result-syms
                                      reuse-buffers?)]
     (with-meta
       wrapper
-      {:c-source src :kernel-name kernel-name})))
+      {:c-source src :kernel-name kernel-name :native-call-policy :ordinary
+       :native-pointer-access pointer-access})))
