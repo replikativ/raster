@@ -372,6 +372,8 @@
       (binding-dtype! values id expression)))
   primal)
 
+(declare validate-map-programs!)
+
 (defn validate!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
    This detects stale or changed producer data; it is not a proof of custom derivative math."
@@ -406,6 +408,8 @@
       (doseq [[p t g] (map vector active-inputs tangent-inputs (soac/outputs transpose))]
         (when-not (= (get primal-values p) (get linear-values t) (get transpose-values g))
           (fail! :ad-normalized-tangent-interface {:primal p :tangent t :cotangent g}))))
+    (when (contains? bundle :map-programs)
+      (validate-map-programs! bundle))
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
     bundle))
@@ -439,14 +443,8 @@
   [primal interface]
   (build-bundle primal interface (revisions)))
 
-(defn linearize-map-element
-  "Linearize the typed scalar region of one pure, homogeneous functional map.
-
-   This returns the existing scalar bundle, not an executable array pullback. One array
-   element is active; scalar captures are inactive. Local dtypes come from the validated
-   region, not the result storage precision. Array scheduling and coefficient snapshots
-   remain downstream obligations; retaining an input array is not a residual snapshot."
-  [map-program source-ns]
+(defn- project-map-element
+  [map-program source-ns output-id]
   (soac/validate! map-program)
   (when-not (= 1 (count (soac/equations map-program)))
     (fail! :ad-normalized-map-boundary {:equations (count (soac/equations map-program))}))
@@ -456,7 +454,9 @@
         results (nth equation 2)
         facts (soac/facts map-program)
         equation-facts (get-in facts [:equations (second equation)])
-        values (:values facts)]
+        values (:values facts)
+        extent (:extent attributes)
+        extent-value (get values extent)]
     (when-not (and (= 'map kind)
                    (= 1 (count arrays)) (= 1 (count results))
                    (= results (soac/outputs map-program))
@@ -474,6 +474,13 @@
                    (empty? (soac/result-storage map-program (second equation)))
                    (nil? (:result-transform attributes))
                    (empty? (get-in attributes [:attributes :stable-array-captures]))
+                   (or (integer? extent)
+                       (and (= :tensor (:kind extent-value)) (= [] (:shape extent-value))
+                            (dtype/known? (:dtype extent-value))
+                            (dtype/integral? (:dtype extent-value))
+                            (= {:kind :plain} (:representation extent-value))
+                            (nil? (:logical-layout extent-value))
+                            (empty? (:effects extent-value)) (empty? (:attributes extent-value))))
                    (instance? clojure.lang.Namespace source-ns))
       (fail! :ad-normalized-map-boundary {:equation equation}))
     (let [array-value (get values (first arrays))
@@ -501,7 +508,7 @@
         (fail! :ad-normalized-map-space {:binding id :retained retained :dtype dt}))
       (binding [*ns* source-ns]
         (let [params (mapv #(tagged % dt) parameters)
-              output ((typed-gensym dt) "map_element_output")
+              output (or output-id ((typed-gensym dt) "map_element_output"))
               input-values (into (array-map)
                                  (map (fn [id] [id (av/tensor {:dtype dt :shape []})])) params)
               local-bindings (vec (mapcat (fn [{:keys [id dtype init]}]
@@ -516,8 +523,128 @@
                                                         [output (first body-results)])))
               scalar (program input-values
                               (into local-bindings [output (first body-results)]) [output])]
-          (linearize-program scalar {:params params :tags (vec (repeat (count params) (tag dt)))
-                                     :active-inputs [(first params)] :source-ns source-ns}))))))
+          {:primal scalar
+           :interface {:params params :tags (vec (repeat (count params) (tag dt)))
+                       :active-inputs [(first params)] :source-ns source-ns}})))))
+
+(defn linearize-map-element
+  "Linearize the typed scalar region of one pure, homogeneous functional map.
+
+   Returns the existing scalar bundle, not array execution. The element is active;
+   scalar captures are inactive. Retained local dtypes are not storage-default guesses."
+  [map-program source-ns]
+  (let [{:keys [primal interface]} (project-map-element map-program source-ns nil)]
+    (linearize-program primal interface)))
+
+(defn- map-residual-roles [bundle source]
+  (let [{:keys [captures lambda]} (soac/operation-parts (first (soac/equations source)))
+        capture-values (zipmap (rest (:parameters (soac/lambda-parts lambda))) captures)
+        scalars (select-keys capture-values (:residuals bundle))]
+    ;; Only direct scalar captures have an existing outer scalar value. Snapshot other
+    ;; coefficients per lane, including invariant locals, without another activity analysis.
+    {:scalars scalars :arrays (vec (remove #(contains? scalars %) (:residuals bundle)))}))
+
+(defn- scalar-program-lambda [program parameters outputs]
+  (soac/lambda-form
+   parameters
+   (mapv (fn [[id expression]]
+           (soac/local-value id (:dtype (get-in (soac/facts program) [:values id])) expression))
+         (partition 2 (bindings program)))
+   outputs))
+
+(defn- lift-map-programs [bundle source interface]
+  (let [equation (first (soac/equations source))
+        {:keys [attributes arrays captures]} (soac/operation-parts equation)
+        {:keys [residual-arrays scalar-captures tangent-input cotangent-input
+                tangent-output gradient-output]} interface
+        outputs (soac/outputs source)
+        input-value (get-in (soac/facts source) [:values (first arrays)])
+        output-value (get-in (soac/facts source) [:values (first outputs)])
+        _ (when-not (and (contains? #{nil :owned} (:ownership output-value))
+                         (fingerprint/equivalent?
+                          (select-keys input-value [:memory-space :placement :sharding])
+                          (select-keys output-value [:memory-space :placement :sharding])))
+            (fail! :ad-normalized-map-storage {:input input-value :output output-value}))
+        coefficients (vec (filter #(contains? residual-arrays %) (:residuals bundle)))
+        scalar-coefficients (vec (filter #(contains? scalar-captures %) (:residuals bundle)))
+        tensor (assoc output-value :ownership :owned)
+        residual-outputs (mapv residual-arrays coefficients)
+        values (merge (:values (soac/facts source))
+                      (zipmap (concat outputs residual-outputs [tangent-output gradient-output])
+                              (repeat tensor))
+                      {tangent-input (assoc tensor :ownership :borrowed)
+                       cotangent-input (assoc tensor :ownership :borrowed)})
+        make-map
+        (fn [id arrays captures lambda outputs]
+          (let [extent (:extent attributes)
+                inputs (vec (distinct (concat arrays captures
+                                              (when-not (integer? extent) [extent]))))
+                equation (list '= id outputs (list 'map attributes arrays captures lambda))]
+            (soac/make
+             (soac/default-program-facts
+              {:values (select-keys values (concat inputs outputs)) :inputs inputs
+               :equations {id (soac/default-equation-facts)}
+               :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
+             [equation] outputs)))
+        primal-results (into outputs residual-outputs)
+        primal-yields (into (soac/outputs (:primal bundle)) coefficients)
+        derivative-captures (mapv scalar-captures scalar-coefficients)
+        derivative-parameters (fn [seed] (into [seed] (concat coefficients scalar-coefficients)))]
+    {:source source :interface interface
+     :primal (make-map 'ad-map-primal arrays captures
+                       (scalar-program-lambda (:primal bundle) (:params bundle) primal-yields)
+                       primal-results)
+     :linear (make-map 'ad-map-linear (into [tangent-input] residual-outputs) derivative-captures
+                       (scalar-program-lambda (:linear bundle)
+                                              (derivative-parameters (first (:tangent-inputs bundle)))
+                                              (soac/outputs (:linear bundle)))
+                       [tangent-output])
+     :transpose (make-map 'ad-map-transpose (into [cotangent-input] residual-outputs)
+                          derivative-captures
+                          (scalar-program-lambda (:transpose bundle)
+                                                 (derivative-parameters (:cotangent-seed bundle))
+                                                 (soac/outputs (:transpose bundle)))
+                          [gradient-output])}))
+
+(defn- validate-map-programs! [{:keys [map-programs source-ns] :as bundle}]
+  (let [{:keys [source interface]} map-programs
+        {:keys [primal] :as projected}
+        (project-map-element source source-ns (first (soac/outputs (:primal bundle))))
+        scalar-interface (:interface projected)
+        interface (:interface map-programs)
+        {:keys [scalars arrays]} (map-residual-roles bundle source)
+        ids (concat (vals (:residual-arrays interface))
+                    (map interface [:tangent-input :cotangent-input :tangent-output :gradient-output]))]
+    (when-not (and (fingerprint/equivalent? primal (:primal bundle))
+                   (fingerprint/equivalent? (select-keys bundle [:params :tags :active-inputs])
+                                            (select-keys scalar-interface [:params :tags :active-inputs]))
+                   (= #{:residual-arrays :scalar-captures :tangent-input :cotangent-input
+                        :tangent-output :gradient-output} (set (keys interface)))
+                   (fingerprint/equivalent? (set arrays) (set (keys (:residual-arrays interface))))
+                   (fingerprint/equivalent? scalars (:scalar-captures interface))
+                   (every? symbol? ids) (= (count ids) (count (distinct ids)))
+                   (empty? (set/intersection (set ids) (set (keys (:values (soac/facts source)))))))
+      (fail! :ad-normalized-map-interface {:interface interface :projected projected}))
+    (doseq [program (map map-programs [:primal :linear :transpose])] (soac/validate! program))
+    ;; Fixed interface IDs make reconstruction deterministic. Exact semantic equality includes
+    ;; expression metadata and float bits; no fresh AD generation or printed-string comparison.
+    (when-not (fingerprint/equivalent? map-programs (lift-map-programs bundle source interface))
+      (fail! :ad-normalized-map-programs {:interface interface})))
+  bundle)
+
+(defn linearize-map-program
+  "Lift one checked map's scalar bundle into ordinary primal/linear/transpose SOAC maps.
+   Primal exports fresh owned coefficient arrays; derivatives consume explicit dx/dy arrays.
+   This builds programs only. Allocation, execution and asynchronous lifetimes are downstream."
+  [source source-ns]
+  (let [bundle (linearize-map-element source source-ns)
+        {:keys [scalars arrays]} (map-residual-roles bundle source)
+        interface {:residual-arrays (into {} (map (fn [id] [id (gensym "ad_residual_")])) arrays)
+                   :scalar-captures scalars
+                   :tangent-input (gensym "ad_tangent_") :cotangent-input (gensym "ad_cotangent_")
+                   :tangent-output (gensym "ad_push_") :gradient-output (gensym "ad_pull_")}
+        bundle (assoc bundle :map-programs (lift-map-programs bundle source interface))]
+    (validate! (assoc bundle :certificate (certificate bundle)))))
 
 (defn prepare
   "Build one validated primal/linear/transpose bundle for a resolved scalar deftm Var.

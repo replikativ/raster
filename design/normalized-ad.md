@@ -139,6 +139,23 @@ execution; a mutable input array is not a snapshot. Inactive scalar captures can
 residuals. Array transposition needs an explicit cotangent array and must not silently sum an
 array output through `value+grad`. This slice does not close the training/model acceptance gate.
 
+`linearize-map-program` adds checked `:map-programs` to that same scalar bundle: the original
+map, a tuple-map primal, and explicitly seeded linear/transpose maps. The tuple primal exports
+fresh owned arrays for coefficients other than direct scalar captures. Invariant locals are
+conservatively snapshotted per lane too; this does not introduce another activity analysis.
+Derivative maps consume those arrays rather than recomputing coefficients or rereading the
+original input. Direct scalar coefficients keep their existing capture identities.
+
+Validation checks the source-to-scalar relation and reconstructs only the map lifting with
+fixed interface IDs. Metadata-sensitive semantic equality checks local definitions, yields,
+shape, ownership and coefficient correspondence before the existing bundle certificate. Map
+extents retain exact value IDs, including compound IDs, with a retained integral scalar
+contract. This is program construction, not yet physical allocation or execution: the runtime
+adapter still has to demonstrate fresh buffers, mutation-safe pullbacks and lifecycle cleanup.
+This first lifting requires matching input/output memory-space, placement and sharding, and
+an unspecified or owned functional result. It preserves those constraints rather than silently
+turning an external output into owned storage. Cross-placement derivatives remain a later plan.
+
 The next arithmetic slice admits binary division through the same operation descriptors and
 templates. Generated nested rule terms are flattened by the existing AD ANF normalizer;
 temporary contracts come from the rule's declared homogeneous scalar space and are checked
