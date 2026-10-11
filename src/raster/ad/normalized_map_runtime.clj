@@ -31,10 +31,11 @@
 
   Returns {:inputs ordered-source-ids :vjp fn :jvp fn}. (:vjp prepared) takes
   an ordered argument vector and returns [output pullback]; pullback takes an
-  explicit dy array and returns positional cotangents (nil for inactive inputs).
+  explicit dy array and returns positional cotangents (nil for excluded arrays and scalar inputs).
   (:jvp prepared) takes the argument vector and an explicit dx array and returns
   [output tangent]. Data must not be mutated concurrently with primal execution.
-  Pullbacks privately own fresh coefficient snapshots, not mutable source data.
+  Pullbacks privately own fresh coefficient snapshots, including required excluded-array
+  elements, not any mutable source array. Exactly one source array is active.
   This is not implicit-seed value+grad, device execution, or general loop AD."
   [bundle]
   (normalized/validate! bundle)
@@ -44,7 +45,7 @@
         {:keys [arrays captures attributes]} (soac/operation-parts (first (soac/equations source)))
         inputs (:inputs (soac/facts source))
         values (:values (soac/facts source))
-        active (first arrays)
+        active (:active-array interface)
         dt (:dtype (get values active))
         extent-id (:extent attributes)
         primal (executable primal (:source-ns bundle))
@@ -64,7 +65,8 @@
                               :long (instance? Long extent)
                               :int (instance? Integer extent) false)))
               (fail! :ad-map-runtime-extent-type {:extent extent}))
-            (array! (get environment active) dt extent :primal)
+            (doseq [id arrays]
+              (array! (get environment id) dt extent id))
             (doseq [id captures]
               (when-not (case (:dtype (get values id))
                           :float (instance? Float (get environment id))
@@ -75,9 +77,9 @@
         (fn [environment]
           (let [results (invoke primal environment)
                 ;; Keep only immutable scalar captures/extent and freshly owned
-                ;; residual outputs. Neither x nor returned y is a pullback input.
+                ;; residual outputs. No mutable source array or returned y is a pullback input.
                 residual-ids (vals (:residual-arrays interface))
-                saved (merge (dissoc environment active)
+                saved (merge (apply dissoc environment arrays)
                              (select-keys (zipmap (:outputs primal) results) residual-ids))]
             [(first results) saved]))]
     {:inputs inputs

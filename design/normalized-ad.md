@@ -120,8 +120,9 @@ after inlining or materialization to recover semantics lost by an earlier pass.
 ## Linearization and transposition
 
 The map migration starts at its typed element region. `linearize-map-element` accepts one
-validated pure functional map with one homogeneous plain Float/Double array and one result.
-The element parameter is active; scalar captures are inactive. Ordered local definitions
+validated pure functional map with one or two homogeneous plain Float/Double arrays and one
+result. Exactly one element parameter is active; scalar captures and any other array are
+inactive. Two arrays require explicit selection by source value ID. Ordered local definitions
 retain their declared dtypes and are checked before scalar projection can repair a widening.
 The importer uses the existing scalar program entry, derivative rules, bundle and validators;
 it does not rewalk source or infer types from output storage. Known empty frontend storage
@@ -399,13 +400,13 @@ The opt-in `raster.ad.normalized-map-runtime/prepare` consumer accepts an alread
 validated map bundle and constructs the existing three host projections once.
 Its `:inputs` vector defines the argument order. `:vjp` takes that ordered argument
 vector and returns `[output pullback]`; the pullback takes an explicit cotangent
-array and returns positional cotangents, with nil for inactive scalar captures
+array and returns positional cotangents, with nil for excluded arrays, inactive scalar captures
 and extent inputs. `:jvp` takes the argument vector and an explicit tangent array
 and returns `[output tangent]`. Array outputs never imply a scalar seed.
 
 Exact primitive storage, scalar capture types, array lengths and representable
 nonnegative extents are checked before execution. Coefficient arrays remain
-private primal-time snapshots; neither the original input nor the mutable primal
+private primal-time snapshots; neither original input array nor the mutable primal
 output is read by the pullback. Each derivative result is fresh. The caller must
 prevent concurrent mutation during primal acquisition; snapshot ownership does
 not promise atomic acquisition. Producer/rule certificates are checked at
@@ -416,3 +417,15 @@ separate capability gates.
 
 The unchanged Gemma, SFT and held checkpoint gates remain independent: successful
 scalar normalization does not certify them.
+
+The bounded map region also admits two same-shape homogeneous arrays when the caller
+explicitly selects one source value ID with `{:active-array id}`. The two-argument
+one-array entry remains unchanged; two arrays without a selection refuse. Existing
+SOAC parameter layout identifies element parameters separately from inactive scalar
+captures. An excluded element needed as a coefficient is saved into a fresh residual
+array, not borrowed from its mutable source. Runtime validates every source array and
+retains none of them in the pullback. Only the selected positional slot has a cotangent;
+the excluded array, scalar captures and extent retain nil slots. Multiple active arrays,
+reductions and general map composition remain separate capability gates. The unchanged
+real Gemma gate remains FAILED (11/28 adapter components); this map witness is not a
+replacement objective or model acceptance result.
