@@ -351,6 +351,19 @@
   [op-sym rule-fn]
   (register-op-descriptor! op-sym {:shape {:dim-rule rule-fn}}))
 
+(defn- array-length-dimension
+  [[argument :as arguments] dimensions parameters]
+  (when (and (= 1 (count arguments)) (symbol? argument))
+    (cond
+      (contains? parameters argument) (list 'clojure.core/alength argument)
+      (contains? dimensions argument) (get dimensions argument))))
+
+;; Qualified source identities own this proof; a bare local named alength is
+;; not an alias declaration. Implementation spelling resolves through the
+;; existing owner-preserving descriptor resolver.
+(doseq [operation '[clojure.core/alength raster.arrays/alength]]
+  (register-dim-rule! operation array-length-dimension))
+
 (defn get-device-rule [op-sym]
   (get-in (get-op-descriptor op-sym) [:device :rule]))
 

@@ -29,9 +29,16 @@
   (when (and (seq? let-form) (#{'let 'let*} (first let-form)))
     (let [[_ bindings-vec & _] let-form
           pairs (partition 2 bindings-vec)]
-      (reduce
-       (fn [env [sym expr]]
-         (let [dim (cond
+      (:dimensions
+       (reduce
+       (fn [{env :dimensions locals :locals} [sym expr]]
+         (let [{:keys [operation arguments implementation-op lexical-callee]}
+               (descriptor/call-description expr)
+               local-call? (or lexical-callee
+                               (and (symbol? implementation-op)
+                                    (nil? (namespace implementation-op))
+                                    (contains? locals implementation-op)))
+               dim (cond
                      (and (symbol? expr) (contains? env expr))
                      (get env expr)
 
@@ -46,43 +53,23 @@
                        (when (and (symbol? body) (contains? env body))
                          (get env body)))
 
-                     (and (seq? expr)
-                          (= 'clojure.core/alength (first expr))
-                          (= 2 (count expr))
-                          (symbol? (second expr)))
-                     (let [arg (second expr)]
-                       (cond
-                         (params-set arg) expr
-                         (contains? env arg) (get env arg)
-                         :else nil))
-
-                     ;; .invk alength: (.invk raster.arrays/alength_m_*-impl arr)
-                     (and (seq? expr)
-                          (= '.invk (first expr))
-                          (= 3 (count expr))
-                          (symbol? (second expr))
-                          (let [n (name (second expr))]
-                            (.startsWith ^String n "alength_m_"))
-                          (symbol? (nth expr 2)))
-                     (let [arg (nth expr 2)
-                           ;; Normalize to clojure.core/alength for downstream
-                           canonical (list 'clojure.core/alength arg)]
-                       (cond
-                         (params-set arg) canonical
-                         (contains? env arg) (get env arg)
-                         :else nil))
-
-                     (seq? expr)
-                     (let [head (first expr)
-                           args (vec (rest expr))]
-                       (when-let [[op-descriptor _] (and (symbol? head)
-                                                         (descriptor/resolve-op-descriptor head))]
+                     (and (seq? expr) (not local-call?))
+                     (when-let [[op-descriptor owner] (and (symbol? operation)
+                                                       (descriptor/resolve-op-descriptor operation))]
                          (when-let [rule (get-in op-descriptor [:shape :dim-rule])]
-                           (rule args env params-set)))))]
-           (if (and dim (every? params-set (free-syms dim)))
-             (assoc env sym dim)
-             env)))
-       {} pairs))))
+                           (let [dimension (rule arguments env params-set)]
+                             ;; Length retains the source expression's inferred
+                             ;; scalar tag, and its argument's metadata. Other
+                             ;; rules own their dimension-expression metadata.
+                             (if (and (descriptor/alength-op? owner)
+                                      (instance? clojure.lang.IObj dimension))
+                               (vary-meta dimension merge (meta expr))
+                               dimension)))))]
+           {:locals (conj locals sym)
+            :dimensions (if (and dim (every? params-set (free-syms dim)))
+                          (assoc env sym dim)
+                          (dissoc env sym))}))
+       {:dimensions {} :locals params-set} pairs)))))
 
 (def ^:private alloc-ctor-remap
   "Array constructor remapping per dtype."

@@ -321,3 +321,61 @@
                 transformed-error (error-of #(eval (:form result)))]
             (is (some? original-error))
             (is (= (class original-error) (class transformed-error)))))))))
+
+(deftest length-dimensions-require-the-actual-global-owner
+  (let [argument (with-meta 'a {:raster.type/tag 'doubles})
+        expression-meta {:raster.type/tag 'long :line 42}
+        global (with-meta (list '.invk 'raster.arrays/alength_m_doubles-impl argument)
+                 expression-meta)
+        retained (with-meta (list '.invk 'other-implementation argument)
+                   (assoc expression-meta :raster.op/original 'raster.arrays/alength))
+        foreign (list '.invk 'campaign.foreign/alength_m_doubles-impl argument)
+        lexical (with-meta global (assoc expression-meta :raster.op/lexical-callee true))]
+    (doseq [expression [(with-meta (list 'clojure.core/alength argument) expression-meta)
+                        global retained]]
+      (let [dimensions (hoist/build-dim-env (list 'let* ['size expression] 'size) #{'a})
+            dimension (get dimensions 'size)]
+        (is (= (list 'clojure.core/alength argument) dimension))
+        (is (= expression-meta (select-keys (meta dimension) (keys expression-meta))))
+        (is (identical? argument (second dimension)))))
+    (doseq [expression [foreign lexical
+                        (with-meta global {:raster.op/original 'campaign.foreign/alength})]]
+      (is (= {} (hoist/build-dim-env (list 'let* ['size expression] 'size) #{'a}))))
+    ;; Wrong arity/unknown intermediate carries no length proof.
+    (is (= {} (hoist/build-dim-env '(let* [size (clojure.core/alength a b)] size) #{'a 'b})))
+    (is (= {} (hoist/build-dim-env '(let* [size (clojure.core/alength unknown)] size) #{'a})))))
+
+(deftest dimension-rules-obey-ordered-lexical-masking
+  (let [lookup descriptor/get-op-descriptor
+        dimension-rule {:shape {:dim-rule (fn [_ _ _] '(clojure.core/alength a))}}]
+    (with-redefs [descriptor/get-op-descriptor
+                  (fn [operation]
+                    (if (= 'length-like operation) dimension-rule (lookup operation)))]
+      (is (= {'size '(clojure.core/alength a)}
+             (hoist/build-dim-env '(let* [size (length-like a)] size) #{'a})))
+      (is (= {} (hoist/build-dim-env '(let* [size (length-like a)] size) #{'a 'length-like})))
+      (is (= {} (hoist/build-dim-env '(let* [length-like nil size (length-like a)] size) #{'a})))
+      (is (= {} (hoist/build-dim-env '(let* [length-like nil size (.invk length-like a)] size) #{'a}))))
+    ;; A later unknown rebinding cannot reuse the earlier dimension fact.
+    (is (= {} (hoist/build-dim-env '(let* [size (clojure.core/alength a) size nil] size) #{'a})))
+    (is (= {'size '(clojure.core/alength a)}
+           (hoist/build-dim-env '(let* [alength nil size (clojure.core/alength a)] size) #{'a})))))
+
+(deftest foreign-length-facts-cannot-change-allocation-capacity
+  (let [output (with-meta 'out {:raster.buffer/hoistable true})
+        foreign '(.invk campaign.foreign/alength_m_doubles-impl a)
+        pairs [['size foreign] [output '(double-array size)]]
+        dimensions (hoist/build-dim-env (list 'let* (vec (mapcat identity pairs)) output) #{'a})
+        rewritten (hoist/rewrite-alloc-exprs pairs dimensions #{'a})]
+    (is (= pairs rewritten))
+    (is (identical? foreign (second (first rewritten))))
+    ;; The independently supplied helper result is 2 while the backing array
+    ;; has 5 elements. Rewriting to core alength would allocate the wrong size.
+    (is (= 2 (alength ^doubles
+                     (eval (list 'let* ['a '(double-array 5) 'size 2]
+                                 (second (second rewritten)))))))
+    (let [global-pairs [['size '(.invk raster.arrays/alength_m_doubles-impl a)]
+                        [output '(double-array size)]]
+          dimensions (hoist/build-dim-env (list 'let* (vec (mapcat identity global-pairs)) output) #{'a})
+          rewritten (hoist/rewrite-alloc-exprs global-pairs dimensions #{'a})]
+      (is (= '(double-array (clojure.core/alength a)) (second (second rewritten)))))))
