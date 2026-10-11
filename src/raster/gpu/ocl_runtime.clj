@@ -1254,6 +1254,60 @@
 
 (declare registered-1d-workgroup-size)
 
+(defn- create-map-buffer!
+  [context host-seg byte-size err-seg]
+  (let [handle (.invokeWithArguments ^MethodHandle @h-clCreateBuffer
+                                    (into-array Object
+                                                [context (long (bit-or CL_MEM_READ_WRITE CL_MEM_COPY_HOST_PTR))
+                                                 (long byte-size) host-seg err-seg]))
+        error (read-int err-seg)]
+    (when-not (= CL_SUCCESS error)
+      (throw (ex-info "clCreateBuffer failed" {:error error :size byte-size})))
+    (when (or (nil? handle) (zero? (.address ^MemorySegment handle)))
+      (throw (ex-info "clCreateBuffer returned a null handle"
+                      {:reason :native-buffer-null :size byte-size})))
+    handle))
+
+(defn- with-map-staging
+  "Reserve temporary memory and its root lease before native contact. Failed teardown remains
+   reachable through the existing arena registration retention path."
+  [info arrays operation]
+  (let [slots (mapv #(when-not (device-buffer? %) (cleanup/acquisition-slot)) arrays)
+        lease-slot (cleanup/acquisition-slot)
+        resources (into [] (keep-indexed
+                            (fn [idx slot]
+                              (when slot
+                                {:id [:temporary-memory idx]
+                                 :release #(cleanup/release-native!
+                                            slot (fn [handle]
+                                                   (cl-call! "clReleaseMemObject"
+                                                             @h-clReleaseMemObject [handle])))})) slots))
+        owner (cleanup/owner
+               (conj resources
+                     {:id :runtime-root-lease :after (set (map :id resources))
+                      :release #(cleanup/release-native!
+                                 lease-slot (fn [lease]
+                                              (cleanup/release! (::cleanup/owner lease))))}))
+        retain! #(cleanup/retain-registration! kernel-registry info %)]
+    (cleanup/build! owner
+                    #(do (root/capture-lease! state lease-slot)
+                         (operation slots)
+                         {})
+                    retain!)
+    (try
+      (cleanup/release! owner)
+      (catch Throwable primary
+        ;; build! handles operation failure; this is the successful-operation release path.
+        (when (seq (cleanup/pending owner))
+          (try (retain! owner)
+               (catch Throwable secondary
+                 (let [wrapper (ex-info "Map staging retains unresolved cleanup"
+                                        {::cleanup/unresolved owner} primary)]
+                   (.addSuppressed wrapper secondary)
+                   (throw wrapper)))))
+        (throw primary)))
+    nil))
+
 (defn invoke-registered-map-void-kernel
   "Invoke a compiled map-void kernel. Mirrors ze-runtime API.
   arrays: vector of OclBuffers or JVM arrays
@@ -1300,9 +1354,12 @@
        (let [{:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
          {:keys [queue]} @state
          dtype (kernel-info-value info :dtype :float)
-         default-elem-size (long (get dtype-byte-sizes dtype 4))
+         default-elem-size (long (get dtype-byte-sizes dtype 4))]
 
-         ;; Expand arrays: OclBuffer passes through, JVM arrays get staged
+     (with-map-staging info arrays
+       (fn [slots]
+       ;; Expand arrays: OclBuffer passes through, JVM arrays get staged
+       (let [
          expanded-entries
          (reduce
           (fn [acc [idx arr]]
@@ -1327,11 +1384,11 @@
                                               (keyword (str "void-arr-" idx)) byte-size)
                     _ (MemorySegment/copy (MemorySegment/ofArray arr) 0
                                           host-seg 0 byte-size)
-                    cl-mem-handle (.invokeWithArguments ^MethodHandle @h-clCreateBuffer
-                                                        (into-array Object [context (long (bit-or CL_MEM_READ_WRITE CL_MEM_COPY_HOST_PTR))
-                                                                            (long byte-size) host-seg err-seg]))]
+                    cl-mem-handle (cleanup/acquire-native!
+                                   (nth slots idx)
+                                   #(create-map-buffer! context host-seg byte-size err-seg))]
                 (conj acc {:cl-mem cl-mem-handle :source arr :byte-size byte-size
-                           :host-seg host-seg :temp? true}))))
+                           :host-seg host-seg}))))
           []
           (map-indexed vector arrays))
 
@@ -1374,19 +1431,17 @@
            (cl-call! "clFinish" @h-clFinish [queue]))
          (finally (.close gs-arena))))
 
-     ;; Copy back JVM arrays and free temp cl_mems
-     (doseq [{:keys [cl-mem source byte-size host-seg temp? write?]} expanded-entries]
+     ;; Copy back only written arrays. The reserved owner releases all temporaries afterwards,
+     ;; including when acquisition, binding, launch or readback throws.
+     (doseq [{:keys [cl-mem source byte-size host-seg write?]} expanded-entries]
        (when (and source (or (nil? abi) write?))
          ;; Read back from device
          (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
                    [queue cl-mem (int CL_TRUE) (long 0) (long byte-size)
                     host-seg (int 0) MemorySegment/NULL MemorySegment/NULL])
-         (MemorySegment/copy host-seg 0 (MemorySegment/ofArray source) 0 (long byte-size)))
-       (when temp?
-         (.invokeWithArguments ^MethodHandle @h-clReleaseMemObject
-                               (into-array Object [cl-mem]))))
+         (MemorySegment/copy host-seg 0 (MemorySegment/ofArray source) 0 (long byte-size))))
 
-     nil)))))
+     nil))))))))
 
 (defn invoke-registered-kernel
   "Pipeline-friendly value-returning map invocation for OpenCL.
