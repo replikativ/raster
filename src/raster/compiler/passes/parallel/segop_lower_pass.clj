@@ -95,15 +95,15 @@
                                                     (ex-info "lower-soac produced no SegOps" {})
                                                     device-id dtype)})))))))
 
-(defn- unknown-vector-shape [] ['?])
+(defn- unknown-vector-shape [id] [(list 'unknown-dimension id)])
 
 (defn- result-shape
-  [node]
+  [id node]
   (cond
     (soac/soac-reduce? node) []
     ;; An imperative map/scan binding aliases a caller-provided output buffer. Its iteration domain
     ;; is not proof of the buffer's physical/logical extent (padded rows and strided views are common).
-    :else (unknown-vector-shape)))
+    :else (unknown-vector-shape id)))
 
 (defn- declared-scalar-type!
   [id provided kernel-dtype]
@@ -124,12 +124,12 @@
   (let [array-ids (set/union (or (soac/soac-inputs node) #{})
                              (or (soac/soac-outputs node) #{}))
         shape (cond
-                result? (result-shape node)
+                result? (result-shape id node)
                 ;; A scalar reduction's indexed reads are certified over its reduction extent.
                 ;; Retain that minimum physical capacity instead of the compatibility `?` shape;
                 ;; graph staging can then prove the input is large enough without guessing.
                 (and (contains? array-ids id) (soac/soac-reduce? node)) [(:bound node)]
-                (contains? array-ids id) (unknown-vector-shape)
+                (contains? array-ids id) (unknown-vector-shape id)
                 :else [])
         type-id (if (and result? (soac/contract? node)) (get-in node [:facts :out]) id)
         declared-types (if (contains? array-ids type-id) array-types scalar-types)

@@ -30,6 +30,16 @@
 (defn- run-simd [form] (par-simd/simd-pass form :min-elements 0 :dtype :double))
 (defn- norm [src] (str/replace (str src) #"_\d{3,}" "_N"))
 
+(deftest compatibility-unknown-storage-retains-its-exact-value-identity
+  (let [program (lowered map-form)]
+    (doseq [id '[X O]]
+      (is (= [(list 'unknown-dimension id)] (get-in program [:values id :shape]))
+          "unknown storage is not a free scalar named ? or the output iteration extent"))
+    (let [result-id (first (:results (first (:equations program))))]
+      (is (= [:binding 'o] result-id))
+      (is (= '[(unknown-dimension o)] (get-in program [:values result-id :shape]))
+          "the result envelope retains the source binding's storage identity"))))
+
 (deftest compatibility-reentry-receives-pipeline-parameter-declarations
   (let [source '(let* [result (raster.par/map! out i n nil
                                 (clojure.core/aget input i))] result)

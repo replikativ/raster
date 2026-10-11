@@ -7,6 +7,7 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.report :as report]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.quant.kernels-k :as qk]
             [raster.quant.pack :as pack]
             [raster.compiler.backend.cpu.quant :as q]
@@ -364,8 +365,14 @@
         "the scheduled SegMap is preserved through OpenCL emission")
     (is (= '[[aq :byte] [bq :byte] [bsums :int] [da :float] [db :float]
              [wp :int] [xp :int] [xs :float] [y :float]
-             [in :long] [out :long] [_n_bound :long]]
+             [in :long] [nrows :long] [out :long] [_n_bound :long]]
            (mapv (juxt :name :dtype) (:abi (first projection-kernels)))))
+    (let [scheduled (get-in (first projection-kernels) [:provenance :scheduled-operation])]
+      (is (contains? (scheduled-body/storage-expression-references
+                      (get-in scheduled [:body :parameters])) 'nrows)
+          "the row carrier closes retained pointer storage, not only iteration geometry")
+      (is (= {:parameter 'nrows :value 'nrows :dtype :long :kernel-dtype :long :conversion :identity}
+             (first (filter #(= 'nrows (:parameter %)) (:scalar-bindings scheduled))))))
     (is (re-find #"rstr_dp4a" (:source (first projection-kernels)))
         "Q4_K row projection reaches the target-neutral integer-dot intrinsic")
     (is (not (re-find #"\\bdouble\\b" (:source (first projection-kernels))))
@@ -418,8 +425,13 @@
               [xs :float] [y :float] [in :long] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels q6-pipeline))))
     (is (= '[[[wp :int] [ws :float] [xp :int] [xs :float] [y :float]
-              [in :long] [out :long] [_n_bound :long]]]
+              [in :long] [nrows :long] [out :long] [_n_bound :long]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) (:kernels i8-pipeline))))
+    (let [scheduled (get-in (first (:kernels i8-pipeline)) [:provenance :scheduled-operation])]
+      (is (contains? (scheduled-body/storage-expression-references
+                      (get-in scheduled [:body :parameters])) 'nrows))
+      (is (= {:parameter 'nrows :value 'nrows :dtype :long :kernel-dtype :long :conversion :identity}
+             (first (filter #(= 'nrows (:parameter %)) (:scalar-bindings scheduled))))))
     (is (every? #(re-find #"rstr_dp4a" (:source %))
                 (concat (:kernels q6-pipeline) (:kernels i8-pipeline)))
         "both formats use the one target-neutral integer-dot intrinsic")))

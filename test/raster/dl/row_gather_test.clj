@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.resident-plan :as resident-plan]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as ops]
@@ -156,8 +157,15 @@
       (is (= [:map-void] (mapv :convention (:steps descriptor))))
       (is (= :kernel-body (get-in step [:artifact :provenance :dialect])))
       (is (= :kernel-body (get-in step [:artifact :attributes :emission-route])))
-      (is (= '[indices src out width _n_bound] (mapv :name (:abi step))))
-      (is (= [:int :float :float :long :long] (mapv :dtype (:abi step))))
+      (is (= '[indices src out nrows width _n_bound] (mapv :name (:abi step))))
+      (is (= [:int :float :float :long :long :long] (mapv :dtype (:abi step))))
+      (let [scheduled (get-in step [:artifact :provenance :scheduled-operation])]
+        (is (contains? (scheduled-body/storage-expression-references
+                        (get-in scheduled [:body :parameters])) 'nrows))
+        (is (= {:parameter 'nrows :value 'nrows :dtype :long :kernel-dtype :long :conversion :identity}
+               (first (filter #(= 'nrows (:parameter %)) (:scalar-bindings scheduled))))))
+      (is (= 3 ((:value-fn (nth (:argument-specs step) 3)) [nil nil nil 3 5]))
+          "the new physical row slot reads the declared source row carrier")
       (is (= 'rstr_extent_0 (last (get-in step [:artifact :arguments])))
           "the schedule names the typed scalar extent instead of embedding host code")
       (is (= 15 ((:value-fn (last (:argument-specs step)))

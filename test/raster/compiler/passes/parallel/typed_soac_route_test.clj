@@ -1807,7 +1807,7 @@
                  {:refinement (:refinement public-plan)})
                 (is false "a retained matching stage source cannot authorize a changed body")
                 (catch clojure.lang.ExceptionInfo exception
-                  (is (= :emitted-mixed-matrix-artifact-refinement (:reason (ex-data exception)))))))
+                  (is (= :scheduled-kernel-body-artifact-projection (:reason (ex-data exception)))))))
             (let [input (first (get-in planned [:graph :inputs]))
                   repeated (update (:graph planned) :inputs
                                    #(into [(assoc input :elements

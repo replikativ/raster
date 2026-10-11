@@ -15,11 +15,13 @@
 
 (deftest public-chunked-rmsnorm-tail-closes-row-storage-into-the-native-abi
   ;; Compile the real three-stage producer, not a hand-written tail. No allocation/dispatch.
+  ;; ZE selects the checked-arithmetic Intel source dialect for this compile-only proof;
+  ;; an arbitrary OpenCL CPU correctly cannot promise portable trapping Long multiplication.
   (let [prepared (compiled/lower
                   #'nn/rms-norm-chunked-backward-dx
                   [(float-array 512) (float-array 512) (float-array 256)
                    (long 2) (long 256) (long 13) (double 1.0e-6) (double 1)]
-                  {:compiler :equation-first :target :ocl:0 :dtype :float
+                  {:compiler :equation-first :target :ze:0 :dtype :float
                    :inline? true :taps '[pss pc k1 k2]})
         steps (get-in prepared [:lowering :plan :instances 0 :call :steps])
         bodies (vec (mapcat (fn [step]
