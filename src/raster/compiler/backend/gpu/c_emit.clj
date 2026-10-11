@@ -299,13 +299,18 @@
 ;; Devirtualized arithmetic → C operator/function mapping
 ;; ================================================================
 
-(defn- mangled-name->c-op
-  "C/OpenCL/GLSL lowering for a mangled devirtualized impl name (e.g.
-  '_plus__m_double_double' or 'sqrt__m_double'), via the shared intrinsics
-  registry. Returns {:kind :infix/:fn/:floored-mod :op \"...\"} or nil.
-  GLSL fn-name overrides (abs vs fabs, min vs max) keyed off the emit config."
-  [sym-name]
-  (intrinsics/c-lowering sym-name (= :glsl (:cast-style *emit-config*))))
+(defn- gpu-helper-call-lowering
+  "Select call-site intrinsic ownership before resolving its reference helper var.
+   Emission and helper collection must agree, including concrete descriptor withdrawals
+   and retained semantic identities. Helper naming is a separate projection."
+  [expression]
+  (let [callee (if (= '.invk (first expression))
+                 (second expression)
+                 (first expression))
+        identity (if (contains? (meta expression) :raster.op/original)
+                   (:raster.op/original (meta expression))
+                   callee)]
+    (intrinsics/op->c-lowering identity (= :glsl (:cast-style *emit-config*)))))
 
 ;; ================================================================
 ;; Type mappings
@@ -1505,7 +1510,7 @@
           (resolve-gpu-inlinable-var (first expr)))
      (let [sym (first expr)
            args (rest expr)
-           c-op (mangled-name->c-op sym)]
+           c-op (gpu-helper-call-lowering expr)]
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
@@ -1543,12 +1548,7 @@
           (resolve-gpu-inlinable-var (second expr)))
      (let [resolved-var (resolve-gpu-inlinable-var (second expr))
            args (nnext expr)
-           ;; Metadata-first: the walker stamps the .invk form with its semantic op
-           ;; (:raster.op/original). Use it directly; fall back to mangled-name parsing.
-           c-op (if-let [op (:raster.op/original (meta expr))]
-                  (intrinsics/op->c-lowering op (= :glsl (:cast-style *emit-config*)))
-                  (mangled-name->c-op
-                   (symbol (str (:ns (meta resolved-var))) (str (:name (meta resolved-var))))))]
+           c-op (gpu-helper-call-lowering expr)]
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
@@ -1973,26 +1973,22 @@
   identifier 'unchecked_int'`; gemma-270m `bind-decode!` died there. The discriminator is REGISTRY
   OWNERSHIP, not `^:no-inline`: the CPU-C int8-MAC seam is `^:no-inline` and DOES want a generated
   helper (cpu/aot.clj helper-c-defs)."
-  [sym seen result]
-  (when-not (contains? @seen sym)
-    (when-let [v (resolve-gpu-inlinable-var sym)]
-      (let [m (meta v)
-            ;; the resolved var's qualified name, so -impl vars map to the same c-name as direct calls
-            base-sym (symbol (str (.-ns ^clojure.lang.Var v)) (str (:name m)))]
-        ;; The collector records the MANGLED dispatch name (`raster.par/dp4a_m_long_long_long`),
-        ;; which the registry does not know. Ask about the `_m_` parent — the same walk
-        ;; `dispatch/no-inline?` does — so a devirtualized intrinsic call is recognised.
-        (when-not (let [n (name base-sym)
-                        parent (if-let [i (clojure.string/index-of n "_m_")]
-                                 (symbol (namespace base-sym) (subs n 0 i))
-                                 base-sym)]
-                    (intrinsics/op->c-lowering parent false))
-          (swap! seen conj sym)
-          (swap! result conj
-                 {:sym base-sym :var v
-                  :source-body (:raster.core/deftm-source-body m)
-                  :params (:raster.core/deftm-params m)
-                  :tags (:raster.core/deftm-tags m)}))))))
+  [expression seen result]
+  (let [sym (if (= '.invk (first expression))
+              (second expression)
+              (first expression))]
+    (when-not (contains? @seen sym)
+      (when-let [v (resolve-gpu-inlinable-var sym)]
+        (let [m (meta v)
+              ;; -impl vars and their direct reference helpers share one definition name.
+              base-sym (symbol (str (.-ns ^clojure.lang.Var v)) (str (:name m)))]
+          (when-not (gpu-helper-call-lowering expression)
+            (swap! seen conj sym)
+            (swap! result conj
+                   {:sym base-sym :var v
+                    :source-body (:raster.core/deftm-source-body m)
+                    :params (:raster.core/deftm-params m)
+                    :tags (:raster.core/deftm-tags m)})))))))
 
 (defn collect-gpu-fn-calls
   "Scan body for calls to GPU-inlinable deftm functions.
@@ -2004,13 +2000,13 @@
      (fn [form]
        (when (seq? form)
           ;; Direct calls: (fn-sym args...)
-         (when (symbol? (first form))
-           (try-add-gpu-helper (first form) seen result))
+         (when (and (symbol? (first form)) (not= '.invk (first form)))
+           (try-add-gpu-helper form seen result))
           ;; Typed dispatch: (.invk impl-var args...)
          (when (and (= '.invk (first form))
                     (>= (count form) 2)
                     (symbol? (second form)))
-           (try-add-gpu-helper (second form) seen result)))
+           (try-add-gpu-helper form seen result)))
        form)
      body)
     @result))
