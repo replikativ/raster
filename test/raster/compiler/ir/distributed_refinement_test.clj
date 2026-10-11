@@ -327,7 +327,7 @@
   (let [captured (atom nil)
         assemble distributed/refinement-plan
         expected (with-redefs [distributed/refinement-plan
-                              (fn [request] (reset! captured request) (assemble request))]
+                              (fn [& args] (reset! captured (first args)) (apply assemble args))]
                    (realized-plan 2 (realization-options)))
         request @captured
         input [:worker-0 :input]]

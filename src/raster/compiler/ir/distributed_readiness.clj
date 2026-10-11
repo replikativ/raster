@@ -18,9 +18,9 @@
 (defn- node-views [plan ids]
   (mapv #(dense! (get-in plan [:nodes % :view])) (sort-by pr-str ids)))
 
-(defn- compute-action [step entry]
+(defn- compute-action [step entry caller-options]
   (let [plan (:link-plan entry)
-        contract (link/initialization-contract plan)
+        contract (link/initialization-contract plan caller-options)
         ;; Declared initializers are conditional local preconditions too. Until local analysis
         ;; distinguishes used initializer subregions, retain their complete scopes conservatively.
         requires (node-views plan (into (:requires contract) (:initializers contract)))]
@@ -86,15 +86,16 @@
    reuploads. Their source objects remain caller-owned mutable obligations, not certificates.
    Returned actions and source requirements are not a runnable executable: allocation sharing,
    ownership/lifetimes, runtime input gates and actual transport/event completion still need proof."
-  [{:keys [steps] :as plan}]
-  (let [{:keys [bindings unbound]} (compute/bindings plan)
+  ([plan] (check plan nil))
+  ([{:keys [steps] :as plan} caller-options]
+  (let [{:keys [bindings unbound]} (compute/bindings plan caller-options)
         _ (when (seq unbound)
             (fail! "readiness requires all compute steps to be bound"
                    :distributed-readiness-unbound {:steps unbound}))
-        endpoints (compute/transfer-bindings plan)
+        endpoints (compute/transfer-bindings plan caller-options)
         actions (mapv (fn [step]
                         (case (:kind step)
-                          :compute (compute-action step (get bindings (:id step)))
+                          :compute (compute-action step (get bindings (:id step)) caller-options)
                           :transfer (let [{:keys [source target]} (get endpoints (:id step))]
                                       {:id (:id step) :kind :transfer
                                        :requires [(:view source)] :reads [(:view source)]
@@ -128,4 +129,4 @@
                 facts (into facts (map #(hash-map :view % :producer (:id action)) (:produces action)))]
             (recur (next remaining) facts history)))
         {:initializers initializers :actions (mapv #(dissoc % :initializers) actions)
-         :final-regions facts}))))
+         :final-regions facts})))))

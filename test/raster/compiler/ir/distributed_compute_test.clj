@@ -859,7 +859,7 @@
                   (update :steps #(mapv (fn [step] (assoc step :device :gpu-0)) %))))
         calls (atom 0)
         original link/value-accesses]
-    (with-redefs [link/value-accesses (fn [local] (swap! calls inc) (original local))]
+    (with-redefs [link/value-accesses (fn [& args] (swap! calls inc) (apply original args))]
       (is (empty? (:unbound (distributed/compute-bindings plan))))
       (is (= 1 @calls)))))
 

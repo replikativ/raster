@@ -1,5 +1,29 @@
 # Compiler unification campaign
 
+### Independent distributed math intent reconciliation
+
+Distributed planning, readiness (including retained-output readiness), resident root/scratch
+projection, simulation, certification and one-shot execution now thread an independent caller
+`:scalar-math` request through the existing numerical/LinkPlan authorities. Retained artifacts,
+plan attributes and ambient compiler proof scopes cannot authorize selected math. Default
+certificates retain their existing record shape and structural identity; only a nondefault
+canonical request is retained in their extension map and independently required by verification.
+Runtime intent is attached to the existing executable extension map before its original-owner
+seal is issued. No record class, allocation/session owner, output lease or replay protocol changes.
+Current storage-contract checks still precede output overlap/readiness checks.
+
+Runtime options now reject unknown keys instead of silently ignoring them, and malformed math
+requests refuse before hardware/session acquisition. Tests retain default compatibility, exact
+request/certificate correspondence, acquisition ordering and actual OpenCL/Level Zero five-trip
+selected-math execution as distinct obligations. This reconciles only the missing math seam of
+held #1182; it does not replay historical ownership/output-watch changes or establish fabric
+performance. The original eight-item compiler campaign and normalized-AD agenda remain open,
+including exact generated SFT and the unchanged real Gemma gate (11/28 adapter failures).
+Durable distributed capture/restore is deliberately not extended here: its producer-description
+adapter still validates under default intent and refuses selected-math plans. Supporting that
+composition requires a separate independent caller request, never consent inferred from the
+runtime owner or its certificate. Existing default durable capture remains unchanged.
+
 ### Map store-callee derivative authority
 
 An active map with a lexical nonlinear store callable named `double` kept its

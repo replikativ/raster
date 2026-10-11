@@ -73,9 +73,9 @@
         checked (fn [operation]
                   (reset! calls 0)
                   (with-redefs [distributed/validate!
-                                (fn [candidate]
+                                (fn [& args]
                                   (swap! calls inc)
-                                  (original candidate))]
+                                  (apply original args))]
                     (operation)))]
     (doseq [operation [#(distributed/simulate plan)
                        #(distributed/certify plan)

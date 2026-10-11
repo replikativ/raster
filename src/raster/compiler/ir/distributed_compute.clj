@@ -19,12 +19,12 @@
                     id))))
         (:values plan)))
 
-(defn- entry-facts [device target id entry]
+(defn- entry-facts [device target id entry caller-options]
   (when-not (and (some? id) (map? entry) (= #{:link-plan} (set (keys entry))))
     (fail! "a named compute entry owns one LinkPlan"
            :distributed-compute-entry {:device device :entry id}))
   (let [plan (:link-plan entry)
-        accesses (link/value-accesses plan)]
+        accesses (link/value-accesses plan caller-options)]
     (when-not (= target (:target plan))
       (fail! "compute entry target differs from its explicit worker placement"
              :distributed-compute-entry-device {:device device :target target :entry id}))
@@ -249,7 +249,8 @@
    replica DAG predecessors. Boundaries require an exact ABI-written provider view on a
    preceding same-device compute step. Initialization, intervening-write freshness, and
    executable transfer endpoints remain additional execution-proof obligations."
-  [{:keys [device-plans steps values shards halos]}]
+  ([plan] (bindings plan nil))
+  ([{:keys [device-plans steps values shards halos]} caller-options]
   (let [step-by-id (into {} (map (juxt :id identity)) steps)
         halo-steps (into {} (map (juxt :id identity)) (mapcat :steps halos))
         ;; A boundary is local storage, not an extra globally partitioned value. Its
@@ -282,7 +283,7 @@
                (fail! "analytical plans cannot also declare named compute entries"
                       :distributed-compute-mixed-plans {:device device}))
              (let [entries (into {} (map (fn [[id entry]]
-                                          [id (entry-facts device target id entry)])) entries)]
+                                          [id (entry-facts device target id entry caller-options)])) entries)]
              (reduce-kv
               (fn [bound id call]
                 (when-not (and (map? call) (= #{:entry :bindings} (set (keys call))))
@@ -352,7 +353,7 @@
         (vswap! replicas assoc key region)))
     {:bindings bound
      :unbound (mapv :id (filter #(and (= :compute (:kind %))
-                                     (not (contains? bound (:id %)))) steps))}))
+                                     (not (contains? bound (:id %)))) steps))})))
 
 (defn- unique-endpoint-view! [views reason step]
   (let [regions (distinct (map #(dissoc % :id) views))]
@@ -415,8 +416,9 @@
    Unlike the analytical planner, this fails
    on absent/ambiguous endpoints and unsupported transfer kinds. No allocation is performed;
    source initialization, freshness, and transport capability are NOT proven here."
-  [{:keys [steps shards halos copy-bindings] :as plan}]
-  (let [bound (:bindings (bindings plan))
+  ([plan] (transfer-bindings plan nil))
+  ([{:keys [steps shards halos copy-bindings] :as plan} caller-options]
+  (let [bound (:bindings (bindings plan caller-options))
         step-by-id (into {} (map (juxt :id identity)) steps)
         halo-ids (into #{} (map :id) (mapcat :steps halos))
         shard-by-id (into {} (for [[value candidates] shards candidate candidates]
@@ -466,4 +468,4 @@
                 [id (checked-copy-projection
                       step {:device source :value value :shard source-shard :view from}
                       {:device target :value value :shard (:target-shard attributes)
-                       :replica id :view to})])))))))
+                       :replica id :view to})]))))))))

@@ -137,7 +137,7 @@
                 (recur (+ offset n)))))))
     (when profile? @observations)))
 
-(defn instantiate!
+(defn- instantiate-with-options!
   "Validate and initialize an owning, one-shot distributed execution.
    Local LinkPlans must target real devices and all local allocations must be owned. Explicit
    `{:transport :host-staged}` permits synchronous cross-device copies via a temporary native
@@ -150,15 +150,21 @@
    Budgets cover declared owned LinkPlan roots. Optional :include-graph-temporaries? includes
    conservative graph scratch bounds for this serial runner, not total driver memory.
    Source objects must remain valid and stable through this synchronous initialization."
-  ([plan] (instantiate! plan {}))
-  ([plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
-          :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false}}]
-   (let [;; Physical root contracts must agree before comparing retained output ranges.
+  [plan {:keys [transport max-staging-bytes device-capacities include-graph-temporaries?]
+          :or {max-staging-bytes 1048576 device-capacities {} include-graph-temporaries? false} :as options}]
+   (when-not (and (map? options)
+                 (every? #{:transport :max-staging-bytes :device-capacities
+                           :include-graph-temporaries? :scalar-math} (keys options)))
+     (throw (ex-info "unsupported distributed runtime options"
+                     {:reason :distributed-runtime-options :options options})))
+   (let [caller-options (distributed/caller-math-options (select-keys options [:scalar-math]))
+         ;; Physical root contracts must agree before comparing retained output ranges.
          ;; An inconsistent root is not a valid overlap/readiness witness.
          {:keys [bindings specs allocation-budgets]}
-         (distributed/resident-storage-plan plan {:device-capacities device-capacities
-                                                 :include-graph-temporaries? include-graph-temporaries?})
-         ready (distributed/check-retained-output-readiness plan)
+         (distributed/resident-storage-plan plan (merge caller-options
+                                                       {:device-capacities device-capacities
+                                                        :include-graph-temporaries? include-graph-temporaries?}))
+         ready (distributed/check-retained-output-readiness plan caller-options)
          schedule (schedule plan)
          _ (when-not (contains? #{nil :host-staged :resident-copy} transport)
              (throw (ex-info "unsupported distributed transport"
@@ -175,7 +181,7 @@
                             (get-in action [:writes 0 :allocation :device]))
                  (throw (ex-info "resident-copy requires co-located physical endpoints"
                                  {:reason :distributed-runtime-resident-copy :step (:id action)})))))
-         projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %)))
+         projections (update-vals bindings #(link-plan/borrow-owned-storage (:link-plan %) caller-options))
          sessions (atom {})]
      (try
        (doseq [[device entries] (sort-by (comp pr-str key) (group-by (comp first key) specs))]
@@ -192,11 +198,21 @@
                             (physical-view @sessions view) source
                             {:elements (reduce * 1 (:shape view))}))
        (seal-runtime-value
-        (->DistributedExecutable plan schedule ready bindings projections @sessions transport
-                                 max-staging-bytes (atom :ready) allocation-budgets nil (atom nil)))
+        ;; The independent immutable request belongs to the exact issued owner before sealing.
+        ;; Keep the record class unchanged; associating it after sealing would create a copy.
+        (assoc (->DistributedExecutable plan schedule ready bindings projections @sessions transport
+                                        max-staging-bytes (atom :ready) allocation-budgets nil (atom nil))
+               :caller-options caller-options))
        (catch Throwable e
          (try (close-sessions! @sessions) (catch Throwable cleanup (.addSuppressed e cleanup)))
-         (throw e))))))
+         (throw e)))))
+
+(defn instantiate!
+  "Acquire one owner with independent caller :scalar-math intent. Default math stays default;
+   plan/artifact metadata never authorizes a selected policy. Ownership and budgets are unchanged."
+  ([plan] (instantiate! plan {}))
+  ([plan options]
+   (link-plan/without-validation-context #(instantiate-with-options! plan options))))
 
 (defn- device-observations [executable]
   (into {} (map (fn [[target session]]
@@ -255,8 +271,9 @@
                   session (get (:sessions executable) (:target plan))
                   ids (set (map #(get-in % [:view :allocation :id]) (vals (:nodes plan))))
                   buffers (into {} (map (fn [id] [id (gpu/buffer session id)])) ids)]
-              (with-open [local (link/instantiate! plan {:session session :external-buffers buffers
-                                                       :profile? profile?})]
+              (with-open [local (link/instantiate! plan (merge (:caller-options executable)
+                                                             {:session session :external-buffers buffers
+                                                              :profile? profile?}))]
                 (if profile? (link/profile! local) (do (link/run! local) nil))))
             :transfer
             (let [action (actions id)]
@@ -308,7 +325,7 @@
   "Execute the DAG once, synchronously. Completion is recorded after each call returns.
    Failed/completed owners cannot replay stale initialization evidence."
   [executable]
-  (execute! executable false))
+  (link-plan/without-validation-context #(execute! executable false)))
 
 (defn profile!
   "Execute once with existing Link kernel profiling and awaited transfer-event measurements.
@@ -324,7 +341,7 @@
   (when-not (original-executable? executable)
     (throw (ex-info "profiling requires the original distributed owner"
                     {:reason :distributed-runtime-owner})))
-  (execute! executable true))
+  (link-plan/without-validation-context #(execute! executable true)))
 
 (defn output-values
   "Return retained compute outputs as step-id -> logical-value-id -> resident value.

@@ -55,6 +55,18 @@
             route-costs cost-vector device-plans copy-bindings refinements])
 (defrecord CertifiedDistributedPlan [plan certificate])
 
+(defn ^:no-doc caller-math-options
+  "Canonical independent caller intent. Retained plans/artifacts are never consent."
+  [options]
+  (when-not (or (nil? options)
+                (and (map? options) (set/subset? (set (keys options)) #{:scalar-math})))
+    (fail! "distributed caller intent accepts only scalar-math"
+           :distributed-math-options {:options options}))
+  (let [policy (numerical-contract/validate-scalar-math-policy! (:scalar-math options))]
+    ;; Empty intent preserves the existing default physical certificate representation:
+    ;; absent and explicitly empty policies must not manufacture retained schedule attributes.
+    (if (seq (:overrides policy)) {:scalar-math policy} {})))
+
 (defn device-mesh? [value] (instance? DeviceMesh value))
 (defn device-resource? [value] (instance? DeviceResource value))
 (defn topology-link? [value] (instance? TopologyLink value))
@@ -942,7 +954,7 @@
     halos))
 
 (defn- validate-device-plans!
-  [mesh device-plans]
+  [mesh device-plans caller-options]
   (when-not (map? device-plans)
     (fail! "distributed device plans must be a map keyed by device identity"
            :distributed-device-plans {:device-plans device-plans}))
@@ -956,7 +968,7 @@
       (fail! "a shard-local plan must be a map"
              :distributed-device-plan {:device device-id :plan local}))
     (when link-plan
-      (link-plan/validate! link-plan)
+      (link-plan/validate! link-plan caller-options)
       (when-not (= (get local :target device-id) (:target link-plan))
         (fail! "shard-local LinkPlan target differs from its mesh device"
                :distributed-device-link-target
@@ -1079,7 +1091,7 @@
 
 (defn- validate-structure!
   "Validate and return a DistributedPlan without realizing any runtime resource."
-  [plan]
+  [plan caller-options]
   (when-not (distributed-plan? plan)
     (fail! "expected a DistributedPlan value"
            :distributed-plan-type {:actual (type plan)}))
@@ -1119,7 +1131,7 @@
     (validate-value-shards! mesh topology values shards)
     (validate-collectives! mesh topology values collective-groups collectives steps)
     (validate-halos! topology values shards halos steps)
-    (validate-device-plans! mesh device-plans)
+    (validate-device-plans! mesh device-plans caller-options)
     (validate-steps! mesh topology values steps outputs)
     (validate-copy-bindings! plan)
     (when-not (map? attributes)
@@ -1129,13 +1141,13 @@
 
 (defn- validate-refinements! [{:keys [refinements topology values shards steps copy-bindings
                                     mesh collective-groups collectives]
-                             :as plan} bound]
+                             :as plan} bound caller-options]
   (when-not (map? refinements)
     (fail! "collective realizations must be an explicit map" :distributed-refinements {}))
   (let [step-by-id (into {} (map (juxt :id identity)) steps)
         claimed (volatile! #{})
         ;; Exact-call memoization, not a global cache or a source-content snapshot.
-        actions (delay (:actions (readiness/check plan)))]
+        actions (delay (:actions (readiness/check plan caller-options)))]
     (doseq [[id {:keys [refinement input-producers combine-costs storage combines] :as realization}]
             refinements]
       (when-not (and (map? realization)
@@ -1231,16 +1243,18 @@
                      :distributed-refinement-immutable
                      {:id id :ssa ssa :producer producer :writer (:id action)}))))))))
 
-(defn- validated-compute-facts [plan]
-  (let [facts (compute/bindings (validate-structure! plan))]
-    (validate-refinements! plan (:bindings facts))
+(defn- validated-compute-facts [plan options]
+  (let [caller-options (caller-math-options options)
+        facts (compute/bindings (validate-structure! plan caller-options) caller-options)]
+    (validate-refinements! plan (:bindings facts) caller-options)
     facts))
 
 (defn validate!
   "Validate distributed structure and local compute bindings without realizing resources."
-  [plan]
-  (validated-compute-facts plan)
-  plan)
+  ([plan] (validate! plan nil))
+  ([plan options]
+   (validated-compute-facts plan options)
+   plan))
 
 (defn compute-bindings
   "Validate and resolve named local compute entries and qualified shard bindings.
@@ -1256,8 +1270,8 @@
    via `{:kind :boundary :region {...} :provider {:step id :local-value id}}`. Such private
    outputs are retained under the producer entry's `:boundary-outputs`, without a synthetic
    global shard. Combining transfers are not admitted as copy-replica placements."
-  [plan]
-  (validated-compute-facts plan))
+  ([plan] (compute-bindings plan nil))
+  ([plan options] (validated-compute-facts plan options)))
 
 (defn resident-storage-plan
   "Independently validate and project the current finite runtime's owned LinkPlan root pool.
@@ -1273,11 +1287,12 @@
   ([plan {:keys [device-capacities include-graph-temporaries?]
           :or {device-capacities {} include-graph-temporaries? false} :as options}]
    (when-not (and (map? options)
-                  (set/subset? (set (keys options)) #{:device-capacities :include-graph-temporaries?})
+                  (set/subset? (set (keys options)) #{:device-capacities :include-graph-temporaries? :scalar-math})
                   (map? device-capacities) (boolean? include-graph-temporaries?))
      (fail! "physical device capacities must be a map"
             :distributed-runtime-physical-budget {:options options}))
-   (let [{:keys [bindings unbound]} (compute-bindings plan)
+   (let [caller-options (caller-math-options (select-keys options [:scalar-math]))
+         {:keys [bindings unbound]} (compute-bindings plan caller-options)
          _ (when (seq unbound)
              (fail! "resident storage projection requires all compute steps to be bound"
                     :distributed-resident-unbound {:steps unbound}))
@@ -1302,7 +1317,7 @@
                                   {:allocation key :previous previous :actual spec})))
                        (assoc specs key spec))) specs (:nodes link-plan))) {} bindings)
          temporary-plans (when include-graph-temporaries?
-                           (update-vals bindings #(link-plan/temporary-storage-plan (:link-plan %))))
+                           (update-vals bindings #(link-plan/temporary-storage-plan (:link-plan %) caller-options)))
          temporary-peaks (reduce (fn [peaks {:keys [target resident-bytes]}]
                                    (update peaks target (fnil max 0) resident-bytes))
                                  {} (vals temporary-plans))
@@ -1332,25 +1347,30 @@
    Unsupported or absent endpoints fail rather than acquiring guessed
    storage. Returns a map keyed by transfer step ID. This does not authorize execution:
    initialization/freshness, shared allocation and transport capabilities remain obligations."
-  [plan]
-  (compute/transfer-bindings (validate! plan)))
+  ([plan] (transfer-bindings plan nil))
+  ([plan options]
+   (let [caller-options (caller-math-options options)]
+     (compute/transfer-bindings (validate! plan caller-options) caller-options))))
 
 (defn check-readiness
   "Check conditional physical initialization, DAG effect ordering and replica/boundary freshness.
    Returns startup initializer obligations, action scopes and final initialized regions. Requires
    bound compute and strict copy endpoints; no allocation or execution occurs. Source snapshots,
    resource ownership, runtime input gates and event completion remain runtime obligations."
-  [plan]
-  (readiness/check (validate! plan)))
+  ([plan] (check-readiness plan nil))
+  ([plan options]
+   (let [caller-options (caller-math-options options)]
+     (readiness/check (validate! plan caller-options) caller-options))))
 
 (defn check-retained-output-readiness
   "Check startup readiness and preserve every retained output through the complete schedule.
    A retained compute output may pass through initialized bytes, but no later compute or transfer
    may write an overlapping physical range. This is a pure conservative final-frontier check,
    not evidence of actual execution, authentication or temporal/communication lineage."
-  [plan]
-  (let [ready (check-readiness plan)
-        bindings (:bindings (compute-bindings plan))]
+  ([plan] (check-retained-output-readiness plan nil))
+  ([plan options]
+  (let [ready (check-readiness plan options)
+        bindings (:bindings (compute-bindings plan options))]
     (doseq [[index action] (map-indexed vector (:actions ready))
             :when (contains? (set (:outputs plan)) (:id action))
             :let [local (get-in bindings [(:id action) :link-plan])]
@@ -1361,16 +1381,18 @@
         (fail! "a retained distributed output is overwritten before completion"
                :distributed-runtime-output-overwritten
                {:step (:id action) :node node-id :writer (:id later)})))
-    ready))
+    ready)))
 
 (defn plan
-  [{:keys [id mesh topology values shards collective-groups collectives
+  ([request] (plan request nil))
+  ([{:keys [id mesh topology values shards collective-groups collectives
            halos device-plans copy-bindings refinements steps outputs attributes]
     :or {values {} shards {} collective-groups {} collectives []
-         halos [] device-plans {} copy-bindings {} refinements {} steps [] outputs [] attributes {}}}]
+         halos [] device-plans {} copy-bindings {} refinements {} steps [] outputs [] attributes {}}} options]
   (validate!
    (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
-                      device-plans copy-bindings refinements (vec steps) (vec outputs) attributes)))
+                      device-plans copy-bindings refinements (vec steps) (vec outputs) attributes)
+   options)))
 
 (defn refinement-plan-fields
   "Construct ordinary DistributedPlan fields for one collective refinement.
@@ -1435,8 +1457,8 @@
   "Assemble and validate one complete collective refinement through the ordinary plan authority.
    For compositional construction, `refinement-plan-fields` returns unvalidated fields; only
    the complete containing DAG can establish dependency, initialization and ownership proofs."
-  [request]
-  (plan (refinement-plan-fields request)))
+  ([request] (refinement-plan request nil))
+  ([request options] (plan (refinement-plan-fields request) options)))
 
 (defn compose-refinement-plans
   "Assemble multiple explicitly scoped collective requests into one validated ordinary DAG.
@@ -1451,7 +1473,8 @@
    The ordinary readiness/certification/runtime boundaries retain their separate obligations;
    returning a plan is not proof that its caller-owned startup sources have been realized.
    This creates no execution owner and does not permit replay of a completed one-shot owner."
-  [context requests]
+  ([context requests] (compose-refinement-plans context requests nil))
+  ([context requests options]
   (let [allowed #{:id :mesh :topology :outputs :attributes}
         required #{:id :mesh :topology :outputs}
         _ (when-not (and (map? context) (set/subset? (set (keys context)) allowed)
@@ -1519,7 +1542,7 @@
                    (update :steps into (:steps fields))))))
          {:values {} :shards {} :collective-groups {} :copy-bindings {} :refinements {}
           :device-plans {} :steps []} requests)]
-    (plan (merge fields context))))
+    (plan (merge fields context) options))))
 
 (defn- physical-target [plan worker]
   ;; One explicit placement projection, not recursive rewriting of target identities.
@@ -1669,7 +1692,7 @@
               (fail! "empirical simulation requires an explicit context, profiles and valid policy"
                      :distributed-cost-options {:options options})))
         pool (when (some #(contains? options %) [:device-capacities :include-graph-temporaries?])
-               (resident-storage-plan plan (select-keys options [:device-capacities :include-graph-temporaries?])))
+               (resident-storage-plan plan (select-keys options [:device-capacities :include-graph-temporaries? :scalar-math])))
         costs (when (seq route-options)
                 (into {} (for [step (:steps plan) :when (= :transfer (:kind step))]
                            [(:id step) (empirical-route-cost plan step (:route-context options)
@@ -1785,12 +1808,13 @@
   ([plan options]
    (when-not (and (map? options)
                   (set/subset? (set (keys options)) #{:route-context :profiles :route-policy :device-capacities
-                                                    :include-graph-temporaries?}))
+                                                    :include-graph-temporaries? :scalar-math}))
      (fail! "unsupported distributed simulation options" :distributed-cost-options {:options options}))
    (when (and (some #(contains? options %) [:route-context :profiles :route-policy])
               (not (map? (:route-policy options))))
      (fail! "empirical route policy must be a map" :distributed-cost-options {:options options}))
-   (simulate-validated (validate! plan) options)))
+   (let [caller-options (caller-math-options (select-keys options [:scalar-math]))]
+     (simulate-validated (validate! plan caller-options) options))))
 
 (defn- shard-coverage
   [plan]
@@ -1811,9 +1835,9 @@
         (:steps plan)))
 
 (defn- derive-certificate
-  [plan]
+  [plan caller-options]
   (let [simulation (simulate-validated plan {})]
-    (->DistributedPlanCertificate
+    (cond-> (->DistributedPlanCertificate
      (:id plan)
      (mapv (juxt :name :size) (get-in plan [:mesh :axes]))
      (shard-coverage plan)
@@ -1840,29 +1864,37 @@
      ;; This is structural plan verification, not a digest of mutable buffer contents.
      (:device-plans plan)
      (:copy-bindings plan)
-     (:refinements plan))))
+     (:refinements plan))
+      ;; Default certificates retain their existing record/value identity. A nondefault
+      ;; request is explicit witness data, never permission inferred during verification.
+      (seq (get-in caller-options [:scalar-math :overrides]))
+      (assoc :scalar-math (:scalar-math caller-options)))))
 
 (defn certify
   "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.
    Local contracts are compared as compiler values, not portable hashes or buffer snapshots.
    Certificates retain their referenced objects but acquire no runtime ownership/arena lease."
-  [plan]
-  (let [plan (validate! plan)]
-    (->CertifiedDistributedPlan plan (derive-certificate plan))))
+  ([plan] (certify plan nil))
+  ([plan options]
+   (let [caller-options (caller-math-options options)
+         plan (validate! plan caller-options)]
+     (->CertifiedDistributedPlan plan (derive-certificate plan caller-options)))))
 
 (defn verify!
   "Revalidate a CertifiedDistributedPlan and independently derive its certificate."
-  [certified]
+  ([certified] (verify! certified nil))
+  ([certified options]
   (when-not (certified-plan? certified)
     (fail! "expected a CertifiedDistributedPlan"
            :distributed-certified-plan-type {:actual (type certified)}))
-  (let [plan (validate! (:plan certified))
+  (let [caller-options (caller-math-options options)
+        plan (validate! (:plan certified) caller-options)
         certificate (:certificate certified)
-        expected (derive-certificate plan)]
+        expected (derive-certificate plan caller-options)]
     (when-not (certificate? certificate)
       (fail! "distributed plan certificate has the wrong type"
              :distributed-certificate-type {:actual (type certificate)}))
     (when-not (= expected certificate)
       (fail! "distributed plan certificate does not match its plan"
              :distributed-certificate {:expected expected :actual certificate}))
-    certified))
+    certified)))

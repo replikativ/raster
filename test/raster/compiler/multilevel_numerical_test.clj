@@ -385,7 +385,7 @@
            (failure (assoc-in implementations [:restriction :contract :ratio] [4 4]))))
     (let [compute-bindings distributed/compute-bindings]
       (with-redefs [distributed/compute-bindings
-                    (fn [p] (assoc-in (compute-bindings p)
+                    (fn [& args] (assoc-in (apply compute-bindings args)
                                       [:bindings [:prolongation :apply] :boundary-outputs :extra]
                                       {:access :write}))]
         (is (= :amr-execution-effects (failure implementations))
@@ -393,7 +393,7 @@
     (let [compute-bindings distributed/compute-bindings
           target-id (get-in implementations [:prolongation :target])]
       (with-redefs [distributed/compute-bindings
-                    (fn [p] (assoc-in (compute-bindings p)
+                    (fn [& args] (assoc-in (apply compute-bindings args)
                                       [:bindings [:prolongation :apply] :values target-id :access]
                                       :read-write))]
         (is (= :amr-execution-effects (failure implementations))
@@ -401,7 +401,7 @@
     (let [compute-bindings distributed/compute-bindings
           source-id (get-in implementations [:prolongation :source])]
       (with-redefs [distributed/compute-bindings
-                    (fn [p] (assoc-in (compute-bindings p)
+                    (fn [& args] (assoc-in (apply compute-bindings args)
                                       [:bindings [:prolongation :apply] :values source-id :domain] nil))]
         (is (= :amr-execution-shard (failure implementations))
             "logical shape alone cannot prove a whole dense physical patch")))
