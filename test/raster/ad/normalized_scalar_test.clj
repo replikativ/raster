@@ -61,11 +61,14 @@
                                '(.invk raster.ad.normalized-scalar-test/receiver-alias coefficient t)
                                (meta expression))
           aliased-program (linear-program aliased-expression '[coefficient t])]
-      (is (= '#{t result}
-             (normalized/validate-linear! aliased-program '[t] '[coefficient])))
-      (with-redefs [receiver-alias (Object.)]
-        (is (= :ad-normalized-call-contract
-               (reason #(normalized/validate-linear! aliased-program '[t] '[coefficient]))))))
+      ;; Other namespaces may refresh registered methods after this namespace loads.
+      ;; The alias positive refers to the current selection, not its load-time snapshot.
+      (with-redefs [receiver-alias (:typed-impl selected)]
+        (is (= '#{t result}
+               (normalized/validate-linear! aliased-program '[t] '[coefficient])))
+        (with-redefs [receiver-alias (Object.)]
+          (is (= :ad-normalized-call-contract
+                 (reason #(normalized/validate-linear! aliased-program '[t] '[coefficient])))))))
     (doseq [contradictory [nil
                           (assoc selected :tags '[float float])
                           (assoc selected :return-tag 'float)
