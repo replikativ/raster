@@ -377,6 +377,15 @@ The local reference check supports this boundary and adds specific obligations:
 
 These observations refer to the available sibling checkouts, not an assertion about
 the latest upstream versions. No reference compiler becomes a runtime dependency.
+Actual `deftm` maps enter through the existing frontend. The normalized importer
+admits its bookkeeping only when it describes the sole map/result binding and
+has no host activity or allocation; unknown/inconsistent facets still refuse.
+Homogeneous identity conversions use the shared metadata-preserving canonical
+conversion projection and existing ANF normalization. Deterministic local IDs
+derived from the scalar output identity let relational validation repeat that
+projection without fresh-name or printed-source equality. The original frontend
+program stays in the bundle; its facts are not silently stripped.
+
 Host materialization of the lifted maps reuses `typed-soac-route`'s production
 allocation, ordered scalar region and tuple-store projection. It returns ordinary
 retained source with exact logical input/output IDs transported to fresh source

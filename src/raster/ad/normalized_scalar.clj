@@ -443,6 +443,19 @@
   [primal interface]
   (build-bundle primal interface (revisions)))
 
+(defn- map-source-envelope?
+  [facts equation]
+  (let [attributes (dissoc (:attributes facts) :source-arithmetic)
+        equation-facts (get-in facts [:equations (second equation)])]
+    (or (and (empty? attributes) (empty? (:attributes equation-facts)))
+        (and (= {:source-dialect :closed-clojure
+                 :source-bindings (nth equation 2)
+                 :host-binding-ids [] :host-read-values [] :host-read-sites [] :allocations []}
+                attributes)
+             (= {:source-prefix? true} (:attributes equation-facts))
+             (= :analyzed-source (get-in equation-facts [:provenance :front-end]))
+             (= 0 (get-in equation-facts [:provenance :source-binding-id]))))))
+
 (defn- project-map-element
   [map-program source-ns output-id]
   (soac/validate! map-program)
@@ -462,8 +475,7 @@
                    (= results (soac/outputs map-program))
                    (empty? (:effects facts)) (empty? (:aliases facts))
                    (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
-                   (empty? (:attributes equation-facts))
-                   (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
+                   (map-source-envelope? facts equation)
                    (or (nil? (get-in facts [:attributes :source-arithmetic]))
                        (= numerics/retained-source-arithmetic
                           (get-in facts [:attributes :source-arithmetic])))
@@ -511,18 +523,33 @@
               output (or output-id ((typed-gensym dt) "map_element_output"))
               input-values (into (array-map)
                                  (map (fn [id] [id (av/tensor {:dtype dt :shape []})])) params)
+              expressions (concat (map :init locals) body-results)
+              _ (doseq [expression expressions
+                        term (tree-seq coll? seq expression)
+                        :when (soac/scalar-convert-form? term)
+                        :let [attributes (:attributes (soac/scalar-convert-parts term))]]
+                  (when-not (= dt (:source-dtype attributes) (:target-dtype attributes))
+                    (fail! :ad-normalized-map-space {:conversion term :dtype dt})))
               local-bindings (vec (mapcat (fn [{:keys [id dtype init]}]
-                                            [(tagged id dtype) init]) locals))
+                                            [(tagged id dtype) (soac/scalar-converts->source init)]) locals))
+              output-expression (soac/scalar-converts->source (first body-results))
+              ordinal (atom 0)
+              normalized-bindings
+              (anf/anf-normalize-bindings
+               (into local-bindings [output output-expression])
+               (fn [_]
+                 ;; Reprojection uses the same output ID. Stable local IDs let relational
+                 ;; validation reproduce ANF without comparing generated source strings.
+                 (tagged (symbol (str (name output) "__anf_" (swap! ordinal inc))) dt)))
             ;; Check initializers at their retained dtype before scalar-equation's exact
             ;; widening repair. Projection must not manufacture conversion evidence.
               _ (reduce (fn [known [id expression]]
                           (let [known (assoc known id (av/tensor {:dtype dt :shape []}))]
                             (binding-dtype! known id expression)
                             known))
-                        input-values (partition 2 (into local-bindings
-                                                        [output (first body-results)])))
+                        input-values (partition 2 normalized-bindings))
               scalar (program input-values
-                              (into local-bindings [output (first body-results)]) [output])]
+                              normalized-bindings [output])]
           {:primal scalar
            :interface {:params params :tags (vec (repeat (count params) (tag dt)))
                        :active-inputs [(first params)] :source-ns source-ns}})))))
