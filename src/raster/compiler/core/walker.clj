@@ -958,6 +958,8 @@
                      (walk body-expr idx-ctx))
       (meta form))))
 
+(declare retain-source-callee-identity)
+
 (defmethod walk-form :par-map [form ctx]
   ;; Handle both standard and offset variants:
   ;;   Standard: (par/map! out idx bound cast body)
@@ -975,6 +977,7 @@
         walked-bound (walk bound-expr ctx)
         idx-ctx (ctx-assoc-type ctx i-sym 'long)
         walked-body (walk body-expr idx-ctx)
+        cast-fn (retain-source-callee-identity cast-fn idx-ctx)
         result (if offset?
                  (list 'raster.par/map! hinted-out i-sym walked-bound
                        :offset (walk base-expr ctx) cast-fn walked-body)
@@ -1370,7 +1373,8 @@
                               int 'ints
                               (throw (ex-info (str "par/map: unrecognized cast hint `" cast-hint "`")
                                               {:cast-hint cast-hint :form form}))))
-        store-cast (or cast-hint (types/array-tag->cast out-tag))
+        store-cast (retain-source-callee-identity
+                    (or cast-hint (types/array-tag->cast out-tag)) idx-ctx)
         elem-type (case out-tag
                     floats :float
                     doubles :double

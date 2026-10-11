@@ -192,9 +192,8 @@
   [tenv sym map-form tag]
   (let [[_ out idx bound & tail] map-form
         [cast body] (when (= 2 (count tail)) tail)]
+    (rev/assert-map-store-callee! map-form true)
     (when-not (and (= 2 (count tail)) (symbol? out) (symbol? idx)
-                   (contains? '#{nil float double clojure.core/float
-                                 clojure.core/double} cast)
                    (pure-map-step? body)
                    (not (some #{out} (tree-seq coll? seq body))))
       (throw (ex-info "jvp: map! needs a floating cast, pure body and non-self-reading output"
@@ -421,7 +420,9 @@
              (= 'raster.par/map! head)
              (let [[_ out idx _bound & tail] init
                    body (last tail)
-                   active? (any-active? (dissoc tenv idx) body)]
+                   cast (when (= 2 (count tail)) (first tail))
+                   active? (or (any-active? (dissoc tenv idx) body)
+                               (any-active? (dissoc tenv idx) cast))]
                (cond
                  (contains? tenv out)
                  (throw (ex-info "jvp: map! mutates an active input buffer"

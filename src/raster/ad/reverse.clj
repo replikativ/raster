@@ -2008,7 +2008,7 @@
                         (let [d-arr-sym (arr->d-sym arr)
                               at (util/subst-syms {counter-sym j-sym} idx)]
                           [(ad-gensym "_scatter")
-                           (list 'aset d-arr-sym at
+                           (list 'raster.arrays/aset d-arr-sym at
                                  (list 'raster.ad.reverse/grad-acc
                                        (list 'aget d-arr-sym at)
                                        (list 'nth grads-iter-sym i)))]))
@@ -2204,6 +2204,21 @@
          ;; Remove arrays that are aget'd (they're inputs, not scalars)
          :free-syms (disj all-free idx-sym)})))))
 
+(defn ^:no-doc assert-map-store-callee!
+  "An active map's scalar pullback does not differentiate an arbitrary store
+   callable. Admit only no callable or a source-resolved floating core cast.
+   This preserves existing floating conversion semantics, not a new rounding policy."
+  [map-form active?]
+  (let [cast (nth map-form 4 nil)
+        callee (:raster.op/resolved-callee (meta cast))]
+    (when (and active? cast
+               (not (and (symbol? cast) (symbol? callee)
+                         (= "clojure.core" (namespace callee))
+                         (some-> callee op/cast-result-tag dtype/dtype-for-scalar-tag dtype/fp-dtype?))))
+      (throw (ex-info "AD map! store callable has no proved floating conversion authority"
+                      {:reason :ad-map-store-callee :cast cast :resolved-callee callee
+                       :form map-form})))))
+
 (defn- gen-reverse-par-map
   "Generate reverse-mode AD code for a raster.par/map! form.
 
@@ -2218,6 +2233,9 @@
   Returns a record map for gen-reverse-let to use."
   [par-map-form active-params]
   (let [[_ out-sym idx-sym bound-expr cast-fn body-expr] par-map-form
+        _ (binding [util/*shadowing-locals* (into util/*shadowing-locals* active-params)]
+            (assert-map-store-callee!
+             par-map-form (init-active? par-map-form (zipmap active-params (repeat true)))))
         {:keys [agets scalar-bindings body-result free-syms]}
         (analyze-par-map-body body-expr idx-sym true (conj (set active-params) out-sym))
 
@@ -2277,7 +2295,7 @@
                                     val-result-sym (list 'nth vpb-sym 0)
                                     pb-sym (list 'nth vpb-sym 1)]
                 store-and-aset [(ad-gensym "_store") (list 'aset tape-sym idx-sym pb-sym)
-                                (ad-gensym "_aset") (list 'aset out-sym idx-sym
+                                (ad-gensym "_aset") (list 'raster.arrays/aset out-sym idx-sym
                                                           (if cast-fn
                                                             (list cast-fn val-result-sym)
                                                             val-result-sym))]
@@ -2342,12 +2360,16 @@
         backward-maps
         (mapv (fn [d-arr-sym arr-sym]
                 (let [reads (keep-indexed (fn [k read] (when (= arr-sym (:arr read)) [k read])) agets)
+                      store-tag (or (some-> arr-sym meta :raster.type/tag
+                                            dtype/dtype-for-array-tag dtype/scalar-tag-for-dtype)
+                                    (lost-tag! :parmap-adjoint-store (name arr-sym)))
+                      store-cast (symbol "clojure.core" (name store-tag))
                       lane-slots (keep (fn [[k {:keys [idx]}]] (when (= idx-sym idx) k)) reads)
                       gathers (remove (fn [[_ {:keys [idx]}]] (= idx-sym idx)) reads)]
                   (vec (concat
                         ;; every lane read of the array, summed, overwrites its lane
                         (when (seq lane-slots)
-                          [d-arr-sym (list 'raster.par/map! d-arr-sym bwd-idx-sym bound-expr nil
+                          [d-arr-sym (list 'raster.par/map! d-arr-sym bwd-idx-sym bound-expr store-cast
                                            (lane-grad lane-slots))])
                         ;; each gathered read: per-lane cotangents and indices, then
                         ;; their scatter-add into the array's cotangent
@@ -2355,7 +2377,7 @@
                                   (let [vals-sym (ad-gensym "gather_d" (:raster.type/tag (meta arr-sym)))
                                         idxs-sym (ad-gensym "gather_idx" 'ints)]
                                     [vals-sym (list 'raster.arrays/zeros-like arr-sym bound-expr)
-                                     vals-sym (list 'raster.par/map! vals-sym bwd-idx-sym bound-expr nil
+                                     vals-sym (list 'raster.par/map! vals-sym bwd-idx-sym bound-expr store-cast
                                                     (lane-grad [k]))
                                      idxs-sym (list 'clojure.core/int-array bound-expr)
                                      idxs-sym (list 'raster.par/map! idxs-sym bwd-idx-sym bound-expr 'int
@@ -2527,7 +2549,7 @@
                   (mapcat (fn [k {:keys [arr idx]}]
                             (let [d-arr (arr->d-sym arr)]
                               [(ad-gensym "_scatter")
-                               (list 'aset d-arr idx
+                               (list 'raster.arrays/aset d-arr idx
                                      (list 'raster.ad.reverse/grad-acc
                                            (list 'aget d-arr idx)
                                            (nth step-grads k)))]))
@@ -2792,7 +2814,7 @@
                               d-arr-sym (get arr->d-sym arr)
                               at (util/subst-syms {idx-sym j-sym} idx)]
                           [scatter-sym
-                           (list 'aset d-arr-sym at
+                           (list 'raster.arrays/aset d-arr-sym at
                                  (list 'raster.ad.reverse/grad-acc
                                        (list 'aget d-arr-sym at)
                                        (list 'nth grads-iter-sym
@@ -3040,7 +3062,7 @@
               (mapcat (fn [k {:keys [arr idx]}]
                         (let [d-arr (arr->d-sym arr)]
                           [(ad-gensym "_scatter")
-                           (list 'aset d-arr idx
+                           (list 'raster.arrays/aset d-arr idx
                                  (list 'raster.ad.reverse/grad-acc
                                        (list 'aget d-arr idx)
                                        (nth step-grads (clojure.core/+ 1 k))))]))
@@ -4388,8 +4410,8 @@
           bound' (hoist-nested-lets bound)
           body' (hoist-nested-lets body)]
       (if (seq? init')
-        (let [bound-sym (gensym "reduce_bound__")
-              init-sym (gensym "reduce_init__")
+        (let [bound-sym (with-meta (gensym "reduce_bound__") (meta bound'))
+              init-sym (with-meta (gensym "reduce_init__") (meta init'))
               reduction (with-meta (list head acc init-sym idx bound-sym body') (meta form))]
           (hoist-nested-lets
            (list 'let* [bound-sym bound' init-sym init'] reduction)))

@@ -1,5 +1,38 @@
 # Compiler unification campaign
 
+### Map store-callee derivative authority
+
+An active map with a lexical nonlinear store callable named `double` kept its
+correct primal but differentiated only the pre-store scalar body in reverse AD.
+Source walking now retains the actual store-callee identity for map!/pmap using
+the same scope-aware authority as scan. Both AD modes admit no store callable
+or an established floating core conversion; active lexical, foreign and unknown
+store callables refuse with `:ad-map-store-callee`. Inactive and reverse
+`:wrt`-excluded maps retain their original primal effects. Runtime zero extent
+does not establish construction-time callee authority. Existing Float conversion
+semantics are unchanged; this is not general closure differentiation or a new
+rounding policy. The original real-model acceptance gate remains failed.
+
+A separate preexisting mixed-storage defect was exposed by the Float-store
+positive: a Double reduction pullback accumulated a Double contribution into a
+Float shadow array using generic core `aset`, which failed at invocation. Numeric
+adjoint scatter in dotimes, additive/general reduction and scan now calls the
+existing typed `raster.arrays/aset`
+authority, whose Float-array/Double overload performs the established storage
+narrowing. Accumulation, index replay and store order are unchanged; object-array
+pullback tape stores are untouched. Mixed Float storage remains a mandatory
+numerical control, not a narrowed or waived fixture.
+
+Generated numeric map writes use the same typed setter, and backward lane/gather
+maps derive their explicit destination conversion from retained array dtype via
+the canonical dtype projections. Missing type evidence still refuses. Reduction
+initializer hoisting retains existing operand metadata on its temporary instead
+of dropping the carry proof; bound-before-initializer evaluation order is unchanged.
+Focused controls pass 8 tests / 159 assertions, and affected admission, lexical,
+soundness and ordered-normalization suites pass 61 tests / 462 assertions in the
+existing warm REPL. These checks do not establish new Float-scan support or close
+the unchanged real-model acceptance gate.
+
 ### Qualified reduction algebra identity
 
 `typed-reduce-identity` now queries the exact declared operator rather than

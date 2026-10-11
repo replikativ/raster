@@ -1841,7 +1841,7 @@
                   (jvp/jvp #'laws-o10-discrete-map-cast)
                   nil
                   (catch clojure.lang.ExceptionInfo e e))]
-      (is (= :jvp-map-unverified-step (:reason (ex-data error)))
+      (is (= :ad-map-store-callee (:reason (ex-data error)))
           "an integral cast cannot be treated as a floating tangent map"))))
 
 ;; DATA-DEPENDENT trip count: the bound reads the carry. Every gate on the
