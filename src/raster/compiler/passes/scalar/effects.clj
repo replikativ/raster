@@ -169,23 +169,30 @@
           (and source target
                (= [:exact :exact] (scalar-conversion/policy source target)))))))
 
-(defn- checked-integral-cast?
-  "Whether a semantic expression contains a source cast which may throw.
+(defn- source-cast-flags
+  "Evaluation obligations for source casts derived from the shared descriptor.
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   checked casts to integral types remain conservatively non-removable. A proven
+   reference casts and checked integral casts remain conservatively non-removable. A proven
    identity/widening or a successful checked constant conversion adds no obligation."
   [expr]
-  (boolean
-   (some (fn [node]
+  (into #{}
+   (mapcat (fn [node]
            (when (seq? node)
              (let [operation (descriptor/semantic-op node)]
-               (and (descriptor/cast-op? operation)
-                    (= :reject (descriptor/cast-integral-narrowing operation))
-                    (contains? '#{byte int long}
-                               (descriptor/cast-result-tag operation))
-                    (not (proven-total-cast? node))))))
+               (when (and (descriptor/cast-op? operation) (not (proven-total-cast? node)))
+                    (cond-> []
+                        (and (= :reject (descriptor/cast-integral-narrowing operation))
+                             (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
+                        (conj :checked-source-cast)
+                        ;; Even a floating cast can throw on an unknown reference
+                        ;; (nil, a string, or an arbitrary Number implementation).
+                        ;; Numeric retained operand evidence is required before
+                        ;; DCE/CSE can discard this evaluation obligation.
+                        (nil? (some-> (first (descriptor/call-args node))
+                                      types/sym-type-tag dtype/dtype-for-scalar-tag))
+                        (conj :source-reference-cast))))))
          (tree-seq coll? seq expr))))
 
 (def ^:private descriptor-cache-capacity 65536)
@@ -274,9 +281,7 @@
           result (if (map? result)
                    (update result :flags #(or % #{}))
                    {:effect (or result :io) :flags #{}})]
-      (cond-> result
-        (checked-integral-cast? semantic-expr)
-        (update :flags conj :checked-source-cast)))
+      (update result :flags into (source-cast-flags semantic-expr)))
     (catch Exception _
       ;; Conservative: unknown = effectful
       {:effect :io :flags #{}})

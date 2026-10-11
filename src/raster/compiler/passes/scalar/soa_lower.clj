@@ -22,7 +22,7 @@
             [raster.compiler.core.inference :as inference]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.ir.form :as form]
             [clojure.walk :as walk]))
 
 (defn field-arr-sym [soa-sym field-name]
@@ -194,6 +194,41 @@
 
 (declare lower)
 
+(defn- local-constructor-fields
+  "Exact generated factory evidence, not the spelling of a call head."
+  [ctx head]
+  (when (and (symbol? head) (not (contains? (:locals ctx) head)))
+    (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) head)]
+      (when (var? v)
+        (let [{:keys [class fields implementation]} (:raster.core/value-constructor (meta v))]
+          (when (and (class? class) (identical? implementation (.getRawRoot ^clojure.lang.Var v)))
+            (let [fields (mapv (fn [name]
+                                 (let [field (.getField ^Class class name)
+                                       tag (symbol (.getName (.getType field)))]
+                                   {:name name :element-tag tag})) fields)]
+              ;; Initial conversion contract covers numeric primitive fields.
+              ;; Other products retain their ordinary representation for now.
+              (when (every? #(#{'double 'float 'long 'int} (:element-tag %)) fields) fields))))))))
+
+(defn- constructor-fields [ctx head]
+  (if (:local-only? ctx)
+    (local-constructor-fields ctx head)
+    (when-let [tag (constructor->scalar-tag head)]
+      (:fields (get @types/soa-registry tag)))))
+
+(defn- constructor-snapshots
+  "Generic factories evaluate all actuals before primitive field conversions."
+  [ctx expression fields]
+  (when (= (count fields) (count (rest expression)))
+    (let [raw (mapv (fn [arg] [(with-meta (gensym "field_actual__") (dissoc (meta arg) :tag)) (lower ctx arg)])
+                    (rest expression))
+          converted (mapv (fn [{:keys [element-tag]} [actual _]]
+                            (let [sym (with-meta (gensym "field_value__")
+                                        {:raster.type/tag element-tag})]
+                              [sym (list (symbol "clojure.core" (name element-tag)) actual)])) fields raw)]
+      {:bindings (vec (mapcat identity (concat raw converted)))
+       :fields (zipmap (map :name fields) (map first converted))})))
+
 (defn- explode
   "If form is value-type-valued and explodable, return {field-name → lowered-field-expr};
    else nil. Handles: exploded local sym, construction, SoA element read (named accessor
@@ -204,9 +239,12 @@
     (seq? form)
     (let [head (first form)]
       (cond
-        (constructor->scalar-tag head)
-        (let [fields (:fields (get @types/soa-registry (constructor->scalar-tag head)))]
-          (zipmap (map :name fields) (map #(lower ctx %) (rest form))))
+        (constructor-fields ctx head)
+        (let [fields (constructor-fields ctx head)]
+          (if (:local-only? ctx)
+            (when-let [{:keys [bindings fields]} (constructor-snapshots ctx form fields)]
+              (into {} (map (fn [[name value]] [name (list 'let* bindings value)]) fields)))
+            (zipmap (map :name fields) (map #(lower ctx %) (rest form)))))
         (and (aget-head? head) (soa-info-for ctx (second form)))
         (let [soa  (symbol (name (second form)))
               i    (lower ctx (nth form 2))
@@ -242,16 +280,41 @@
     (and (seq? form) (= 'let* (first form)))
     (let [[_ binds & body] form
           [ctx' out] (reduce (fn [[c bs] [s e]]
-                               (if-let [ex (explode c e)]
-                                 [(assoc-in c [:exploded s] ex) bs]   ; virtual: drop binding
+                               (if-let [snap (when (and (:local-only? c) (seq? e))
+                                               (when-let [fields (constructor-fields c (first e))]
+                                                 (constructor-snapshots c e fields)))]
+                                 [(-> c (assoc-in [:exploded s] (:fields snap)) (update :locals conj s))
+                                  (into bs (:bindings snap))]
+                                 (if-let [ex (explode c e)]
+                                 [(-> c (assoc-in [:exploded s] ex) (update :locals conj s)) bs]
                                  (let [e' (lower c e)]
                                    ;; A later or nested binding can shadow an exploded
                                    ;; local. Its initializer sees the old scope; its body
                                    ;; must see the new, ordinary local.
-                                   [(update c :exploded dissoc s)
-                                    (conj bs s e')])))
+                                   [(-> c (update :exploded dissoc s) (update :locals conj s))
+                                    (conj bs s e')]))))
                              [ctx []] (partition 2 binds))]
-      (apply list 'let* (vec out) (map #(lower ctx' %) body)))
+      (relist form (concat ['let* (with-meta (vec out) (meta binds))]
+                           (map #(lower ctx' %) body))))
+
+    ;; Reuse the shared binder algebra outside let*. A loop or parallel index
+    ;; may shadow a factory or projected record just as an ordinary local can.
+    (and (:local-only? ctx) (form/scope-info form))
+    (let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)
+          mask (fn [c binders]
+                 (-> c (update :locals into (filter symbol? binders))
+                       (update :exploded #(apply dissoc % binders))))]
+      (rebuild
+       (mapv (fn [{:keys [binders inits body] :as scope}]
+               (let [base (if rec? (mask ctx binders) ctx)
+                     [local inits'] (reduce
+                                     (fn [[c expressions] [binder init]]
+                                       [(mask c [binder])
+                                        (conj expressions (lower (if (or sequential? rec?) c ctx) init))])
+                                     [base []] (map vector binders inits))
+                     local (mask local binders)]
+                 (assoc scope :inits inits' :body (mapv #(lower local %) body)))) scopes)
+       (mapv #(lower ctx %) outer)))
 
     ;; SoA store whose value is wrapped in a binding/do (e.g. from inlining a
     ;; value-type helper deftm): float the wrapper out so the store lands on the
@@ -309,33 +372,27 @@
 
 (defn lower-local-constructors
   "Project nonescaping defvalue constructor locals onto their scalar fields.
-   Constructor arguments must be values or proven pure/total scalar expressions,
-   so removing the allocation cannot drop or reorder argument effects. A value
+   Exact generated factory evidence is required. Ordered argument snapshots and
+   primitive conversions preserve effects, reads and exceptional control. A value
    that escapes a field projection leaves the original form untouched; its
    caller may still handle it as a value or reject active AD explicitly."
-  [body]
-  (let [forms (tree-seq coll? seq body)
-        ctors (filter #(and (seq? %) (constructor->scalar-tag (first %))) forms)
-        ;; The shared projector currently models let* scopes, not fn-parameter
-        ;; binding scopes. Do not run this optional AD simplification through a
-        ;; nested function until that binding rule is represented explicitly.
+  ([body] (lower-local-constructors body {}))
+  ([body {:keys [source-ns locals]}]
+  (let [ctx {:soa {} :exploded {} :local-only? true :source-ns source-ns :locals (set locals)}
+        forms (tree-seq coll? seq body)
+        ctors (filter #(and (seq? %) (local-constructor-fields ctx (first %))) forms)
+        ;; Nested functions can capture projected record identities. Keep this
+        ;; optional simplification outside closures until escape analysis models
+        ;; their ownership; ordinary loop/parallel scopes use scope-info below.
         nested-fn? (some #(and (seq? %) (#{'fn 'fn* 'clojure.core/fn} (first %))) forms)]
-    (if (and (seq ctors) (not nested-fn?)
-             ;; A pure, total scalar argument can be duplicated by field
-             ;; projection without changing effects or exceptional control.
-             ;; Allocations and unknown calls remain unprojected; their
-             ;; identities/effects would need explicit bindings.
-             (every? (fn [ctor]
-                       (every? #(or (not (coll? %))
-                                    (effects/cse-safe-expr? %))
-                               (rest ctor))) ctors))
+    (if (and (seq ctors) (not nested-fn?))
       (try
-        (lower {:soa {} :exploded {} :local-only? true} body)
+        (lower ctx body)
         (catch clojure.lang.ExceptionInfo e
           (if (= :value-type-local-escape (:reason (ex-data e)))
             body
             (throw e))))
-      body)))
+      body))))
 
 (defn soa-lower
   "Expand SoA/array-bundle params and scalar-replace value-type access.

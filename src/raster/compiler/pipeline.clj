@@ -483,12 +483,12 @@
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (inline/expand-for-backends current 3 (:param-env opts))
-              ;; GPU aggregate locals must disappear before the fixpoint
-              ;; typedness census and TypedSOAC construction. The same shared
-              ;; projector already serves AD; keep JVM value identity intact.
-              expanded (if (device/gpu-target? (:target-device opts))
-                         (soa-lower/lower-local-constructors expanded)
-                         expanded)
+              ;; Local nonescaping value products have the same scalar meaning
+              ;; on JVM, C and accelerators. Preserve escaping objects, exact
+              ;; factory ownership and ordered argument/conversion obligations.
+              expanded (soa-lower/lower-local-constructors
+                        expanded {:source-ns (:source-ns opts)
+                                  :locals (keys (:param-env opts))})
               ;; Step 2: Normalize + Rewalk only if expand introduced NEW
               ;; undevirtualized calls (e.g. from composable AD body inlining).
               ;; Regular expand (compound deftm inlining) produces pre-walked code

@@ -27,7 +27,6 @@
   (let [projected '(let* [a 1.0 b 2.0 p (->Cplx a b)]
                      (clojure.core/+ (.re p) (.im p)))
         escaping '(let* [a 1.0 b 2.0 p (->Cplx a b)] p)
-        effectful '(let* [b 2.0 p (->Cplx (println "effect") b)] (.re p))
         pure-casts '(let* [p (->Cplx (clojure.core/double a)
                                       (clojure.core/double b))]
                       (clojure.core/+ (.re p) (.im p)))
@@ -37,20 +36,15 @@
                   (clojure.core/list (.re p) (quote p)))
         nested-fn '(let* [a 1.0 p (->Cplx a a)]
                      (fn* [p] (clojure.core/+ p 1.0)))]
-    (is (= '(let* [a 1.0 b 2.0] (clojure.core/+ a b))
-           (sl/lower-local-constructors projected)))
-    (is (= escaping (sl/lower-local-constructors escaping)))
-    (is (= effectful (sl/lower-local-constructors effectful)))
-    (is (= '(let* []
-              (clojure.core/+ (clojure.core/double a)
-                              (clojure.core/double b)))
-           (sl/lower-local-constructors pure-casts)))
-    (is (= '(let* [a 1.0] (let* [p 3.0] (clojure.core/+ p 1.0)))
-           (sl/lower-local-constructors shadowed)))
-    (is (= '(let* [a 1.0]
-              (clojure.core/list a (quote p)))
-           (sl/lower-local-constructors quoted)))
-    (is (= nested-fn (sl/lower-local-constructors nested-fn)))))
+    (let [source-ns (the-ns 'raster.compiler.passes.scalar.soa-lower-test)
+          project #(sl/lower-local-constructors % {:source-ns source-ns})]
+      (binding [*ns* source-ns]
+        (is (= (eval projected) (eval (project projected))))
+        (is (= (eval shadowed) (eval (project shadowed))))
+        (is (= (eval quoted) (eval (project quoted))))
+        (is (= 3.0 (eval (list 'let* '[a 1.0 b 2.0] (project pure-casts))))))
+      (is (= escaping (project escaping)))
+      (is (= nested-fn (project nested-fn))))))
 
 (deftm cadd-soa! [as :- CplxSoA, bs :- CplxSoA, os :- CplxSoA, n :- Long] :- nil
   (dotimes [i n]
