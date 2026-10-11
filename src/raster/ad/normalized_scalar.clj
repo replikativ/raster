@@ -15,6 +15,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scan :as scan]
@@ -355,7 +356,7 @@
     {:program (program (assoc input-values seed (get values output)) emitted outputs)
      :seed seed}))
 
-(defn- revisions []
+(defn ^:no-doc revisions []
   {:template-revision (templates/registry-revision)
    :compiler-revision (dispatch/compiler-definition-revision)})
 
@@ -404,6 +405,68 @@
                   :tangent-inputs (:tangent-inputs regenerated) :residuals (:coefficients regenerated)
                   :cotangent-seed (:seed transposed)})
         (fail! :ad-normalized-derivation-correspondence {})))))
+
+(defn ^:no-doc execution-source
+  "Project already validated scalar primal bindings for executable dependency capture.
+   This is not source importing, host materialization, or an independent validator."
+  [bundle]
+  {:parameters (:params bundle)
+   :body (list 'let* (bindings (:primal bundle)) (soac/outputs (:primal bundle)))})
+
+(defn ^:no-doc execution-guard
+  "Capture effective executable Var identities in already checked source projections.
+   Scope decomposition is owned by form/scope-info. This is a sequential staleness
+   fence, not a concurrent Var-mutation/ABA or callable-internal-mutation guarantee."
+  [source-ns expected projections]
+  (let [dependencies (atom {})
+        resolve-var (fn [sym] (when (symbol? sym) (ns-resolve source-ns sym)))]
+    (letfn [(capture-var [sym]
+              (let [v (resolve-var sym)]
+                (when (var? v)
+                  (when-not (bound? v)
+                    (fail! :ad-normalized-execution-callee {:callee sym}))
+                  (swap! dependencies assoc sym
+                         {:var v :value (var-get v) :metadata (meta v)}))))
+            (capture [expression locals]
+              (let [{:keys [implementation-op lexical-callee dispatch? operation]}
+                    (descriptor/call-description expression)]
+                (when-not lexical-callee
+                  (when-not (contains? locals implementation-op)
+                    (capture-var implementation-op))
+                  ;; Retained dispatch selection belongs to the global semantic
+                  ;; operation as well as the exact executable receiver.
+                  (when dispatch? (capture-var operation)))))
+            (visit [expression locals]
+              (cond
+                (seq? expression)
+                (when-not (= 'quote (first expression))
+                  ;; Scope-owned macros execute at compilation too. Their binder
+                  ;; semantics remain exclusively in scope-info; special heads
+                  ;; without a Var contribute no executable dependency.
+                  (capture expression locals)
+                  (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info expression)]
+                    (do
+                      (doseq [e outer] (visit e locals))
+                      (doseq [{:keys [binders inits body]} scopes]
+                        (let [all (into locals (remove nil? binders))]
+                          (loop [pairs (seq (map vector binders inits)) visible (if rec? all locals)]
+                            (when-let [[binder init] (first pairs)]
+                              (visit init visible)
+                              (recur (next pairs) (if (and sequential? binder) (conj visible binder) visible))))
+                          (doseq [e body] (visit e all)))))
+                    (doseq [e expression] (visit e locals))))
+                (coll? expression) (doseq [e expression] (visit e locals))))]
+      (doseq [{:keys [parameters body]} projections]
+        (visit body (set parameters))))
+    (let [dependencies @dependencies]
+      (fn []
+        (when-not (= expected (revisions))
+          (fail! :ad-normalized-stale-rules {:expected expected :actual (revisions)}))
+        (doseq [[sym {:keys [var value metadata]}] dependencies]
+          (when-not (and (identical? var (resolve-var sym)) (bound? var)
+                         (identical? value (var-get var)) (= metadata (meta var)))
+            (fail! :ad-normalized-execution-callee {:callee sym})))
+        true))))
 
 (defn- certificate [bundle]
   (fingerprint/fingerprint

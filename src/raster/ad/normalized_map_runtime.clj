@@ -2,6 +2,7 @@
   "Opt-in CPU execution of checked maps, ordered map→sum and indexed-map AD bundles.
   This owns no compiler cache, derivative rules, source importer or GPU session."
   (:require [raster.ad.normalized-scalar :as normalized]
+            [raster.ad.normalized-program-bundle :as canonical]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
@@ -9,13 +10,18 @@
   (throw (ex-info "Arguments are outside the checked map AD runtime boundary"
                   (assoc data :reason reason))))
 
-(defn- executable [program source-ns indexed?]
-  (let [projection ((if indexed? route/materialize-host-indexed-map
+(defn- projection [program indexed?]
+  ((if indexed? route/materialize-host-indexed-map
                        (if (= 2 (count (soac/equations program)))
-                         route/materialize-host-map-reduce route/materialize-host-map)) program)]
-    (assoc projection :execute
+                         route/materialize-host-map-reduce route/materialize-host-map)) program))
+
+(defn- compile-projection [projection source-ns]
+  (assoc projection :execute
            (binding [*ns* source-ns]
-             (eval (list 'fn (:parameters projection) (:body projection)))))))
+             (eval (list 'fn (:parameters projection) (:body projection))))))
+
+(defn- executable [program source-ns indexed?]
+  (compile-projection (projection program indexed?) source-ns))
 
 (defn- invoke [executable values]
   (apply (:execute executable) (mapv values (concat (:inputs executable) (:physical-inputs executable)))))
@@ -54,15 +60,25 @@
   (when (and (:gather-programs bundle)
              (or (contains? bundle :map-programs) (contains? bundle :sum-programs)))
     (fail! :ad-map-runtime-composition {:facets (set (keys (select-keys bundle [:map-programs :sum-programs :gather-programs])))}))
-  (normalized/validate! bundle)
   (when-not (or (:map-programs bundle) (:gather-programs bundle))
+    (normalized/validate! bundle)
     (fail! :ad-map-runtime-bundle {}))
   (let [indexed? (contains? bundle :gather-programs)
         sum? (contains? bundle :sum-programs)
-        programs (cond indexed? (:gather-programs bundle) sum? (:sum-programs bundle) :else (:map-programs bundle))
-        {:keys [interface]} (if indexed? programs (:map-programs bundle))
+        expected (normalized/revisions)
+        owner (when-not indexed? ((if sum? canonical/adapt-map-sum canonical/adapt-map) bundle))
+        _ (when indexed? (normalized/validate! bundle))
+        programs (if indexed? (:gather-programs bundle) owner)
+        interface (if indexed? (:interface programs)
+                      {:active-array (first (get-in owner [:interface :active-inputs]))
+                       :tangent-input (get-in owner [:interface :tangent-input :id])
+                       :cotangent-input (get-in owner [:interface :cotangent-input :id])
+                       :residual-arrays (into {} (keep (fn [[coefficient residual]]
+                                                        (when (= :owned-array (:storage residual))
+                                                          [coefficient (:id residual)])))
+                                             (:residual-bindings owner))})
         {:keys [source primal linear transpose required-zero-gradient]} programs
-        seed-id (if sum? (get-in bundle [:sum-programs :interface :seed]) (:cotangent-input interface))
+        seed-id (:cotangent-input interface)
         {:keys [arrays captures attributes]} (soac/operation-parts (first (soac/equations source)))
         inputs (:inputs (soac/facts source))
         values (:values (soac/facts source))
@@ -70,12 +86,28 @@
         dt (:dtype (get values active))
         extent-id (:extent attributes)
         capacity-id (when indexed? (first (:shape (get values active))))
-        primal (executable primal (:source-ns bundle) indexed?)
-        push (executable linear (:source-ns bundle) indexed?)
-        pull (executable transpose (:source-ns bundle) indexed?)
+        projections (when-not indexed? (mapv #(projection % false) [primal linear transpose]))
+        guard! (if indexed? #(normalized/validate! bundle)
+                   (normalized/execution-guard
+                    (:source-ns owner) expected
+                    (conj projections (normalized/execution-source (get-in owner [:derivation :bundle])))))
+        ;; Bind the captured effective callees to the existing selected-call proof,
+        ;; rather than blessing a mutation between adaptation and identity capture.
+        _ (when-not indexed? (canonical/validate! owner) (guard!))
+        compiled (if indexed?
+                   (mapv #(executable % (:source-ns bundle) true) [primal linear transpose])
+                   (mapv #(compile-projection % (:source-ns owner)) projections))
+        _ (when-not indexed? (guard!))
+        [primal push pull] compiled
+        run (if indexed? (fn [executable environment] (invoke executable environment))
+                (fn [executable environment]
+                  (guard!)
+                  (let [result (invoke executable environment)]
+                    (guard!)
+                    result)))
         context
         (fn [arguments]
-          (normalized/validate! bundle)
+          (guard!)
           (when-not (and (vector? arguments) (= (count inputs) (count arguments)))
             (fail! :ad-map-runtime-arity {:inputs inputs}))
           (let [environment (zipmap inputs arguments)
@@ -118,7 +150,7 @@
                 {:environment environment :extent extent}))))
         acquire
         (fn [environment]
-          (let [results (invoke primal environment)
+          (let [results (run primal environment)
                 ;; Keep only immutable scalar captures/extent and freshly owned
                 ;; residual outputs. No mutable source array or returned y is a pullback input.
                 residual-ids (if indexed? [(:index-snapshot interface)] (vals (:residual-arrays interface)))
@@ -137,22 +169,23 @@
              [output saved] (acquire environment)]
          [output
           (fn [dy]
-            (normalized/validate! bundle)
+            (guard!)
             (if sum? (scalar! dy dt :cotangent) (array! dy dt extent :cotangent))
             (let [seeded (assoc saved seed-id dy)
                   seeded (if indexed?
                            (assoc seeded (:value required-zero-gradient)
                                   (case dt :float (float-array capacity) :double (double-array capacity)))
                            seeded)
-                  gradient (first (invoke pull seeded))]
+                  gradient (first (run pull seeded))]
               (when indexed?
                 (array! gradient dt capacity :gradient)
                 (when-not (identical? gradient (get seeded (:value required-zero-gradient)))
                   (fail! :ad-map-runtime-physical-owner {:output (:gradient-output interface)})))
+              (when-not indexed? (guard!))
               (mapv #(when (= active %) gradient) inputs)))]))
      :jvp
      (fn [arguments dx]
        (let [{:keys [environment extent capacity]} (context arguments)]
          (array! dx dt (if indexed? capacity extent) :tangent)
          (let [[output saved] (acquire environment)]
-           [output (first (invoke push (assoc saved (:tangent-input interface) dx)))])))}))
+           [output (first (run push (assoc saved (:tangent-input interface) dx)))])))}))

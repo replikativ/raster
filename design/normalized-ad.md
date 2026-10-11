@@ -510,8 +510,18 @@ nonnegative extents are checked before execution. Coefficient arrays remain
 private primal-time snapshots; neither original input array nor the mutable primal
 output is read by the pullback. Each derivative result is fresh. The caller must
 prevent concurrent mutation during primal acquisition; snapshot ownership does
-not promise atomic acquisition. Producer/rule certificates are checked at
-preparation and invocation, including pullback invocation. This adds no cache,
+not promise atomic acquisition. Map and ordered-sum preparation now captures a
+private canonical program owner. Full producer/rule validation runs during preparation
+(the migration adapter currently validates twice, followed by one captured-callee proof).
+Hot primal/JVP/pullback calls use existing compiler/template epochs and effective
+executable Var identity checks before and after execution, rather than repeating
+full validation or materialization. Dynamic Var bindings are part of effective identity;
+persistent alias root replacement therefore refuses even without an epoch change.
+This is a sequential fence, not a concurrent raw Var mutation/ABA or callable-internal
+mutation guarantee. Indexed execution retains its existing per-invocation validation.
+The cold base's delegated validator does not yet reconstruct scalar derivative arithmetic;
+the separately integrated deterministic derivation proof strengthens preparation without
+adding a hot replay. This adds no cache,
 GPU session or derivative rule owner. General loops, public `deftm` convenience,
 higher-order AD of runtime closures and asynchronous residual ownership remain
 separate capability gates.
