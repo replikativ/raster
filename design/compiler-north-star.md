@@ -1226,8 +1226,14 @@ input size. Heap arrays use invocation-owned staging; copyback follows the same
 write authority as C constness, and opaque helpers conservatively retain writes
 until per-argument effects are certified. Caller-owned native segments avoid
 staging but must remain live and accessible throughout the synchronous call.
-Writable overlap is rejected when the emitted ABI uses `restrict`. Heap segment
-views are not admitted without a range/alias contract. Failed calls do not
+Writable overlap is rejected when the emitted ABI uses `restrict`. Primitive
+heap views preserve backing identity, byte offset and length: each backing is
+staged once and only declared writable ranges are copied back. Disjoint views
+of one backing satisfy no-alias; overlapping writable views do not. Read-only
+heap segments with hidden backing refuse explicitly; read-only native segments
+remain valid for read access. Full-backing staging is a correctness baseline,
+not a claim of minimal-copy performance for tiny slices of large arrays.
+Failed calls do not
 publish staged writes; mutations of caller-owned native storage are not rolled
 back. A critical call is a separate, explicit caller guarantee of extremely
 short bounded execution in all cases with no upcalls, never the general default.

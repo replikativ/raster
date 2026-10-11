@@ -3,7 +3,7 @@
 
   Adapters own descriptors, scalar conversion, arity and access declarations.
   Heap arrays use call-owned staging; native storage remains caller-owned.
-  Heap segment views are not admitted until backing ranges are represented."
+  Primitive-array-backed views preserve backing identity and exact byte ranges."
   (:import [java.lang.foreign Arena MemorySegment]))
 
 (defn array-segment
@@ -22,13 +22,26 @@
                           {:reason :unsupported-native-pointer
                            :argument-class (some-> x class .getName)}))))
 
+(defn- heap-backing [^MemorySegment segment]
+  (when-not (.isNative segment)
+    (or (.orElse (.heapBase segment) nil)
+        ;; Read-only heap segments intentionally hide their backing array. Do
+        ;; not defeat this JDK boundary with reflection or guessed identities.
+        (throw (ex-info "Heap view backing is unavailable for alias-preserving staging"
+                        {:reason :unsupported-native-heap-view})))))
+
 (defn pointer-segment
-  "Marshal a primitive array or caller-owned native segment; refuse heap views."
+  "Marshal a primitive array or segment. Heap views require primitive backing
+  and a byte range contained in that backing; native storage remains caller-owned.
+  Read-only heap views hide their backing and are refused; declare :read access
+  on an ordinary heap view instead. Read-only native segments remain supported."
   ^MemorySegment [x]
   (let [segment (if (instance? MemorySegment x) x (array-segment x))]
-    (when (and (instance? MemorySegment x) (not (.isNative ^MemorySegment segment)))
-      (throw (ex-info "Heap segment views require an explicit staging/alias contract"
-                      {:reason :unsupported-native-heap-view})))
+    (when-not (.isNative ^MemorySegment segment)
+      ;; JDK heap addresses are byte offsets in their backing array. Full ofArray
+      ;; segments start at zero; validating with asSlice avoids unchecked sums.
+      (let [backing (array-segment (heap-backing segment))]
+        (.asSlice backing (.address ^MemorySegment segment) (.byteSize ^MemorySegment segment))))
     segment))
 
 (defn invoke-ordinary!
@@ -46,44 +59,42 @@
     (dotimes [i n-ptrs]
       (let [segment ^MemorySegment (aget arguments i)
             writable? (not= :read (nth access i))
-            heap (.orElse (.heapBase segment) nil)]
+            heap (heap-backing segment)
+            backing (when heap (array-segment heap))
+            offset (if heap (.address segment) 0)]
+        (when heap
+          (.asSlice ^MemorySegment backing offset (.byteSize segment)))
         (when (or (not (.isAlive (.scope segment)))
                   (not (.isAccessibleBy segment (Thread/currentThread)))
                   (and writable? (.isReadOnly segment)))
           (throw (ex-info "Native pointer is not accessible with its declared access"
                           {:reason :inaccessible-native-pointer :index i})))
         (when no-alias?
-          (doseq [[previous previous-heap previous-write?] ranges]
+          (doseq [[^MemorySegment previous _ previous-write?] ranges]
             (when (and (or writable? previous-write?)
-                       (if heap
-                         (identical? heap previous-heap)
-                         (and (nil? previous-heap)
-                              (< (.address segment) (+ (.address ^MemorySegment previous)
-                                                       (.byteSize ^MemorySegment previous)))
-                              (< (.address ^MemorySegment previous)
-                                 (+ (.address segment) (.byteSize segment))))))
+                       (.isPresent (.asOverlappingSlice segment previous)))
               (throw (ex-info "Writable pointer overlap violates the emitted no-alias ABI"
                               {:reason :native-pointer-alias :index i})))))
-        (.add ranges [segment heap writable?])))
+        (.add ranges [segment heap writable? offset backing])))
     (if (every? #(nil? (second %)) ranges)
       (.invokeWithArguments mh arguments)
       (with-open [arena (Arena/ofConfined)]
         (dotimes [i n-ptrs]
-          (let [[^MemorySegment source heap writable?] (.get ranges i)]
+          (let [[^MemorySegment source heap _ offset ^MemorySegment backing] (.get ranges i)]
             (when heap
               (let [existing (.get heaps heap)
                     destination ^MemorySegment
-                    (or (:segment existing)
-                        (let [storage (.allocate arena (.byteSize ^MemorySegment source) 8)]
-                          (MemorySegment/copy source 0 ^MemorySegment storage 0 (.byteSize source))
+                    (or existing
+                        (let [storage (.allocate arena (.byteSize backing) 8)]
+                          (MemorySegment/copy backing 0 ^MemorySegment storage 0 (.byteSize backing))
                           storage))]
-                (.put heaps heap {:segment destination :source source
-                                  :write? (or writable? (:write? existing))})
-                (aset arguments i destination)))))
+                (.put heaps heap destination)
+                (aset arguments i (.asSlice destination (long offset) (.byteSize source)))))))
         (let [result (.invokeWithArguments mh arguments)]
           ;; On a failed call no staged writes are published. Caller-owned native
           ;; memory is not transactional; its mutations cannot be rolled back.
-          (doseq [entry (.values heaps) :when (:write? entry)]
-            (MemorySegment/copy ^MemorySegment (:segment entry) 0 ^MemorySegment (:source entry) 0
-                                (.byteSize ^MemorySegment (:source entry))))
+          (doseq [[^MemorySegment source heap writable? offset] ranges
+                  :when (and heap writable?)]
+            (MemorySegment/copy ^MemorySegment (.get heaps heap) (long offset) source 0
+                                (.byteSize source)))
           result)))))

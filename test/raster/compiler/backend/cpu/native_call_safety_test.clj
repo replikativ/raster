@@ -36,8 +36,8 @@
     (let [aliasing (cpu/load-kernel library "safe_probe" 2 [] :double)]
       (is (= 10.0 (aliasing x x)))
       (is (= [10.0] (vec x))))
-    (is (= :unsupported-native-heap-view
-           (reason #(native (MemorySegment/ofArray x) y))))
+    (is (= 13.0 (native (MemorySegment/ofArray x) y)))
+    (is (= [13.0] (vec x)))
     (with-open [arena (Arena/ofConfined)]
       (let [storage (.allocate arena 16 8)
             first-row (.asSlice storage 0 8)
