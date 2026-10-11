@@ -1,10 +1,84 @@
 (ns raster.gpu.declared-array-storage-device-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.fixtures.mixed-storage :as storage]
+            [raster.compiler.compatibility-map-packet-test :as map-packet]
+            [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.compiled :as compiled]
+            [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
+
+(defn- run-compatibility-map-storage-case [target]
+  ;; Execute the supplied compatibility packet, not a fresh whole-program typed route.
+  ;; This is the same arena-scoped staged-form boundary as integral-reduction-device-test.
+  (let [runtime (backend/runtime-namespace target)
+        resolve-runtime #(requiring-resolve (symbol (str runtime) %))
+        arena ((resolve-runtime "make-kernel-arena!"))]
+    (try
+      (let [facts ((resolve-runtime "execution-device-info"))]
+        (when-not (contains? (:storage-types facts) :double)
+          (throw (ex-info "compatibility map storage test requires selected-device Double support"
+                          {:reason :declared-scalar-test-capability :target target :facts facts}))))
+      (with-bindings {(resolve-runtime "*current-arena*") arena}
+        (doseq [[kind source] map-packet/float-map-sources]
+          (let [options (assoc map-packet/options :target-device target)
+                packet (:form (segop-lower/segop-lower-pass source options))
+                emitted (opencl-pass/opencl-pass
+                         packet :device-id target :dtype :double :min-elements 0
+                         :array-types (:array-types options)
+                         :scalar-types (:scalar-types options))
+                native (eval (list 'fn ['a 'out 'n] (:form emitted)))
+                original (eval (list 'fn ['a 'out 'n] source))
+                buffer-slots (for [artifact (:kernels emitted)
+                                   slot (:abi artifact)
+                                   :when (not= :scalar (:kind slot))] slot)]
+            (is (= :float (get-in packet [:values [:binding 'left] :dtype])))
+            (when (= kind :legacy-consumer)
+              (is (nil? (:algorithm (last (:equations packet))))
+                  "map! remains an honest legacy consumer"))
+            (is (some #(= :float (:dtype %)) buffer-slots)
+                "the physical ABI contains Float storage under the Double default")
+            (when (not= kind :float-result)
+              (is (some #(= :double (:dtype %)) buffer-slots))
+              (is (some #(and (= :input (:kind %)) (= :float (:dtype %)))
+                        (:abi (last (:kernels emitted))))
+                  "the downstream consumer's native pointer ABI reads the retained Float array"))
+            (is (zero? (get-in emitted [:stats :fallback] 0)))
+            ;; Maps retain direct artifact invocation markers beside any graph dispatches.
+            ;; Match the production pass-backend admission order for this mixed result.
+            (#'pipeline/register-gpu-kernels! (:kernels emitted) target)
+            (#'pipeline/register-gpu-dispatches! (:dispatches emitted) target)
+            (doseq [n [0 1 3]
+                    values [[1.00000001 -3.5 16777217.0]
+                            [-1.00000001 16777219.0 0.125]]]
+              ;; Nonempty caller storage also exercises zero active extent and unwritten tails.
+              (let [input (double-array values)
+                    out (double-array (repeat (max 1 n) -77.0))
+                    source-out (aclone out)
+                    expected (mapv #(double (float %)) (take n values))
+                    source-result (original input source-out (long n))
+                    actual (native input out (long n))]
+                (is (= (class source-result) (class actual)) (str target " " kind " n=" n))
+                (is (= (class (if (= kind :float-result) (float-array 0) (double-array 0)))
+                       (class actual)))
+                (is (= (vec source-result) (vec actual)))
+                (is (= expected (vec (take n actual)))
+                    "independent explicit Float round-trip oracle")
+                (when (= kind :legacy-consumer)
+                  (is (identical? out actual))
+                  (when (zero? n) (is (= [-77.0] (vec actual))))))))))
+      (finally ((resolve-runtime "close-kernel-arena!") arena)))))
+
+(deftest compatibility-map-packets-retain-float-storage-on-both-backends
+  (if @opencl/opencl-fp64-available?
+    (run-compatibility-map-storage-case :ocl:0)
+    (opencl/opencl-skip! "Double-to-Float compatibility map storage on OpenCL"))
+  (if @gp/gpu-available?
+    (run-compatibility-map-storage-case :ze:0)
+    (gp/gpu-skip! "Double-to-Float compatibility map storage on Level Zero")))
 
 (defn- run-case [target]
   (doseq [compiler [nil :equation-first]]

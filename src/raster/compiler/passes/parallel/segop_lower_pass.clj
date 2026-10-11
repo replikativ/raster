@@ -336,10 +336,11 @@
 
 (declare segop-lower-pass)
 
-(defn- reduction-packet
+(defn- singleton-packet
   "Admit, freshen and schedule the complete typed singleton, including host SSA."
-  [result source opts used]
-  (when (par/par-reduce-form? source)
+  [result source opts used kind]
+  (let [packet-stage (if (= kind 'reduce) :typed-reduction-packet :typed-map-packet)
+        source-stage (if (= kind 'reduce) :typed-reduction-source :typed-map-source)]
     (let [attempt (typed-route/attempt
                    (list 'let* [result source] result)
                    (or (:dtype opts) :double) (:array-types opts)
@@ -351,8 +352,8 @@
               _ (when-not (and (program/parallel-program? packet)
                                (= :typed-soac (:dialect packet))
                                (seq (:equations packet)))
-                  (throw (ex-info "typed reduction admission requires a complete packet"
-                                  {:reason :raster/bug :stage :typed-reduction-packet
+                  (throw (ex-info (str "typed " (name kind) " admission requires a complete packet")
+                                  {:reason :raster/bug :stage packet-stage
                                    :source source})))
               _ (program/validate! packet)
               source-form (:source packet)
@@ -361,18 +362,18 @@
                                (even? (count (second source-form)))
                                (seq (nnext source-form))
                                (every? symbol? (take-nth 2 (second source-form))))
-                  (throw (ex-info "typed reduction packet requires its ordered source realization"
-                                  {:reason :raster/bug :stage :typed-reduction-source
+                  (throw (ex-info (str "typed " (name kind) " packet requires its ordered source realization")
+                                  {:reason :raster/bug :stage source-stage
                                    :source source})))
               source-pairs (mapv vec (partition 2 (second source-form)))
               source-bindings (into {} source-pairs)
               _ (doseq [equation (:equations packet)]
-                  (let [[kind binding] (:site equation)]
-                    (when-not (and (= :binding kind)
+                  (let [[site-kind binding] (:site equation)]
+                    (when-not (and (= :binding site-kind)
                                    (contains? source-bindings binding)
                                    (= (:source equation) (get source-bindings binding)))
-                      (throw (ex-info "typed reduction equation lacks its exact source witness"
-                                      {:reason :raster/bug :stage :typed-reduction-source
+                      (throw (ex-info (str "typed " (name kind) " equation lacks its exact source witness")
+                                      {:reason :raster/bug :stage source-stage
                                        :equation (:id equation) :site (:site equation)
                                        :source source})))))
               locals (disj (set (concat (map first source-pairs)
@@ -410,16 +411,25 @@
                                    :outputs (mapv rename-id (:outputs packet)) :equations equations)
               scheduled (:form (segop-lower-pass packet opts))
               primary (some #(when (and (= [result] (:results %))
-                                        (= 'reduce (soac-dialect/operation-kind
+                                        (= kind (soac-dialect/operation-kind
                                                     (first (soac-dialect/equations (:algorithm %)))))) %)
                             (:equations scheduled))]
           (when-not (and primary
-                         (= 'reduce (soac-dialect/operation-kind
+                         (= kind (soac-dialect/operation-kind
                                      (first (soac-dialect/equations (:algorithm primary)))))
                          (= [result] (:results primary)))
-            (throw (ex-info "typed reduction packet lost its result equation"
-                            {:reason :raster/bug :stage :typed-reduction-packet :source source})))
+            (throw (ex-info (str "typed " (name kind) " packet lost its result equation")
+                            {:reason :raster/bug :stage packet-stage :source source})))
           {:program scheduled :pairs pairs :body body :primary primary})))))
+
+(defn- reduction-packet [result source opts used]
+  (when (par/par-reduce-form? source)
+    (singleton-packet result source opts used 'reduce)))
+
+(defn- selected-operation-packet [result source opts used]
+  (if (par/par-map-pure-form? source)
+    (singleton-packet result source opts used 'map)
+    (reduction-packet result source opts used)))
 
 (defn- packet-equations
   [packet primary-site ids]
@@ -598,7 +608,6 @@
             device-id (:target-device opts)
             target-descriptor (:target-descriptor opts)
             dtype (:dtype opts)
-            array-types (:array-types opts)
             ;; Retain flat source binder declarations for every later use, including uses
             ;; whose symbol occurrence no longer carries the binder's metadata.
             scalar-types (reduce (fn [known [id _]]
@@ -612,9 +621,9 @@
           ;; stderr as `WARNING: …` and vanished — invisible to stats, to explain-pipeline, and to
           ;; anyone diagnosing why a kernel took the legacy path.
             declined (atom [])
-            attempt (fn [sym init current-scalar-types]
+            attempt (fn [sym init current-options]
                       (let [r (lower-attempt sym init device-id target-descriptor dtype
-                                             array-types current-scalar-types)]
+                                             (:array-types current-options) (:scalar-types current-options))]
                         (when-let [d (:declined r)] (swap! declined conj d))
                         (when (:segops r) r)))
             used (atom (set (filter symbol? (tree-seq coll? seq form))))
@@ -623,7 +632,7 @@
             scalar-count (atom 0)
             process
             (fn [{:keys [options] :as state} [site sym expression original-site]]
-              (let [packet (reduction-packet sym expression options used)]
+              (let [packet (selected-operation-packet sym expression options used)]
                 (if (:program packet)
                   (let [rows (packet-equations packet original-site ids)
                         packet-pairs (:pairs packet)
@@ -636,6 +645,12 @@
                         (update :pairs into packet-pairs)
                         (cond-> body? (update :body into packet-body))
                         (update :equations into rows)
+                        ;; A later singleton consumes the earlier map's retained element storage,
+                        ;; not the compilation's default precision. Only the owned map result is
+                        ;; newly introduced here; do not replace caller input declarations.
+                        (cond-> (par/par-map-pure-form? expression)
+                          (assoc-in [:options :array-types sym]
+                                    (get-in packet [:program :values sym :dtype])))
                         (update-in [:options :scalar-types] merge
                                    (into {} (keep (fn [[id value]]
                                                     (when (= [] (:shape value))
@@ -645,12 +660,12 @@
                             (swap! declined conj (assoc refusal :stage :typed-admission
                                                       :sym sym :source expression)))
                         current-scalar-types (:scalar-types options)
-                        lowered-values (attempt sym expression current-scalar-types)
+                        lowered-values (attempt sym expression options)
                         row (when lowered-values
                               (swap! lowered inc)
                               (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
                               (equation (swap! ids inc) site sym expression lowered-values
-                                        dtype array-types current-scalar-types))]
+                                        dtype (:array-types options) current-scalar-types))]
                     (-> state
                         (cond-> (= :binding (first site)) (update :pairs conj [sym expression])
                                 (= :body (first site)) (update :body conj expression)

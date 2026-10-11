@@ -5895,12 +5895,22 @@
               logical-result-types
               (into {}
                     (mapcat (fn [description]
-                              (map (fn [result storage]
-                                     [result (value-dtype (:destination storage)
-                                                          dtype array-types)])
-                                   (:results description)
-                                   (:result-storage description))))
-                    (filter :result-storage semantic-descriptions))
+                              (if (seq (:result-storage description))
+                                ;; Caller-owned storage remains the existing authority for
+                                ;; destination-writing operations and their result aliases.
+                                (map (fn [result storage]
+                                       [result (value-dtype (:destination storage)
+                                                            dtype array-types)])
+                                     (:results description)
+                                     (:result-storage description))
+                                ;; A pure map owns its declared element contract without a
+                                ;; destination. Carry that analyzed fact into AbstractValues;
+                                ;; its scalar conversion must not coexist with default-precision
+                                ;; result storage merely because no result-storage alias exists.
+                                (when (= :map (:kind description))
+                                  (map (fn [result] [result (:elem-type description)])
+                                       (:results description))))))
+                    semantic-descriptions)
               array-types' (merge array-types logical-result-types)
               destination-values
               (into {}
