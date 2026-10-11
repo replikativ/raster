@@ -392,9 +392,27 @@ retained source with exact logical input/output IDs transported to fresh source
 symbols, not another array interpreter. Float/double JVM execution controls check
 fresh coefficient arrays, source mutation after the primal, scalar captures and
 empty extents. Device placement, stored/aliased results and external output
-ownership are explicit refusals at this host-only boundary. Argument shape checks,
-runtime publication and asynchronous residual ownership remain downstream work;
-source projection alone is not a whole-array public AD API or a device gate.
+ownership are explicit refusals at this host-only boundary. Source projection
+alone is not a whole-array public AD API or a device gate.
+
+The opt-in `raster.ad.normalized-map-runtime/prepare` consumer accepts an already
+validated map bundle and constructs the existing three host projections once.
+Its `:inputs` vector defines the argument order. `:vjp` takes that ordered argument
+vector and returns `[output pullback]`; the pullback takes an explicit cotangent
+array and returns positional cotangents, with nil for inactive scalar captures
+and extent inputs. `:jvp` takes the argument vector and an explicit tangent array
+and returns `[output tangent]`. Array outputs never imply a scalar seed.
+
+Exact primitive storage, scalar capture types, array lengths and representable
+nonnegative extents are checked before execution. Coefficient arrays remain
+private primal-time snapshots; neither the original input nor the mutable primal
+output is read by the pullback. Each derivative result is fresh. The caller must
+prevent concurrent mutation during primal acquisition; snapshot ownership does
+not promise atomic acquisition. Producer/rule certificates are checked at
+preparation and invocation, including pullback invocation. This adds no cache,
+GPU session or derivative rule owner. General loops, public `deftm` convenience,
+higher-order AD of runtime closures and asynchronous residual ownership remain
+separate capability gates.
 
 The unchanged Gemma, SFT and held checkpoint gates remain independent: successful
 scalar normalization does not certify them.
