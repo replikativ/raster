@@ -4,6 +4,7 @@
             [raster.gpu.ze-runtime :as ze]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.resource-cleanup :as cleanup]
+            [raster.gpu.compatibility-map :as compatibility-map]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -31,6 +32,89 @@
                             (abi/slot 'n :scalar :long :role :bound)]
                       :workgroup-size 4}]
     {:name name :registration registration :registry (atom {name registration})}))
+
+(deftest ocl-both-direct-map-routes-reject-replacement-before-loading
+  (doseq [[route boundary] [[:value :wrapper] [:value :geometry] [:void :geometry]]]
+    (let [{:keys [name registration registry]} (map-fixture)
+          replacement (assoc registration :workgroup-size 8)
+          seen (atom []) changed? (atom false)
+          validate abi/validate-arguments! realize compatibility-map/realize-launch
+          v #(ns-resolve 'raster.gpu.ocl-runtime %)
+          replace! (fn [] (when (compare-and-set! changed? false true)
+                            (swap! registry assoc name replacement)))]
+      (with-redefs-fn
+        {(v 'kernel-registry) registry
+         #'abi/validate-arguments!
+         (fn [slots arguments]
+           (let [result (validate slots arguments)]
+             (when (= boundary :wrapper) (replace!))
+             result))
+         #'compatibility-map/realize-launch
+         (fn [& arguments]
+           (let [geometry (apply realize arguments)]
+             (when (= boundary :geometry) (replace!))
+             geometry))
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))
+         (v 'ensure-host-seg) (fn [_ _ ^long _] (swap! seen conj :stage))}
+        #(do
+           (is (= :registry-generation-changed
+                  (:reason (ex-data
+                            (error-of (fn [] (if (= route :value)
+                                              (ocl/invoke-registered-kernel name [(float-array 2)]
+                                                                            (float-array 2) [(float 2)] 2)
+                                              (ocl/invoke-registered-map-void-kernel
+                                               name [(float-array 2) (float-array 2)] [(float 2)] 2))))))))
+           (is (empty? @seen))
+           (is (identical? replacement (get @registry name))))))))
+
+(deftest ocl-direct-map-artifact-preconditions-precede-loading
+  (let [a (artifact/make
+           {:kernel-name "precondition_map" :target :opencl-c
+            :source "__kernel void precondition_map(__global const float *x, __global float *out, long n) {}"
+            :abi [(abi/slot 'x :input :float) (abi/slot 'out :output :float :role :result)
+                  (abi/slot 'n :scalar :long :role :bound)]
+            :arguments '[x out n]
+            :launch (launch/spec {:workgroup-size [4] :group-count [1]})
+            :preconditions [{:expression 'n :op :> :value 4}]})
+        seen (atom []) v #(ns-resolve 'raster.gpu.ocl-runtime %)]
+    (with-redefs-fn
+      {(v 'kernel-registry) (atom {(:kernel-name a) a})
+       (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))}
+      #(doseq [invoke [(fn [] (ocl/invoke-registered-kernel (:kernel-name a) [(float-array 2)]
+                                                           (float-array 2) [] 2))
+                      (fn [] (ocl/invoke-registered-map-void-kernel
+                              (:kernel-name a) [(float-array 2) (float-array 2)] [] 2))]]
+         (is (= :kernel-precondition-failed (:reason (ex-data (error-of invoke)))))
+         (is (empty? @seen))))))
+
+(deftest ocl-direct-map-earlier-binding-failures-precede-geometry-and-loading
+  (doseq [route [:value :void]
+          fault [:count :dtype :alias :scalar :negative-bound :fractional-bound]]
+    (let [{:keys [name registry]} (map-fixture)
+          ;; The shared fixture's x is intentionally inout; overlap is legal there. Make
+          ;; this fault's immutable-input authority explicit rather than inventing a rule.
+          _ (when (= fault :alias)
+              (swap! registry assoc-in [name :abi 0]
+                     (abi/slot 'x :input :float :aliasing :no-write-alias)))
+          input (if (= fault :dtype) (double-array 2) (float-array 2))
+          output (if (= fault :alias) input (float-array 2))
+          scalars (case fault :count [] :scalar [{:type :double :value 2.0}] [(float 2)])
+          bound (case fault :negative-bound -1 :fractional-bound 1.5 2)
+          seen (atom []) realize compatibility-map/realize-launch
+          v #(ns-resolve 'raster.gpu.ocl-runtime %)]
+      (with-redefs-fn
+        {(v 'kernel-registry) registry
+         #'compatibility-map/realize-launch (fn [& arguments]
+                                             (swap! seen conj :geometry)
+                                             (apply realize arguments))
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))}
+        #(do
+           (is (instance? clojure.lang.ExceptionInfo
+                          (error-of (fn [] (if (= route :value)
+                                            (ocl/invoke-registered-kernel name [input] output scalars bound)
+                                            (ocl/invoke-registered-map-void-kernel
+                                             name [input output] scalars bound))))))
+           (is (empty? @seen)))))))
 
 (defn- reduction-fixture [dtype groups]
   (let [name (str "generation_reduction_" (clojure.core/name dtype))
@@ -323,11 +407,15 @@
   (doseq [typed? [false true]]
     (let [{:keys [name registration registry]} (void-map-fixture typed?)
           replacement (assoc registration :workgroup-size 8)
-          seen (atom [])
+          seen (atom []) realize compatibility-map/realize-launch
           v #(ns-resolve 'raster.gpu.ze-runtime %)]
       (with-redefs-fn
         {#'ze/kernel-registry registry
-         (v 'registered-1d-workgroup-size) (fn [_] (swap! registry assoc name replacement) 4)
+         #'compatibility-map/realize-launch
+         (fn [& arguments]
+           (let [geometry (apply realize arguments)]
+             (swap! registry assoc name replacement)
+             geometry))
          (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))
          (v 'ensure-seg) (fn [_ _ ^long _] (swap! seen conj :stage))
          #'ze/launch! (fn [_ ^long _groups ^long _workgroup _args] (swap! seen conj :launch))}
@@ -416,11 +504,15 @@
 (deftest map-replacement-after-pure-admission-precedes-native-use
   (let [{:keys [name registration registry]} (map-fixture)
         replacement (assoc registration :workgroup-size 8)
-        seen (atom [])
+        seen (atom []) realize compatibility-map/realize-launch
         v #(ns-resolve 'raster.gpu.ze-runtime %)]
     (with-redefs-fn
       {#'ze/kernel-registry registry
-       (v 'registered-1d-workgroup-size) (fn [_] (swap! registry assoc name replacement) 4)
+       #'compatibility-map/realize-launch
+       (fn [& arguments]
+         (let [geometry (apply realize arguments)]
+           (swap! registry assoc name replacement)
+           geometry))
        (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))
        (v 'ensure-seg) (fn [_ _ ^long _] (swap! seen conj :stage))
        #'ze/launch! (fn [_ ^long _groups ^long _workgroup _args] (swap! seen conj :launch))}

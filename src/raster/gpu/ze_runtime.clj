@@ -1969,29 +1969,7 @@
   "Realize the compiler's complete launch, or check the remaining 1-D compatibility contract.
    Workgroup overrides cannot invalidate an artifact's emitted static assumptions."
   [registered arguments bound opts]
-  (let [default-workgroup (registered-1d-workgroup-size registered)
-        workgroup (first (:workgroup-size
-                          (klaunch/geometry
-                           {:workgroup-size [(get opts :workgroup-size default-workgroup)]
-                            :group-count [1]})))
-        _ (when (kart/kernel-artifact? registered)
-            (when-not (= default-workgroup workgroup)
-              (throw (ex-info "direct map override differs from the emitted workgroup"
-                              {:reason :kernel-workgroup-override
-                               :kernel-name (:kernel-name registered)
-                               :expected default-workgroup :actual workgroup}))))
-        geometry
-        (when-not (compatibility-map/empty-map? registered arguments bound)
-          (if (kart/kernel-artifact? registered)
-            (kcall/realize-launch registered arguments)
-            (klaunch/geometry
-             {:workgroup-size [workgroup]
-              :group-count [(klaunch/resolve-expression
-                             identity (klaunch/ceil-div bound workgroup))]})))]
-    (when (and geometry (not= 1 (klaunch/dimensions geometry)))
-      (throw (ex-info "direct map requires a one-dimensional launch"
-                      {:reason :kernel-launch-dimensionality :launch geometry})))
-    geometry))
+  (compatibility-map/realize-launch registered arguments bound opts))
 
 (defn- kernel-info-value
   "Read a compiler-owned emitter attribute from an artifact or a remaining specialized entry."
