@@ -1308,17 +1308,10 @@
         (throw primary)))
     nil))
 
-(defn invoke-registered-map-void-kernel
-  "Invoke a compiled map-void kernel. Mirrors ze-runtime API.
-  arrays: vector of OclBuffers or JVM arrays
-  scalar-args: vector of {:type :int/:float/:long :value v}
-  n: number of work items"
-  ([^String kernel-name arrays scalar-args n]
-   (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
-  ([^String kernel-name arrays scalar-args n opts]
-   (let [registered (or (get @kernel-registry kernel-name)
-                        (throw (ex-info "Kernel not registered" {:kernel-name kernel-name})))
-         abi (:abi registered)
+(defn- invoke-map-snapshot!
+  "Validate and execute one admitted registration snapshot; both public direct-map routes use it."
+  [^String kernel-name registered arrays scalar-args n opts]
+   (let [abi (:abi registered)
          split-binding (when abi
                          (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
                            (kabi/validate-physical-pointer-dtypes!
@@ -1333,24 +1326,16 @@
                          (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
                          (kexec/physical-runtime-scalar (kabi/slot 'n :scalar :int :role :bound) n))
          n (long (:value checked-bound))
-         default-workgroup (registered-1d-workgroup-size registered)
-         workgroup-size (first (:workgroup-size
-                                (klaunch/geometry
-                                 {:workgroup-size [(get opts :workgroup-size default-workgroup)]
-                                  :group-count [1]})))
-         _ (when (and (kart/kernel-artifact? registered) (not= default-workgroup workgroup-size))
-             (throw (ex-info "direct map override differs from the emitted workgroup"
-                             {:reason :kernel-workgroup-override
-                              :expected default-workgroup :actual workgroup-size})))
-         empty? (compatibility-map/empty-map? registered
-                                             (vec (concat arrays (or checked-scalars scalar-args)
-                                                          [checked-bound])) n)]
-     (if empty?
-       (do
-         (cleanup/assert-registry-mutable! kernel-registry)
-         (locking kernel-registry
-           (cleanup/assert-registration-current! kernel-registry kernel-name registered)
-           nil))
+         geometry (compatibility-map/realize-launch
+                   registered (vec (concat arrays (or checked-scalars scalar-args) [checked-bound])) n opts)
+         workgroup-size (first (:workgroup-size geometry))
+         global-size (when geometry
+                       (Math/multiplyExact (long workgroup-size) (long (first (:group-count geometry)))))]
+     (cleanup/assert-registry-mutable! kernel-registry)
+     (locking kernel-registry
+       (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+     (if-not geometry
+       nil
        (let [{:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
          {:keys [queue]} @state
          dtype (kernel-info-value info :dtype :float)
@@ -1384,9 +1369,12 @@
                                               (keyword (str "void-arr-" idx)) byte-size)
                     _ (MemorySegment/copy (MemorySegment/ofArray arr) 0
                                           host-seg 0 byte-size)
-                    cl-mem-handle (cleanup/acquire-native!
-                                   (nth slots idx)
-                                   #(create-map-buffer! context host-seg byte-size err-seg))]
+                    ;; Cached staging owns its use guard above. Protect this independent
+                    ;; native acquisition too; the enclosing monitor alone is reentrant.
+                    cl-mem-handle (cleanup/with-registry-use kernel-registry
+                                    (cleanup/acquire-native!
+                                     (nth slots idx)
+                                     #(create-map-buffer! context host-seg byte-size err-seg)))]
                 (conj acc {:cl-mem cl-mem-handle :source arr :byte-size byte-size
                            :host-seg host-seg}))))
           []
@@ -1402,6 +1390,7 @@
          ;; Set kernel args: buffers first, then scalars, then n
          arg-idx (atom 0)]
 
+     (cleanup/with-registry-use kernel-registry
      ;; Buffer args
      (doseq [{:keys [cl-mem]} expanded-entries]
        (set-kernel-arg-buffer! kernel-handle @arg-idx cl-mem)
@@ -1418,8 +1407,7 @@
      (swap! arg-idx inc)
 
      ;; Enqueue NDRange
-     (let [global-size (* workgroup-size (long (Math/ceil (/ (double n) workgroup-size))))
-           gs-arena (Arena/ofConfined)]
+     (let [gs-arena (Arena/ofConfined)]
        (try
          (let [global-seg (.allocate gs-arena I64)
                local-seg (.allocate gs-arena I64)]
@@ -1441,7 +1429,17 @@
                     host-seg (int 0) MemorySegment/NULL MemorySegment/NULL])
          (MemorySegment/copy host-seg 0 (MemorySegment/ofArray source) 0 (long byte-size))))
 
-     nil))))))))
+     nil)))))))))
+
+(defn invoke-registered-map-void-kernel
+  "Invoke a compiled map-void kernel over JVM arrays or OclBuffers. Plain entries support
+   checked workgroup overrides; canonical artifacts retain their complete emitted launch."
+  ([kernel-name arrays scalar-args n]
+   (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
+  ([kernel-name arrays scalar-args n opts]
+   (let [registered (or (get @kernel-registry kernel-name)
+                        (throw (ex-info "Kernel not registered" {:kernel-name kernel-name})))]
+     (invoke-map-snapshot! kernel-name registered arrays scalar-args n opts))))
 
 (defn invoke-registered-kernel
   "Pipeline-friendly value-returning map invocation for OpenCL.
@@ -1465,9 +1463,9 @@
     (when-not (= 1 (count result-pairs))
       (throw (ex-info "map kernel ABI must identify exactly one result"
                       {:kernel-name kernel-name :result-slots (mapv first result-pairs)})))
-    (invoke-registered-map-void-kernel kernel-name
+    (invoke-map-snapshot! kernel-name registered
                                        (vec (concat input-arrays [output-array]))
-                                       scalar-args n)
+                                       scalar-args n {})
     (second (first result-pairs))))
 
 ;; ================================================================

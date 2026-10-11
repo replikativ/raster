@@ -3,6 +3,9 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.storage-representation :as probe]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-abi :as abi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.runtime-root :as root]
             [raster.gpu.ocl-runtime :as ocl]
@@ -31,6 +34,7 @@
                 :dtype :float :workgroup-size 4 :arena-id :staging-test
                 ::cleanup/owner (cleanup/owner [])}
           registry (atom {"staging-test" info})
+          customization (customize v arena)
           redefs (merge {(v 'state) runtime-state
                   (v 'kernel-registry) registry
                   (v 'h-clReleaseMemObject) (delay :fake)
@@ -62,13 +66,113 @@
                       (let [attempt (swap! release-attempts inc)]
                         (when (and (fails? :release) (= attempt 1))
                           (throw release-failure)))))}
-                        (customize v arena))]
+                        (dissoc customization ::invoke))]
       (with-redefs-fn redefs
-        #(let [result (error-of (fn [] (ocl/invoke-registered-map-void-kernel
-                                       "staging-test" [(float-array 2) (float-array 2)] [] 2)))
+        #(let [result (error-of (or (::invoke customization)
+                                   (fn [] (ocl/invoke-registered-map-void-kernel
+                                           "staging-test" [(float-array 2) (float-array 2)] [] 2))))
                retained (vec (remove (fn [[key _]] (= key "staging-test")) @registry))]
            (check {:result result :primary primary :release-failure release-failure
                    :calls calls :retained retained :state runtime-state})))))))
+
+(defn- direct-map-artifact [groups]
+  (artifact/make
+   {:kernel-name "staging_test" :target :opencl-c
+    :source "__kernel void staging_test(__global const float *x, __global float *out, long n) {}"
+    :abi [(abi/slot 'x :input :float) (abi/slot 'out :output :float :role :result)
+          (abi/slot 'n :scalar :long :role :bound)]
+    :arguments '[x out n]
+    :launch (launch/spec {:workgroup-size [4] :group-count [groups]})}))
+
+(deftest ocl-direct-map-native-grid-retains-artifact-authority
+  (doseq [route [:value :void]
+          [groups n expected] [[2 17 8]
+                               [(launch/minimum 3 (launch/ceil-div 'n 4)) 17 12]
+                               [1 0 4]]]
+    (let [seen (atom []) output (float-array 2)]
+      (with-ocl-map-staging-fault
+        nil false
+        (fn [v arena]
+          (let [registered (assoc (direct-map-artifact groups)
+                                  ::cleanup/owner (cleanup/owner []) :arena-id :staging-test)
+                registry (atom {"staging_test" registered})]
+            {(v 'kernel-registry) registry
+             (v 'ensure-kernel-loaded!)
+             (fn [_]
+               (is (Thread/holdsLock registry))
+               ;; A legitimate lazy update changes the map, not the owning generation.
+               (swap! registry update "staging_test" assoc :kernel-handle MemorySegment/NULL)
+               (get @registry "staging_test"))
+             (v 'ensure-host-seg)
+             (fn [_ key ^long size]
+               (is (Thread/holdsLock registry))
+               (swap! registry update "staging_test" assoc :last-staging-key key)
+               (.allocate arena size))
+             (v 'cl-call!)
+             (fn [label _ arguments]
+               (when (= label "clEnqueueNDRangeKernel")
+                 (is (= :registration-in-use
+                        (:reason (ex-data (error-of #(cleanup/assert-registry-mutable! registry))))))
+                 (swap! seen conj [(.get ^MemorySegment (nth arguments 4) ValueLayout/JAVA_LONG 0)
+                                  (.get ^MemorySegment (nth arguments 5) ValueLayout/JAVA_LONG 0)])))
+             ::invoke (fn [] (if (= route :value)
+                               (let [result (ocl/invoke-registered-kernel
+                                             "staging_test" [(float-array 2)] output [] n)]
+                                 (is (identical? output result)))
+                               (ocl/invoke-registered-map-void-kernel
+                                "staging_test" [(float-array 2) output] [] n)))}))
+        (fn [{:keys [result state]}]
+          (is (nil? result))
+          (is (= [[expected 4]] @seen))
+          (is (zero? (root/lease-count state))))))))
+
+(deftest ocl-direct-map-native-use-rejects-reentrant-retirement-and-preserves-errors
+  (doseq [boundary [:binding "clEnqueueNDRangeKernel" "clEnqueueReadBuffer"]]
+    (let [failure (ex-info "native direct map failure" {}) guarded (atom [])]
+      (with-ocl-map-staging-fault
+        nil false
+        (fn [v _]
+          (let [check! (fn []
+                         (swap! guarded conj
+                                (:reason (ex-data (error-of #(ocl/close-kernel-arena! :staging-test)))))
+                         (throw failure))]
+            (if (= boundary :binding)
+              {(v 'set-kernel-arg-buffer!) (fn [_ ^long _idx _value] (check!))}
+              {(v 'cl-call!) (fn [label _ _]
+                               (when (= label boundary) (check!)))})))
+        (fn [{:keys [result retained state]}]
+          (is (identical? failure result))
+          (is (= [:registration-in-use] @guarded))
+          (is (empty? retained))
+          (is (nil? (cleanup/assert-registry-mutable!
+                     @(ns-resolve 'raster.gpu.ocl-runtime 'kernel-registry))))
+          (is (zero? (root/lease-count state))))))))
+
+(deftest ocl-direct-map-native-acquisition-rejects-reentrant-lifecycle-mutation
+  (doseq [mutation [:close :register]]
+    (let [seen (atom [])]
+      (with-ocl-map-staging-fault
+        nil false
+        (fn [v _]
+          {(v 'create-map-buffer!)
+           (fn [& _]
+             (let [registry @(v 'kernel-registry)
+                   original (get @registry "staging-test")
+                   failure (error-of
+                            #(case mutation
+                               :close (ocl/close-kernel-arena! :staging-test)
+                               :register (ocl/register-kernel!
+                                          "staging-test" {:source "replacement" :dtype :float})))]
+               (is (= :registration-in-use (:reason (ex-data failure))))
+               (is (identical? original (get @registry "staging-test")))
+               (swap! seen conj mutation)
+               ;; A caught lifecycle rejection does not poison the admitted invocation.
+               (MemorySegment/ofAddress (+ 800 (count @seen)))))})
+        (fn [{:keys [result retained state]}]
+          (is (nil? result))
+          (is (= [mutation mutation] @seen))
+          (is (empty? retained))
+          (is (zero? (root/lease-count state))))))))
 
 (deftest ocl-positive-map-staging-rolls-back-every-execution-boundary
   (doseq [point [nil :later-staging :binding "clEnqueueNDRangeKernel"
