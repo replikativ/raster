@@ -1406,6 +1406,49 @@
                      :preserve-declared-array-storage? preserve-declared-array-storage?
                      :reuse-buffers? reuse-buffers?)))
 
+(defn- retained-compilation-loader
+  "Preserve retained class identities when defining AOT bytecode.
+   A same-named class from a sibling REPL loader is not ABI-compatible."
+  [preferred source-ns form tags]
+  (let [tags (concat tags
+                     (mapcat (fn [node]
+                               (keep #(get (meta node) %) [:tag :raster.type/tag]))
+                             (tree-seq coll? seq form)))
+        classes (binding [*ns* (or source-ns *ns*)]
+                  (->> tags
+                       (keep #(when % (if (class? %) % (types/tag->check-class %))))
+                       (mapcat #(take-while some?
+                                            (iterate (fn [^Class c]
+                                                       (when (.isArray c) (.getComponentType c))) %)))
+                       (remove #(or (= Object %) (.isPrimitive ^Class %)))
+                       distinct vec))
+        conflicts (filter #(> (count (val %)) 1) (group-by #(.getName ^Class %) classes))
+        candidates (distinct (cons preferred (map #(.getClassLoader ^Class %) classes)))
+        visible? (fn [loader ^Class cls]
+                   (try (identical? cls (Class/forName (.getName cls) false loader))
+                        (catch ClassNotFoundException _ false)))]
+    (when (seq conflicts)
+      (throw (ex-info "AOT references incompatible classes with the same binary name"
+                      {:reason :aot-class-identity-conflict
+                       :classes (mapv key conflicts)})))
+    (or (some #(when (and (instance? clojure.lang.DynamicClassLoader %)
+                         (every? (partial visible? %) classes)) %) candidates)
+        ;; Separate REPL branches may each own a legitimate required class.
+        ;; An ordinary child still resolves duplicate names incorrectly. Route
+        ;; these exact, already resolved ABI classes locally; delegate all other
+        ;; classes normally. This is not a new global type registry.
+        (let [by-name (into {} (map (fn [^Class c] [(.getName c) c]) classes))
+              loader (proxy [clojure.lang.DynamicClassLoader] [preferred]
+                       (loadClass
+                         ([name] (or (get by-name name) (proxy-super loadClass name)))
+                         ([name resolve?]
+                          (or (get by-name name) (proxy-super loadClass name resolve?)))))]
+          (when-not (every? (partial visible? loader) classes)
+            (throw (ex-info "AOT loader does not preserve retained class identities"
+                            {:reason :aot-class-loader-visibility
+                             :classes (mapv #(.getName ^Class %) classes)})))
+          loader))))
+
 (defn- compile-aot-jvm
   "JVM/GPU compile-aot: bytecode (SIMD) or GPU (target-device) backend."
   [f-var & {:keys [inline? simd? dtype target-device preserve-declared-array-storage?
@@ -1490,7 +1533,10 @@
                                           ;; it the backend falls back to *ns* and fails with
                                           ;; "Cannot resolve class for (. container leaf)".
                                           source-ns (assoc :source-ns source-ns))
-                             result (if (form/binding-form? form)
+                             loader (retained-compilation-loader
+                                     parent-cl source-ns form (conj (vec (vals param-env)) return-tag))
+                             result (binding [me/*compilation-classloader* loader]
+                                      (if (form/binding-form? form)
                                       (closure/hoist-and-compile form active-params active-params
                                                                  hoist-opts)
                                     ;; Non-let* result: wrap in trivial let* and compile normally.
@@ -1499,7 +1545,7 @@
                                                      (if (seq? form) (first form) (type form))))
                                           (closure/hoist-and-compile
                                            (list 'let* [] form)
-                                           active-params active-params hoist-opts)))]
+                                           active-params active-params hoist-opts))))]
                        ;; Store diagnostics on the compiled function's metadata
                          (alter-meta! f-var assoc
                                       ::compiled-diagnostics

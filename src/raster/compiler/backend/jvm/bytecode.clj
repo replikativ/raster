@@ -9,6 +9,7 @@
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.macroexpand :as mex]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dispatch :as dispatch]
@@ -3482,7 +3483,13 @@
             cls (when (and obj-tag (pos? (count (str obj-tag))))
                   (or (try (Class/forName (str obj-tag)) (catch Exception _ nil))
                       (when-let [r (ns-resolve src-ns (symbol (str obj-tag)))]
-                        (when (class? r) r))))]
+                        (when (class? r) r))
+                      ;; Inlined helpers retain their declared type tag even when
+                      ;; the caller's namespace does not import that class.
+                      ;; Reuse the compiler's class authority, not a name search.
+                      (let [resolved (binding [*ns* src-ns]
+                                       (types/tag->check-class (symbol (str obj-tag))))]
+                        (when-not (= Object resolved) resolved))))]
         (if-not cls
           (throw (ex-info (str "Cannot resolve class for: (. " obj " " meth-str ")")
                           {:obj obj :method meth-str}))
