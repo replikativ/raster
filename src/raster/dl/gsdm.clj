@@ -1340,21 +1340,42 @@
                         :random (if (< (.nextDouble rng) 0.5) OBSERVED LATENT)))))))
     out))
 
+(defn- marginalize-example
+  "`ex` with its states replaced by `states`, then `k` of its variables,
+  chosen at random, MARGINALIZED and removed (`marginalize-graph`, with
+  fill-in)."
+  [ex states k ^java.util.Random rng]
+  (if (zero? k)
+    (assoc ex :states states)
+    (let [n (long (:n-vars ex))
+          chosen (set (take k (sort-by (fn [_] (.nextDouble rng)) (range n))))
+          st (aclone ^longs states)]
+      (doseq [i chosen] (aset st (int i) (long MARGINALIZED)))
+      (let [mg (marginalize-graph (:values ex) (:spaces ex) st (:src-edges ex) (:dst-edges ex) n (:n-edges ex))]
+        {:values (:values mg) :spaces (:spaces mg) :states (:states mg)
+         :src-edges (:src-edges mg) :dst-edges (:dst-edges mg)
+         :n-vars (:n-vars mg) :n-edges (:n-edges mg)}))))
+
 (defn training-batch
   "Arguments of the batched loss (after the weights) for `batch` fresh
   examples of `problem` (a fn of an rng, as `make-linear-gaussian-problem`),
   each with its own condition mask and timestep t uniform on the schedule:
   latent variables are noised to x_t, clamped ones keep x0, and the target is
-  x0. Every example must have the same number of variables."
-  [problem batch alphas-cumprod mask-mix emb-dim ^java.util.Random rng]
-  (let [timesteps (alength ^doubles alphas-cumprod)
-        exs (vec (repeatedly batch #(problem rng)))
-        n-per (long (:n-vars (first exs)))
-        _ (when-not (every? #(= n-per (long (:n-vars %))) exs)
-            (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars exs)})))
-        ts (vec (repeatedly batch #(.nextInt rng timesteps)))
-        states (mapv #(condition-states (:states %) mask-mix rng) exs)
-        noised (mapv (fn [ex st t]
+  x0. With `marginalized` k > 0, each example also marginalizes its own k
+  random variables, so all keep the same size. Every example of the problem
+  must have the same number of variables."
+  ([problem batch alphas-cumprod mask-mix emb-dim rng]
+   (training-batch problem batch alphas-cumprod mask-mix emb-dim rng 0))
+  ([problem batch alphas-cumprod mask-mix emb-dim ^java.util.Random rng marginalized]
+   (let [timesteps (alength ^doubles alphas-cumprod)
+         raw (vec (repeatedly batch #(problem rng)))
+         _ (when-not (apply = (map #(long (:n-vars %)) raw))
+             (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars raw)})))
+         exs (mapv #(marginalize-example % (condition-states (:states %) mask-mix rng) marginalized rng) raw)
+         states (mapv :states exs)
+         n-per (long (:n-vars (first exs)))
+         ts (vec (repeatedly batch #(.nextInt rng timesteps)))
+         noised (mapv (fn [ex st t]
                        (let [x0 ^doubles (:values ex)
                              a (aget ^doubles alphas-cumprod t)
                              xt (double-array n-per)]
@@ -1376,16 +1397,17 @@
      (long-array (mapcat (fn [ex o] (map #(+ % o) (:dst-edges ex))) exs offsets))
      (embed-timesteps (map double ts) emb-dim)
      node-example to-cf to-nm
-     (long batch) n-per (long (reduce + (map :n-edges exs)))]))
+     (long batch) n-per (long (reduce + (map :n-edges exs)))])))
 
 (defn train-gsdm
   "Train a GSDM on fresh examples of `problem` with the compiled batched
   train step (Adam). Options: :config (`make-gsdm-config`), :batch (32),
   :steps, :lr (1e-3), :betas (the noise schedule), :mask-mix, :seed,
-  :max-grad-norm (1.0), :train-step (a compiled step to reuse). Returns
-  {:weights (flat, for `gsdm-sample`) :losses :train-step}."
-  [problem {:keys [config batch steps lr betas mask-mix seed max-grad-norm train-step]
-            :or {batch 32 lr 1e-3 mask-mix default-mask-mix seed 0 max-grad-norm 1.0}}]
+  :max-grad-norm (1.0), :max-marginalized (0: each batch marginalizes k
+  uniform on 0..max variables per example), :train-step (a compiled step to
+  reuse). Returns {:weights (flat, for `gsdm-sample`) :losses :train-step}."
+  [problem {:keys [config batch steps lr betas mask-mix seed max-grad-norm train-step max-marginalized]
+            :or {batch 32 lr 1e-3 mask-mix default-mask-mix seed 0 max-grad-norm 1.0 max-marginalized 0}}]
   (let [{:keys [n-layers emb-dim n-heads n-spaces]} config
         weights (init-gsdm-weights config)
         w (flat->tree weights n-layers)
@@ -1398,7 +1420,8 @@
         rng (java.util.Random. (long seed))
         losses (vec (for [step (range 1 (inc steps))]
                       (apply train-fn w (:m state) (:v state)
-                             (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng)
+                             (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng
+                                                     (.nextInt rng (inc (int max-marginalized))))
                                      [(double max-grad-norm) (double lr) 0.9 0.999 1e-8 step]))))]
     ;; the tree shares the flat map's arrays, which Adam updated in place
     {:weights weights :losses losses :train-step ts}))

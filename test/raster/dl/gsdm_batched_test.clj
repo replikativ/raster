@@ -102,3 +102,16 @@
         batched (gsdm/make-gsdm-batched-loss {:n-layers n-layers :emb-dim emb-dim :n-heads 2 :n-spaces 1})
         fast (rp/compile-aot batched)]
     (is (< (Math/abs (- (apply batched w (batch-args examples)) (apply fast w (batch-args examples)))) 1e-12))))
+
+(deftest marginalized-training-batches
+  ;; each example marginalizes its own 2 of 4 variables: all keep 2 nodes
+  (let [problem (gsdm/make-linear-gaussian-problem 3)
+        ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 100))
+        [xt _ _ states _ src dst _ node-example _ _ b n-per n-edges]
+        (gsdm/training-batch problem 6 ac gsdm/default-mask-mix emb-dim (java.util.Random. 4) 2)]
+    (is (= [6 2] [b n-per]))
+    (is (= 12 (alength ^doubles xt) (alength ^longs states) (alength ^longs node-example)))
+    (is (not-any? #(= gsdm/MARGINALIZED %) (vec states)))
+    ;; the fully connected graph on the 2 kept variables, self-loops included
+    (is (= (* 6 4) n-edges))
+    (is (every? true? (map #(= (quot %1 2) (quot %2 2)) src dst)))))
