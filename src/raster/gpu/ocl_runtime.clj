@@ -25,6 +25,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.gpu.compatibility-map :as compatibility-map]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
@@ -1251,6 +1252,8 @@
 ;; Kernel invocation
 ;; ================================================================
 
+(declare registered-1d-workgroup-size)
+
 (defn invoke-registered-map-void-kernel
   "Invoke a compiled map-void kernel. Mirrors ze-runtime API.
   arrays: vector of OclBuffers or JVM arrays
@@ -1259,7 +1262,9 @@
   ([^String kernel-name arrays scalar-args n]
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [abi (:abi (get @kernel-registry kernel-name))
+   (let [registered (or (get @kernel-registry kernel-name)
+                        (throw (ex-info "Kernel not registered" {:kernel-name kernel-name})))
+         abi (:abi registered)
          split-binding (when abi
                          (let [binding (kabi/validate-split-binding! abi arrays scalar-args)]
                            (kabi/validate-physical-pointer-dtypes!
@@ -1272,15 +1277,29 @@
                                  (:scalar-slots split-binding) scalar-args))
          checked-bound (if split-binding
                          (kexec/physical-runtime-scalar (:bound-slot split-binding) n)
-                         {:type :int :value (Math/toIntExact (long n))})
-         {:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
+                         (kexec/physical-runtime-scalar (kabi/slot 'n :scalar :int :role :bound) n))
+         n (long (:value checked-bound))
+         default-workgroup (registered-1d-workgroup-size registered)
+         workgroup-size (first (:workgroup-size
+                                (klaunch/geometry
+                                 {:workgroup-size [(get opts :workgroup-size default-workgroup)]
+                                  :group-count [1]})))
+         _ (when (and (kart/kernel-artifact? registered) (not= default-workgroup workgroup-size))
+             (throw (ex-info "direct map override differs from the emitted workgroup"
+                             {:reason :kernel-workgroup-override
+                              :expected default-workgroup :actual workgroup-size})))
+         empty? (compatibility-map/empty-map? registered
+                                             (vec (concat arrays (or checked-scalars scalar-args)
+                                                          [checked-bound])) n)]
+     (if empty?
+       (do
+         (cleanup/assert-registry-mutable! kernel-registry)
+         (locking kernel-registry
+           (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+           nil))
+       (let [{:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
          {:keys [queue]} @state
          dtype (kernel-info-value info :dtype :float)
-         workgroup-size (long (get opts :workgroup-size
-                                   (if (:launch info)
-                                     (first (klaunch/static-workgroup-size (:launch info)))
-                                     (long (or (:workgroup-size info) 256)))))
-         n (long n)
          default-elem-size (long (get dtype-byte-sizes dtype 4))
 
          ;; Expand arrays: OclBuffer passes through, JVM arrays get staged
@@ -1367,7 +1386,7 @@
          (.invokeWithArguments ^MethodHandle @h-clReleaseMemObject
                                (into-array Object [cl-mem]))))
 
-     nil)))
+     nil)))))
 
 (defn invoke-registered-kernel
   "Pipeline-friendly value-returning map invocation for OpenCL.
@@ -1425,7 +1444,9 @@
         (throw (ex-info "1-D kernel path received a multidimensional launch contract"
                         {:kernel-name (:kernel-name kernel-info) :launch launch})))
       (first workgroup))
-    (long (or (:workgroup-size kernel-info) 256))))
+    (first (:workgroup-size
+            (klaunch/geometry {:workgroup-size [(or (:workgroup-size kernel-info) 256)]
+                               :group-count [1]})))))
 
 (defn- create-kernel-fresh
   "A DEDICATED cl_kernel per binding — kernel args are mutable state on the
