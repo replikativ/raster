@@ -129,5 +129,5 @@
 
 (deftest ema-update
   (let [e (double-array [1.0 2.0]) w (double-array [3.0 6.0])]
-    (gsdm/ema-update! e w 0.75 2)
+    (gsdm/ema-update! e w 0.75 0.25 2)
     (is (= [1.5 3.0] (vec e)))))

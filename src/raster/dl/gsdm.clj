@@ -1348,7 +1348,9 @@
   (let [n (long (:n-vars ex))
         st (aclone ^longs states)
         kept (filterv #(not= MARGINALIZED (aget st (int %))) (range n))
-        chosen (take k (sort-by (fn [_] (.nextDouble rng)) kept))]
+        chosen (take k (let [l (java.util.ArrayList. ^java.util.Collection kept)]
+                         (java.util.Collections/shuffle l rng)
+                         l))]
     (doseq [i chosen] (aset st (int i) (long MARGINALIZED)))
     (if (= n (count kept) (+ (count kept) (count chosen)))
       (assoc ex :states st)
@@ -1403,10 +1405,10 @@
      (long batch) n-per (long (reduce + (map :n-edges exs)))])))
 
 (deftm ema-update!
-  "ema ← mu·ema + (1 − mu)·w, in place."
-  (All [T] [ema :- (Array T) w :- (Array T) mu :- Double n :- Long] :- (Array T)
+  "ema ← mu·ema + one-minus-mu·w, in place; the rates in the element type."
+  (All [T] [ema :- (Array T) w :- (Array T) mu :- T one-minus-mu :- T n :- Long] :- (Array T)
        (dotimes [i n]
-         (aset ema i (n/+ (n/* mu (aget ema i)) (n/* (n/- 1.0 mu) (aget w i)))))
+         (aset ema i (n/+ (n/* mu (aget ema i)) (n/* one-minus-mu (aget w i)))))
        ema))
 
 (defn train-gsdm
@@ -1435,7 +1437,7 @@
         update-ema! (fn [step]
                       (let [mu (min (double ema-rate) (/ (+ 1.0 step) (+ 10.0 step)))]
                         (doseq [[k e] ema]
-                          (ema-update! e (get weights k) mu (alength ^doubles e)))))
+                          (ema-update! e (get weights k) mu (- 1.0 mu) (alength ^doubles e)))))
         losses (vec (for [step (range 1 (inc steps))]
                       (let [loss (apply train-fn w (:m state) (:v state)
                                         (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng
