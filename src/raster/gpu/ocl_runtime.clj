@@ -235,7 +235,8 @@
 (defn- cl-call!
   "Invoke an OpenCL function and check for errors."
   [^String name ^MethodHandle handle args]
-  (let [ret (int (.invokeWithArguments handle (into-array Object args)))]
+  (let [^objects arguments (into-array Object args)
+        ret (int (.invokeWithArguments handle arguments))]
     (when (not= CL_SUCCESS ret)
       (throw (ex-info (str "OpenCL " name " failed with error " ret)
                       {:function name :error ret})))
