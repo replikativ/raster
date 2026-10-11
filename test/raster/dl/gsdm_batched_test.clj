@@ -131,3 +131,15 @@
   (let [e (double-array [1.0 2.0]) w (double-array [3.0 6.0])]
     (gsdm/ema-update! e w 0.75 0.25 2)
     (is (= [1.5 3.0] (vec e)))))
+
+(deftest marginalized-variables-keep-their-identity
+  ;; variable 0 marginalized: the kept variables 1..3 carry the positions
+  ;; they have in the full graph, not 0..2
+  (let [base (gsdm/make-linear-gaussian-problem 3)
+        problem (fn [rng] (let [ex (base rng) st (aclone ^longs (:states ex))]
+                            (aset st 0 (long gsdm/MARGINALIZED))
+                            (assoc ex :states st)))
+        ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 10))
+        pos-emb (nth (gsdm/training-batch problem 1 ac {:posterior 1.0} emb-dim (java.util.Random. 6) 0) 4)
+        full (gsdm/compute-position-embeddings (long-array 4) 4 emb-dim)]
+    (is (= (vec (java.util.Arrays/copyOfRange ^doubles full emb-dim (* 4 emb-dim))) (vec pos-emb)))))

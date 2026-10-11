@@ -831,11 +831,13 @@
   t: timestep (double)
   src/dst-edges: [n_edges] (long[])
   n-vars, n-edges: sizes (after marginalization)"
-  [weights config values spaces states t src-edges dst-edges n-vars n-edges]
+  ([weights config values spaces states t src-edges dst-edges n-vars n-edges]
+   (gsdm-forward-dynamic weights config values spaces states t src-edges dst-edges n-vars n-edges
+                         (compute-position-embeddings spaces n-vars (:emb-dim config))))
+  ([weights config values spaces states t src-edges dst-edges n-vars n-edges pos-emb]
   (let [{:keys [emb-dim n-heads n-layers n-spaces n-states]} config
         n-states (or n-states N-STATES)
         ;; Compute position embeddings for current variable set
-        pos-emb (compute-position-embeddings spaces n-vars emb-dim)
         ;; Embed
         h (flat-embed values (:embed-space weights) spaces
                       (:embed-state weights) states pos-emb
@@ -865,7 +867,18 @@
       ;; Unembed
       (flat-unembed h (:unembed-Wu1 weights) (:unembed-bu1 weights)
                     (:unembed-Wu2 weights) (:unembed-bu2 weights)
-                    n-vars emb-dim))))
+                    n-vars emb-dim)))))
+
+(defn- select-position-rows
+  "The rows of the position embeddings `pos-emb` [n, emb-dim] of the variables
+  at `indices`, in order: positions computed on the full graph, so a
+  variable keeps its identity when others are marginalized."
+  [pos-emb indices emb-dim]
+  (let [d (long emb-dim)
+        out (double-array (* (alength ^longs indices) d))]
+    (dotimes [j (alength ^longs indices)]
+      (System/arraycopy pos-emb (* (aget ^longs indices j) d) out (* j d) d))
+    out))
 
 ;; ================================================================
 ;; DDPM sampling (inference)
@@ -902,6 +915,8 @@
         mg-n-vars (long (:n-vars mg))
         mg-n-edges (long (:n-edges mg))
         orig-indices ^longs (:original-indices mg)
+        mg-pos-emb (select-position-rows (compute-position-embeddings spaces n-vars (:emb-dim config))
+                                         orig-indices (:emb-dim config))
         ;; Normalize observed values if normalizer provided (2-pass)
         mg-normalizer (when normalizer
                         (let [mg-mean (double-array mg-n-vars)
@@ -943,7 +958,7 @@
                     (aset x i (aget mg-values i))))
               ;; Predict x0 from current x_t
               pred-x0 (gsdm-forward-dynamic weights config x mg-spaces mg-states
-                                            (double step) mg-src mg-dst mg-n-vars mg-n-edges)
+                                            (double step) mg-src mg-dst mg-n-vars mg-n-edges mg-pos-emb)
               ;; Clamp the prediction at clamped positions
               _ (dotimes [i mg-n-vars]
                   (when (clamped? (aget mg-states i))
@@ -1343,9 +1358,11 @@
 (defn- marginalize-example
   "`ex` with its states replaced by `states`, then `k` more of its variables,
   chosen at random among those not marginalized already, MARGINALIZED; all
-  marginalized variables are removed (`marginalize-graph`, with fill-in)."
-  [ex states k ^java.util.Random rng]
+  marginalized variables are removed (`marginalize-graph`, with fill-in).
+  :pos-emb holds the kept variables' positions on the full graph."
+  [ex states k emb-dim ^java.util.Random rng]
   (let [n (long (:n-vars ex))
+        pos-emb (compute-position-embeddings (:spaces ex) n emb-dim)
         st (aclone ^longs states)
         kept (filterv #(not= MARGINALIZED (aget st (int %))) (range n))
         chosen (take k (let [l (java.util.ArrayList. ^java.util.Collection kept)]
@@ -1353,11 +1370,12 @@
                          l))]
     (doseq [i chosen] (aset st (int i) (long MARGINALIZED)))
     (if (= n (count kept) (+ (count kept) (count chosen)))
-      (assoc ex :states st)
+      (assoc ex :states st :pos-emb pos-emb)
       (let [mg (marginalize-graph (:values ex) (:spaces ex) st (:src-edges ex) (:dst-edges ex) n (:n-edges ex))]
         {:values (:values mg) :spaces (:spaces mg) :states (:states mg)
          :src-edges (:src-edges mg) :dst-edges (:dst-edges mg)
-         :n-vars (:n-vars mg) :n-edges (:n-edges mg)}))))
+         :n-vars (:n-vars mg) :n-edges (:n-edges mg)
+         :pos-emb (select-position-rows pos-emb (:original-indices mg) emb-dim)}))))
 
 (defn training-batch
   "Arguments of the batched loss (after the weights) for `batch` fresh
@@ -1374,7 +1392,7 @@
          raw (vec (repeatedly batch #(problem rng)))
          _ (when-not (apply = (map #(long (:n-vars %)) raw))
              (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars raw)})))
-         exs (mapv #(marginalize-example % (condition-states (:states %) mask-mix rng) marginalized rng) raw)
+         exs (mapv #(marginalize-example % (condition-states (:states %) mask-mix rng) marginalized emb-dim rng) raw)
          _ (when-not (apply = (map #(long (:n-vars %)) exs))
              (throw (ex-info "Marginalization left examples of different sizes" {:sizes (map :n-vars exs)})))
          states (mapv :states exs)
@@ -1397,7 +1415,7 @@
      (long-array (mapcat (comp seq :spaces) exs))
      (double-array (mapcat (comp seq :values) exs))
      (long-array (mapcat seq states))
-     (double-array (mapcat #(seq (compute-position-embeddings (:spaces %) n-per emb-dim)) exs))
+     (double-array (mapcat (comp seq :pos-emb) exs))
      (long-array (mapcat (fn [ex o] (map #(+ % o) (:src-edges ex))) exs offsets))
      (long-array (mapcat (fn [ex o] (map #(+ % o) (:dst-edges ex))) exs offsets))
      (embed-timesteps (map double ts) emb-dim)
