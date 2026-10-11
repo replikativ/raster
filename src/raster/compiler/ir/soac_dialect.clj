@@ -2616,6 +2616,16 @@
   [program-facts equation-forms program-outputs]
   (validate! (list 'soac-program program-facts (vec equation-forms) (vec program-outputs))))
 
+(defn- declared-dimension-value
+  "Only canonical direct value dimensions identify retained facts. Opaque shape algebra does
+   not grant permission to treat its symbols or callable heads as logical value dependencies."
+  [dimension]
+  (cond
+    (symbol? dimension) dimension
+    (and (seq? dimension) (= 2 (count dimension))
+         (= 'value (first dimension)) (value-id? (second dimension)))
+    (second dimension)))
+
 (defn- project-equation-subprogram
   [program equation]
   (let [equation-id (second equation)
@@ -2625,7 +2635,13 @@
                            (filter value-id? (operation-extents equation)))))
         source-facts (facts program)
         equation-facts (get-in source-facts [:equations equation-id])
-        value-ids (set (concat inputs results (physical-results source-facts equation)))
+        direct-value-ids (set (concat inputs results (physical-results source-facts equation)))
+        ;; Shape facts are not executable inputs. Preserve existing facts verbatim, including
+        ;; contradictory types, for the consuming authority to check; never infer missing facts.
+        ;; This is a direct projection, not recursive closure over arbitrary symbolic dimensions.
+        shape-value-ids (keep declared-dimension-value
+                              (mapcat #(get-in source-facts [:values % :shape]) direct-value-ids))
+        value-ids (into direct-value-ids shape-value-ids)
         program-facts (-> source-facts
                           (assoc :values (select-keys (:values source-facts) value-ids)
                                  :inputs inputs :equations {equation-id equation-facts}
@@ -2633,7 +2649,9 @@
     (make program-facts [equation] results)))
 
 (defn equation-subprogram
-  "Project an exact member's value dependencies, retaining all source bookkeeping.
+  "Project an exact member's value dependencies and declared direct shape facts, retaining all
+   source bookkeeping. Shape-only facts do not become execution inputs; opaque shape expressions
+   remain unchanged and are not recursively interpreted as value dependencies.
    Consumers narrowing a frontend envelope must separately validate its source relationship."
   [program equation]
   (validate! program)

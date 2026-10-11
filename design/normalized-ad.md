@@ -1,5 +1,21 @@
 # Normalized AD design proposal
 
+## Equation projection and shape facts
+
+`soac/equation-subprogram(s)` keeps executable inputs distinct from shape-only facts. When an
+input, logical result or physical destination has a direct symbolic dimension or canonical
+`(value id)` dimension, projection retains the already-declared AbstractValue for that ID
+verbatim. Thus projecting indexed `data[m]` retains `m` without making it a kernel argument.
+Missing facts stay missing; contradictory dtypes or nonscalar facts remain available for the
+consuming authority to reject. Projection does not infer types, synthesize scalar facts or
+add equations that compute dimensions.
+
+This is a bounded direct projection, not general recursive shape closure. Opaque `extent` and
+`unknown-dimension` wrappers and compound shape algebra remain unchanged. General dependency
+closure must extend the existing dimension projection authority, not collect symbols from
+arbitrary S-expressions or introduce a second shape/type vocabulary. Public surface semantics,
+floating-point policy and AD operation coverage do not change.
+
 ## Indexed-map construction checkpoint
 
 `linearize-indexed-map-program` constructs ordinary SOAC programs in the existing certified
