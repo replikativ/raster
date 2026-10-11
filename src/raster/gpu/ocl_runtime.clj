@@ -1308,6 +1308,12 @@
         (throw primary)))
     nil))
 
+(defn- known-direct-capacity [value _slot]
+  (cond
+    (device-buffer? value) (:n-elements (assert-buffer-live! value))
+    (instance? MemorySegment value) nil
+    (dt/dtype-for-jvm-array value) (java.lang.reflect.Array/getLength value)))
+
 (defn- invoke-map-snapshot!
   "Validate and execute one admitted registration snapshot; both public direct-map routes use it."
   [^String kernel-name registered arrays scalar-args n opts]
@@ -1332,6 +1338,10 @@
          global-size (when geometry
                        (Math/multiplyExact (long workgroup-size) (long (first (:group-count geometry)))))]
      (cleanup/assert-registry-mutable! kernel-registry)
+     (when geometry
+       (kcall/validate-retained-input-capacities!
+        registered (vec (concat arrays (or checked-scalars scalar-args) [checked-bound]))
+        known-direct-capacity))
      (locking kernel-registry
        (cleanup/assert-registration-current! kernel-registry kernel-name registered)
      (if-not geometry
