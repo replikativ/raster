@@ -29,12 +29,17 @@
 (deftest linearity-requires-zero-preservation-not-just-dependence
   (doseq [[expression inputs tangents coefficients expected]
           [['(raster.numeric/* t t) '[t] '[t] [] :ad-normalized-nonlinear]
+           ['(raster.numeric// coefficient t) '[coefficient t] '[t] '[coefficient]
+            :ad-normalized-nonlinear]
+           ['(raster.numeric// t t) '[t] '[t] [] :ad-normalized-nonlinear]
            ['(raster.numeric/+ t coefficient) '[t coefficient] '[t] '[coefficient]
             :ad-normalized-affine-offset]
            [2.0 [] [] [] :ad-normalized-nonlinear-output]]]
     (is (= expected (reason #(normalized/validate-linear!
                              (linear-program expression inputs) tangents coefficients)))))
   (let [program (linear-program '(raster.numeric/* coefficient t) '[coefficient t])]
+    (is (= '#{t result} (normalized/validate-linear! program '[t] '[coefficient]))))
+  (let [program (linear-program '(raster.numeric// t coefficient) '[t coefficient])]
     (is (= '#{t result} (normalized/validate-linear! program '[t] '[coefficient]))))
   (is (= :ad-normalized-unknown-type
          (reason #(normalized/validate-linear!

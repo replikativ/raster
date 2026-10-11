@@ -10,6 +10,8 @@
   (n/+ (n/+ (n/* x x) (n/* x y)) x))
 (deftm float-affine [x :- Float y :- Float] :- Float
   (n/+ (n/* x y) x))
+(deftm quotient [x :- Double y :- Double] :- Double (n// x y))
+(deftm float-quotient [x :- Float y :- Float] :- Float (n// x y))
 (deftm subtract-aliases [x :- Double y :- Double] :- Double
   (let [product (n/* x y)
         alias product
@@ -63,6 +65,55 @@
     (is (every? #(instance? Float %) result))
     (is (= [(float 8.0) (float 1.5)] jresult))
     (is (every? #(instance? Float %) jresult))))
+
+(deftest normalized-scalar-public-division
+  (let [vg (reverse/value+grad #'quotient :representation :normalized-scalar)
+        directional (jvp/jvp #'quotient :representation :normalized-scalar)
+        [value gx gy] (vg 6.0 2.0)
+        [jvalue tangent] (directional 6.0 2.0 0.5 -0.25)]
+    (is (= [3.0 0.5 -1.5] [value gx gy]))
+    (is (= value jvalue))
+    (is (= (+ (* gx 0.5) (* gy -0.25)) tangent))
+    (doseq [[slot analytic] [[0 gx] [1 gy]]]
+      (let [h 1.0e-5
+            args [6.0 2.0]
+            plus (apply quotient (update args slot + h))
+            minus (apply quotient (update args slot - h))]
+        (is (< (Math/abs (- analytic (/ (- plus minus) (* 2.0 h)))) 1.0e-9)))))
+  (let [result ((reverse/value+grad #'float-quotient :representation :normalized-scalar)
+                (float 6.0) (float 2.0))
+        directional ((jvp/jvp #'float-quotient :representation :normalized-scalar)
+                     (float 6.0) (float 2.0) (float 0.5) (float -0.25))]
+    (is (= [(float 3.0) (float 0.5) (float -1.5)] result))
+    (is (every? #(instance? Float %) result))
+    (is (= [(float 3.0) (float 0.625)] directional))
+    (is (every? #(instance? Float %) directional)))
+  (is (= [3.0 nil -1.5]
+         ((reverse/value+grad #'quotient :representation :normalized-scalar :wrt [1]) 6.0 2.0))))
+
+(deftest normalized-division-keeps-template-exceptional-arithmetic
+  (let [vg (reverse/value+grad #'quotient :representation :normalized-scalar)
+        directional (jvp/jvp #'quotient :representation :normalized-scalar)
+        same-ieee? (fn [expected actual]
+                     (if (Double/isNaN (double expected))
+                       (Double/isNaN (double actual))
+                       (= (Double/doubleToRawLongBits (double expected))
+                          (Double/doubleToRawLongBits (double actual)))))]
+    (doseq [[x y tx ty] [[1.0 0.0 0.0 0.0]
+                        [1.0 -0.0 0.0 0.0]
+                        [Double/POSITIVE_INFINITY 2.0 0.0 0.0]
+                        [0.0 0.0 1.0 1.0]
+                        [-0.0 2.0 1.0 0.0]]]
+      ;; Independent explicit evaluation of the existing division rule, with no
+      ;; reciprocal rewrite or suppression of an explicitly supplied zero seed.
+      (let [value (n// x y)
+            gx (n// 1.0 y)
+            gy (n/- (n// (n/* 1.0 x) (n/* y y)))
+            tangent (n/+ (n// tx y) (n/- (n// (n/* ty x) (n/* y y))))]
+        (doseq [[expected actual] (map vector [value gx gy] (vg x y))]
+          (is (same-ieee? expected actual)))
+        (doseq [[expected actual] (map vector [value tangent] (directional x y tx ty))]
+          (is (same-ieee? expected actual)))))))
 
 (deftest normalized-scalar-public-subtraction-and-aliases
   (let [vg (reverse/value+grad #'subtract-aliases :representation :normalized-scalar)

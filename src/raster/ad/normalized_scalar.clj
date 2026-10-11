@@ -52,11 +52,12 @@
                             ;; checked non-nil scalar operands; its nil case cannot occur.
                             (= 'raster.ad.reverse/grad-acc template-identity)) '+
                         (descriptor/subtraction-op? operation) '-
-                        (descriptor/multiplication-op? operation) '*)
+                        (descriptor/multiplication-op? operation) '*
+                        (descriptor/division-op? operation) '/)
         cast-tag (descriptor/cast-result-tag operation)]
     (when (or lexical-callee (nil? operation))
       (fail! :ad-normalized-callee {:expression expression :call call}))
-    (when-not (or (and (contains? '#{+ - *} canonical)
+    (when-not (or (and (contains? '#{+ - * /} canonical)
                        (contains? #{1 2} (count arguments))
                        (or (= 2 (count arguments)) (= '- canonical)))
                   (and (contains? '#{float double} cast-tag) (= 1 (count arguments))))
@@ -197,6 +198,8 @@
                           linear? (some #{:linear} kinds)]
                       (when (and (= '* canonical) (every? #{:linear} kinds))
                         (fail! :ad-normalized-nonlinear {:result result :expression expression}))
+                      (when (and (= '/ canonical) (= :linear (second kinds)))
+                        (fail! :ad-normalized-nonlinear {:result result :expression expression}))
                       (when (and cast-tag linear?
                                  (not= (expression-dtype values (first arguments))
                                        (:dtype (get values result))))
@@ -205,7 +208,7 @@
                                  (some #{:coefficient} kinds))
                         (fail! :ad-normalized-affine-offset {:expression expression}))
                       (cond linear? :linear
-                            (and (not= '* canonical) (every? #{:zero} kinds)) :zero
+                            (and (not (contains? '#{* /} canonical)) (every? #{:zero} kinds)) :zero
                             :else :coefficient))
                     (if (number? expression) (if (zero? expression) :zero :coefficient)
                         (get classes expression :coefficient)))]
@@ -273,6 +276,10 @@
         dt (:dtype (get values (first (soac/outputs primal))))
         emitted (into emitted [output (or (get tangents (first (soac/outputs primal)))
                                           (if (= dt :float) '(clojure.core/float 0.0) 0.0))])
+        ;; Templates may retain nested scalar terms. Reuse the shared ANF boundary;
+        ;; fresh values carry the rule's declared homogeneous space, which program
+        ;; checks against retained operands and selected method contracts below.
+        emitted (anf/anf-normalize-bindings emitted fresh)
         defined (set (take-nth 2 emitted))
         external (set/difference (set (mapcat util/free-syms (take-nth 2 (rest emitted)))) defined)
         coefficients (vec (filter external (concat (:inputs (soac/facts primal))
@@ -327,6 +334,7 @@
         zero (if (= :float (:dtype (get values output))) '(clojure.core/float 0.0) 0.0)
         emitted (into emitted (mapcat (fn [input result] [result (get adjoints input zero)])
                                      tangent-inputs outputs))
+        emitted (anf/anf-normalize-bindings emitted fresh)
         input-values (into (array-map) (map (fn [id] [id (get values id)]) coefficients))]
     {:program (program (assoc input-values seed (get values output)) emitted outputs)
      :seed seed}))

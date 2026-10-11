@@ -119,6 +119,20 @@ after inlining or materialization to recover semantics lost by an earlier pass.
 
 ## Linearization and transposition
 
+The next arithmetic slice admits binary division through the same operation descriptors and
+templates. Generated nested rule terms are flattened by the existing AD ANF normalizer;
+temporary contracts come from the rule's declared homogeneous scalar space and are checked
+against operands and selected signatures, not inferred by another operator table. The
+linear program permits division by a coefficient, never by a tangent-dependent denominator.
+Transpose generation uses the existing rules and the same checked equation boundary. This
+does not introduce reciprocal simplification, StrongZero, reassociation or a new rounding
+policy. Public controls include analytic quotients, independent finite differences, JVP/VJP
+pairing, excluded inputs and Float storage classes; forged tangent denominators refuse.
+Focused public/IR controls pass 12 tests / 110 assertions, including signed-zero, NaN and
+explicit-zero-seed exceptional arithmetic; the affected existing gates pass 69 / 525 in the
+warm REPL. Independent bounded source review found no blocker. Array/control regions,
+compiled normalized AD and the unchanged model-scale gates remain outside this acceptance.
+
 The proposed static compilation result is a bundle of ordinary typed programs:
 
 ```text
