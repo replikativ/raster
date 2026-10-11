@@ -7,9 +7,174 @@
             [raster.gpu.runtime-root :as root]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze])
-  (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
+  (:import [java.lang.foreign Arena MemorySegment ValueLayout]
+           [java.lang.invoke MethodHandles]))
 
 (defn- error-of [f] (try (f) nil (catch Throwable error error)))
+
+(defn- with-ocl-map-staging-fault
+  ([failure-point retry-safe? check]
+   (with-ocl-map-staging-fault failure-point retry-safe? (fn [_ _] {}) check))
+  ([failure-point retry-safe? customize check]
+  (with-open [arena (Arena/ofShared)]
+    (let [v #(ns-resolve 'raster.gpu.ocl-runtime %)
+          primary (ex-info "injected map failure" {})
+          release-failure (ex-info "injected temporary release failure"
+                                   {:cleanup-retry-safe? retry-safe?})
+          fails? #(if (set? failure-point) (contains? failure-point %) (= failure-point %))
+          calls (atom []) creates (atom 0) release-attempts (atom 0)
+          runtime-state (atom {:initialized? false})
+          _ (root/initialize! runtime-state []
+                              (fn [_] {:arena arena :context MemorySegment/NULL
+                                       :queue MemorySegment/NULL}))
+          info {:kernel-name "staging-test" :kernel-handle MemorySegment/NULL
+                :dtype :float :workgroup-size 4 :arena-id :staging-test
+                ::cleanup/owner (cleanup/owner [])}
+          registry (atom {"staging-test" info})
+          redefs (merge {(v 'state) runtime-state
+                  (v 'kernel-registry) registry
+                  (v 'h-clReleaseMemObject) (delay :fake)
+                  (v 'h-clEnqueueNDRangeKernel) (delay :fake)
+                  (v 'h-clFinish) (delay :fake)
+                  (v 'h-clEnqueueReadBuffer) (delay :fake)
+                  (v 'ensure-kernel-loaded!) (fn [_] info)
+                  (v 'ensure-host-seg)
+                  (fn [_ key ^long size]
+                    (when (and (fails? :later-staging) (= key :void-arr-1))
+                      (throw primary))
+                    (.allocate arena (long size)))
+                  (v 'create-map-buffer!)
+                  (fn [& _]
+                    (let [idx (swap! creates inc)]
+                      (swap! calls conj [:create idx])
+                      (when (and (fails? :later-acquisition) (= idx 2))
+                        (throw primary))
+                      (MemorySegment/ofAddress (+ 100 idx))))
+                  (v 'set-kernel-arg-buffer!)
+                  (fn [_ ^long _idx _value] (when (fails? :binding) (throw primary)))
+                  (v 'set-kernel-arg-scalar!) (fn [_ ^long _idx _value] nil)
+                  (v 'cl-call!)
+                  (fn [label _ args]
+                    (swap! calls conj [label (when (= label "clReleaseMemObject")
+                                              (.address ^MemorySegment (first args)))])
+                    (when (fails? label) (throw primary))
+                    (when (= label "clReleaseMemObject")
+                      (let [attempt (swap! release-attempts inc)]
+                        (when (and (fails? :release) (= attempt 1))
+                          (throw release-failure)))))}
+                        (customize v arena))]
+      (with-redefs-fn redefs
+        #(let [result (error-of (fn [] (ocl/invoke-registered-map-void-kernel
+                                       "staging-test" [(float-array 2) (float-array 2)] [] 2)))
+               retained (vec (remove (fn [[key _]] (= key "staging-test")) @registry))]
+           (check {:result result :primary primary :release-failure release-failure
+                   :calls calls :retained retained :state runtime-state})))))))
+
+(deftest ocl-positive-map-staging-rolls-back-every-execution-boundary
+  (doseq [point [nil :later-staging :binding "clEnqueueNDRangeKernel"
+                 "clFinish" "clEnqueueReadBuffer"]]
+    (with-ocl-map-staging-fault
+      point false
+      (fn [{:keys [result primary calls retained state]}]
+        (if point (is (identical? primary result)) (is (nil? result)))
+        (is (= (if (= point :later-staging) [101] [101 102])
+               (mapv second (filter #(= "clReleaseMemObject" (first %)) @calls))))
+        (is (empty? retained))
+        (is (zero? (root/lease-count state)))))))
+
+(deftest ocl-positive-map-staging-retains-indeterminate-acquisition
+  (with-ocl-map-staging-fault
+    :later-acquisition false
+    (fn [{:keys [result primary calls retained state]}]
+      (is (identical? primary result))
+      (is (= [101] (mapv second (filter #(= "clReleaseMemObject" (first %)) @calls))))
+      (is (= 1 (count retained)))
+      (is (= 1 (root/lease-count state)))
+      (let [owner (::cleanup/owner (second (first retained))) before @calls]
+        (is (identical? primary (error-of #(cleanup/release! owner))))
+        (is (= before @calls))))))
+
+(deftest ocl-positive-map-staging-retains-release-failure-disposition
+  (doseq [retry-safe? [false true]]
+    (with-ocl-map-staging-fault
+      :release retry-safe?
+      (fn [{:keys [result release-failure calls retained state]}]
+        (is (identical? release-failure result))
+        (is (= 1 (count retained)))
+        (is (= [101 102] (mapv second (filter #(= "clReleaseMemObject" (first %)) @calls))))
+        (is (= 1 (root/lease-count state)))
+        (let [owner (::cleanup/owner (second (first retained))) before @calls
+              retry (error-of #(cleanup/release! owner))]
+          (if retry-safe?
+            (do (is (nil? retry))
+                (is (= [101 102 101]
+                       (mapv second (filter #(= "clReleaseMemObject" (first %)) @calls))))
+                (is (zero? (root/lease-count state))))
+            (do (is (identical? release-failure retry))
+                (is (= before @calls))
+                (is (= 1 (root/lease-count state))))))))))
+
+(deftest ocl-positive-map-staging-checks-native-allocation-result
+  (with-open [arena (Arena/ofShared)]
+    (let [v #(ns-resolve 'raster.gpu.ocl-runtime %)
+          handle (MethodHandles/dropArguments
+                  (MethodHandles/constant MemorySegment MemorySegment/NULL)
+                  0 (into-array Class [MemorySegment Long/TYPE Long/TYPE MemorySegment MemorySegment]))]
+      (doseq [error [-61 0]]
+        (with-redefs-fn {(v 'h-clCreateBuffer) (delay handle)
+                        (v 'read-int) (fn ^long [_] error)}
+          #(let [failure (error-of (fn [] ((v 'create-map-buffer!) MemorySegment/NULL
+                                           (.allocate arena 8) 8 (.allocate arena 4))))]
+             (if (zero? error)
+               (is (= :native-buffer-null (:reason (ex-data failure))))
+               (is (= error (:error (ex-data failure)))))))))))
+
+(deftest ocl-positive-map-staging-preserves-primary-with-failed-rollback
+  (with-ocl-map-staging-fault
+    #{:binding :release} true
+    (fn [{:keys [result primary release-failure retained state]}]
+      (is (identical? primary result))
+      (is (some #(identical? release-failure %) (.getSuppressed ^Throwable result)))
+      (is (= 1 (count retained)))
+      (is (= 1 (root/lease-count state)))
+      (is (nil? (error-of #(cleanup/release! (::cleanup/owner (second (first retained)))))))
+      (is (zero? (root/lease-count state))))))
+
+(deftest ocl-positive-map-staging-retains-uncertain-nonnull-allocation-error
+  (with-ocl-map-staging-fault
+    nil false
+    (fn [v _]
+      (let [create! @(v 'create-map-buffer!)
+            handle (MethodHandles/dropArguments
+                    (MethodHandles/constant MemorySegment (MemorySegment/ofAddress 901))
+                    0 (into-array Class [MemorySegment Long/TYPE Long/TYPE MemorySegment MemorySegment]))]
+        {(v 'create-map-buffer!) create!
+         (v 'h-clCreateBuffer) (delay handle)
+         (v 'read-int) (fn ^long [_] -61)}))
+    (fn [{:keys [result calls retained state]}]
+      (is (= -61 (:error (ex-data result))))
+      (is (empty? (filter #(= "clReleaseMemObject" (first %)) @calls)))
+      (is (= 1 (count retained)))
+      (is (= 1 (root/lease-count state)))
+      (let [before @calls]
+        (is (identical? result
+                        (error-of #(cleanup/release! (::cleanup/owner (second (first retained)))))))
+        (is (= before @calls))))))
+
+(deftest ocl-positive-map-staging-publication-failure-exposes-unresolved-owner
+  (let [publication (ex-info "injected cleanup retention failure" {})]
+    (with-ocl-map-staging-fault
+      :release true
+      (fn [_ _] {#'cleanup/retain-registration! (fn [& _] (throw publication))})
+      (fn [{:keys [result release-failure retained state]}]
+        (is (identical? release-failure (.getCause ^Throwable result)))
+        (is (some #(identical? publication %) (.getSuppressed ^Throwable result)))
+        (is (empty? retained))
+        (is (= 1 (root/lease-count state)))
+        (let [owner (::cleanup/unresolved (ex-data result))]
+          (is (some? owner))
+          (is (nil? (error-of #(cleanup/release! owner))))
+          (is (zero? (root/lease-count state))))))))
 
 (deftest both-binders-reject-registration-replacement-before-native-loading
   (doseq [[namespace bind!] [['raster.gpu.ze-runtime ze/bind-kernel-call]
