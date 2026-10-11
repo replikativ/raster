@@ -178,12 +178,44 @@
   (doseq [[form reason]
           [['(raster.par/contract C [[i m] [j n]] [] (* (aget a i) (aget b j))) :map-domain]
            ['(raster.par/contract C [[i 4] [j 3]] [] (* (aget a i) (aget b j)) :init 1.0) :map-options]
-           ['(raster.par/contract C [[i 4] [j 3]] [] (* (aget a (aget ids i)) (aget b j))) :operand-layout]
-           ['(raster.par/contract C [[i 2] [j 5]] [] (+ (aget A i) (aget A j))) :map-multiple-accesses]]]
+           ['(raster.par/contract C [[i 4] [j 3]] [] (* (aget a (aget ids i)) (aget b j))) :operand-layout]]]
     (let [routed (route/route-contraction form :dtype :double)]
       (is (= :segmap (:strategy routed)))
       (is (= :verified-segmap-opencl (artifact/emission-route (:artifact routed))))
       (is (= reason (:fallback-reason routed))))))
+
+(deftest zero-contract-repeated-dense-reads-retain-coordinates-and-physical-capacity
+  (doseq [[expression extent expected-coordinates]
+          [['(clojure.core/+ (clojure.core/aget A i) (clojure.core/aget A j)) 5 #{'i 'j}]
+           ['(clojure.core/+ (clojure.core/aget A i) (clojure.core/aget A i)) 2 #{'i}]]]
+    (let [verified (facts/from-components
+                    {:out 'C :free-axes '[[i 2] [j 5]] :contract-axes []
+                     :body expression :dtype :double})
+          reads (facts/dense-operand-read-maps verified)
+          routed (with-redefs [facts/surface-form (fn [& _] (throw (ex-info "reconstructed source" {})))
+                              lower/contract-form->segmap (fn [& _] (throw (ex-info "reparsed source" {})))
+                              emit/generate-segmap-nd-kernel (fn [& _] (throw (ex-info "source fallback" {})))]
+                   (route/route-contraction nil :facts verified :dtype :double))
+          kernel (:kernel-body routed)
+          parameters (into {} (map (juxt :id identity)) (:parameters kernel))
+          loads (filter #(= 'A (:buffer %)) (:operations kernel))]
+      (is (= :kernel-body (artifact/emission-route (:artifact routed))))
+      (is (= :segmap (:strategy routed)))
+      (is (= [extent] (:shape (parameters 'A))))
+      (let [shape (:shape (parameters 'C))
+            extent (first shape)]
+        (is (= 1 (count shape)))
+        (is (launch/index-expr? extent))
+        (is (= :mul (:op extent)))
+        (is (= [2 5] (:arguments extent)))
+        (is (= 10 (launch/resolve-expression identity extent))))
+      (is (= expected-coordinates
+             (set (mapcat #(map first (mapcat identity (:groups (:map %)))) reads))))
+      (is (= expected-coordinates (set (mapcat :coordinates loads))))
+      (is (identical? kernel (body/validate! kernel)))
+      (doseq [target [:opencl-portable :cuda :hip]]
+        (is (string? (:source (emit/generate-contraction-kernel-body
+                              kernel :target-dialect target))))))))
 
 (defn- portable-result-transform-form []
   (let [epilogue {:acc 'acc
