@@ -40,36 +40,76 @@
         arena ((runtime-var "make-kernel-arena!"))]
     (try
       (with-bindings {(runtime-var "*current-arena*") arena}
-        (doseq [same-coordinate? [false true]]
-          (let [form (repeated-dense-map-form same-coordinate?)
-                routed (route/route-contraction form :dtype :double)
+        (doseq [[same-coordinate? transform-kind output-dtype]
+                [[false nil :double] [true nil :double]
+                 [false :add-constant :double] [false :float-checkpoint :double]
+                 [false :float-output :float]]]
+          (let [transform (case transform-kind
+                            :add-constant {:acc 'acc :expr '(clojure.core/+ acc 3.0)
+                                           :operands [] :scalars [] :dtype :double}
+                            :float-checkpoint {:acc 'acc
+                                               :expr '(clojure.core/double (clojure.core/float acc))
+                                               :operands [] :scalars [] :dtype :double}
+                            :float-output {:acc 'acc
+                                           :expr '(clojure.core/float (clojure.core/+ acc 3.0))
+                                           :operands [] :scalars [] :dtype :float}
+                            nil)
+                form (cond-> (repeated-dense-map-form same-coordinate?)
+                       transform (concat [:epilogue transform])
+                       (= :float output-dtype) (concat [:out-dtype :float]))
+                form (apply list form)
+                ;; An accepted epilogue must never escape to a source-shaped leaf.
+                routed (with-redefs [sco/generate-segmap-nd-kernel
+                                     (fn [& _] (throw (ex-info "source fallback reentered" {})))]
+                         (route/route-contraction form :dtype :double))
                 artifact (:artifact routed)
-                required (if same-coordinate? 2 5)]
+                required (if same-coordinate? 2 5)
+                allocate-output #(if (= :float output-dtype) (float-array %) (double-array %))
+                result-slot (first (filter #(= :result (:role %)) (:abi artifact)))]
             (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+            (is (= output-dtype (:out-dtype routed)))
+            (is (= output-dtype (:dtype result-slot)))
+            (is (= output-dtype (:kernel-dtype result-slot)))
+            (is (= output-dtype (:dtype (first (filter #(= 'C (:id %))
+                                                       (:parameters (:kernel-body routed)))))))
             (is (= [required]
                    (:shape (first (filter #(= 'A (:id %))
                                           (:parameters (:kernel-body routed)))))))
             ((runtime-var "register-kernel!") (:kernel-name artifact) artifact)
             ;; The ten-element output leaves a partial workgroup. Reuse the same registered
             ;; artifact with changed inputs; no shape inflation or handwritten native binder.
-            (doseq [values [(take required [1.25 -3.5 7.0 8.0 0.125])
-                           (take required [-8.0 2.0 0.5 -1.0 16.0])]]
+            (doseq [values (map #(take required %)
+                                (if (contains? #{:float-checkpoint :float-output} transform-kind)
+                                  [[16777217.0 0.0 -16777217.0 1.0 -1.0]
+                                   [-16777217.0 0.0 16777217.0 -1.0 1.0]]
+                                  [[1.25 -3.5 7.0 8.0 0.125]
+                                   [-8.0 2.0 0.5 -1.0 16.0]]))]
               (let [input (double-array values)
                     before (vec input)
-                    output (double-array 10)
+                    output (allocate-output 10)
                     expected (vec (for [i (range 2) j (range 5)]
-                                    (+ (nth values i)
-                                       (nth values (if same-coordinate? i j)))))]
+                                    (let [element (+ (nth values i)
+                                                     (nth values (if same-coordinate? i j)))]
+                                      (case transform-kind
+                                        :add-constant (+ element 3.0)
+                                        :float-checkpoint (double (float element))
+                                        :float-output (float (+ element 3.0))
+                                        element))))]
                 ((runtime-var "invoke-registered-map-void-kernel")
                  (:kernel-name artifact) [input output] [] 10)
                 (is (= expected (vec output)))
+                (is (= (class (allocate-output 0)) (class output)))
+                (when (= :float-checkpoint transform-kind)
+                  (is (= (if (pos? (first values)) 16777216.0 -16777216.0)
+                         (aget ^doubles output 1))
+                      "the large completed result must pass through an observable Float checkpoint"))
                 (is (= before (vec input)))))
             ;; Required capacity must be rejected before staging/native contact, not padded
             ;; into a different mathematical operation or left to an out-of-bounds device read.
             (try
               ((runtime-var "invoke-registered-map-void-kernel")
                (:kernel-name artifact)
-               [(double-array (dec required)) (double-array 10)] [] 10)
+               [(double-array (dec required)) (allocate-output 10)] [] 10)
               (is false "known undersized input must fail at retained capacity admission")
               (catch clojure.lang.ExceptionInfo error
                 (is (= :kernel-body-buffer-capacity (:reason (ex-data error))))

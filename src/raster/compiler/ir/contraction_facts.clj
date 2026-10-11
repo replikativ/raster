@@ -307,6 +307,15 @@
                      (map #(util/free-syms (:sym %)) (:scalars epilogue))))]
     {:reads reads :writes writes :scalars (set/difference refs reads writes)}))
 
+(defn closed-epilogue?
+  "Whether the result transform closes over only its completed scalar result.
+   This is a dependency gate, not an operator/effect proof; scalar lowering still validates it."
+  [facts]
+  (let [{:keys [acc expr operands scalars] :as epilogue} (:epilogue facts)]
+    (or (nil? epilogue)
+        (and (symbol? acc) (some? expr) (empty? operands) (empty? scalars)
+             (empty? (util/free-syms expr #{acc}))))))
+
 (defn scalar-reduction-view
   "Project the canonical one-component ProductReduction into the contraction facts needed by
    legality and schedule passes. This is a checked view, not a second stored representation."
