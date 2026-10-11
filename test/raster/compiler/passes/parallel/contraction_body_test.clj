@@ -177,12 +177,80 @@
 (deftest outer-product-retains-explicit-migration-declines
   (doseq [[form reason]
           [['(raster.par/contract C [[i m] [j n]] [] (* (aget a i) (aget b j))) :map-domain]
-           ['(raster.par/contract C [[i 4] [j 3]] [] (* (aget a i) (aget b j)) :init 1.0) :map-options]
+           ['(raster.par/contract C [[i 4] [j 3]] [] (* (aget a i) (aget b j)) :decode {a x}) :map-options]
            ['(raster.par/contract C [[i 4] [j 3]] [] (* (aget a (aget ids i)) (aget b j))) :operand-layout]]]
     (let [routed (route/route-contraction form :dtype :double)]
       (is (= :segmap (:strategy routed)))
       (is (= :verified-segmap-opencl (artifact/emission-route (:artifact routed))))
       (is (= reason (:fallback-reason routed))))))
+
+(deftest zero-contract-source-fallback-cannot-claim-an-unemitted-output-conversion
+  (let [source '(raster.par/contract C [[i 4]] []
+                 (clojure.core/aget A (clojure.core/aget ids i)) :out-dtype :float)
+        verified (facts/contraction-facts source :dtype :double)
+        fallback emit/generate-segmap-nd-kernel
+        fallbacks (atom [])
+        failure (with-redefs [emit/generate-segmap-nd-kernel
+                              (fn [& arguments]
+                                (let [emitted (apply fallback arguments)]
+                                  (swap! fallbacks conj emitted)
+                                  emitted))]
+                  (try (route/route-contraction source :facts verified :dtype :double)
+                       nil (catch clojure.lang.ExceptionInfo e (ex-data e))))]
+    (is (= 1 (count @fallbacks)))
+    (is (= :double (:dtype (first (filter #(= :result (:role %))
+                                         (:abi (first @fallbacks)))))))
+    (is (= :contraction-output-dtype-not-lowered (:reason failure)))
+    (is (= :float (:expected failure)))
+    (is (= :double (:actual failure)))
+    (is (= :segmap (:strategy failure)))))
+
+(deftest zero-contract-closed-result-transform-uses-completed-element
+  (let [transform {:acc 'acc :expr '(clojure.core/+ acc 3.0)
+                   :dtype :double :operands [] :scalars []}
+        verified (facts/from-components
+                  {:out 'C :free-axes '[[i 2] [j 5]] :contract-axes []
+                   :body '(clojure.core/+ (clojure.core/aget A i) (clojure.core/aget A j))
+                   :dtype :double :opts {:epilogue transform
+                                        :init '(throw (Exception. "must not evaluate"))
+                                        :combine 'not-a-combine}})
+        routed (with-redefs [facts/surface-form (fn [& _] (throw (ex-info "reconstructed source" {})))
+                            lower/contract-form->segmap (fn [& _] (throw (ex-info "reparsed source" {})))
+                            emit/generate-segmap-nd-kernel (fn [& _] (throw (ex-info "source fallback" {})))]
+                 (route/route-contraction nil :facts verified :dtype :double))
+        kernel (:kernel-body routed)]
+    (is (facts/closed-epilogue? verified))
+    (is (= :kernel-body (artifact/emission-route (:artifact routed))))
+    (is (= transform (get-in kernel [:attributes :result-transform])))
+    (is (identical? kernel (body/validate! kernel)))
+    (is (= 2 (count (filter #(= 'A (:buffer %)) (:operations kernel)))))
+    (is (= 1 (count (filter #(= 'C (:buffer %)) (:operations kernel)))))
+    (let [converted (assoc transform :expr '(clojure.core/double (clojure.core/float acc)))
+          converted-facts (facts/from-components
+                           (assoc (select-keys verified
+                                               [:out :free-axes :contract-axes :body :dtype])
+                                  :opts (assoc (:opts verified) :epilogue converted)))
+          converted-route (route/route-contraction nil :facts converted-facts :dtype :double)
+          converted-body (:kernel-body converted-route)
+          casts (filter #(= :cast (get-in % [:expression :op])) (:operations converted-body))
+          [narrow widen] casts]
+      (is (= :kernel-body (artifact/emission-route (:artifact converted-route))))
+      (is (identical? converted-body (body/validate! converted-body)))
+      (is (= [:float :double] (mapv #(get-in % [:expression :result-type]) casts)))
+      (is (= {:rounding :nearest-even :overflow :ieee} (get-in narrow [:expression :options])))
+      (is (= {:rounding :exact :overflow :exact} (get-in widen [:expression :options])))
+      (is (= [(get-in narrow [:result :id])] (get-in widen [:expression :arguments])))
+      (is (= (get-in widen [:result :id]) (:value (last (:operations converted-body))))))
+    (doseq [captured ['(clojure.core/+ acc bias) '(clojure.core/aget C 0)]]
+      (let [failure (try
+                      (route/route-contraction nil
+                        :facts (facts/from-components
+                                {:out 'C :free-axes '[[i 2]] :contract-axes []
+                                 :body '(clojure.core/aget A i) :dtype :double
+                                 :opts {:epilogue (assoc transform :expr captured)}})
+                        :dtype :double)
+                      nil (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+        (is (= :epilogue-unsupported-by-this-leaf (:reason failure)))))))
 
 (deftest zero-contract-repeated-dense-reads-retain-coordinates-and-physical-capacity
   (doseq [[expression extent expected-coordinates]

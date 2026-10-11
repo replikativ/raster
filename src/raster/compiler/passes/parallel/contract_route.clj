@@ -306,7 +306,10 @@
    — and a version keyed on the tensorize plan forced that plan early and refused shapes DPAS would
    have accepted. The chosen strategy is the only reliable witness of whether a splice exists."
   [epilogue d]
-  (when (and (seq epilogue) (not (contains? splice-capable-strategies (:strategy d))))
+  (when (and (seq epilogue)
+             (not (or (contains? splice-capable-strategies (:strategy d))
+                      (and (= :segmap (:strategy d)) (= :kernel-body (:emission-route d))
+                           (:kernel-body d)))))
     (throw (ex-info (str "contraction: strategy " (:strategy d) " has no store splice, so its "
                          ":epilogue would be silently dropped")
                     ;; The leaves that declined before this fallback was chosen are the reason
@@ -545,7 +548,13 @@
             :emission-route (if emitted :kernel-body :verified-segmap-opencl)
             :kernel-body (:body portable)
             :kernel-name kernel-name :source source :array-params array-params :abi abi
-            :dtype dtype :out-dtype dtype :wg [workgroup-size] :grid [(ceil-div nseg workgroup-size)]
+            ;; The emitted physical result owns storage, including on the source fallback.
+            ;; The existing outer declared-output check refuses a conversion that leaf lacks.
+            :dtype dtype :out-dtype (or (some (fn [slot]
+                                               (when (= :result (:role slot)) (:dtype slot)))
+                                             abi)
+                                        dtype)
+            :wg [workgroup-size] :grid [(ceil-div nseg workgroup-size)]
             :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
             :out-elems nseg :dims [nseg]}
             (not emitted) (assoc :fallback-reason (:reason portable)
