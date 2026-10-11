@@ -164,13 +164,36 @@
   {:int ValueLayout/JAVA_INT :long ValueLayout/JAVA_LONG
    :float ValueLayout/JAVA_FLOAT :double ValueLayout/JAVA_DOUBLE})
 
+(defn- array-segment
+  "Resolve FFM's primitive-array overloads without reflective method lookup.
+  This is a Java storage boundary, not scalar type inference."
+  ^MemorySegment [x]
+  (cond
+    (instance? double/1 x) (MemorySegment/ofArray ^doubles x)
+    (instance? float/1 x) (MemorySegment/ofArray ^floats x)
+    (instance? long/1 x) (MemorySegment/ofArray ^longs x)
+    (instance? int/1 x) (MemorySegment/ofArray ^ints x)
+    (instance? short/1 x) (MemorySegment/ofArray ^shorts x)
+    (instance? byte/1 x) (MemorySegment/ofArray ^bytes x)
+    (instance? char/1 x) (MemorySegment/ofArray ^chars x)
+    :else (throw (ex-info "Native pointer argument requires a primitive numeric array"
+                          {:reason :unsupported-native-pointer
+                           :argument-class (some-> x class .getName)}))))
+
+(defn- scalar-marshaller [dtype]
+  (case dtype
+    :int #(int %) :long #(long %) :float #(float %) :double #(double %)
+    (throw (ex-info "Unsupported native scalar argument ABI"
+                    {:reason :unsupported-native-scalar :dtype dtype}))))
+
 (defn load-kernel
   "Load a kernel from a compiled .so. Old arities return void; the explicit
   return ABI supports :void/:int/:long/:float/:double. `n-ptrs` = number of
   leading pointer args (arrays). `scalars` describes the trailing scalar args (in
   order, after the arrays): either a COUNT (all JAVA_INT, the common counter case)
   or a VECTOR of type keywords (:int/:long/:float/:double) when types are mixed
-  (e.g. a double `eps`). Pointers must precede scalars in the call."
+  (e.g. a double `eps`). Pointers must precede scalars in the call. Invocation
+  requires exactly the declared argument count; extra arguments are rejected."
   ([so name n-ptrs] (load-kernel so name n-ptrs 1))
   ([so name n-ptrs scalars]
    (load-kernel so name n-ptrs scalars :void))
@@ -179,6 +202,9 @@
      (throw (ex-info "Unsupported native scalar return ABI"
                      {:reason :unsupported-native-return :return-type return-type})))
    (let [stypes (if (number? scalars) (vec (repeat scalars :int)) (vec scalars))
+         marshallers (into (vec (repeat n-ptrs array-segment))
+                           (map scalar-marshaller stypes))
+         arity (count marshallers)
          lib (SymbolLookup/libraryLookup ^String so (Arena/global))
          layouts (concat (repeat n-ptrs ValueLayout/ADDRESS) (map scalar-layout stypes))
          fd (if (= :void return-type)
@@ -188,17 +214,22 @@
          mh (.downcallHandle linker (.orElseThrow (.find lib name)) fd
                              (into-array Linker$Option [(Linker$Option/critical true)]))]
      (fn [& args]
-       ;; Hint mh as MethodHandle (matches the BLAS bindings) so invokeWithArguments
-       ;; isn't a reflective call. Per-call cost is dominated by critical(true)
-       ;; heap-pinning of the array segments; amortized in the monolithic
-       ;; one-call-per-compiled-fn model. Arrays first (pinned segments), then
-       ;; scalars marshalled to their declared primitive type.
-       (let [ptr-args (map #(MemorySegment/ofArray %) (take n-ptrs args))
-             scal-args (map (fn [t v] (case t :int (int v) :long (long v)
-                                            :float (float v) :double (double v)))
-                            stypes (drop n-ptrs args))]
+       ;; The ABI-directed conversion plan is compiled once. In particular,
+       ;; overloaded ofArray must not invoke Reflector on every pointer argument.
+       (let [arguments (object-array arity)]
+         (loop [index 0 remaining (seq args)]
+           (if (< index arity)
+             (if remaining
+               (do (aset arguments index ((nth marshallers index) (first remaining)))
+                   (recur (inc index) (next remaining)))
+               (throw (ex-info "Too few native kernel arguments"
+                               {:reason :native-call-arity :expected arity :actual index})))
+             (when remaining
+               (throw (ex-info "Too many native kernel arguments"
+                               {:reason :native-call-arity :expected arity
+                                :actual (+ index (count remaining))})))))
          (.invokeWithArguments ^java.lang.invoke.MethodHandle mh
-                               (object-array (concat ptr-args scal-args))))))))
+                               arguments))))))
 
 (defn compile-elementwise
   "Convenience: emit + compile + load an element-wise kernel. Returns a fn
