@@ -1248,6 +1248,11 @@ conversion remain adapter-owned. Allocator, aggregate and pointer-return handle
 conventions require a separate contract rather than implicit admission. Batched
 fallback loops must share one staging scope for the whole batch before migration:
 staging a full backing array per head would introduce severe copy amplification.
+`with-staged-pointers!` supplies that synchronous batch boundary through the same
+ownership engine: intermediate writes remain visible to later native calls,
+heap publication happens only when the whole operation succeeds, and borrowed
+staging closes on every exit. Caller-owned native writes remain nontransactional.
+The callback must not retain borrowed storage or launch asynchronous work.
 
 Execution scheduling is a distinct backend-neutral lowering. An `ExecutionPlan`
 assigns operations to logical queue classes and connects them with logical

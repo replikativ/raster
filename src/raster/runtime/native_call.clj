@@ -63,7 +63,7 @@
     indices))
 
 (defn- invoke-prepared!
-  [^MethodHandle mh ^objects arguments indices n-ptrs access no-alias?]
+  [^MethodHandle mh ^objects arguments indices n-ptrs access no-alias? operation]
   ;; A native segment is caller-owned for the synchronous call. Heap arrays use
   ;; invocation-owned native storage; sharing a Java array shares that storage.
   (let [heaps (java.util.IdentityHashMap.)
@@ -90,7 +90,7 @@
                               {:reason :native-pointer-alias :index argument-index})))))
         (.add ranges [segment heap writable? offset backing])))
     (if (every? #(nil? (second %)) ranges)
-      (.invokeWithArguments mh arguments)
+      (if operation (operation arguments) (.invokeWithArguments mh arguments))
       (with-open [arena (Arena/ofConfined)]
         (dotimes [i n-ptrs]
           (let [[^MemorySegment source heap _ offset ^MemorySegment backing] (.get ranges i)]
@@ -104,7 +104,7 @@
                 (.put heaps heap destination)
                 (aset arguments (int (if indices (nth indices i) i))
                       (.asSlice destination (long offset) (.byteSize source)))))))
-        (let [result (.invokeWithArguments mh arguments)]
+        (let [result (if operation (operation arguments) (.invokeWithArguments mh arguments))]
           ;; On a failed call no staged writes are published. Caller-owned native
           ;; memory is not transactional; its mutations cannot be rolled back.
           (doseq [[^MemorySegment source heap writable? offset] ranges
@@ -128,9 +128,9 @@
         (throw (ex-info "Native pointer slots must be distinct valid argument indices"
                         {:reason :invalid-native-pointer-slots :slots slots :arity (alength arguments)})))
       (pointer-access! slots access)
-      (invoke-prepared! mh arguments nil slots access no-alias?))
+      (invoke-prepared! mh arguments nil slots access no-alias? nil))
     (let [indices (pointer-indices! slots (alength arguments) access)]
-      (invoke-prepared! mh arguments indices (count indices) access no-alias?))))
+      (invoke-prepared! mh arguments indices (count indices) access no-alias? nil))))
 
 (defn prepare-call
   "Prepare an adapter's ordinary scalar-return FFM handle for interleaved ABI
@@ -159,4 +159,25 @@
                           {:reason :native-call-arity :expected arity :actual (alength values)})))
         (doseq [i indices]
           (aset values (int i) (pointer-segment (aget values (int i)))))
-        (invoke-prepared! mh values indices (count indices) access false)))))
+        (invoke-prepared! mh values indices (count indices) access false nil)))))
+
+(defn with-staged-pointers!
+  "Execute a synchronous batch with one shared pointer ownership scope.
+  operation receives a private object array of admitted native segments. It may
+  slice those segments and perform multiple ordinary native calls; it must not
+  retain the borrowed segments or launch work that outlives this callback.
+  Each primitive backing is staged once for the entire batch. Only declared
+  writable ranges publish after successful completion of the whole operation;
+  an exception closes staging without heap publication. Caller-owned native
+  writes are not transactional. This does not infer numerical bounds or roles."
+  [pointers pointer-access operation]
+  (let [arguments (object-array pointers)
+        access (vec pointer-access)
+        n-ptrs (alength arguments)]
+    (pointer-access! n-ptrs access)
+    (when-not (ifn? operation)
+      (throw (ex-info "Native batch requires a synchronous operation"
+                      {:reason :invalid-native-batch-operation})))
+    (dotimes [i n-ptrs]
+      (aset arguments i (pointer-segment (aget arguments i))))
+    (invoke-prepared! nil arguments nil n-ptrs access false operation)))

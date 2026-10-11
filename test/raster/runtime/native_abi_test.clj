@@ -83,3 +83,60 @@
                        (MethodType/methodType Void/TYPE (into-array Class [Object]))]]
       (is (= :unsupported-native-handle-shape
              (reason #(native/prepare-call (MethodHandles/empty signature) [])))))))
+
+(deftest a-native-batch-shares-one-staging-scope-and-intermediate-state
+  (let [a (double-array [2.0 0.0 0.0])
+        mh (interleaved-handle)
+        captured (atom nil)
+        result (native/with-staged-pointers!
+                [a a] [:read :read-write]
+                (fn [^objects segments]
+                  (let [^MemorySegment x (aget segments 0)
+                        ^MemorySegment y (aget segments 1)]
+                    (reset! captured [x y])
+                    (is (= (.address x) (.address y)))
+                    (is (identical? (.scope x) (.scope y)))
+                    (.invokeWithArguments mh [(int 1) x (double 2.0) (.asSlice y 8 8) (long 1)])
+                    (is (= 5.0 (.get x ValueLayout/JAVA_DOUBLE 8)))
+                    (is (= [2.0 0.0 0.0] (vec a)) "No publication between heads")
+                    (.invokeWithArguments mh [(int 2) (.asSlice x 8 8) (double 3.0)
+                                             (.asSlice y 16 8) (long 1)]))))]
+    (is (= 2 result))
+    (is (= [2.0 5.0 16.0] (vec a)))
+    (is (every? #(not (.isAlive (.scope ^MemorySegment %))) @captured))))
+
+(deftest failed-native-batch-withholds-heap-results-but-not-caller-native-writes
+  (let [a (double-array [1.0 0.0])
+        captured (atom nil)
+        mh (interleaved-handle)]
+    (with-open [arena (Arena/ofConfined)]
+      (let [resident (.allocate arena 8 8)]
+        (is (thrown? IllegalStateException
+                     (native/with-staged-pointers!
+                      [a resident] [:read-write :write]
+                      (fn [^objects segments]
+                        (let [^MemorySegment heap (aget segments 0)
+                              ^MemorySegment output (aget segments 1)]
+                          (reset! captured heap)
+                          (.invokeWithArguments mh [(int 1) heap (double 2.0)
+                                                   (.asSlice heap 8 8) (long 1)])
+                          (.invokeWithArguments mh [(int 2) heap (double 4.0) output (long 3)])
+                          (throw (IllegalStateException. "second head failed")))))))
+        (is (= [1.0 0.0] (vec a)))
+        (is (= 7.0 (.get resident ValueLayout/JAVA_DOUBLE 0)))
+        (is (false? (.isAlive (.scope ^MemorySegment @captured))))
+        (is (.isAlive (.scope resident)))))))
+
+(deftest native-batch-validates-before-operation-and-supports-empty-batches
+  (let [called (atom false)
+        operation (fn [_] (reset! called true))]
+    (is (= :invalid-native-pointer-access
+           (reason #(native/with-staged-pointers! [(double-array 1)] [] operation))))
+    (is (= :unsupported-native-heap-view
+           (reason #(native/with-staged-pointers!
+                     [(.asReadOnly (MemorySegment/ofArray (double-array 1)))] [:read] operation))))
+    (is (false? @called))
+    (is (= :invalid-native-batch-operation
+           (reason #(native/with-staged-pointers! [] [] nil))))
+    (is (= :empty (native/with-staged-pointers! [] [] (fn [^objects pointers]
+                                                     (is (zero? (alength pointers))) :empty))))))
