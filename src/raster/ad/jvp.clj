@@ -328,6 +328,8 @@
            bindings (conj bindings sym init)
            tag (:raster.type/tag (meta sym))
            done (fn [tenv' extra] {:tenv tenv' :bindings (into bindings extra)})]
+       (when (:raster.ad.reverse/inexact-source-scan-checkpoint (meta init))
+         (rev/assert-source-scan-checkpoint! init (any-active? tenv init)))
        (cond
          ;; literal / constant — no tangent
          (and (anf/trivial-expr? init) (not (symbol? init)))

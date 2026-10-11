@@ -372,6 +372,14 @@
 ;; new `ad-form-kind` clause + one `ad-record` defmethod — the engine is untouched.
 ;; ================================================================
 
+(defn ^:no-doc assert-source-scan-checkpoint!
+  "Enforce a source checkpoint obligation only after the existing activity
+   authority proves that this region needs a derivative."
+  [expression active?]
+  (when (and active? (::inexact-source-scan-checkpoint (meta expression)))
+    (throw (ex-info "AD stored-carry loop requires an exact carry checkpoint"
+                    {:reason :ad-scan-carry-precision :loop expression}))))
+
 (defn- ad-form-kind
   "Classify a binding init into a reverse-record kind. SOACs (soac-record-kinds)
   are recognized BEFORE the activity gate (they manage their own activity via
@@ -383,7 +391,8 @@
     (not active?)                                                   :inactive
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
-    (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr))) :loop
+    (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr)))
+    (do (assert-source-scan-checkpoint! init-expr true) :loop)
     ;; Do not treat an unlinearized region as an inactive ordinary call. Until
     ;; shared preparation flattens it, it has no reverse record contract.
     (or (form/binding-form? init-expr)
@@ -1145,8 +1154,7 @@
   A raw `loop` bound to a let* binding is not recordable by the per-binding
   engine (`ad-record :loop` fails loud): only a loop in TAIL position is
   differentiable (via `lift-loop-to-tail` → `gen-reverse-loop-with-let`).
-  `transform-body` applies that lift once at the top level, but a SECOND raw
-  loop composed in series lands as a mid-let binding inside the FIRST loop's
+  A SECOND raw loop composed in series lands as a mid-let binding inside the FIRST loop's
   result-branch continuation (gen-reverse-loop*'s compound-result path funnels
   that continuation here) — where the tail-lift was never re-applied.
 
@@ -1162,16 +1170,19 @@
       (gen-reverse-let-core bindings body-exprs active-params)
       ;; Thread activity across the bindings (init-active?, same rule the engine
       ;; uses) WITHOUT running ad-record (which would throw on the active loop).
-      ;; Only route when the FIRST loop binding — the one lift-loop-to-tail
-      ;; targets — is active; otherwise preserve the core path (and its
-      ;; fail-loud behavior for a genuinely un-liftable active loop).
+      ;; Select the first ACTIVE loop with this activity authority. Earlier
+      ;; inactive loops stay in the primal prefix, rather than becoming tapes.
       (let [activity (reduce (fn [act [s init]] (assoc act s (init-active? init act)))
                              (into {} (map (fn [p] [p true]) active-params))
                              pairs)
-            first-loop-sym (ffirst (filter (fn [[_ init]] (loop-init? init)) pairs))]
-        (if-not (get activity first-loop-sym)
+            first-loop-sym (ffirst (filter (fn [[sym init]]
+                                            (and (loop-init? init) (get activity sym))) pairs))]
+        (if-not first-loop-sym
           (gen-reverse-let-core bindings body-exprs active-params)
-          (let [lifted (lift-loop-to-tail (apply list 'let* (vec bindings) body-exprs))]
+          (let [_ (assert-source-scan-checkpoint!
+                   (second (first (filter #(= first-loop-sym (first %)) pairs))) true)
+                lifted (lift-loop-to-tail (apply list 'let* (vec bindings) body-exprs)
+                                          first-loop-sym)]
             (cond
               ;; lift-loop-to-tail → bare tail loop (no bindings preceded it)
               (and (seq? lifted) (contains? #{'loop 'loop*} (first lifted)))
@@ -1296,6 +1307,15 @@
   - Active loop var adjoints chain across iterations
   - Free param adjoints accumulate across all iterations"
   [loop-form active-params]
+  (let [active? (init-active? loop-form (zipmap active-params (repeat true)))]
+    (assert-source-scan-checkpoint! loop-form active?)
+    ;; The generic tape route is not a convergence/while-solver contract.
+    ;; Preserve the canonical materializer's existing invariant-bound gate
+    ;; rather than accidentally admitting a data-dependent trip count here.
+    (when active?
+      (when-let [{:keys [acc-sym bound-expr]} (patterns/match-reduce-loop loop-form)]
+        (when (patterns/contains-sym? bound-expr acc-sym)
+          (ad-record :loop '_loop loop-form {})))))
   ;; CC2 fix: if any init expressions are non-trivial (compound expressions
   ;; that reference active params), lift them into let bindings and delegate
   ;; to gen-reverse-loop-with-let so adjoints propagate through the init.
@@ -1325,7 +1345,8 @@
                                                  [sym (:init-sym entry)])
                                                [sym init]))
                                            raw-bindings))
-            new-loop-form (list* 'loop* new-loop-bindings (drop 2 loop-form))]
+            new-loop-form (with-meta (list* 'loop* new-loop-bindings (drop 2 loop-form))
+                            (meta loop-form))]
         (gen-reverse-loop-with-let let-bindings new-loop-form active-params))
       (gen-reverse-loop* loop-form active-params))))
 
@@ -3045,10 +3066,9 @@
   adjoints [d_param1 d_param2 ...] in the same order as active-params."
   [form active-params]
   (with-ad-gensym
-    (let [;; If a loop ended up bound to a let-var (common after inlining a
-          ;; deftm whose body's tail is a loop), lift it to tail position so
-          ;; gen-reverse-loop-with-let can handle it.
-          form (lift-loop-to-tail form)
+    (let [;; Binding-position loops are routed by gen-reverse-let's existing
+          ;; activity decision. Unconditionally tail-lifting here rewrites even
+          ;; primal-only loops and bypasses that decision/checkpoint obligation.
           [bindings body-exprs] (extract-let-parts form)
           ;; Check if the let body is a loop
           body-expr-1 (when (= 1 (count body-exprs)) (first body-exprs))
@@ -3683,6 +3703,28 @@
 
     :else form))
 
+(defn- retain-source-scan-checkpoint-obligations
+  "Check a recognized stored-carry loop before beta/ANF can hide its store
+   behind argument bindings. An inexact output is not an unrounded carry tape;
+   losing the scan pattern must not silently admit the generic loop fallback.
+   Store pure source evidence; the existing activity decision enforces it.
+   Inactive regions need no residual tape and remain ordinary primal code."
+  [body]
+  (postwalk-code
+   (fn [expression]
+     (if (seq? expression)
+       (let [clean (vary-meta expression dissoc ::inexact-source-scan-checkpoint)]
+         (if-let [{:keys [out-sym acc-sym cast-fn else-expr]}
+                  (patterns/match-scan-loop clean)]
+           (cond-> clean
+             (and (or (= out-sym else-expr)
+                      (patterns/acc-ref? else-expr acc-sym))
+                  (not (exact-scan-carry-checkpoint? out-sym acc-sym cast-fn)))
+             (vary-meta assoc ::inexact-source-scan-checkpoint true))
+           clean))
+       expression))
+   body))
+
 (defn ^:no-doc ad-prepare
   "The ONE shared pre-AD preparation, used by the reverse path
   (`build-grad-walked-body`, `grad-expr`) AND the forward/JVP path
@@ -3704,7 +3746,8 @@
   here. Loops the gates decline are left untouched for the existing paths."
   ([body] (ad-prepare body nil))
   ([body param-env]
-   (let [body (inline/inline-transparent-lexical-calls body param-env)
+   (let [body (retain-source-scan-checkpoint-obligations body)
+         body (inline/inline-transparent-lexical-calls body param-env)
          ;; A source-written reduction must project its initializer and step
         ;; before broad ANF is allowed to move either across the binder.
         source-scoped (binding [inline/*param-env* param-env]
@@ -4337,18 +4380,20 @@
   expects. Inlines the post-bindings + body into the loop's result branch.
 
   When called on something that isn't a let* with a loop in binding position,
-  returns the form unchanged. Handles only the FIRST loop binding found —
-  recurse from the caller if multiple loops in series need lifting.
+  returns the form unchanged. The caller's existing activity analysis selects
+  target-loop-sym; earlier inactive loops stay in the primal prefix. Recurse
+  from the caller if multiple active loops in series need lifting.
 
   Loop body shape required: (if test (recur ...) result-expr) or
                             (if test result-expr (recur ...))."
-  [form]
+  [form target-loop-sym]
   (if-not (and (seq? form) (#{'let 'let*} (first form)))
     form
     (let [[let-sym bindings & body-exprs] form
           pairs (partition 2 bindings)
-          loop-binding? (fn [[_ init]]
-                          (and (seq? init) (#{'loop 'loop*} (first init))))
+          loop-binding? (fn [[sym init]]
+                          (and (= target-loop-sym sym)
+                               (seq? init) (#{'loop 'loop*} (first init))))
           [pre-pairs post] (split-with (complement loop-binding?) pairs)
           [loop-pair & post-pairs] post]
       (if-not loop-pair
@@ -4382,7 +4427,8 @@
                       new-loop-body (if recur-in-then?
                                       (list 'if test-expr recur-branch cont)
                                       (list 'if test-expr cont recur-branch))
-                      new-loop-form (apply list 'loop* loop-bindings [new-loop-body])]
+                      new-loop-form (with-meta (apply list 'loop* loop-bindings [new-loop-body])
+                                      (meta loop-form))]
                   (if (seq pre-pairs)
                     (apply list let-sym
                            (vec (mapcat identity pre-pairs))
@@ -4547,8 +4593,8 @@
                             *constant-gradient-arrays* constant-gradient-arrays]
                     (ad-prepare qualified-source
                                 (zipmap all-params tags)))
-        ;; transform-body itself will lift any binding-position loop into
-        ;; tail position via lift-loop-to-tail.
+        ;; transform-body delegates binding-position loops to gen-reverse-let's
+        ;; activity-aware routing; inactive loops remain in the primal prefix.
           ad-form (binding [*constant-gradient-arrays* constant-gradient-arrays
                             util/*shadowing-locals* (into util/*shadowing-locals* all-params)]
                     (transform-body hoisted diff-active-params))
