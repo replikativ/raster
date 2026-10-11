@@ -1404,10 +1404,12 @@
   train step (Adam). Options: :config (`make-gsdm-config`), :batch (32),
   :steps, :lr (1e-3), :betas (the noise schedule), :mask-mix, :seed,
   :max-grad-norm (1.0), :max-marginalized (0: each batch marginalizes k
-  uniform on 0..max variables per example), :train-step (a compiled step to
-  reuse). Returns {:weights (flat, for `gsdm-sample`) :losses :train-step}."
-  [problem {:keys [config batch steps lr betas mask-mix seed max-grad-norm train-step max-marginalized]
-            :or {batch 32 lr 1e-3 mask-mix default-mask-mix seed 0 max-grad-norm 1.0 max-marginalized 0}}]
+  uniform on 0..max variables per example), :ema-rate (0.999), :train-step
+  (a compiled step to reuse). Returns {:weights :ema-weights (both flat, for
+  `gsdm-sample`; sample with the EMA) :losses :train-step}."
+  [problem {:keys [config batch steps lr betas mask-mix seed max-grad-norm train-step max-marginalized ema-rate]
+            :or {batch 32 lr 1e-3 mask-mix default-mask-mix seed 0 max-grad-norm 1.0 max-marginalized 0
+                 ema-rate 0.999}}]
   (let [{:keys [n-layers emb-dim n-heads n-spaces]} config
         weights (init-gsdm-weights config)
         w (flat->tree weights n-layers)
@@ -1418,10 +1420,20 @@
         train-fn (:train-fn ts)
         alphas-cumprod (diff/compute-alphas-cumprod betas)
         rng (java.util.Random. (long seed))
+        ema (into {} (map (fn [[k a]] [k (aclone ^doubles a)])) weights)
+        ;; the EMA of every weight array, with the usual warm-up of its rate
+        update-ema! (fn [step]
+                      (let [mu (min (double ema-rate) (/ (+ 1.0 step) (+ 10.0 step)))]
+                        (doseq [[k ^doubles e] ema
+                                :let [^doubles a (get weights k)]]
+                          (dotimes [i (alength e)]
+                            (aset e i (+ (* mu (aget e i)) (* (- 1.0 mu) (aget a i))))))))
         losses (vec (for [step (range 1 (inc steps))]
-                      (apply train-fn w (:m state) (:v state)
-                             (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng
-                                                     (.nextInt rng (inc (int max-marginalized))))
-                                     [(double max-grad-norm) (double lr) 0.9 0.999 1e-8 step]))))]
+                      (let [loss (apply train-fn w (:m state) (:v state)
+                                        (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng
+                                                                (.nextInt rng (inc (int max-marginalized))))
+                                                [(double max-grad-norm) (double lr) 0.9 0.999 1e-8 step]))]
+                        (update-ema! step)
+                        loss)))]
     ;; the tree shares the flat map's arrays, which Adam updated in place
-    {:weights weights :losses losses :train-step ts}))
+    {:weights weights :ema-weights ema :losses losses :train-step ts}))
