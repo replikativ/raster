@@ -9,6 +9,7 @@
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
@@ -108,6 +109,43 @@
            (get-in scheduled-body [:source :operations])))
     (is (identical? scheduled-body (scheduled/validate! scheduled-body)))
     (is (identical? witness (refinement/validate! witness)))))
+
+(deftest product-consumer-preserves-source-storage-preconditions-through-runtime-preflight
+  (let [program (#'fixtures/scheduled-product-consumer)
+        routed (route/schedule (region/analyze program (#'fixtures/numerical-equations program)))
+        witness (:refinement routed)
+        source (:source witness)
+        conditions (:preconditions source)
+        emitted (:emitted (route/emit "guarded_product_consumer" routed :cuda))]
+    ;; This is the real independently analyzed fixture's capacity condition, not a guard
+    ;; invented on the candidate after scheduling. One row fits its declared 64-element input;
+    ;; two rows do not. The runtime gate must survive eliminating the private intermediate.
+    (is (= [64] (get-in program [:values 'input :shape])))
+    (is (= [64] (get-in program [:values 'weights :shape])))
+    (is (= [1] (get-in program [:values 'output :shape])))
+    (is (seq conditions))
+    (is (= conditions (:preconditions (:graph routed)) (:preconditions emitted)))
+    (is (= (graph/boundary-contract source) (graph/boundary-contract (:graph routed))))
+    (is (identical? witness (refinement/validate! witness)))
+    (is (identical? emitted (graph-call/preflight! emitted {'rows {:type :long :value 1}})))
+    (try
+      (graph-call/preflight! emitted {'rows {:type :long :value 2}})
+      (is false "the emitted graph must reject a row count exceeding source storage capacity")
+      (catch clojure.lang.ExceptionInfo failure
+        (is (= :kernel-precondition-failed (:reason (ex-data failure))))
+        (is (some #{(:condition (ex-data failure))} conditions))))
+    (doseq [changed [[] (assoc-in conditions [0 :op] :!=)]]
+      (is (= :scheduled-graph-refinement-boundary
+             (try (refinement/validate! (assoc-in witness [:graph :preconditions] changed)) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))
+          "removing or changing a source gate is not a lawful schedule refinement")
+      (is (= :scheduled-graph-refinement-source
+             (try (refinement/validate-against!
+                   (-> witness
+                       (assoc-in [:source :preconditions] changed)
+                       (assoc-in [:graph :preconditions] changed)) source) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure)))))
+          "coherent tampering of both sides still fails the independent source certificate"))))
 
 (deftest certified-region-projects-through-one-portable-body
   (let [routed (routed-region)]

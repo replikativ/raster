@@ -62,6 +62,7 @@
         (graph/make
          {:inputs (:inputs source-graph) :outputs (:outputs source-graph) :temporaries []
           :scalars (:scalars source-graph)
+          :preconditions (:preconditions source-graph)
           :nodes [(graph/->ScheduledKernel
                    [:product-ordered-consumer (:equations plan)] source uses scalar-uses [])]
           :effects (:effects source-graph)

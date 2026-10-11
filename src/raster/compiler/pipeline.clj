@@ -2551,9 +2551,10 @@
   Options:
     :simd?           - apply SIMD optimization (default true)
     :target-device   - device-id for backend (e.g. :cuda:0)
+    :values          - retained abstract parameter values for semantic analysis
     :inline?         - inline deftm calls (default true)"
   [f-var & {:keys [mode inline?
-                   simd? target-device dtype preserve-declared-array-storage?]
+                   simd? target-device dtype preserve-declared-array-storage? values]
             :or {mode :forward
                  simd? true}}]
   (let [inline? (if (nil? inline?) true inline?)
@@ -2583,6 +2584,7 @@
                          {:preserve-declared-array-storage? preserve-declared-array-storage?})
         opts (cond-> {:inline? inline?
                       :diagnostic? true
+                      :values values
                       :active-params active-params
                       :simd? simd? :target-device target-device
                       :dtype effective-dtype

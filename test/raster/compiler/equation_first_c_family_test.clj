@@ -2127,12 +2127,29 @@
                         :values {'input (av/tensor {:dtype :int :shape [64]})
                                  'weights (av/tensor {:dtype :int :shape [64]})
                                  'output (av/tensor {:dtype :int :shape [1]})}})
+          operation (first (:operations
+                            (first (filter #(seq (:operations %))
+                                           (get-in compilation [:emitted :equations])))))
+          graph (:graph operation)
+          source (get-in operation [:refinement :source])
           linked (equation-first/lower
                   compilation [(int-array 64) (int-array 64) (int-array 1) 1])]
       (is (= :none (get-in compilation [:stats :fallback])))
-      (is (= 2 (count (:kernels compilation))))
+      (is (= 1 (count (:kernels compilation))) "the certified two-operation region is fused")
       (is (every? #(get-in % [:attributes :kernel-body]) (:kernels compilation)))
-      (is (= [8] (get-in compilation
+      (is (= ["SegRed" "SegMap"]
+             (mapv #(some-> % :operation class .getSimpleName) (:nodes source))))
+      (is (identical? operation (emitted-equation/validate! operation)))
+      (is (= :declared-integral-tree-with-ordered-outer-fold
+             (get-in operation [:refinement :numerics :policy])))
+      (is (= :ordered (get-in operation [:refinement :numerics :ordered-consumer :association])))
+      (is (seq (:preconditions source)))
+      (is (= (:preconditions source) (:preconditions graph)))
+      (is (identical? graph (graph-call/preflight! graph {'rows {:type :long :value 1}})))
+      (is (= :kernel-precondition-failed
+             (try (graph-call/preflight! graph {'rows {:type :long :value 2}}) nil
+                  (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+      (is (= [32] (get-in compilation
                          [:kernels 0 :attributes :kernel-body :launch :workgroup-size])))
       (is (= 0 (get-in linked [:attributes :driver-allocations]))))))
 
