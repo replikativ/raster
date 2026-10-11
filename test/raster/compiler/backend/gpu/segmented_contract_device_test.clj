@@ -8,6 +8,7 @@
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
+            [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]))
 
@@ -81,9 +82,9 @@
   (if @opencl/opencl-available?
     (check-repeated-dense-map! :ocl:0)
     (opencl/opencl-skip! "zero-contract repeated dense reads"))
-  (if @gpu?
+  (if @gpu-probe/gpu-available?
     (check-repeated-dense-map! :ze:0)
-    (println "[skip] zero-contract repeated dense reads: no Level Zero device available")))
+    (gpu-probe/gpu-skip! "zero-contract repeated dense reads")))
 
 (deftest segmented-contraction-matches-cpu-on-device
   (if-not @gpu?
