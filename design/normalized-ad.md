@@ -32,16 +32,37 @@ certificate. Only the two declared runtime Namespace fields are projected to nam
 after their actual Namespace identity has been checked; opaque unsupported values are not
 silently sanitized. Existing rule/definition epochs and all physical AV facets remain bound.
 Host execution tests use existing materialization; non-host placement still refuses there.
-The existing authority checks scalar linearity, residual interfaces and source/lift relations;
-it does not independently regenerate registered scalar derivative arithmetic. This pilot is
-not a proof of custom-rule mathematics. Fixed-ID scalar rule reconstruction remains a separate
-consolidation obligation, not a capability granted by producer certification.
+The existing authority checks scalar linearity, residual interfaces and source/lift relations,
+and regenerates registered scalar derivative arithmetic using the recorded typed generation
+stream described below. This establishes correspondence to the currently registered rules,
+not independent proof of custom-rule mathematics or a capability granted by producer certification.
 
 This thin migration adapter adds no runtime mode, parser, rule registry, cache, equation
 composition or fusion permission. Old APIs and runtimes remain unchanged. The nested evidence
 and family validators may retire only after a common program validator independently owns the
 same source/derivative/residual obligations and the existing numerical/refusal gates agree.
 Map→sum/indexed composition, exact SFT and the unchanged FAILED Gemma gate (11/28) remain open.
+
+## Scalar derivation correspondence
+
+Scalar bundles retain an ordered pure generation stream, including tangent inputs, cotangent
+seed and every template/ANF temporary. The existing typed fresh owner creates these IDs.
+Validation rejects missing evidence, malformed requests or metadata, source collisions,
+duplicates and incomplete/excess replay; it never allocates replacement IDs or alpha-normalizes
+an untrusted derivative. Existing family and certificate refusals retain their ordering.
+
+After those checks, validation regenerates the linear program from the retained primal and
+active interface, then transposes that regenerated linear program using current registered
+rules. Full typed programs, tangent/seed IDs and residual ordering must agree semantically.
+Rule/definition epochs are checked before and after replay. Existing bundles without generation
+evidence refuse rather than receiving a new certificate or inferred proof.
+
+This deliberately replays rule emitters on every validation, including runtime primal and
+pullback boundaries; there is no opaque validation cache or safety skip. Emitters must remain
+deterministic under their registered contract, and their original failures propagate. Agreement
+with current registered derivative arithmetic is not independent proof of its mathematics,
+nor floating reassociation permission or completion of the AD/training migration. Exact SFT
+and the unchanged Gemma FAILED gate (11/28) remain independent obligations.
 
 ## Indexed-map construction checkpoint
 

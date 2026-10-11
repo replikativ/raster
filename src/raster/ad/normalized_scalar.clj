@@ -227,13 +227,22 @@
         (fail! :ad-normalized-nonlinear-output {:outputs (soac/outputs program)}))
       (into #{} (keep (fn [[id class]] (when (= :linear class) id))) classes))))
 
-(defn- typed-gensym [dt]
-  (fn fresh
-    ([prefix] (tagged (gensym (str prefix "__nsad_")) dt))
-    ([prefix requested-tag]
-     (when (and requested-tag (not= requested-tag (tag dt)))
-       (fail! :ad-normalized-rule-type {:requested requested-tag :dtype dt}))
-     (fresh prefix))))
+(defn- typed-gensym
+  ([dt] (typed-gensym dt (fn [prefix _] (gensym (str prefix "__nsad_")))))
+  ([dt allocate]
+   (fn fresh
+     ([prefix] (fresh prefix nil))
+     ([prefix requested-tag]
+      (when (and requested-tag (not= requested-tag (tag dt)))
+        (fail! :ad-normalized-rule-type {:requested requested-tag :dtype dt}))
+      (tagged (allocate (str prefix) requested-tag) dt)))))
+
+(defn- recording-fresh [dt phase stream]
+  (typed-gensym dt
+                (fn [prefix requested-tag]
+                  (let [id (tagged (gensym (str prefix "__nsad_")) dt)]
+                    (swap! stream conj {:phase phase :prefix prefix :requested-tag requested-tag :id id})
+                    id))))
 
 (defn- sum-contributions [contributions fresh]
   (reduce (fn [[bs current] next]
@@ -243,8 +252,8 @@
 
 (defn- linearize [primal active-inputs fresh]
   (let [values (:values (soac/facts primal))
-        tangent-inputs (mapv (fn [id] (tagged (gensym (str (name id) "__tangent_"))
-                                              (:dtype (get values id)))) active-inputs)
+        tangent-inputs (mapv (fn [id] (fresh (str (name id) "__tangent")
+                                           (tag (:dtype (get values id))))) active-inputs)
         {:keys [emitted tangents]}
         (reduce
          (fn [{:keys [emitted tangents]} [result expression]]
@@ -302,7 +311,7 @@
   (let [dependent (validate-linear! linear tangent-inputs coefficients)
         values (:values (soac/facts linear))
         output (first (soac/outputs linear))
-        seed (tagged (gensym "cotangent__") (:dtype (get values output)))
+        seed (fresh "cotangent" (tag (:dtype (get values output))))
         known-bindings (vec (mapcat identity (remove #(contains? dependent (first %))
                                                      (partition 2 (bindings linear)))))
         {:keys [emitted adjoints]}
@@ -350,6 +359,52 @@
   {:template-revision (templates/registry-revision)
    :compiler-revision (dispatch/compiler-definition-revision)})
 
+(defn- validate-derivation!
+  "Replay existing rules with exact recorded typed IDs. No recursive bundle validation,
+   fresh fallback, alpha-normalization or supplied linear program feeds the transpose."
+  [{:keys [primal params active-inputs generation] :as bundle}]
+  (let [before (revisions)
+        dt (:dtype (get-in (soac/facts primal) [:values (first params)]))
+        source-ids (set (keys (:values (soac/facts primal))))
+        ids (when (vector? generation) (mapv :id generation))]
+    (when-not (= before (select-keys bundle [:template-revision :compiler-revision]))
+      (fail! :ad-normalized-stale-rules
+             {:expected (select-keys bundle [:template-revision :compiler-revision]) :actual before}))
+    (when-not (and (vector? generation)
+                   (every? (fn [entry]
+                             (and (map? entry) (= #{:phase :prefix :requested-tag :id} (set (keys entry)))
+                                  (contains? #{:linear :transpose} (:phase entry))
+                                  (string? (:prefix entry))
+                                  (or (nil? (:requested-tag entry)) (= (tag dt) (:requested-tag entry)))
+                                  (symbol? (:id entry)) (nil? (namespace (:id entry)))
+                                  (= {:raster.type/tag (tag dt)} (meta (:id entry))))) generation)
+                   (= (count ids) (count (distinct ids)))
+                   (empty? (set/intersection source-ids (set ids))))
+      (fail! :ad-normalized-generation-stream {}))
+    (let [position (atom 0)
+          replay (fn [phase]
+                   (typed-gensym dt
+                                 (fn [prefix requested-tag]
+                                   (let [entry (get generation @position)]
+                                     (when-not (= {:phase phase :prefix prefix :requested-tag requested-tag}
+                                                  (select-keys entry [:phase :prefix :requested-tag]))
+                                       (fail! :ad-normalized-generation-stream {:position @position :phase phase}))
+                                     (swap! position inc)
+                                     (:id entry)))))
+          regenerated (linearize primal active-inputs (replay :linear))
+          transposed (transpose (:program regenerated) (:tangent-inputs regenerated)
+                                (:coefficients regenerated) (replay :transpose))]
+      (when-not (= before (revisions))
+        (fail! :ad-normalized-stale-rules {:before before :after (revisions)}))
+      (when-not (= @position (count generation))
+        (fail! :ad-normalized-generation-stream {:position @position :count (count generation)}))
+      (when-not (fingerprint/equivalent?
+                 (select-keys bundle [:linear :transpose :tangent-inputs :residuals :cotangent-seed])
+                 {:linear (:program regenerated) :transpose (:program transposed)
+                  :tangent-inputs (:tangent-inputs regenerated) :residuals (:coefficients regenerated)
+                  :cotangent-seed (:seed transposed)})
+        (fail! :ad-normalized-derivation-correspondence {})))))
+
 (defn- certificate [bundle]
   (fingerprint/fingerprint
    ;; Project the checked runtime field in place. A synthetic replacement key would
@@ -380,7 +435,8 @@
 
 (defn validate!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
-   This detects stale or changed producer data; it is not a proof of custom derivative math."
+   Replays registered scalar rules on every call; no validation cache is used. Correspondence
+   with those rules is not independent proof of custom derivative mathematics."
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
            cotangent-seed source-ns] :as bundle}]
   (when-not (instance? clojure.lang.Namespace source-ns)
@@ -418,8 +474,11 @@
       (validate-sum-programs! bundle))
     (when (contains? bundle :gather-programs)
       (validate-gather-programs! bundle))
+    ;; Preserve all existing family/certificate refusal ordering. Matching a certificate
+    ;; never grants derivation authority: current-rule replay remains mandatory afterward.
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
+    (validate-derivation! bundle)
     bundle))
 
 (defn- build-bundle [primal {:keys [params tags active-inputs source-ns]} revision]
@@ -433,15 +492,16 @@
                    (set/subset? (set active-inputs) (set params)))
       (fail! :ad-normalized-program-interface
              {:params params :active-inputs active-inputs :source-ns source-ns}))
-    (let [fresh (typed-gensym (:dtype (get-in (soac/facts primal) [:values (first params)])))
-          {:keys [program tangent-inputs coefficients]} (linearize primal active-inputs fresh)
-          transposed (transpose program tangent-inputs coefficients fresh)
+    (let [dt (:dtype (get-in (soac/facts primal) [:values (first params)]))
+          generation (atom [])
+          {:keys [program tangent-inputs coefficients]} (linearize primal active-inputs (recording-fresh dt :linear generation))
+          transposed (transpose program tangent-inputs coefficients (recording-fresh dt :transpose generation))
           _ (when-not (= revision (revisions))
               (fail! :ad-normalized-stale-rules {:before revision :after (revisions)}))
           bundle (merge revision {:primal primal :linear program :transpose (:program transposed)
                                   :params params :tags tags :active-inputs active-inputs
                                   :tangent-inputs tangent-inputs :residuals coefficients
-                                  :cotangent-seed (:seed transposed) :source-ns source-ns})]
+                                  :cotangent-seed (:seed transposed) :generation @generation :source-ns source-ns})]
       (validate! (assoc bundle :certificate (certificate bundle))))))
 
 (defn linearize-program
