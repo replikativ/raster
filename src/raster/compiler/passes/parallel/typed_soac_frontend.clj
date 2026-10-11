@@ -5294,7 +5294,16 @@
                   (dtype/dtype-for-scalar-tag expression-tag))
        :expression expr})))
 
-(defn- scalar-equation
+(defn scalar-equation
+  "Project one retained scalar binding into a TypedSOAC equation.
+
+   description supplies :id, :sym and :expr. scalar-dtypes contains preceding scalar value
+   dtypes; scalar-types supplies the existing retained source type environment. Reuses the
+   frontend's result-type/explicit-widening checks and ordered free-capture substitution.
+   Callers must supply the existing lexical shadowing context for core-spelled local IDs.
+
+   This checks result evidence, not derivative availability or effect legality. Validate the
+   resulting equation in its TypedSOAC program before using it as a semantic AD boundary."
   [description scalar-dtypes scalar-types]
   (let [{:keys [id sym expr]} description
         captures (vec (sort-by pr-str (util/free-syms expr)))

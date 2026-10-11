@@ -5212,7 +5212,9 @@
                    "Runtime construction and compiled AD calls share this preparation gate.")
               {:var f-var :reason :flatten-failed}))))
 
-(defn ^clojure.lang.IFn value+grad
+(declare value+grad)
+
+(defn- ^clojure.lang.IFn source-value+grad
   "Composable value+gradient operator.
 
   (value+grad f) returns a function that computes [value, grad1, ..., gradN].
@@ -5361,6 +5363,38 @@
                       :forward
                       :reverse)]
        (value+grad f-var :mode (if (some? wrt) :reverse selected) :wrt wrt)))))
+
+(defn ^clojure.lang.IFn value+grad
+  "Construct value and all positional gradient slots. Default :representation :source
+   retains existing AD. :normalized-scalar opts into the checked scalar runtime bundle;
+   it supports :mode :reverse and :wrt, but not :compile? true yet."
+  ([f-var] (source-value+grad f-var))
+  ([f-var & {:keys [representation mode wrt compile?]
+             :or {representation :source mode :reverse} :as options}]
+   (case representation
+     :source (apply source-value+grad f-var (mapcat identity (dissoc options :representation)))
+     :normalized-scalar
+     (do
+       (when-not (= :reverse mode)
+         (throw (ex-info "normalized scalar value+grad requires reverse mode"
+                         {:reason :normalized-scalar-mode :mode mode})))
+       (when compile?
+         (throw (ex-info "normalized scalar value+grad currently supports runtime construction only"
+                         {:reason :normalized-scalar-compile-unsupported})))
+       (let [bundle ((requiring-resolve 'raster.ad.normalized-scalar/prepare)
+                     (resolve-deftm-var f-var) wrt)
+             {:keys [walked-body params tags source-ns]}
+             ((requiring-resolve 'raster.ad.normalized-scalar/value+grad-body) bundle)
+             runtime-fn (binding [*ns* source-ns]
+                          (make-runtime-value+grad-fn walked-body params))]
+         (with-meta (fn [& args] (apply runtime-fn args))
+           {::value+grad true ::compiled? false :raster.core/deftm true
+            :raster.core/deftm-walked-body walked-body
+            :raster.core/deftm-params params :raster.core/deftm-tags tags
+            :raster.core/deftm-source-ns (ns-name source-ns)
+            :raster.ad/normalized-bundle bundle})))
+     (throw (ex-info "unknown AD representation"
+                     {:reason :ad-representation :representation representation})))))
 
 (defn grad
   "Composable gradient operator.

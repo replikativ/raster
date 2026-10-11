@@ -561,7 +561,7 @@
                                 params (range)))]
         (eval (list 'fn ['& args-sym] (list 'let unpack body)))))))
 
-(defn ^clojure.lang.IFn jvp
+(defn- ^clojure.lang.IFn source-jvp
   "Forward-mode value-and-directional-derivative for a deftm var.
 
   (jvp #'f) → (fn [p1 … pN Δp_a … Δp_k] -> [primal tangent])
@@ -632,6 +632,38 @@
           :raster.core/deftm-walked-body [qualified]
           :raster.core/deftm-params fn-params
           :raster.core/deftm-tags out-tags})))))
+
+(defn ^clojure.lang.IFn jvp
+  "Construct value-and-directional-derivative. Default :representation :source retains
+   existing AD. Opt-in :normalized-scalar uses the checked scalar bundle at runtime only;
+   :wrt selects tangent inputs there. :compile? true is not yet supported on that route."
+  ([f-var] (source-jvp f-var))
+  ([f-var & {:keys [representation wrt compile?] :or {representation :source}}]
+   (case representation
+     :source (do
+               (when (or (some? wrt) compile?)
+                 (throw (ex-info "source JVP does not support :wrt or :compile?"
+                                 {:reason :ad-source-jvp-options :wrt wrt :compile? compile?})))
+               (source-jvp f-var))
+     :normalized-scalar
+     (do
+       (when compile?
+         (throw (ex-info "normalized scalar JVP currently supports runtime construction only"
+                         {:reason :normalized-scalar-compile-unsupported})))
+       (let [bundle ((requiring-resolve 'raster.ad.normalized-scalar/prepare)
+                     (rev/resolve-deftm-var f-var) wrt)
+             {:keys [walked-body params tags source-ns]}
+             ((requiring-resolve 'raster.ad.normalized-scalar/jvp-body) bundle)
+             runtime-fn (binding [*ns* source-ns]
+                          (make-runtime-jvp-fn (first walked-body) params))]
+         (with-meta (fn [& args] (apply runtime-fn args))
+           {::jvp true :raster.core/deftm true
+            :raster.core/deftm-walked-body walked-body
+            :raster.core/deftm-params params :raster.core/deftm-tags tags
+            :raster.core/deftm-source-ns (ns-name source-ns)
+            :raster.ad/normalized-bundle bundle})))
+     (throw (ex-info "unknown AD representation"
+                     {:reason :ad-representation :representation representation})))))
 
 ;; ================================================================
 ;; HVP — forward-over-reverse (§13 A4, Pearlmutter 1994)

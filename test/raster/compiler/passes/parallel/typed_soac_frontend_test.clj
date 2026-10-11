@@ -20,6 +20,49 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
+(deftest shared-scalar-projector-retains-result-type-and-ordered-captures
+  (let [expression (with-meta '(clojure.core/+ z a) {:raster.type/tag 'float})
+        equation (frontend/scalar-equation {:id :scalar-result :sym 'answer :expr expression}
+                                           {} {'a :float 'z :float})
+        {:keys [attributes captures lambda]} (dialect/operation-parts equation)
+        {:keys [parameters body-results]} (dialect/lambda-parts lambda)
+        facts (dialect/default-program-facts
+               {:values {'a (av/tensor {:dtype :float :shape []})
+                         'z (av/tensor {:dtype :float :shape []})
+                         'answer (av/tensor {:dtype :float :shape []})}
+                :inputs '[a z]
+                :equations {:scalar-result (dialect/default-equation-facts)}})
+        program (dialect/make facts [equation] '[answer])]
+    (is (= :scalar-result (second equation)))
+    (is (= '[answer] (nth equation 2)))
+    (is (= [:float] (:dtypes attributes)))
+    (is (= '[a z] captures))
+    (is (= (list 'clojure.core/+ (second parameters) (first parameters)) (first body-results)))
+    (is (= (meta expression) (meta (first body-results))))
+    (is (identical? program (dialect/validate! program)))))
+
+(deftest shared-scalar-projector-reuses-preceding-value-and-lexical-capture-facts
+  (let [equation (binding [util/*shadowing-locals* (conj util/*shadowing-locals* 'count)]
+                   (frontend/scalar-equation {:id 0 :sym 'answer :expr 'count}
+                                             {'count :double} {}))
+        {:keys [attributes captures]} (dialect/operation-parts equation)]
+    (is (= [:double] (:dtypes attributes)))
+    (is (= '[count] captures))))
+
+(deftest shared-scalar-projector-refuses-missing-and-contradictory-result-evidence
+  (is (= :unsupported-scalar-binding
+         (try (frontend/scalar-equation {:id 0 :sym 'answer :expr '(unknown-scalar x)} {} {})
+              nil
+              (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+  (let [binder (with-meta 'answer {:raster.type/tag 'float})
+        expression (with-meta '(clojure.core/+ x y) {:raster.type/tag 'double})
+        failure (try (frontend/scalar-equation {:id 0 :sym binder :expr expression} {} {})
+                     nil
+                     (catch clojure.lang.ExceptionInfo failure failure))]
+    (is (= :scalar-binding-dtype-conflict (:reason (ex-data failure))))
+    (is (= :float (:binding-dtype (ex-data failure))))
+    (is (= :double (:expression-dtype (ex-data failure))))))
+
 (deftest local-polymorphic-array-storage-honors-the-preservation-policy
   (let [out (with-meta 'out {:raster.type/tag 'floats})
         pairs [[out '(raster.arrays/zeros-like x 3)]]
