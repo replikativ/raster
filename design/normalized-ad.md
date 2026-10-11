@@ -1,5 +1,26 @@
 # Normalized AD design proposal
 
+## Indexed-map construction checkpoint
+
+`linearize-indexed-map-program` constructs ordinary SOAC programs in the existing certified
+bundle's `:gather-programs` facet. The admitted source is a functional indexed map: one excluded
+Int/Long pointwise index array and one stable, indirectly read Float/Double data array, with exact
+canonical read operands and the actual directly resolved core `aget` Var, independent
+data/output extents, unchanged indices and no destination
+alias, narrowing or effects. Imperative `par/gather` caller destination storage is not erased.
+Retained `.invk` reads are refused until selected executable receiver identity is proved;
+semantic operation metadata alone cannot authorize their derivative.
+The existing scalar identity linearizer and rule/definition revisions remain authoritative.
+
+Primal explicitly exports a fresh owned index snapshot; linear gathers the explicit data tangent
+through it. Transpose is a sequential effect-map with ordered read/add/write checkpoints. Its
+`:required-zero-gradient` contract requires a fresh, exclusive, typed-zero data-length physical binding;
+the effect equation does **not** allocate or initialize this destination. Construction validates
+source/interface/program correspondences, retained physical facts and the owned snapshot.
+No host adapter, runtime ownership enforcement, device execution, gather→sum or public-engine
+integration is provided by this checkpoint. The existing homogeneous map importer remains
+unchanged. These construction controls do not close the unchanged failed real-weight training gate.
+
 Status: architecture assessed against Raster main
 `642b5f0c0aad7c49f223357a796ce09c900e7c1c`, with an initial opt-in scalar implementation.
 This is not a replacement for the compiler campaign or completion of normalized AD. The

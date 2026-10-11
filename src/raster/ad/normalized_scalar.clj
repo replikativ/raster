@@ -374,7 +374,7 @@
       (binding-dtype! values id expression)))
   primal)
 
-(declare validate-map-programs! validate-sum-programs!)
+(declare validate-map-programs! validate-sum-programs! validate-gather-programs!)
 
 (defn validate!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
@@ -414,6 +414,8 @@
       (validate-map-programs! bundle))
     (when (contains? bundle :sum-programs)
       (validate-sum-programs! bundle))
+    (when (contains? bundle :gather-programs)
+      (validate-gather-programs! bundle))
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
     bundle))
@@ -706,6 +708,203 @@
                     :tangent-output (gensym "ad_push_") :gradient-output (gensym "ad_pull_")}
          bundle (assoc bundle :map-programs (lift-map-programs bundle source interface))]
      (validate! (assoc bundle :certificate (certificate bundle))))))
+
+(defn- project-indexed-element
+  "Check a functional map's exact indirect read using the existing operand/layout authority."
+  [source source-ns output]
+  (soac/validate! source)
+  (when-not (= 1 (count (soac/equations source)))
+    (fail! :ad-normalized-indexed-map-boundary {:equations (count (soac/equations source))}))
+  (let [facts (soac/facts source)
+        [equation :as equations] (soac/equations source)
+        {:keys [kind attributes arrays captures lambda]} (soac/operation-parts equation)
+        {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+        layout (soac/parameter-layout equation)
+        [indices] arrays [data] captures [result] (nth equation 2)
+        [index-element] (:elements layout) [data-parameter] (:capture-parameters layout)
+        values (:values facts)
+        index-value (get values indices) data-value (get values data) result-value (get values result)
+        dt (:dtype data-value) it (:dtype index-value)
+        extent (:extent attributes)
+        plain? (fn [value]
+                 (and (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
+                      (= 1 (count (:shape value))) (nil? (:logical-layout value))
+                      (empty? (:effects value)) (empty? (:attributes value))))
+        integral-extent? (fn [id]
+                           (or (and (integer? id) (<= 0 id Integer/MAX_VALUE))
+                               (let [value (get values id)]
+                                 (and (= :tensor (:kind value)) (= [] (:shape value))
+                                      (contains? #{:int :long} (:dtype value))
+                                      (= {:kind :plain} (:representation value))
+                                      (nil? (:logical-layout value))
+                                      (empty? (:effects value)) (empty? (:attributes value))))))
+        read (first body-results)
+        ;; The semantic descriptor supplies operands, not executable receiver proof.
+        ;; Initial indexed admission is an actual direct core Var only; retained dispatch
+        ;; requires a separate selected implementation contract before it can be admitted.
+        read-var (when (and (seq? read) (symbol? (first read))
+                            (not= '.invk (first read))
+                            (instance? clojure.lang.Namespace source-ns))
+                   (ns-resolve source-ns (first read)))]
+    (when-not (and (= 1 (count equations)) (= 'map kind)
+                   (= 1 (count arrays) (count captures) (count (nth equation 2)))
+                   (= [result] (soac/outputs source)) (= 2 (count parameters)) (empty? locals)
+                   (instance? clojure.lang.Namespace source-ns)
+                   (empty? (:effects facts)) (empty? (:aliases facts))
+                   (empty? (get-in facts [:equations (second equation) :effects]))
+                   (empty? (get-in facts [:equations (second equation) :aliases]))
+                   (map-source-envelope? facts equation)
+                   (empty? (soac/result-storage source (second equation)))
+                   (set/subset? (set (keys attributes)) #{:index :extent :attributes})
+                   (set/subset? (set (keys (:attributes attributes)))
+                                #{:stable-array-captures :pointwise-storage-inputs})
+                   (empty? (get-in attributes [:attributes :pointwise-storage-inputs]))
+                   (fingerprint/equivalent? [data] (get-in attributes [:attributes :stable-array-captures]))
+                   (or (nil? (get-in facts [:attributes :source-arithmetic]))
+                       (= numerics/retained-source-arithmetic (get-in facts [:attributes :source-arithmetic])))
+                   (every? plain? [index-value data-value result-value])
+                   (contains? #{:float :double} dt) (= dt (:dtype result-value))
+                   (contains? #{:int :long} it)
+                   (= [extent] (:shape index-value) (:shape result-value))
+                   (integral-extent? extent) (integral-extent? (first (:shape data-value)))
+                   (contains? #{nil :owned} (:ownership result-value))
+                   (every? #(fingerprint/equivalent?
+                              (select-keys data-value [:memory-space :placement :sharding])
+                              (select-keys % [:memory-space :placement :sharding]))
+                           [index-value result-value])
+                   (= 1 (count body-results)) (descriptor/aget-call? read)
+                   (identical? #'clojure.core/aget read-var)
+                   (not (contains? (set parameters)
+                                   (:implementation-op (descriptor/call-description read))))
+                   (= [data-parameter index-element] (descriptor/call-args read)))
+      (fail! :ad-normalized-indexed-map-boundary {:equation equation}))
+    (doseq [[id expected] (concat [[index-element it] [data-parameter (dtype/array-tag-for-dtype dt)]
+                                  [read dt]]
+                                 (map vector (descriptor/call-args read)
+                                      [(dtype/array-tag-for-dtype dt) it]))]
+      (when-let [retained (types/sym-type-tag id)]
+        (when-not (= retained (if (keyword? expected) (tag expected) expected))
+          (fail! :ad-normalized-indexed-map-boundary {:parameter id :retained retained}))))
+    (let [element (tagged (symbol (str (name output) "__element")) dt)
+          scalar (program {element (av/tensor {:dtype dt :shape []})} [output element] [output])]
+      {:primal scalar
+       :interface {:params [element] :tags [(tag dt)] :active-inputs [element] :source-ns source-ns}})))
+
+(defn- lift-gather-programs [bundle source interface]
+  (let [facts (soac/facts source) [equation] (soac/equations source)
+        {:keys [attributes arrays captures lambda]} (soac/operation-parts equation)
+        [indices] arrays [data] captures [result] (soac/outputs source)
+        {:keys [parameters body-results]} (soac/lambda-parts lambda)
+        [index-element data-parameter] parameters
+        {:keys [index-snapshot tangent-input tangent-output cotangent-input zero-gradient gradient-output]} interface
+        index-value (assoc (get-in facts [:values indices]) :ownership :owned)
+        output-value (assoc (get-in facts [:values result]) :ownership :owned)
+        data-value (assoc (get-in facts [:values data]) :ownership :owned)
+        dt (:dtype data-value)
+        extent (:extent attributes)
+        capacity-facts (filter #(contains? (:values facts) %) [extent (first (:shape data-value))])
+        values (merge (:values facts) {index-snapshot index-value tangent-output output-value
+                                      tangent-input (assoc data-value :ownership :borrowed)
+                                      cotangent-input (assoc output-value :ownership :borrowed)
+                                      zero-gradient data-value gradient-output data-value})
+        make-map (fn [id arrays captures region outputs]
+                   (let [equation (list '= id outputs
+                                        (list 'map (assoc-in attributes [:attributes :stable-array-captures] captures)
+                                              arrays captures region))
+                         inputs (vec (distinct (concat (soac/operation-inputs equation)
+                                                       (filter soac/value-id? (soac/operation-extents equation)))))]
+                     (soac/make (soac/default-program-facts
+                                 {:values (select-keys values (concat inputs outputs capacity-facts)) :inputs inputs
+                                  :equations {id (soac/default-equation-facts)}
+                                  :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
+                                [equation] outputs)))
+        ;; Reuse fixed fresh interface IDs as lexical parameters, not conventional stems
+        ;; which could capture a source extent or input of the same name.
+        destination (with-meta zero-gradient {:raster.type/tag (dtype/array-tag-for-dtype dt)})
+        dy (tagged cotangent-input dt) index (tagged index-snapshot (:dtype index-value))
+        effects #{:memory/read :memory/write}
+        addition (tagged (list 'raster.numeric/+ (list 'clojure.core/aget destination index) dy) dt)
+        ;; Destinations are physical storage, not semantic operation-inputs. The declared
+        ;; read/write destination owns both sides of the ordered update. Its required
+        ;; typed-zero physical binding is supplied by a later execution adapter, not
+        ;; duplicated as a capture (the shared dialect forbids overlapping operand roles).
+        transpose-equation (list '= 'ad-gather-transpose [gradient-output]
+                                 (list 'effect-map
+                                       {:index (:index attributes) :extent extent :dtypes [dt]
+                                        :iteration-order :sequential}
+                                       [cotangent-input index-snapshot] [] [zero-gradient]
+                                       (soac/effect-lambda-form [dy index destination]
+                                                                [(list 'effect destination :ordered index 1 addition)])))
+        transpose-inputs (vec (distinct (concat (soac/operation-inputs transpose-equation)
+                                               (filter soac/value-id? (soac/operation-extents transpose-equation)))))
+        transpose-facts (soac/default-program-facts
+                         {:values (select-keys values (concat transpose-inputs [zero-gradient gradient-output] capacity-facts))
+                          :inputs transpose-inputs :effects effects
+                          :attributes {:source-arithmetic numerics/retained-source-arithmetic}
+                          :equations {'ad-gather-transpose
+                                      (assoc (soac/default-equation-facts) :effects effects
+                                             :aliases {gradient-output zero-gradient}
+                                             :attributes {:result-storage
+                                                          [{:destination zero-gradient :access :read-write
+                                                            :host-return :effect}]})}})
+        _ (binding [*ns* (:source-ns bundle)]
+            (selected-call-contract! (call! {} addition) [dt dt] dt))]
+    {:source source :interface interface
+     :required-zero-gradient {:value zero-gradient :dtype dt :shape (:shape data-value)
+                              :ownership :owned :initialization :typed-zero :exclusive true}
+     :primal (make-map 'ad-gather-primal arrays captures
+                       (soac/lambda-form parameters (conj (vec body-results) index-element))
+                       [result index-snapshot])
+     :linear (make-map 'ad-gather-linear [index-snapshot] [tangent-input]
+                       (soac/lambda-form parameters [(list 'clojure.core/aget data-parameter index-element)])
+                       [tangent-output])
+     :transpose (soac/make transpose-facts [transpose-equation] [gradient-output])}))
+
+(defn- validate-gather-programs! [{:keys [gather-programs source-ns] :as bundle}]
+  (let [{:keys [source interface]} gather-programs
+        projected (project-indexed-element source source-ns (first (soac/outputs (:primal bundle))))
+        ids (vals interface)
+        source-equation (first (soac/equations source))
+        source-bound (conj (set (:parameters (soac/lambda-parts
+                                             (:lambda (soac/operation-parts source-equation)))))
+                           (get-in (soac/operation-parts source-equation) [:attributes :index]))]
+    (when-not (and (= #{:index-snapshot :tangent-input :tangent-output :cotangent-input
+                       :zero-gradient :gradient-output} (set (keys interface)))
+                   (every? symbol? ids) (= (count ids) (count (distinct ids)))
+                   (empty? (set/intersection (set ids)
+                                            (set/union source-bound
+                                                       (set (keys (:values (soac/facts source)))))))
+                   (fingerprint/equivalent? (:primal projected) (:primal bundle))
+                   (fingerprint/equivalent? (select-keys (:interface projected) [:params :tags :active-inputs])
+                                            (select-keys bundle [:params :tags :active-inputs])))
+      (fail! :ad-normalized-gather-interface {:interface interface}))
+    (doseq [p (map gather-programs [:primal :linear :transpose])] (soac/validate! p))
+    (when-not (fingerprint/equivalent? gather-programs (lift-gather-programs bundle source interface))
+      (fail! :ad-normalized-gather-programs {:interface interface})))
+  bundle)
+
+(defn linearize-indexed-map-program
+  "Construct checked indexed-map programs only; no host/device execution is exposed.
+   A functional map reads one Float/Double data array through unchanged excluded Int/Long
+   indices. Primal explicitly snapshots indices. Ordered transpose requires a fresh owned
+   typed-zero physical gradient binding; the effect equation does not allocate or zero it."
+  [source source-ns]
+  (let [revision (revisions)
+        output (gensym "indexed_element_output_")
+        {:keys [primal interface]} (project-indexed-element source source-ns output)
+        bundle (build-bundle primal interface revision)
+        equation (first (soac/equations source))
+        source-parts (soac/operation-parts equation)
+        used (into (set (keys (:values (soac/facts source))))
+                   (conj (:parameters (soac/lambda-parts (:lambda source-parts)))
+                         (get-in source-parts [:attributes :index])))
+        fresh (fn [key] (loop [id (gensym (str "ad_gather_" (name key) "_"))]
+                          (if (contains? used id) (recur (gensym (str "ad_gather_" (name key) "_"))) id)))
+        interface (into {} (map (fn [key] [key (fresh key)]))
+                        [:index-snapshot :tangent-input :tangent-output :cotangent-input
+                         :zero-gradient :gradient-output])
+        bundle (assoc bundle :gather-programs (lift-gather-programs bundle source interface))]
+    (validate! (assoc bundle :certificate (certificate bundle)))))
 
 (defn- sum-source-map
   "Check the two-equation source before narrowing its known frontend bookkeeping.
