@@ -547,6 +547,13 @@ GPU session or derivative rule owner. General loops, public `deftm` convenience,
 higher-order AD of runtime closures and asynchronous residual ownership remain
 separate capability gates.
 
+Public `value+grad`/`jvp` runtime closures with `:representation :normalized-scalar`
+use the same effective-callee and epoch fence around compilation and invocation.
+Full validation stays construction-time, and existing source mode, `:wrt`, carrier
+conventions and deftm metadata remain unchanged. Consumers which extract or compile
+the exposed walked-body metadata bypass these runtime closures and are **not**
+claimed to inherit their guards. The sequential identity/ABA limitations above apply.
+
 The unchanged Gemma, SFT and held checkpoint gates remain independent: successful
 scalar normalization does not certify them.
 

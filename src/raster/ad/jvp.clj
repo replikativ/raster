@@ -654,9 +654,19 @@
                      (rev/resolve-deftm-var f-var) wrt)
              {:keys [walked-body params tags source-ns]}
              ((requiring-resolve 'raster.ad.normalized-scalar/jvp-body) bundle)
+             guard! ((requiring-resolve 'raster.ad.normalized-scalar/execution-guard)
+                     source-ns (select-keys bundle [:template-revision :compiler-revision])
+                     [{:parameters params :body (first walked-body)}])
+             _ ((requiring-resolve 'raster.ad.normalized-scalar/validate!) bundle)
+             _ (guard!)
              runtime-fn (binding [*ns* source-ns]
-                          (make-runtime-jvp-fn (first walked-body) params))]
-         (with-meta (fn [& args] (apply runtime-fn args))
+                          (make-runtime-jvp-fn (first walked-body) params))
+             _ (guard!)]
+         (with-meta (fn [& args]
+                      (guard!)
+                      (let [result (apply runtime-fn args)]
+                        (guard!)
+                        result))
            {::jvp true :raster.core/deftm true
             :raster.core/deftm-walked-body walked-body
             :raster.core/deftm-params params :raster.core/deftm-tags tags
