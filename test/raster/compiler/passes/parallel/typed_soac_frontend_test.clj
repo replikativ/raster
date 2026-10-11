@@ -2735,6 +2735,46 @@
                        :scalar-types {'heads :long 'n :long}}))
         "a validated TypedSOAC program must own every parallel leaf as an equation")))
 
+(deftest ordered-local-fold-keeps-its-declared-type-independent-of-map-storage
+  (let [source '(let* [result
+                      (raster.par/pmap
+                       i n float
+                       (let* [^long total
+                              (raster.par/reduce sum 0 j 8
+                                                 (clojure.core/unchecked-subtract sum j))]
+                         (clojure.core/float total)))]
+                 result)
+        program (frontend/form->program source {:dtype :float :scalar-types {'n :long}})
+        parts (dialect/operation-parts (first (dialect/equations program)))
+        lambda (dialect/lambda-parts (:lambda parts))
+        local (first (:locals lambda))
+        fold (:init local)
+        conversion (first (:body-results lambda))]
+    ;; The source explicitly declares a Long recurrence and a Float destination. The
+    ;; destination dtype must not turn the local recurrence into Float arithmetic or leave
+    ;; its source reduce uncanonicalized. Subtraction deliberately preserves ordered Fold.
+    (is (some? program))
+    (is (identical? program (dialect/validate! program)))
+    (is (= 1 (count (:body-results lambda))))
+    (is (= :float (get-in (dialect/facts program) [:values 'result :dtype])))
+    (is (= ['total] (mapv :id (:locals lambda))))
+    (is (= :long (:dtype local)))
+    (is (= 'fold (first fold)))
+    (is (= {:accumulator 'sum :index 'j :identity 0 :dtype :long
+            :extent 8 :association :ordered}
+           (select-keys (second fold) [:accumulator :index :identity :dtype :extent :association])))
+    (is (= '[(clojure.core/unchecked-subtract sum j)]
+           (:body-results (dialect/lambda-parts (nth fold 2)))))
+    (is (dialect/scalar-convert-form? conversion))
+    (is (= {:source-dtype :float :target-dtype :float :rounding :exact :overflow :exact
+            :source-op 'clojure.core/float}
+           (:attributes (dialect/scalar-convert-parts conversion))))
+    (is (= '(clojure.core/float total)
+           (:operand (dialect/scalar-convert-parts conversion)))
+        "the source's executable Long-to-Float cast remains inside its canonical result contract")
+    (is (not-any? #(and (seq? %) (= 'raster.par/reduce (first %)))
+                  (tree-seq coll? seq (first (dialect/equations program)))))))
+
 (deftest nested-branchy-multi-carry-loops-become-ordered-product-folds
   (let [source
         '(let* [effect

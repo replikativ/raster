@@ -4891,7 +4891,7 @@
                        (util/subst-syms
                         substitutions
                         (first (elementize [init] arrays parameters index)))
-                       fold-dtype)))))
+                       dtype)))))
         body-results (mapv #(canonicalize-scalar-folds
                              (util/subst-syms (zipmap captures capture-parameters) %)
                              fold-dtype)
