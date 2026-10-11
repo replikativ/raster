@@ -19,7 +19,7 @@
     (try
       (with-bindings {(resolve-runtime "*current-arena*") arena}
         (doseq [kind [:secondary-output :integer-offset]]
-          (let [{:keys [source emitted]} (retirement/emit kind target true)
+          (let [{:keys [source emitted]} (retirement/emit kind target (= :ze (backend/backend-type target)))
                 original (eval (list 'fn '[a b d n offset] source))
                 native (eval (list 'fn '[a b d n offset] (:form emitted)))]
             (is (= 1 (count (:kernels emitted))))
