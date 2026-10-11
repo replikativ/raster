@@ -38,4 +38,4 @@
 (deftest selected-loop-on-level-zero
   (if @ze/gpu-available?
     (check-device! :ze:0)
-    (println "SKIP: distributed independently selected scalar math on Level Zero")))
+    (ze/gpu-skip! "distributed independently selected scalar math")))
