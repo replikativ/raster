@@ -68,6 +68,23 @@
           (is (= :ad-normalized-region
                  (reason #(#'normalized/equation-expression changed-equation)))))))))
 
+(deftest certificate-projects-only-the-declared-runtime-field
+  (let [bundle (normalized/linearize-program
+                (linear-program '(raster.numeric/* coefficient t) '[coefficient t])
+                {:params '[coefficient t] :tags '[double double] :active-inputs '[t]
+                 :source-ns (the-ns 'raster.ad.normalized-scalar-test)})
+        extra (assoc bundle :source-namespace 'caller.evidence)
+        certified (assoc extra :certificate (#'normalized/certificate extra))]
+    (is (identical? certified (normalized/validate! certified)))
+    (is (= :ad-normalized-certificate
+           (reason #(normalized/validate! (assoc certified :source-namespace 'changed.evidence)))))
+    (is (= :ad-normalized-certificate
+           (reason #(normalized/validate! (dissoc certified :source-namespace)))))
+    (is (= :semantic-fingerprint-unsupported
+           (reason #(#'normalized/certificate (assoc bundle :source-namespace (Object.))))))
+    (is (= :ad-normalized-bundle-interface
+           (reason #(normalized/validate! (assoc bundle :source-ns 'not.a.namespace)))))))
+
 (deftest linearity-requires-zero-preservation-not-just-dependence
   (doseq [[expression inputs tangents coefficients expected]
           [['(raster.numeric/* t t) '[t] '[t] [] :ad-normalized-nonlinear]

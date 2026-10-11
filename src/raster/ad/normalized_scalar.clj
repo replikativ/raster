@@ -352,8 +352,10 @@
 
 (defn- certificate [bundle]
   (fingerprint/fingerprint
-   (assoc (dissoc bundle :certificate :source-ns)
-          :source-namespace (ns-name (:source-ns bundle)))))
+   ;; Project the checked runtime field in place. A synthetic replacement key would
+   ;; overwrite caller data at that key and leave it outside the certificate.
+   (assoc (dissoc bundle :certificate)
+          :source-ns (ns-name (:source-ns bundle)))))
 
 (defn- validate-primal! [primal params tags]
   (soac/validate! primal)
