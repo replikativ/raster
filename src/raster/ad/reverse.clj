@@ -70,9 +70,9 @@
   "Only reads from differentiated arrays need scatter cotangents. Reads from
   explicitly constant parameter arrays stay ordinary scalar expressions."
   [form]
-  (and (seq? form) (op/aget-op? (first form))
-       (= 3 (count form))
-       (not (contains? *constant-gradient-arrays* (second form)))))
+  (and (op/aget-call? form)
+       (= 2 (count (op/call-args form)))
+       (not (contains? *constant-gradient-arrays* (first (op/call-args form))))))
 
 (defn- ad-gensym
   "Generate a unique symbol for AD-generated code.
@@ -2087,18 +2087,20 @@
   reads must scatter-add their cotangents; a lane-wise overwrite would race."
   [idx-sym sequential? on-read & [replay-index]]
   (fn lift [expr scoped? locals]
-    (let [index (when (gradient-bearing-array-read? expr)
+    (let [[array original-index] (when (gradient-bearing-array-read? expr)
+                                  (op/call-args expr))
+          index (when (gradient-bearing-array-read? expr)
                   (if (and replay-index (not scoped?))
-                    (replay-index (nth expr 2))
-                    (nth expr 2)))]
+                    (replay-index original-index)
+                    original-index))]
      (cond
       (and (gradient-bearing-array-read? expr)
            (or (= idx-sym index)
                (and sequential? (not scoped?)
-                    (not (contains? locals (nth expr 1)))
+                    (not (contains? locals array))
                     (or (integer? index)
                         (replayable-gather-index? index idx-sym locals)))))
-      (on-read (nth expr 1) index)
+      (on-read array index)
       (seq? expr)
       (let [{:keys [kind liftable?]} (form/form-info expr)
             nested-scope? (or scoped? (= :binding kind) (not liftable?))]
@@ -2161,10 +2163,11 @@
     ;; (1) let*-bound agets
     (doseq [[[sym init] aliases] (map vector bindings alias-snapshots)]
       (when (gradient-bearing-array-read? init)
-        (swap! agets conj {:sym sym :arr (nth init 1)
-                          :idx (if aliases
-                                 (util/subst-syms aliases (nth init 2))
-                                 (nth init 2))})))
+        (let [[array index] (op/call-args init)]
+          (swap! agets conj {:sym sym :arr array
+                            :idx (if aliases
+                                   (util/subst-syms aliases index)
+                                   index)}))))
     ;; (2) lift admitted inline reads, deduplicating by array AND original index.
     ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
@@ -3636,7 +3639,7 @@
   arrays contribute no evidence, as in read-array-elem-types."
   [dtype expr]
   (every? (fn [read]
-            (case (:raster.type/tag (meta (second read)))
+            (case (:raster.type/tag (meta (first (op/call-args read))))
               floats (= dtype :float)
               doubles (= dtype :double)
               (nil Object) true
