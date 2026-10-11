@@ -36,6 +36,106 @@
       (is (= 1 (:schema-version (edn/read-string (slurp file)))))
       (finally (io/delete-file file)))))
 
+(deftest outcome-accounting-separates-device-skips-and-preserves-report-events
+  (let [file (java.io.File/createTempFile "raster-ci-outcomes-" ".edn")
+        v #'timing-preserves-results-and-records-exceptions
+        id 'raster.ci.timed-runner-test/timing-preserves-results-and-records-exceptions
+        selected #{'raster.ci.timed-runner-test}
+        events [{:type :begin-test-var :var v}
+                {:type :pass :message "ordinary numerical check"}
+                {:type :pass :message "opencl-skip-marker"}
+                {:type :pass :message "gpu-skip-marker"}
+                {:type :pass :message "gpu-capability-skip-marker"}
+                {:type :fail :message "required runtime missing"}
+                {:type :error :actual (Exception. "kernel failure")}]
+        forwarded (atom [])
+        summary {:test 1 :pass 4 :fail 1 :error 1}]
+    (try
+      (let [actual (with-redefs [clojure.test/report #(swap! forwarded conj %)
+                                runner/test
+                                (fn [_]
+                                  (binding [clojure.test/*testing-vars* (list v)]
+                                    (doseq [event events] (clojure.test/report event)))
+                                  summary)]
+                     (timed/run-timed! {:namespace selected} file))
+            report (edn/read-string (slurp file))]
+        (is (= summary actual))
+        (is (= events @forwarded) "the original reporter receives every unchanged event once")
+        (is (= {id {:started 1 :assertions {:pass 4 :fail 1 :error 1}
+                    :skip-markers {"opencl-skip-marker" 1 "gpu-skip-marker" 1
+                                   "gpu-capability-skip-marker" 1}}}
+               (:outcomes report)))
+        (is (= 1 (:schema-version report)) "timing fields keep their existing schema"))
+      (finally (io/delete-file file)))))
+
+(deftest outcome-accounting-does-not-claim-unselected-or-simulated-tests
+  (let [file (java.io.File/createTempFile "raster-ci-selection-outcomes-" ".edn")
+        v #'timing-preserves-results-and-records-exceptions]
+    (try
+      (with-redefs [clojure.test/report (fn [_])
+                    runner/test
+                    (fn [_]
+                      (binding [clojure.test/*testing-vars* (list v)]
+                        (clojure.test/report {:type :pass :message "opencl-skip-marker"}))
+                      {:test 0 :pass 0 :fail 0 :error 0})]
+        (timed/run-timed! {:namespace #{'some.other-test}} file))
+      (is (= {} (:outcomes (edn/read-string (slurp file)))))
+      (with-redefs [clojure.test/report (fn [_])
+                    runner/test
+                    (fn [_]
+                      ;; Gate-honesty tests replace reporting to simulate device states. Those
+                      ;; inner synthetic events must not become real coverage/skip evidence.
+                      (with-redefs [clojure.test/report (fn [_])]
+                        (binding [clojure.test/*testing-vars* (list v)]
+                          (clojure.test/report {:type :pass :message "opencl-skip-marker"})))
+                      {:test 0 :pass 0 :fail 0 :error 0})]
+        (timed/run-timed! {:namespace #{'raster.ci.timed-runner-test}} file))
+      (is (= {} (:outcomes (edn/read-string (slurp file)))))
+      (finally (io/delete-file file)))))
+
+(deftest outcome-accounting-preserves-real-test-counters
+  (let [file (java.io.File/createTempFile "raster-ci-real-outcomes-" ".edn")
+        v #'timing-preserves-results-and-records-exceptions
+        run-var (fn []
+                  (binding [clojure.test/*report-counters* (ref clojure.test/*initial-report-counters*)
+                            clojure.test/*test-out* (java.io.StringWriter.)]
+                    (clojure.test/test-var v)
+                    @clojure.test/*report-counters*))
+        baseline (run-var)]
+    (try
+      (let [observed (with-redefs [runner/test (fn [_] (run-var))]
+                       (timed/run-timed! {:namespace #{'raster.ci.timed-runner-test}} file))
+            outcomes (vals (:outcomes (edn/read-string (slurp file))))]
+        (is (= baseline observed))
+        (is (= 1 (count outcomes)))
+        (is (= 1 (:started (first outcomes))))
+        (is (= (:pass baseline) (get-in (first outcomes) [:assertions :pass])))
+        (is (nil? (:skip-markers (first outcomes)))))
+      (finally (io/delete-file file)))))
+
+(deftest outcome-observation-never-retries-or-masks-a-reporting-error
+  (let [file (java.io.File/createTempFile "raster-ci-reporter-error-" ".edn")
+        v #'timing-preserves-results-and-records-exceptions
+        failure (Exception. "original reporter failed")
+        calls (atom 0)
+        reporter (fn [_] (swap! calls inc) (throw failure))]
+    (try
+      (let [observed
+            (with-redefs [clojure.test/report reporter
+                          runner/test
+                          (fn [_]
+                            (binding [clojure.test/*testing-vars* (list v)]
+                              (clojure.test/report {:type :pass})))]
+              (let [error (try
+                            (timed/run-timed! {:namespace #{'raster.ci.timed-runner-test}} file)
+                            nil
+                            (catch Exception error error))]
+                [error (identical? reporter clojure.test/report)]))]
+        (is (identical? failure (first observed)))
+        (is (true? (second observed)) "the prior reporter is restored even after failure")
+        (is (= 1 @calls)))
+      (finally (io/delete-file file)))))
+
 (deftest timing-output-failure-does-not-mask-test-outcomes
   (let [file (java.io.File/createTempFile "raster-timings-parent-" ".edn")
         impossible-report (io/file file "timings.edn")

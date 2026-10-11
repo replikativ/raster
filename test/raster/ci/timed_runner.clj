@@ -9,6 +9,30 @@
 
 (def ^:dynamic *loading?* false)
 
+(def ^:private skip-marker-messages
+  ;; Existing device gates emit these passing assertions. Keep them distinct from ordinary
+  ;; assertions: a passing marker proves an honest skip, not numerical device execution.
+  #{"opencl-skip-marker" "gpu-skip-marker" "gpu-capability-skip-marker"})
+
+(defn- record-outcome!
+  [timings selected event]
+  (let [v (or (:var event) (first test/*testing-vars*))
+        {:keys [ns name]} (meta v)
+        namespace (when ns (ns-name ns))
+        id (when name (symbol (str namespace) (str name)))
+        type (:type event)]
+    (when (and id (contains? selected namespace))
+      (cond
+        (= :begin-test-var type)
+        (swap! timings update-in [:outcomes id :started] (fnil inc 0))
+
+        (contains? #{:pass :fail :error} type)
+        (swap! timings
+               (fn [report]
+                 (cond-> (update-in report [:outcomes id :assertions type] (fnil inc 0))
+                   (and (= :pass type) (contains? skip-marker-messages (:message event)))
+                   (update-in [:outcomes id :skip-markers (:message event)] (fnil inc 0)))))))))
+
 (defn measured
   [timings path f]
   (let [start (System/nanoTime)]
@@ -20,16 +44,21 @@
 (defn run-timed!
   [options report-file]
   (let [started (System/nanoTime)
-        timings (atom {:schema-version 1 :namespaces {} :vars {}
+        timings (atom {:schema-version 1 :namespaces {} :vars {} :outcomes {}
                        :load-order [] :test-order []})
         selected (:namespace options)
         require* clojure.core/require
         test-ns* test/test-ns
-        test-var* test/test-var]
+        test-var* test/test-var
+        report* test/report]
     (when-not (seq selected)
       (throw (ex-info "timed CI runner requires explicit namespace selection" {})))
     (try
-      (with-redefs [clojure.core/require
+      (with-redefs [test/report
+                    (fn [event]
+                      (record-outcome! timings selected event)
+                      (report* event))
+                    clojure.core/require
                     (fn [& args]
                       (if (and (not *loading?*) (= 1 (count args))
                                (contains? selected (first args)))
