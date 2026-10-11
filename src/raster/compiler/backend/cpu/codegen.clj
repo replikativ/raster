@@ -165,17 +165,26 @@
    :float ValueLayout/JAVA_FLOAT :double ValueLayout/JAVA_DOUBLE})
 
 (defn load-kernel
-  "Load a void(addr*, ..., scalars) kernel from a compiled .so. `n-ptrs` = number of
+  "Load a kernel from a compiled .so. Old arities return void; the explicit
+  return ABI supports :void/:int/:long/:float/:double. `n-ptrs` = number of
   leading pointer args (arrays). `scalars` describes the trailing scalar args (in
   order, after the arrays): either a COUNT (all JAVA_INT, the common counter case)
   or a VECTOR of type keywords (:int/:long/:float/:double) when types are mixed
   (e.g. a double `eps`). Pointers must precede scalars in the call."
   ([so name n-ptrs] (load-kernel so name n-ptrs 1))
   ([so name n-ptrs scalars]
+   (load-kernel so name n-ptrs scalars :void))
+  ([so name n-ptrs scalars return-type]
+   (when-not (or (= :void return-type) (contains? scalar-layout return-type))
+     (throw (ex-info "Unsupported native scalar return ABI"
+                     {:reason :unsupported-native-return :return-type return-type})))
    (let [stypes (if (number? scalars) (vec (repeat scalars :int)) (vec scalars))
          lib (SymbolLookup/libraryLookup ^String so (Arena/global))
          layouts (concat (repeat n-ptrs ValueLayout/ADDRESS) (map scalar-layout stypes))
-         fd (FunctionDescriptor/ofVoid (into-array MemoryLayout layouts))
+         fd (if (= :void return-type)
+              (FunctionDescriptor/ofVoid (into-array MemoryLayout layouts))
+              (FunctionDescriptor/of (scalar-layout return-type)
+                                     (into-array MemoryLayout layouts)))
          mh (.downcallHandle linker (.orElseThrow (.find lib name)) fd
                              (into-array Linker$Option [(Linker$Option/critical true)]))]
      (fn [& args]

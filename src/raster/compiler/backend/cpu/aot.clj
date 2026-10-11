@@ -23,6 +23,8 @@
             [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.ir.form :as form]
@@ -442,8 +444,20 @@
   decls + buffer-writing loops) and the canonical counted map loop as a clean
   `for`; delegates everything else (reductions, nested let*, aset, if) to the
   shared emit-stmt. `ct` is the array element C type for scalar decls."
-  [form array-syms ct]
+  ([form array-syms ct] (emit-host-stmt form array-syms ct false))
+  ([form array-syms ct return?]
   (cond
+    ;; The counted-loop statement projection deliberately discards its exit
+    ;; value. A numeric tail must use the shared value-carrying loop emitter.
+    (and return? (map-loop? form))
+    (str "return " (emit-expr* form array-syms) ";")
+
+    (and return? (seq? form) (= 'do (first form)))
+    (clojure.string/join "\n  "
+      (map-indexed (fn [i expression]
+                     (emit-host-stmt expression array-syms ct (= i (- (count form) 2))))
+                   (rest form)))
+
     (map-loop? form)
     (let [[_ binds ifbody] form
           iv (first binds) init (second binds)
@@ -512,15 +526,18 @@
                     (str (ce/decl-type sym init) " " (ce/c-symbol sym) " = "
                          (emit-expr* init array-syms) ";")))))
              "\n  "
-           ;; body: emit statement forms only. The function is void; the trailing
-           ;; result value (a buffer symbol, or a vector [q scales] of them for a
-           ;; multi-output kernel) is data for the host wrapper, NOT a C statement.
+           ;; Numeric return mode applies only to the last outer value. Buffer
+           ;; results remain host-wrapper data, never C return statements.
              (clojure.string/join
               "\n  "
               (for [[ordinal b] (map-indexed vector body)
-                    :when (not (or (symbol? b) (vector? b)))]
+                    :when (or (and return? (= ordinal (dec (count body))))
+                              (not (or (symbol? b) (vector? b))))]
                 (binding [*bound-segops* (operations-at-site [:body ordinal])]
-                  (emit-host-stmt b array-syms ct)))))))
+                  (emit-host-stmt b array-syms ct
+                                  (and return? (= ordinal (dec (count body)))))))))))
+
+    return? (str "return " (emit-expr* form array-syms) ";")
 
     ;; a preserved par/map! → C-SIMD element-wise store block (or scalar fallback).
     (and (seq? form) (par/par-map-form? form))
@@ -536,7 +553,7 @@
         ;; induction variable.
         (emit-host-stmt (par/expand-par-map! form) array-syms ct))
 
-    :else (ce/emit-stmt form nil array-syms "idx")))
+    :else (ce/emit-stmt form nil array-syms "idx"))))
 
 (defn- written-array-syms
   "Array symbols that are aset targets in `form` — i.e. in-place output params written
@@ -589,7 +606,8 @@
    - length-syms  : {arr len-sym} integer length params for (alength arr)
    - stripped     : the let* body (buffer-allocs already removed) to emit
    Returns the C source string."
-  [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped]
+  [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped
+   & {:keys [return-type] :or {return-type :void}}]
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
         array-syms (set (concat (map first array-params) (map first buffers) (map first local-buffers)))
         ;; SROA: small, compile-time-fixed-size, non-escaping scratch buffers are emitted
@@ -633,7 +651,7 @@
                          *simd-preamble* simd-pre
                          *length-syms* length-syms
                          csimd/*array-types* array-types]
-                 (emit-host-stmt stripped array-syms ct))
+                 (emit-host-stmt stripped array-syms ct (not= :void return-type)))
         ;; C definitions for any ^:no-inline deftm helpers (e.g. the int8-MAC seam,
         ;; which lowers to a maddubs helper via its :c-helper override).
         [helper-incs helper-defs] (helper-c-defs stripped)]
@@ -642,7 +660,8 @@
          (apply str @simd-pre)   ; immintrin + hsum helpers, if any C-SIMD block emitted
          helper-incs
          (when (seq helper-defs) (str helper-defs "\n"))
-         "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
+         (if (= :void return-type) "void" (ctype return-type))
+         " " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
          local-decls
          body-c
          "\n}\n")))
@@ -751,10 +770,12 @@
                      (some-> cache (vreset! {:sizes sizes :bufs b})) b))
             arguments (into (into (mapv #(nth args %) array-indices) bufs)
                             (into (mapv #(nth args %) scalar-indices) lengths))]
-        (apply native arguments)
-        (let [results (mapv (fn [[kind i]]
+        (let [native-result (apply native arguments)]
+          (if (= :native-scalar result-shape)
+            native-result
+            (let [results (mapv (fn [[kind i]]
                               (case kind :input (nth args i) :buffer (nth bufs i) nil)) result-plan)]
-          (if (= :vector result-shape) results (first results)))))))
+              (if (= :vector result-shape) results (first results)))))))))
 
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
@@ -764,7 +785,15 @@
   With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
   __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
   [f-var dtype & {:keys [simd? reuse-buffers?] :or {simd? false}}]
-  (let [{:keys [form parallel-program params param-env]}
+  (let [return-tag (:return-tag (pl/deftm-frontend-facts f-var dtype))
+        return-type (some-> return-tag dtype/dtype-for-scalar-tag)
+        return-class (get types/tag->java-class return-tag)
+        _ (when (or (and return-type (not (contains? #{:int :long :float :double} return-type)))
+                    (and return-class (.isPrimitive ^Class return-class)
+                         (not= Void/TYPE return-class) (nil? return-type)))
+            (throw (ex-info "Unsupported native scalar return ABI"
+                            {:reason :unsupported-native-return :return-tag return-tag})))
+        {:keys [form parallel-program params param-env]}
         (fused-scalar-form f-var dtype :simd? simd?)
         form (recover-rectangular-maps form)
         {nform :form length-syms :length-syms} (normalize-for-c form)
@@ -792,7 +821,8 @@
         scalar-ffm (vec (concat (map (fn [[_ c]] (ctype->ffm c "int")) scalar-params)
                                 (repeat (count len-order) :int)))
         kernel-name (str "aot_" (ce/c-symbol (:name (meta f-var))) "_" (name dtype))
-        {result-shape :shape result-syms :syms} (result-buffers stripped buffers)
+        {result-shape :shape result-syms :syms}
+        (if return-type {:shape :native-scalar :syms []} (result-buffers stripped buffers))
         ;; SROA partition: small fixed-size non-result scratch buffers → C-locals (kept
         ;; out of the signature so clang register-promotes them); the rest stay heap.
         result-set    (set result-syms)
@@ -806,11 +836,11 @@
         src (binding [*scheduled-program* parallel-program
                       *host-value-remap* host-value-remap]
               (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers
-                         length-syms stripped))
+                         length-syms stripped :return-type (or return-type :void)))
         so  (cpu/compile-source! src)
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count heap-buffers))
-                                scalar-ffm)
+                                scalar-ffm (or return-type :void))
         wrapper (native-call-wrapper native params array-params scalar-params len-order
                                      heap-buffers scalar-bindings result-shape result-syms
                                      reuse-buffers?)]
