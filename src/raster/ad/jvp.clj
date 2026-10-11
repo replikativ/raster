@@ -557,58 +557,63 @@
   (:raster.core/deftm-walked-body / -params / -tags) so compile-aot can
   consume the transform later, mirroring value+grad."
   [f-var]
-  (let [resolved (rev/resolve-deftm-var f-var)
-        m (meta resolved)
-        params (or (:raster.core/deftm-params m)
-                   (throw (ex-info "jvp requires a deftm var" {:var f-var})))
-        walked-body (or (rcore/ensure-walked-body! resolved)
-                        (throw (ex-info "No walked body on var" {:var f-var})))
-        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
-        all-params (vec (map-indexed
-                         (fn [i p]
-                           (let [tag (nth tags i nil)
-                                 base (if (symbol? p) p (symbol (name p)))]
-                             (if tag
-                               (with-meta base {:raster.type/tag tag})
-                               (with-meta base nil))))
-                         params))
-        ;; Only differentiable-tag params get tangent slots (⊥ params carry
-        ;; no tangent space — same seeding rule as build-grad-walked-body).
-        diff-params (vec (keep-indexed
-                          (fn [i p]
-                            (when (tangent/differentiable? (nth tags i nil)) p))
-                          all-params))
-        _ (when (empty? diff-params)
-            (throw (ex-info (str "jvp: no differentiable params on " f-var
-                                 " — every param tag is ⊥ (no tangent space)")
-                            {:var f-var :tags tags})))
-        ;; Shared pre-AD prep (identical to the reverse path).
-        prepared (rev/ad-prepare (first walked-body)
-                                 (zipmap all-params tags))
-        [bindings body-exprs] (extract-let-parts prepared)
-        [norm-bindings body-sym] (anf/normalize-for-ad bindings body-exprs jvp-gensym)
-        ;; Tangent params: one per differentiable param, tagged like its primal.
-        tangent-params (mapv (fn [p] (with-meta (symbol (str "d" (name p) "__jt"))
-                                       (meta p)))
-                             diff-params)
-        {:keys [tenv bindings]} (jvp-fold norm-bindings
-                                          (zipmap diff-params tangent-params))
-        tangent-out (or (get tenv body-sym)
-                        ;; output independent of every seeded input → typed 0̄
-                        (branch-tangent-zero body-sym))
-        jvp-form (list 'let* (vec bindings) [body-sym tangent-out])
-        fn-params (into all-params tangent-params)
-        source-ns (or (:ns m) *ns*)
-        qualified (inf/qualify-body-symbols jvp-form source-ns (set fn-params))
-        runtime-fn (make-runtime-jvp-fn qualified fn-params)
-        out-tags (into (vec (take (count params) (concat tags (repeat nil))))
-                       (mapv #(:raster.type/tag (meta %)) tangent-params))]
-    (with-meta (fn [& args] (apply runtime-fn args))
-      {::jvp true
-       :raster.core/deftm true
-       :raster.core/deftm-walked-body [qualified]
-       :raster.core/deftm-params fn-params
-       :raster.core/deftm-tags out-tags})))
+  ;; Preparation and the scalar fold can both emit reverse-owned temporaries.
+  ;; Keep one context across the complete construction, inheriting an outer
+  ;; composer's counter exactly as HVP does, rather than resetting per phase.
+  (rev/call-with-shared-ad-gensym
+   (fn []
+     (let [resolved (rev/resolve-deftm-var f-var)
+           m (meta resolved)
+           params (or (:raster.core/deftm-params m)
+                      (throw (ex-info "jvp requires a deftm var" {:var f-var})))
+           walked-body (or (rcore/ensure-walked-body! resolved)
+                           (throw (ex-info "No walked body on var" {:var f-var})))
+           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+           all-params (vec (map-indexed
+                            (fn [i p]
+                              (let [tag (nth tags i nil)
+                                    base (if (symbol? p) p (symbol (name p)))]
+                                (if tag
+                                  (with-meta base {:raster.type/tag tag})
+                                  (with-meta base nil))))
+                            params))
+           ;; Only differentiable-tag params get tangent slots (⊥ params carry
+           ;; no tangent space — same seeding rule as build-grad-walked-body).
+           diff-params (vec (keep-indexed
+                             (fn [i p]
+                               (when (tangent/differentiable? (nth tags i nil)) p))
+                             all-params))
+           _ (when (empty? diff-params)
+               (throw (ex-info (str "jvp: no differentiable params on " f-var
+                                    " — every param tag is ⊥ (no tangent space)")
+                               {:var f-var :tags tags})))
+           ;; Shared pre-AD prep (identical to the reverse path).
+           prepared (rev/ad-prepare (first walked-body)
+                                    (zipmap all-params tags))
+           [bindings body-exprs] (extract-let-parts prepared)
+           [norm-bindings body-sym] (anf/normalize-for-ad bindings body-exprs jvp-gensym)
+           ;; Tangent params: one per differentiable param, tagged like its primal.
+           tangent-params (mapv (fn [p] (with-meta (symbol (str "d" (name p) "__jt"))
+                                          (meta p)))
+                                diff-params)
+           {:keys [tenv bindings]} (jvp-fold norm-bindings
+                                             (zipmap diff-params tangent-params))
+           tangent-out (or (get tenv body-sym)
+                           ;; output independent of every seeded input → typed 0̄
+                           (branch-tangent-zero body-sym))
+           jvp-form (list 'let* (vec bindings) [body-sym tangent-out])
+           fn-params (into all-params tangent-params)
+           source-ns (or (:ns m) *ns*)
+           qualified (inf/qualify-body-symbols jvp-form source-ns (set fn-params))
+           runtime-fn (make-runtime-jvp-fn qualified fn-params)
+           out-tags (into (vec (take (count params) (concat tags (repeat nil))))
+                          (mapv #(:raster.type/tag (meta %)) tangent-params))]
+       (with-meta (fn [& args] (apply runtime-fn args))
+         {::jvp true
+          :raster.core/deftm true
+          :raster.core/deftm-walked-body [qualified]
+          :raster.core/deftm-params fn-params
+          :raster.core/deftm-tags out-tags})))))
 
 ;; ================================================================
 ;; HVP — forward-over-reverse (§13 A4, Pearlmutter 1994)
