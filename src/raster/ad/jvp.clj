@@ -219,13 +219,7 @@
   unrounded carry tape and are deliberately not reconstructed this way."
   [tenv sym scan-form tag]
   (let [[_ out acc init idx bound cast body] scan-form]
-    (when-not (and (contains? '#{nil double}
-                             (:raster.type/tag (meta acc)))
-                   (or (contains? '#{double clojure.core/double} cast)
-                       (and (nil? cast)
-                            (= 'double (:raster.type/tag (meta acc)))))
-                   (contains? '#{doubles (Array double)}
-                              (:raster.type/tag (meta out))))
+    (when-not (rev/exact-scan-carry-checkpoint? out acc cast)
       (throw (ex-info "jvp: scan carry reconstruction requires double storage and cast"
                       {:reason :jvp-scan-carry-precision
                        :cast cast

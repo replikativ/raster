@@ -3,13 +3,239 @@
   active initializer, and transposes every admitted read; reads it cannot
   transpose are rejected instead of silently mis-scattered."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :refer [deftm scan]]
             [raster.ad.reverse :as rev]
+            [raster.ad.jvp :as jvp]
+            [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.types :as types]
+            [raster.compiler.core.walker :as walker]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.arrays :as ra]
             [raster.numeric :as n]
             [raster.par :as par]))
 
 (defn- close? [a b] (< (Math/abs (- (double a) (double b))) 1e-9))
+
+(deftest generated-scan-preserves-extensible-store-callees
+  (let [tag 'review-custom-scan-array
+        cast 'review.custom/store
+        registry (atom {tag {:element-cast cast :compute-cast 'double}})]
+    (with-redefs [types/array-like-registry registry]
+      (doseq [[array-tag expected] [[tag cast] ['doubles 'double]
+                                    ['floats 'float]]]
+        (let [expanded (inf/expand-scan ['acc 0.0] ['xs] 'acc {'xs {:tag array-tag}} {})
+              scan (nth expanded 2)]
+          (is (= expected (nth scan 6))))))))
+
+(deftest source-walker-retains-pure-callee-identity-without-changing-execution-spelling
+  ;; Full clojure.core namespace aliases are unsupported by deftm generation.
+  ;; This tests its source-resolution boundary directly, not public AD execution.
+  (let [helper-name (gensym "raster.ad.scan_helper_")
+        source-name (gensym "raster.ad.scan_source_")
+        helper (create-ns helper-name)
+        source (create-ns source-name)]
+    (try
+      (intern helper 'double (fn [x] (double (float x))))
+      (binding [*ns* source]
+        (refer 'clojure.core)
+        (alias 'clojure.core helper-name))
+      (doseq [[cast lexical expected]
+              [['double false 'clojure.core/double]
+               ['clojure.core/double false (symbol (str helper-name) "double")]
+               ['double true nil]
+               ['missing-store false nil]]]
+        (let [cast (with-meta cast {:raster.op/resolved-callee 'clojure.core/double})
+              expression (list 'raster.par/scan 'out 'acc 'h0 'i 2 cast 'acc)
+              env (cond-> {'out {:tag 'doubles} 'h0 {:tag 'double}}
+                    lexical (assoc 'double {:tag nil}))
+              walked (walker/walk-body expression {:source-ns source :type-env env})
+              retained (nth walked 6)]
+          (is (= cast retained) "execution spelling is unchanged")
+          (is (= expected (:raster.op/resolved-callee (meta retained)))
+              "incoming assertions cannot override resolved or lexical identity")
+          (is (string? (fingerprint/fingerprint walked)) "callee evidence is process-independent data")))
+      (finally (remove-ns source-name) (remove-ns helper-name)))))
+
+(deftest public-helper-alias-scan-store-is-not-an-identity-conversion
+  (let [helper-name (gensym "raster.ad.scan_helper_")
+        source-name (gensym "raster.ad.scan_source_")
+        helper (create-ns helper-name)
+        source (create-ns source-name)]
+    (try
+      (intern helper 'double (fn [x] (double (float x))))
+      (binding [*ns* source]
+        (refer 'clojure.core)
+        (alias 'narrow helper-name)
+        (alias 'n 'raster.numeric)
+        (alias 'ra 'raster.arrays)
+        (alias 'par 'raster.par)
+        (eval '(raster.core/deftm alias-shadowed-scan [h0 :- Double] :- Double
+                 (let [out (double-array 2)
+                       result (par/scan out acc h0 i 2 narrow/double
+                                (if (n/== i 0)
+                                  (n/+ acc 0.0)
+                                  (let [z (n/- acc 16777216.0)] (n/* z z))))]
+                   (ra/aget result 1))))
+        (let [function (ns-resolve source 'alias-shadowed-scan)
+              x 16777216.5 h 0.0625]
+          (is (= 0.25 (function x)))
+          (is (= 1.0 (/ (- (function (+ x h)) (function (- x h))) (* 2.0 h))))
+          (doseq [[construct reason] [[rev/value+grad :par-scan-carry-precision]
+                                     [jvp/jvp :jvp-scan-carry-precision]]]
+            (is (= reason (try (construct function) nil
+                              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+      (finally (remove-ns source-name) (remove-ns helper-name)))))
+
+(deftm narrowing-scan-residual [h0 :- Double] :- Double
+  (let [out (float-array 2)
+        result (par/scan out acc h0 i 2 float
+                 (if (n/== i 0)
+                   (n/+ acc 0.0)
+                   (let [z (n/- acc 16777216.0)] (n/* z z))))]
+    (double (ra/aget result 1))))
+
+(deftm exact-scan-residual [h0 :- Double] :- Double
+  (let [out (double-array 2)
+        result (par/scan out acc h0 i 2 double
+                 (if (n/== i 0)
+                   (n/+ acc 0.0)
+                   (let [z (n/- acc 16777216.0)] (n/* z z))))]
+    (ra/aget result 1)))
+
+(deftm rounded-feedback-scan [h0 :- Double] :- Double
+  (let [out (float-array 2)
+        result (par/scan out acc (float h0) i 2 float
+                 (float
+                  (if (n/== i 0)
+                    (n/+ acc 0.0)
+                    (let [z (n/- (double acc) 16777216.0)] (n/* z z)))))]
+    (double (ra/aget result 1))))
+
+(deftm shadowed-scan-store-cast [h0 :- Double] :- Double
+  (let [double (fn [x] (clojure.core/double (float x)))
+        out (double-array 2)
+        result (par/scan out acc h0 i 2 double
+                 (if (n/== i 0)
+                   (n/+ acc 0.0)
+                   (let [z (n/- acc 16777216.0)] (n/* z z))))]
+    (ra/aget result 1)))
+
+(deftm qualified-core-scan-store-cast [h0 :- Double] :- Double
+  (let [double (fn [x] (clojure.core/double (float x)))
+        out (double-array 2)
+        result (par/scan out acc h0 i 2 clojure.core/double
+                 (if (n/== i 0)
+                   (n/+ acc 0.0)
+                   (let [z (n/- acc 16777216.0)] (n/* z z))))]
+    (ra/aget result 1)))
+
+(deftm generated-dsl-scan [h0 :- Double, xs :- (Array double)] :- Double
+  (let [result (scan [acc h0] [xs] (n/+ (n/* acc acc) xs))]
+    (ra/aget result 1)))
+
+(deftm explicit-cast-stored-loop [h0 :- Double] :- Double
+  (let [out (double-array 2)
+        result (loop [i 0 acc h0]
+                 (if (< i 2)
+                   (let [next (if (n/== i 0) (n/+ acc 0.0)
+                                  (let [z (n/- acc 16777216.0)] (n/* z z)))]
+                     (ra/aset out i (double next))
+                     (recur (inc i) next))
+                   out))]
+    (ra/aget result 1)))
+
+(deftm shadowed-cast-stored-loop [h0 :- Double] :- Double
+  (let [double (fn [x] (clojure.core/double (float x)))
+        out (double-array 2)
+        result (loop [i 0 acc h0]
+                 (if (< i 2)
+                   (let [next (if (n/== i 0) (n/+ acc 0.0)
+                                  (let [z (n/- acc 16777216.0)] (n/* z z)))]
+                     (ra/aset out i (double next))
+                     (recur (inc i) next))
+                   out))]
+    (ra/aget result 1)))
+
+(deftest stored-loop-casts-retain-source-identity-through-scan-lifting
+  (let [x 16777216.5 h 0.0625
+        [v gradient] ((rev/value+grad #'explicit-cast-stored-loop) x)
+        [jv tangent] ((jvp/jvp #'explicit-cast-stored-loop) x 1.0)]
+    (is (= 0.25 (explicit-cast-stored-loop x) (shadowed-cast-stored-loop x) v jv))
+    (is (= 1.0 gradient tangent))
+    (is (= 1.0 (/ (- (shadowed-cast-stored-loop (+ x h))
+                     (shadowed-cast-stored-loop (- x h))) (* 2.0 h))))
+    (doseq [[construct reason] [[rev/value+grad :par-scan-carry-precision]
+                               [jvp/jvp :jvp-scan-carry-precision]]]
+      (is (= reason (try (construct #'shadowed-cast-stored-loop) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftm nonlinear-loop-with-shadowed-double [h0 :- Double] :- Double
+  (let [double (fn [x] (clojure.core/double (float x)))]
+    (loop [i 0 acc h0]
+      (if (< i 2)
+        (recur (inc i)
+               (if (n/== i 0)
+                 (n/+ acc 0.0)
+                 (let [z (n/- acc 16777216.0)] (n/* z z))))
+        acc))))
+
+(deftest compiler-generated-scans-preserve-executable-double-carry-identity
+  (let [prepared (rev/ad-prepare
+                  (first (raster.core/ensure-walked-body! #'nonlinear-loop-with-shadowed-double))
+                  {'h0 'double})
+        scans (filter #(and (seq? %) (= 'raster.par/scan (first %)))
+                      (tree-seq coll? seq prepared))]
+    (is (seq scans) "the nonlinear loop actually uses the synthetic scan route")
+    (doseq [scan scans]
+      (is (nil? (nth scan 6)) "a synthetic Double tape stores the carry directly")
+      (is (= 'double (:raster.type/tag (meta (nth scan 2)))))))
+  (let [x 16777216.5
+        [v gradient] ((rev/value+grad #'nonlinear-loop-with-shadowed-double) x)
+        [jv tangent] ((jvp/jvp #'nonlinear-loop-with-shadowed-double) x 1.0)]
+    (is (= 0.25 (nonlinear-loop-with-shadowed-double x) v jv))
+    (is (= 1.0 gradient tangent)))
+  (let [xs (double-array [0.0 0.0])
+        [v gradient] ((rev/value+grad #'generated-dsl-scan :wrt [0]) 0.5 xs)
+        [jv tangent] ((jvp/jvp #'generated-dsl-scan) 0.5 xs 1.0 (double-array 2))]
+    (is (= 0.0625 (generated-dsl-scan 0.5 xs) v jv))
+    ;; Independent two-step recurrence h1=h0², h2=h1² has derivative 4*h0³.
+    (is (= 0.5 gradient tangent))))
+
+(deftest scan-store-cast-spelling-does-not-certify-identity
+  (let [x 16777216.5 h 0.0625]
+    (is (= 0.25 (shadowed-scan-store-cast x)))
+    (is (= 1.0 (/ (- (shadowed-scan-store-cast (+ x h))
+                     (shadowed-scan-store-cast (- x h))) (* 2.0 h))))
+    (doseq [[construct reason] [[rev/value+grad :par-scan-carry-precision]
+                               [jvp/jvp :jvp-scan-carry-precision]]]
+      (is (= reason
+             (try (construct #'shadowed-scan-store-cast) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest scan-checkpoints-must-preserve-nonlinear-carry-residuals
+  (let [x 16777216.5 h 0.0625
+        ;; Plain host oracle records the unrounded carries independently of par/scan.
+        carry1 (+ x 0.0)
+        carry2 (* (- carry1 16777216.0) (- carry1 16777216.0))
+        fd (/ (- (narrowing-scan-residual (+ x h))
+                 (narrowing-scan-residual (- x h))) (* 2.0 h))]
+    (is (= [16777216.5 0.25] [carry1 carry2]))
+    (is (= 16777216.0 (double (float carry1))) "the stored checkpoint loses the residual")
+    (is (= carry2 (narrowing-scan-residual x)))
+    (is (= 1.0 fd) "dyadic perturbations make the independent source FD exact")
+    (is (= 0.0 (rounded-feedback-scan x)) "rounded feedback is a different primal program")
+    (doseq [[construct reason] [[rev/value+grad :par-scan-carry-precision]
+                               [jvp/jvp :jvp-scan-carry-precision]]]
+      (is (= reason
+             (try (construct #'narrowing-scan-residual) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (doseq [function [#'exact-scan-residual #'qualified-core-scan-store-cast]]
+      (let [[v gradient] ((rev/value+grad function) x)
+            [jv tangent] ((jvp/jvp function) x 0.25)]
+        (is (= carry2 v jv))
+        (is (= fd gradient))
+        (is (= 0.25 tangent))
+        (is (= (* -2.0 tangent) (* 0.25 (* -2.0 gradient))) "independent scalar transpose law")))))
 
 ;; Additive shape does not license replaying an effectful step. The ordered
 ;; closure tape must retain each forward read instead of executing its write

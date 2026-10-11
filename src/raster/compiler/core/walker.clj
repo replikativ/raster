@@ -1000,6 +1000,21 @@
 (defn- compiler-cast [tag expression]
   (list (symbol "clojure.core" (name tag)) expression))
 
+(defn- retain-source-callee-identity
+  "Preserve execution spelling and derive pure callee evidence before scope is lost.
+   Lexical bindings and failed resolution clear any incoming assertion."
+  [callee ctx]
+  (if (symbol? callee)
+    (let [callee (vary-meta callee dissoc :raster.op/resolved-callee)
+          v (when-not (contains? (:type-env ctx) callee)
+              (binding [*ns* (the-ns (:source-ns ctx))]
+                (try (ns-resolve *ns* callee) (catch Exception _ nil))))]
+      (if (var? v)
+        (vary-meta callee assoc :raster.op/resolved-callee
+                   (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v)))))
+        callee))
+    callee))
+
 (defn- load-transform-source
   "Resolve macros and free var names before load-lambda expansion, without assigning types.
    The shared lexical substitution protects locals and quoted data from var qualification."
@@ -1223,10 +1238,15 @@
                             {:form form :init init-expr})))
         body-ctx (-> ctx
                      (ctx-assoc-type i-sym 'long)
-                     (ctx-assoc-type acc-sym acc-tag))]
+                     (ctx-assoc-type acc-sym acc-tag))
+        ;; Keep execution spelling: requalification can change resolution when
+        ;; the source namespace aliases a canonical namespace name. Clear any
+        ;; incoming assertion, then retain the pure defining-symbol projection
+        ;; of the actual source-resolved Var (never the runtime Var itself).
+        cast-fn (retain-source-callee-identity cast-fn body-ctx)]
     (let [elem-type (cond
-                      (= cast-fn 'float) :float
-                      (= cast-fn 'double) :double
+                      (contains? '#{float clojure.core/float} cast-fn) :float
+                      (contains? '#{double clojure.core/double} cast-fn) :double
                       (= acc-tag 'float) :float
                       (= acc-tag 'double) :double
                       (= acc-tag 'long) :long
@@ -1234,7 +1254,9 @@
                       :else (throw (ex-info (str "par/scan: cannot determine element type from cast `"
                                                  cast-fn "` or acc-tag `" acc-tag "`")
                                             {:cast-fn cast-fn :acc-tag acc-tag :form form})))
-          result (list 'raster.par/scan hinted-out acc-sym walked-init i-sym walked-bound cast-fn
+          result (list 'raster.par/scan hinted-out
+                       (vary-meta acc-sym assoc :raster.type/tag acc-tag)
+                       walked-init i-sym walked-bound cast-fn
                        (walk body-expr body-ctx))]
       (with-meta result (cond-> {:raster.type/elem-type elem-type}
                           out-tag (assoc :tag out-tag :raster.type/tag out-tag))))))
@@ -1698,7 +1720,7 @@
   ;; Primitive casts like (double x) — walk the inner form but don't add
   ;; another cast layer on re-walks (inner cast check is in :call handler).
   (let [[cast-sym inner] form]
-    (list cast-sym (walk inner ctx))))
+    (list (retain-source-callee-identity cast-sym ctx) (walk inner ctx))))
 
 ;; ================================================================
 ;; Branch: Clojure special forms

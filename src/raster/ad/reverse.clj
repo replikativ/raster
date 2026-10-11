@@ -2779,6 +2779,16 @@
                 (nil? (tmpl/resolve-template (second form)))))
          (tree-seq coll? seq body))))
 
+(defn ^:no-doc exact-scan-carry-checkpoint?
+  "Whether retained scan storage and its resolved store callee preserve a Double carry.
+   Spellings are not identity evidence: source walking retains the actual callee
+   defining symbol before lexical scope is lost. Narrowing requires an unrounded residual tape."
+  [out acc cast]
+  (and (= 'double (:raster.type/tag (meta acc)))
+       (or (= 'clojure.core/double (:raster.op/resolved-callee (meta cast)))
+           (and (nil? cast) (= 'double (:raster.type/tag (meta acc)))))
+       (contains? '#{doubles (Array double)} (:raster.type/tag (meta out)))))
+
 (defn- gen-reverse-par-scan
   "Generate reverse-mode AD code for a raster.par/scan form — the sanctioned
   differentiable recurrence (the carry chains across steps AND every per-step
@@ -2806,12 +2816,21 @@
   The carry remaining after step 0 is δinit.
 
   Cast note: the forward chains the UNCAST acc while out stores cast(acc);
-  reconstruction reads the stored value — exact identity for the `double`
-  cast, standard checkpoint rounding for narrowing casts (float).
+  reconstruction reads the stored value. Only Double carry/storage with an
+  identity store is admitted: rounding a checkpoint can change the point at
+  which a nonlinear step's pullback is evaluated. Narrowing needs a separate
+  unrounded carry tape, which this rule does not retain.
 
   Returns a record map for the reverse-pass engine (emit-backward :par-scan)."
   [par-scan-form active-params]
-  (let [[_ out-sym acc-sym init-expr idx-sym bound-expr _cast-fn body-expr] par-scan-form
+  (let [[_ out-sym acc-sym init-expr idx-sym bound-expr cast-fn body-expr] par-scan-form
+        _ (when-not (exact-scan-carry-checkpoint? out-sym acc-sym cast-fn)
+            (throw (ex-info "par/scan AD: carry reconstruction requires double storage and an identity cast"
+                            {:reason :par-scan-carry-precision
+                             :cast cast-fn
+                             :carry-tag (:raster.type/tag (meta acc-sym))
+                             :out-tag (:raster.type/tag (meta out-sym))
+                             :form par-scan-form})))
         ;; The outer AD preparation runs before a carry loop becomes a scan.
         ;; Its body is therefore still a nested expression at that point, and
         ;; untemplated deftm helpers inside it have not been inlined. Prepare
@@ -3442,6 +3461,11 @@
   [{:keys [out dtype cast acc idx bound init body]}]
   (with-ad-gensym
     (let [scalar-tag (case dtype :float 'float :double 'double nil)
+          ;; Only the synthetic tape's proven Double carry has an identity store.
+          ;; No callable conversion may be rebound by the source lexical/namespace scope.
+          acc (if (and (nil? out) (= :double dtype))
+                (vary-meta acc assoc :raster.type/tag 'double) acc)
+          cast (if (and (nil? out) (= :double dtype)) nil cast)
           array-tag  (case dtype :float 'floats :double 'doubles nil)
           alloc-fn   (case dtype :float 'clojure.core/float-array
                            :double 'clojure.core/double-array nil)
@@ -3566,7 +3590,7 @@
                   (carry-dtype-consistent? dtype body))
          (emit-carry-recurrence {:out nil
                            :dtype dtype
-                           :cast (case dtype :float 'float :double 'double)
+                           :cast (case dtype :float 'float :double nil)
                            :acc acc-sym :idx index-sym
                            :bound bound-expr :init acc-init
                            :body body}))))
@@ -3600,7 +3624,7 @@
                   (active-reads-match-dtype? dtype scoped-update-expr))
          (emit-carry-recurrence {:out nil
                            :dtype dtype
-                           :cast (case dtype :float 'float :double 'double)
+                           :cast (case dtype :float 'float :double nil)
                            :acc acc-sym :idx index-sym
                            :bound bound-expr :init acc-init
                            :body scoped-update-expr}))))))
