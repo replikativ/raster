@@ -66,11 +66,13 @@
            :canonical canonical :cast-tag cast-tag)))
 
 (defn- equation-expression [equation]
-  (let [{:keys [captures lambda]} (soac/operation-parts equation)
-        {:keys [parameters locals body-results]} (soac/lambda-parts lambda)]
-    (when (or (seq locals) (not= 1 (count body-results)))
+  (let [{:keys [kind captures lambda]} (soac/operation-parts equation)]
+    (when (or (not= 'scalar kind) (not= 1 (count (nth equation 2))))
       (fail! :ad-normalized-region {:equation equation}))
-    (util/subst-syms (zipmap parameters captures) (first body-results))))
+    (let [{:keys [parameters locals body-results]} (soac/lambda-parts lambda)]
+      (when (or (seq locals) (not= 1 (count body-results)))
+        (fail! :ad-normalized-region {:equation equation}))
+      (util/subst-syms (zipmap parameters captures) (first body-results)))))
 
 (defn- selected-call-contract!
   "Check retained calls against the existing non-invoking dispatch authority.
@@ -348,19 +350,37 @@
    (assoc (dissoc bundle :certificate :source-ns)
           :source-namespace (ns-name (:source-ns bundle)))))
 
+(defn- validate-primal! [primal params tags]
+  (soac/validate! primal)
+  (let [values (:values (soac/facts primal))
+        dtypes (mapv dtype/dtype-for-scalar-tag tags)
+        produced (set (mapcat #(nth % 2) (soac/equations primal)))]
+    (when-not (and (vector? params) (seq params) (every? symbol? params)
+                   (= (count params) (count (distinct params)) (count tags))
+                   (every? #{:float :double} dtypes) (apply = dtypes)
+                   (set/subset? (set (:inputs (soac/facts primal))) (set params))
+                   (empty? (set/intersection (set params) produced))
+                   (every? true? (map (fn [id dt] (= dt (:dtype (get values id)))) params dtypes))
+                   (= 1 (count (soac/outputs primal)))
+                   (= (first dtypes) (:dtype (get values (first (soac/outputs primal))))))
+      (fail! :ad-normalized-program-interface {:params params :tags tags}))
+    (doseq [[_ value] values] (scalar-dtype! value))
+    (doseq [[id expression] (partition 2 (bindings primal))]
+      (binding-dtype! values id expression)))
+  primal)
+
 (defn validate!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
    This detects stale or changed producer data; it is not a proof of custom derivative math."
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
-           cotangent-seed] :as bundle}]
+           cotangent-seed source-ns] :as bundle}]
   (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
     (fail! :ad-normalized-stale-rules {:expected (select-keys bundle [:template-revision :compiler-revision])
                                      :actual (revisions)}))
-  (doseq [p [primal linear transpose]] (soac/validate! p))
-  (doseq [[id value] (:values (soac/facts primal))] (scalar-dtype! value))
-  (doseq [[id expression] (partition 2 (bindings primal))]
-    (binding-dtype! (:values (soac/facts primal)) id expression))
+  (validate-primal! primal params tags)
+  (doseq [p [linear transpose]] (soac/validate! p))
   (when-not (and (set/subset? (set (:inputs (soac/facts primal))) (set params))
+                 (instance? clojure.lang.Namespace source-ns)
                  (every? #(contains? (:values (soac/facts primal)) %) params)
                  (= (count params) (count tags))
                  (= (count active-inputs) (count tangent-inputs) (count (soac/outputs transpose)))
@@ -383,6 +403,32 @@
   (when-not (= (:certificate bundle) (certificate bundle))
     (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
   bundle)
+
+(defn- build-bundle [primal {:keys [params tags active-inputs source-ns]} revision]
+  (validate-primal! primal params tags)
+  (when-not (and (instance? clojure.lang.Namespace source-ns)
+                 (vector? active-inputs)
+                 (= (count active-inputs) (count (distinct active-inputs)))
+                 (set/subset? (set active-inputs) (set params)))
+    (fail! :ad-normalized-program-interface
+           {:params params :active-inputs active-inputs :source-ns source-ns}))
+  (let [fresh (typed-gensym (:dtype (get-in (soac/facts primal) [:values (first params)])))
+        {:keys [program tangent-inputs coefficients]} (linearize primal active-inputs fresh)
+        transposed (transpose program tangent-inputs coefficients fresh)
+        _ (when-not (= revision (revisions))
+            (fail! :ad-normalized-stale-rules {:before revision :after (revisions)}))
+        bundle (merge revision {:primal primal :linear program :transpose (:program transposed)
+                               :params params :tags tags :active-inputs active-inputs
+                               :tangent-inputs tangent-inputs :residuals coefficients
+                               :cotangent-seed (:seed transposed) :source-ns source-ns})]
+    (validate! (assoc bundle :certificate (certificate bundle)))))
+
+(defn linearize-program
+  "Build checked scalar primal/linear/transpose programs from an existing TypedSOAC program.
+   The interface explicitly supplies :params, retained :tags, :active-inputs and :source-ns.
+   This compiler entry never walks source, resolves a deftm Var or re-infers its types."
+  [primal interface]
+  (build-bundle primal interface (revisions)))
 
 (defn prepare
   "Build one validated primal/linear/transpose bundle for a resolved scalar deftm Var.
@@ -415,15 +461,9 @@
         primal-output (fresh "primal_output")
         source-bindings (into (vec source-bindings) [primal-output output])
         input-values (into (array-map) (map (fn [p dt] [p (av/tensor {:dtype dt :shape []})]) params dtypes))
-        primal (program input-values source-bindings [primal-output])
-        {:keys [program tangent-inputs coefficients]} (linearize primal active fresh)
-        transposed (transpose program tangent-inputs coefficients fresh)
-        _ (when-not (= revision (revisions))
-            (fail! :ad-normalized-stale-rules {:before revision :after (revisions)}))
-        bundle (merge revision {:primal primal :linear program :transpose (:program transposed)
-     :params params :tags tags :active-inputs active :tangent-inputs tangent-inputs
-     :residuals coefficients :cotangent-seed (:seed transposed) :source-ns source-ns})]
-    (validate! (assoc bundle :certificate (certificate bundle)))))
+        primal (program input-values source-bindings [primal-output])]
+    (build-bundle primal {:params params :tags tags :active-inputs active :source-ns source-ns}
+                  revision)))
 
 (defn- emitted-body [bundle program result-forms params tags]
   {:walked-body [(list 'let* (into (bindings (:primal bundle)) (bindings program)) result-forms)]

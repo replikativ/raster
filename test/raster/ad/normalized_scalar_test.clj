@@ -5,7 +5,7 @@
             [raster.ad.reverse :as reverse]
             [raster.ad.jvp :as jvp]
             [raster.ad.templates :as templates]
-            [raster.core :refer [deftm]]
+            [raster.core :as core :refer [deftm]]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.ir.abstract-value :as av]
@@ -25,6 +25,48 @@
       {:values (assoc (zipmap inputs (repeat value)) result value)
        :inputs inputs :equations {:equation (soac/default-equation-facts)}})
      [equation] [result])))
+
+(deftest checked-program-entry-does-not-revisit-source
+  (let [primal (linear-program '(raster.numeric/* coefficient t) '[coefficient t])
+        interface {:params '[coefficient t] :tags '[double double] :active-inputs '[t]
+                   :source-ns (the-ns 'raster.ad.normalized-scalar-test)}
+        bundle (with-redefs [core/ensure-walked-body!
+                            (fn [& _] (throw (ex-info "unexpected source walk" {})))
+                            inference/qualify-body-symbols
+                            (fn [& _] (throw (ex-info "unexpected source qualification" {})))]
+                 (normalized/linearize-program primal interface))
+        emit (fn [body]
+               (binding [*ns* (:source-ns body)]
+                 (eval (list 'fn (:params body) (first (:walked-body body))))))
+        vg (emit (normalized/value+grad-body bundle))
+        directional (emit (normalized/jvp-body bundle))]
+    (is (identical? primal (:primal bundle)))
+    (is (identical? bundle (normalized/validate! bundle)))
+    (is (= [6.0 nil 3.0] (vg 3.0 2.0)))
+    (is (= [6.0 1.5] (directional 3.0 2.0 0.5)))
+    (doseq [invalid [(assoc interface :tags '[float float])
+                     (assoc interface :params '[coefficient coefficient])
+                     (assoc interface :params '[coefficient t result] :tags '[double double double])
+                     (assoc interface :active-inputs '[t t])
+                     (assoc interface :active-inputs '[missing])
+                     (assoc interface :source-ns nil)]]
+      (is (= :ad-normalized-program-interface
+             (reason #(normalized/linearize-program primal invalid)))))))
+
+(deftest program-entry-keeps-unused-inputs-but-never-reinterprets-other-operations
+  (let [primal (linear-program '(raster.numeric/* coefficient t) '[coefficient t])
+        facts (assoc-in (soac/facts primal) [:values 'unused] (av/tensor {:dtype :double :shape []}))
+        program (soac/make facts (soac/equations primal) (soac/outputs primal))
+        interface {:params '[coefficient t unused] :tags '[double double double]
+                   :active-inputs '[unused] :source-ns *ns*}]
+    (is (= '[unused] (:active-inputs (normalized/linearize-program program interface))))
+    (let [equation (first (soac/equations primal))
+          operation (nth equation 3)]
+      (doseq [kind '[reduce map scan]]
+        (let [changed (apply list (assoc (vec operation) 0 kind))
+              changed-equation (apply list (assoc (vec equation) 3 changed))]
+          (is (= :ad-normalized-region
+                 (reason #(#'normalized/equation-expression changed-equation)))))))))
 
 (deftest linearity-requires-zero-preservation-not-just-dependence
   (doseq [[expression inputs tangents coefficients expected]
