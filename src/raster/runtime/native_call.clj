@@ -83,7 +83,7 @@
           (let [[^MemorySegment source heap _ offset ^MemorySegment backing] (.get ranges i)]
             (when heap
               (let [existing (.get heaps heap)
-                    destination ^MemorySegment
+                    ^MemorySegment destination
                     (or existing
                         (let [storage (.allocate arena (.byteSize backing) 8)]
                           (MemorySegment/copy backing 0 ^MemorySegment storage 0 (.byteSize backing))
