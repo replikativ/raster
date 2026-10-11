@@ -37,6 +37,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.gpu.compatibility-map :as compatibility-map]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
@@ -1973,20 +1974,21 @@
                           (klaunch/geometry
                            {:workgroup-size [(get opts :workgroup-size default-workgroup)]
                             :group-count [1]})))
-        geometry
-        (if (kart/kernel-artifact? registered)
-          (do
+        _ (when (kart/kernel-artifact? registered)
             (when-not (= default-workgroup workgroup)
               (throw (ex-info "direct map override differs from the emitted workgroup"
                               {:reason :kernel-workgroup-override
                                :kernel-name (:kernel-name registered)
-                               :expected default-workgroup :actual workgroup})))
-            (kcall/realize-launch registered arguments))
-          (klaunch/geometry
-           {:workgroup-size [workgroup]
-            :group-count [(klaunch/resolve-expression
-                           identity (klaunch/ceil-div bound workgroup))]}))]
-    (when-not (= 1 (klaunch/dimensions geometry))
+                               :expected default-workgroup :actual workgroup}))))
+        geometry
+        (when-not (compatibility-map/empty-map? registered arguments bound)
+          (if (kart/kernel-artifact? registered)
+            (kcall/realize-launch registered arguments)
+            (klaunch/geometry
+             {:workgroup-size [workgroup]
+              :group-count [(klaunch/resolve-expression
+                             identity (klaunch/ceil-div bound workgroup))]})))]
+    (when (and geometry (not= 1 (klaunch/dimensions geometry)))
       (throw (ex-info "direct map requires a one-dimensional launch"
                       {:reason :kernel-launch-dimensionality :launch geometry})))
     geometry))
@@ -2220,6 +2222,8 @@
                 (throw (ex-info "map kernel ABI storage dtype mismatch"
                                 {:kernel-name kernel-name :slot slot
                                  :expected (:dtype slot) :actual actual})))))
+        _ (kabi/validate-logical-pointer-aliases!
+           abi (mapv second (remove #(= :scalar (:kind (first %))) pairs)) kcall/pointer-overlaps?)
         bound-pair (first (filter #(= :bound (:role (first %))) pairs))
         _ (when-not bound-pair
             (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
@@ -2228,6 +2232,8 @@
         wg (first (:workgroup-size geometry))
         group-count (first (:group-count geometry))]
     (with-admitted-registration kernel-name registered
+      (if-not geometry
+        (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs) output-array)
       (let [;; Loading/compilation may touch the native driver. Every ABI check above deliberately
         ;; runs first, so a malformed marker fails deterministically even on a machine without
         ;; the target device.
@@ -2254,7 +2260,7 @@
             :when (and host (kabi/writable? slot))]
       (MemorySegment/copy ^MemorySegment arg 0 ^MemorySegment host 0 (long n-bytes)))
     (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs)
-        output-array))))))
+        output-array)))))))
 
 (defn- combine-scalar-partials
   "Compatibility terminal combine with the storage dtype's operation-by-operation rounding."
@@ -2457,6 +2463,7 @@
          wg (first (:workgroup-size geometry))
          group-count (first (:group-count geometry))]
      (with-admitted-registration kernel-name registered
+       (when geometry
        (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         ;; Determine per-array byte size from actual array type
          arr-byte-size (fn [arr]
@@ -2506,7 +2513,7 @@
      (cleanup/with-registry-use kernel-registry
        (launch! kernel-handle group-count wg all-args)
        (readback-void-map! abi expanded-entries)
-       nil))))))
+       nil)))))))
 
 (defn bind-kernel-call
   "Bind a backend-neutral KernelCall over Level Zero resident buffers. ABI order and complete

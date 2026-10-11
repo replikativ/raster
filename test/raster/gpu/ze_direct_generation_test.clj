@@ -2,11 +2,15 @@
   "Exact registration admission through the public direct-call route, without a driver."
   (:require [clojure.test :refer [deftest is]]
             [raster.gpu.ze-runtime :as ze]
+            [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.gpu.storage-representation :as probe])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -144,7 +148,7 @@
   (doseq [wg [0 -1 1.5 :invalid nil]]
     (is (some? (error-of #(#'ze/direct-map-geometry {:workgroup-size 4} [] 2
                                                    {:workgroup-size wg})))))
-  (is (some? (error-of #(#'ze/direct-map-geometry {:workgroup-size 4} [] 0 {}))))
+  (is (nil? (#'ze/direct-map-geometry {:workgroup-size 4} [] 0 {})))
   (is (= [2] (:workgroup-size
               (#'ze/direct-map-geometry {:workgroup-size 4} [] 9 {:workgroup-size 2})))))
 
@@ -189,7 +193,7 @@
 
 (deftest direct-map-invalid-geometry-precedes-all-native-contact
   (doseq [typed? [false true]
-          [bound opts default-wg] [[-1 {} 4] [1.5 {} 4] [0 {} 4]
+          [bound opts default-wg] [[-1 {} 4] [1.5 {} 4]
                                   [2 {:workgroup-size 0} 4]
                                   [2 {:workgroup-size -1} 4]
                                   [2 {:workgroup-size 1.5} 4]
@@ -209,7 +213,7 @@
                        (fn [] (ze/invoke-registered-map-void-kernel
                                name [(float-array 2) (float-array 2)] [2.0] bound opts)))))
            (is (empty? @seen))))))
-  (doseq [[bound workgroup] [[-1 4] [1.5 4] [0 4] [2 0] [2 -1] [2 1.5]]]
+  (doseq [[bound workgroup] [[-1 4] [1.5 4] [2 0] [2 -1] [2 1.5]]]
     (let [{:keys [name registration]} (map-fixture)
           seen (atom [])]
       (with-redefs-fn
@@ -222,6 +226,98 @@
            (is (some? (error-of (fn [] (ze/invoke-registered-kernel
                                       name [(float-array 2)] (float-array 2) [2.0] bound)))))
            (is (empty? @seen)))))))
+
+(defn- canonical-empty-map-fixture []
+  (let [typed (frontend/form->program
+               '(let* [result (raster.par/pmap i n float (clojure.core/aget x i))] result)
+               {:dtype :float :array-types {'x :float} :scalar-types {'n :long}})
+        operation (first (soac-lower/lower-typed-map typed :ze:0 :dtype :float))
+        registered (segop-opencl/generate-scheduled-segmap-kernel
+                     operation :dtype :float :target-dialect :opencl-portable
+                     :array-types {'x :float} :scalar-types {'n :long})]
+    {:name (:kernel-name registered) :registration registered}))
+
+(deftest empty-direct-maps-validate-and-return-without-native-contact
+  (doseq [backend ['raster.gpu.ze-runtime 'raster.gpu.ocl-runtime]
+          canonical? [false true]]
+    (let [{:keys [name registration]} (if canonical? (canonical-empty-map-fixture) (map-fixture))
+          registry (atom {name registration})
+          seen (atom [])
+          v #(ns-resolve backend %)
+          invoke @(v 'invoke-registered-kernel)
+          void @(v 'invoke-registered-map-void-kernel)
+          input (float-array [3.0]) output (float-array 0)
+          scalars (if canonical? [] [{:type :float :value (float 2.0)}])]
+      (with-redefs-fn
+        {(v 'kernel-registry) registry
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load)
+                                      (throw (AssertionError. "empty map loaded a kernel")))
+         (v (if (= backend 'raster.gpu.ze-runtime) 'ensure-seg 'ensure-host-seg))
+         (fn [& _] (swap! seen conj :stage)
+           (throw (AssertionError. "empty map staged memory")))}
+        #(do
+           (is (identical? output (invoke name [input] output scalars 0)))
+           (is (nil? (void name [input output] scalars 0)))
+           (doseq [bad [-1 1.5]]
+             (is (some? (error-of (fn [] (invoke name [input] output scalars bad))))))
+           (is (some? (error-of (fn [] (void name [input output] scalars 0 {:workgroup-size 0})))))
+           (is (some? (error-of (fn [] (void name [(double-array 1) output] scalars 0)))))
+           (is (some? (error-of (fn [] (void name [input output] (conj scalars :extra) 0)))))
+           (when canonical?
+             (is (some? (error-of (fn [] (void name [input input] scalars 0)))))
+             (is (some? (error-of (fn [] (invoke name [input] input scalars 0)))))
+             (let [bound-name (:name (first (filter (fn [slot] (= :bound (:role slot))) (:abi registration))))
+                   constrained (update registration :preconditions conj
+                                       {:expression bound-name :op :> :value 0})]
+               (swap! registry assoc name constrained)
+               (is (= :kernel-precondition-failed
+                      (:reason (ex-data (error-of (fn [] (invoke name [input] output scalars 0)))))))
+               (swap! registry assoc name registration))
+             (is (= :kernel-workgroup-override
+                    (:reason (ex-data (error-of (fn [] (void name [input output] scalars 0
+                                                          {:workgroup-size 3}))))))))
+           (is (empty? @seen)))))))
+
+(deftest empty-direct-map-still-rejects-a-replaced-registration
+  (doseq [backend ['raster.gpu.ze-runtime 'raster.gpu.ocl-runtime]]
+    (let [{:keys [name registration]} (canonical-empty-map-fixture)
+          registry (atom {name registration})
+          seen (atom [])
+          validate call/validate-preconditions!
+          v #(ns-resolve backend %)]
+      (with-redefs-fn
+        {(v 'kernel-registry) registry
+         #'call/validate-preconditions! (fn [a args]
+                                         (validate a args)
+                                         (swap! registry assoc name (assoc registration :source "replacement")))
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load))}
+        #(do
+           (is (= :registry-generation-changed
+                  (:reason (ex-data (error-of
+                                     (fn [] ((deref (v 'invoke-registered-kernel))
+                                             name [(float-array 1)] (float-array 0) [] 0)))))))
+           (is (empty? @seen)))))))
+
+(deftest zero-bound-does-not-skip-an-opaque-positive-grid-artifact
+  (doseq [backend ['raster.gpu.ze-runtime 'raster.gpu.ocl-runtime]]
+    (let [a (artifact/make
+             {:kernel-name "opaque_zero" :target :opencl-c
+              :source "__kernel void opaque_zero(__global const float *x, __global float *out, long n) {}"
+              :abi [(abi/slot 'x :input :float) (abi/slot 'out :output :float :role :result)
+                    (abi/slot 'n :scalar :long :role :bound)]
+              :arguments '[x out n]
+              :launch (launch/spec {:workgroup-size [4] :group-count [1]})})
+          v #(ns-resolve backend %)
+          failure (ex-info "ordinary loading boundary" {})
+          seen (atom [])]
+      (with-redefs-fn
+        {(v 'kernel-registry) (atom {(:kernel-name a) a})
+         (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load) (throw failure))}
+        #(do
+           (is (identical? failure (error-of
+                                   (fn [] ((deref (v 'invoke-registered-kernel))
+                                           (:kernel-name a) [(float-array 1)] (float-array 1) [] 0)))))
+           (is (= [:load] @seen)))))))
 
 (deftest void-map-replacement-after-pure-admission-precedes-native-use
   (doseq [typed? [false true]]
