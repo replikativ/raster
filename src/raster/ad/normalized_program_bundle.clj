@@ -1,5 +1,5 @@
 (ns raster.ad.normalized-program-bundle
-  "Canonical TypedSOAC program envelope, initially adapting one checked homogeneous map.
+  "Canonical TypedSOAC program envelope for checked homogeneous maps and ordered map sums.
    Scalar derivation evidence remains nested; no rules, evaluator, cache or source importer
    are added. This migration adapter does not compose equations or add runtime support."
   (:require [raster.ad.normalized-scalar :as scalar]
@@ -9,10 +9,13 @@
 (defn- fail! [reason data]
   (throw (ex-info "Invalid normalized program bundle" (assoc data :reason reason))))
 
-(defn- checked-map! [bundle]
+(defn- checked-evidence! [bundle kind]
   (scalar/validate! bundle)
   (when-not (and (:map-programs bundle)
-                 (not (contains? bundle :sum-programs))
+                 (case kind
+                   :checked-scalar-map (not (contains? bundle :sum-programs))
+                   :checked-scalar-map-sum (some? (:sum-programs bundle))
+                   false)
                  (not (contains? bundle :gather-programs)))
     (fail! :ad-program-bundle-scope {}))
   bundle)
@@ -20,12 +23,15 @@
 (defn- value-interface [program id source]
   {:id id :source source :value (get-in (soac/facts program) [:values id])})
 
-(defn- map-envelope
+(defn- program-envelope
   "Pure fixed-ID projection of already checked evidence. It generates no derivative code."
-  [bundle]
-  (let [{:keys [source primal linear transpose interface]} (:map-programs bundle)
+  [bundle kind]
+  (let [sum? (= :checked-scalar-map-sum kind)
+        {:keys [source primal linear transpose]} (if sum? (:sum-programs bundle) (:map-programs bundle))
         {:keys [active-array tangent-input tangent-output cotangent-input gradient-output
-                residual-arrays scalar-captures]} interface
+                residual-arrays scalar-captures]} (get-in bundle [:map-programs :interface])
+        tangent-output (if sum? (get-in bundle [:sum-programs :interface :tangent-result]) tangent-output)
+        cotangent-input (if sum? (get-in bundle [:sum-programs :interface :seed]) cotangent-input)
         inputs (:inputs (soac/facts source))
         result (first (soac/outputs source))
         producer (second (first (soac/equations primal)))
@@ -54,7 +60,7 @@
                  :cotangent-input (value-interface transpose cotangent-input result)
                  :cotangent-result (value-interface transpose gradient-output active-array)}
      :residual-bindings residual-bindings :physical-bindings {}
-     :derivation {:kind :checked-scalar-map :bundle bundle}
+     :derivation {:kind kind :bundle bundle}
      :source-ns (:source-ns bundle)}))
 
 (defn- pure-envelope [bundle]
@@ -79,12 +85,14 @@
   "Check the original scalar authority and fixed-ID source/program/interface correspondence.
    This is not independent proof of custom-rule mathematics or floating reassociation."
   [{:keys [source-ns derivation] :as bundle}]
-  (when-not (and (= :checked-scalar-map (:kind derivation)) (map? (:bundle derivation)))
+  (when-not (and (contains? #{:checked-scalar-map :checked-scalar-map-sum} (:kind derivation))
+                 (map? (:bundle derivation)))
     (fail! :ad-program-bundle-derivation {}))
   (namespace! bundle)
-  (let [evidence (checked-map! (:bundle derivation))
-        expected (map-envelope evidence)]
-    ;; Existing scalar validation already reconstructs lift-map with fixed interface IDs and
+  (let [kind (:kind derivation)
+        evidence (checked-evidence! (:bundle derivation) kind)
+        expected (program-envelope evidence kind)]
+    ;; Existing scalar validation already reconstructs map/sum lifts with fixed interface IDs and
     ;; validates each SOAC. Compare the canonical projection, not a newly generated derivative.
     (when-not (fingerprint/equivalent? (pure-envelope expected) (pure-envelope bundle))
       (fail! :ad-program-bundle-correspondence {}))
@@ -98,5 +106,16 @@
    No allocation or execution occurs. The evidence is transitional and may be retired only
    after a common program validator owns the same source/derivative/ownership obligations."
   [bundle]
-  (let [result (map-envelope (checked-map! bundle))]
+  (let [kind :checked-scalar-map
+        result (program-envelope (checked-evidence! bundle kind) kind)]
+    (validate! (assoc result :certificate (certificate result)))))
+
+(defn adapt-map-sum
+  "Adapt an existing checked map→ordered sum without changing its reduction or execution.
+   Tangent input is an array, tangent result and explicit cotangent seed are scalars; snapshots
+   retain their original tuple-map producers. Indexed/ambiguous evidence refuses. No new
+   composition, rules, reassociation permission, physical obligations or runtime mode is added."
+  [bundle]
+  (let [kind :checked-scalar-map-sum
+        result (program-envelope (checked-evidence! bundle kind) kind)]
     (validate! (assoc result :certificate (certificate result)))))

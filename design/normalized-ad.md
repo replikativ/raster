@@ -41,7 +41,15 @@ This thin migration adapter adds no runtime mode, parser, rule registry, cache, 
 composition or fusion permission. Old APIs and runtimes remain unchanged. The nested evidence
 and family validators may retire only after a common program validator independently owns the
 same source/derivative/residual obligations and the existing numerical/refusal gates agree.
-Map→sum/indexed composition, exact SFT and the unchanged FAILED Gemma gate (11/28) remain open.
+`adapt-map-sum` uses the same canonical projection for an existing admitted map→ordered sum.
+The original two-equation source and generated programs stay exact. Tangent input remains an
+array, while primal/tangent results and the explicit cotangent seed have the retained scalar
+Float/Double space. Residual producer bindings still name the original tuple-map outputs;
+physical obligations remain empty. The existing sum authority retains the initializer, actual
+step, dtype and operand/iteration order; algebra metadata grants no reassociation permission.
+No sum runtime selector, broadcast seed array, fusion or new derivative rule is added. Indexed
+canonical migration, further equation composition, exact SFT and the unchanged FAILED Gemma
+gate (11/28) remain open.
 
 ## Indexed-map construction checkpoint
 
