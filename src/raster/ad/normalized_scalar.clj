@@ -71,6 +71,36 @@
       (fail! :ad-normalized-region {:equation equation}))
     (util/subst-syms (zipmap parameters captures) (first body-results))))
 
+(defn- selected-call-contract!
+  "Check retained calls against the existing non-invoking dispatch authority.
+   Runtime implementation objects are compared here, never serialized as AD identities."
+  [call argument-dtypes result-dtype]
+  (let [{:keys [operation dispatch? implementation-op]} call
+        operation-var (when (symbol? operation) (resolve operation))]
+    (when (or dispatch? (:raster.core/dispatch-table (meta operation-var)))
+      (let [argument-tags (mapv tag argument-dtypes)
+            selected (dispatch/selected-call-signature
+                      operation argument-tags
+                      (inference/registered-call-selection operation argument-tags))
+            implementation-var (when (and dispatch? (symbol? implementation-op))
+                                 (resolve implementation-op))]
+        ;; This scalar vertical admits exact registered homogeneous methods only.
+        ;; Promotion or a merely applicable parametric template is not a proof.
+        (when-not (and (= :registered (:selection selected))
+                       (= argument-tags (:tags selected))
+                       (= (tag result-dtype) (:return-tag selected))
+                       (not (some some? (:promotion-casts selected)))
+                       (or (not dispatch?)
+                           (and (var? implementation-var) (bound? implementation-var)
+                                (some? (:typed-impl selected))
+                                (identical? @implementation-var (:typed-impl selected)))))
+          (fail! :ad-normalized-call-contract
+                 {:operation operation :implementation implementation-op
+                  :arguments argument-tags :result (tag result-dtype)
+                  :selected (select-keys selected
+                                         [:selection :mangled-sym :tags :return-tag
+                                          :promotion-casts])}))))))
+
 (defn- binding-dtype! [values binding expression]
   (let [declared (or (some-> (get values binding) scalar-dtype!)
                      (some-> (types/sym-type-tag binding) dtype/dtype-for-scalar-tag))
@@ -80,10 +110,11 @@
                  (expression-dtype values expression)
 
                  (seq? expression)
-                 (let [{:keys [arguments cast-tag]} (call! expression)
+                 (let [{:keys [arguments cast-tag] :as call} (call! expression)
                        arg-types (mapv #(expression-dtype values %) arguments)]
                    (when (some nil? arg-types)
                      (fail! :ad-normalized-unknown-type {:binding binding :expression expression}))
+                   (when declared (selected-call-contract! call arg-types declared))
                    (or (some-> cast-tag dtype/dtype-for-scalar-tag)
                        ;; This is a homogeneity check, not result-type inference.
                        ;; The selected/walker result must already be retained.

@@ -6,6 +6,8 @@
             [raster.ad.jvp :as jvp]
             [raster.ad.templates :as templates]
             [raster.core :refer [deftm]]
+            [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.core.inference :as inference]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]))
@@ -39,6 +41,48 @@
                    (linear-program (with-meta '(raster.numeric/* coefficient t)
                                      {:raster.type/tag 'float}) '[coefficient t])
                    '[t] '[coefficient])))))
+
+(def receiver-alias @#'raster.numeric/_star__m_double_double-impl)
+
+(deftest retained-calls-require-selected-formals-result-and-implementation
+  (let [expression (with-meta
+                     '(.invk raster.numeric/_star__m_double_double-impl coefficient t)
+                     {:raster.op/original 'raster.numeric/* :raster.type/tag 'double})
+        program (linear-program expression '[coefficient t])
+        selected (dispatch/selected-call-signature
+                  'raster.numeric/* '[double double]
+                  (inference/registered-call-selection 'raster.numeric/* '[double double]))]
+    (is (= '#{t result} (normalized/validate-linear! program '[t] '[coefficient])))
+    (is (= '#{t result}
+           (normalized/validate-linear!
+            (linear-program '(raster.numeric/* coefficient t) '[coefficient t])
+            '[t] '[coefficient])))
+    (let [aliased-expression (with-meta
+                               '(.invk raster.ad.normalized-scalar-test/receiver-alias coefficient t)
+                               (meta expression))
+          aliased-program (linear-program aliased-expression '[coefficient t])]
+      (is (= '#{t result}
+             (normalized/validate-linear! aliased-program '[t] '[coefficient])))
+      (with-redefs [receiver-alias (Object.)]
+        (is (= :ad-normalized-call-contract
+               (reason #(normalized/validate-linear! aliased-program '[t] '[coefficient]))))))
+    (doseq [contradictory [nil
+                          (assoc selected :tags '[float float])
+                          (assoc selected :return-tag 'float)
+                          (assoc selected :promotion-casts '[float nil])
+                          (assoc selected :selection :parametric)
+                          (assoc selected :typed-impl nil)]]
+      (with-redefs [dispatch/selected-call-signature (constantly contradictory)]
+        (is (= :ad-normalized-call-contract
+               (reason #(normalized/validate-linear! program '[t] '[coefficient]))))))
+    ;; Semantic metadata cannot bless a different executable receiver.
+    (let [wrong-receiver (with-meta
+                           '(.invk raster.numeric/_star__m_float_float-impl coefficient t)
+                           (meta expression))]
+      (is (= :ad-normalized-call-contract
+             (reason #(normalized/validate-linear!
+                       (linear-program wrong-receiver '[coefficient t])
+                       '[t] '[coefficient])))))))
 
 (deftest bundle-rejects-stale-residuals-and-semantic-metadata
   (let [bundle (:raster.ad/normalized-bundle

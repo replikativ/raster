@@ -22,6 +22,19 @@ Initial warm validation: 12 focused tests / 74 assertions and 69 affected tests 
 pass. Independent review approved the production implementation at `5bf179dd`; the subsequent
 test-only control adds subtraction and lexical aliases. Fresh CI remains a separate gate.
 
+The next bounded implementation checks every registered scalar call against the existing
+non-invoking dispatch selection. Argument tags and the declared return must agree with the
+retained value contracts. A devirtualized receiver must be the actual selected implementation
+object; semantic operation metadata alone cannot certify it. Promotions, unprojectable methods
+and merely applicable parametric templates refuse in this homogeneous scalar vertical.
+Implementation objects are compared transiently, not included in serialized fingerprints.
+This tightens admission without creating another method/type registry or broadening coverage.
+Focused public/IR controls pass 10 tests / 72 assertions; affected source AD/inlining controls
+pass 69 tests / 525 assertions in the existing warm REPL. Independent review found no bounded
+source blocker. Receiver aliases, changed receiver roots, direct calls and contradictory
+selected signatures are explicit controls. Arbitrary host redefinitions outside compiler
+registration are not comprehensively covered by the compiler revision contract.
+
 Raster should differentiate a checked, unscheduled numerical program with explicit value,
 control, conversion and effect contracts. Forward and reverse AD should consume the same
 normalized program and tangent facts. Hardware scheduling and buffer realization should
