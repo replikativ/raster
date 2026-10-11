@@ -331,7 +331,8 @@
         ;; accumulator), so no form needs its own rule here.
         (or (contains? '#{loop loop* dotimes} head)
             (= :par (:kind (form/form-info init-expr))))
-        (boolean (some #(get activity % false) (util/free-syms init-expr)))
+        (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys activity))]
+          (boolean (some #(get activity % false) (util/free-syms init-expr))))
 
         ;; Surviving lexical regions carry their free dependencies. They are
         ;; not ordinary calls with only symbol-valued arguments; preparation
@@ -380,6 +381,18 @@
     (throw (ex-info "AD stored-carry loop requires an exact carry checkpoint"
                     {:reason :ad-scan-carry-precision :loop expression}))))
 
+(defn ^:no-doc assert-unhandled-parallel-region!
+  "A parallel region reaching a mode's ordinary-call fallback has no scoped
+   derivative handler. Active captures cannot be proved constant from the
+   call's top-level arguments. Both modes use their existing scoped activity
+   authority and invoke this only after their supported handlers. Inactive
+   regions stay primal; this is refusal, not support for parallel effects."
+  [expression active? sym]
+  (when (and active? (= :par (:kind (form/form-info expression))))
+    (throw (ex-info "Active parallel region has no scoped AD rule"
+                    {:reason :ad-unsupported-active-parallel-region
+                     :form-head (first expression) :sym sym :init expression}))))
+
 (defn- ad-form-kind
   "Classify a binding init into a reverse-record kind. SOACs (soac-record-kinds)
   are recognized BEFORE the activity gate (they manage their own activity via
@@ -391,6 +404,8 @@
     (not active?)                                                   :inactive
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
+    (= :par (:kind (form/form-info init-expr)))
+    (do (assert-unhandled-parallel-region! init-expr true sym) :inactive)
     (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr)))
     (do (assert-source-scan-checkpoint! init-expr true) :loop)
     ;; Do not treat an unlinearized region as an inactive ordinary call. Until

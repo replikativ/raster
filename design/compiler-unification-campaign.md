@@ -14,6 +14,29 @@ integral-reduction tests pass 46 tests / 506 assertions in the warm REPL.
 This does not repair the separate mangled-descriptor basename compatibility
 path, certify all reductions, or resolve the failed real-model training gate.
 
+### Active parallel-effect AD admission
+
+A public scalar objective that filled a fresh array with `x*x` using
+`par/map-void!` and reduced that array returned the correct primal but zero
+derivatives in both reverse AD and JVP. Scoped activity saw the capture, but
+ordinary-call fallback inspected only the top-level call arguments and dropped
+the captured dependency. Both modes now refuse an active parallel region that
+reaches fallback without their own scoped derivative handler, through the
+shared form/activity contract and `:ad-unsupported-active-parallel-region`.
+Inactive and reverse `:wrt`-excluded effects retain primal execution; supported
+map, reduction and scan handlers remain admitted. This is an intentional
+surface behavior correction from a wrong derivative to explicit refusal.
+
+Focused and surrounding AD suites pass 96 tests / 737 assertions in the warm
+REPL, including an independent polynomial/finite-difference counterexample.
+Complete differentiation of fresh-buffer effect maps remains open: canonical
+single-assignment maps and ordered buffer versions must enter the existing
+functional AD rules with their ownership, replay and precision obligations.
+Enabling helper inlining alone is not sufficient; the unchanged SFT objective
+is retained as the generated-AD acceptance target, separate from its existing
+handwritten-backward and native replay tests. No fixture-specific derivative
+or weaker real-model training oracle is introduced.
+
 ### October 10 non-executing call-signature evidence
 
 The compiler's registered-method selection now exposes a non-executing tag-tuple

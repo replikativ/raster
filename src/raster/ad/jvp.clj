@@ -477,6 +477,13 @@
                         :form-head head :sym sym}))
                (done tenv []))
 
+             ;; Known scan/reduce/map handlers above own their scoped rules.
+             ;; Other parallel captures must not disappear in argument-only
+             ;; ordinary-call activity. Inactive effects still execute primal.
+             (= :par (:kind (form/form-info init)))
+             (do (rev/assert-unhandled-parallel-region! init (any-active? tenv init) sym)
+                 (done tenv []))
+
              ;; call (incl. devirtualized .invk)
              :else
              (let [{op-sym :operation args :arguments lexical :lexical-callee}
