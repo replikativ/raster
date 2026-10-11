@@ -5782,6 +5782,180 @@
                        :dtype (:dtype (get values sym))}))))
           descriptions)))
 
+(defn canonicalize-fresh-full-write-maps
+  "Project a closed single-write effect region to the existing functional map contract.
+
+   This deliberately admits only positively typed Double storage/value regions and immutable
+   integral extent identities. No program dtype supplies missing evidence. Allocation stays at
+   its source site; the map replaces the effect at its original site, followed by the original
+   unused statement's nil value. Unproved regions remain unchanged for consumer admission."
+  [source {:keys [array-types scalar-types] :or {array-types {} scalar-types {}}}]
+  (let [original-source source
+        source (util/normalize-let-body source)
+        source (if (and (form/binding-form? original-source)
+                        (form/binding-form? source))
+                 (util/remake-from source
+                                   (cons (first source)
+                                         (cons (with-meta (second source) (meta (second original-source)))
+                                               (nnext source))))
+                 source)]
+   (if-not (and (form/binding-form? source) (vector? (second source))
+               (even? (count (second source))))
+    {:form original-source :rewrites [] :declines []}
+    (let [[head bindings & tail] source
+          pairs (vec (mapv vec (partition 2 bindings)))
+          ids (mapv first pairs)
+          unique-bindings? (= (count ids) (count (set ids)))
+          integral-extent? (fn [extent scalars]
+                             (or (integer? extent)
+                                 (and (symbol? extent)
+                                      (contains? #{:int :long} (get scalars extent)))))
+          rebuilt
+          (binding [util/*shadowing-locals* (source-shadowing-locals source array-types scalar-types)
+                    *region-local-counter* (atom -1)
+                    *region-local-source-symbols* (source-symbols source)
+                    *declared-kinds* {:arrays (set (keys array-types))
+                                     :scalars (set (keys scalar-types))}]
+            (reduce
+             (fn [{:keys [arrays scalars allocations extent-aliases] :as state}
+                  [ordinal [statement expression]]]
+               (let [tag (types/sym-type-tag statement)
+                     call (descriptor/call-description expression)
+                     receiver (:implementation-op call)
+                     lexical-allocation? (or (:lexical-callee call)
+                                             (and (symbol? receiver)
+                                                  (nil? (namespace receiver))
+                                                  (contains? util/*shadowing-locals* receiver)))
+                     allocation-op (when-not lexical-allocation? (:semantic-op call))
+                     constructor-tag (get descriptor/alloc-sym->array-tag allocation-op)
+                     declared-array (some-> tag dtype/dtype-for-array-tag dtype/canon)
+                     allocated-array (some-> constructor-tag dtype/dtype-for-array-tag dtype/canon)
+                     array-dtype (or declared-array allocated-array)
+                     scalar-dtype (some-> (or (retained-local-dtype statement expression)
+                                             (retained-scalar-dtype expression scalars)) dtype/canon)
+                     canonical-scalar (normalize-scalar-casts
+                                       (util/subst-syms extent-aliases expression) scalars)
+                     extent-alias (when (and (symbol? canonical-scalar)
+                                             (contains? #{:int :long} (get scalars canonical-scalar)))
+                                    canonical-scalar)
+                     canonical-extent (fn [value]
+                                        (normalize-scalar-casts
+                                         (util/subst-syms extent-aliases value) scalars))
+                     extent (when-not lexical-allocation?
+                              (binding [*declared-kinds*
+                                        {:arrays (set (keys arrays))
+                                         :scalars (into #{} (keep (fn [[id type]] (when type id))) scalars)}]
+                                (allocation-length expression)))
+                     allocation (when (and extent allocated-array
+                                           (or (nil? declared-array) (= declared-array allocated-array))
+                                           (= :zero (descriptor/allocation-initialization allocation-op)))
+                                  {:source-binding-id ordinal :source-expression expression
+                                   :extent extent :dtype allocated-array :initialization :zero})
+                     info (when (par/par-map-void-form? expression)
+                            (par/extract-par-map-void-info expression))
+                     region (when info
+                              (store-region (retain-free-scalar-reference-types
+                                             (:body info) scalars) (:idx info)))
+                     store (when (= 1 (count (:stores region))) (first (:stores region)))
+                     destination (:out store)
+                     original-allocation (get allocations destination)
+                     local-types (into scalars (map (juxt :id :dtype)) (:locals region))
+                     value-dtype (when store
+                                   (retained-expression-dtype (:value store) arrays local-types))
+                     map-body (when store
+                                (if (seq (:locals region))
+                                  (list 'let* (vec (mapcat (fn [{:keys [id dtype init]}]
+                                                           [(with-meta id {:raster.type/tag
+                                                                           (dtype/scalar-tag-for-dtype dtype)})
+                                                            init]) (:locals region)))
+                                        (:value store))
+                                  (:value store)))
+                     earlier (when original-allocation
+                               (subvec pairs (inc (:source-binding-id original-allocation)) ordinal))
+                     suffix (list* 'let* (vec (mapcat identity (subvec pairs (inc ordinal)))) tail)
+                     reason
+                     (when info
+                       (cond
+                         (not unique-bindings?) :fresh-write-nonunique-bindings
+                         (or (nil? store) (seq (:loops region))
+                             (not= [[:store 0]] (region-order region))
+                             (not= (:idx info) (:index store))
+                             (not (contains? #{true 1} (get store :predicate 1)))
+                             (:reduction-op store)) :fresh-write-unproved-single-store
+                         (not original-allocation) :fresh-write-unproved-allocation
+                         (or (not= :double (:dtype original-allocation))
+                             (not= :double value-dtype)) :fresh-write-unproved-double-value
+                         ;; The first capability does not erase intermediate rounding just
+                         ;; because the final value widens back to Double. Existing descriptor
+                         ;; identity, not a spelling list, owns the conversion classification.
+                         (some (fn [node]
+                                 (when (seq? node)
+                                   (when-let [cast-tag (descriptor/cast-result-tag
+                                                       (descriptor/semantic-op node))]
+                                     (not= :double (dtype/dtype-for-scalar-tag cast-tag)))))
+                               (tree-seq coll? seq map-body))
+                         :fresh-write-unsupported-conversion
+                         (or (not (integral-extent? (canonical-extent (:bound info)) scalars))
+                             (not= (canonical-extent (:extent original-allocation))
+                                   (canonical-extent (:bound info))))
+                         :fresh-write-unproved-full-extent
+                         (some #(contains? (util/free-syms (second %)) destination) earlier)
+                         :fresh-write-prior-use
+                         (contains? (util/free-syms map-body) destination) :fresh-write-self-read
+                         (not (effects/removable-expr? map-body)) :fresh-write-unproved-purity
+                         (contains? (util/free-syms suffix) statement) :fresh-write-observed-statement
+                         :else nil))
+                     description
+                     (when (and info (nil? reason))
+                       (write-region-description ordinal statement (:idx info) (:bound info)
+                                                 region :double :host-return :effect
+                                                 :array-types arrays :scalar-types scalars))
+                     accepted? (and description (= :map (:kind description))
+                                    (= 1 (count (:result-storage description)))
+                                    (= :write (get-in description [:result-storage 0 :access])))
+                     replacements
+                     (if accepted?
+                       (let [effect-id (with-meta (gensym "fresh_map_effect_")
+                                         {:raster.effect/effectful true :raster.type/tag 'doubles})
+                             typed-destination (vary-meta destination assoc :raster.type/tag 'doubles)
+                             map-form (with-meta
+                                        (list 'raster.par/map! typed-destination (:idx info) (:bound info)
+                                              nil map-body)
+                                        (assoc (meta expression) :elem-type :double))]
+                         [[effect-id map-form] [statement nil]])
+                       [[statement expression]])]
+                 (cond-> (-> state
+                             (update :pairs into replacements)
+                             (assoc :scalars (assoc scalars statement scalar-dtype))
+                             (assoc :extent-aliases (cond-> (dissoc extent-aliases statement)
+                                                     extent-alias (assoc statement extent-alias)))
+                             (assoc :arrays (cond-> (dissoc arrays statement)
+                                              array-dtype (assoc statement array-dtype)))
+                             (assoc :allocations (cond-> (dissoc allocations statement)
+                                                   allocation (assoc statement allocation))))
+                   accepted? (update :rewrites conj {:site [:binding statement]
+                                                     :source-binding-id ordinal
+                                                     :destination destination :extent (:bound info)
+                                                     :allocation original-allocation :dtype :double})
+                   (and info (not accepted?))
+                   (update :declines conj {:site [:binding statement]
+                                          :reason (or reason :fresh-write-unproved-functional-map)}))))
+             {:pairs [] :arrays array-types :scalars scalar-types :allocations {} :extent-aliases {}
+              :rewrites [] :declines []}
+             (map-indexed vector pairs)))
+          admitted-destinations (set (map :destination (:rewrites rebuilt)))
+          result-pairs (map (fn [[id expression]]
+                              [(if (contains? admitted-destinations id)
+                                 (vary-meta id assoc :raster.type/tag 'doubles)
+                                 id)
+                               expression])
+                            (:pairs rebuilt))]
+      {:form (if (seq (:rewrites rebuilt))
+               (with-meta (list* head (with-meta (vec (mapcat identity result-pairs))
+                                               (meta bindings)) tail) (meta source))
+               original-source)
+       :rewrites (:rewrites rebuilt) :declines (:declines rebuilt)}))))
+
 (defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
                  preserve-declared-array-storage?]

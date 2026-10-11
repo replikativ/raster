@@ -42,7 +42,7 @@
   [alpha :- Double a :- (Array double) b :- (Array double)] :- Double
   (par/dot-product (par/scale alpha a) b))
 
-(deftest active-parallel-effects-refuse-instead-of-dropping-captured-derivatives
+(deftest proved-fresh-parallel-effects-preserve-captured-derivatives
   ;; Independent polynomial/central-difference witness. No generated function
   ;; may return the historically wrong [12, 0] for this source computation.
   (doseq [source [#'active-effect-square #'core-spelled-active-effect-square]]
@@ -52,10 +52,110 @@
       (is (= expected (source x size)))
       (is (= derivative (/ (- (source (+ x h) size) (source (- x h) size))
                            (* 2.0 h))))
-      (doseq [construct [rev/value+grad jvp/jvp]]
-        (is (= :ad-unsupported-active-parallel-region
-               (try (construct source) nil
-                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
+      (is (= [expected derivative nil] ((rev/value+grad source :wrt [0]) x size)))
+      (is (= [expected derivative] ((jvp/jvp source) x size 1.0))))))
+
+(deftm unsupported-multiple-write-square [x :- Double size :- Long] :- Double
+  (let [out (double-array size)]
+    (par/map-void! i size
+      (do (ra/aset out i (n/* x x))
+          (ra/aset out i (n/+ x 1.0))))
+    (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
+
+(deftm unsupported-rounded-write [x :- Double size :- Long] :- Double
+  (let [out (double-array size)]
+    (par/map-void! i size (ra/aset out i (float x)))
+    (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
+
+(deftest unproved-parallel-effects-still-refuse-in-both-modes
+  (is (= 9.0 (unsupported-multiple-write-square 2.0 3)))
+  (is (= 16777216.0 (unsupported-rounded-write 16777217.0 1)))
+  (doseq [construct [rev/value+grad jvp/jvp]
+          source [#'unsupported-multiple-write-square #'unsupported-rounded-write]]
+    (is (= :ad-unsupported-active-parallel-region
+           (try (construct source) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftm fresh-gather-sum
+  [src :- (Array double) indices :- (Array long) size :- Long] :- Double
+  (let [out (double-array size)]
+    (par/map-void! i size
+      (let [index (ra/aget indices i)]
+        (ra/aset out i (ra/aget src index))))
+    (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
+
+(deftest fresh-gather-write-transposes-repeated-indices
+  (let [src (double-array [2.0 3.0 5.0])
+        indices (long-array [2 0 2])
+        tangent (double-array [0.25 -0.5 2.0])
+        original (vec src)
+        expected (reduce + 0.0 (map #(nth original %) indices))
+        ;; Independent scatter-sum: the repeated index must accumulate twice.
+        gradient (mapv #(double (count (filter #{%} indices))) (range (count src)))
+        [v g _ _] ((rev/value+grad #'fresh-gather-sum :wrt [0]) src indices 3)
+        [jv jg] ((jvp/jvp #'fresh-gather-sum) src indices 3 tangent)
+        h 0.125]
+    (is (= 12.0 expected (fresh-gather-sum src indices 3) v jv))
+    (is (= gradient (vec g)))
+    (is (= 4.25 jg (reduce + 0.0 (map * gradient tangent))))
+    (dotimes [coordinate (count src)]
+      (let [plus (double-array src) minus (double-array src)]
+        (aset plus coordinate (+ (aget plus coordinate) h))
+        (aset minus coordinate (- (aget minus coordinate) h))
+        (is (= (nth gradient coordinate)
+               (/ (- (fresh-gather-sum plus indices 3) (fresh-gather-sum minus indices 3))
+                  (* 2.0 h))))))
+    (is (= original (vec src)))
+    (is (= [2 0 2] (vec indices)))
+    (is (= [0.0 [0.0 0.0 0.0]]
+           (let [[v g] ((rev/value+grad #'fresh-gather-sum :wrt [0])
+                        src (long-array 0) 0)] [v (vec g)])))))
+
+(deftm direct-map-local-gather-chain
+  [src :- (Array double) indices :- (Array long) size :- Long index :- Long] :- Double
+  (let [out (double-array size)
+        mapped (par/map! out i size nil
+                        (let [index (ra/aget indices i)
+                              alias index
+                              value (ra/aget src alias)]
+                          value))]
+    (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
+
+(deftm direct-map-mutated-local-gather-index
+  [src :- (Array double) indices :- (Array long) size :- Long] :- Double
+  (let [out (double-array size)
+        mapped (par/map! out i size nil
+                        (let [index (ra/aget indices i)] (ra/aget src index)))
+        overwritten (par/map! indices j size long 0)]
+    (par/reduce total 0.0 i size (n/+ total (ra/aget out i)))))
+
+(deftest existing-functional-map-replays-pure-index-aliases-without-capture
+  (let [src (double-array [2.0 3.0 5.0]) indices (long-array [2 0 2])
+        tangent (double-array [0.25 -0.5 2.0])
+        ;; The outer parameter is deliberately out of bounds: the inner lexical
+        ;; index must win, and both local aliases must reach the scatter transpose.
+        [value gradient] ((rev/value+grad #'direct-map-local-gather-chain :wrt [0])
+                          src indices 3 99)
+        [jvalue derivative] ((jvp/jvp #'direct-map-local-gather-chain)
+                              src indices 3 99 tangent)]
+    (is (= 12.0 value jvalue (direct-map-local-gather-chain src indices 3 99)))
+    (is (= [1.0 0.0 2.0] (vec gradient)))
+    (is (= 4.25 derivative))
+    (is (= [2.0 3.0 5.0] (vec src)))
+    (is (= [2 0 2] (vec indices)))
+    (is (= [0.0 [0.0 0.0 0.0]]
+           (let [[value gradient] ((rev/value+grad #'direct-map-local-gather-chain :wrt [0])
+                                   src (long-array 0) 0 99)] [value (vec gradient)])))))
+
+(deftest replayed-local-index-keeps-existing-source-mutation-protection
+  (is (= :replayed-array-overwritten
+         (try (rev/value+grad #'direct-map-mutated-local-gather-index :wrt [0]) nil
+              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+
+(deftest empty-fresh-square-write-remains-an-empty-primal-and-tangent
+  (is (= 0.0 (active-effect-square 2.0 0)))
+  (is (= [0.0 0.0 nil] ((rev/value+grad #'active-effect-square :wrt [0]) 2.0 0)))
+  (is (= [0.0 0.0] ((jvp/jvp #'active-effect-square) 2.0 0 1.0))))
 
 (deftest inactive-and-excluded-parallel-effects-remain-primal
   (is (= 14.0 (inactive-effect-square 2.0 3)))

@@ -2083,24 +2083,28 @@
   "Returns (fn lift [expr scoped? locals]) that replaces each admitted active
   array read with (on-read arr index). Reads at the map index are admitted
   everywhere; sequential scans additionally admit unconditional reads at an
-  integer literal or a replayable gather index. Parallel map/reduce must not
-  receive the sequential permission: repeated destinations would race."
-  [idx-sym sequential? on-read]
+  integer literal or a replayable gather index. Consumers that enable gather
+  reads must scatter-add their cotangents; a lane-wise overwrite would race."
+  [idx-sym sequential? on-read & [replay-index]]
   (fn lift [expr scoped? locals]
-    (cond
+    (let [index (when (gradient-bearing-array-read? expr)
+                  (if (and replay-index (not scoped?))
+                    (replay-index (nth expr 2))
+                    (nth expr 2)))]
+     (cond
       (and (gradient-bearing-array-read? expr)
-           (or (= idx-sym (nth expr 2))
+           (or (= idx-sym index)
                (and sequential? (not scoped?)
                     (not (contains? locals (nth expr 1)))
-                    (or (integer? (nth expr 2))
-                        (replayable-gather-index? (nth expr 2) idx-sym locals)))))
-      (on-read (nth expr 1) (nth expr 2))
+                    (or (integer? index)
+                        (replayable-gather-index? index idx-sym locals)))))
+      (on-read (nth expr 1) index)
       (seq? expr)
       (let [{:keys [kind liftable?]} (form/form-info expr)
             nested-scope? (or scoped? (= :binding kind) (not liftable?))]
         (with-meta (apply list (map #(lift % nested-scope? locals) expr)) (meta expr)))
       (vector? expr) (with-meta (mapv #(lift % scoped? locals) expr) (meta expr))
-      :else expr)))
+      :else expr))))
 
 (defn- analyze-par-map-body
   "Analyze a par/map! body for aget references and free scalars.
@@ -2122,39 +2126,70 @@
   its backward loop scatter-adds at those indices."
   ([body-expr idx-sym] (analyze-par-map-body body-expr idx-sym false))
   ([body-expr idx-sym literal-index-reads?]
+   (analyze-par-map-body body-expr idx-sym literal-index-reads? nil))
+  ([body-expr idx-sym literal-index-reads? replay-forbidden-values]
   (let [agets (atom [])
         ;; Extract let* bindings if present
         [bindings body-result0]
         (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
           [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
-          [[] body-expr])]
+          [[] body-expr])
+        ;; Map index replay may expand only pure sequential aliases independent
+        ;; of active captures and the destination being written. Keep the
+        ;; original local initializers at their original evaluation sites; these
+        ;; expressions are proof/replay data, not a reordered scalar program.
+        local-ids (set (map first bindings))
+        index-alias-state
+        (when (some? replay-forbidden-values)
+          (binding [util/*shadowing-locals* (into util/*shadowing-locals*
+                                                (conj local-ids idx-sym))]
+            (reduce
+             (fn [{:keys [aliases snapshots]} [id initializer]]
+               (let [expanded (util/subst-syms aliases initializer)
+                     free (util/free-syms expanded)]
+                 {:snapshots (conj snapshots aliases)
+                  :aliases (if (and (not-any? local-ids free)
+                                    (not-any? replay-forbidden-values free)
+                                    (not-any? gradient-bearing-array-read?
+                                              (tree-seq coll? seq expanded))
+                                    (= :pure (effects/analyze-effect expanded)))
+                             (assoc aliases id expanded)
+                             (dissoc aliases id))}))
+             {:aliases {} :snapshots []} bindings)))
+        index-aliases (:aliases index-alias-state)
+        alias-snapshots (or (:snapshots index-alias-state) (repeat nil))]
     ;; (1) let*-bound agets
-    (doseq [[sym init] bindings]
+    (doseq [[[sym init] aliases] (map vector bindings alias-snapshots)]
       (when (gradient-bearing-array-read? init)
-        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})))
+        (swap! agets conj {:sym sym :arr (nth init 1)
+                          :idx (if aliases
+                                 (util/subst-syms aliases (nth init 2))
+                                 (nth init 2))})))
     ;; (2) lift admitted inline reads, deduplicating by array AND original index.
     ;; Literal reads in scan stay inside the reverse iteration, not outside a zero-trip loop.
     (let [seen (atom {})
-          lift (scan-read-lifter
-                idx-sym literal-index-reads?
-                (fn [arr index]
+          on-read (fn [arr index]
                   (let [k [arr index]]
                     (or (get @seen k)
                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
                           (swap! seen assoc k s)
                           (swap! agets conj {:sym s :arr arr :idx index})
-                          s)))))
+                          s))))
+          lift-for (fn [aliases]
+                     (scan-read-lifter idx-sym literal-index-reads? on-read
+                                       (when aliases #(util/subst-syms aliases %))))
+          lift (lift-for index-aliases)
           ;; These top-level bindings were stripped above. A lifted read is replayed
           ;; before scalar bindings, so it must not capture their aliases/shadows.
           body-result (lift body-result0 false (set (map first bindings)))
           scalar-bindings* (:bindings
-                            (reduce (fn [{:keys [locals bindings]} [s init]]
+                            (reduce (fn [{:keys [locals bindings]} [[s init] aliases]]
                                       {:locals (conj locals s)
                                        :bindings (if (gradient-bearing-array-read? init)
                                                    bindings
-                                                   (conj bindings [s (lift init false locals)]))})
+                                                   (conj bindings [s ((lift-for aliases) init false locals)]))})
                                     {:locals #{} :bindings []}
-                                    bindings))]
+                                    (map vector bindings alias-snapshots)))]
       (let [aget-syms (set (map :sym @agets))
             bound-syms (set (cons idx-sym (concat (map first scalar-bindings*) aget-syms)))
             free-syms (util/free-syms body-result bound-syms)
@@ -2184,7 +2219,7 @@
   [par-map-form active-params]
   (let [[_ out-sym idx-sym bound-expr cast-fn body-expr] par-map-form
         {:keys [agets scalar-bindings body-result free-syms]}
-        (analyze-par-map-body body-expr idx-sym true)
+        (analyze-par-map-body body-expr idx-sym true (conj (set active-params) out-sym))
 
         ;; Determine which arrays are written and read
         written-arrs [out-sym]
@@ -3801,7 +3836,20 @@
         ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
         materialized (:form (materialize/materialize-pass scoped nil))]
     ;; Hoist nested lets out of call args into flat ANF for AD.
-     (hoist-nested-lets materialized))))
+    (let [flat (hoist-nested-lets materialized)
+          tag-facts
+          (reduce-kv
+           (fn [facts id tag]
+             (cond
+               (dtype/dtype-for-array-tag tag)
+               (assoc-in facts [:array-types id] (dtype/dtype-for-array-tag tag))
+               (dtype/dtype-for-scalar-tag tag)
+               (assoc-in facts [:scalar-types id] (dtype/dtype-for-scalar-tag tag))
+               :else facts))
+           {:array-types {} :scalar-types {}} (or param-env {}))]
+      (:form ((requiring-resolve
+               'raster.compiler.passes.parallel.typed-soac-frontend/canonicalize-fresh-full-write-maps)
+              flat tag-facts))))))
 
 (defn grad-expr
   "Transform a quoted S-expression for reverse-mode AD.
