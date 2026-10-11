@@ -101,6 +101,100 @@
           (is (= @submitted @awaited @released))
           (is (empty? (:events @session))))))))
 
+(deftest compatibility-transfer-measurement-survives-await-retirement-failure
+  ;; Modern transfer submission owns ::transfer-state. This explicit compatibility entry must
+  ;; exercise the separate common-event branch, including its stable :awaited measurement.
+  (doseq [retry-safe? [true false]]
+    (let [failure (ex-info "compatibility native retirement failed"
+                           {:cleanup-retry-safe? retry-safe?})
+          waits (atom 0) release-dispatches (atom 0) native-releases (atom 0)
+          queries (atom 0) closed (atom 0) order (atom [])
+          owner (cleanup/owner
+                 [{:id :native-event
+                   :release #(do
+                               (when (= 1 (swap! native-releases inc)) (throw failure))
+                               (swap! order conj :native-retired))}])
+          token {::cleanup/owner owner}
+          destination (float-array 8)
+          lease (reify java.lang.AutoCloseable
+                  (close [_] (swap! closed inc) (swap! order conj :host-closed)))
+          event (g/->GPUEvent :compatibility-transfer :event {:class :transfer})
+          submitted (System/nanoTime)
+          backend-measurement {:timing-source :device-event :elapsed-ns 40 :bytes 32
+                               :commands 1 :direction :download :asynchronous? true}
+          footprint {:buffer-keys #{:buffer} :allocation-ids #{:allocation}
+                     :resident-buffers [:buffer]}
+          entry (merge footprint
+                       {:event event :kind :transfer :status :pending :backend-event token
+                        :value [destination] :submitted-ns submitted :submit-return-ns (+ submitted 10)
+                        :retained-resources [lease]})
+          session (atom {:device-id :ze:0 :session-id :compatibility-transfer :closed? false
+                         :buffers {} :kernel-graphs {} :events {(:id event) entry}})
+          event-entry #(get-in @session [:events (:id event)])
+          error-of (fn [f] (try (f) nil (catch Throwable error error)))]
+      (with-redefs-fn
+        {(ns-resolve 'raster.gpu.core 'rt-resolve)
+         (fn [_ name]
+           (case name
+             "await-event!" (fn [value]
+                              (is (identical? token value))
+                              (swap! waits inc)
+                              backend-measurement)
+             "release-event!" (fn [value]
+                                (is (identical? token value))
+                                (swap! release-dispatches inc)
+                                (cleanup/release! (::cleanup/owner value)))
+             "event-complete?" (fn [_] (swap! queries inc) false)
+             (throw (ex-info "unexpected compatibility runtime operation" {:name name}))))}
+        (fn []
+          (is (not (contains? (event-entry) :raster.gpu.core/transfer-state)))
+          (is (false? (g/event-complete? session event)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be awaited"
+                                (g/event-measurement session event)))
+          (is (identical? failure (error-of #(g/await-event! session event))))
+          (let [awaited (event-entry) saved (:measurement awaited)]
+            (is (= :awaited (:status awaited)))
+            (is (identical? token (:backend-event awaited)))
+            (is (= footprint (select-keys awaited (keys footprint))))
+            (is (= [lease] (:retained-resources awaited)))
+            (is (= backend-measurement
+                   (select-keys saved (keys backend-measurement))))
+            (is (= 10 (:submit-host-ns saved)))
+            (is (<= 10 (:host-wall-ns saved)))
+            (is (zero? @closed))
+            (is (true? (g/event-complete? session event)))
+            (is (= 1 @queries) "stable awaited progress requires no further backend query")
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be awaited"
+                                  (g/event-measurement session event)))
+            (if retry-safe?
+              (do
+                (is (= [destination] (g/await-event! session event)))
+                (is (= saved (g/event-measurement session event))
+                    "retry preserves the first successful wait's complete measurement")
+                (is (= :complete (:status (event-entry))))
+                (is (nil? (:backend-event (event-entry))))
+                (is (empty? (:retained-resources (event-entry))))
+                (is (= 2 @native-releases @release-dispatches))
+                (is (= 1 @closed))
+                (is (= [:native-retired :host-closed] @order))
+                (is (= [destination] (g/await-event! session event)))
+                (is (nil? (g/release-event! session event)))
+                (is (empty? (:events @session)))
+                (is (= 2 @native-releases @release-dispatches))
+                (is (= 1 @closed)))
+              (do
+                (dotimes [_ 2]
+                  (is (identical? failure (error-of #(g/release-event! session event)))))
+                (is (= 1 @native-releases))
+                (is (= 3 @release-dispatches))
+                (is (= :awaited (:status (event-entry))))
+                (is (= saved (:measurement (event-entry))))
+                (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be awaited"
+                                      (g/event-measurement session event)))
+                (is (zero? @closed))
+                (is (empty? @order)))))
+          (is (= 1 @waits) "retirement retry never repeats backend wait"))))))
+
 (deftest pending-transfer-retains-only-its-resident-buffer
   (let [freed (atom [])
         buffer (lifecycle/native-buffer #(hash-map :dtype :float :n-elements 8 :byte-size 32)
