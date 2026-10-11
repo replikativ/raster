@@ -12,6 +12,7 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kernel-call]
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -28,7 +29,8 @@
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
-            [raster.compiler.backend.gpu.segop-opencl :as sg]))
+            [raster.compiler.backend.gpu.segop-opencl :as sg]
+            [raster.compiler.backend.gpu.segmap-retirement-fixture :as retirement]))
 
 (deftest scalar-reduction-storage-alias-requires-the-exact-closed-projection
   (let [source '(let* [^long extent (clojure.core/long
@@ -1110,40 +1112,71 @@
 ;; ================================================================
 
 (deftest segmap-fused-secondary-output-is-array-param
-  (let [form '(raster.par/map! hout1 i n float
-                               (do (raster.arrays/aset hout2 i (float (* (clojure.core/aget d i)
-                                                                         (clojure.core/aget a i))))
-                                   (* (clojure.core/aget d i) (clojure.core/aget b i))))
-        s (soac/par-form->soac 'da form 0)
-        segmap (first (lower/lower-map s nil :dtype :float))
-        k (sg/generate-segmap-kernel segmap 'hout1 :dtype :float)]
-    (testing "secondary output is an array param, not a scalar param"
-      (is (kart/kernel-artifact? k))
-      (is (some #{'hout2} (kart/attribute k :array-params)))
-      (is (not (some #{'hout2} (kart/attribute k :scalar-params))))
-      (is (some #{'hout2} (kart/attribute k :written-arrays))))
-    (testing "declared __global and NON-const in the C signature"
-      (is (re-find #"__global float\* restrict hout2" (:source k)))
-      (is (not (re-find #"const float\* restrict hout2" (:source k)))))
-    (testing "written via subscript in the body"
-      (is (re-find #"hout2\[" (:source k))))
-    (testing "the ABI preserves secondary-output, primary-output, scalar and bound order"
-      (is (= '[a b d hout2 hout1 _n_bound] (mapv :name (:abi k))))
-      (is (= [:input :input :input :output :output :scalar]
-             (mapv :kind (:abi k))))
-      (is (= '[a b d hout2 hout1 n] (:arguments k))))))
+  (let [{:keys [artifact operation admission]} (retirement/emit :secondary-output :ocl:0 false)
+        slots (:abi artifact)
+        pointers (filterv #(not= :scalar (:kind %)) slots)
+        outputs (filterv #(= :output (:kind %)) pointers)]
+    (is (= 1 (get-in admission [:stats :horizontal])))
+    (is (= #{'hout1 'hout2} (:outputs operation)))
+    (is (= #{'hout1 'hout2} (set (map :name outputs))))
+    (is (= #{'a 'b 'd} (set (map :name (filter #(= :input (:kind %)) pointers)))))
+    (is (every? #(= :float (:dtype %)) outputs))
+    (is (= :kernel-body (kart/attribute artifact :emission-route)))
+    (doseq [slot outputs]
+      (let [name (or (:c-name slot) (str (:name slot)))]
+        (is (str/includes? (:source artifact) (str name "[")))
+        (is (re-find (re-pattern (str "__global float\\*\\s+" name)) (:source artifact)))
+        (is (not (re-find (re-pattern (str "__global const float\\*[^,)]*" name)) (:source artifact))))))
+    (is (= (mapv :name (remove #(= :bound (:role %)) slots))
+           (vec (butlast (:arguments artifact)))))
+    (is (= 'n (last (:arguments artifact))))
+    (is (= artifact (kart/validate! artifact)))))
+
+(deftest canonical-secondary-output-alias-contract-survives-retirement
+  (let [{:keys [artifact]} (retirement/emit :secondary-output :ocl:0 false)
+        pointers (filterv #(not= :scalar (:kind %)) (:abi artifact))
+        arrays (mapv (fn [_] (float-array 1)) pointers)
+        output-indices (keep-indexed #(when (= :output (:kind %2)) %1) pointers)]
+    (is (= arrays (kabi/validate-logical-pointer-aliases!
+                  (:abi artifact) arrays kernel-call/pointer-overlaps?)))
+    (doseq [index output-indices]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kabi/validate-logical-pointer-aliases!
+                    (:abi artifact) (assoc arrays index (first arrays)) kernel-call/pointer-overlaps?))))
+    ;; This ABI proves input-vs-write disjointness, not pairwise output disjointness.
+    ;; Fresh pure-map output identity belongs to realization and its numerical/native controls.
+    (let [shared-outputs (assoc arrays (second output-indices) (nth arrays (first output-indices)))]
+      (is (= shared-outputs
+             (kabi/validate-logical-pointer-aliases!
+              (:abi artifact) shared-outputs kernel-call/pointer-overlaps?))))))
 
 (deftest segmap-abi-preserves-integer-scalar-type
-  (let [form '(raster.par/map! out i n float
-                               (clojure.core/aget a (clojure.core/+ i offset)))
-        s (soac/par-form->soac 'out form 1)
-        segmap (first (lower/lower-map s nil :dtype :float))
-        k (sg/generate-segmap-kernel segmap 'out :dtype :float
-                                     :scalar-types {'offset :int})]
-    (is (= '[a out offset _n_bound] (mapv :name (:abi k))))
-    (is (= [:float :float :int :int] (mapv :dtype (:abi k))))
-    (is (re-find #"int offset" (:source k)))
-    (is (= '[a out offset n] (:arguments k)))))
+  (let [{:keys [artifact]} (retirement/emit :integer-offset :ocl:0 false)
+        offset (some #(when (= 'offset (:name %)) %) (:abi artifact))]
+    (is (= :scalar (:kind offset)))
+    (is (= :int (:dtype offset) (:kernel-dtype offset)))
+    (is (re-find #"int offset" (:source artifact)))
+    (is (some #{'offset} (:arguments artifact)))
+    (is (= :kernel-body (kart/attribute artifact :emission-route)))
+    (is (= artifact (kart/validate! artifact)))))
+
+(deftest retired-segmap-fixtures-preserve-independent-source-values
+  (doseq [kind [:secondary-output :integer-offset]
+          n [0 1 3]
+          seed [1.0 -2.0]]
+    (let [{:keys [source packet]} (retirement/emit kind :ocl:0 false)
+          execute #(eval (list 'fn '[a b d n offset] %))
+          a (float-array (map #(+ seed %) (range 4)))
+          b (float-array [2.0 -4.0 8.0])
+          d (float-array [0.5 0.25 -0.5])
+          expected (if (= kind :secondary-output)
+                     [(mapv #(float (* %1 %2)) (take n d) (take n b))
+                      (mapv #(float (* %1 %2)) (take n d) (take n a))]
+                     (mapv float (take n (drop 1 a))))
+          values #(if (= kind :secondary-output) (mapv vec %) (vec %))]
+      (is (= expected
+             (values ((execute source) a b d (long n) (int 1)))
+             (values ((execute (:source packet)) a b d (long n) (int 1))))))))
 
 (deftest scheduled-segmap-fails-closed-at-the-kernel-body-boundary
   (let [form '(raster.par/map! out i n float
