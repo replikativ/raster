@@ -16,6 +16,33 @@ closure must extend the existing dimension projection authority, not collect sym
 arbitrary S-expressions or introduce a second shape/type vocabulary. Public surface semantics,
 floating-point policy and AD operation coverage do not change.
 
+## Canonical program-envelope pilot
+
+`normalized-program-bundle/adapt-map` projects exactly one already-admitted homogeneous map
+into a canonical envelope: top-level source/primal/linear/transpose fields are actual TypedSOAC
+programs, never scalar lane programs with changed field meanings. Ordered retained-ID/AV
+interfaces identify the explicit tangent and cotangent spaces. Residual bindings identify their
+exact source/scalar origins and primal equation/result producers; direct scalar captures remain
+immutable inputs, while coefficient arrays retain owned snapshot AVs. Pure maps have no physical
+binding obligations. The existing scalar/map bundle is explicitly nested derivation evidence.
+
+Validation still uses the existing scalar/rule/type/call and fixed-ID map-lifting authority,
+then checks exact canonical projection correspondence and a process-independent semantic
+certificate. Only the two declared runtime Namespace fields are projected to namespace names,
+after their actual Namespace identity has been checked; opaque unsupported values are not
+silently sanitized. Existing rule/definition epochs and all physical AV facets remain bound.
+Host execution tests use existing materialization; non-host placement still refuses there.
+The existing authority checks scalar linearity, residual interfaces and source/lift relations;
+it does not independently regenerate registered scalar derivative arithmetic. This pilot is
+not a proof of custom-rule mathematics. Fixed-ID scalar rule reconstruction remains a separate
+consolidation obligation, not a capability granted by producer certification.
+
+This thin migration adapter adds no runtime mode, parser, rule registry, cache, equation
+composition or fusion permission. Old APIs and runtimes remain unchanged. The nested evidence
+and family validators may retire only after a common program validator independently owns the
+same source/derivative/residual obligations and the existing numerical/refusal gates agree.
+Map→sum/indexed composition, exact SFT and the unchanged FAILED Gemma gate (11/28) remain open.
+
 ## Indexed-map construction checkpoint
 
 `linearize-indexed-map-program` constructs ordinary SOAC programs in the existing certified
