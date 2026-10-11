@@ -761,8 +761,18 @@
                             (cond (contains? param-index s) [:input (param-index s)]
                                   (contains? buffer-index s) [:buffer (buffer-index s)]
                                   :else [:absent nil])) result-syms)
-        cache (when reuse-buffers? (volatile! nil))]
-    (fn [& args]
+        cache (when reuse-buffers? (volatile! nil))
+        abi-indices (into array-indices scalar-indices)]
+    (if (and (empty? heap-buffers) (= :native-scalar result-shape))
+      ;; No allocation extent or returned-buffer selector exists in this plan.
+      ;; Keep the ordinary native adapter (including ownership/alias admission),
+      ;; but do not construct an unused size environment on every density call.
+      (fn [& args]
+        (let [args (vec args)
+              arguments (into (mapv #(nth args %) abi-indices)
+                              (map #(count (nth args (first %))) length-plan))]
+          (apply native arguments)))
+      (fn [& args]
       (let [args (vec args)
             lengths (mapv #(count (nth args (first %))) length-plan)
             env (reduce (fn [m [[_ ls] n]] (assoc m ls n))
@@ -783,7 +793,7 @@
             native-result
             (let [results (mapv (fn [[kind i]]
                               (case kind :input (nth args i) :buffer (nth bufs i) nil)) result-plan)]
-              (if (= :vector result-shape) results (first results)))))))))
+              (if (= :vector result-shape) results (first results))))))))))
 
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C

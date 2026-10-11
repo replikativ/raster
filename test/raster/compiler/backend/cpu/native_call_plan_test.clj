@@ -9,6 +9,29 @@
     '[[irrelevant (Math/sqrt eps)] [base (+ n x_length)] [extent (int base)]]
     :vector '[out x] reuse?))
 
+(deftest scalar-return-without-scratch-keeps-the-checked-native-boundary
+  (let [calls (atom [])
+        x (double-array [1.0 2.0])
+        ids (int-array [1 0])
+        f (#'aot/native-call-wrapper
+           (fn [& arguments] (swap! calls conj (vec arguments)) 7.25)
+           '[scale ids x n] '[[ids "int"] [x "double"]]
+           '[[scale "double"] [n "long"]] '[[x x_length] [ids ids_length]]
+           [] '[[unused (unknown-size n)]] :native-scalar [] false)]
+    (with-redefs [aot/resolve-int-expr
+                  (fn [& _] (throw (AssertionError. "no scratch extent needs evaluation")))]
+      (is (= 7.25 (f 0.5 ids x 19)))
+      (is (= 7.25 (f 0.75 (int-array 0) (double-array 3) 40))))
+    (is (identical? ids (ffirst @calls)))
+    (is (identical? x (second (first @calls))))
+    (is (= [0.5 19 2 2] (subvec (first @calls) 2)))
+    (is (= [0.75 40 3 0] (subvec (second @calls) 2))))
+  (let [failure (ex-info "ordinary native refusal" {:reason :native-alias})
+        f (#'aot/native-call-wrapper (fn [& _] (throw failure))
+           '[x] '[[x "double"]] [] [] [] [] :native-scalar [] false)]
+    (is (identical? failure
+                   (try (f (double-array 1)) (catch clojure.lang.ExceptionInfo error error))))))
+
 (deftest precomputed-native-abi-and-size-dependencies
   (let [calls (atom [])
         resolver aot/resolve-int-expr
