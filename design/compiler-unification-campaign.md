@@ -24,6 +24,25 @@ adapter still validates under default intent and refuses selected-math plans. Su
 composition requires a separate independent caller request, never consent inferred from the
 runtime owner or its certificate. Existing default durable capture remains unchanged.
 
+### Typed scan declines do not retry compatibility inference
+
+Recognized inclusive/exclusive scans retain the complete typed singleton admission decision.
+An intentional typed refusal now preserves its source, effects and exact structured diagnostic
+without retrying compatibility SOAC inference; other parallel families' fallback behavior and
+unexpected/invariant exception propagation are unchanged. The private fallback graph-construction
+branch is retired. Public compatibility scan constructors remain for direct fixtures, while
+admitted scans continue through the shared typed schedule, scalar interface and node validator.
+This is a routing consolidation, not broader helper/algebra admission, new AD support or completion
+of the unchanged failed real-model training gate. Native scan and independent source-prefix oracles
+remain required.
+
+Warm validation passes 30 focused boundary/source-packet tests / 570 assertions and
+145 surrounding TypedSOAC, graph, emitter and actual-device tests / 1792 assertions.
+Both local device backends were asserted available before the native controls. Partial
+literal traversal retains padded backing storage and untouched suffixes; a concrete
+element helper follows its independently obtained typed admission or exact refusal.
+No test substitutes successful scheduling for an unsupported helper or recurrence.
+
 ### Original scalar closure for compatibility scan graphs
 
 Compatibility scan graph construction now requires retained scalar dtype facts for dynamic

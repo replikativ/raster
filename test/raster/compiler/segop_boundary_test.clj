@@ -122,18 +122,14 @@
                   result)
            {})
         declines (get-in r [:stats :segops-declined])
-        typed-decline (first declines)
-        d (first (filter #(= :segop (:stage %)) declines))]
+        typed-decline (first declines)]
     (is (zero? (get-in r [:stats :segops-lowered])))
     (is (zero? (get-in r [:stats :kernel-graphs-lowered])))
-    (is (= 2 (count declines)))
+    (is (= 1 (count declines)))
     (is (= :typed-admission (:stage typed-decline)))
     (is (= :scan-not-associative (:reason typed-decline)))
     (is (= (get (into {} (map vec (partition 2 (second (program/source-form (:form r)))))) 'result)
-           (:source typed-decline)))
-    (is (= :segop (:stage d)))
-    (is (= :scan-not-associative (:reason d)))
-    (is (= :backend-relowers-or-uses-specialized-codegen (:fallback d)))))
+           (:source typed-decline)))))
 
 (deftest an-unrepresentable-par-form-becomes-a-diagnostic
   (testing "a par form with no lowering rule is the case that used to vanish onto stderr"

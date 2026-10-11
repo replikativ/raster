@@ -88,14 +88,7 @@
           (cond
             (:err segops) (decline :segop (:err segops))
             (seq (:ok segops))
-            (if (soac-lower/scan-soac? legacy-node)
-              (let [graph (attempt #(soac-lower/scan-kernel-graph
-                                    legacy-node (:ok segops) {:array-types array-types
-                                                             :scalar-types scalar-types}))]
-                (if (:err graph)
-                  (decline :kernel-graph (:err graph))
-                  {:soac legacy-node :segops (:ok segops) :kernel-graph (:ok graph)}))
-              {:soac legacy-node :segops (:ok segops)})
+            {:soac legacy-node :segops (:ok segops)}
             :else (when par? {:declined (diagnostic sym form :segop
                                                     (ex-info "lower-soac produced no SegOps" {})
                                                     device-id dtype)})))))))
@@ -697,7 +690,14 @@
                             (swap! declined conj (assoc refusal :stage :typed-admission
                                                       :sym sym :source expression)))
                         current-scalar-types (:scalar-types options)
-                        lowered-values (attempt sym expression options)
+                        ;; A recognized scan's typed refusal is its admission decision, not
+                        ;; permission to rediscover weaker semantics through compatibility SOAC.
+                        ;; Other parallel families retain their existing fallback boundary.
+                        typed-scan-declined? (and (:declined packet)
+                                                  (or (par/par-scan-form? expression)
+                                                      (par/par-scan-exclusive-form? expression)))
+                        lowered-values (when-not typed-scan-declined?
+                                         (attempt sym expression options))
                         row (when lowered-values
                               (swap! lowered inc)
                               (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))

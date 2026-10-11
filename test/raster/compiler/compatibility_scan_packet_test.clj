@@ -1,6 +1,7 @@
 (ns raster.compiler.compatibility-scan-packet-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.par]
+            [raster.numeric]
             [raster.compiler.ir.abstract-value :as value]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.soac :as soac]
@@ -30,6 +31,106 @@
                       (throw (AssertionError. "admitted scan reached legacy semantic inference")))
                     (apply original arguments))]
       (f))))
+
+(deftest typed-scan-refusals-do-not-retry-legacy-conversion
+  (reject-legacy-scans
+   (fn []
+     (doseq [mode [:inclusive :exclusive]]
+       (let [scan (apply list (assoc (vec (scan-form mode :double 'n))
+                                    7 '(Math/tanh (+ (* weight acc) (clojure.core/aget input i)))))
+             source (list 'let* ['before '(swap! events conj :before)
+                                'result scan 'after '(swap! events conj :after)] 'result)
+             expected (:declined (route/attempt (list 'let* ['result scan] 'result)
+                                                :double {'input :double 'out :double}
+                                                {:scalar-types {'n :long 'weight :double}}))
+             result (lower/segop-lower-pass source
+                                           (assoc (options :double) :scalar-types
+                                                  {'n :long 'weight :double}))
+             packet (:form result)
+             declines (get-in result [:stats :segops-declined])]
+         (is (= :scan-not-associative (:reason expected)))
+         (is (= [(assoc expected :stage :typed-admission :sym 'result :source scan)] declines))
+         (is (empty? (:equations packet)))
+         (is (zero? (get-in result [:stats :kernel-graphs-lowered])))
+         (is (= source (:source packet)))
+         ;; Zero iterations exercise the unchanged primal/effect path without needing
+         ;; the unsupported recurrence's scheduling or derivative semantics.
+         (let [events (atom []) out (double-array 1)
+               execute (eval (list 'fn ['input 'out 'n 'weight 'events] (:source packet)))]
+           (is (identical? out (execute (double-array 0) out 0 0.5 events)))
+           (is (= [:before :after] @events))))))))
+
+(deftest scan-decline-boundary-preserves-options-and-fail-fast-exceptions
+  (doseq [mode [:inclusive :exclusive]]
+    (let [scan (scan-form mode :double 'n)
+          source (list 'let* ['result scan] 'result)
+          opts (options :double)
+          refusal {:reason :typed-soac-unbound-scalar :details {:value 'n}}
+          observed (atom nil)]
+      (reject-legacy-scans
+       (fn []
+         (with-redefs [route/attempt (fn [form dt arrays options]
+                                      (reset! observed [form dt arrays options])
+                                      {:declined refusal})]
+           (let [result (lower/segop-lower-pass source opts)]
+             (is (= [(assoc refusal :stage :typed-admission :sym 'result :source scan)]
+                    (get-in result [:stats :segops-declined])))
+             (is (= source (get-in result [:form :source])))))))
+      (is (= [source :double (:array-types opts)
+              {:scalar-types (:scalar-types opts) :values (:values opts)
+               :resident-reductions? false}] @observed))
+      (doseq [failure [(ex-info "compiler invariant" {:reason :raster/bug})
+                       (NullPointerException. "unexpected analysis failure")]]
+        (with-redefs [route/attempt (fn [& _] (throw failure))]
+          (is (identical? failure
+                          (try (lower/segop-lower-pass source opts) nil
+                               (catch Throwable actual actual)))))))))
+
+(deftest partial-literal-scans-keep-padded-storage-and-concrete-elements
+  (reject-legacy-scans
+   (fn []
+     (doseq [mode [:inclusive :exclusive]
+             element ['(clojure.core/aget input i)
+                      '(.invk raster.numeric/_star__m_double_double-impl
+                              (clojure.core/aget input i) (clojure.core/aget input i))]]
+       (let [scan (apply list (assoc (vec (scan-form mode :double 2)) 7 (list '+ 'acc element)))
+             source (list 'let* ['result scan] 'result)
+             opts (-> (options :double)
+                      (assoc :scalar-types {})
+                      (assoc-in [:values 'input :shape] [4])
+                      (assoc-in [:values 'out :shape] [6]))
+             expected (route/attempt source :double (:array-types opts)
+                                     {:scalar-types {} :values (:values opts)})
+             result (lower/segop-lower-pass source opts)
+             packet (:form result)]
+         (if-let [refusal (:declined expected)]
+           (do (is (= [(assoc refusal :stage :typed-admission :sym 'result :source scan)]
+                      (get-in result [:stats :segops-declined])))
+               (is (empty? (:equations packet))))
+           (do (is (some? (:program expected)))
+               (is (= 1 (get-in result [:stats :typed-soac-reused])))
+               (is (= [4] (get-in packet [:values 'input :shape])))
+               (is (= [6] (get-in packet [:values 'out :shape])))))
+         (doseq [form [source (:source packet)]]
+           (let [input (double-array [2.0 3.0 100.0 200.0])
+                 out (double-array (repeat 6 -9.0))
+                 execute (eval (list 'fn ['input 'out] form))
+                 prefixes (if (= element '(clojure.core/aget input i)) [0.0 2.0 5.0] [0.0 4.0 13.0])
+                 expected-prefix (if (= mode :inclusive) (rest prefixes) prefixes)]
+             (is (identical? out (execute input out)))
+             (is (= (vec (concat expected-prefix (repeat (- 6 (count expected-prefix)) -9.0)))
+                    (vec out)))
+             (is (= [2.0 3.0 100.0 200.0] (vec input))))))))))
+
+(deftest non-scan-compatibility-fallback-is-unchanged
+  (let [calls (atom []) original soac/par-form->soac
+        scatter '(raster.par/scatter! out indices input n)]
+    (with-redefs [soac/par-form->soac (fn [& args]
+                                      (swap! calls conj (second args))
+                                      (apply original args))]
+      (let [result (lower/segop-lower-pass (list 'let* ['result scatter] 'result) (options :double))]
+        (is (= [scatter] @calls))
+        (is (= :soac (:stage (first (get-in result [:stats :segops-declined])))))))))
 
 (deftest scans-import-complete-typed-packets-and-caller-capacities
   (reject-legacy-scans
