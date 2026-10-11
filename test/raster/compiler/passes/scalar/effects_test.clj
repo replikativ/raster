@@ -50,6 +50,19 @@
                       :checked-source-cast))
       "the op descriptor's explicit wrapping cast has no checked exception obligation"))
 
+(deftest generated-reference-conversions-retain-their-evaluation-obligation
+  (let [cast '(clojure.core/double x)
+        retained (with-meta cast {:raster.effect/source-reference-cast true})
+        selected (with-meta '(.invk generated/cast-impl x)
+                   {:raster.op/original 'clojure.core/double
+                    :raster.effect/source-reference-cast true})]
+    (doseq [expression [retained selected]]
+      (is (contains? (:flags (effects/descriptor expression)) :source-reference-cast))
+      (is (not (effects/removable-expr? expression)))
+      (is (not (effects/cse-safe-expr? expression))))
+    (is (not (contains? (:flags (effects/descriptor cast)) :source-reference-cast))
+        "missing scoped type information alone does not declare a reference cast")))
+
 (deftest cached-descriptors-distinguish-metadata
   ;; Descriptors are memoized. The source operation of a devirtualized call
   ;; lives in metadata, which equality ignores, so the cache must not hand one

@@ -3260,7 +3260,8 @@
 
 (defn- requires-ordered-evaluation?
   [expression]
-  (contains? (:flags (effects/descriptor expression)) :checked-source-cast))
+  (boolean (some #{:checked-source-cast :source-reference-cast}
+                 (:flags (effects/descriptor expression)))))
 
 (defn- parallel-extent
   [expression]

@@ -5,6 +5,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.passes.scalar.soa-lower :as sl]
+            [raster.compiler.passes.scalar.cse :as cse]
             [raster.compiler.passes.scalar.dce :as dce]))
 
 (defvalue LocalFloatPair [a :- Double b :- Double])
@@ -36,7 +37,8 @@
 (deftest argument-evaluation-precedes-conversion
   (let [source '(let* [p (->LocalFloatPair "bad" (do (swap! observations conj :later) 2.0))]
                  (.b p))]
-    (doseq [expression [source (project source) (:form (dce/eliminate-dead-bindings (project source)))]]
+    (doseq [expression [source (project source) (cse/cse-let (project source))
+                       (:form (dce/eliminate-dead-bindings (cse/cse-let (project source))))]]
       (reset! observations [])
       (is (thrown? ClassCastException (run expression)))
       (is (= [:later] @observations)))))

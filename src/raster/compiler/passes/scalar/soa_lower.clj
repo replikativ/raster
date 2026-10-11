@@ -225,7 +225,13 @@
           converted (mapv (fn [{:keys [element-tag]} [actual _]]
                             (let [sym (with-meta (gensym "field_value__")
                                         {:raster.type/tag element-tag})]
-                              [sym (list (symbol "clojure.core" (name element-tag)) actual)])) fields raw)]
+                              [sym (cond-> (list (symbol "clojure.core" (name element-tag)) actual)
+                                     ;; A generic factory converts Object actuals. Keep a
+                                     ;; denial-only evaluation obligation when the source
+                                     ;; lacks numeric evidence; the field dtype is not proof
+                                     ;; that this conversion cannot throw or call Number.
+                                     (nil? (some-> actual types/sym-type-tag dtype/dtype-for-scalar-tag))
+                                     (with-meta {:raster.effect/source-reference-cast true}))])) fields raw)]
       {:bindings (vec (mapcat identity (concat raw converted)))
        :fields (zipmap (map :name fields) (map first converted))})))
 

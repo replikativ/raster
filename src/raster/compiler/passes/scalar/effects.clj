@@ -174,24 +174,25 @@
 
    This deliberately derives from op-descriptor's closed conversion contract;
    it is not another function registry. Without retained operand dtypes here,
-   reference casts and checked integral casts remain conservatively non-removable. A proven
-   identity/widening or a successful checked constant conversion adds no obligation."
+   checked integral casts remain conservatively non-removable. Local product
+   lowering additionally retains its generic factory's reference conversion
+   obligation explicitly. Untyped scoped binders require their own type evidence;
+   this does not globally reinterpret their casts as reference conversions."
   [expr]
   (into #{}
    (mapcat (fn [node]
            (when (seq? node)
              (let [operation (descriptor/semantic-op node)]
-               (when (and (descriptor/cast-op? operation) (not (proven-total-cast? node)))
+               (when (descriptor/cast-op? operation)
                     (cond-> []
-                        (and (= :reject (descriptor/cast-integral-narrowing operation))
+                        (and (not (proven-total-cast? node))
+                             (= :reject (descriptor/cast-integral-narrowing operation))
                              (contains? '#{byte int long} (descriptor/cast-result-tag operation)))
                         (conj :checked-source-cast)
-                        ;; Even a floating cast can throw on an unknown reference
-                        ;; (nil, a string, or an arbitrary Number implementation).
-                        ;; Numeric retained operand evidence is required before
-                        ;; DCE/CSE can discard this evaluation obligation.
-                        (nil? (some-> (first (descriptor/call-args node))
-                                      types/sym-type-tag dtype/dtype-for-scalar-tag))
+                        ;; This is denial-only evidence from the source factory:
+                        ;; no optimizer may erase its conversion merely because
+                        ;; the projected field is not otherwise used.
+                        (true? (:raster.effect/source-reference-cast (meta node)))
                         (conj :source-reference-cast))))))
          (tree-seq coll? seq expr))))
 
