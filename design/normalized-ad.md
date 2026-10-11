@@ -418,6 +418,30 @@ separate capability gates.
 The unchanged Gemma, SFT and held checkpoint gates remain independent: successful
 scalar normalization does not certify them.
 
+`linearize-map-sum-program` is the next program-construction checkpoint. It accepts
+exactly a checked functional map followed by one scalar Float/Double additive sum.
+The reduction must read the exact map result over the same extent, have a positive
+typed zero initializer, and its actual homogeneous selected step must add precisely
+the accumulator and element. Its retained algebra certificate is independently
+rederived from that step; it is not reassociation consent. Original addition operand
+order, initializer, dtype and the original reduction equation remain in the primal.
+The linear program reduces the tangent map with the same step and zero; the transpose
+map receives an explicit scalar seed as a capture, without a broadcast array or
+implicit cotangent summation. Identity maps may need no residual arrays.
+
+The existing bundle carries these ordinary SOAC programs under `:sum-programs`.
+Validation rechecks the original two-equation source, the map prefix relationship,
+fresh interfaces and construction correspondence, including semantic metadata and
+owned residuals. Known frontend binding bookkeeping is projected only after its
+complete two-binding envelope and absent host activity have been checked; unknown
+attributes are not stripped. No derivative rules or numerical interpreter are added.
+This checkpoint does not execute sums: the one-map runtime explicitly refuses a sum
+bundle until shared host materialization and execution are extended. Nonzero or
+negative-zero initialization, arbitrary folds, transforms, stored results, effects,
+mixed precision and reassociated/device execution remain separate gates. The unchanged
+real-weight Gemma gate remains FAILED (11/28 adapter components), and exact SFT remains
+an independent acceptance obligation.
+
 The bounded map region also admits two same-shape homogeneous arrays when the caller
 explicitly selects one source value ID with `{:active-array id}`. The two-argument
 one-array entry remains unchanged; two arrays without a selection refuse. Existing

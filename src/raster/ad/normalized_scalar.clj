@@ -10,12 +10,14 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inference]
+            [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.core :as core]))
@@ -372,7 +374,7 @@
       (binding-dtype! values id expression)))
   primal)
 
-(declare validate-map-programs!)
+(declare validate-map-programs! validate-sum-programs!)
 
 (defn validate!
   "Validate the bundle's typed interfaces and retained producer certificate before emission.
@@ -410,6 +412,8 @@
           (fail! :ad-normalized-tangent-interface {:primal p :tangent t :cotangent g}))))
     (when (contains? bundle :map-programs)
       (validate-map-programs! bundle))
+    (when (contains? bundle :sum-programs)
+      (validate-sum-programs! bundle))
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
     bundle))
@@ -443,18 +447,27 @@
   [primal interface]
   (build-bundle primal interface (revisions)))
 
-(defn- map-source-envelope?
-  [facts equation]
+(defn- source-envelope?
+  [facts equations]
   (let [attributes (dissoc (:attributes facts) :source-arithmetic)
-        equation-facts (get-in facts [:equations (second equation)])]
-    (or (and (empty? attributes) (empty? (:attributes equation-facts)))
+        equation-facts (mapv #(get-in facts [:equations (second %)]) equations)]
+    (or (and (empty? attributes) (every? #(empty? (:attributes %)) equation-facts))
         (and (= {:source-dialect :closed-clojure
-                 :source-bindings (nth equation 2)
+                 :source-bindings (vec (mapcat #(nth % 2) equations))
                  :host-binding-ids [] :host-read-values [] :host-read-sites [] :allocations []}
                 attributes)
-             (= {:source-prefix? true} (:attributes equation-facts))
-             (= :analyzed-source (get-in equation-facts [:provenance :front-end]))
-             (= 0 (get-in equation-facts [:provenance :source-binding-id]))))))
+             (every? true?
+                     (map-indexed
+                      (fn [index equation-facts]
+                        ;; With no intervening host activity, the first parallel equation
+                        ;; ends the frontend's stageable scalar prefix for every later one.
+                        (and (= {:source-prefix? (zero? index)} (:attributes equation-facts))
+                             (= :analyzed-source (get-in equation-facts [:provenance :front-end]))
+                             (= index (get-in equation-facts [:provenance :source-binding-id]))))
+                      equation-facts))))))
+
+(defn- map-source-envelope? [facts equation]
+  (source-envelope? facts [equation]))
 
 (defn- project-map-element
   [map-program source-ns output-id options]
@@ -692,6 +705,181 @@
                     :tangent-input (gensym "ad_tangent_") :cotangent-input (gensym "ad_cotangent_")
                     :tangent-output (gensym "ad_push_") :gradient-output (gensym "ad_pull_")}
          bundle (assoc bundle :map-programs (lift-map-programs bundle source interface))]
+     (validate! (assoc bundle :certificate (certificate bundle))))))
+
+(defn- sum-source-map
+  "Check the two-equation source before narrowing its known frontend bookkeeping.
+   This is a relational projection, not permission to erase arbitrary host activity."
+  [source source-ns]
+  (soac/validate! source)
+  (when-not (and (= 2 (count (soac/equations source)))
+                 (instance? clojure.lang.Namespace source-ns))
+    (fail! :ad-normalized-sum-boundary {:source source :source-ns source-ns}))
+  (let [[map-equation reduction :as equations] (soac/equations source)
+        facts (soac/facts source)
+        map-parts (soac/operation-parts map-equation)
+        {:keys [kind attributes arrays captures lambda]} (soac/operation-parts reduction)
+        {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+        [acc element] parameters
+        [identity] (:identities attributes)
+        [dt] (:dtypes attributes)
+        [result] (nth reduction 2)
+        values (:values facts)
+        body (first body-results)
+        scalar-values {result (get values result)
+                       acc (av/tensor {:dtype dt :shape []})
+                       element (av/tensor {:dtype dt :shape []})}]
+    (when-not (and (= 2 (count equations)) (= 'map (:kind map-parts)) (= 'reduce kind)
+                   (= [result] (soac/outputs source)) (= 1 (count (nth reduction 2)))
+                   (empty? (:effects facts)) (empty? (:aliases facts))
+                   (source-envelope? facts equations)
+                   (or (nil? (get-in facts [:attributes :source-arithmetic]))
+                       (= numerics/retained-source-arithmetic
+                          (get-in facts [:attributes :source-arithmetic])))
+                   (every? #(and (empty? (:effects %)) (empty? (:aliases %)))
+                           (map #(get-in facts [:equations (second %)]) equations))
+                   (= arrays (nth map-equation 2)) (= 1 (count arrays)) (empty? captures)
+                   (fingerprint/equivalent? (:extent attributes) (get-in map-parts [:attributes :extent]))
+                   (= 2 (count parameters)) (empty? locals) (= 1 (count body-results))
+                   (every? #(or (nil? (types/sym-type-tag %))
+                                (= dt (dtype/dtype-for-scalar-tag (types/sym-type-tag %)))) parameters)
+                   (= [acc] (:accumulators attributes)) (= 1 (count (:identities attributes)))
+                   (= 1 (count (:algebra attributes))) (contains? #{:float :double} dt)
+                   (= dt (scalar-dtype! (get values result)) (:dtype (get values (first arrays))))
+                   (fingerprint/equivalent?
+                    (select-keys (get values result) [:memory-space :placement :sharding])
+                    (select-keys (get values (first arrays)) [:memory-space :placement :sharding]))
+                   (contains? #{nil :owned} (:ownership (get values result)))
+                   (= {:kind :plain} (:representation (get values result)))
+                   (nil? (:logical-layout (get values result)))
+                   (empty? (:attributes (get values result)))
+                   (empty? (soac/result-storage source (second reduction)))
+                   (set/subset? (set (keys attributes))
+                                #{:index :extent :attributes :accumulators :identities :dtypes
+                                  :algebra :source-arithmetic})
+                   (set/subset? (set (keys (:attributes attributes)))
+                                #{:stable-array-captures :pointwise-storage-inputs})
+                   (every? empty? (vals (:attributes attributes)))
+                   (or (nil? (:source-arithmetic attributes))
+                       (= numerics/retained-source-arithmetic (:source-arithmetic attributes))))
+      (fail! :ad-normalized-sum-boundary {:source source}))
+    (binding [*ns* source-ns]
+      ;; The concrete step must add the exact accumulator and element, not merely carry an
+      ;; additive certificate for some other expression. Selected overloads remain homogeneous.
+      (let [{:keys [operation arguments canonical] :as call} (call! scalar-values body)
+            typed-zero (descriptor/typed-reduce-identity operation dt)
+            identity-value (:value (constant/value identity))
+            identity-type
+            (if (number? identity)
+              (literal-dtype identity)
+              (when (seq? identity)
+                (let [{:keys [cast-tag arguments]} (call! values identity)]
+                  ;; A source literal cast must still have actual nonlexical call authority.
+                  ;; Only a single literal operand is needed for this typed-zero boundary.
+                  (when (and (= 1 (count arguments)) (number? (first arguments)))
+                    (some-> cast-tag dtype/dtype-for-scalar-tag)))))]
+        (when-not (and (= '+ canonical) (descriptor/addition-op? operation)
+                       ;; References identify the exact binders; use-site type metadata is
+                       ;; separately checked, not mistaken for a different logical value ID.
+                       (or (= arguments [acc element]) (= arguments [element acc]))
+                       (every? #(or (nil? (types/sym-type-tag %))
+                                    (= dt (dtype/dtype-for-scalar-tag (types/sym-type-tag %))))
+                               arguments)
+                       (= dt identity-type (literal-dtype identity-value))
+                       (constant/zero-value? identity)
+                       (fingerprint/equivalent? identity-value (:value (constant/value typed-zero))))
+          (fail! :ad-normalized-sum-step {:body body :identity identity :dtype dt}))
+        (binding-dtype! scalar-values result body)
+        (selected-call-contract! call [dt dt] dt)
+        (let [derived (scan/certify-reassociation {:acc acc :init identity :lambda body} dt)]
+          (when-not (fingerprint/equivalent? derived (first (:algebra attributes)))
+            (fail! :ad-normalized-sum-algebra {:derived derived :retained (:algebra attributes)})))))
+    (let [view (soac/equation-subprogram source map-equation)]
+      (if (= :closed-clojure (get-in facts [:attributes :source-dialect]))
+        ;; All original bindings, provenance and absent host operations were checked above.
+        ;; The one-map view's binding list is the exact checked first source prefix.
+        (let [view-facts (assoc-in (soac/facts view) [:attributes :source-bindings]
+                                  (nth map-equation 2))]
+          (soac/make view-facts [map-equation] (nth map-equation 2)))
+        view))))
+
+(defn- compose-sum [map-program reduction source result]
+  (let [map-equation (first (soac/equations map-program))
+        equations [map-equation reduction]
+        inputs (:inputs (soac/facts map-program))
+        outputs (into [result] (rest (soac/outputs map-program)))
+        values (merge (:values (soac/facts source)) (:values (soac/facts map-program)))]
+    (soac/make
+     (soac/default-program-facts
+      {:values (select-keys values (concat inputs (mapcat #(nth % 2) equations)))
+       :inputs inputs
+       :equations {(second map-equation) (get-in (soac/facts map-program) [:equations (second map-equation)])
+                   (second reduction) (get-in (soac/facts source) [:equations (second reduction)])}
+       :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
+     equations outputs)))
+
+(defn- lift-sum-programs [bundle source interface]
+  (let [[_ reduction] (soac/equations source)
+        map-programs (:map-programs bundle)
+        map-interface (:interface map-programs)
+        map-result (first (soac/outputs (:source map-programs)))
+        result (first (soac/outputs source))
+        {:keys [seed tangent-result]} interface
+        tangent-source (soac/remap-values source
+                                         {map-result (:tangent-output map-interface)
+                                          result tangent-result})
+        tangent-reduction (second (soac/equations tangent-source))
+        transpose (:transpose map-programs)
+        transpose-equation (first (soac/equations transpose))
+        {:keys [attributes arrays captures lambda]} (soac/operation-parts transpose-equation)
+        {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+        ;; Move the explicit per-lane dy parameter to a scalar capture, leaving its scalar AD
+        ;; identity unchanged. No broadcast array, reduction of cotangents or second evaluator.
+        transpose-lambda (soac/lambda-form
+                          (into (vec (rest parameters)) [(:cotangent-seed bundle)])
+                          (mapv (fn [{:keys [id dtype init]}] (soac/local-value id dtype init)) locals)
+                          body-results)
+        transpose-equation (list '= (second transpose-equation) (nth transpose-equation 2)
+                                 (list 'map attributes (vec (rest arrays))
+                                       (into (vec captures) [seed]) transpose-lambda))
+        transpose-facts (-> (soac/facts transpose)
+                            (update :values dissoc (:cotangent-input map-interface))
+                            (assoc-in [:values seed] (get-in (soac/facts source) [:values result]))
+                            (update :inputs #(conj (vec (remove #{(:cotangent-input map-interface)} %)) seed)))]
+    {:source source :interface interface
+     :primal (compose-sum (:primal map-programs) reduction source result)
+     :linear (compose-sum (:linear map-programs) tangent-reduction tangent-source tangent-result)
+     :transpose (soac/make transpose-facts [transpose-equation] (soac/outputs transpose))}))
+
+(defn- validate-sum-programs! [{:keys [sum-programs source-ns] :as bundle}]
+  (let [{:keys [source interface]} sum-programs
+        projected (sum-source-map source source-ns)
+        ids (map interface [:seed :tangent-result])]
+    (when-not (and (fingerprint/equivalent? projected (get-in bundle [:map-programs :source]))
+                   (= #{:seed :tangent-result} (set (keys interface)))
+                   (every? symbol? ids) (= (count ids) (count (distinct ids)))
+                   (empty? (set/intersection (set ids)
+                                            (set (concat (keys (:values (soac/facts source)))
+                                                         (mapcat #(keys (:values (soac/facts %)))
+                                                                 (vals (select-keys (:map-programs bundle)
+                                                                                    [:primal :linear :transpose]))))))))
+      (fail! :ad-normalized-sum-interface {:interface interface}))
+    (doseq [program (map sum-programs [:primal :linear :transpose])] (soac/validate! program))
+    (when-not (fingerprint/equivalent? sum-programs (lift-sum-programs bundle source interface))
+      (fail! :ad-normalized-sum-programs {:interface interface})))
+  bundle)
+
+(defn linearize-map-sum-program
+  "Build checked map→ordered additive sum programs in the existing normalized bundle.
+   One homogeneous Float/Double accumulator, exact typed zero, and the original selected
+   addition step are required. Algebra evidence grants no reassociation permission.
+   Transpose consumes an explicit scalar seed. This entry constructs programs, not execution."
+  ([source source-ns] (linearize-map-sum-program source source-ns {}))
+  ([source source-ns options]
+   (let [map-source (sum-source-map source source-ns)
+         bundle (linearize-map-program map-source source-ns options)
+         interface {:seed (gensym "ad_sum_seed_") :tangent-result (gensym "ad_sum_tangent_")}
+         bundle (assoc bundle :sum-programs (lift-sum-programs bundle source interface))]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 
 (defn prepare

@@ -100,6 +100,7 @@
             [raster.compiler.ir.contraction-closure :as contraction]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.scan :as scan-ir]))
 
 (defn value-id?
@@ -2614,6 +2615,39 @@
   "Construct and validate a typed SOAC program."
   [program-facts equation-forms program-outputs]
   (validate! (list 'soac-program program-facts (vec equation-forms) (vec program-outputs))))
+
+(defn- project-equation-subprogram
+  [program equation]
+  (let [equation-id (second equation)
+        results (vec (nth equation 2))
+        inputs (vec (distinct
+                     (into (operation-inputs equation)
+                           (filter value-id? (operation-extents equation)))))
+        source-facts (facts program)
+        equation-facts (get-in source-facts [:equations equation-id])
+        value-ids (set (concat inputs results (physical-results source-facts equation)))
+        program-facts (-> source-facts
+                          (assoc :values (select-keys (:values source-facts) value-ids)
+                                 :inputs inputs :equations {equation-id equation-facts}
+                                 :effects (:effects equation-facts)))]
+    (make program-facts [equation] results)))
+
+(defn equation-subprogram
+  "Project an exact member's value dependencies, retaining all source bookkeeping.
+   Consumers narrowing a frontend envelope must separately validate its source relationship."
+  [program equation]
+  (validate! program)
+  (when-not (some #(semantic/equivalent? equation %) (equations program))
+    (fail! :typed-soac-equation-projection
+           "equation projection requires an exact member of the source program"
+           {:equation equation}))
+  (project-equation-subprogram program equation))
+
+(defn equation-subprograms
+  "Project all equations in order with one whole-program validation, not N membership scans."
+  [program]
+  (validate! program)
+  (mapv #(project-equation-subprogram program %) (equations program)))
 
 (defn remap-values
   "Alpha-rename stable value IDs throughout a TypedSOAC program.

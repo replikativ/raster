@@ -39,6 +39,8 @@
   This is not implicit-seed value+grad, device execution, or general loop AD."
   [bundle]
   (normalized/validate! bundle)
+  (when (contains? bundle :sum-programs)
+    (fail! :ad-map-runtime-sum-not-materialized {}))
   (when-not (:map-programs bundle)
     (fail! :ad-map-runtime-bundle {}))
   (let [{:keys [source interface primal linear transpose]} (:map-programs bundle)

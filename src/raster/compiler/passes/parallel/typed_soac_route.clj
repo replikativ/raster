@@ -28,23 +28,6 @@
    :long ['clojure.core/long-array 'longs 'long]
    :byte ['clojure.core/byte-array 'bytes 'byte]})
 
-(defn- equation-subprogram
-  [program equation]
-  (let [equation-id (second equation)
-        results (vec (nth equation 2))
-        inputs (vec (distinct
-                     (into (dialect/operation-inputs equation)
-                           (filter dialect/value-id? (dialect/operation-extents equation)))))
-        source-facts (dialect/facts program)
-        equation-facts (get-in source-facts [:equations equation-id])
-        value-ids (set (concat inputs results (dialect/physical-results source-facts equation)))
-        facts (-> source-facts
-                  (assoc :values (select-keys (:values source-facts) value-ids)
-                         :inputs (vec inputs)
-                         :equations {equation-id equation-facts}
-                         :effects (:effects equation-facts)))]
-    (dialect/make facts [equation] results)))
-
 (defn- scalar-region
   [equation]
   (let [{:keys [kind attributes arrays captures destinations lambda element-lambda]}
@@ -775,9 +758,8 @@
   (let [facts (dialect/facts typed-program)
         equations
         (mapv
-         (fn [equation]
+         (fn [equation subprogram]
            (let [equation-id (second equation)
-                 subprogram (equation-subprogram typed-program equation)
                  {:keys [site source pairs]} (get realized equation-id)
                  equation-facts (get-in facts [:equations equation-id])
                  auxiliary-bindings
@@ -792,7 +774,8 @@
               (assoc (:provenance equation-facts) :pass :typed-soac-fusion)
               (cond-> (assoc (:attributes equation-facts) :algorithm-dialect :typed-soac)
                 (seq auxiliary-bindings) (assoc :realization-bindings auxiliary-bindings)))))
-         (dialect/equations typed-program))]
+         (dialect/equations typed-program)
+         (dialect/equation-subprograms typed-program))]
     (parallel-program/make
      {:dialect :typed-soac
       :source source
