@@ -9,7 +9,11 @@
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
+            [raster.gpu.device-probe :as ocl]
+            [raster.gpu.value :as value]
             [raster.math :as math]
+            [raster.numeric :as n]
             [raster.par :as par]))
 
 (deftm float-ops!
@@ -23,6 +27,46 @@
                    (ra/aset f i (+ p z)))))
 
 (defn- bits [x] (Float/floatToRawIntBits (float x)))
+
+(deftm mixed-norm-tail!
+  [dy :- (Array float), x :- (Array float), weight :- (Array float),
+   inv :- (Array float), dot :- (Array float), out :- (Array float),
+   features :- Long, count :- Long, gain :- Double] :- (Array float)
+  (par/map-void! t count
+    (let [row (quot t features) column (rem t features)
+          gi (double (n/+ gain (double (ra/aget weight column))))]
+      (ra/aset out t
+               (float (n/- (n/* (double (ra/aget inv row))
+                                (n/* gi (double (ra/aget dy t))))
+                            (double (n/* (ra/aget dot row) (ra/aget x t))))))))
+  out)
+
+(deftest float-storage-retains-double-arithmetic-and-float-product-rounding
+  ;; Same arithmetic boundary as chunked norm backward: Float dot*x is rounded
+  ;; BEFORE widening into a Double subtraction, whose result is stored as Float.
+  ;; Prematurely narrowing the other product, or widening dot*x, both erase e².
+  (let [e (float (/ 1.0 8388608.0)) a (float (+ 1.0 e)) b (float (- 1.0 e))
+        magnitude (float (* (double e) (double e)))
+        expected [magnitude (- magnitude) (- magnitude) magnitude]
+        arguments [(float-array [1.0 1.0 1.0 1.0]) (float-array [a b a b])
+                   (float-array [e (- e)]) (float-array [a b]) (float-array [a b])
+                   (float-array 4) 2 4 1.0]
+        cpu (apply mixed-norm-tail! arguments)]
+    (is (= (mapv bits expected) (mapv bits cpu)) "independent exact dyadic oracle versus JVM")
+    (is (every? #(not (zero? %)) expected) "the fixture distinguishes collapsed Float arithmetic")
+    (doseq [[target available? skip!] [[:ocl:0 ocl/opencl-available? ocl/opencl-skip!]
+                                      [:ze:0 gp/gpu-available? gp/gpu-skip!]]]
+      (if-not @available?
+        (skip! (str "mixed norm precision on " target))
+        (let [live (compiled/compile #'mixed-norm-tail! (assoc arguments 5 (float-array 4))
+                                     {:compiler :equation-first :dtype :float :target target})]
+          (try
+            (dotimes [_ 2]
+              (let [outputs (live {})]
+                (is (= 1 (count outputs)))
+                (is (= (mapv bits expected)
+                       (mapv bits (value/->host (first (vals outputs))))) (str target))))
+            (finally (compiled/close! live))))))))
 
 (deftest division-and-sqrt-are-correctly-rounded
   (if-not @gp/gpu-available?
