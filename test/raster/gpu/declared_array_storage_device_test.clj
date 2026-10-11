@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.fixtures.mixed-storage :as storage]
             [raster.compiler.compatibility-map-packet-test :as map-packet]
+            [raster.compiler.backend.gpu.segmap-retirement-fixture :as retirement]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -10,6 +11,52 @@
             [raster.gpu.runtime-backend :as backend]
             [raster.gpu.device-probe :as opencl]
             [raster.gpu.value :as value]))
+
+(defn- run-retired-segmap-invariants [target]
+  (let [runtime (backend/runtime-namespace target)
+        resolve-runtime #(requiring-resolve (symbol (str runtime) %))
+        arena ((resolve-runtime "make-kernel-arena!"))]
+    (try
+      (with-bindings {(resolve-runtime "*current-arena*") arena}
+        (doseq [kind [:secondary-output :integer-offset]]
+          (let [{:keys [source emitted]} (retirement/emit kind target true)
+                original (eval (list 'fn '[a b d n offset] source))
+                native (eval (list 'fn '[a b d n offset] (:form emitted)))]
+            (is (= 1 (count (:kernels emitted))))
+            (is (zero? (get-in emitted [:stats :fallback] 0)))
+            (#'pipeline/register-gpu-kernels! (:kernels emitted) target)
+            (#'pipeline/register-gpu-dispatches! (:dispatches emitted) target)
+            (doseq [n [0 1 3] seed [1.0 -2.0]]
+              (let [a (float-array (map #(+ seed %) (range 4)))
+                    b (float-array [2.0 -4.0 8.0])
+                    d (float-array [0.5 0.25 -0.5])
+                    expected (if (= kind :secondary-output)
+                               [(mapv #(float (* %1 %2)) (take n d) (take n b))
+                                (mapv #(float (* %1 %2)) (take n d) (take n a))]
+                               (mapv float (take n (drop 1 a))))
+                    source-result (original a b d (long n) (int 1))
+                    actual (native a b d (long n) (int 1))
+                    arrays #(if (= kind :secondary-output) % [%])]
+                (is (= (if (= kind :secondary-output) (mapv vec source-result) (vec source-result))
+                       expected
+                       (if (= kind :secondary-output) (mapv vec actual) (vec actual)))
+                    (str target " " kind " n=" n " seed=" seed))
+                (is (every? #(= (class (float-array 0)) (class %)) (arrays actual)))
+                (doseq [index (range (count (arrays actual)))]
+                  (is (not (identical? a (nth (arrays actual) index)))))
+                (when (= kind :secondary-output)
+                  (is (not (identical? (first actual) (second actual)))))
+                (is (= (mapv float (map #(+ seed %) (range 4))) (vec a))
+                    "input captures remain unchanged"))))))
+      (finally ((resolve-runtime "close-kernel-arena!") arena)))))
+
+(deftest retired-source-map-invariants-match-both-local-backends
+  (if @opencl/opencl-available?
+    (run-retired-segmap-invariants :ocl:0)
+    (opencl/opencl-skip! "canonical secondary-output and integer-capture maps on OpenCL"))
+  (if @gp/gpu-available?
+    (run-retired-segmap-invariants :ze:0)
+    (gp/gpu-skip! "canonical secondary-output and integer-capture maps on Level Zero")))
 
 (defn- run-compatibility-map-storage-case [target]
   ;; Execute the supplied compatibility packet, not a fresh whole-program typed route.
