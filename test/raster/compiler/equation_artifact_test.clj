@@ -10,6 +10,12 @@
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.kernel-abi :as kernel-abi]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
+            [raster.compiler.ir.kernel-call :as kernel-call]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.link-plan :as link-plan]
@@ -279,6 +285,46 @@
      (boring/decode
       (boring/encode (#'artifact/prepare-sequences value) options)
       options))))
+
+(deftest retained-minimum-round-trips-through-the-existing-compiler-record-codec
+  (let [launch (kernel-launch/spec {:workgroup-size [4] :group-count [1]})
+        original (kernel-body/make
+                  {:id :minimum-codec
+                   :parameters [(assoc (kernel-body/->KernelParameter
+                                        'x :input :float [1] :global
+                                        (layout/row-major [1] :float) :operand)
+                                       :minimum-elements 'n)
+                                (kernel-body/->KernelParameter
+                                 'out :output :float [1] :global
+                                 (layout/row-major [1] :float) :result)
+                                (kernel-body/->KernelParameter
+                                 'n :scalar :int [] nil nil :bound)]
+                   :launch launch})
+        restored (compiler-record-round-trip original)
+        executable (kernel-artifact/make
+                    {:kernel-name "minimum_codec"
+                     :source "__kernel void minimum_codec(__global const float* x, __global float* out, int n) {}"
+                     :abi [(kernel-abi/slot 'x :input :float :role :operand)
+                           (kernel-abi/slot 'out :output :float :role :result)
+                           (kernel-abi/slot 'n :scalar :int :role :bound)]
+                     :arguments '[x out n] :launch (:launch restored)
+                     :attributes {:kernel-body restored}})
+        bind #(kernel-call/validate-retained-input-capacities!
+               executable [% (float-array 1) {:type :int :value 4}]
+               (fn [value _] (java.lang.reflect.Array/getLength value)))]
+    (is (fingerprint/equivalent? original restored))
+    (is (identical? restored (kernel-body/validate! restored)))
+    (is (kernel-launch/launch-spec? (:launch restored)))
+    (is (identical? (:launch restored) (kernel-launch/validate-spec! (:launch restored))))
+    (is (= 'n (get-in restored [:parameters 0 :minimum-elements])))
+    (is (identical? executable (bind (float-array 4))))
+    (try
+      (bind (float-array 3))
+      (is false "restoring a compiler record must not discard its independent minimum")
+      (catch clojure.lang.ExceptionInfo failure
+        (is (= :kernel-body-buffer-capacity (:reason (ex-data failure))))
+        (is (= 4 (:required-elements (ex-data failure))))
+        (is (= 3 (:buffer-elements (ex-data failure))))))))
 
 (deftest scan-certificates-round-trip-through-the-existing-compiler-record-codec
   (let [source (soac/par-form->soac 'result

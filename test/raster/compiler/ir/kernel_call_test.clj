@@ -115,11 +115,7 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-integral or absent scalar"
                          (body/validate! (-> kernel
                                              (assoc-in [:parameters 2 :dtype] :float)
-                                             (assoc-in [:parameters 0 :minimum-elements] 'n)))))
-    (let [with-minimum (assoc-in kernel [:parameters 0 :minimum-elements] 'n)
-          restored (read-string (pr-str with-minimum))]
-      (is (= with-minimum restored))
-      (is (= 'n (get-in restored [:parameters 0 :minimum-elements]))))))
+                                             (assoc-in [:parameters 0 :minimum-elements] 'n)))))))
 
 (deftest retained-input-backing-extent-closes-only-its-exact-physical-slot
   (let [shape [(klaunch/runtime-value '(extent x))]
