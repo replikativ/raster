@@ -16,11 +16,13 @@
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.scalar-range :as ranges]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.index-expression :as index-expression]
-            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]))
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
 
 (defn- decline!
   [rule message data]
@@ -109,10 +111,12 @@
                 (= index (descriptor/unwrap-int-cast idx))))
           (mapcat descriptor/aget-reads expressions)))
 
+(declare scheduled-read-minima)
+
 (defn lower
   "Apply a portable grid-stride scalar schedule to a typed one-dimensional SegMap."
   [segmap {:keys [workgroup-size array-types scalar-types array-shapes scalar-math]
-           :or {workgroup-size 256 array-types {} scalar-types {}}}]
+           :or {workgroup-size 256 array-types {} scalar-types {}} :as options}]
   (when-not (segop/seg-map? segmap)
     (throw (ex-info "map KernelBody lowering requires SegMap"
                     {:reason :raster/bug :operation segmap})))
@@ -620,17 +624,38 @@
           [(body/->Guard :map-active scalar-operations)])
         ;; These are physical capacities supplied by the enclosing graph, not a proof that
         ;; arbitrary indexed accesses are in bounds. The iteration extent remains independent.
-        pointer-shape (fn [id] (get array-shapes id ['_n_bound]))
+        input-minima (when (some #(not (get array-shapes %)) inputs)
+                       (if (and (integer? bound) (zero? bound))
+                         (zipmap inputs (repeat 0))
+                         (merge
+                                   (map-reads/independent-read-requirements
+                                    (assoc segmap :scalar-region
+                                           {:locals locals :result (if effects (list* 'do effects) result)})
+                                    options)
+                                   (scheduled-read-minima index bound scheduled-operations options))))
+        pointer-shape (fn [id]
+                        (or (get array-shapes id)
+                            ;; A primary result writes every logical index. A smaller read
+                            ;; footprint (or unknown backing) cannot replace this known prefix.
+                            (when (and (= id primary-output) (contains? (set inputs) id))
+                              ['_n_bound])
+                            (when-let [minimum (get input-minima id)]
+                              [(if (= 0 minimum) (launch/product 0) minimum)])
+                            (when-not (contains? (set inputs) id) ['_n_bound])
+                            ;; An unknown input still has an exact backing allocation at bind.
+                            ;; This is storage identity, not a minimum or indexed-access proof.
+                            [(launch/runtime-value (list 'extent id))]))
         parameters
         (vec (concat
               (map #(body/->KernelParameter
                      % :input (get array-types %) (pointer-shape %) :global
                      (layout/row-major (pointer-shape %) (get array-types %)) :operand)
                    read-only-inputs)
-              (map #(body/->KernelParameter
-                     % (if (contains? inout %) :inout :output)
-                     (get array-types %) (pointer-shape %) :global
-                     (layout/row-major (pointer-shape %) (get array-types %)) :result)
+              (map #(cond-> (body/->KernelParameter
+                            % (if (contains? inout %) :inout :output)
+                            (get array-types %) (pointer-shape %) :global
+                            (layout/row-major (pointer-shape %) (get array-types %)) :result)
+                      (= % primary-output) (assoc :minimum-elements '_n_bound))
                    outputs)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
@@ -685,6 +710,14 @@
                  (some #(= node %) (:nodes kernel-graph)))
     (throw (ex-info "map capacity projection requires its exact graph node"
                     {:reason :segmap-capacity-node})))
+  (scheduled-body/validate-dense-input-storage! candidate node kernel-graph)
+  (let [primary (:out-sym (:operation node))]
+    (doseq [parameter (get-in candidate [:body :parameters])]
+      (when-not (= (when (= primary (:id parameter)) '_n_bound)
+                   (:minimum-elements parameter))
+        (throw (ex-info "map primary write minimum differs from its source store domain"
+                        {:reason :segmap-write-minimum :parameter (:id parameter)
+                         :primary primary :minimum-elements (:minimum-elements parameter)})))))
   (let [buffers (into {} (map (juxt :id identity))
                       (concat (:inputs kernel-graph) (:outputs kernel-graph)
                               (:temporaries kernel-graph)))]
@@ -697,6 +730,104 @@
                         {:reason :segmap-static-capacity :buffer id
                          :expected [elements] :actual shape})))))
   candidate)
+
+(defn- scheduled-read-minima
+  "The existing typed-SSA range proof, consumed before pointer parameters are constructed."
+  [index bound scheduled-operations options]
+  (when (and (integer? bound) (<= 1 bound Integer/MAX_VALUE))
+    (let [operations (tree-seq coll? seq scheduled-operations)
+          loads (filter #(= "raster.compiler.ir.kernel_body.ScalarLoad"
+                                  (some-> % class .getName)) operations)
+                ;; A lexical map local may be retained as typed SSA rather than beta-expanded
+                ;; into the load coordinate.  Reuse only the range certificates carried by its
+                ;; validated ScalarCompute; otherwise a harmless `(let* [k (+ i j)] (aget a k))`
+                ;; loses the same capacity proof as its inlined spelling.
+                computed-ranges
+                (reduce
+                 (fn [known node]
+                   (if (= "raster.compiler.ir.kernel_body.ScalarCompute"
+                          (some-> node class .getName))
+                     (let [id (get-in node [:result :id])
+                           type (get-in node [:result :type])
+                           expression (:expression node)
+                           proof (get-in expression [:options :proof])
+                           argument-range
+                           (fn [argument]
+                             (cond
+                               (symbol? argument) (get-in known [argument :range])
+                               (and (integer? (:value argument)) (:type argument))
+                               (ranges/literal (:value argument) (:type argument))
+                               :else nil))
+                           arguments (mapv argument-range (:arguments expression))
+                           derived
+                           (or (when (and (= :typed-scalar-range (:kind proof))
+                                          (ranges/contained-in-dtype? proof type))
+                                 (select-keys proof [:lower :upper]))
+                               (when (every? some? arguments)
+                                 (case (:op expression)
+                                   (:+ :- :*)
+                                   (let [range (ranges/arithmetic (:op expression) arguments)]
+                                     (when (ranges/contained-in-dtype? range type) range))
+                                   :quot
+                                   (let [[numerator divisor] arguments
+                                         range (when (and (<= 0 (:lower numerator))
+                                                          (= (:lower divisor) (:upper divisor))
+                                                          (pos? (:lower divisor)))
+                                                 (ranges/quotient arguments))]
+                                     (when (ranges/contained-in-dtype? range type) range))
+                                   :rem
+                                   (let [[numerator divisor] arguments
+                                         d (:lower divisor)
+                                         range (when (and (<= 0 (:lower numerator))
+                                                          (= d (:upper divisor)) (pos? d))
+                                                 {:lower 0
+                                                  :upper (min (:upper numerator) (dec d))})]
+                                     (when (ranges/contained-in-dtype? range type) range))
+                                   :cast
+                                   (let [range (first arguments)]
+                                     (when (and (= :exact (get-in expression [:options :overflow]))
+                                                (ranges/contained-in-dtype? range type))
+                                       range))
+                                   nil)))]
+                       (if (and (symbol? id) derived)
+                         (assoc known id {:type type :range derived})
+                         known))
+                     known))
+                 {index {:type :long :range {:lower 0 :upper (dec bound)}}}
+                 operations)
+                leaf-types (merge (:scalar-types options)
+                                  {index :long}
+                                  (into {} (map (fn [[id fact]] [id (:type fact)]))
+                                        computed-ranges))
+                leaf-ranges (merge {index {:lower 0 :upper (dec bound)}}
+                                   (into {} (map (fn [[id fact]] [id (:range fact)]))
+                                         computed-ranges))
+                requirements
+                (mapv (fn [{:keys [buffer coordinates predicate]}]
+                        (when (and (= :map-active predicate) (= 1 (count coordinates)))
+                          (when-let [range (ranges/typed-index-range
+                                           (first coordinates)
+                                           leaf-types leaf-ranges)]
+                            (when (<= 0 (:lower range))
+                              [buffer (inc' (:upper range))]))))
+                      loads)]
+            (when (and (seq loads) (every? some? requirements))
+              (reduce (fn [result [id extent]] (update result id (fnil max 0) extent))
+                      {} requirements)))))
+
+(defn static-read-requirements
+  "Optional all-load proof for a plain, positive static, one-dimensional result map."
+  [operation options]
+  (when (and (segop/seg-map? operation) (:out-sym operation)
+             (= 1 (count (get-in operation [:space :dims])))
+             (empty? (set/intersection (set (:inputs operation)) (set (:outputs operation))))
+             (not (seq (get-in operation [:scalar-region :effects]))))
+    (let [{index :name bound :bound} (first (get-in operation [:space :dims]))]
+      (when (and (integer? bound) (<= 1 bound Integer/MAX_VALUE))
+        (try
+          (scheduled-read-minima index bound (get-in (lower operation options)
+                                                     [:kernel-body :operations]) options)
+          (catch clojure.lang.ExceptionInfo _ nil))))))
 
 (defn schedule
   "Refine one SegMap into a complete, target-neutral ScheduledKernelBody.

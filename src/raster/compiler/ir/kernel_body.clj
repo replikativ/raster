@@ -2359,6 +2359,19 @@
         (throw (ex-info "kernel parameter requires a known dtype" {:parameter p})))
       (when-not (keyword? (:role p))
         (throw (ex-info "kernel parameter requires a semantic role" {:parameter p})))
+      ;; An optional minimum is an independent binding obligation, not the physical layout
+      ;; or a backing-allocation identity. Only admitted integral scalar parameters may occur.
+      (when (contains? p :minimum-elements)
+        (when (= :scalar (:kind p))
+          (throw (ex-info "only pointer parameters may require minimum elements"
+                          {:reason :kernel-body-minimum-elements :parameter p})))
+        (let [minimum (:minimum-elements p)
+              scalar-types (into {} (keep #(when (= :scalar (:kind %))
+                                             [(:id %) (:dtype %)])) parameters)]
+          (when (and (integer? minimum) (neg? minimum))
+            (throw (ex-info "minimum elements must be non-negative"
+                            {:reason :kernel-body-minimum-elements :parameter p})))
+          (launch/validate-typed-expression! minimum scalar-types)))
       (if (= :scalar (:kind p))
         (when (or (seq (:shape p)) (:layout p) (:memory-space p))
           (throw (ex-info "scalar kernel parameters cannot carry storage layout"

@@ -8,6 +8,8 @@
   (:require [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-abi :as abi]
@@ -373,6 +375,40 @@
       (fail! :scheduled-kernel-body-node-membership
              "scheduled body requires an exact node from its graph"
              {:node (:id node)}))
+    scheduled))
+
+(defn validate-dense-input-storage!
+  "Independently compare flat dense read-capable pointers with graph-owned storage extents.
+   This checks correspondence, not the safety of arbitrary indexed reads."
+  [scheduled node kernel-graph]
+  (let [scheduled (validate-against-node! scheduled node kernel-graph)
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs kernel-graph) (:outputs kernel-graph) (:temporaries kernel-graph)))
+        parameters (get-in scheduled [:body :parameters])
+        bindings (into {} (map (fn [[parameter argument]] [(:id parameter) argument]))
+                       (map vector parameters (:arguments scheduled)))
+        rebind #(if-let [backing (launch/backing-extent-id %)]
+                  (launch/runtime-value (list 'extent (get bindings backing backing)))
+                  (launch/rebind-expression % bindings))]
+    (doseq [[parameter argument] (map vector parameters (:arguments scheduled))
+            :when (contains? #{:input :inout} (:kind parameter))]
+      (let [elements (:elements (get buffers argument))
+            shape (mapv rebind (:shape parameter))
+            storage-layout (:layout parameter)
+            rebound-layout (cond-> (update storage-layout :shape #(mapv rebind %))
+                             (:strides storage-layout) (update :strides #(mapv rebind %)))]
+        (when-not (and (some? elements) (not= elements argument)
+                       (= 1 (count shape))
+                       (if-let [backing (launch/backing-extent-id (first shape))]
+                         (and (= backing argument)
+                              (= argument (launch/backing-extent-id elements)))
+                         (and (nil? (launch/backing-extent-id elements))
+                              (extent/equivalent? elements (first shape))))
+                       (= (layout/row-major shape (:dtype parameter)) rebound-layout))
+          (fail! :scheduled-kernel-body-input-storage
+                 "input pointer capacity differs from its dense graph storage"
+                 {:node (:id node) :parameter (:id parameter) :argument argument
+                  :expected [elements] :actual shape :layout rebound-layout}))))
     scheduled))
 
 (defn validate-artifact-projection!

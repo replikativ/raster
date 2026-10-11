@@ -20,7 +20,8 @@
             [raster.compiler.ir.index-expression :as index-expression]
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
-            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]))
+            [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
+            [raster.compiler.passes.parallel.segmap-body :as map-body]))
 
 (defn- fail!
   [reason message data]
@@ -335,6 +336,30 @@
      :elements (value-elements values derived-scalars value)
      :memory-space (or (:memory-space value) :device)}))
 
+(defn input-storage-context
+  "Project known dense input storage and scalar definitions from one exact causal equation slice.
+   Unknown allocation extents remain unknown; neither future equations nor iteration size supplies them."
+  [parallel-program equation operation]
+  (let [body (body-for-equation parallel-program equation)
+        _ (when-not (some #(= operation %) (:operations equation))
+            (fail! :scheduled-equation-input-storage-source
+                   "input storage requires an exact operation from its retained equation"
+                   {:equation (:id equation) :operation (:id operation)}))
+        values (:values body)
+        definitions (derived-scalar-expressions
+                     values (take-while #(true? (get-in % [:attributes :host-only])) (:equations body)))]
+    {:scalar-definitions definitions
+     :array-shapes
+     (into {}
+           (keep (fn [input]
+                   (let [value (get values input)
+                         elements (:elements (storage-spec values definitions input))]
+                     (when (and (= {:kind :plain} (:representation value))
+                                (nil? (:logical-layout value))
+                                (not (unresolved-capacity? input value elements)))
+                       [input [(if (= 0 elements) (launch/product 0) elements)]]))))
+           (:inputs operation))}))
+
 (defn- product-read-requirements
   "Optional minimum capacities from typed product loads, never guessed from loop size alone."
   [values operations derived-scalars]
@@ -571,7 +596,7 @@
                     static-reads (when (and pure-map?
                                             (some #(not (contains? optional-reads %))
                                                   (:inputs operation)))
-                                   (map-reads/static-read-requirements operation map-read-options))
+                                   (map-body/static-read-requirements operation map-read-options))
                     derived (merge-with (fn [left right]
                                           (if (= left right) left (launch/maximum left right)))
                                         optional-reads static-reads)
@@ -620,6 +645,20 @@
                                        extent))
                            specs))
                        buffer-specs result-storage-values)
+         ;; When no independent minimum closed the shape, an external plain input still names
+         ;; one exact runtime backing range. Preserve that storage identity, not a fabricated
+         ;; logical extent. Known read/write requirements above always take precedence.
+         buffer-specs (reduce (fn [specs id]
+                                (let [value (get values id)
+                                      elements (get-in specs [id :elements])]
+                                  (if (and (= {:kind :plain} (:representation value))
+                                           (nil? (:logical-layout value))
+                                           (unresolved-capacity? id value elements)
+                                           (or (= elements (list 'unknown-dimension id))
+                                               (= elements (list 'extent id))))
+                                    (assoc-in specs [id :elements] (list 'extent id))
+                                    specs)))
+                              buffer-specs inputs)
          capacity-preconditions
          (->> (concat (mapcat (comp seq :requirements) read-capacity-certificates)
                       (mapcat (fn [[id requirements]] (map #(vector id %) requirements))

@@ -50,6 +50,146 @@
 (defn- host-capacity [value _slot]
   (java.lang.reflect.Array/getLength value))
 
+(deftest retained-minimum-elements-is-independent-of-physical-storage
+  (let [artifact (retained-capacity-artifact [(klaunch/runtime-value '(extent x))])
+        kernel (assoc-in artifact [:attributes :kernel-body :parameters 0 :minimum-elements] 'n)
+        seen (atom [])
+        capacity (fn [value slot]
+                   (swap! seen conj (:name slot)) (host-capacity value slot))
+        bind #(kcall/validate-retained-input-capacities!
+               %1 [%2 (float-array 1) {:type :int :value %3}] capacity)]
+    (is (identical? kernel (bind kernel (float-array 8) 4)))
+    (is (= ['x] @seen) "one callback owns both the storage span and minimum check")
+    (reset! seen [])
+    (try
+      (bind kernel (float-array 3) 4)
+      (is false "backing identity is not permission to omit an independent minimum")
+      (catch clojure.lang.ExceptionInfo failure
+        (is (= :kernel-body-buffer-capacity (:reason (ex-data failure))))
+        (is (= 4 (:required-elements (ex-data failure))))
+        (is (= 3 (:buffer-elements (ex-data failure))))))
+    (is (= ['x] @seen))
+    (is (identical? kernel (bind kernel (float-array 0) 0)))
+    (is (identical? kernel
+                    (kcall/validate-retained-input-capacities!
+                     kernel [:opaque (float-array 1) {:type :int :value 4}] (fn [_ _] nil)))
+        "opaque capacity remains an explicit obligation, not proof the minimum is satisfied")
+    (let [inout (-> kernel
+                    (assoc-in [:abi 0 :kind] :inout)
+                    (assoc-in [:attributes :kernel-body :parameters 0 :kind] :inout)
+                    (assoc-in [:attributes :kernel-body :parameters 0 :shape] [1])
+                    (assoc-in [:attributes :kernel-body :parameters 0 :layout]
+                              (layout/row-major [1] :float)))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                           (bind inout (float-array 3) 4)))
+      (is (identical? inout (bind inout (float-array 8) 4)))))
+  (let [kernel (-> (retained-capacity-artifact [1])
+                   (assoc :effects {:kind :pure-contraction})
+                   (assoc-in [:attributes :out-elems] 4)
+                   (assoc-in [:attributes :kernel-body :parameters 1 :minimum-elements] 'n))
+        args [(float-array 1) (float-array 8) {:type :int :value 4}]
+        call (kcall/make kernel args)
+        plan (kcall/binding-plan call)
+        seen (atom [])]
+    (is (identical? plan
+                    (kcall/validate-resident-output-capacities!
+                     call plan kernel
+                     (fn [value slot] (swap! seen conj [value (:name slot)])
+                       (host-capacity value slot)))))
+    (is (= [[(first args) 'x] [(second args) 'out]] @seen)
+        "the same exact output's minimum and contextual extent share one capacity fact"))
+  (let [kernel (assoc-in (retained-capacity-artifact [1])
+                         [:attributes :kernel-body :parameters 1 :minimum-elements] 'n)
+        args [(float-array 1) (float-array 3) {:type :int :value 4}]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                         (kcall/validate-retained-input-capacities! kernel args host-capacity)))
+    (is (identical? kernel
+                    (kcall/validate-retained-input-capacities!
+                     kernel (assoc args 1 (float-array 8)) host-capacity))))
+  (let [kernel (:kernel-body (:attributes (retained-capacity-artifact [1])))]
+    (doseq [minimum [-1 1.5 nil 'free (klaunch/runtime-value '(extent x))]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (body/validate! (assoc-in kernel [:parameters 0 :minimum-elements] minimum)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only pointer"
+                         (body/validate! (assoc-in kernel [:parameters 2 :minimum-elements] 1))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-integral or absent scalar"
+                         (body/validate! (-> kernel
+                                             (assoc-in [:parameters 2 :dtype] :float)
+                                             (assoc-in [:parameters 0 :minimum-elements] 'n)))))
+    (let [with-minimum (assoc-in kernel [:parameters 0 :minimum-elements] 'n)
+          restored (read-string (pr-str with-minimum))]
+      (is (= with-minimum restored))
+      (is (= 'n (get-in restored [:parameters 0 :minimum-elements]))))))
+
+(deftest retained-input-backing-extent-closes-only-its-exact-physical-slot
+  (let [shape [(klaunch/runtime-value '(extent x))]
+        kernel (retained-capacity-artifact shape)
+        input (float-array 7)
+        arguments [input (float-array 1) {:type :int :value 1}]
+        seen (atom [])
+        capacity (fn [value slot]
+                   (swap! seen conj [value (:name slot) (:dtype slot)])
+                   (host-capacity value slot))]
+    (is (identical? kernel (kcall/validate-retained-input-capacities! kernel arguments capacity)))
+    (is (= [[input 'x :float]] @seen) "only the ABI storage slot owns backing capacity")
+    (is (identical? kernel
+                    (kcall/validate-retained-input-capacities!
+                     kernel [(float-array 0) (float-array 1) {:type :int :value 0}] host-capacity)))
+    (is (identical? kernel
+                    (kcall/validate-retained-input-capacities! kernel arguments (fn [_ _] nil)))
+        "opaque native capacity remains an obligation, not a fabricated zero or read minimum")
+    (let [inout (-> kernel
+                    (assoc-in [:abi 0 :kind] :inout)
+                    (assoc-in [:attributes :kernel-body :parameters 0 :kind] :inout))]
+      (is (identical? inout (kcall/validate-retained-input-capacities! inout arguments host-capacity))))
+    (let [allocation (bview/allocation {:id :backing-parent :byte-size 128 :memory-space :device})
+          view (bview/view allocation {:id :backing-slice :byte-offset 16 :dtype :float :shape [7]})
+          resident {:view view}
+          capacities (atom [])
+          callback (fn [value slot]
+                     (swap! capacities conj [value (:dtype slot)])
+                     (quot (:byte-length (:view value)) 4))]
+      (is (identical? kernel
+                      (kcall/validate-retained-input-capacities!
+                       kernel [resident (float-array 1) {:type :int :value 1}] callback)))
+      (is (= [[resident :float]] @capacities)
+          "the exact view, not its larger allocation parent, supplies ABI-element capacity"))
+    (let [renamed (assoc kernel :arguments '[logical-input out n])]
+      (is (identical? renamed (kcall/validate-retained-input-capacities! renamed arguments host-capacity)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"differs from its physical ABI"
+                           (kcall/validate-retained-input-capacities!
+                            (assoc-in renamed [:abi 0 :name] 'wrong) arguments host-capacity))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact flat input"
+                         (kcall/validate-retained-input-capacities!
+                          (retained-capacity-artifact [(klaunch/runtime-value '(extent out))])
+                          arguments host-capacity)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                         (kcall/validate-retained-input-capacities!
+                          (retained-capacity-artifact [8]) arguments host-capacity))
+        "a complete independent minimum is never replaced by the supplied backing length")))
+
+(deftest retained-capacity-preserves-physical-expression-and-operand-projection
+  (let [extent (klaunch/ceil-div 'source-n 256)
+        kernel (assoc (retained-capacity-artifact [extent]) :arguments ['x 'out extent])
+        arguments [(float-array 3) (float-array 1) {:type :int :value 3}]]
+    (is (identical? kernel (kcall/validate-retained-input-capacities! kernel arguments host-capacity)))
+    (try
+      (kcall/validate-retained-input-capacities!
+       kernel [(float-array 2) (float-array 1) {:type :int :value 3}] host-capacity)
+      (is false "the physically bound expression still enforces capacity")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :kernel-body-buffer-capacity (:reason (ex-data e))))
+        (is (= 3 (:required-elements (ex-data e))))
+        (is (= 2 (:buffer-elements (ex-data e)))))))
+  (doseq [role [:lhs :rhs]]
+    (let [kernel (assoc-in (retained-capacity-artifact [2])
+                         [:attributes :kernel-body :parameters 0 :role] role)
+          arguments [(float-array 2) (float-array 1) {:type :int :value 1}]]
+      (is (identical? kernel (kcall/validate-retained-input-capacities! kernel arguments host-capacity)))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"differs from its physical ABI"
+                           (kcall/validate-retained-input-capacities!
+                            (assoc-in kernel [:abi 0 :role] :result) arguments host-capacity))))))
+
 (deftest retained-body-capacity-uses-storage-extents-and-exact-projection
   (doseq [[required supplied] [[5 4] [2 1]]]
     (let [kernel (retained-capacity-artifact [required])

@@ -49,6 +49,68 @@
        {:id row :dtype :long :init (rem q rows)}]
      :result (list 'aget 'input coordinate)}}))
 
+(defn- phased-fold-map [fold-expression map-expression]
+  (segop/map->SegFoldMap
+   {:id :read-phases
+    :space (segop/make-seg-space-nd [{:name 'row :bound 3} {:name 'column :bound 17}])
+    :index 'column :extent 17
+    :folds [{:accumulator 'sum :dtype :float :identity 0.0 :extent 17
+             :locals [] :step fold-expression :association :ordered}]
+    :map-results [map-expression]
+    :inputs '#{x gamma beta} :outputs '[out] :dtypes [:float] :scalars #{}}))
+
+(deftest fold-map-read-minima-cover-all-phases-not-the-output-size
+  (let [operation (phased-fold-map
+                   '(+ sum (aget x (+ (* row 17) column)))
+                   '(+ (* sum (aget gamma column)) (aget beta column)))
+        minima (requirements/segfoldmap-read-requirements operation {})]
+    (is (requirements/capacity-covers? 51 (get minima 'x)))
+    (is (requirements/capacity-covers? 17 (get minima 'gamma)))
+    (is (requirements/capacity-covers? 17 (get minima 'beta)))
+    (is (not (requirements/capacity-covers? 50 (get minima 'x))))
+    (is (not (requirements/capacity-covers? 16 (get minima 'beta))))
+    (is (= minima (requirements/segfoldmap-read-requirements operation {})))))
+
+(deftest fold-map-unknown-read-is-not-masked-by-a-known-phase
+  (let [operation (assoc (phased-fold-map '(+ sum (aget x column))
+                                         '(aget x (aget offsets row)))
+                         :inputs '#{x offsets})
+        minima (requirements/segfoldmap-read-requirements operation {})]
+    (is (not (contains? minima 'x)))
+    (is (requirements/capacity-covers? 3 (get minima 'offsets))))
+  (let [operation (-> (phased-fold-map '(+ sum (aget x column)) '(aget x column))
+                      (assoc :inputs #{'x})
+                      (assoc-in [:folds 0 :identity] '(aget x (aget x row))))]
+    (is (not (contains? (requirements/segfoldmap-read-requirements operation {}) 'x)))))
+
+(deftest fold-map-multiple-read-phases-preserve-the-largest-minimum
+  (let [operation (-> (phased-fold-map '(+ sum (aget x column)) '(aget x column))
+                      (assoc :inputs #{'x})
+                      (assoc-in [:folds 0 :extent] 23))
+        required (get (requirements/segfoldmap-read-requirements operation {}) 'x)]
+    (is (requirements/capacity-covers? 23 required))
+    (is (not (requirements/capacity-covers? 22 required)))))
+
+(deftest fold-map-local-and-bound-reads-participate-in-the-proof
+  (let [operation (-> (phased-fold-map '(+ sum value) '(aget x column))
+                      (assoc :inputs '#{x lengths})
+                      (assoc-in [:folds 0 :locals]
+                                '[{:id value :dtype :float :init (aget x column)}])
+                      (assoc-in [:folds 0 :extent] '(aget lengths row)))
+        minima (requirements/segfoldmap-read-requirements operation {})]
+    (is (not (contains? minima 'x)))
+    (is (requirements/capacity-covers? 3 (get minima 'lengths)))))
+
+(deftest fold-map-empty-step-does-not-erase-identity-or-map-reads
+  (let [operation (-> (phased-fold-map '(+ sum (aget x column)) '(aget beta column))
+                      (assoc :inputs '#{x beta gamma})
+                      (assoc-in [:folds 0 :extent] 0)
+                      (assoc-in [:folds 0 :identity] '(aget gamma row)))
+        minima (requirements/segfoldmap-read-requirements operation {})]
+    (is (= 0 (get minima 'x)))
+    (is (requirements/capacity-covers? 3 (get minima 'gamma)))
+    (is (requirements/capacity-covers? 17 (get minima 'beta)))))
+
 (deftest symbolic-packing-read-retains-its-exact-runtime-capacity
   (let [coordinate '(+ (* row (* heads width)) (+ (* head width) column))
         certificate (requirements/symbolic-read-certificate

@@ -269,6 +269,13 @@
     (index-cast? expression) (expression-references (:argument expression))
     :else #{expression}))
 
+(defn backing-extent-id
+  "Recognize the existing opaque allocation-extent identity, never an indexed-read proof."
+  [expression]
+  (let [value (if (runtime-value? expression) (:value expression) expression)]
+    (when (and (seq? value) (= 2 (count value)) (= 'extent (first value)))
+      (second value))))
+
 (defn rebind-expression
   "Replace opaque compiler-value leaves in an integer expression.
 

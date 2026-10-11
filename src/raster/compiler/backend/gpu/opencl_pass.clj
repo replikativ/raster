@@ -219,6 +219,10 @@
    algorithm rather than recovering semantic facts from the host expression being replaced."
   nil)
 
+(def ^:dynamic *bound-storage-context*
+  "The exact retained program/equation for request-local standalone storage projection."
+  nil)
+
 (defn- take-bound-segop
   "The precomputed SegOp of `kind` for the current binding, if segop-lower produced one."
   [stats kind pred]
@@ -680,7 +684,7 @@
           (when (or supplied-program direct-mini-program?)
             (throw (ex-info "Map leaf is missing its retained typed equation"
                             {:reason :unscheduled-map-leaf :form form})))
-          (let [emitted (binding [*bound-segops* nil *bound-algorithm* nil]
+          (let [emitted (binding [*bound-segops* nil *bound-algorithm* nil *bound-storage-context* nil]
                           (opencl-pass form :device-id device-id :dtype dtype
                                        :min-elements min-elements :compile-spirv? compile-spirv?
                                        :scalar-types top-scalar-types :array-types top-array-types
@@ -839,7 +843,8 @@
                       kernel (segop-cl/generate-scheduled-segmap-kernel
                               segmap
                               :dtype dtype :scalar-types top-scalar-types
-                              :array-types (merge top-array-types (:array-types (meta form))))
+                              :array-types (merge top-array-types (:array-types (meta form)))
+                              :storage-context *bound-storage-context*)
                       k (register-kernel! kernel :ze-maps)
                       result-count (count (filter #(= :result (:role %)) (:abi k)))]
                   ;; The compatibility map marker models exactly one returned buffer. A fused
@@ -1008,7 +1013,7 @@
                (segop-cl/generate-segfoldmap-kernel
                 scheduled
                 :scalar-types top-scalar-types
-                :array-types top-array-types)
+                :array-types top-array-types :storage-context *bound-storage-context*)
                :ze-maps :none)
               (throw (ex-info "GPU fold-map source has no verified TypedSOAC schedule"
                               {:reason :unscheduled-segmented-fold-map
@@ -1032,7 +1037,7 @@
                                 scheduled
                                 :dtype (:dtype scheduled)
                                 :scalar-types top-scalar-types
-                                :array-types top-array-types)
+                                :array-types top-array-types :storage-context *bound-storage-context*)
                       k (register-kernel! kernel :ze-maps)]
                     (emit-map-void-invocation k device-id))
                   (if (and (not supplied-program)
@@ -1066,7 +1071,8 @@
                                       (= :typed-soac (:algorithm-dialect %))))]
               (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                             scheduled :dtype (:dtype scheduled)
-                            :scalar-types top-scalar-types :array-types top-array-types)
+                            :scalar-types top-scalar-types :array-types top-array-types
+                            :storage-context *bound-storage-context*)
                     k (register-kernel! kernel :ze-maps)]
                 (emit-map-invocation k device-id))
               (emit-nested-map! form))
@@ -1079,7 +1085,8 @@
                                       (= :typed-soac (:algorithm-dialect %))))]
               (let [kernel (segop-cl/generate-scheduled-segmap-kernel
                             scheduled :dtype (:dtype scheduled)
-                            :scalar-types top-scalar-types :array-types top-array-types)
+                            :scalar-types top-scalar-types :array-types top-array-types
+                            :storage-context *bound-storage-context*)
                     k (register-kernel! kernel :ze-maps)]
                 (emit-map-invocation k device-id))
               (emit-nested-map! form))
@@ -1113,6 +1120,7 @@
                                               dtype device-id top-scalar-types array-types)
                         kernel (segop-cl/generate-scheduled-segmap-kernel
                                 segmap :dtype dtype :scalar-types top-scalar-types
+                                :storage-context *bound-storage-context*
                                 :array-types array-types)
                         k (register-kernel! kernel :ze-maps)]
                     (list 'do (emit-map-void-invocation k device-id) out)))))
@@ -1132,6 +1140,7 @@
                                               dtype device-id top-scalar-types array-types)
                         kernel (segop-cl/generate-scheduled-segmap-kernel
                                 segmap :dtype dtype :scalar-types top-scalar-types
+                                :storage-context *bound-storage-context*
                                 :array-types array-types)
                         k (register-kernel! kernel :ze-maps)]
                     ;; A flat gather is an ordinary dense map with one stable indirect read.
@@ -1148,6 +1157,7 @@
                                             dtype device-id top-scalar-types array-types)
                       kernel (segop-cl/generate-scheduled-segmap-kernel
                               segmap :dtype dtype :scalar-types top-scalar-types
+                              :storage-context *bound-storage-context*
                               :array-types array-types)
                       k (register-kernel! kernel :ze-reduces)]
                   (list 'do (emit-map-void-invocation k device-id) out))))
@@ -1213,6 +1223,9 @@
                                                                  (when parallel-program
                                                                    (parallel-program/operations-for-binding
                                                                     parallel-program sym expr))
+                                                                 *bound-storage-context*
+                                                                 (when (and parallel-program equation)
+                                                                   {:program parallel-program :equation equation})
                                                                  *bound-algorithm*
                                                                  (when parallel-program
                                                                    (parallel-program/algorithm-for-binding
@@ -1250,6 +1263,9 @@
                                                     parallel-program equation))
                                           equation))
                                        (binding [*bound-segops* (:operations equation)
+                                                 *bound-storage-context*
+                                                 (when (and parallel-program equation)
+                                                   {:program parallel-program :equation equation})
                                                  *bound-algorithm*
                                                  (when parallel-program
                                                    (parallel-program/algorithm-for-source

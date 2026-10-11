@@ -10,10 +10,12 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kernel-call]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as klaunch]
@@ -58,6 +60,47 @@
                    (segred-body/validate-against-node!
                     certificate node candidate closed-algorithm closed-body))
           "an independent graph capacity or incomplete proof context cannot authorize the alias"))))
+
+(deftest map-storage-alias-projects-only-an-exact-causal-physical-bound
+  (let [source '(let* [^long extent (clojure.core/long
+                                    ^long (clojure.core/* (clojure.core/long rows)
+                                                         (clojure.core/long width)))
+                       result (raster.par/pmap i extent float (clojure.core/aget a i))] result)
+        options {:dtype :float :array-types {'a :float}
+                 :scalar-types {'rows :long 'width :long}
+                 :values {'a (av/tensor {:dtype :float :shape ['rows 'width]})}}
+        typed (:program (typed-route/attempt source :float {'a :float} options))
+        body (:form (segop-lower/segop-lower-pass typed options))
+        equation (last (:equations body))
+        algorithm (:algorithm equation)
+        graph (equation-graph/make algorithm body)
+        emit #(get-in (sg/generate-kernel-graph
+                       % :scheduled-equation-algorithm algorithm :scheduled-equation-body body)
+                      [:nodes 0 :operation])
+        artifact (emit graph)
+        parameters (get-in artifact [:attributes :kernel-body :parameters])
+        input (first (filter #(= :input (:kind %)) parameters))
+        context (equation-graph/input-storage-context body equation (first (:operations equation)))]
+    (is (= ['_n_bound] (:shape input)))
+    (is (= (layout/row-major ['_n_bound] :float) (:layout input)))
+    (is (= '[a result extent] (:arguments artifact)))
+    (is (contains? (:scalar-definitions context) 'extent))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (equation-graph/input-storage-context
+                  body equation (assoc (first (:operations equation)) :id :foreign))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (emit (assoc-in graph [:inputs 0 :elements] 1)))
+        "a stale graph capacity cannot be certified by descriptive alias metadata")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sg/generate-kernel-graph graph :scheduled-equation-algorithm algorithm))
+        "the alias needs the complete exact closed context")
+    (let [unrelated (assoc-in graph [:attributes :derived-storage-scalars] {'extent 1})
+          ignored (emit unrelated)]
+      (is (= parameters (get-in ignored [:attributes :kernel-body :parameters])))
+      (is (= (:arguments artifact) (:arguments ignored)))
+      (is (= (get-in artifact [:attributes :kernel-body :operations])
+             (get-in ignored [:attributes :kernel-body :operations]))
+          "descriptive aliases cannot change the verified projection or its computation"))))
 
 (deftest portable-map-retains-selected-math-consent
   (let [operation (segop/->SegMap
@@ -113,7 +156,7 @@
                       '(aget a (int (aget b j)))]]
     (let [graph (capacity-fixture/inferred-graph expression)
           operation (get-in graph [:nodes 0 :operation])]
-      (is (nil? (map-reads/static-read-requirements
+      (is (nil? (segmap-body/static-read-requirements
                  operation {:dtype :float :array-types {'a :float 'b :float 'C :float}}))))))
 
 (deftest public-outer-product-derives-unknown-input-capacities
@@ -147,6 +190,111 @@
       (is (= 12 (get-in body [:attributes :extent])))
       (is (= artifact (scheduled-body/validate-artifact-projection! certificate artifact))))))
 
+(deftest typed-map-transports-symbolic-storage-instead-of-iteration-width
+  (let [extent (klaunch/product 2 2)
+        graph (assoc-in (capacity-fixture/graph) [:inputs 0 :elements] extent)
+        artifact (get-in (sg/generate-kernel-graph graph) [:nodes 0 :operation])
+        shapes (into {} (map (juxt :id :shape))
+                     (get-in artifact [:attributes :kernel-body :parameters]))
+        candidate (get-in artifact [:attributes :scheduled-kernel-body])
+        node (first (:nodes graph))]
+    (is (= [extent] (shapes 'a)))
+    (is (= [3] (shapes 'b)))
+    (is (= [12] (shapes 'C)))
+    (is (identical? candidate
+                    (scheduled-body/validate-dense-input-storage! candidate node graph))
+        "the shared helper rebinds each expression through parameter-to-argument identities")
+    (doseq [corrupted [(-> candidate
+                          (assoc-in [:body :parameters 0 :shape] [1])
+                          (assoc-in [:body :parameters 0 :layout] (layout/row-major [1] :float)))
+                      (assoc-in candidate [:body :parameters 0 :layout :strides] [2])]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
+                           (segmap-body/validate-static-graph-capacities! corrupted node graph))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no retained storage capacity"
+                         (sg/generate-kernel-graph
+                          (assoc-in graph [:inputs 0 :elements] 'a))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no retained storage capacity"
+                         (sg/generate-kernel-graph
+                          (assoc-in graph [:inputs 0 :elements] 0))))))
+
+(deftest raw-primary-inout-keeps-its-known-written-prefix
+  (let [operation (segop/->SegMap
+                   :primary-inout (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(inc (clojure.core/aget out i)) nil #{'out} #{'out} #{'n}
+                   (segop/->KernelGrid 1 32 0) :float 'out nil)
+        emit #(sg/generate-scheduled-segmap-kernel
+               % :array-types {'out :float} :scalar-types {'n :int})
+        ;; Exercise precedence independently: even a smaller input-read requirement is not
+        ;; permission to discard the primary output's exact per-index write domain.
+        artifact (with-redefs [map-reads/independent-read-requirements (fn [& _] {'out 1})]
+                   (emit operation))]
+    (is (= '[out n _n_bound] (mapv :name (:abi artifact))))
+    (is (= '[out n n] (:arguments artifact)))
+    (is (= ['_n_bound] (get-in artifact [:attributes :kernel-body :parameters 0 :shape])))
+    (is (= '_n_bound (get-in artifact [:attributes :kernel-body :parameters 0 :minimum-elements])))
+    (let [physical (sg/generate-scheduled-segmap-kernel
+                    operation :array-types {'out :float} :scalar-types {'n :int}
+                    :array-shapes {'out [8]})]
+      (is (= [8] (get-in physical [:attributes :kernel-body :parameters 0 :shape])))
+      (is (= (layout/row-major [8] :float)
+             (get-in physical [:attributes :kernel-body :parameters 0 :layout])))
+      (is (identical? physical
+                      (kernel-call/validate-retained-input-capacities!
+                       physical [(float-array 8) {:type :int :value 4} {:type :int :value 4}]
+                       (fn [value _] (java.lang.reflect.Array/getLength value)))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"smaller than"
+                           (kernel-call/validate-retained-input-capacities!
+                            physical [(float-array 8) {:type :int :value 9} {:type :int :value 9}]
+                            (fn [value _] (java.lang.reflect.Array/getLength value))))))
+    (try
+      (kernel-call/validate-retained-input-capacities!
+       artifact [(float-array 3) {:type :int :value 4} {:type :int :value 4}]
+       (fn [value _] (java.lang.reflect.Array/getLength value)))
+      (is false "three backing elements cannot cover four primary writes")
+      (catch clojure.lang.ExceptionInfo failure
+        (is (= :kernel-body-buffer-capacity (:reason (ex-data failure))))
+        (is (= 4 (:required-elements (ex-data failure))))
+        (is (= 3 (:buffer-elements (ex-data failure))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"writable results may only read"
+                         (emit (assoc operation :lambda '(inc (clojure.core/aget out 0)))))
+        "constant cross-lane reads do not bypass the independent alias contract")))
+
+(deftest secondary-indexed-store-does-not-inherit-the-primary-write-minimum
+  (let [operation (segop/->SegMap
+                   :secondary-indexed-store (segop/make-seg-space 'i 'n)
+                   (segop/->SegLevel :thread :virtual)
+                   '(do (clojure.core/aset histogram (clojure.core/aget bins i) (float 1))
+                        (clojure.core/aget values i))
+                   nil #{'bins 'values} #{'histogram 'result} #{'n}
+                   (segop/->KernelGrid 1 32 0) :float 'result nil)
+        artifact (sg/generate-scheduled-segmap-kernel
+                  operation :array-types {'bins :int 'values :float 'histogram :float 'result :float}
+                  :array-shapes {'bins [12] 'values [12] 'histogram [3] 'result [12]}
+                  :scalar-types {'n :int})
+        parameters (into {} (map (juxt :id identity))
+                         (get-in artifact [:attributes :kernel-body :parameters]))]
+    (is (= '_n_bound (:minimum-elements (parameters 'result))))
+    (is (not (contains? (parameters 'histogram) :minimum-elements)))
+    (is (= [3] (:shape (parameters 'histogram))))))
+
+(deftest graph-input-backing-extent-preserves-exact-storage-identity
+  (let [graph (assoc-in (capacity-fixture/graph) [:inputs 0 :elements] '(extent a))
+        artifact (get-in (sg/generate-kernel-graph graph) [:nodes 0 :operation])
+        candidate (get-in artifact [:attributes :scheduled-kernel-body])
+        node (first (:nodes graph))
+        shape [(klaunch/runtime-value '(extent a))]]
+    (is (= shape (get-in candidate [:body :parameters 0 :shape])))
+    (is (identical? candidate (scheduled-body/validate-dense-input-storage! candidate node graph)))
+    (doseq [wrong-shape [[(klaunch/runtime-value '(extent b))] [1]]]
+      (let [wrong (-> candidate
+                      (assoc-in [:body :parameters 0 :shape] wrong-shape)
+                      (assoc-in [:body :parameters 0 :layout] (layout/row-major wrong-shape :float)))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
+                             (scheduled-body/validate-dense-input-storage! wrong node graph)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no retained storage capacity"
+                         (sg/generate-kernel-graph
+                          (assoc-in graph [:inputs 0 :elements] '(extent b)))))))
+
 (deftest map-capacity-projection-rejects-drift-without-changing-the-algorithm
   (let [graph (capacity-fixture/graph)
         emit #(get-in (sg/generate-kernel-graph %) [:nodes 0 :operation])
@@ -154,36 +302,52 @@
         larger (emit (capacity-fixture/graph 8))
         source #(str/replace (:source %) (:kernel-name %) "map_capacity")
         candidate (get-in small [:attributes :scheduled-kernel-body])
-        corrupted (assoc-in candidate [:body :parameters 0 :shape] [12])]
+        corrupted (-> candidate
+                      (assoc-in [:body :parameters 0 :shape] [12])
+                      (assoc-in [:body :parameters 0 :layout] (layout/row-major [12] :float)))]
     (is (= (source small) (source larger)))
     (is (= (:arguments small) (:arguments larger)))
     (is (= (:launch small) (:launch larger)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
                          (segmap-body/validate-static-graph-capacities!
                           corrupted (first (:nodes graph)) graph)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
-                         (segmap-body/validate-static-graph-capacities!
-                          (assoc-in candidate [:body :parameters 0 :layout] nil)
-                          (first (:nodes graph)) graph)))
+    (try
+      (segmap-body/validate-static-graph-capacities!
+       (assoc-in candidate [:body :parameters 0 :layout] nil) (first (:nodes graph)) graph)
+      (is false "a missing layout must fail structural admission")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= "kernel buffer parameter requires a named layout" (.getMessage e)))
+        (is (= {:layout nil} (ex-data e)))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exact graph node"
                          (segmap-body/validate-static-graph-capacities!
-                          candidate (assoc (first (:nodes graph)) :id :foreign-node) graph)))))
+                          candidate (assoc (first (:nodes graph)) :id :foreign-node) graph)))
+    (let [index (first (keep-indexed #(when (= :result (:role %2)) %1)
+                                   (get-in candidate [:body :parameters])))]
+      (is (some? index))
+      (doseq [tamper [#(dissoc % :minimum-elements) #(assoc % :minimum-elements 1)]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"write minimum differs"
+                             (segmap-body/validate-static-graph-capacities!
+                              (update-in candidate [:body :parameters index] tamper)
+                              (first (:nodes graph)) graph)))))))
 
 (deftest emitted-graph-interface-preserves-in-place-buffer-direction
   (let [operation (segop/->SegMap
                    901 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
-                   '(inc (clojure.core/aget output i)) nil #{'output} #{'output} #{}
+                   '(inc (clojure.core/aget output i)) nil #{'output} #{'output} #{'n}
                    (segop/->KernelGrid 1 32 0) :float 'output nil)
         scheduled (kgraph/from-segops [operation]
-                                      {:inputs #{'output} :outputs #{'output} :dtype :float})
+                                      {:inputs #{'output} :outputs #{'output} :dtype :float
+                                       ;; This fixture proves direction, not unknown-capacity admission.
+                                       :buffer-specs {'output {:dtype :float :elements 'n}}
+                                       :scalars [(kgraph/scalar 'n :int)]})
         emitted (sg/generate-kernel-graph
                  scheduled :array-types {'output :float} :scalar-types {'n :int})]
     (is (= ['output 'n] (:arguments emitted)))
     (is (= [:inout :scalar] (mapv :kind (:abi emitted))))
     (let [parameters (get-in emitted [:nodes 0 :operation :attributes :kernel-body :parameters])]
       (is (= 1 (count (filter #(= :inout (:kind %)) parameters))))
-      (is (= ['_n_bound] (:shape (first parameters)))
-          "unknown graph capacities retain the compatibility shape without new scalar arguments"))
+      (is (= ['n] (:shape (first parameters)))
+          "graph storage expression remains independent of its private iteration-bound slot"))
     (is (= :inout (get-in emitted [:inputs 0 :role])))))
 
 (deftest two-phase-reduction-graph-emits-its-explicit-scheduled-dataflow

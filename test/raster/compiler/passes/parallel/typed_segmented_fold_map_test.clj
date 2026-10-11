@@ -393,6 +393,10 @@
         (fold-body/lower operation
                          {:array-types {'counts :int 'values :float
                                         'sum-out :float 'maximum-out :float}
+                          ;; The source pitch remains width even when the fold visits only eight
+                          ;; columns. Declare the physical pools independently of that visit domain.
+                          :array-shapes {'counts [(launch/product 'rows 'width)]
+                                         'values [(launch/product 'rows 'width)]}
                           :scalar-types {'rows :long 'width :long}})]
     (is (= 8 workgroup-size))
     (is (= [8 8] (mapv (comp first :shape) (:allocations kernel-body))))
@@ -645,6 +649,60 @@
     (is (= artifact
            (scheduled-body/validate-artifact-projection! certificate artifact)))))
 
+(deftest graph-fold-map-keeps-broadcast-input-capacity-independent-of-output
+  (let [operation (with-redefs [source (walk/postwalk-replace
+                                        {'(clojure.core/+ (clojure.core/* segment width) index)
+                                         'index} source)]
+                    (scheduled-operation))
+        graph (kgraph/from-segops
+               [operation]
+               {:inputs #{'values} :outputs #{'out} :dtype :float
+                :buffer-specs {'values {:dtype :float :elements 'width}
+                               'out {:dtype :float :elements (launch/product 'nsegments 'width)}}
+                :scalars [(kgraph/scalar 'nsegments :int) (kgraph/scalar 'width :int)]})
+        emitted (segop-opencl/generate-kernel-graph
+                 graph :target-dialect :opencl-portable
+                 :array-types {'values :float 'out :float}
+                 :scalar-types {'nsegments :int 'width :int})
+        parameters (get-in emitted [:nodes 0 :operation :attributes :kernel-body :parameters])
+        input (first (filter #(= 'values (:id %)) parameters))
+        candidate (get-in emitted [:nodes 0 :operation :attributes :scheduled-kernel-body])
+        node (first (:nodes graph))]
+    (is (= ['width] (:shape input)))
+    (is (= (layout/row-major ['width] :float) (:layout input)))
+    (doseq [corrupted [(-> candidate
+                          (assoc-in [:body :parameters 0 :shape] [1])
+                          (assoc-in [:body :parameters 0 :layout] (layout/row-major [1] :float)))
+                      (assoc-in candidate [:body :parameters 0 :layout :strides] [2])]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"capacity differs"
+                           (fold-body/validate-against-node! corrupted node graph))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no retained storage capacity"
+                         (segop-opencl/generate-kernel-graph
+                          (assoc-in graph [:inputs 0 :elements] 'values)
+                          :array-types {'values :float 'out :float}
+                          :scalar-types {'nsegments :int 'width :int})))))
+
+(deftest standalone-fold-map-does-not-invent-storage-for-indirect-reads
+  (let [operation (assoc (scheduled-operation)
+                         :inputs #{'values 'indices}
+                         :map-results '[(clojure.core/aget values
+                                                         (clojure.core/aget indices index))])
+        options {:array-types {'values :float 'indices :int 'out :float}
+                 :scalar-types {'nsegments :int 'width :int}}]
+    (let [scheduled (fold-body/schedule operation options)
+          shapes (into {} (map (juxt :id :shape)) (get-in scheduled [:body :parameters]))]
+      (is (= [(launch/runtime-value '(extent values))] (shapes 'values)))
+      (is (not (contains? (:attributes scheduled) :read-capacity-certificate)))
+      (is (seq (shapes 'indices)))
+      ;; Unknown indexed reads retain their physical backing identity, not a falsely certified
+      ;; iteration-sized pool. The pure read-proof tests independently continue to return nil.
+      (is (not= [(launch/product 'nsegments 'width)] (shapes 'values))))
+    (let [scheduled (fold-body/schedule
+                     operation (assoc options :array-shapes {'values [51] 'indices [17]}))
+          shapes (into {} (map (juxt :id :shape)) (get-in scheduled [:body :parameters]))]
+      (is (= [51] (shapes 'values)))
+      (is (= [17] (shapes 'indices))))))
+
 (deftest fold-map-graph-emission-never-uses-the-segred-validator
   (let [operation (scheduled-operation)
         elements (launch/product 'nsegments 'width)
@@ -744,10 +802,10 @@
         forged-schedule
         (assoc-in scheduled [:body :schedule :workgroup-size] 1)]
     (is (= scheduled (fold-body/validate-against-node! scheduled node graph)))
-    (is (= :segfoldmap-storage-extent
+    (is (= :scheduled-kernel-body-input-storage
            (reason-of #(fold-body/validate-against-node! forged-shape node graph))))
     (let [wrong-extent (make-graph :float (launch/sum elements 1))]
-      (is (= :segfoldmap-storage-extent
+      (is (= :scheduled-kernel-body-input-storage
              (reason-of #(fold-body/validate-against-node!
                           scheduled (first (:nodes wrong-extent)) wrong-extent)))))
     (let [forged-attribute-graph
@@ -759,7 +817,7 @@
             :scalars [(kgraph/scalar 'nsegments :int)
                       (kgraph/scalar 'width :int)]
             :attributes {:derived-storage-scalars {'nsegments 1 'width 1}}})]
-      (is (= :segfoldmap-storage-extent
+      (is (= :scheduled-kernel-body-input-storage
              (reason-of #(fold-body/validate-against-node!
                           scheduled (first (:nodes forged-attribute-graph))
                           forged-attribute-graph)))
@@ -970,6 +1028,8 @@
                        operation :target-dialect :opencl-portable
                        :array-types {'values :float 'offsets :long
                                      'lengths :long 'out :float}
+                       ;; Declared storage does not prove the runtime lengths/offset values.
+                       :array-shapes {'values [51] 'offsets [3] 'lengths [3]}
                        :scalar-types {'rows :long})
                       nil
                       (catch clojure.lang.ExceptionInfo exception

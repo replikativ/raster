@@ -18,6 +18,7 @@
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dtype :as dt]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as am]
@@ -29,6 +30,7 @@
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
@@ -40,6 +42,7 @@
             [raster.compiler.passes.parallel.staged-contraction-body :as staged-body]
             [raster.compiler.passes.parallel.product-reduction-body :as product-body]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segscan-body :as segscan-body]
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
@@ -180,18 +183,85 @@
                    :explicit-stores true}})))
 
 
+(defn- graph-array-shapes
+  "Transport checked graph storage extents without substituting the output iteration domain.
+   Retain launch expressions as expressions; their original physical scalar binding is resolved
+   at call admission. Unknown source forms are not promoted to capacity facts."
+  [kernel-graph]
+  (when kernel-graph
+    (kgraph/validate! kernel-graph)
+    (into {}
+          (keep (fn [{:keys [id elements]}]
+                  (when (and (not= id elements)
+                             (or (and (integer? elements) (pos? elements))
+                                 (symbol? elements) (klaunch/dimension-expression? elements)
+                                 (= id (klaunch/backing-extent-id elements))))
+                    [id [(if (klaunch/backing-extent-id elements)
+                           (klaunch/runtime-value elements) elements)]])))
+          (concat (:inputs kernel-graph) (:outputs kernel-graph) (:temporaries kernel-graph)))))
+
+(defn- checked-graph-input-shapes
+  "Graph-backed reads require graph-owned storage facts, never an iteration-width fallback."
+  [operation kernel-graph array-shapes]
+  (let [graph-shapes (graph-array-shapes kernel-graph)
+        shapes (merge array-shapes graph-shapes)]
+    (when kernel-graph
+      (doseq [input (:inputs operation)]
+        (when-not (get graph-shapes input)
+          (throw (ex-info "graph input has no retained storage capacity"
+                          {:reason :kernel-body-input-capacity-unresolved
+                           :operation (:id operation) :input input})))))
+    shapes))
+
+(defn- project-physical-input-shapes
+  "After source/storage validation, project an equal whole input extent to its physical bound.
+   Definitions are derived by the caller from a checked causal program or exact graph context;
+   no graph attribute, name resemblance, address expression, or output geometry proves equality."
+  [scheduled definitions]
+  (let [scheduled (scheduled-body/validate! scheduled)
+        parameters (get-in scheduled [:body :parameters])
+        bound-ids (into #{} (keep #(when (and (= :scalar (:kind %)) (= :bound (:role %)))
+                                   (:id %))) parameters)
+        binding (first (filter #(and (contains? bound-ids (:parameter %))
+                                     (contains? #{:int :long} (:dtype %)))
+                               (:scalar-bindings scheduled)))
+        expand #(klaunch/rebind-expression % definitions)]
+    (if-not (and binding (contains? definitions (:value binding)))
+      scheduled
+      (scheduled-body/validate!
+       (update-in scheduled [:body :parameters]
+                  (fn [parameters]
+                    (mapv
+                     (fn [{:keys [kind shape dtype] :as parameter}]
+                       (if (and (contains? #{:input :inout} kind)
+                                (= 1 (count shape))
+                                (= (layout/row-major shape dtype) (:layout parameter))
+                                (extent/equivalent? (expand (first shape))
+                                                    (expand (:value binding))))
+                         (let [shape [(:parameter binding)]]
+                           (assoc parameter :shape shape :layout (layout/row-major shape dtype)))
+                         parameter))
+                     parameters)))))))
+
 (defn generate-segfoldmap-kernel
   "Schedule and emit one certified ordered SegFoldMap through the canonical KernelBody target."
   [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types
-                        graph-node kernel-graph scheduled-equation-algorithm
+                        array-shapes storage-context graph-node kernel-graph scheduled-equation-algorithm
                         scheduled-equation-body]
                  :or {kernel-name-prefix "segmented_fold_map"
                       target-dialect :opencl-intel
                       scalar-types {} array-types {}} :as opts}]
-  (let [scheduled
+  (let [storage-options (when storage-context
+                          (equation-graph/input-storage-context (:program storage-context)
+                                                                (:equation storage-context) segfoldmap))
+        scheduled
         (segfoldmap-body/schedule
          segfoldmap (merge {:workgroup-size workgroup-size
-                           :scalar-types scalar-types :array-types array-types}
+                           :scalar-types scalar-types :array-types array-types
+                           :array-shapes (checked-graph-input-shapes
+                                          segfoldmap kernel-graph
+                                          (merge array-shapes (:array-shapes storage-options)))
+                           :scalar-definitions (:scalar-definitions storage-options)}
                           (select-keys opts [:scalar-math])))
         _ (when (not= (some? graph-node) (some? kernel-graph))
             (throw (ex-info "fold-map graph certification requires both node and graph"
@@ -212,7 +282,7 @@
 (defn generate-segmap-kernel-body
   "Schedule and emit one typed SegMap through the shared scalar KernelBody dialect."
   [segmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types array-shapes
-                   graph-node kernel-graph]
+                   storage-context graph-node kernel-graph scheduled-equation-algorithm scheduled-equation-body]
              :or {kernel-name-prefix "segmap"
                   target-dialect :opencl-intel workgroup-size 256
                   scalar-types {} array-types {}} :as opts}]
@@ -220,7 +290,10 @@
     (throw (ex-info "map graph certification requires both node and graph"
                     {:reason :segmap-graph-context
                      :graph-node graph-node :kernel-graph kernel-graph})))
-  (let [projected (if (and graph-node (:read-capacity-certificate graph-node))
+  (let [storage-options (when storage-context
+                          (equation-graph/input-storage-context (:program storage-context)
+                                                                (:equation storage-context) segmap))
+        projected (if (and graph-node (:read-capacity-certificate graph-node))
                     (try
                       (map-reads/validate-and-project-addresses segmap graph-node kernel-graph)
                       (catch clojure.lang.ExceptionInfo exception
@@ -238,13 +311,23 @@
         (segmap-body/schedule projected
                               (merge {:workgroup-size workgroup-size
                                :scalar-types scalar-types :array-types array-types
-                               :array-shapes array-shapes}
+                               :array-shapes (checked-graph-input-shapes
+                                              segmap kernel-graph
+                                              (merge array-shapes (:array-shapes storage-options)))
+                               :scalar-definitions (:scalar-definitions storage-options)}
                                      (select-keys opts [:scalar-math])))
         ;; The projected operation is private schedule input. ScheduledKernelBody remains a
         ;; refinement of the exact semantic graph node, which is what later binding validates.
         scheduled (if graph-node (assoc scheduled :source segmap) scheduled)
         _ (when (or graph-node kernel-graph)
             (segmap-body/validate-static-graph-capacities! scheduled graph-node kernel-graph))
+        ;; First prove source/graph correspondence in its original storage representation.
+        ;; Only then replace a whole, causally equal extent with an existing physical scalar.
+        definitions (if kernel-graph
+                      (equation-graph/validated-storage-scalars
+                       kernel-graph scheduled-equation-algorithm scheduled-equation-body)
+                      (:scalar-definitions storage-options))
+        scheduled (project-physical-input-shapes scheduled definitions)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ]
     (kernel-body-target/emit-artifact kernel-name scheduled target-dialect
@@ -335,7 +418,8 @@
                    (merge {:dtype dtype :scalar-types scalar-types :array-types array-types
                            :array-shapes array-shapes :graph-node graph-node :kernel-graph kernel-graph
                            :target-dialect target-dialect :kernel-name-prefix kernel-name-prefix}
-                          (select-keys opts [:scalar-math :target-descriptor]))))))
+                          (select-keys opts [:scalar-math :target-descriptor :storage-context
+                                             :scheduled-equation-algorithm :scheduled-equation-body]))))))
 
 (defn generate-segred-kernel
   "Emit a scheduled full reduction exclusively through target-neutral KernelBody.
@@ -451,13 +535,9 @@
         scalar-types (merge scalar-types
                             (into {} (map (juxt :id :dtype)) (:scalars graph)))
         array-types (graph-array-types graph array-types)
-        ;; Preserve independently owned static buffer capacities. Do not turn unknown or
-        ;; symbolic extents into output-sized facts or introduce new shape-only ABI scalars.
-        static-shapes (into {}
-                            (keep (fn [{:keys [id elements]}]
-                                    (when (and (integer? elements) (pos? elements))
-                                      [id [elements]])))
-                            (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
+        ;; Preserve graph-owned storage expressions independently of iteration geometry;
+        ;; resolving them must not introduce new shape-only ABI scalars.
+        storage-shapes (graph-array-shapes graph)
         emitted
         (kgraph/map-operations
          graph
@@ -467,9 +547,10 @@
              (apply generate-scheduled-segmap-kernel operation
                     (mapcat identity
                             (merge {:dtype (:dtype operation) :scalar-types scalar-types :array-types array-types
-                                    :array-shapes static-shapes :graph-node node :kernel-graph graph
+                                    :array-shapes storage-shapes :graph-node node :kernel-graph graph
                                     :target-dialect target-dialect :kernel-name-prefix "graph_segmap"}
-                                   (select-keys opts [:scalar-math :target-descriptor]))))
+                                   (select-keys opts [:scalar-math :target-descriptor
+                                                      :scheduled-equation-algorithm :scheduled-equation-body]))))
 
              (segop/seg-stencil? operation)
              (apply generate-segstencil-kernel-body operation
@@ -723,7 +804,7 @@
                        (kabi/slot
                         id kind dtype
                         :c-name (get parameter-names id)
-                        :role (if (= id '_nseg) :bound role)
+                        :role (body-abi/projected-role id role)
                         :aliasing (when (= kind :input) :no-write-alias))))
                    parameters))]
     {:kernel-name kernel-name
@@ -1042,7 +1123,7 @@
          (mapv (fn [{:keys [id kind dtype role]}]
                  (kabi/slot id kind dtype
                             :c-name (or (get parameter-names id) (ce/c-symbol id))
-                            :role (if (contains? #{:lhs :rhs} role) :operand role)))
+                            :role (body-abi/projected-role id role)))
                (:parameters kernel-body))
          kernel-body)
         epilogue-slots (filterv #(= :epilogue (:role %)) abi)]

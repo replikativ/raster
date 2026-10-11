@@ -7,6 +7,14 @@
   (:require [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-body :as kbody]))
 
+(defn projected-role
+  "Canonical physical ABI role for a retained semantic parameter. Matrix operand sides
+   remain distinct in body identities; the existing physical ABI projects both to operand."
+  [id role]
+  (cond (= '_nseg id) :bound
+        (contains? #{:lhs :rhs} role) :operand
+        :else role))
+
 (defn retained-buffer-contracts
   "Check the ordered retained body/ABI projection before exposing global storage shapes.
    This is request-local admission, not a new artifact certificate or runtime ownership proof."
@@ -19,7 +27,9 @@
     (mapv (fn [slot parameter]
             (when-not (and (= (:name slot) (:id parameter))
                            (= (:kind slot) (:kind parameter))
-                           (= (:role slot) (if (= '_nseg (:id parameter)) :bound (:role parameter)))
+                           (= (if (= '_nseg (:name slot)) (:role slot)
+                                (projected-role (:name slot) (:role slot)))
+                              (projected-role (:id parameter) (:role parameter)))
                            (= (:dtype parameter)
                               (if (= :scalar (:kind slot)) (:kernel-dtype slot) (:dtype slot))))
               (throw (ex-info "retained body parameter differs from its physical ABI"
