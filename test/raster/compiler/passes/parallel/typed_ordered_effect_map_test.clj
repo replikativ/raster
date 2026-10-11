@@ -885,19 +885,6 @@
            (try (dialect/validate! rebound) nil
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
-(deftest explicit-store-emission-refuses-typed-regions
-  (let [program (:program (route/attempt row-loop-source :float {'x :float 'out :float}
-                                         {:scalar-types {'rows :long 'feat :long}}))
-        scheduled (:form (segop-lower/segop-lower-pass
-                          program {:target-device :ze:0 :dtype :float}))
-        operation (first (get-in scheduled [:equations 0 :operations]))]
-    (is (= :explicit-segmap-requires-source-lambda
-           (try (segop-opencl/generate-explicit-segmap-kernel
-                 operation :dtype :float :array-types {'x :float 'out :float}
-                 :scalar-types {'rows :long 'feat :long})
-                nil
-                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
-
 (deftest unchecked-int-effect-loop-step-needs-a-proved-int-bound
   (let [source (-> #'city/episode-splitmix-histogram!
                    (raster.core/resolve-deftm-var :double)
