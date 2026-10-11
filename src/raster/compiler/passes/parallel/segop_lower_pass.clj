@@ -16,6 +16,7 @@
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -371,7 +372,7 @@
                   (let [[site-kind binding] (:site equation)]
                     (when-not (and (= :binding site-kind)
                                    (contains? source-bindings binding)
-                                   (= (:source equation) (get source-bindings binding)))
+                                   (semantic/equivalent? (:source equation) (get source-bindings binding)))
                       (throw (ex-info (str "typed " (name kind) " equation lacks its exact source witness")
                                       {:reason :raster/bug :stage source-stage
                                        :equation (:id equation) :site (:site equation)

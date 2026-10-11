@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
@@ -547,9 +548,36 @@
             required' (set/union required dependencies)]
         (if (= required required') required (recur required'))))))
 
+(defn- retain-analyzed-binding-expressions
+  "Transport analyzed expressions only at their exact original ordered binding identities."
+  [form descriptions invariant]
+  (let [[head bindings & body] form
+        pairs (mapv vec (partition 2 bindings))
+        ids (mapv :id descriptions)]
+    (when-not (= (count ids) (count (distinct ids)))
+      (throw (ex-info "analyzed source descriptors repeat a binding site"
+                      {:reason :raster/bug :invariant invariant :source-binding-ids ids})))
+    (doseq [{:keys [id sym expr]} descriptions]
+      (when-not (and (integer? id) (<= 0 id) (< id (count pairs))
+                     (= sym (first (nth pairs id))) (some? expr))
+        (throw (ex-info "analyzed source descriptor lost its binding site"
+                        {:reason :raster/bug :invariant invariant
+                         :binding sym :source-binding-id id}))))
+    (let [pairs (reduce (fn [pairs {:keys [id expr]}]
+                          (assoc pairs id [(first (nth pairs id)) expr])) pairs descriptions)]
+      (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
+        (meta form)))))
+
 (defn- realize-source
   [form program]
-  (let [[let-head bindings & body] form
+  (let [form (retain-analyzed-binding-expressions
+              form (mapv (fn [{:keys [source-binding-id destination source-expression]}]
+                           {:id source-binding-id :sym destination :expr source-expression})
+                         (filter #(or (contains? % :source-expression)
+                                      (contains? % :source-binding-id))
+                                 (get-in (dialect/facts program) [:attributes :allocations])))
+              :allocation-source-binding-mismatch)
+        [let-head bindings & body] form
         original-pairs (vec (partition 2 bindings))
         host-binding-ids (set (get-in (dialect/facts program)
                                       [:attributes :host-binding-ids]))
@@ -633,19 +661,20 @@
                (= (count witness) (count (distinct (map :binding witness))))
                (every? (fn [{:keys [binding expression]}]
                          (and (not= primary binding)
-                              (= 1 (count (filter #(= [binding expression] (vec %)) source-pairs)))))
+                              (= 1 (count (filter #(semantic/equivalent? [binding expression] (vec %)) source-pairs)))))
                        witness)
                (some (fn [{binding :binding generated :expression kind :kind}]
-                       (and (= [symbol expression] [binding generated])
+                       (and (semantic/equivalent? [symbol expression] [binding generated])
                             (case kind
                               :result-allocation
                               (and (some #{binding} (:results equation))
                                    (dialect/program-form? (:algorithm equation))
                                    (some (fn [inner]
                                            (and (some #{binding} (nth inner 2))
-                                                (= [binding generated]
-                                                   (equation-allocation-pair
-                                                    (:values program) inner binding))))
+                                                (semantic/equivalent?
+                                                 [binding generated]
+                                                 (equation-allocation-pair
+                                                  (:values program) inner binding))))
                                          (dialect/equations (:algorithm equation))))
                               :storage-alias
                               (and (symbol? generated) (contains? destinations generated))
@@ -844,24 +873,9 @@
    stamped descriptor while executing an undecorated copy. This is producer transport, not
    type inference or source repair at certificate lookup."
   [form entries]
-  (let [[head bindings & body] form
-        pairs (mapv vec (partition 2 bindings))
-        pairs
-        (reduce
-         (fn [pairs {:keys [kind description]}]
-           (if (= :segmented-weighted-reduction kind)
-             (let [{:keys [id sym expr]} description]
-               (when-not (and (integer? id) (<= 0 id) (< id (count pairs))
-                              (= sym (first (nth pairs id))))
-                 (throw (ex-info "protected source descriptor lost its binding site"
-                                 {:reason :raster/bug
-                                  :invariant :protected-source-binding-mismatch
-                                  :binding sym :source-binding-id id})))
-               (assoc pairs id [(first (nth pairs id)) expr]))
-             pairs))
-         pairs entries)]
-    (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
-      (meta form))))
+  (retain-analyzed-binding-expressions
+   form (mapv :description (filter #(= :segmented-weighted-reduction (:kind %)) entries))
+   :protected-source-binding-mismatch))
 
 (defn- mixed-envelope
   [form projection options]

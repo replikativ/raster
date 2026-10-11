@@ -12,6 +12,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segop :as segop]
@@ -553,11 +554,11 @@
                       (:equations parallel-program))]
     (doseq [[symbol expression] (partition 2 (second (:source parallel-program)))
             :when (and (not (and (contains? prefix-bindings symbol)
-                                 (= expression (get prefix-bindings symbol))))
+                                 (semantic/equivalent? expression (get prefix-bindings symbol))))
                        (not (program/equation-for-binding parallel-program symbol expression))
                        (not (typed-route/realization-binding? parallel-program symbol expression))
                        (not (and (contains? allocations symbol)
-                                 (= expression (get allocations symbol))))
+                                 (semantic/equivalent? expression (get allocations symbol))))
                        ;; A changed claimed binding invalidates its executor even when the new
                        ;; source expression is pure. Only unclaimed host work may be removed.
                        (or (contains? claimed symbol)
