@@ -196,7 +196,7 @@
                                   (clojure.core/+ acc (clojure.core/aget a i)))
                 0)
           operations (soac-lower/lower-scan node nil)
-          scheduled (soac-lower/scan-kernel-graph node operations {})
+          scheduled (soac-lower/scan-kernel-graph node operations {:scalar-types {'n :int}})
           emitted (segop-opencl/generate-scan-kernel-graph scheduled)
           artifacts (mapv :operation (:nodes emitted))]
       (is (kernel-graph/kernel-graph? emitted))

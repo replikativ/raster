@@ -332,7 +332,7 @@
                                                     (+ acc (aget input i)))
                                   908 :dtype :double)
         operations (soac-lower/lower-scan source nil :dtype :double)
-        graph (soac-lower/scan-kernel-graph source operations {})
+        graph (soac-lower/scan-kernel-graph source operations {:scalar-types {'n :int}})
         emitted (segop-opencl/generate-scan-kernel-graph graph :target-dialect :cuda)]
     (doseq [[node emitted-node] (map vector (:nodes graph) (:nodes emitted))
             :let [original (:operation emitted-node)

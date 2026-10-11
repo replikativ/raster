@@ -102,7 +102,7 @@
         operations (lower/lower-scan node nil :dtype :float)]
     (emit/generate-scan-kernel-graph
      (lower/scan-kernel-graph
-      node operations {:array-types {'values :float 'out :float}}))))
+      node operations {:scalar-types {'n :int} :array-types {'values :float 'out :float}}))))
 
 (deftest resident-driver-validates-before-device-measurement
   (let [actions (atom [])

@@ -87,11 +87,15 @@
                                                      :dtype (or dtype :double)))]
           (cond
             (:err segops) (decline :segop (:err segops))
-            (seq (:ok segops)) (cond-> {:soac legacy-node :segops (:ok segops)}
-                                 (soac-lower/scan-soac? legacy-node)
-                                 (assoc :kernel-graph
-                                        (soac-lower/scan-kernel-graph
-                                         legacy-node (:ok segops) {:array-types array-types})))
+            (seq (:ok segops))
+            (if (soac-lower/scan-soac? legacy-node)
+              (let [graph (attempt #(soac-lower/scan-kernel-graph
+                                    legacy-node (:ok segops) {:array-types array-types
+                                                             :scalar-types scalar-types}))]
+                (if (:err graph)
+                  (decline :kernel-graph (:err graph))
+                  {:soac legacy-node :segops (:ok segops) :kernel-graph (:ok graph)}))
+              {:soac legacy-node :segops (:ok segops)})
             :else (when par? {:declined (diagnostic sym form :segop
                                                     (ex-info "lower-soac produced no SegOps" {})
                                                     device-id dtype)})))))))

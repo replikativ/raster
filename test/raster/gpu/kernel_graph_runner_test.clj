@@ -34,7 +34,7 @@
         operations (lower/lower-scan node nil :dtype :float)]
     (emit/generate-scan-kernel-graph
      (lower/scan-kernel-graph
-      node operations {:array-types {'values :float 'out :float}}))))
+      node operations {:scalar-types {'n :int} :array-types {'values :float 'out :float}}))))
 
 (deftest integrated-opencl-allocation-still-uploads-through-cl-mem
   (let [source (float-array [1.0 2.0])

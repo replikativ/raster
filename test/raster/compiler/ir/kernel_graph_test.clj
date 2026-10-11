@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.segscan-body :as scan-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
 
 (defn- symbolic-scan []
@@ -13,10 +14,93 @@
    '(raster.par/scan out acc 0.0 i n double (+ acc (aget values i)))
    41))
 
+(deftest scan-source-scalars-retain-exact-width-and-node-closure
+  (doseq [mode [:inclusive :exclusive]
+          scalar-type [:int :long]]
+    (let [bound (launch/product 'rows 'columns)
+          source (assoc (symbolic-scan) :bound bound
+                        :lambda '(+ acc (* scale (aget values i))) :scalars #{'scale})
+          description (assoc (#'lower/legacy-scan-description source) :mode mode)
+          operations (#'lower/lower-scan-description description nil)
+          scheduled (#'lower/scan-kernel-graph-description
+                     description operations
+                     {:scalar-types {'rows scalar-type 'columns scalar-type 'scale :double}})]
+      (is (= {'rows scalar-type 'columns scalar-type 'scale :double}
+             (into {} (map (juxt :id :dtype)) (:scalars scheduled))))
+      (let [original-order [(graph/scalar 'scale :double)
+                            (graph/scalar 'rows scalar-type)
+                            (graph/scalar 'columns scalar-type)]
+            typed-view (#'lower/scan-kernel-graph-description
+                        description
+                        operations {:scalar-types {'rows scalar-type 'columns scalar-type 'scale :double}})
+            ordered-description (assoc description :public-scalars original-order)
+            typed-projection (#'lower/scan-kernel-graph-description ordered-description operations {})]
+        (is (= original-order (:scalars typed-projection)))
+        (is (= (:nodes typed-view) (:nodes typed-projection))))
+      (doseq [node (:nodes scheduled)]
+        (is (= (segop/operation-scalars (:operation node)) (:scalar-uses node)))
+        (is (some? (scan-body/schedule-for-node node scheduled {}))))
+      (is (= 0 (launch/resolve-expression {'rows 0 'columns 17}
+                                         (:elements (first (:inputs scheduled))))))
+      (is (= (if (= mode :inclusive) 0 1)
+             (launch/resolve-expression {'rows 0 'columns 17}
+                                        (:elements (first (:outputs scheduled)))))))))
+
+(deftest scan-source-scalars-refuse-unknown-nonintegral-and-conflicting-evidence
+  (let [source (symbolic-scan)
+        operations (lower/lower-scan source nil)
+        failure (fn [types]
+                  (try (lower/scan-kernel-graph source operations {:scalar-types types}) nil
+                       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (doseq [types [{} {'n nil} {'n :unknown} {'n :float}]]
+      (is (= :scan-source-scalar-type (failure types))))
+    (let [bound (with-meta 'n {:raster.type/tag 'float})
+          operation (assoc-in (first operations) [:space :dims 0 :bound] bound)]
+      (is (= :scan-source-scalar-type
+             (try (#'lower/scan-public-scalars {:public-scalars [(graph/scalar 'n :long)]}
+                                               [operation] {'n :long}) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (doseq [tag ['unknown-semantic-type 'longs]
+            site [:extent :operand]]
+      (let [operand (with-meta 'n {:raster.type/tag tag})
+            operation (if (= site :extent)
+                        (assoc-in (first operations) [:space :dims 0 :bound] operand)
+                        (assoc (first operations) :scalars #{operand}))]
+        (is (= :scan-source-scalar-type
+               (try (#'lower/scan-public-scalars {:public-scalars [(graph/scalar 'n :long)]}
+                                                 [operation] {'n :long}) nil
+                    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            (str "equal bare declaration must not erase " tag " at " site))))
+    (let [scheduled (lower/scan-kernel-graph source operations {:scalar-types {'n :long}})
+          node (first (:nodes scheduled))]
+      (is (= :scan-source-scalar-type
+             (try (#'lower/scan-public-scalars {:public-scalars (:scalars scheduled)}
+                                               operations {'n :int}) nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+      (is (= :scalar-contract
+             (try (scan-body/schedule-for-node node scheduled {:scalar-types {'n :int}}) nil
+                  (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e))))))
+      (let [unproved (-> scheduled (assoc :scalars nil)
+                         (update :nodes #(mapv (fn [n] (assoc n :scalar-uses nil)) %)))]
+        (is (= :scalar-contract
+               (try (scan-body/schedule-for-node (first (:nodes unproved)) unproved {}) nil
+                    (catch clojure.lang.ExceptionInfo e (:missing-rule (ex-data e))))))))))
+
+(deftest static-empty-scan-needs-no-invented-scalar-interface
+  (doseq [mode [:inclusive :exclusive]]
+    (let [source (assoc (symbolic-scan) :bound 0)
+          description (assoc (#'lower/legacy-scan-description source) :mode mode)
+          operations (#'lower/lower-scan-description description nil)
+          scheduled (#'lower/scan-kernel-graph-description description operations {})]
+      (is (= [] (:scalars scheduled)))
+      (is (every? #(= #{} (:scalar-uses %)) (:nodes scheduled)))
+      (is (= (if (= mode :inclusive) 0 1)
+             (launch/resolve-expression {} (:elements (first (:outputs scheduled)))))))))
+
 (deftest three-stage-scan-has-explicit-scheduled-dataflow
   (let [node (symbolic-scan)
         operations (lower/lower-scan node nil)
-        scheduled (lower/scan-kernel-graph node operations)
+        scheduled (lower/scan-kernel-graph node operations {:scalar-types {'n :int}})
         [intra block carry] (:nodes scheduled)
         temporary (first (:temporaries scheduled))]
     (is (graph/kernel-graph? scheduled))
@@ -55,7 +139,7 @@
 (deftest graph-validation-rejects-an-unscheduled-memory-hazard
   (let [node (symbolic-scan)
         operations (lower/lower-scan node nil)
-        scheduled (lower/scan-kernel-graph node operations)
+        scheduled (lower/scan-kernel-graph node operations {:scalar-types {'n :int}})
         missing-edge (assoc-in scheduled [:nodes 1 :dependencies] [])]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"omits a memory-hazard dependency"
@@ -67,7 +151,7 @@
               '(raster.par/scan out acc 0.0 i 64 double (+ acc (aget values i)))
               5)
         operations (lower/lower-scan node nil)
-        scheduled (lower/scan-kernel-graph node operations)]
+        scheduled (lower/scan-kernel-graph node operations {:scalar-types {'n :int}})]
     (is (= :single (get-in scheduled [:attributes :strategy])))
     (is (= 1 (count (:nodes scheduled))))
     (is (empty? (:temporaries scheduled)))
@@ -209,7 +293,7 @@
               12)
         operations (lower/lower-scan node nil)
         scheduled (lower/scan-kernel-graph
-                   node operations {:array-types {'integer-values :int 'out :double}})]
+                   node operations {:scalar-types {'n :int} :array-types {'integer-values :int 'out :double}})]
     (is (= :int (get-in scheduled [:inputs 0 :dtype])))
     (is (= :double (get-in scheduled [:outputs 0 :dtype])))
     (is (= :double (get-in scheduled [:temporaries 0 :dtype])))

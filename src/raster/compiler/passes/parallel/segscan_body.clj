@@ -512,7 +512,7 @@
 
 (defn schedule-for-node
   "Derive scan schedule inputs from one exact node and its graph-owned storage and algebra.
-   Caller scalar types only fill legacy graphs without declared scalar types."
+   Every graph requires its original source scalar table and node dependency closure."
   [node kernel-graph options]
   (let [kernel-graph (graph/validate! kernel-graph)
         _ (when-not (some #(= node %) (:nodes kernel-graph))
@@ -520,14 +520,9 @@
                       {:node (:id node)}))
         declared (into {} (map (juxt :id :dtype)) (:scalars kernel-graph))
         supplied (:scalar-types options)
-        ;; Legacy graph constructors expose no GraphScalar table. Their bound ABI has always
-        ;; been int; project that existing contract only for missing extent leaves. Typed graphs
-        ;; never receive this compatibility default, and explicit caller types take precedence.
-        legacy-bound-types (when (nil? (:scalars kernel-graph))
-                             (zipmap (launch/expression-references
-                                      (:bound (segop/seg-space-reduced-dim
-                                               (:space (:operation node)))))
-                                     (repeat :int)))
+        _ (when (nil? (:scalars kernel-graph))
+            (decline! :scalar-contract "scan graph lacks its original source scalar interface"
+                      {:node (:id node)}))
         _ (doseq [[id dt] declared :when (contains? supplied id)]
             (when-not (= dt (dtype/canon (get supplied id)))
               (decline! :scalar-contract "scan scalar types conflict with its graph"
@@ -553,12 +548,8 @@
                     :output-ids (set (map :id (:outputs kernel-graph)))
                     :scan-algebra algebra :scan-mode scan-mode
                     :scan-workgroup (or (get-in first-scan [:grid :block-size]) 256)
-                    :scalar-types (merge legacy-bound-types supplied declared)}))]
-    ;; Direct legacy graph constructors predate explicit GraphScalar declarations.
-    ;; Typed production graphs must close their scalar dependencies here as well.
-    (if (some? (:scalars kernel-graph))
-      (scheduled-body/validate-against-node! scheduled node kernel-graph)
-      scheduled)))
+                    :scalar-types (merge supplied declared)}))]
+    (scheduled-body/validate-against-node! scheduled node kernel-graph)))
 
 (defn validate-against-node!
   "Independently reconstruct the exact scan body from its semantic node and graph facts."

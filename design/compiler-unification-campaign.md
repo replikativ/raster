@@ -24,6 +24,32 @@ adapter still validates under default intent and refuses selected-math plans. Su
 composition requires a separate independent caller request, never consent inferred from the
 runtime owner or its certificate. Existing default durable capture remains unchanged.
 
+### Original scalar closure for compatibility scan graphs
+
+Compatibility scan graph construction now requires retained scalar dtype facts for dynamic
+extents and scalar captures. It projects the exact selected operations' dependencies through
+the existing SegOp operand authority and constructs ordinary GraphScalar declarations;
+KernelGraph construction owns node dependency closure. Typed scan declarations retain their
+existing order and dtype authority. Extent leaves must be integral, unknown/conflicting facts
+refuse, and no emitted ABI or default `int` guess supplies original source proof.
+
+The sole production legacy constructor caller forwards its existing scalar facts. Direct
+constructor fixtures provide their established exact scalar interfaces; static no-capture
+scans need no invented scalars. Scan scheduling now requires the original table and always
+checks scheduled-body/node correspondence, retiring the legacy width fallback and validation
+bypass. Manually assembled scan graphs without that table explicitly refuse. Public numerical
+source forms and inclusive/exclusive arithmetic are unchanged; dynamic constructor calls now
+require `:scalar-types`. This is source-interface closure, not new scan algebra, AD coverage,
+GPU performance evidence or completion of the unchanged real-model training gate.
+
+Warm validation passes 67 focused tests / 564 assertions and 38 affected graph/runtime
+tests / 302 assertions. Explicitly available OpenCL and Level Zero execute 8 native
+scan/replay/view tests / 40 assertions; source packet tests and their native controls
+pass 10 tests / 681 assertions. Scan certificate serialization adds 9 passing assertions.
+Unsupported retained semantic tags refuse rather than disappearing during dtype projection.
+The remaining typed-decline-to-compatibility retry is still reachable and is a separate
+retirement step; these checks do not establish general scan AD or training acceptance.
+
 ### Map store-callee derivative authority
 
 An active map with a lexical nonlinear store callable named `double` kept its

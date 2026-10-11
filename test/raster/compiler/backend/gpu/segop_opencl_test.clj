@@ -767,7 +767,8 @@
    (let [result-type (or (:dtype opts) :double)
          node (soac/par-form->soac 'scan-result form 71 :dtype result-type)
          operations (lower/lower-scan node nil :dtype result-type)
-         graph (lower/scan-kernel-graph node operations opts)]
+         graph (lower/scan-kernel-graph node operations
+                                        (update opts :scalar-types #(merge {'n :int} %)))]
      (sg/generate-scan-kernel-graph graph
                                     :scalar-types (:scalar-types opts)))))
 
@@ -775,7 +776,7 @@
   (let [form '(raster.par/scan out acc 0.0 i n double (+ acc (aget values i)))
         node (soac/par-form->soac 'scan-result form 906 :dtype :double)
         operations (lower/lower-scan node nil :dtype :double)
-        graph (lower/scan-kernel-graph node operations {})
+        graph (lower/scan-kernel-graph node operations {:scalar-types {'n :int}})
         emitted (sg/generate-scan-kernel-graph graph)]
     (doseq [[source-node emitted-node] (map vector (:nodes graph) (:nodes emitted))
             :let [artifact (:operation emitted-node)
@@ -799,7 +800,8 @@
                   {:raster.type/tag 'float})
         form (list 'raster.par/scan 'out 'acc 0.0 'i 'n 'float (list '+ 'acc element))
         source (soac/par-form->soac 'scan-result form 909 :dtype :float)
-        graph (lower/scan-kernel-graph source (lower/lower-scan source nil :dtype :float) {})
+        graph (lower/scan-kernel-graph source (lower/lower-scan source nil :dtype :float)
+                                      {:scalar-types {'n :int}})
         node (first (:nodes graph))
         policy {:overrides {[:tanh :float] :f64-target-library-rte-f32}}
         ordinary (segscan-body/schedule-for-node node graph {})
@@ -836,13 +838,13 @@
   (let [form '(raster.par/scan out acc 0.0 i n double
                                (+ acc (* scale (aget values i))))
         node (soac/par-form->soac 'scan-result form 907 :dtype :double)
-        operations (lower/lower-scan node nil :dtype :double)
-        graph (lower/scan-kernel-graph node operations {})]
-    (is (= :kernel-scalar-dtype-unknown
-           (try (sg/generate-scan-kernel-graph graph)
+        operations (lower/lower-scan node nil :dtype :double)]
+    (is (= :scan-source-scalar-type
+           (try (lower/scan-kernel-graph node operations {:scalar-types {'n :int}})
                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (is (kgraph/kernel-graph?
-         (sg/generate-scan-kernel-graph graph :scalar-types {'scale :double})))))
+         (sg/generate-scan-kernel-graph
+          (lower/scan-kernel-graph node operations {:scalar-types {'n :int 'scale :double}}))))))
 
 (defn- kernel-body-operations
   [artifact]
@@ -990,7 +992,7 @@
                               (klaunch/ceil-div 'n carry-width)
                               carry-width 0))
         graph (lower/scan-kernel-graph
-               node operations {:array-types {'values :float 'out :float}})
+               node operations {:scalar-types {'n :int} :array-types {'values :float 'out :float}})
         carry (get-in (sg/generate-scan-kernel-graph graph) [:nodes 2 :operation])
         scan-block (some #(when (= 'scan-block (:id %)) %)
                          (get-in carry [:attributes :kernel-body :indices]))]

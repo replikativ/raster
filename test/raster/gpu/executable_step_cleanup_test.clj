@@ -14,7 +14,7 @@
                 'scan-result '(raster.par/scan out acc 0.0 i n float (+ acc (aget values i))) 92)]
       (emit/generate-scan-kernel-graph
        (lower/scan-kernel-graph node (lower/lower-scan node nil :dtype :float)
-                                {:array-types {'values :float 'out :float}})))))
+                                {:scalar-types {'n :int} :array-types {'values :float 'out :float}})))))
 
 (defn- session []
   (atom {:device-id :ocl:0 :closed? false :graphs {} :prepared {} :kernel-graphs {}

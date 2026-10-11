@@ -1226,15 +1226,52 @@
   "Turn an already lowered scan into a verified scheduled graph.
 
    This consumes the exact SegOps returned by `lower-scan`; it must not lower a second time because
-   the block-totals buffer identity is generated during decomposition."
+   the block-totals buffer identity is generated during decomposition. Dynamic extents and
+   scalar captures require explicit retained :scalar-types; emitted ABI slots are not proof."
   ([soac segops]
    (scan-kernel-graph soac segops {}))
-  ([soac segops {:keys [array-types] :or {array-types {}}}]
+  ([soac segops {:keys [array-types scalar-types] :or {array-types {} scalar-types {}}}]
    (scan-kernel-graph-description (legacy-scan-description soac) segops
-                                  {:array-types array-types})))
+                                  {:array-types array-types :scalar-types scalar-types})))
+
+(defn- scan-public-scalars
+  "Project the selected scan's source scalar interface using existing operand and dtype facts.
+   No emitted ABI reconstruction or implicit bound width is permitted."
+  [description segops scalar-types]
+  (let [operand-ids (mapcat segop/operation-scalars segops)
+        extent-operands (mapcat #(segop/operation-scalars (assoc % :scalars #{})) segops)
+        required (set operand-ids)
+        extent-ids (set extent-operands)
+        ;; Equal source IDs can carry different metadata. Do not let an unhinted ordered
+        ;; declaration erase a contradictory retained operand fact during set projection.
+        source-operands (group-by identity (concat operand-ids extent-operands))
+        declared (into {} (map (juxt :id :dtype)) (:public-scalars description))]
+    (mapv
+     (fn [id]
+       (let [supplied (get scalar-types id)
+             retained (get declared id)
+             dt (or retained supplied)
+             source-tags (keep #(-> % meta :raster.type/tag)
+                               (cons id (get source-operands id)))
+             ;; A nonnil semantic tag is an obligation, even when it has no scalar
+             ;; projection. Only absent/nil tags may defer to the retained interface.
+             source-dtypes (mapv dtype/dtype-for-scalar-tag source-tags)]
+         (when-not (and (dtype/known? dt)
+                        (or (nil? supplied) (and (dtype/known? supplied)
+                                                (= (dtype/canon supplied) (dtype/canon dt))))
+                        (every? #(and (dtype/known? %) (= % (dtype/canon dt))) source-dtypes)
+                        (or (not (contains? extent-ids id)) (dtype/integral? dt)))
+           (throw (ex-info "scan source scalar requires exact retained dtype evidence"
+                           {:reason :scan-source-scalar-type :scalar id :declared retained
+                            :supplied supplied :source-tags (vec source-tags)
+                            :source-dtypes source-dtypes
+                            :extent? (contains? extent-ids id)})))
+         (kernel-graph/scalar id dt)))
+     (concat (map :id (:public-scalars description))
+             (sort-by pr-str (set/difference required (set (keys declared))))))))
 
 (defn- scan-kernel-graph-description
-  [description segops {:keys [array-types] :or {array-types {}}}]
+  [description segops {:keys [array-types scalar-types] :or {array-types {} scalar-types {}}}]
   (let [external (set/union (or (:inputs description) #{})
                             (or (:outputs description) #{}))
         used (reduce set/union #{}
@@ -1269,7 +1306,7 @@
      {:inputs (or (:inputs description) #{})
       :outputs (or (:outputs description) #{})
       :temporaries temporaries
-      :scalars (:public-scalars description)
+      :scalars (scan-public-scalars description segops scalar-types)
       :buffer-specs buffer-specs
       :dtype dtype
       :effects {:memory-order :dependency-ordered}
