@@ -404,7 +404,11 @@
     (not active?)                                                   :inactive
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
-    (= :par (:kind (form/form-info init-expr)))
+    (and (= :par (:kind (form/form-info init-expr)))
+         ;; Declared call rules still own parallel deftm primitives such as
+         ;; dot-product/scale. Only unhandled scoped regions refuse here;
+         ;; admitted templates must reach the existing :call record below.
+         (not (tmpl/resolve-template (:operation (op/call-description init-expr)))))
     (do (assert-unhandled-parallel-region! init-expr true sym) :inactive)
     (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr)))
     (do (assert-source-scan-checkpoint! init-expr true) :loop)
