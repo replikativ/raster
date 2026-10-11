@@ -377,5 +377,15 @@ The local reference check supports this boundary and adds specific obligations:
 
 These observations refer to the available sibling checkouts, not an assertion about
 the latest upstream versions. No reference compiler becomes a runtime dependency.
+Host materialization of the lifted maps reuses `typed-soac-route`'s production
+allocation, ordered scalar region and tuple-store projection. It returns ordinary
+retained source with exact logical input/output IDs transported to fresh source
+symbols, not another array interpreter. Float/double JVM execution controls check
+fresh coefficient arrays, source mutation after the primal, scalar captures and
+empty extents. Device placement, stored/aliased results and external output
+ownership are explicit refusals at this host-only boundary. Argument shape checks,
+runtime publication and asynchronous residual ownership remain downstream work;
+source projection alone is not a whole-array public AD API or a device gate.
+
 The unchanged Gemma, SFT and held checkpoint gates remain independent: successful
 scalar normalization does not certify them.

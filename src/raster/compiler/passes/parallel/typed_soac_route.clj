@@ -8,6 +8,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -235,7 +236,7 @@
                                 {result host-binding})
               host-returns (set (map :host-return storage))
               multiple-buffer-results? (and (= #{:buffer} host-returns)
-                                             (< 1 (count physical-results)))
+                                            (< 1 (count physical-results)))
               _ (when (and storage
                            (not (or (= #{:effect} host-returns)
                                     (= #{:buffer} host-returns))))
@@ -389,19 +390,19 @@
                             nil))))
             statement
             (fn [{:keys [destination conflict destination-index predicate value]}]
-                    (let [cast (get cast-by-destination destination)
-                          result-dtype (get dtype-by-destination destination)
-                          destination (with-meta destination
-                                        {:raster.type/tag
-                                         (dtype/array-tag-for-dtype result-dtype)
-                                         :tag (dtype/array-tag-for-dtype result-dtype)})
-                          typed-value (if cast (list (generated-cast cast) value) value)
-                          store (if (dialect/reducing-scatter-conflict? conflict)
-                                  (list 'raster.par/atomic-add!
-                                        destination destination-index typed-value)
-                                  (list 'clojure.core/aset destination destination-index
-                                        typed-value))]
-                      (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+              (let [cast (get cast-by-destination destination)
+                    result-dtype (get dtype-by-destination destination)
+                    destination (with-meta destination
+                                  {:raster.type/tag
+                                   (dtype/array-tag-for-dtype result-dtype)
+                                   :tag (dtype/array-tag-for-dtype result-dtype)})
+                    typed-value (if cast (list (generated-cast cast) value) value)
+                    store (if (dialect/reducing-scatter-conflict? conflict)
+                            (list 'raster.par/atomic-add!
+                                  destination destination-index typed-value)
+                            (list 'clojure.core/aset destination destination-index
+                                  typed-value))]
+                (if (contains? #{true 1} predicate) store (list 'if predicate store))))
             continuation (effect-source/ordered-effects
                           effects nil {:emit-store statement :emit-loop loop-statement
                                        :emit-region materialize-locals})
@@ -526,6 +527,93 @@
          :pairs [[result source]]
          :site [:binding result]
          :source source}))))
+
+(defn materialize-host-map
+  "Project one pure functional map to ordinary host source using the production materializer.
+
+   Returns ordered logical :inputs/:outputs, fresh :parameters, a :value-symbols transport and
+   a retained :body returning a vector of fresh primitive result arrays. This constructs source
+   only: callers own compilation, argument shape checks, execution and result lifetimes.
+   Device placement, stored/aliased results and unknown semantic facets are not erased."
+  [program]
+  (dialect/validate! program)
+  (let [facts (dialect/facts program)
+        equations (dialect/equations program)
+        equation (first equations)
+        {:keys [kind attributes arrays captures]} (when equation
+                                                    (dialect/operation-parts equation))
+        equation-facts (get-in facts [:equations (second equation)])
+        inputs (:inputs facts)
+        outputs (dialect/outputs program)
+        extent (:extent attributes)
+        extent-value (get-in facts [:values extent])
+        operands (concat arrays captures outputs)
+        plain-host? (fn [value]
+                      (and (= :tensor (:kind value))
+                           (= {:kind :plain} (:representation value))
+                           (nil? (:logical-layout value))
+                           (contains? #{nil :host} (:memory-space value))
+                           (nil? (:placement value)) (nil? (:sharding value))
+                           (empty? (:effects value)) (empty? (:attributes value))))]
+    (when-not (and (= 1 (count equations)) (= 'map kind)
+                   (= outputs (nth equation 2))
+                   (empty? (:effects facts)) (empty? (:aliases facts))
+                   (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
+                   (empty? (:attributes equation-facts))
+                   (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
+                   (or (nil? (get-in facts [:attributes :source-arithmetic]))
+                       (= numerics/retained-source-arithmetic
+                          (get-in facts [:attributes :source-arithmetic])))
+                   (set/subset? (set (keys attributes)) #{:index :extent :attributes})
+                   (set/subset? (set (keys (:attributes attributes)))
+                                #{:stable-array-captures :pointwise-storage-inputs})
+                   (every? empty? (vals (:attributes attributes)))
+                   (empty? (dialect/result-storage program (second equation)))
+                   (or (integer? extent)
+                       (and (plain-host? extent-value) (= [] (:shape extent-value))
+                            (dtype/known? (:dtype extent-value))
+                            (dtype/integral? (:dtype extent-value))))
+                   (every? (fn [id]
+                             (let [value (get-in facts [:values id])]
+                               (and (plain-host? value)
+                                    (contains? #{:float :double} (:dtype value))))) operands)
+                   (every? #(= (dialect/extent-shape extent) (get-in facts [:values % :shape]))
+                           (concat arrays outputs))
+                   (every? #(= [] (get-in facts [:values % :shape])) captures)
+                   (every? #(contains? #{nil :owned} (get-in facts [:values % :ownership])) outputs)
+                   (= (set inputs) (set (concat arrays captures
+                                                (when (dialect/value-id? extent) [extent])))))
+      (throw (ex-info "map cannot be materialized as fresh host primitive arrays"
+                      {:reason :typed-soac-host-map-boundary :equation equation})))
+    ;; The dialect validator already rejects locals shadowing the operation index. The host
+    ;; materializer also introduces a bare cast under that index: refuse that additional
+    ;; collision rather than duplicating scoped substitution here.
+    (when (contains? '#{float double} (:index attributes))
+      (throw (ex-info "map host projection requires capture-safe internal binders"
+                      {:reason :typed-soac-host-map-binder-collision
+                       :index (:index attributes)})))
+    ;; Exact IDs may be keywords/vectors; they are not source expressions. Renaming every outer
+    ;; value also avoids source-level collisions with casts and the map's lexical binders.
+    (let [symbols (into {} (map (fn [[id value]]
+                                  (let [array? (seq (:shape value))
+                                        tag (if array?
+                                              (dtype/array-tag-for-dtype (:dtype value))
+                                              (dtype/scalar-tag-for-dtype (:dtype value)))]
+                                    [id (with-meta (gensym "host_map_value_")
+                                          (cond-> {:raster.type/tag tag}
+                                            array? (assoc :tag tag)))])))
+                        (:values facts))
+          projected (dialect/remap-values program symbols)
+          ;; Placement here is a host-source ordering site, not hardware placement. It belongs
+          ;; only to this projection copy; the logical program and its provenance stay intact.
+          projected (dialect/make
+                     (assoc-in (dialect/facts projected)
+                               [:equations (second equation) :provenance :source-binding-id] 0)
+                     (dialect/equations projected) (dialect/outputs projected))
+          {:keys [pairs]} (realize-equation projected (first (dialect/equations projected)))]
+      {:inputs inputs :outputs outputs :parameters (mapv symbols inputs)
+       :value-symbols symbols
+       :body (list 'let* (vec (mapcat identity pairs)) (mapv symbols outputs))})))
 
 (defn- required-host-bindings
   "Return the transitive source bindings needed by host materialization.
@@ -785,10 +873,10 @@
         equation-facts (select-keys (:equations source-facts) equation-ids)
         effects (reduce set/union #{} (map :effects (vals equation-facts)))
         current-storage (into #{} (mapcat #(entry-storage-values
-                                           source-facts equations-by-id %))
+                                            source-facts equations-by-id %))
                               (:entries component))
         prior-storage (into #{} (mapcat #(entry-storage-values
-                                         source-facts equations-by-id %))
+                                          source-facts equations-by-id %))
                             (:prefix component))
         first-access-storage (set/difference current-storage prior-storage)
         allocations (filterv #(contains? first-access-storage (:destination %))
@@ -988,9 +1076,9 @@
   ([form dtype array-types]
    (attempt form dtype array-types {}))
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
-                                 resident-uniform-input-loads?
-                                 scalar-types values abstract-machine segmented-plans?
-                                 preserve-declared-array-storage?]
+                                   resident-uniform-input-loads?
+                                   scalar-types values abstract-machine segmented-plans?
+                                   preserve-declared-array-storage?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
