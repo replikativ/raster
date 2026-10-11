@@ -2,6 +2,7 @@
   "Tests for free variable analysis — correctness of scoping across all binding forms."
   (:require [clojure.test :refer [deftest testing is]]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.core.util :as util]))
 
 ;; ================================================================
@@ -370,12 +371,36 @@
 
 (deftest subst-syms-rebuilds-ir-records-instead-of-emptying-them
   (testing "a KernelBody index record keeps its type and gets its fields substituted"
-    (let [expression (body/expression :mul 'batch (body/index-cast 'seq-len :long :exact))
+    (let [expression (with-meta
+                       (body/expression :mul 'batch (body/index-cast 'seq-len :long :exact))
+                       {:test/provenance :original-index})
           substituted (util/subst-syms '{batch arg_batch seq-len arg_seq} expression)]
-      (is (instance? raster.compiler.ir.kernel_body.IndexExpr substituted))
+      (is (launch/index-expr? substituted))
+      (is (record? substituted))
+      (is (identical? (class expression) (class substituted)))
+      (is (= {:test/provenance :original-index} (meta substituted)))
+      (is (= :mul (:op substituted)))
+      (is (= 2 (count (:arguments substituted))))
       (is (= 'arg_batch (first (:arguments substituted))))
-      (is (= 'arg_seq (:argument (second (:arguments substituted)))))))
+      (let [cast (second (:arguments substituted))]
+        (is (launch/index-cast? cast))
+        (is (record? cast))
+        (is (= {:argument 'arg_seq :dtype :long :overflow :exact} (into {} cast))))
+      (is (= 21 (launch/resolve-expression '{batch 3 seq-len 7} expression)))
+      (is (= 21 (launch/resolve-expression
+                 '{arg_batch 3 arg_seq 7 batch 100 seq-len 999} substituted)))
+      (is (= 'batch (first (:arguments expression))))
+      (is (= 'seq-len (:argument (second (:arguments expression)))))))
   (testing "records nested inside forms are reached"
     (let [form (list 'let* ['n (body/expression :add 'a 1)] 'n)
-          substituted (util/subst-syms '{a b} form)]
-      (is (= 'b (first (:arguments (second (second substituted)))))))))
+          substituted (util/subst-syms '{a b n leaked} form)
+          nested (second (second substituted))]
+      (is (= 'let* (first substituted)))
+      (is (= 'n (first (second substituted))))
+      (is (= 'n (last substituted)) "the surrounding binder masks replacement")
+      (is (launch/index-expr? nested))
+      (is (record? nested))
+      (is (= :add (:op nested)))
+      (is (= ['b 1] (:arguments nested)))
+      (is (= 10 (launch/resolve-expression '{b 9 a 100} nested)))
+      (is (= ['a 1] (:arguments (second (second form))))))))
