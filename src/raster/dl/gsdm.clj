@@ -996,31 +996,27 @@
 ;; ================================================================
 
 (defn layer-spec
-  "HMap spec for one transformer block's weights."
-  []
-  '(HMap :mandatory
-         {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
-          :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
-          :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
-          :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
-          :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
-          :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
-          :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
-          :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
-          :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
+  "HMap spec for one transformer block's weights, arrays of `el` (double by
+  default; float for GPU training)."
+  ([] (layer-spec 'double))
+  ([el]
+   (let [p (list 'Param (list 'Array el))]
+     (list 'HMap :mandatory
+           (into {} (map (fn [k] [k p]))
+                 [:res-W1 :res-b1 :res-W2 :res-b2 :res-Wt :res-bt :res-g1 :res-bn1 :res-g2 :res-bn2
+                  :attn-Wq :attn-bq :attn-Wk :attn-bk :attn-Wv :attn-bv :attn-g :attn-b])))))
 
 (defn weights-spec
-  "HMap spec for the full GSDM weight tree at given n-layers."
-  [n-layers]
-  (let [ls (layer-spec)]
-    (list 'HMap :mandatory
-          {:temb-W1     '(Param (Array double))   :temb-b1     '(Param (Array double))
-           :temb-W2     '(Param (Array double))   :temb-b2     '(Param (Array double))
-           :embed-We    '(Param (Array double))   :embed-be    '(Param (Array double))
-           :embed-space '(Param (Array double))   :embed-state '(Param (Array double))
-           :unembed-Wu1 '(Param (Array double))   :unembed-bu1 '(Param (Array double))
-           :unembed-Wu2 '(Param (Array double))   :unembed-bu2 '(Param (Array double))
-           :layers      (list 'HVec (vec (repeat n-layers ls)))})))
+  "HMap spec for the full GSDM weight tree at given n-layers, arrays of `el`."
+  ([n-layers] (weights-spec n-layers 'double))
+  ([n-layers el]
+   (let [ls (layer-spec el)
+         p (list 'Param (list 'Array el))]
+     (list 'HMap :mandatory
+           (assoc (into {} (map (fn [k] [k p]))
+                        [:temb-W1 :temb-b1 :temb-W2 :temb-b2 :embed-We :embed-be :embed-space :embed-state
+                         :unembed-Wu1 :unembed-bu1 :unembed-Wu2 :unembed-bu2])
+                  :layers (list 'HVec (vec (repeat n-layers ls))))))))
 
 (defn flat->tree
   "Convert init-gsdm-weights output (flat keyword-keyed) into the tree shape
@@ -1236,57 +1232,66 @@
              wV (array-ops/segment-div wV Z n-nodes emb-dim n-heads 1e-6)]
          (array-ops/array-add h wV (* n-nodes emb-dim)))))
 
-;; NOTE: the layer spec must stay identical to `layer-spec`.
-(rp/defmodel transformer-block-step-batched
-  [h :- (Array double)
-   layer :- (Params (HMap :mandatory
-                          {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
-                           :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
-                           :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
-                           :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
-                           :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
-                           :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
-                           :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
-                           :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
-                           :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
-   temb :- (Array double) node-example :- (Array long)
-   to-cf :- (Array long) to-nm :- (Array long)
-   src-edges :- (Array long) dst-edges :- (Array long)
-   batch :- Long n-per :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
-  :- (Array double)
-  (let [h-res (resnet-block-batched h temb node-example to-cf to-nm
-                                    (:res-W1 layer) (:res-b1 layer)
-                                    (:res-W2 layer) (:res-b2 layer)
-                                    (:res-Wt layer) (:res-bt layer)
-                                    (:res-g1 layer) (:res-bn1 layer)
-                                    (:res-g2 layer) (:res-bn2 layer)
-                                    batch n-per emb-dim)]
-    (graph-attention-batched h-res
-                             (:attn-Wq layer) (:attn-bq layer)
-                             (:attn-Wk layer) (:attn-bk layer)
-                             (:attn-Wv layer) (:attn-bv layer)
-                             (:attn-g  layer) (:attn-b  layer)
-                             src-edges dst-edges to-cf to-nm
-                             batch n-per n-edges emb-dim n-heads)))
+(defn transformer-block-step-batched
+  "The batched layer step for `tree/scan-vec`, over arrays of `el` (double or
+  float): resnet-block-batched then graph-attention-batched. Defined (once
+  per element type) as a defmodel whose layer spec is `(layer-spec el)`."
+  [el]
+  (let [sym (symbol (str "transformer-block-step-batched-" el))]
+    (or (find-var (symbol "raster.dl.gsdm" (str sym)))
+        (let [a (list 'Array el)
+              form `(raster.params/defmodel ~sym
+                      [~'h :- ~a
+                       ~'layer :- (~'Params ~(layer-spec el))
+                       ~'temb :- ~a ~'node-example :- (~'Array ~'long)
+                       ~'to-cf :- (~'Array ~'long) ~'to-nm :- (~'Array ~'long)
+                       ~'src-edges :- (~'Array ~'long) ~'dst-edges :- (~'Array ~'long)
+                       ~'batch :- ~'Long ~'n-per :- ~'Long ~'n-edges :- ~'Long ~'emb-dim :- ~'Long ~'n-heads :- ~'Long]
+                      :- ~a
+                      (~'let [~'h-res (raster.dl.gsdm/resnet-block-batched
+                                       ~'h ~'temb ~'node-example ~'to-cf ~'to-nm
+                                       (:res-W1 ~'layer) (:res-b1 ~'layer)
+                                       (:res-W2 ~'layer) (:res-b2 ~'layer)
+                                       (:res-Wt ~'layer) (:res-bt ~'layer)
+                                       (:res-g1 ~'layer) (:res-bn1 ~'layer)
+                                       (:res-g2 ~'layer) (:res-bn2 ~'layer)
+                                       ~'batch ~'n-per ~'emb-dim)]
+                       (raster.dl.gsdm/graph-attention-batched
+                        ~'h-res
+                        (:attn-Wq ~'layer) (:attn-bq ~'layer)
+                        (:attn-Wk ~'layer) (:attn-bk ~'layer)
+                        (:attn-Wv ~'layer) (:attn-bv ~'layer)
+                        (:attn-g ~'layer) (:attn-b ~'layer)
+                        ~'src-edges ~'dst-edges ~'to-cf ~'to-nm
+                        ~'batch ~'n-per ~'n-edges ~'emb-dim ~'n-heads)))]
+          (binding [*ns* (the-ns 'raster.dl.gsdm)]
+            (eval form))
+          (find-var (symbol "raster.dl.gsdm" (str sym)))))))
 
 (defn make-gsdm-batched-loss
   "The batched loss: B examples of n-per nodes as one disjoint-union graph,
   one timestep per example (t-emb [B, emb-dim], `embed-timesteps`), the masked MSE over all their latent
-  nodes. Same weight tree as `make-gsdm-loss`."
-  [{:keys [n-layers emb-dim n-heads n-spaces]
-    :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1}}]
-  (let [w-spec (weights-spec n-layers)
-        sym (symbol (str "gsdm-batched-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s"))
+  nodes. Same weight tree as `make-gsdm-loss`. :dtype :float declares every
+  real array float (for GPU training: `rp/compile-train-step` with
+  :target-device and :dtype :float); the data and weights passed must then
+  be float arrays."
+  [{:keys [n-layers emb-dim n-heads n-spaces dtype]
+    :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1 dtype :double}}]
+  (let [el (symbol (name dtype))
+        a (list 'Array el)
+        step-var (transformer-block-step-batched el)
+        w-spec (weights-spec n-layers el)
+        sym (symbol (str "gsdm-batched-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s-" (name dtype)))
         form `(raster.core/deftm ~sym
                 [~'w :- ~w-spec
-                 ~'values :- (~'Array ~'double)
+                 ~'values :- ~a
                  ~'spaces :- (~'Array ~'long)
-                 ~'target :- (~'Array ~'double)
+                 ~'target :- ~a
                  ~'states :- (~'Array ~'long)
-                 ~'pos-emb :- (~'Array ~'double)
+                 ~'pos-emb :- ~a
                  ~'src-edges :- (~'Array ~'long)
                  ~'dst-edges :- (~'Array ~'long)
-                 ~'t-emb :- (~'Array ~'double)
+                 ~'t-emb :- ~a
                  ~'node-example :- (~'Array ~'long)
                  ~'to-cf :- (~'Array ~'long)
                  ~'to-nm :- (~'Array ~'long)
@@ -1307,7 +1312,7 @@
                         ~'temb (raster.dl.gsdm/timestep-mlp-batched
                                 ~'t-emb (:temb-W1 ~'w) (:temb-b1 ~'w)
                                 (:temb-W2 ~'w) (:temb-b2 ~'w) ~'batch ~'emb-dim-val)
-                        ~'h-final (raster.tree/scan-vec raster.dl.gsdm/transformer-block-step-batched
+                        ~'h-final (raster.tree/scan-vec ~(symbol "raster.dl.gsdm" (str (.sym ^clojure.lang.Var step-var)))
                                                         ~'h-init (:layers ~'w)
                                                         ~'temb ~'node-example ~'to-cf ~'to-nm
                                                         ~'src-edges ~'dst-edges
