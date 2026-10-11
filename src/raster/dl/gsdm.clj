@@ -1090,3 +1090,315 @@
     (binding [*ns* (the-ns 'raster.dl.gsdm)]
       (eval form))
     (find-var (symbol "raster.dl.gsdm" (str sym)))))
+
+;; ================================================================
+;; Batched GSDM: B examples of equal size as one disjoint-union graph
+;;
+;; Nodes of all examples are stacked node-major, [B·n, emb-dim]; edges are
+;; offset into that stack, so graph attention never crosses examples.
+;; GroupNorm normalizes over the nodes of ONE example (as the reference's
+;; batch axis does): `node-group-norm` permutes to channel-first per example,
+;; [B, emb-dim, n], with a gather, runs group-norm with batch = B, and
+;; permutes back. The timestep is per example: its embedding, [B, emb-dim],
+;; reaches each node by a gather over the node's example index. Gathers carry
+;; their AD template (backward = scatter-add), so the batched model trains
+;; through the same compile-aot / compile-train-step paths.
+;; ================================================================
+
+(defn batch-layout
+  "Index arrays for B examples of n nodes each, emb-dim channels:
+  :node-example [B·n] (the example of each node), :to-cf and :to-nm, the
+  gathers from node-major [B·n, d] to channel-first [B, d, n] and back."
+  [batch n emb-dim]
+  (let [batch (long batch) n (long n) d (long emb-dim)
+        total (* batch n d)
+        to-cf (long-array total)
+        to-nm (long-array total)]
+    (dotimes [b batch]
+      (dotimes [c d]
+        (dotimes [i n]
+          (let [cf (+ (* b d n) (* c n) i)
+                nm (+ (* (+ (* b n) i) d) c)]
+            (aset to-cf cf nm)
+            (aset to-nm nm cf)))))
+    {:node-example (long-array (for [b (range batch) _ (range n)] b))
+     :to-cf to-cf
+     :to-nm to-nm}))
+
+(deftm node-group-norm
+  "GroupNorm of node-major features x [B·n, d] over the nodes of each
+  example separately."
+  (All [T] [x :- (Array T) gamma :- (Array T) beta :- (Array T)
+            to-cf :- (Array long) to-nm :- (Array long)
+            batch :- Long n-per :- Long emb-dim :- Long]
+       :- (Array T)
+       (let [total (* batch (* n-per emb-dim))
+             num-groups (n/max 1 (n/min 32 (quot emb-dim 2)))
+             cf (array-ops/gather x to-cf total total 1)
+             cf (nn/group-norm cf gamma beta batch emb-dim n-per num-groups 1e-5)]
+         (array-ops/gather cf to-nm total total 1))))
+
+(defn embed-timesteps
+  "Sinusoidal embeddings of the timesteps `ts` (B of them), as a double
+  array [B, dim]: sin in the first half of each row, cos in the second, as
+  `embed-timestep`. Data, computed before the model: the batched model takes
+  it as input, so reverse mode never sees it."
+  [ts dim]
+  (let [dim (long dim)
+        half-dim (quot dim 2)
+        log-scale (/ (Math/log 10000.0) (double (max 1 (dec half-dim))))
+        out (double-array (* (count ts) dim))]
+    (doseq [[b t] (map-indexed vector ts)
+            d (range half-dim)]
+      (let [angle (* (double t) (Math/exp (* (- (double d)) log-scale)))]
+        (aset out (+ (* b dim) d) (Math/sin angle))
+        (aset out (+ (* b dim) half-dim d) (Math/cos angle))))
+    out))
+
+(deftm timestep-mlp-batched
+  "timestep-mlp for B timesteps given by their sinusoidal embeddings
+  t-emb [B, emb_dim] (`embed-timesteps`): returns [B, emb_dim]."
+  (All [T] [t-emb :- (Array T) W1 :- (Array T) b1 :- (Array T)
+            W2 :- (Array T) b2 :- (Array T) batch :- Long emb-dim :- Long]
+       :- (Array T)
+       (let [h (nn/linear t-emb W1 b1 batch emb-dim emb-dim)
+             h (nn/silu h (* batch emb-dim))]
+         (nn/linear h W2 b2 batch emb-dim emb-dim))))
+
+(deftm resnet-block-batched
+  "resnet-block over B examples: per-example GroupNorm and timestep.
+  x [B·n, d], temb [B, d], node-example [B·n]."
+  (All [T] [x :- (Array T) temb :- (Array T) node-example :- (Array long)
+            to-cf :- (Array long) to-nm :- (Array long)
+            W1 :- (Array T) b1 :- (Array T)
+            W2 :- (Array T) b2 :- (Array T)
+            Wt :- (Array T) bt :- (Array T)
+            gamma1 :- (Array T) beta1 :- (Array T)
+            gamma2 :- (Array T) beta2 :- (Array T)
+            batch :- Long n-per :- Long emb-dim :- Long]
+       :- (Array T)
+       (let [n-nodes (* batch n-per)
+             total (* n-nodes emb-dim)
+             h (node-group-norm x gamma1 beta1 to-cf to-nm batch n-per emb-dim)
+             h (nn/silu h total)
+             h (nn/linear h W1 b1 n-nodes emb-dim emb-dim)
+             temb-proj (nn/silu temb (* batch emb-dim))
+             temb-proj (nn/linear temb-proj Wt bt batch emb-dim emb-dim)
+             ;; each node gets its example's row
+             temb-nodes (array-ops/gather temb-proj node-example batch n-nodes emb-dim)
+             h (array-ops/array-add h temb-nodes total)
+             h (node-group-norm h gamma2 beta2 to-cf to-nm batch n-per emb-dim)
+             h (nn/silu h total)
+             h (nn/linear h W2 b2 n-nodes emb-dim emb-dim)]
+         (array-ops/array-add x h total))))
+
+(deftm graph-attention-batched
+  "graph-attention-multihead over B examples: per-example GroupNorm, edges
+  offset into the stacked nodes."
+  (All [T] [h :- (Array T)
+            Wq :- (Array T) bq :- (Array T)
+            Wk :- (Array T) bk :- (Array T)
+            Wv :- (Array T) bv :- (Array T)
+            gamma :- (Array T) beta :- (Array T)
+            src-edges :- (Array long) dst-edges :- (Array long)
+            to-cf :- (Array long) to-nm :- (Array long)
+            batch :- Long n-per :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
+       :- (Array T)
+       (let [n-nodes (* batch n-per)
+             dk (quot emb-dim n-heads)
+             h-norm (node-group-norm h gamma beta to-cf to-nm batch n-per emb-dim)
+             Q (nn/linear h-norm Wq bq n-nodes emb-dim emb-dim)
+             K (nn/linear h-norm Wk bk n-nodes emb-dim emb-dim)
+             V (nn/linear h-norm Wv bv n-nodes emb-dim emb-dim)
+             raw-scores (array-ops/indexed-dot Q K dst-edges src-edges
+                                               n-nodes n-nodes n-edges dk emb-dim n-heads)
+             scores (array-ops/scale-clamp-exp raw-scores
+                                               (/ 1.0 (n/sqrt (double dk))) 5.0
+                                               (* n-edges n-heads))
+             Z (array-ops/scatter-add scores dst-edges n-nodes n-edges n-heads)
+             wV (array-ops/scatter-mul-add scores V dst-edges src-edges
+                                           n-nodes n-nodes n-edges dk emb-dim n-heads)
+             wV (array-ops/segment-div wV Z n-nodes emb-dim n-heads 1e-6)]
+         (array-ops/array-add h wV (* n-nodes emb-dim)))))
+
+;; NOTE: the layer spec must stay identical to `layer-spec`.
+(rp/defmodel transformer-block-step-batched
+  [h :- (Array double)
+   layer :- (Params (HMap :mandatory
+                          {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
+                           :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
+                           :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
+                           :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
+                           :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
+                           :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
+                           :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
+                           :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
+                           :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
+   temb :- (Array double) node-example :- (Array long)
+   to-cf :- (Array long) to-nm :- (Array long)
+   src-edges :- (Array long) dst-edges :- (Array long)
+   batch :- Long n-per :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
+  :- (Array double)
+  (let [h-res (resnet-block-batched h temb node-example to-cf to-nm
+                                    (:res-W1 layer) (:res-b1 layer)
+                                    (:res-W2 layer) (:res-b2 layer)
+                                    (:res-Wt layer) (:res-bt layer)
+                                    (:res-g1 layer) (:res-bn1 layer)
+                                    (:res-g2 layer) (:res-bn2 layer)
+                                    batch n-per emb-dim)]
+    (graph-attention-batched h-res
+                             (:attn-Wq layer) (:attn-bq layer)
+                             (:attn-Wk layer) (:attn-bk layer)
+                             (:attn-Wv layer) (:attn-bv layer)
+                             (:attn-g  layer) (:attn-b  layer)
+                             src-edges dst-edges to-cf to-nm
+                             batch n-per n-edges emb-dim n-heads)))
+
+(defn make-gsdm-batched-loss
+  "The batched loss: B examples of n-per nodes as one disjoint-union graph,
+  one timestep per example (t-emb [B, emb-dim], `embed-timesteps`), the masked MSE over all their latent
+  nodes. Same weight tree as `make-gsdm-loss`."
+  [{:keys [n-layers emb-dim n-heads n-spaces]
+    :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1}}]
+  (let [w-spec (weights-spec n-layers)
+        sym (symbol (str "gsdm-batched-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s"))
+        form `(raster.core/deftm ~sym
+                [~'w :- ~w-spec
+                 ~'values :- (~'Array ~'double)
+                 ~'spaces :- (~'Array ~'long)
+                 ~'target :- (~'Array ~'double)
+                 ~'states :- (~'Array ~'long)
+                 ~'pos-emb :- (~'Array ~'double)
+                 ~'src-edges :- (~'Array ~'long)
+                 ~'dst-edges :- (~'Array ~'long)
+                 ~'t-emb :- (~'Array ~'double)
+                 ~'node-example :- (~'Array ~'long)
+                 ~'to-cf :- (~'Array ~'long)
+                 ~'to-nm :- (~'Array ~'long)
+                 ~'batch :- ~'Long
+                 ~'n-per :- ~'Long
+                 ~'n-edges :- ~'Long]
+                :- ~'Double
+                (~'let [~'emb-dim-val ~(long emb-dim)
+                        ~'n-heads-val ~(long n-heads)
+                        ~'n-spaces-val ~(long n-spaces)
+                        ~'n-states-val ~(long N-STATES)
+                        ~'n-total (~'* ~'batch ~'n-per)
+                        ~'h-init (raster.dl.gsdm/flat-embed
+                                  ~'values (:embed-space ~'w) ~'spaces
+                                  (:embed-state ~'w) ~'states ~'pos-emb
+                                  (:embed-We ~'w) (:embed-be ~'w)
+                                  ~'n-total ~'emb-dim-val ~'n-spaces-val ~'n-states-val)
+                        ~'temb (raster.dl.gsdm/timestep-mlp-batched
+                                ~'t-emb (:temb-W1 ~'w) (:temb-b1 ~'w)
+                                (:temb-W2 ~'w) (:temb-b2 ~'w) ~'batch ~'emb-dim-val)
+                        ~'h-final (raster.tree/scan-vec raster.dl.gsdm/transformer-block-step-batched
+                                                        ~'h-init (:layers ~'w)
+                                                        ~'temb ~'node-example ~'to-cf ~'to-nm
+                                                        ~'src-edges ~'dst-edges
+                                                        ~'batch ~'n-per ~'n-edges ~'emb-dim-val ~'n-heads-val)
+                        ~'pred (raster.dl.gsdm/flat-unembed
+                                ~'h-final
+                                (:unembed-Wu1 ~'w) (:unembed-bu1 ~'w)
+                                (:unembed-Wu2 ~'w) (:unembed-bu2 ~'w)
+                                ~'n-total ~'emb-dim-val)]
+                       (raster.dl.array-ops/masked-mse-loss ~'pred ~'target ~'states ~'n-total)))]
+    (binding [*ns* (the-ns 'raster.dl.gsdm)]
+      (eval form))
+    (find-var (symbol "raster.dl.gsdm" (str sym)))))
+
+;; ================================================================
+;; Training: noised, conditioned examples in batches
+;; ================================================================
+
+(def default-mask-mix
+  "Condition-mask mixture (Simformer): the problem's own states (posterior),
+  all latent (joint), observed and latent swapped (likelihood), and each
+  variable observed with probability 1/2 (random)."
+  {:posterior 0.4 :joint 0.2 :likelihood 0.2 :random 0.2})
+
+(defn condition-states
+  "States for one example, drawn from `mask-mix` {kind weight} around the
+  problem's `default-states`. Clamped (OBSERVED or INTERVENED) and LATENT
+  variables are swapped by :likelihood; MARGINALIZED ones are kept."
+  [default-states mask-mix ^java.util.Random rng]
+  (let [kinds (vec (keys mask-mix))
+        total (reduce + (vals mask-mix))
+        u (* total (.nextDouble rng))
+        kind (loop [[k & more] kinds acc 0.0]
+               (let [acc (+ acc (get mask-mix k))]
+                 (if (or (nil? more) (< u acc)) k (recur more acc))))
+        out (aclone default-states)]
+    (dotimes [i (alength out)]
+      (let [s (aget out i)]
+        (when (not= MARGINALIZED s)
+          (aset out i
+                (long (case kind
+                        :posterior s
+                        :joint LATENT
+                        :likelihood (if (clamped? s) LATENT OBSERVED)
+                        :random (if (< (.nextDouble rng) 0.5) OBSERVED LATENT)))))))
+    out))
+
+(defn training-batch
+  "Arguments of the batched loss (after the weights) for `batch` fresh
+  examples of `problem` (a fn of an rng, as `make-linear-gaussian-problem`),
+  each with its own condition mask and timestep t uniform on the schedule:
+  latent variables are noised to x_t, clamped ones keep x0, and the target is
+  x0. Every example must have the same number of variables."
+  [problem batch alphas-cumprod mask-mix emb-dim ^java.util.Random rng]
+  (let [timesteps (alength ^doubles alphas-cumprod)
+        exs (vec (repeatedly batch #(problem rng)))
+        n-per (long (:n-vars (first exs)))
+        _ (when-not (every? #(= n-per (long (:n-vars %))) exs)
+            (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars exs)})))
+        ts (vec (repeatedly batch #(.nextInt rng timesteps)))
+        states (mapv #(condition-states (:states %) mask-mix rng) exs)
+        noised (mapv (fn [ex st t]
+                       (let [x0 ^doubles (:values ex)
+                             a (aget ^doubles alphas-cumprod t)
+                             xt (double-array n-per)]
+                         (dotimes [i n-per]
+                           (aset xt i (if (clamped? (aget ^longs st i))
+                                        (aget x0 i)
+                                        (+ (* (Math/sqrt a) (aget x0 i))
+                                           (* (Math/sqrt (- 1.0 a)) (.nextGaussian rng))))))
+                         xt))
+                     exs states ts)
+        offsets (map #(* % n-per) (range batch))
+        {:keys [node-example to-cf to-nm]} (batch-layout batch n-per emb-dim)]
+    [(double-array (mapcat seq noised))
+     (long-array (mapcat (comp seq :spaces) exs))
+     (double-array (mapcat (comp seq :values) exs))
+     (long-array (mapcat seq states))
+     (double-array (mapcat #(seq (compute-position-embeddings (:spaces %) n-per emb-dim)) exs))
+     (long-array (mapcat (fn [ex o] (map #(+ % o) (:src-edges ex))) exs offsets))
+     (long-array (mapcat (fn [ex o] (map #(+ % o) (:dst-edges ex))) exs offsets))
+     (embed-timesteps (map double ts) emb-dim)
+     node-example to-cf to-nm
+     (long batch) n-per (long (reduce + (map :n-edges exs)))]))
+
+(defn train-gsdm
+  "Train a GSDM on fresh examples of `problem` with the compiled batched
+  train step (Adam). Options: :config (`make-gsdm-config`), :batch (32),
+  :steps, :lr (1e-3), :betas (the noise schedule), :mask-mix, :seed,
+  :max-grad-norm (1.0), :train-step (a compiled step to reuse). Returns
+  {:weights (flat, for `gsdm-sample`) :losses :train-step}."
+  [problem {:keys [config batch steps lr betas mask-mix seed max-grad-norm train-step]
+            :or {batch 32 lr 1e-3 mask-mix default-mask-mix seed 0 max-grad-norm 1.0}}]
+  (let [{:keys [n-layers emb-dim n-heads n-spaces]} config
+        weights (init-gsdm-weights config)
+        w (flat->tree weights n-layers)
+        ts (or train-step
+               (rp/compile-train-step (make-gsdm-batched-loss {:n-layers n-layers :emb-dim emb-dim
+                                                               :n-heads n-heads :n-spaces n-spaces})))
+        state ((:init-state ts) w)
+        train-fn (:train-fn ts)
+        alphas-cumprod (diff/compute-alphas-cumprod betas)
+        rng (java.util.Random. (long seed))
+        losses (vec (for [step (range 1 (inc steps))]
+                      (apply train-fn w (:m state) (:v state)
+                             (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng)
+                                     [(double max-grad-norm) (double lr) 0.9 0.999 1e-8 step]))))]
+    ;; the tree shares the flat map's arrays, which Adam updated in place
+    {:weights weights :losses losses :train-step ts}))
