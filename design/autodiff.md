@@ -582,9 +582,19 @@ independent of AD.
   naming the op): `solve`, `einsum`, `maxpool2d` (needs a gather-at-argmax kernel),
   `array-det`, effectful `dgemm!`. Forward mode now handles double-carry
   `par/scan` and loop-to-scan recurrences using the output as its carry tape;
-  narrowing float carries still decline until an unrounded residual is
-  represented. HVP through loop pullback closures remains guarded rather than
+  both reverse and JVP scan rules decline narrowing Float checkpoints until an
+  unrounded residual is represented. The shared checkpoint gate also requires
+  an identity store: source walking retains the actual free callee's defining symbol in
+  `:raster.op/resolved-callee` while lexical scope is retained, overwriting any
+  incoming assertion without changing execution spelling. Compiler-owned synthetic
+  Double carry tapes use a nil identity store with a proven Double carry tag. A lexical/helper callee named
+  `double`, including a namespace alias, is not an identity proof.
+  Primal scan execution is unchanged; even explicit rounded Float feedback is
+  conservatively outside these residual-reconstruction rules. HVP through loop pullback closures remains guarded rather than
   silently returning an incorrect zero.
+  Aliasing the entire namespace name `clojure.core` remains unsupported by public
+  deftm generation; direct walker tests of that resolution boundary do not claim
+  that such a namespace can compile and execute a public AD program.
 - **Kinks** — differentiation through `if` and through activation kinks (relu) is
   correct almost-everywhere; there is no oracle *at* a nondifferentiable point, so
   the laws sample away from kinks.
