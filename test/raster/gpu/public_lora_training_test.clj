@@ -30,6 +30,39 @@
             finite-difference (/ (- (evaluate h) (evaluate (- h))) (* 2.0 h))]
         (is (< (Math/abs (- finite-difference (aget ^doubles gradient i))) 1.0e-8))))))
 
+(deftest every-stale-startup-input-distinguishes-the-correct-update-trajectory
+  (let [initial (fixture/inputs)
+        keys [:A :B :x :tgt]
+        captured (mapv #(vec (get initial %)) keys)
+        ;; Same three batches as the device trajectory, using only the
+        ;; independent coordinate-loop oracle and rounded adapter storage.
+        trajectory (vec (reductions
+                         (fn [state step]
+                           (fixture/update-oracle
+                            (merge state (select-keys (fixture/inputs step) [:x :tgt]))))
+                         initial (range 3)))]
+    (doseq [step [1 2]
+            :let [current (merge (nth trajectory step)
+                                 (select-keys (fixture/inputs step) [:x :tgt]))
+                  before (mapv #(vec (get current %)) keys)
+                  correct (nth trajectory (inc step))]
+            key keys]
+      ;; Replace exactly one input, holding every other current input fixed.
+      ;; This tests stale adapters separately from stale batches/targets;
+      ;; simultaneous changes cannot mask an insensitive fixture.
+      (let [stale-input (assoc current key (get initial key))
+            stale-update (fixture/update-oracle stale-input)
+            error (max (fixture/max-error (:A correct) (:A stale-update))
+                       (fixture/max-error (:B correct) (:B stale-update)))]
+        (is (not= (vec (get current key)) (vec (get stale-input key)))
+            (str "step " step " changes " key " from startup"))
+        (is (> error 2.0e-7)
+            (str "step " step " stale " key " must exceed the unchanged device-update tolerance"))
+        (is (= before (mapv #(vec (get current %)) keys))
+            "counterfactual oracle evaluation never mutates the correct trajectory")))
+    (is (= captured (mapv #(vec (get initial %)) keys))
+        "startup arrays remain unchanged by every oracle/counterfactual")))
+
 (defn- check-public-training! [target]
   (let [initial (fixture/inputs)
         captured (mapv #(vec (get initial %)) [:A :B :x :tgt])
