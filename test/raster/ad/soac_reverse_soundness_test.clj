@@ -3,6 +3,7 @@
   active initializer, and transposes every admitted read; reads it cannot
   transpose are rejected instead of silently mis-scattered."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.core :refer [deftm scan]]
             [raster.ad.reverse :as rev]
             [raster.ad.jvp :as jvp]
@@ -220,6 +221,81 @@
   (is (= 5.0625 (inactive-loop-before-two-active-loops 1.0)))
   (is (= [5.0625 1.0]
          ((rev/value+grad #'inactive-loop-before-two-active-loops) 1.0))))
+
+(defn- checkpoint-denials [body]
+  (filter #(contains? (meta %) :raster.ad.reverse/inexact-source-scan-checkpoint)
+          (tree-seq coll? seq body)))
+
+(deftest checkpoint-denial-is-monotone-not-capability-evidence
+  (let [retain @(ns-resolve 'raster.ad.reverse 'retain-source-scan-checkpoint-obligations)
+        enforce @(ns-resolve 'raster.ad.reverse 'assert-source-scan-checkpoint!)
+        source (first (raster.core/ensure-walked-body! #'shadowed-cast-stored-loop))
+        exact-source (first (raster.core/ensure-walked-body! #'explicit-cast-stored-loop))
+        key :raster.ad.reverse/inexact-source-scan-checkpoint
+        mark-loops (fn [body payload]
+                     (walk/postwalk
+                      #(if (and (seq? %) (#{'loop 'loop*} (first %)))
+                         (vary-meta % assoc key payload) %)
+                      body))]
+    (rev/call-with-shared-ad-gensym
+     (fn []
+       (let [once (rev/ad-prepare source {'h0 'double})
+             twice (rev/ad-prepare once {'h0 'double})]
+         (is (empty? (checkpoint-denials source)))
+         (is (seq (checkpoint-denials once)))
+         (is (seq (checkpoint-denials twice)))
+         (doseq [body [once twice] expression (checkpoint-denials body)]
+           (is (true? (get (meta expression) key)))
+           (is (= :ad-scan-carry-precision
+                  (try (enforce expression true) nil
+                       (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+           (is (nil? (enforce expression false))))
+         (is (empty? (checkpoint-denials
+                      (rev/ad-prepare (rev/ad-prepare exact-source {'h0 'double})
+                                      {'h0 'double})))))))
+    (doseq [[v env] [[#'inactive-stored-shadow-cast-loop {'h 'double}]
+                     [#'excluded-stored-shadow-cast-loop {'h 'double 'x 'double}]]]
+      (rev/call-with-shared-ad-gensym
+       (fn []
+         (let [once (rev/ad-prepare (first (raster.core/ensure-walked-body! v)) env)
+               twice (rev/ad-prepare once env)]
+           (is (seq (checkpoint-denials once)))
+           (is (seq (checkpoint-denials twice)))
+           (doseq [expression (checkpoint-denials twice)]
+             (is (nil? (enforce expression false))))))))
+    ;; Neither a fabricated safe claim nor stale/malformed evidence can grant
+    ;; capability. On exact source, a forged denial is conservatively a denial.
+    (doseq [payload [true false nil {:safe? true} {:source 'stale}]]
+      (doseq [body [source exact-source]]
+        (let [retained (retain (mark-loops body payload))
+              denials (checkpoint-denials retained)]
+          (is (seq denials))
+          (doseq [expression denials]
+            (is (true? (get (meta expression) key)))
+            (is (= :ad-scan-carry-precision
+                   (try (enforce expression true) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+            (is (nil? (enforce expression false)))))))))
+
+;; Real public composition seam: the value+grad function publishes a retained
+;; transformed body, which outer AD must prepare again. The holder's root is
+;; restored by with-redefs; no compiler registry or cache is reset.
+(def checkpoint-derived-value+grad nil)
+
+(deftm composed-checkpoint-primal [h :- Double x :- Double] :- Double
+  (double (first (checkpoint-derived-value+grad h x))))
+
+(deftest public-derived-body-composition-retains-checkpoint-denial
+  (with-redefs [checkpoint-derived-value+grad
+                (rev/value+grad #'excluded-stored-shadow-cast-loop :wrt [0])]
+    (is (= [2.25 1.0 nil] (checkpoint-derived-value+grad 2.0 16777216.5)))
+    (is (= 2.25 (composed-checkpoint-primal 2.0 16777216.5)))
+    (is (= :ad-scan-carry-precision
+           (try (rev/value+grad #'composed-checkpoint-primal :wrt [1]) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :ad-scan-carry-precision
+           (try (jvp/jvp #'composed-checkpoint-primal) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
 
 (deftest stored-loop-casts-retain-source-identity-through-scan-lifting
   (let [anchor 16777216.0 h 0.0625

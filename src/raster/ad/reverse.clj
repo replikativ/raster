@@ -3707,21 +3707,26 @@
   "Check a recognized stored-carry loop before beta/ANF can hide its store
    behind argument bindings. An inexact output is not an unrounded carry tape;
    losing the scan pattern must not silently admit the generic loop fallback.
-   Store pure source evidence; the existing activity decision enforces it.
-   Inactive regions need no residual tape and remain ordinary primal code."
+   Denial is monotone across preparation: an existing key, including malformed
+   or legacy payloads, can only retain a refusal obligation, never authorize AD.
+   Independently rediscover source unsafety and canonicalize the union to pure
+   true. The existing activity decision enforces it; inactive regions remain
+   ordinary primal code. This metadata is not authenticated provenance."
   [body]
   (postwalk-code
    (fn [expression]
      (if (seq? expression)
-       (let [clean (vary-meta expression dissoc ::inexact-source-scan-checkpoint)]
-         (if-let [{:keys [out-sym acc-sym cast-fn else-expr]}
-                  (patterns/match-scan-loop clean)]
-           (cond-> clean
-             (and (or (= out-sym else-expr)
-                      (patterns/acc-ref? else-expr acc-sym))
-                  (not (exact-scan-carry-checkpoint? out-sym acc-sym cast-fn)))
-             (vary-meta assoc ::inexact-source-scan-checkpoint true))
-           clean))
+       (let [prior-denial? (contains? (meta expression) ::inexact-source-scan-checkpoint)
+             clean (vary-meta expression dissoc ::inexact-source-scan-checkpoint)
+             source-denial?
+             (when-let [{:keys [out-sym acc-sym cast-fn else-expr]}
+                        (patterns/match-scan-loop clean)]
+               (and (or (= out-sym else-expr)
+                        (patterns/acc-ref? else-expr acc-sym))
+                    (not (exact-scan-carry-checkpoint? out-sym acc-sym cast-fn))))]
+         (cond-> clean
+           (or prior-denial? source-denial?)
+           (vary-meta assoc ::inexact-source-scan-checkpoint true)))
        expression))
    body))
 
