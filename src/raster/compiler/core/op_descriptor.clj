@@ -285,6 +285,8 @@
 
 (defn resolve-op-descriptor
   "Resolve a unified descriptor, handling mangled and unqualified names.
+  Qualified identities may inherit only from their own qualified base. Bare
+  legacy mangled names retain the existing basename compatibility lookup.
   Returns [descriptor base-op] or nil."
   [op-sym]
   (or
@@ -293,7 +295,12 @@
    (when-let [base (extract-base-op op-sym)]
      (when-let [d (get-op-descriptor base)]
        [d base]))
-   (when (symbol? op-sym)
+   ;; The shared decoder also handles escaped punctuation in implementation
+   ;; names, without discarding the declaring namespace.
+   (when-let [base (mangled/impl->op op-sym)]
+     (when-let [d (get-op-descriptor base)]
+       [d base]))
+   (when (and (symbol? op-sym) (nil? (namespace op-sym)))
      (let [n (name op-sym)
            base-n (mangled/unqualified-base-name op-sym)]
        (when (not= base-n n)
