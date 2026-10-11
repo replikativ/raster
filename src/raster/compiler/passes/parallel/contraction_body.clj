@@ -75,10 +75,12 @@
                             {:reason :contraction-map-count-overflow
                              :dimensions segment-dims :limit Integer/MAX_VALUE})))
         _ (when (and map-only?
-                     (or (seq (:opts contract-facts)) (:epilogue contract-facts)
+                     (or (seq (apply dissoc (:opts contract-facts)
+                                     [:init :combine :epilogue :out-dtype]))
+                         (not (facts/closed-epilogue? contract-facts))
                          (some #(= (:out contract-facts) (:sym %)) (:operands contract-facts))))
             (decline! :map-options
-                      "initial zero-reduction schedule requires an unadorned, non-aliasing map"
+                      "zero-reduction schedule requires a closed result transform and non-aliasing map"
                       {:options (:opts contract-facts)}))
         _ (when (empty? segment-dims)
             (decline! :no-segments

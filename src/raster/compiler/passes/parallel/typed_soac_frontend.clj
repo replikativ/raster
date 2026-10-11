@@ -3113,19 +3113,33 @@
         ;; A static zero-reduction contraction is a map, not a fold from a fabricated zero.
         ;; Coordinate decomposition is the existing axis-flattening operation. Required input
         ;; capacities are derived later from actual typed loads, independently of output size.
-        (when (and (seq free-axes) (empty? opts) (not= symbol out)
+        (when (and (seq free-axes)
+                   (empty? (apply dissoc opts [:init :combine :epilogue :out-dtype]))
+                   (contraction-facts/closed-epilogue? facts) (not= symbol out)
                    (contains? #{:float :double} contraction-dtype)
                    (every? #(and (integer? (second %)) (pos? (second %))) free-axes)
                    (<= (reduce *' 1 (map second free-axes)) Integer/MAX_VALUE)
                    (not-any? #(= out (:sym %)) (:operands facts)))
           (let [[index extent body] (contraction-facts/flatten-contract-axes
                                     free-axes (:body facts))
+                ;; A result transform is ordinary map composition: evaluate the element once
+                ;; into an existing typed local, then evaluate the closed consumer. No fold,
+                ;; initializer, combine or new transform dialect is invented for a zero axis.
+                completed-result (when epilogue (fresh-region-local-id!))
+                result-body (if epilogue
+                              (util/subst-syms {(:acc epilogue) completed-result} (:expr epilogue))
+                              body)
+                locals (if epilogue
+                         [{:id completed-result :dtype contraction-dtype :init body}] [])
                 io (extract-io body index [out])]
             (merge {:kind :map :id id :sym symbol :results [symbol]
-                    :index index :extent extent :locals [] :casts [nil] :bodies [body]
-                    :body-dtypes [(retained-expression-dtype body array-types scalar-types)]
+                    :index index :extent extent :locals locals :casts [nil] :bodies [result-body]
+                    :body-dtypes [(retained-expression-dtype result-body array-types
+                                                            (cond-> scalar-types
+                                                              completed-result
+                                                              (assoc completed-result contraction-dtype)))]
                     :result-storage [{:destination out :access :write :host-return :buffer}]
-                    :host-binding symbol :elem-type contraction-dtype
+                    :host-binding symbol :elem-type output-dtype
                     :source-operation :raster.par/contract}
                    io)))
       (when (and (seq contract-axes)
@@ -4891,7 +4905,7 @@
                        (util/subst-syms
                         substitutions
                         (first (elementize [init] arrays parameters index)))
-                       fold-dtype)))))
+                       dtype)))))
         body-results (mapv #(canonicalize-scalar-folds
                              (util/subst-syms (zipmap captures capture-parameters) %)
                              fold-dtype)

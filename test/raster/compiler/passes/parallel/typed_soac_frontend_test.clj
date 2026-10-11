@@ -1329,6 +1329,53 @@
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-soac-stable-read-alias (:reason (ex-data exception))))))))))
 
+(deftest zero-contract-epilogue-composes-through-a-typed-completed-result
+  (let [transform {:acc 'acc :expr '(clojure.core/+ acc 3.0)
+                   :operands [] :scalars [] :dtype :double}
+        source (list 'let* ['result
+                            (list 'raster.par/contract 'C '[[i 2] [j 5]] []
+                                  '(clojure.core/+ (clojure.core/aget A i)
+                                                   (clojure.core/aget A j))
+                                  :init '(throw (Exception. "unused initializer"))
+                                  :combine 'unknown-combine :epilogue transform)] 'result)
+        options {:dtype :double :array-types {'A :double 'C :double}}
+        program (frontend/form->program source options)
+        parts (dialect/operation-parts (first (dialect/equations program)))
+        region (dialect/lambda-parts (:lambda parts))
+        local (first (:locals region))]
+    (is (some? program))
+    (is (= program (dialect/validate! program)))
+    (is (= 1 (count (:locals region))))
+    (is (= :double (:dtype local)))
+    (is (some #{(:id local)} (tree-seq coll? seq (:body-results region))))
+    (is (not-any? #{'unknown-combine 'throw} (tree-seq coll? seq program)))
+    (let [repeated-region (-> (frontend/form->program source options)
+                              dialect/equations first dialect/operation-parts
+                              :lambda dialect/lambda-parts)
+          repeated-local (first (:locals repeated-region))]
+      (is (= (select-keys local [:id :dtype])
+             (select-keys repeated-local [:id :dtype]))
+          "completed-result IDs use the deterministic supply, independently of axis gensyms")
+      (is (= (:body-results region) (:body-results repeated-region))))
+    (let [operation (nth (second source) 1)
+          converted (assoc transform :expr '(clojure.core/double (clojure.core/float acc)))
+          operation (apply list (concat (drop-last 2 operation) [:epilogue converted]))
+          converted-program (frontend/form->program
+                             (list 'let* ['result operation] 'result) options)
+          converted-region (-> converted-program dialect/equations first
+                               dialect/operation-parts :lambda dialect/lambda-parts)
+          completed-id (:id (first (:locals converted-region)))]
+      (is (= :double (:dtype (first (:locals converted-region)))))
+      (is (= [(list 'clojure.core/double (list 'clojure.core/float completed-id))]
+             (:body-results converted-region))
+          "raw explicit casts are retained; scheduled scalar SSA owns their conversion policy"))
+    (doseq [expression ['(clojure.core/+ acc bias) '(clojure.core/aget C 0)]]
+      (let [operation (nth (second source) 1)
+            operation (apply list (concat (drop-last 2 operation)
+                                           [:epilogue (assoc transform :expr expression)]))]
+        (is (nil? (frontend/form->program (list 'let* ['result operation] 'result)
+                                         options)))))))
+
 (deftest explicit-contraction-result-transform-stays-in-typed-soac
   (let [transform {:acc 'acc
                    :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
