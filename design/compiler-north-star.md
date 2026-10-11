@@ -1240,6 +1240,15 @@ short bounded execution in all cases with no upcalls, never the general default.
 Benchmarks must distinguish ordinary resident, staged, and explicitly critical
 boundaries; a tiny critical probe does not establish workload speed or safety.
 
+Numerical ABIs may interleave scalar and pointer arguments. Runtime preparation
+derives pointer positions from resolved FFM handle carriers, snapshots explicit
+access declarations and retains original ABI order; this is not language type
+inference or a function-name registry. Descriptor/provider policy and scalar
+conversion remain adapter-owned. Allocator, aggregate and pointer-return handle
+conventions require a separate contract rather than implicit admission. Batched
+fallback loops must share one staging scope for the whole batch before migration:
+staging a full backing array per head would introduce severe copy amplification.
+
 Execution scheduling is a distinct backend-neutral lowering. An `ExecutionPlan`
 assigns operations to logical queue classes and connects them with logical
 wait/completion events. Compiler events are stable identities, never OpenCL,
