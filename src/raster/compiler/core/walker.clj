@@ -282,7 +282,11 @@
     ;; Skip aget/aset/aclone on JVM primitive arrays — let :array-op handle those.
     ;; Array-like types (Multivector etc.) go through deftm dispatch.
     ;; alength always goes through deftm dispatch for Long return type.
-    (and (seq? form) (inf/generic-fn?* (:source-ns ctx) (first form))
+    (and (seq? form)
+         ;; A lexical callable (even unknown-typed) masks only its exact
+         ;; executable symbol, never an unrelated qualified global callee.
+         (not (contains? (:type-env ctx) (first form)))
+         (inf/generic-fn?* (:source-ns ctx) (first form))
          (not (and (let [fn-name (name (first form))]
                      (contains? #{"aget" "aset" "aclone"} fn-name))
                    (symbol? (second form))

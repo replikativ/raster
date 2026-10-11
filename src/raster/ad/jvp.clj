@@ -114,7 +114,7 @@
   "Emit the paired tangent bindings for one active :call binding.
   Returns [tenv' extra-bindings]."
   [tenv sym init tag]
-  (let [{op :operation args :arguments} (opdesc/call-description init)
+  (let [{op :operation args :arguments lexical :lexical-callee} (opdesc/call-description init)
         tangent-args (mapv #(when (symbol? %) (get tenv %)) args)]
     (if-let [jf (tmpl/op-jvp-fn op)]
       (let [ctx {:bindings [] :gensym-fn jvp-gensym}
@@ -129,10 +129,12 @@
                        ":jvp-fn / :structure facet — hand frule pending (§13 A3). "
                        "Tag its Jacobian structure in raster.ad.templates/op-structures "
                        "or register an explicit :jvp-fn.")
-                  (str "jvp: no AD rule for op `" op "` (bound to `" sym
+                  (str "jvp: no AD rule for op `" (or lexical op) "` (bound to `" sym
                        "`) with active tangent inputs — un-templated deftm calls "
                        "should have been inlined by ad-prepare."))
-                {:op op :canonical canonical :sym sym
+                {:reason (if lexical :ad-active-lexical-callee :ad-missing-jvp-rule)
+                 :callee lexical
+                 :op op :canonical canonical :sym sym
                  :active-args (filterv identity tangent-args)}))))))
 
 (declare jvp-fold)
@@ -458,22 +460,25 @@
                  :else (done tenv [])))
 
              ;; Remaining control flow has no forward rule yet.
-             (contains? unsupported-forward-heads head)
+             (or (contains? unsupported-forward-heads head)
+                 (= :lambda (:kind (form/form-info init))))
              (if (any-active? tenv init)
                (throw (ex-info
                        (str "jvp: forward-mode rules for `" head "` (bound to `"
                             sym "`) are not implemented yet — forward loop/SOAC "
                             "rules are follow-up work (reverse mode supports "
                             "these; use vjp/value+grad).")
-                       {:form-head head :sym sym}))
+                       {:reason (case (:kind (form/form-info init))
+                                  :lambda :ad-active-closure
+                                  :do :ad-active-unlinearized-region
+                                  nil)
+                        :form-head head :sym sym}))
                (done tenv []))
 
              ;; call (incl. devirtualized .invk)
              :else
-             (let [op-sym (if (= '.invk head)
-                            (or (:raster.op/original (meta init))
-                                (:op (meta init)) (second init))
-                            head)]
+             (let [{op-sym :operation args :arguments lexical :lexical-callee}
+                   (opdesc/call-description init)]
                (cond
                  ;; Pure allocations (zeros-like / alloc-like / *-array …):
                  ;; a fresh zero/uninitialized buffer with NO differentiable
@@ -489,7 +494,7 @@
                  (done tenv [])
 
                  (some #(and (symbol? %) (contains? tenv %))
-                       (if (= '.invk head) (nnext init) (rest init)))
+                       (cond-> args lexical (conj lexical)))
                  (let [[tenv' extra] (fold-call tenv sym init tag)]
                    (done tenv' extra))
 

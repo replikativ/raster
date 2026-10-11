@@ -261,7 +261,7 @@
   [orig-params new-binders]
   (loop [ps (seq orig-params), bs (seq new-binders), out []]
     (if-not ps
-      out
+      (with-meta out (meta orig-params))
       (let [p (first ps)]
         (if (and (symbol? p) (not= '& p))
           (recur (next ps) (next bs) (conj out (first bs)))

@@ -279,7 +279,9 @@
   [expr]
   (if (seq? expr)
     (let [head (first expr)
-          qualified-head (get numeric-op->qualified head head)]
+          qualified-head (if (op/semantic-op expr)
+                           (get numeric-op->qualified head head)
+                           head)]
       (with-meta (cons qualified-head (rest expr)) (meta expr)))
     expr))
 
@@ -313,7 +315,8 @@
         ;; An array's length is an integer shape, never a gradient carrier
         (or (contains? '#{alength clojure.core/alength raster.arrays/alength}
                        (op/semantic-op init-expr))
-            (and (= '.invk head) (symbol? (second init-expr))
+            (and (= '.invk head) (not (:lexical-callee (op/call-description init-expr)))
+                 (symbol? (second init-expr))
                  (.startsWith (name (second init-expr)) "alength_m_"))) false
 
         ;; The predicate is discrete; activity comes from either lexical arm.
@@ -330,10 +333,25 @@
             (= :par (:kind (form/form-info init-expr))))
         (boolean (some #(get activity % false) (util/free-syms init-expr)))
 
-        ;; Normal call / .invk: active iff any arg is active
+        ;; Surviving lexical regions carry their free dependencies. They are
+        ;; not ordinary calls with only symbol-valued arguments; preparation
+        ;; normally flattens these before the reverse-record classifier.
+        (or (form/binding-form? init-expr)
+            (= :do (:kind (form/form-info init-expr))))
+        (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys activity))]
+          (boolean (some #(get activity % false) (util/free-syms init-expr))))
+
+        ;; An opaque closure carries its free captures. The scope grammar
+        ;; excludes formal binders; transparent local lambdas were beta-reduced.
+        (= :lambda (:kind (form/form-info init-expr)))
+        (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys activity))]
+          (boolean (some #(get activity % false) (util/free-syms init-expr))))
+
+        ;; Lexical receiver dependence is not a global operation identity.
         :else
-        (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
-          (boolean (some #(and (symbol? %) (get activity % false)) args)))))
+        (let [{:keys [arguments lexical-callee]} (op/call-description init-expr)]
+          (boolean (some #(and (symbol? %) (get activity % false))
+                         (cond-> arguments lexical-callee (conj lexical-callee)))))))
 
     :else false))
 
@@ -366,20 +384,29 @@
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
     (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr))) :loop
+    ;; Do not treat an unlinearized region as an inactive ordinary call. Until
+    ;; shared preparation flattens it, it has no reverse record contract.
+    (or (form/binding-form? init-expr)
+        (= :do (:kind (form/form-info init-expr))))
+    (throw (ex-info "Active lexical region survived AD normalization"
+                    {:reason :ad-active-unlinearized-region
+                     :form-head (first init-expr) :sym sym :init init-expr}))
     ;; Fail loud on control-flow / interop forms carrying an ACTIVE value: the
     ;; `:call` fallthrough would wrap them in a bogus deftm rule → silently
     ;; wrong/dropped gradient. AD through these is unsupported — throw a clear
     ;; message instead of miscompiling. (Inactive occurrences already routed to
     ;; :inactive above, so constant control flow is untouched.)
     (and (seq? init-expr)
-         (contains? '#{case case* try letfn letfn* fn fn* new
-                       monitor-enter monitor-exit}
-                    (first init-expr)))
+         (or (= :lambda (:kind (form/form-info init-expr)))
+             (contains? '#{case case* try letfn letfn* new
+                           monitor-enter monitor-exit}
+                        (first init-expr))))
     (throw (ex-info (str "AD through `" (first init-expr)
                          "` is not supported (form bound to `" sym "`). "
                          "Rewrite using a differentiable primitive "
                          "(e.g. `if`, `par/reduce`, or a deftm with an AD template).")
-                    {:form-head (first init-expr) :sym sym :init init-expr}))
+                    {:reason (when (= :lambda (:kind (form/form-info init-expr))) :ad-active-closure)
+                     :form-head (first init-expr) :sym sym :init init-expr}))
     (seq? init-expr)                                                :call
     :else                                                          :inactive))
 
@@ -514,16 +541,19 @@
   '#{double float long int doubles floats longs ints})
 
 (defmethod ad-record :call [_ sym init-expr activity]
-  (let [{op :operation args :arguments implementation :implementation-op}
+  (let [{op :operation args :arguments implementation :implementation-op lexical :lexical-callee}
         (op/call-description init-expr)
-        resolved (or (tmpl/resolve-template op)
-                     (auto-make-deftm-rule implementation))
-        has-active-args? (some #(and (symbol? %) (get activity % false)) args)]
+        resolved (when-not lexical
+                   (or (tmpl/resolve-template op)
+                       (auto-make-deftm-rule implementation)))
+        has-active-args? (some #(and (symbol? %) (get activity % false))
+                               (cond-> args lexical (conj lexical)))]
     (when (and (not resolved) has-active-args?)
-      (throw (ex-info (str "No AD template for `" op
+      (throw (ex-info (str "No AD template for `" (or lexical op)
                            "` which has active (differentiable) inputs. "
                            "Register an AD template or mark inputs as constant.")
-                      {:op op :args args :sym sym
+                      {:reason (if lexical :ad-active-lexical-callee :ad-missing-rule)
+                       :callee lexical :op op :args args :sym sym
                        :active (filterv #(and (symbol? %) (get activity % false)) args)})))
     {:record
      (when resolved
@@ -3363,7 +3393,8 @@
   [body]
   (postwalk-code
    (fn [form]
-     (if (and (seq? form) (contains? variadic-core-arithmetic (first form)))
+     (if (and (seq? form) (not= '.invk (first form))
+              (contains? variadic-core-arithmetic (op/semantic-op form)))
        (let [op (first form)
              args (rest form)
              n (count args)
@@ -3673,7 +3704,8 @@
   here. Loops the gates decline are left untouched for the existing paths."
   ([body] (ad-prepare body nil))
   ([body param-env]
-   (let [;; A source-written reduction must project its initializer and step
+   (let [body (inline/inline-transparent-lexical-calls body param-env)
+         ;; A source-written reduction must project its initializer and step
         ;; before broad ANF is allowed to move either across the binder.
         source-scoped (binding [inline/*param-env* param-env]
                         (-> body lower-recurrence-bodies
