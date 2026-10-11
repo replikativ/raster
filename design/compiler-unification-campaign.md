@@ -4107,3 +4107,13 @@ seven-argument program-call constructor. This is a mixed-revision diagnostic
 environment, not evidence of a production miscompile or a new numerical result.
 Rebuild a coherent compiler source set before continuing that comparison. The
 original componentwise real-model acceptance remains failed and unchanged.
+
+Legacy scan graph constructors still omit the source GraphScalar table and, in some
+cases, node scalar dependencies. Their emitted ABI projection remains the established
+compatibility contract, not a certified original storage-scalar dependency proof.
+Scheduled artifacts retain exact projection validation, but cannot authorize additional
+source storage dependencies without the original typed scalar contract. Migration debt:
+derive and retain the complete source scalar interface and per-node dependencies in
+those constructors, then retire the ABI-only boundary with legacy/typed scan, carry,
+empty, mixed-storage and math-policy regressions. A present scalar table (including an
+empty one) with a missing node dependency contract must fail closed.

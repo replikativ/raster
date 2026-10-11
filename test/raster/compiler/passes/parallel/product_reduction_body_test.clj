@@ -15,6 +15,8 @@
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.reduction-test :as fixtures]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.product-reduction-body :as product]
@@ -157,6 +159,40 @@
         (is (string? (:source emitted)))
         (is (= (mapv #(select-keys % [:name :kind :dtype :role]) (:abi old))
                (mapv #(select-keys % [:name :kind :dtype :role]) (:abi emitted))))))))
+
+(deftest product-storage-only-scalars-close-before-abi-construction
+  (let [source (argmax-segred)
+        input-shape [(launch/product 'pool 1)]
+        owner-options (-> options (assoc-in [:array-shapes 'values] input-shape)
+                          (assoc-in [:scalar-types 'pool] :long))
+        candidate (product/schedule source owner-options)
+        parameters (get-in candidate [:body :parameters])
+        node (graph/->ScheduledKernel :product-storage source
+                                     (mapv #(graph/->ValueUse (:value %) (:access %))
+                                           (get-in candidate [:effects :uses]))
+                                     (segop/operation-scalars source) [])
+        storage-graph (graph/make
+                       {:inputs [(graph/buffer 'values :float (first input-shape) :device :input)]
+                        :outputs (mapv #(graph/buffer (:id %) (:dtype %) 'nrows :device :output)
+                                       (filter (fn [parameter] (= :output (:kind parameter))) parameters))
+                        :scalars (mapv (fn [[id type]] (graph/scalar id type))
+                                       (:scalar-types owner-options)) :nodes [node]})]
+    (is (= input-shape (:shape (first parameters))))
+    (is (= :long (:dtype (first (filter #(= 'pool (:id %)) parameters)))))
+    (is (some #{'pool} (:arguments candidate)))
+    (is (= candidate (scheduled/validate-against-node! candidate node storage-graph)))
+    (doseq [type [nil :float :double]]
+      (is (= :scheduled-kernel-body-storage-scalar-dtype
+             (try (product/schedule source (assoc-in owner-options [:scalar-types 'pool] type)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (let [keep-parameter? #(not= 'pool (:id %))
+          tampered (-> candidate
+                       (update-in [:body :parameters] #(filterv keep-parameter? %))
+                       (update :arguments #(vec (remove #{'pool} %)))
+                       (update :scalar-bindings #(filterv (fn [binding] (not= 'pool (:parameter binding))) %)))]
+      (is (= :scheduled-kernel-body-node-scalars
+             (try (scheduled/validate-against-node! tampered node storage-graph) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
 
 (deftest product-candidate-declines-missing-retained-evidence
   (doseq [[changed expected]

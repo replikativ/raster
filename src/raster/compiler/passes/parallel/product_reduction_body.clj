@@ -84,7 +84,7 @@
             (when-not (and (get array-types id) (seq (get array-shapes id)))
               (decline! :input-storage "product input requires retained dtype and extent"
                         {:input id})))
-        parameters
+        pointer-parameters
         (vec (concat
               (map (fn [id]
                      (body/->KernelParameter id :input (get array-types id)
@@ -96,7 +96,12 @@
                       (when result
                         (body/->KernelParameter result :output dtype ['_n_bound] :global
                                                  (layout/row-major ['_n_bound] dtype) :effect)))
-                    components)
+                    components)))
+        storage-types (scheduled/storage-scalar-closure
+                       pointer-parameters scalar-types #{'_n_bound})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        parameters
+        (vec (concat pointer-parameters
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar rows-type [] nil nil :bound)]))

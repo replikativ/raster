@@ -222,7 +222,7 @@
          (range) segment-dims)
         base-coordinate (body/expression :mul segment-index map-extent)
         input-shapes (checked-input-shapes segfold options)
-        parameters
+        pointer-parameters
         (vec (concat
               (map (fn [input]
                      (let [input-dtype (get array-types input)
@@ -235,7 +235,13 @@
                      (body/->KernelParameter output :output output-dtype [total-elements] :global
                                              (layout/row-major [total-elements] output-dtype)
                                              :result))
-                   outputs output-dtypes)
+                   outputs output-dtypes)))
+        storage-types (scheduled-body/storage-scalar-closure
+                       pointer-parameters (merge declared-scalar-types scalar-types) #{'_nseg})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        scalar-types (merge scalar-types storage-types)
+        parameters
+        (vec (concat pointer-parameters
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_nseg :scalar :long [] nil nil :bound)]))
@@ -469,6 +475,7 @@
                                                       (get array-types (symbol (name id)))
                                                       default-dtype))]))
                           (concat inputs outputs))
+        declared-scalar-types scalar-types
         scalar-types (into {}
                            (map (fn [id]
                                   [id (dtype/canon
@@ -513,7 +520,7 @@
          (range) segment-dims)
         base-coordinate (body/expression :mul segment-index map-extent)
         input-shapes (checked-input-shapes segfold options)
-        parameters
+        pointer-parameters
         (vec (concat
               (map (fn [input]
                      (let [input-dtype (get array-types input)
@@ -526,7 +533,13 @@
                      (body/->KernelParameter output :output output-dtype [total-elements] :global
                                              (layout/row-major [total-elements] output-dtype)
                                              :result))
-                   outputs output-dtypes)
+                   outputs output-dtypes)))
+        storage-types (scheduled-body/storage-scalar-closure
+                       pointer-parameters (merge declared-scalar-types scalar-types) #{})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        scalar-types (merge scalar-types storage-types)
+        parameters
+        (vec (concat pointer-parameters
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)))
         base-env (merge (zipmap (map :name segment-dims) (repeat :long)) scalar-types)

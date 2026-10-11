@@ -15,6 +15,9 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kernel-call]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
+            [raster.compiler.backend.gpu.kernel-body-target :as kernel-target]
+            [raster.compiler.backend.gpu.emitted-graph-interface :as emitted-interface]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -61,7 +64,7 @@
                     certificate node candidate closed-algorithm closed-body))
           "an independent graph capacity or incomplete proof context cannot authorize the alias"))))
 
-(deftest map-storage-alias-projects-only-an-exact-causal-physical-bound
+(deftest map-storage-retains-exact-shape-and-closes-its-scalar-abi
   (let [source '(let* [^long extent (clojure.core/long
                                     ^long (clojure.core/* (clojure.core/long rows)
                                                          (clojure.core/long width)))
@@ -80,10 +83,25 @@
         artifact (emit graph)
         parameters (get-in artifact [:attributes :kernel-body :parameters])
         input (first (filter #(= :input (:kind %)) parameters))
+        scheduled (get-in artifact [:attributes :scheduled-kernel-body])
+        node (first (:nodes graph))
         context (equation-graph/input-storage-context body equation (first (:operations equation)))]
-    (is (= ['_n_bound] (:shape input)))
-    (is (= (layout/row-major ['_n_bound] :float) (:layout input)))
-    (is (= '[a result extent] (:arguments artifact)))
+    (is (= [(get-in graph [:inputs 0 :elements])] (:shape input)))
+    (is (= (layout/row-major (:shape input) :float) (:layout input)))
+    (is (= '[a result rows width extent] (:arguments artifact)))
+    (is (= #{'rows 'width 'extent}
+           (scheduled-body/graph-scalar-dependencies scheduled node graph)))
+    (doseq [tamper [(fn [parameter]
+                     (let [shape [(klaunch/product 2 (first (:shape parameter)))]]
+                       (assoc parameter :shape shape :layout (layout/row-major shape :float))))
+                   #(assoc-in % [:layout :strides] [2])]]
+      (let [candidate (update-in scheduled [:body :parameters]
+                                 #(mapv (fn [parameter]
+                                          (if (= :output (:kind parameter))
+                                            (tamper parameter) parameter)) %))]
+        (is (= :scheduled-kernel-body-output-storage
+               (try (scheduled-body/graph-scalar-dependencies candidate node graph) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
     (is (contains? (:scalar-definitions context) 'extent))
     (is (thrown? clojure.lang.ExceptionInfo
                  (equation-graph/input-storage-context
@@ -100,7 +118,139 @@
       (is (= (:arguments artifact) (:arguments ignored)))
       (is (= (get-in artifact [:attributes :kernel-body :operations])
              (get-in ignored [:attributes :kernel-body :operations]))
-          "descriptive aliases cannot change the verified projection or its computation"))))
+          "descriptive aliases cannot change retained storage or its computation"))))
+
+(deftest partial-storage-extent-is-an-honest-scalar-slot-under-a-compound-bound
+  (let [source '(let* [^long extent (clojure.core/long
+                                    ^long (clojure.core/* (clojure.core/long rows)
+                                                         (clojure.core/long width)))
+                       result (raster.par/pmap i extent float
+                                (clojure.core/aget a (clojure.core/quot i width)))] result)
+        options {:dtype :float :array-types {'a :float}
+                 :scalar-types {'rows :long 'width :long}
+                 :values {'a (av/tensor {:dtype :float :shape ['rows]})}}
+        typed (:program (typed-route/attempt source :float {'a :float} options))
+        program (:form (segop-lower/segop-lower-pass typed options))
+        equation (last (:equations program))
+        graph (equation-graph/make (:algorithm equation) program)
+        emitted (sg/generate-kernel-graph
+                 graph :scheduled-equation-algorithm (:algorithm equation)
+                 :scheduled-equation-body program)
+        artifact (get-in emitted [:nodes 0 :operation])
+        scheduled (get-in artifact [:attributes :scheduled-kernel-body])
+        input (first (filter #(= :input (:kind %))
+                             (get-in artifact [:attributes :kernel-body :parameters])))]
+    (is (= ['rows] (:shape input)))
+    (is (= :long (:dtype (first (filter #(= 'rows (:id %))
+                                       (get-in artifact [:attributes :kernel-body :parameters]))))))
+    (is (= '[a result rows width extent] (:arguments artifact)))
+    (is (emitted-equation/emitted-equation?
+         (emitted-equation/make (:algorithm equation) program emitted)))
+    (is (= 'rows (:value (first (filter #(= 'rows (:parameter %))
+                                       (:scalar-bindings scheduled))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (sg/generate-kernel-graph
+                  (update graph :scalars #(vec (remove (fn [scalar] (= 'rows (:id scalar))) %)))
+                  :scheduled-equation-algorithm (:algorithm equation)
+                  :scheduled-equation-body program)))))
+
+(deftest output-only-storage-scalars-require-exact-independent-graph-storage
+  (let [operation (segop/->SegMap
+                   1903 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(clojure.core/aget input i) nil #{'input} #{'output} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)
+        elements (klaunch/product (klaunch/runtime-value 'rows) (klaunch/runtime-value 'chunks))
+        scheduled (segmap-body/schedule
+                   operation {:workgroup-size 32 :scalar-types {'n :long 'rows :long 'chunks :long}
+                              :array-types {'input :float 'output :float}
+                              :array-shapes {'input ['n] 'output [elements]}})
+        node (kgraph/->ScheduledKernel
+              :storage-only-output operation
+              (mapv #(kgraph/->ValueUse (:value %) (:access %)) (get-in scheduled [:effects :uses]))
+              #{'n} [])
+        graph (kgraph/make
+               {:inputs [(kgraph/buffer 'input :float 'n :device :input)]
+                :outputs [(kgraph/buffer 'output :float elements :device :output)]
+                :scalars (mapv #(kgraph/scalar % :long) '[n rows chunks]) :nodes [node]})
+        check #(scheduled-body/graph-scalar-dependencies %1 node %2)
+        artifact (kernel-target/emit-artifact "storage_output" scheduled :opencl-portable)
+        emitted (kgraph/map-operations graph (constantly artifact))
+        finalize #(emitted-interface/finalize! %1 :opencl-c {} %2)]
+    (is (= #{'n}
+           (scheduled-body/certified-physical-scalar-dependencies
+            node (assoc graph :scalars nil) artifact))
+        "a legacy graph cannot authorize represented storage-only dependencies")
+    (is (nil? (scheduled-body/certified-physical-scalar-dependencies
+               (assoc node :scalar-uses nil) (assoc graph :scalars nil) artifact))
+        "legacy ABI-only projection does not manufacture a source dependency proof")
+    (doseq [scalars [(:scalars graph) []]]
+      (is (= :scheduled-kernel-body-node-scalars
+             (try (scheduled-body/certified-physical-scalar-dependencies
+                   (assoc node :scalar-uses nil) (assoc graph :scalars scalars) artifact) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (let [same-deps-source (assoc operation :scalars #{'rows 'chunks})
+          same-deps-node (assoc node :operation same-deps-source :scalar-uses #{'n 'rows 'chunks})
+          same-deps-graph (assoc graph :nodes [same-deps-node])
+          same-deps-artifact (kernel-target/emit-artifact
+                              "same_deps_storage_output" (assoc scheduled :source same-deps-source)
+                              :opencl-portable)]
+      (is (= #{'n 'rows 'chunks}
+             (scheduled-body/certified-physical-scalar-dependencies
+              same-deps-node same-deps-graph same-deps-artifact)))
+      (doseq [changed [(assoc-in same-deps-node [:operation :id] :foreign)
+                       (assoc-in same-deps-node [:operation :lambda]
+                                 '(clojure.core/+ 1.0 (clojure.core/aget input i)))]]
+        (is (= :scheduled-kernel-body-source
+               (try (scheduled-body/certified-physical-scalar-dependencies
+                     changed (assoc same-deps-graph :nodes [changed]) same-deps-artifact) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+    (is (= #{'n 'rows 'chunks} (check scheduled graph)))
+    (is (= #{'n 'rows 'chunks}
+           (check scheduled (assoc-in graph [:outputs 0 :elements] (klaunch/product 1 elements)))))
+    (is (= scheduled (segmap-body/validate-static-graph-capacities! scheduled node graph)))
+    (is (= #{'n 'rows 'chunks} (get-in (finalize emitted graph) [:nodes 0 :scalar-uses])))
+    (is (= #{'n 'rows 'chunks}
+           (get-in (sg/generate-kernel-graph
+                    graph :scheduled-bodies {(:id node) scheduled}
+                    :target-dialect :opencl-portable) [:nodes 0 :scalar-uses])))
+    (is (= :scheduled-kernel-body-source
+           (try (finalize emitted (assoc-in graph [:nodes 0 :operation :id] :foreign)) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :scheduled-kernel-body-source
+           (try (sg/generate-kernel-graph
+                 (assoc-in graph [:nodes 0 :operation :id] :foreign)
+                 :scheduled-bodies {(:id node) scheduled} :target-dialect :opencl-portable) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (let [rogue (-> scheduled
+                    (update-in [:body :parameters] conj
+                               (kernel-body/->KernelParameter 'rogue :scalar :long [] nil nil :parameter))
+                    (update :arguments conj 'rogue)
+                    (update :scalar-bindings conj {:parameter 'rogue :value 'rogue :dtype :long
+                                                  :kernel-dtype :long :conversion :identity}))
+          rogue-artifact (kernel-target/emit-artifact "rogue_storage_output" rogue :opencl-portable)
+          source (update graph :scalars conj (kgraph/scalar 'rogue :long))]
+      (is (= :scheduled-kernel-body-node-scalars
+             (try (finalize (kgraph/map-operations source (constantly rogue-artifact)) source) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+      (is (= :scheduled-kernel-body-node-scalars
+             (try (sg/generate-kernel-graph
+                   source :scheduled-bodies {(:id node) rogue} :target-dialect :opencl-portable) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (doseq [candidate [(assoc-in graph [:outputs 0 :elements] (klaunch/product 2 elements))
+                      (assoc-in graph [:outputs 0 :dtype] :double)]]
+      (is (= :scheduled-kernel-body-output-storage
+             (try (check scheduled candidate) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (let [candidate (update-in scheduled [:body :parameters]
+                               #(mapv (fn [parameter]
+                                        (if (= :output (:kind parameter))
+                                          (assoc-in parameter [:layout :strides] [2]) parameter)) %))]
+      (is (= :scheduled-kernel-body-output-storage
+             (try (check candidate graph) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (segmap-body/validate-static-graph-capacities!
+                  scheduled node (update graph :scalars #(vec (remove (fn [scalar] (= 'rows (:id scalar))) %))))))))
 
 (deftest portable-map-retains-selected-math-consent
   (let [operation (segop/->SegMap
@@ -150,6 +300,20 @@
     (is (= (kernel-body/predicate :lt 'i
                                  (kernel-body/index-cast '_n_bound :long :exact))
            (first (:predicates (first (:masks kernel-body))))))))
+
+(deftest exact-map-bound-storage-reuses-its-existing-typed-slot
+  (let [operation (segop/->SegMap
+                   2902 (segop/make-seg-space 'i 'n) (segop/->SegLevel :thread :virtual)
+                   '(clojure.core/aget input i) nil #{'input} #{'output} #{}
+                   (segop/->KernelGrid 1 32 0) :float 'output nil)
+        candidate (segmap-body/schedule operation
+                                        {:array-types {'input :float 'output :float}
+                                         :workgroup-size 32})
+        parameters (get-in candidate [:body :parameters])]
+    (is (= ['_n_bound] (:shape (first parameters))) "n is a proved read span, not a default capacity")
+    (is (= ['_n_bound] (mapv :id (filter #(= :scalar (:kind %)) parameters))))
+    (is (= '[input output n] (:arguments candidate)))
+    (is (= :int (:dtype (last parameters))))))
 
 (deftest map-access-proof-declines-negative-and-indirect-coordinates
   (doseq [expression ['(aget a (- i 1))

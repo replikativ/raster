@@ -319,19 +319,27 @@
         registered (segop-opencl/generate-scheduled-segmap-kernel
                      operation :dtype :float :target-dialect :opencl-portable
                      :array-types {'x :float} :scalar-types {'n :long})]
-    {:name (:kernel-name registered) :registration registered}))
+    {:name (:kernel-name registered) :registration registered
+     :scalars (mapv (fn [slot]
+                      {:type (:dtype slot)
+                       :value (case (:dtype slot)
+                                :long (long 0) :int (int 0)
+                                :float (float 0) :double (double 0))})
+                    (filter #(and (= :scalar (:kind %)) (not= :bound (:role %)))
+                            (:abi registered)))}))
 
 (deftest empty-direct-maps-validate-and-return-without-native-contact
   (doseq [backend ['raster.gpu.ze-runtime 'raster.gpu.ocl-runtime]
           canonical? [false true]]
-    (let [{:keys [name registration]} (if canonical? (canonical-empty-map-fixture) (map-fixture))
+    (let [{:keys [name registration] canonical-scalars :scalars}
+          (if canonical? (canonical-empty-map-fixture) (map-fixture))
           registry (atom {name registration})
           seen (atom [])
           v #(ns-resolve backend %)
           invoke @(v 'invoke-registered-kernel)
           void @(v 'invoke-registered-map-void-kernel)
           input (float-array [3.0]) output (float-array 0)
-          scalars (if canonical? [] [{:type :float :value (float 2.0)}])]
+          scalars (if canonical? canonical-scalars [{:type :float :value (float 2.0)}])]
       (with-redefs-fn
         {(v 'kernel-registry) registry
          (v 'ensure-kernel-loaded!) (fn [& _] (swap! seen conj :load)
@@ -364,7 +372,7 @@
 
 (deftest empty-direct-map-still-rejects-a-replaced-registration
   (doseq [backend ['raster.gpu.ze-runtime 'raster.gpu.ocl-runtime]]
-    (let [{:keys [name registration]} (canonical-empty-map-fixture)
+    (let [{:keys [name registration scalars]} (canonical-empty-map-fixture)
           registry (atom {name registration})
           seen (atom [])
           validate call/validate-preconditions!
@@ -379,7 +387,7 @@
            (is (= :registry-generation-changed
                   (:reason (ex-data (error-of
                                      (fn [] ((deref (v 'invoke-registered-kernel))
-                                             name [(float-array 1)] (float-array 0) [] 0)))))))
+                                             name [(float-array 1)] (float-array 0) scalars 0)))))))
            (is (empty? @seen)))))))
 
 (deftest zero-bound-does-not-skip-an-opaque-positive-grid-artifact

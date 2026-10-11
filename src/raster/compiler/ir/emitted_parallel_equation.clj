@@ -91,11 +91,24 @@
     (when-not (every? (comp artifact/kernel-artifact? :operation) (:nodes emitted))
       (fail! :emitted-parallel-equation-artifact
              "emitted equation graph requires only KernelArtifact nodes" {}))
-    (when-not (graph/dataflow-equivalent? scheduled emitted)
+    (let [source-contract (graph/dataflow-contract scheduled)
+          emitted-contract (graph/dataflow-contract emitted)
+          ;; Operations are excluded from the dataflow contract. Keep its exact storage,
+          ;; topology and effects; project only independently certified physical scalar uses.
+          projected-contract
+          (if (= (mapv :id (:nodes scheduled)) (mapv :id (:nodes emitted)))
+            (update source-contract :nodes
+                    (fn [nodes]
+                      (mapv (fn [contract-node source-node emitted-node]
+                              (assoc contract-node :scalar-uses
+                                     (scheduled-body/certified-physical-scalar-dependencies
+                                      source-node scheduled (:operation emitted-node))))
+                            nodes (:nodes scheduled) (:nodes emitted))))
+            source-contract)]
+    (when-not (= projected-contract emitted-contract)
       (fail! :emitted-parallel-equation-dataflow
              "target emission changed scheduled equation dataflow"
-             {:scheduled (graph/dataflow-contract scheduled)
-              :emitted (graph/dataflow-contract emitted)}))
+             {:scheduled projected-contract :emitted emitted-contract})))
     (when-not (every? true?
                       (map (fn [scheduled-node emitted-node generated-body]
                              (let [certificate (get-in emitted-node

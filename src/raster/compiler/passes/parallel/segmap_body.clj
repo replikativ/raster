@@ -194,6 +194,7 @@
                                    {:operation (:id segmap) :scalar id
                                     :declared (vec (keys scalar-types))})))
         array-types (into {} (map (juxt identity array-dtype)) (concat inputs outputs))
+        declared-scalar-types scalar-types
         scalar-types (into {} (map (juxt identity scalar-dtype)) scalars)
         index-scope (conj (set scalars) index)
         index-types (assoc scalar-types index :long)
@@ -633,7 +634,13 @@
                                            {:locals locals :result (if effects (list* 'do effects) result)})
                                     options)
                                    (scheduled-read-minima index bound scheduled-operations options))))
+        ;; The source's exact opaque bound already has an admitted typed ABI slot. Parameterize
+        ;; that identity early, without projecting a compound extent or inferring any capacity.
+        storage-bindings (if (and (or (symbol? bound) (keyword? bound))
+                                  (not (contains? (set scalars) bound)))
+                           {bound '_n_bound} {})
         pointer-shape (fn [id]
+                        (mapv #(launch/rebind-expression % storage-bindings)
                         (or (get array-shapes id)
                             ;; A primary result writes every logical index. A smaller read
                             ;; footprint (or unknown backing) cannot replace this known prefix.
@@ -644,8 +651,8 @@
                             (when-not (contains? (set inputs) id) ['_n_bound])
                             ;; An unknown input still has an exact backing allocation at bind.
                             ;; This is storage identity, not a minimum or indexed-access proof.
-                            [(launch/runtime-value (list 'extent id))]))
-        parameters
+                            [(launch/runtime-value (list 'extent id))])))
+        pointer-parameters
         (vec (concat
               (map #(body/->KernelParameter
                      % :input (get array-types %) (pointer-shape %) :global
@@ -656,7 +663,13 @@
                             (get array-types %) (pointer-shape %) :global
                             (layout/row-major (pointer-shape %) (get array-types %)) :result)
                       (= % primary-output) (assoc :minimum-elements '_n_bound))
-                   outputs)
+                   outputs)))
+        storage-types (scheduled-body/storage-scalar-closure
+                       pointer-parameters declared-scalar-types #{'_n_bound})
+        scalars (vec (sort-by name (into (set scalars) (keys storage-types))))
+        scalar-types (merge scalar-types storage-types)
+        parameters
+        (vec (concat pointer-parameters
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar bound-dtype [] nil nil :bound)]))]

@@ -18,7 +18,6 @@
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dtype :as dt]
-            [raster.compiler.core.layout :as layout]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.intel-block-io :as block-io]
             [raster.compiler.ir.axis-map :as am]
@@ -30,7 +29,6 @@
             [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.extent-expression :as extent]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
@@ -213,36 +211,6 @@
                            :operation (:id operation) :input input})))))
     shapes))
 
-(defn- project-physical-input-shapes
-  "After source/storage validation, project an equal whole input extent to its physical bound.
-   Definitions are derived by the caller from a checked causal program or exact graph context;
-   no graph attribute, name resemblance, address expression, or output geometry proves equality."
-  [scheduled definitions]
-  (let [scheduled (scheduled-body/validate! scheduled)
-        parameters (get-in scheduled [:body :parameters])
-        bound-ids (into #{} (keep #(when (and (= :scalar (:kind %)) (= :bound (:role %)))
-                                   (:id %))) parameters)
-        binding (first (filter #(and (contains? bound-ids (:parameter %))
-                                     (contains? #{:int :long} (:dtype %)))
-                               (:scalar-bindings scheduled)))
-        expand #(klaunch/rebind-expression % definitions)]
-    (if-not (and binding (contains? definitions (:value binding)))
-      scheduled
-      (scheduled-body/validate!
-       (update-in scheduled [:body :parameters]
-                  (fn [parameters]
-                    (mapv
-                     (fn [{:keys [kind shape dtype] :as parameter}]
-                       (if (and (contains? #{:input :inout} kind)
-                                (= 1 (count shape))
-                                (= (layout/row-major shape dtype) (:layout parameter))
-                                (extent/equivalent? (expand (first shape))
-                                                    (expand (:value binding))))
-                         (let [shape [(:parameter binding)]]
-                           (assoc parameter :shape shape :layout (layout/row-major shape dtype)))
-                         parameter))
-                     parameters)))))))
-
 (defn generate-segfoldmap-kernel
   "Schedule and emit one certified ordered SegFoldMap through the canonical KernelBody target."
   [segfoldmap & {:keys [kernel-name-prefix target-dialect workgroup-size scalar-types array-types
@@ -257,7 +225,9 @@
         scheduled
         (segfoldmap-body/schedule
          segfoldmap (merge {:workgroup-size workgroup-size
-                           :scalar-types scalar-types :array-types array-types
+                           :scalar-types (merge scalar-types (:scalar-types storage-options)
+                                                (into {} (map (juxt :id :dtype)) (:scalars kernel-graph)))
+                           :array-types array-types
                            :array-shapes (checked-graph-input-shapes
                                           segfoldmap kernel-graph
                                           (merge array-shapes (:array-shapes storage-options)))
@@ -310,7 +280,9 @@
         scheduled
         (segmap-body/schedule projected
                               (merge {:workgroup-size workgroup-size
-                               :scalar-types scalar-types :array-types array-types
+                               :scalar-types (merge scalar-types (:scalar-types storage-options)
+                                                    (into {} (map (juxt :id :dtype)) (:scalars kernel-graph)))
+                               :array-types array-types
                                :array-shapes (checked-graph-input-shapes
                                               segmap kernel-graph
                                               (merge array-shapes (:array-shapes storage-options)))
@@ -321,13 +293,11 @@
         scheduled (if graph-node (assoc scheduled :source segmap) scheduled)
         _ (when (or graph-node kernel-graph)
             (segmap-body/validate-static-graph-capacities! scheduled graph-node kernel-graph))
-        ;; First prove source/graph correspondence in its original storage representation.
-        ;; Only then replace a whole, causally equal extent with an existing physical scalar.
-        definitions (if kernel-graph
-                      (equation-graph/validated-storage-scalars
-                       kernel-graph scheduled-equation-algorithm scheduled-equation-body)
-                      (:scalar-definitions storage-options))
-        scheduled (project-physical-input-shapes scheduled definitions)
+        ;; Retained storage stays in its original representation. Exact source context still
+        ;; certifies causal host definitions; shape-only leaves now have honest scalar ABI slots.
+        _ (when kernel-graph
+            (equation-graph/validated-storage-scalars
+             kernel-graph scheduled-equation-algorithm scheduled-equation-body))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ]
     (kernel-body-target/emit-artifact kernel-name scheduled target-dialect
@@ -526,7 +496,7 @@
               kernel-name scheduled target-dialect
               (merge {:parameter-names parameter-names :provenance {:graph-node id}}
                      (select-keys opts [:target-descriptor :scalar-math]))))))]
-    (finalize-emitted-graph emitted target-module scalar-types)))
+    (finalize-emitted-graph emitted target-module scalar-types graph)))
 
 (defn- generate-elementwise-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect]
@@ -536,7 +506,7 @@
                             (into {} (map (juxt :id :dtype)) (:scalars graph)))
         array-types (graph-array-types graph array-types)
         ;; Preserve graph-owned storage expressions independently of iteration geometry;
-        ;; resolving them must not introduce new shape-only ABI scalars.
+        ;; integral storage-only leaves are closed into each native ABI before emission.
         storage-shapes (graph-array-shapes graph)
         emitted
         (kgraph/map-operations
@@ -564,7 +534,7 @@
              (throw (ex-info "OpenCL elementwise graph has an unsupported scheduled node"
                              {:reason :kernel-graph-node-target-lowering-missing
                               :target :opencl-c :node id :operation operation})))))]
-    (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types)))
+    (finalize-emitted-graph emitted (kernel-body-c-dialect/target target) scalar-types graph)))
 
 (defn- generate-reduction-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect target-device target-descriptor
@@ -618,7 +588,7 @@
     (finalize-emitted-graph
      emitted
      (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
-     scalar-types)))
+     scalar-types graph)))
 
 (defn- generate-fold-map-kernel-graph
   [graph {:keys [scalar-types array-types target-dialect scheduled-equation-algorithm
@@ -654,7 +624,7 @@
     (finalize-emitted-graph
      emitted
      (kernel-body-c-dialect/target target)
-     scalar-types)))
+     scalar-types graph)))
 
 (defn- generate-staged-contraction-graph
   [graph {:keys [target-dialect scalar-types scheduled-equation-algorithm
@@ -673,7 +643,7 @@
     (finalize-emitted-graph emitted
                             (kernel-body-c-dialect/target
                              (kernel-body-c-dialect/resolve! target-dialect))
-                            scalar-types)))
+                            scalar-types graph)))
 
 (defn- generate-certified-body-graph
   "Project already scheduled bodies without recognizing their operation families again."
@@ -708,7 +678,7 @@
         emitted (cond-> emitted strategy (assoc-in [:attributes :strategy] strategy))]
     (finalize-emitted-graph
      emitted (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
-     scalar-types)))
+     scalar-types graph)))
 
 (defn generate-kernel-graph
   "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.

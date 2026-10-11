@@ -12,6 +12,25 @@
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]))
 
+(deftest storage-only-scalars-require-integral-owner-types
+  (let [pointer (body/->KernelParameter 'x :input :float ['rows] :global
+                                       (layout/row-major ['rows] :float) :operand)
+        bounded (assoc pointer :minimum-elements '_n_bound)
+        backing (assoc pointer :shape [(launch/runtime-value '(extent x))]
+                               :layout (layout/row-major [(launch/runtime-value '(extent x))] :float))]
+    (is (= {'rows :long}
+           (scheduled/storage-scalar-closure [bounded] {'rows :long} #{'_n_bound})))
+    (is (= {} (scheduled/storage-scalar-closure [backing] {} #{})))
+    (doseq [types [{} {'rows :float} {'rows :double}]]
+      (is (= :scheduled-kernel-body-storage-scalar-dtype
+             (try (scheduled/storage-scalar-closure [pointer] types #{}) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (let [pitched (assoc pointer :layout (assoc (:layout pointer) :strides ['pitch]))]
+      (is (= {'rows :long 'pitch :int}
+             (scheduled/storage-scalar-closure [pitched] {'rows :long 'pitch :int} #{})))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (scheduled/storage-scalar-closure [pitched] {'rows :long} #{}))))))
+
 (defn- scalar-body []
   (body/make
    {:id :scheduled-body-test

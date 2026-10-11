@@ -2,13 +2,45 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.nn :as numerical-nn]
             [raster.dl.nn :as nn]
             [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]
+            [raster.gpu.compiled :as compiled]
             [raster.gpu.link :as link]
             [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.device-probe :as opencl-probe]))
+
+(deftest public-chunked-rmsnorm-tail-closes-row-storage-into-the-native-abi
+  ;; Compile the real three-stage producer, not a hand-written tail. No allocation/dispatch.
+  (let [prepared (compiled/lower
+                  #'nn/rms-norm-chunked-backward-dx
+                  [(float-array 512) (float-array 512) (float-array 256)
+                   (long 2) (long 256) (long 13) (double 1.0e-6) (double 1)]
+                  {:compiler :equation-first :target :ocl:0 :dtype :float
+                   :inline? true :taps '[pss pc k1 k2]})
+        steps (get-in prepared [:lowering :plan :instances 0 :call :steps])
+        bodies (vec (mapcat (fn [step]
+                             (keep #(get-in % [:operation :attributes :kernel-body])
+                                   (get-in step [:graph :nodes]))) steps))
+        tail (last bodies)
+        scalar-ids (into #{} (keep #(when (= :scalar (:kind %)) (:id %))) (:parameters tail))
+        contracts (scheduled-body/storage-expression-references (:parameters tail))
+        row-inputs (filter #(and (= :input (:kind %))
+                                (= 1 (count (:shape %)))
+                                (some (fn [reference]
+                                        (and (symbol? reference)
+                                             (= "rows" (name reference))))
+                                      (launch/expression-references (first (:shape %)))))
+                           (:parameters tail))]
+    (is (= 3 (count bodies)) "all three actual equation-first stages are retained")
+    (is (<= 2 (count row-inputs)) "both per-row coefficient buffers retain their storage extent")
+    (is (every? scalar-ids contracts) "every retained storage leaf has a physical scalar slot")
+    (doseq [pointer row-inputs
+            reference (launch/expression-references (first (:shape pointer)))]
+      (is (= :long (:dtype (first (filter #(= reference (:id %)) (:parameters tail)))))))))
 
 (deftest public-rmsnorm-is-one-cooperative-executable
   (doseq [target [:ocl:0 :ze:0]]

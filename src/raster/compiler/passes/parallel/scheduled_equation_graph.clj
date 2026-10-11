@@ -349,6 +349,9 @@
         definitions (derived-scalar-expressions
                      values (take-while #(true? (get-in % [:attributes :host-only])) (:equations body)))]
     {:scalar-definitions definitions
+     :scalar-types (into {} (keep (fn [[id value]]
+                                   (when (integral-scalar-value? value)
+                                     [id (dtype/canon (:dtype value))]))) values)
      :array-shapes
      (into {}
            (keep (fn [input]

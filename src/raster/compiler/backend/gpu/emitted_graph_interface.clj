@@ -14,7 +14,9 @@
    equal scalar uses, proves their emitted dtypes agree, and exposes every external buffer exactly
    once. An explicit target-neutral GraphScalar interface is authoritative: target artifacts may
    choose a physical kernel dtype, but cannot invent, omit, reorder, or retype public scalars."
-  [emitted target-dialect scalar-types]
+  ([emitted target-dialect scalar-types]
+   (finalize! emitted target-dialect scalar-types nil))
+  ([emitted target-dialect scalar-types source-graph]
   (let [external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
         declared-scalars (:scalars emitted)
         declared-scalar-ids (set (map :id declared-scalars))
@@ -155,19 +157,27 @@
           (mapv (fn [slot argument]
                   (kgraph/scalar argument (:dtype slot)))
                 scalar-abi scalar-arguments))
+        source-graph (when source-graph (kgraph/validate! source-graph))
+        _ (when (and source-graph
+                     (not= (mapv :id (:nodes source-graph)) (mapv :id (:nodes emitted))))
+            (throw (ex-info "emitted scalar projection requires the exact ordered source nodes"
+                            {:reason :kernel-graph-artifact-source-nodes})))
         explicit-nodes
-        (mapv (fn [node]
+        (mapv (fn [node source-node]
                 (let [artifact (:operation node)
                       actual (kgraph/scalar-argument-uses
                               (:abi artifact) (:arguments artifact))
-                      scheduled (:scalar-uses node)]
+                      scheduled (if source-graph
+                                  (scheduled-body/certified-physical-scalar-dependencies
+                                   source-node source-graph artifact)
+                                  (:scalar-uses node))]
                   (when (and (some? scheduled) (not= scheduled actual))
                     (throw (ex-info "emitted kernel scalar dependencies differ from its schedule"
                                     {:reason :kernel-graph-artifact-scalar-uses
                                      :node (:id node)
                                      :expected scheduled :actual actual})))
                   (assoc node :scalar-uses actual)))
-              (:nodes emitted))]
+              (:nodes emitted) (if source-graph (:nodes source-graph) (:nodes emitted)))]
     (-> emitted
         (assoc :abi (vec (concat pointer-abi scalar-abi))
                :arguments (vec (concat (map :id external-buffers) scalar-arguments))
@@ -175,4 +185,4 @@
                :nodes explicit-nodes)
         (assoc-in [:provenance :target-dialect] target-dialect)
         (assoc-in [:attributes :emitted?] true)
-        kgraph/validate!)))
+        kgraph/validate!))))
