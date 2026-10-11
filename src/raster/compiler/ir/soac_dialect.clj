@@ -88,6 +88,7 @@
    are not treated as pure maps or admitted to algebraic fusion without a later effect proof.
    Scan results use the same result-storage relation when materialized into caller-owned buffers."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
             [raster.compiler.core.dtype :as dtype]
@@ -141,7 +142,8 @@
    traversal extent remains unchanged and is what schedules use for work decomposition."
   [{:keys [mode extent]}]
   [(if (= :exclusive mode)
-     (if (integer? extent) (inc extent) (list 'clojure.core/inc extent))
+     (if (integer? extent) (inc extent)
+         (list 'clojure.core/inc (first (extent-shape extent))))
      (first (extent-shape extent)))])
 
 (defn segmented-reduce-result-shape
@@ -2622,6 +2624,22 @@
   [program value-map]
   (let [program (validate! program)
         rename #(get value-map % %)
+        expression-map (into {} (keep (fn [[id target]]
+                                       (when (symbol? id)
+                                         [id (first (extent-shape target))]))) value-map)
+        normalize-wrapper
+        (fn [expression]
+          ;; Substitution inserts expression-form IDs. Opaque extent wrappers own raw IDs,
+          ;; whereas a value wrapper around a symbol is the symbol's canonical shape spelling.
+          (if (and (seq? expression) (= 2 (count expression))
+                   (contains? #{'value 'extent 'unknown-dimension} (first expression)))
+            (let [[head id] expression
+                  id (if (and (seq? id) (= 'value (first id)) (= 2 (count id)))
+                       (second id) id)
+                  result (if (= 'value head) (first (extent-shape id)) (list head id))]
+              (if (instance? clojure.lang.IObj result)
+                (with-meta result (meta expression)) result))
+            expression))
         rename-dimension
         (fn [dimension]
           (cond
@@ -2632,9 +2650,32 @@
             (and (seq? dimension) (contains? #{'value 'extent 'unknown-dimension} (first dimension))
                  (= 2 (count dimension))
                  (contains? value-map (second dimension)))
-            (list (first dimension) (rename (second dimension)))
+            (normalize-wrapper
+             (with-meta (list (first dimension) (rename (second dimension))) (meta dimension)))
 
-            :else dimension))
+            :else
+            (let [opaque (atom {})
+                  protected
+                  ((fn visit [expression]
+                     (let [original-meta (meta expression)
+                           expression (walk/walk visit identity expression)
+                           expression (if (instance? clojure.lang.IObj expression)
+                                        (with-meta expression original-meta) expression)]
+                     (if (and (seq? expression) (= 2 (count expression))
+                              (contains? #{'value 'extent 'unknown-dimension} (first expression))
+                              (contains? value-map (second expression)))
+                       (let [placeholder (gensym "shape_id__")
+                             replacement (normalize-wrapper
+                                          (with-meta
+                                            (list (first expression) (rename (second expression)))
+                                            (meta expression)))]
+                         (swap! opaque assoc placeholder replacement)
+                         placeholder)
+                       expression))) dimension)]
+              ;; Protect opaque IDs before the scoped expression substitution: a replacement
+              ;; target must not itself follow another edge in value-map.
+              (binding [util/*shadowing-locals* (into util/*shadowing-locals* (keys expression-map))]
+                (util/subst-syms @opaque (util/subst-syms expression-map protected))))))
         rename-value (fn [value] (update value :shape #(mapv rename-dimension %)))
         source-facts (facts program)
         values (reduce-kv (fn [result id value]

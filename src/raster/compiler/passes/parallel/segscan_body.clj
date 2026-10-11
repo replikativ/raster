@@ -157,7 +157,7 @@
     (let [groups (get-in operation [:grid :num-blocks])
           expected-groups (case phase
                             (:single :block-scan) 1
-                            :intra-block (launch/ceil-div bound workgroup-size)
+                            :intra-block (launch/maximum 1 (launch/ceil-div bound workgroup-size))
                             ;; Carry-in's map grid may be occupancy-capped. This portable leaf
                             ;; intentionally expands it to cover every element without striding.
                             :carry-in nil)
@@ -235,6 +235,9 @@
                (concat
                 [(body/->Mask :scan-active [(body/predicate :lt 'scan-index '_n_bound)])
                  (body/->Mask :scan-lane-zero [(body/predicate :eq 'scan-lane 0)])
+                 (body/->Mask :scan-nonempty-total
+                              [(body/predicate :eq 'scan-lane 0)
+                               (body/predicate :lt 'scan-index '_n_bound)])
                  (body/->Mask :scan-first-lane
                               [(body/predicate :eq 'scan-group 0)
                                (body/predicate :eq 'scan-lane 0)])]
@@ -269,13 +272,14 @@
                  [(body/->ScalarLoad
                    (body/value 'scan-block-total result-type) scratch
                    [(body/expression :sub 'scan-valid-count 1)]
-                   :scan-lane-zero identity :cached)
-                  (body/->ScalarStore totals ['scan-group] 'scan-block-total :scan-lane-zero)])
+                   :scan-nonempty-total identity :cached)
+                  (body/->ScalarStore totals ['scan-group] 'scan-block-total :scan-nonempty-total)])
                (when (= :exclusive scan-mode)
                  [(body/->ScalarStore output [0]
                                       identity
                                       :scan-first-lane)])))
-        group-count (if (= :single phase) 1 (launch/ceil-div '_n_bound workgroup-size))]
+        group-count (if (= :single phase) 1
+                      (launch/maximum 1 (launch/ceil-div '_n_bound workgroup-size)))]
     (body/make
      {:id [:segscan (:id operation) phase :portable-workgroup]
       :parameters parameters :stable-reads stable-reads
@@ -452,7 +456,7 @@
                  :scan-block-size scan-workgroup :operator operator}
       :launch (launch/spec
                {:workgroup-size [workgroup-size]
-                :group-count [(launch/ceil-div '_n_bound workgroup-size)]})
+                :group-count [(launch/maximum 1 (launch/ceil-div '_n_bound workgroup-size))]})
       :provenance {:dialect :kernel-body :source-dialect :segscan
                    :segop-id (:id operation)}
       :attributes {:kind :portable-segscan :phase :carry-in :scan-mode scan-mode

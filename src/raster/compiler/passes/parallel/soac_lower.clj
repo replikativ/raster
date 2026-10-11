@@ -1186,7 +1186,7 @@
                                      (:inputs description)
                                      (conj (:outputs description) totals-sym)
                                      (:scalars description)
-                                     grid-1 :intra-block
+                                     (update grid-1 :num-blocks #(kernel-launch/maximum 1 %)) :intra-block
                                      dtype)
             stage-2-idx (gensym "k_")
             stage-2-space (segop/make-seg-space stage-2-idx (:num-blocks grid-1))
@@ -1200,7 +1200,8 @@
                                      dtype)
             carry-idx (gensym "ci_")
             carry-space (segop/make-seg-space carry-idx bound)
-            grid-3 (phase-grid :map device-id bound dtype target-descriptor)
+            grid-3 (update (phase-grid :map device-id bound dtype target-descriptor)
+                           :num-blocks #(kernel-launch/maximum 1 %))
             level-3 (segop/->SegLevel :thread :virtual)
             out-sym (or (:out scan-op) (first (:outputs description)))
             block-idx-expr (list 'clojure.core/quot carry-idx (:block-size grid-1))

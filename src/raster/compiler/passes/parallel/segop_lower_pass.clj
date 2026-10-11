@@ -340,12 +340,15 @@
 (defn- singleton-packet
   "Admit, freshen and schedule the complete typed singleton, including host SSA."
   [result source opts used kind]
-  (let [packet-stage (if (= kind 'reduce) :typed-reduction-packet :typed-map-packet)
-        source-stage (if (= kind 'reduce) :typed-reduction-source :typed-map-source)]
+  (let [packet-stage (case kind reduce :typed-reduction-packet
+                               map :typed-map-packet scan :typed-scan-packet)
+        source-stage (case kind reduce :typed-reduction-source
+                               map :typed-map-source scan :typed-scan-source)]
     (let [attempt (typed-route/attempt
                    (list 'let* [result source] result)
                    (or (:dtype opts) :double) (:array-types opts)
                    {:scalar-types (:scalar-types opts)
+                    :values (:values opts)
                     :resident-reductions? (true? (:resident-reductions? opts))})]
       (if (:declined attempt)
         {:declined (:declined attempt)}
@@ -428,9 +431,11 @@
     (singleton-packet result source opts used 'reduce)))
 
 (defn- selected-operation-packet [result source opts used]
-  (if (par/par-map-pure-form? source)
-    (singleton-packet result source opts used 'map)
-    (reduction-packet result source opts used)))
+  (cond
+    (par/par-map-pure-form? source) (singleton-packet result source opts used 'map)
+    (or (par/par-scan-form? source) (par/par-scan-exclusive-form? source))
+    (singleton-packet result source opts used 'scan)
+    :else (reduction-packet result source opts used)))
 
 (defn- packet-equations
   [packet primary-site ids]
@@ -438,12 +443,23 @@
         values (:values scheduled)
         produced (set (mapcat :results (:equations scheduled)))]
     (mapv (fn [equation]
+            (let [graph (get-in equation [:attributes :kernel-graph])
+                  public-buffers (concat (:inputs graph) (:outputs graph))
+                  buffer-ids (set (map :id (concat public-buffers (:temporaries graph))))]
+              (doseq [{:keys [id]} public-buffers]
+                (when-not (contains? values id)
+                  (throw (ex-info "typed packet lacks a scheduled public buffer contract"
+                                  {:reason :raster/bug :stage :typed-packet-graph-values
+                                   :equation (:id equation) :value id}))))
             {:equation (-> equation
                            (assoc :id (swap! ids inc))
                            (update :provenance assoc :compatibility-source-site primary-site))
              :operand-values (select-keys values (:operands equation))
              :result-values (select-keys values (:results equation))
-             :physical-values (select-keys values (set/intersection produced (set (:results equation))))})
+             :physical-values (select-keys values
+                                           (set/union buffer-ids
+                                                      (set/intersection produced
+                                                                        (set (:results equation)))))}))
           (:equations scheduled))))
 
 (defn segop-lower-pass
@@ -640,12 +656,28 @@
                         body? (= :body (first site))
                         packet-body (:body packet)]
                     (swap! lowered inc)
+                    (swap! graphs-lowered +
+                           (count (filter #(get-in % [:equation :attributes :kernel-graph]) rows)))
                     (swap! typed-count inc)
                     (swap! scalar-count + (count (filter #(get-in % [:equation :attributes :host-only]) rows)))
                     (-> state
                         (update :pairs into packet-pairs)
                         (cond-> body? (update :body into packet-body))
                         (update :equations into rows)
+                        ;; Public storage keeps the first admitted backing contract. Later
+                        ;; singleton packets may introduce fresh traversal extents, but must
+                        ;; not independently redefine the same resident array's capacity.
+                        (update-in [:options :values]
+                                   (fn [known]
+                                     (let [public-ids
+                                           (set (map :id
+                                                     (mapcat
+                                                      (fn [row]
+                                                        (let [graph (get-in row [:equation :attributes :kernel-graph])]
+                                                          (concat (:inputs graph) (:outputs graph))))
+                                                      rows)))]
+                                       (merge-values (or known {})
+                                                     (select-keys (:values (:program packet)) public-ids)))))
                         ;; A later singleton consumes the earlier map's retained element storage,
                         ;; not the compilation's default precision. Only the owned map result is
                         ;; newly introduced here; do not replace caller input declarations.
