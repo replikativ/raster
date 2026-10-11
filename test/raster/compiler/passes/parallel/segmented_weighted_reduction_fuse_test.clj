@@ -9,6 +9,8 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as fuse]
@@ -135,7 +137,60 @@
            (:operands plan-equation)))
     (is (= '[normalized] (:results plan-equation)))
     (is (identical? program (structured-route/validate-typed-program! program)))
-    (is (= [plan] (:operations plan-equation)))))
+    (is (= [plan] (:operations plan-equation)))
+    (let [source (get (into {} (map vec) (partition 2 (second (:source program))))
+                      (second (:site plan-equation)))
+          runtime-values (nth source 3)
+          changed-type (with-meta
+                         (apply list (assoc (vec source) 3
+                                           (assoc runtime-values 0
+                                                  (with-meta (first runtime-values)
+                                                    {:tag 'double :raster.type/tag 'double}))))
+                         (meta source))
+          changed-callee (with-meta source (assoc (meta source)
+                                                :raster.op/original 'user/other-plan))]
+      (is (every? #(= 'long (:raster.type/tag (meta %)))
+                  (filter symbol? runtime-values)))
+      (is (fingerprint/equivalent? source (:source plan-equation)))
+      (is (identical? plan-equation
+                      (parallel-program/equation-for-binding program 'normalized source)))
+      (is (nil? (parallel-program/equation-for-binding program 'normalized changed-type)))
+      (is (nil? (parallel-program/equation-for-binding program 'normalized changed-callee)))
+      (is (identical? plan-equation
+                      (parallel-program/equation-for-binding
+                       program 'normalized (with-meta source (assoc (meta source) :line 123))))))))
+
+(deftest protected-source-transport-preserves-binders-and-rejects-lost-sites
+  (let [retain-source (var-get (ns-resolve
+                               'raster.compiler.passes.parallel.typed-soac-route
+                               'retain-protected-source))
+        binder (with-meta 'result {:tag 'floats :source-binder true})
+        descriptor-binder (with-meta 'result {:tag 'doubles})
+        untouched (with-meta 'before {:tag 'long})
+        bindings (with-meta [untouched 1 binder '(old-expression)] {:binding-vector true})
+        source (with-meta (list 'let* bindings binder) {:source-root true})
+        expression (with-meta '(retained-expression) {:retained-source true})
+        entry {:kind :segmented-weighted-reduction
+               :description {:id 1 :sym descriptor-binder :expr expression}}
+        result (retain-source source [entry])]
+    (is (identical? binder (nth (second result) 2)))
+    (is (identical? untouched (first (second result))))
+    (is (identical? expression (nth (second result) 3)))
+    (is (= [untouched 1] (subvec (second result) 0 2)))
+    (is (identical? binder (nth result 2)))
+    (is (= (meta source) (meta result)))
+    (is (= (meta bindings) (meta (second result))))
+    (doseq [description [{:id -1 :sym binder}
+                         {:id 2 :sym binder}
+                         {:id nil :sym binder}
+                         {:id 1 :sym 'different}]]
+      (let [error (try
+                    (retain-source source [(assoc entry :description
+                                                  (assoc description :expr expression))])
+                    nil
+                    (catch clojure.lang.ExceptionInfo exception exception))]
+        (is (= :raster/bug (:reason (ex-data error))))
+        (is (= :protected-source-binding-mismatch (:invariant (ex-data error))))))))
 
 (deftest protected-plan-preserves-ordinary-equations-on-both-sides
   (let [{:keys [form]} (fuse/fuse (chain) :float)

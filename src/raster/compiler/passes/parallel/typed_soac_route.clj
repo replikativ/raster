@@ -836,6 +836,33 @@
       :result-storage result-storage
       :host-binding host-binding})))
 
+(defn- retain-protected-source
+  "Materialize each protected descriptor's retained source at its original binding site.
+
+   Source description stamps authoritative lexical scalar facts before plan admission. The
+   host pair and equation witness must retain that same expression, rather than certifying the
+   stamped descriptor while executing an undecorated copy. This is producer transport, not
+   type inference or source repair at certificate lookup."
+  [form entries]
+  (let [[head bindings & body] form
+        pairs (mapv vec (partition 2 bindings))
+        pairs
+        (reduce
+         (fn [pairs {:keys [kind description]}]
+           (if (= :segmented-weighted-reduction kind)
+             (let [{:keys [id sym expr]} description]
+               (when-not (and (integer? id) (<= 0 id) (< id (count pairs))
+                              (= sym (first (nth pairs id))))
+                 (throw (ex-info "protected source descriptor lost its binding site"
+                                 {:reason :raster/bug
+                                  :invariant :protected-source-binding-mismatch
+                                  :binding sym :source-binding-id id})))
+               (assoc pairs id [(first (nth pairs id)) expr]))
+             pairs))
+         pairs entries)]
+    (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
+      (meta form))))
+
 (defn- mixed-envelope
   [form projection options]
   (let [components (component-runs (:entries projection))
@@ -847,7 +874,8 @@
               components)]
     (if-let [decline (some :declined typed-components)]
       {:declined decline}
-      (let [realization (realization-program projection typed-components)
+      (let [form (retain-protected-source form (:entries projection))
+            realization (realization-program projection typed-components)
             {:keys [source realized]}
             (if realization (realize-source form realization) {:source form :realized {}})
             typed-envelopes (mapv #(envelope (:program %) source realized) typed-components)
