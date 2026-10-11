@@ -168,7 +168,7 @@
 
 (defn- argument-substitution
   "Build a call-by-value substitution, emitting argument bindings in source order."
-  [params args tags source-env emit!]
+  [params args tags source-env emit! & [force-bindings?]]
   (into {}
         (map-indexed
          (fn [i p]
@@ -176,7 +176,7 @@
                  t (when tags (nth tags i nil))
                  typed? (and t (not (arg-subst-skip-tags t)) (symbol? a)
                              (not (.contains (str t) "IFn__")))]
-             (if (or typed? (needs-arg-lift? a))
+             (if (or force-bindings? typed? (needs-arg-lift? a))
                ;; A new binder must retain the argument's actual source type. The formal
                ;; parameter may widen it; stamping that consumer type here loses precision
                ;; boundaries. Use the same metadata/environment authority as call resolution.
@@ -554,6 +554,106 @@
                  (cons 'do remaining))]
       (when (and (seq param-syms) body)
         {:params param-syms :body body}))))
+
+(defn inline-transparent-lexical-calls
+  "Prepare AD source callees using lexical scope, not global operator spelling.
+   Only unannotated, unnamed, fixed-arity, single-use local fn lambdas in
+   immutable let scopes are transparent. Reuse
+   call-by-value argument substitution at the original call site; no effect moves
+   across a branch or iteration. Recursive/escaping/opaque callees retain lexical
+   identity and cannot acquire a global operation rule."
+  [source param-env]
+  (let [source (util/alpha-convert source)
+        occurrences (frequencies (filter symbol? (tree-seq coll? seq source)))]
+    (letfn [(lambda-info [binder expression]
+              (when (and (seq? expression)
+                         (= :lambda (:kind (form/form-info expression))))
+                (let [tail (rest expression)
+                      ;; Source fn and walked fn* use unwrapped and wrapped
+                      ;; single arities respectively. Binder/body authority is
+                      ;; still scope-info; this vector only checks source hints.
+                      params (if (vector? (first tail)) (first tail)
+                                 (when (and (= 1 (count tail)) (seq? (first tail)))
+                                   (ffirst tail)))]
+                  (when (and (= 2 (get occurrences binder 0))
+                             ;; Typed ftm and primitive fn formals have a separate
+                             ;; carrier/coercion contract; beta substitution cannot
+                             ;; erase that contract merely because arity matches.
+                             (contains? '#{fn fn* clojure.core/fn} (first expression))
+                             (nil? (:tag (meta expression)))
+                             ;; No named recursion, varargs, multi-arity or destructuring.
+                             (vector? params)
+                             (nil? (:tag (meta params)))
+                             (every? #(and (symbol? %) (not= '& %)
+                                           (nil? (:tag (meta %)))) params)
+                             ;; Even an unnamed fn can recur to its own arity.
+                             ;; Moving that recur would retarget it to a caller loop.
+                             (not-any? #(and (seq? %) (= 'recur (first %)))
+                                       (tree-seq coll? seq expression)))
+                    (let [scopes (:scopes (form/scope-info expression))]
+                      (when (= 1 (count scopes))
+                        (let [{:keys [binders body]} (first scopes)]
+                          {:params binders
+                           :body (if (= 1 (count body)) (first body) (cons 'do body))})))))))
+            (go [expression lexical known]
+              (cond
+                (and (seq? expression) (= 'quote (first expression))) expression
+                (seq? expression)
+                (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expression)]
+                  (rebuild
+                   (mapv (fn [{:keys [binders inits body] :as region}]
+                           (let [base-lexical (if rec? (into lexical binders) lexical)
+                                 base-known (apply dissoc known binders)
+                                 [local-lexical local-known transformed]
+                                 (reduce (fn [[l k xs] [binder init]]
+                                           (let [il (if (or sequential? rec?) l lexical)
+                                                 ik (if (or sequential? rec?) k known)
+                                                 init' (go init il ik)
+                                                 ;; Loop carries are mutable at recur, even
+                                                 ;; when the initializer is a lambda.
+                                                 info (when (form/binding-form? expression)
+                                                        (lambda-info binder init'))]
+                                             [(conj l binder)
+                                              (cond-> (dissoc k binder) info (assoc binder info))
+                                              (conj xs init')]))
+                                         [base-lexical base-known []] (map vector binders inits))
+                                 uninitialized (drop (count inits) binders)
+                                 local-known (apply dissoc local-known uninitialized)
+                                 body' (mapv #(go % (into local-lexical binders) local-known) body)
+                                 ;; A successfully substituted single-use lambda no
+                                 ;; longer has a value use. Remove its pure closure
+                                 ;; construction before activity sees its captures.
+                                 references (reduce into #{} (map util/free-syms (concat transformed body')))
+                                 pairs (filterv (fn [[binder _]]
+                                                  (not (and (get local-known binder)
+                                                            (not (contains? references binder)))))
+                                                (mapv vector binders transformed))]
+                             (assoc region
+                                    :binders (if (form/binding-form? expression) (mapv first pairs) binders)
+                                    :inits (if (form/binding-form? expression) (mapv second pairs) transformed)
+                                    :body body'))) scopes)
+                   (mapv #(go % lexical known) outer))
+                  (let [clean (vary-meta expression dissoc :raster.op/lexical-callee)
+                        {:keys [implementation-op arguments]} (op/call-description clean)
+                        callee (when (contains? lexical implementation-op) implementation-op)
+                        args (mapv #(go % lexical known) arguments)
+                        info (get known callee)]
+                    (if (and info (= (count (:params info)) (count args)))
+                      (let [argument-bindings (atom [])
+                            subst (argument-substitution (:params info) args nil param-env
+                                                         #(swap! argument-bindings conj %) true)
+                            body (util/subst-syms subst (:body info))]
+                        ;; Single use + immutable lexical identities prevent code duplication
+                        ;; and capture. Keep evaluated arguments even if the body ignores them.
+                        (list 'let* (vec (mapcat identity @argument-bindings)) body))
+                      (let [result (with-meta (apply list (map #(go % lexical known) clean)) (meta clean))]
+                        (cond-> result callee (vary-meta assoc :raster.op/lexical-callee callee))))))
+                (vector? expression) (mapv #(go % lexical known) expression)
+                (record? expression) (reduce-kv (fn [r k v] (assoc r k (go v lexical known))) expression expression)
+                (map? expression) (into (empty expression) (map (fn [[k v]] [(go k lexical known) (go v lexical known)]) expression))
+                (set? expression) (into (empty expression) (map #(go % lexical known) expression))
+                :else expression))]
+      (go source (set (keys param-env)) {}))))
 
 (defn- unwrap-D
   "Unwrap nested D applications: (D (D (var f))) → {:var-form (var f) :order 2}.
@@ -1058,7 +1158,8 @@
                      (if nth-resolved
                        (do (swap! result-pairs conj [sym nth-resolved])
                            (reset! any-inlined? true))
-                       (let [head (call-head init)
+                       (let [head (when-not (:lexical-callee (op/call-description init))
+                                    (call-head init))
              ;; Check for explicit AD gradient rules (templates with :grads/:grads-fn).
              ;; Ops with AD rules stay symbolic so the AD transform can use them.
                              has-ad-rule? (when (and head (not skip-ad-rule-check?))
