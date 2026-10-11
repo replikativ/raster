@@ -471,13 +471,12 @@
 (defn- map-source-envelope? [facts equation]
   (source-envelope? facts [equation]))
 
-(defn- project-map-element
-  [map-program source-ns output-id options]
-  (soac/validate! map-program)
-  (when-not (= 1 (count (soac/equations map-program)))
-    (fail! :ad-normalized-map-boundary {:equations (count (soac/equations map-program))}))
-  (let [equations (soac/equations map-program)
-        equation (first equations)
+(defn- project-checked-map-lane
+  "Shared lane body for a validated source and its validated one-equation projection.
+   Private callers own validation/membership. Full original bookkeeping is checked here;
+   the source/equation survive beside the explicit typed scalar output, without stage fusion."
+  [source map-program equation source-ns output-id options]
+  (let [source-facts (soac/facts source)
         {:keys [kind attributes arrays captures lambda]} (soac/operation-parts equation)
         results (nth equation 2)
         facts (soac/facts map-program)
@@ -490,7 +489,8 @@
                    (= results (soac/outputs map-program))
                    (empty? (:effects facts)) (empty? (:aliases facts))
                    (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
-                   (map-source-envelope? facts equation)
+                   (source-envelope? source-facts (soac/equations source))
+                   (empty? (:effects source-facts)) (empty? (:aliases source-facts))
                    (or (nil? (get-in facts [:attributes :source-arithmetic]))
                        (= numerics/retained-source-arithmetic
                           (get-in facts [:attributes :source-arithmetic])))
@@ -574,9 +574,27 @@
                         input-values (partition 2 normalized-bindings))
               scalar (program input-values
                               normalized-bindings [output])]
-          {:primal scalar
+          {:source-program source :source-equation equation :primal scalar
            :interface {:params params :tags (vec (repeat (count params) (tag dt)))
                        :active-inputs [(tagged active-element dt)] :source-ns source-ns}})))))
+
+(defn- project-map-equation-lane
+  "Checked exact-member lane entry. Batch composition should project once with
+   equation-subprograms before calling the shared private lane body."
+  [source equation source-ns output-id options]
+  (project-checked-map-lane source (soac/equation-subprogram source equation)
+                            equation source-ns output-id options))
+
+(defn- project-map-element
+  [map-program source-ns output-id options]
+  (soac/validate! map-program)
+  (when-not (= 1 (count (soac/equations map-program)))
+    (fail! :ad-normalized-map-boundary {:equations (count (soac/equations map-program))}))
+  (let [equation (first (soac/equations map-program))]
+    (when-not (= (nth equation 2) (soac/outputs map-program))
+      (fail! :ad-normalized-map-boundary {:equation equation}))
+    (select-keys (project-checked-map-lane map-program map-program equation source-ns output-id options)
+                 [:primal :interface])))
 
 (defn linearize-map-element
   "Linearize the typed scalar region of one pure, homogeneous functional map.
