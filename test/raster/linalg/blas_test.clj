@@ -1,12 +1,56 @@
 (ns raster.linalg.blas-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
-            [raster.linalg.blas :as blas]))
+            [raster.linalg.blas :as blas]
+            [raster.runtime.native-call :as native-call])
+  (:import [java.lang.foreign MemorySegment]))
 
 (use-fixtures :once
   (fn [f] (if (blas/available?) (f) (println "[SKIP] No BLAS library"))))
 
 (deftest test-available
   (is (blas/available?) "BLAS should be loaded and functional (MKL or OpenBLAS)"))
+
+(deftest fallback-heads-share-one-native-staging-scope
+  (let [scopes (atom 0) calls (atom 0) borrowed (atom nil)
+        stage native-call/with-staged-pointers!
+        single @(deref (ns-resolve 'raster.linalg.blas 'sgemm-mh))
+        a (float-array [1 2 3 4, 2 0 0 2])
+        b (float-array [5 6 7 8, 1 3 2 4]) c (float-array 8)]
+    (with-redefs-fn
+      {(ns-resolve 'raster.linalg.blas 'sgemm-batch-strided-mh) (delay nil)
+       (ns-resolve 'raster.linalg.blas 'sgemm-mh)
+       (delay (fn [args] (swap! calls inc) (single args)))
+       #'native-call/with-staged-pointers!
+       (fn [pointers access operation]
+         (swap! scopes inc)
+         (is (= [:read :read :write] access))
+         (stage pointers access
+                (fn [^objects values]
+                  (reset! borrowed (vec values))
+                  (is (every? #(.isNative ^MemorySegment %) values))
+                  (operation values))))}
+      #(blas/batched-gemm-nt! a b c 2 2 2 2 (float 1)))
+    (is (= 1 @scopes))
+    (is (= 2 @calls) "Both fallback heads must execute inside the one scope")
+    (is (= [17.0 23.0 39.0 53.0 2.0 4.0 6.0 8.0] (vec c)))
+    (is (every? #(not (.isAlive (.scope ^MemorySegment %))) @borrowed))))
+
+(deftest failed-fallback-batch-does-not-publish-partial-heap-output
+  (let [calls (atom 0)
+        single @(deref (ns-resolve 'raster.linalg.blas 'sgemm-mh))
+        a (float-array [1 2 3 4, 2 0 0 2])
+        b (float-array [5 6 7 8, 1 3 2 4]) c (float-array 8 (float 99))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.linalg.blas 'sgemm-batch-strided-mh) (delay nil)
+       (ns-resolve 'raster.linalg.blas 'sgemm-mh)
+       (delay (fn [args]
+                (if (= 2 (swap! calls inc))
+                  (throw (IllegalStateException. "second native head failed"))
+                  (single args))))}
+      #(is (thrown? IllegalStateException
+                    (blas/batched-gemm-nt! a b c 2 2 2 2 (float 1)))))
+    (is (= 2 @calls))
+    (is (= (vec (repeat 8 (float 99))) (vec c)))))
 
 (deftest test-dgemm-identity
   (testing "C = I @ B should give B"

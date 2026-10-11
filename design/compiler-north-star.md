@@ -1218,8 +1218,11 @@ Pointer conversion, access validation, alias admission, staging and cleanup have
 one dependency-light owner in `raster.runtime.native-call`; compiler adapters
 retain library lookup, descriptors, scalar ABI and arity validation. Numerical
 library adapters must share this owner rather than depend on compiler code or
-invent another staging implementation. Their existing critical downcalls still
-need migration; this ownership extraction does not make BLAS/LAPACK safe.
+invent another staging implementation. BLAS numerical handles now use ordinary
+downcalls and explicit per-pointer roles; all six batch entry points share one
+staging scope around both optional strided and per-head fallback paths. Packed
+native operands retain their caller-owned lifetime. LAPACK numerical handles
+still need migration; BLAS migration is not a global native-call safety claim.
 
 General AOT functions use ordinary FFM downcalls, not critical calls inferred from syntax or
 input size. Heap arrays use invocation-owned staging; copyback follows the same
