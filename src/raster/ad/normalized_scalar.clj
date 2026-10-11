@@ -606,6 +606,22 @@
          (partition 2 (bindings program)))
    outputs))
 
+(defn- generated-map-program
+  "Assemble a generated map using canonical executable dependencies. Extra retained value IDs
+   are physical/capacity facts only: retaining them never makes them execution inputs."
+  [values id attributes arrays captures region outputs retained-value-ids]
+  (let [equation (list '= id outputs (list 'map attributes arrays captures region))
+        inputs (vec (distinct (concat (soac/operation-inputs equation)
+                                      (filter soac/value-id? (soac/operation-extents equation)))))]
+    (when-let [missing (seq (remove #(contains? values %) retained-value-ids))]
+      (fail! :ad-normalized-generated-map-facts {:missing-values (vec missing)}))
+    (soac/make
+     (soac/default-program-facts
+      {:values (select-keys values (concat inputs outputs retained-value-ids)) :inputs inputs
+       :equations {id (soac/default-equation-facts)}
+       :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
+     [equation] outputs)))
+
 (defn- lift-map-programs [bundle source interface]
   (let [equation (first (soac/equations source))
         {:keys [attributes arrays captures]} (soac/operation-parts equation)
@@ -631,16 +647,7 @@
                        cotangent-input (assoc tensor :ownership :borrowed)})
         make-map
         (fn [id arrays captures lambda outputs]
-          (let [extent (:extent attributes)
-                inputs (vec (distinct (concat arrays captures
-                                              (when-not (integer? extent) [extent]))))
-                equation (list '= id outputs (list 'map attributes arrays captures lambda))]
-            (soac/make
-             (soac/default-program-facts
-              {:values (select-keys values (concat inputs outputs)) :inputs inputs
-               :equations {id (soac/default-equation-facts)}
-               :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
-             [equation] outputs)))
+          (generated-map-program values id attributes arrays captures lambda outputs []))
         primal-results (into outputs residual-outputs)
         primal-yields (into (soac/outputs (:primal bundle)) coefficients)
         derivative-captures (mapv scalar-captures scalar-coefficients)
@@ -808,16 +815,9 @@
                                       cotangent-input (assoc output-value :ownership :borrowed)
                                       zero-gradient data-value gradient-output data-value})
         make-map (fn [id arrays captures region outputs]
-                   (let [equation (list '= id outputs
-                                        (list 'map (assoc-in attributes [:attributes :stable-array-captures] captures)
-                                              arrays captures region))
-                         inputs (vec (distinct (concat (soac/operation-inputs equation)
-                                                       (filter soac/value-id? (soac/operation-extents equation)))))]
-                     (soac/make (soac/default-program-facts
-                                 {:values (select-keys values (concat inputs outputs capacity-facts)) :inputs inputs
-                                  :equations {id (soac/default-equation-facts)}
-                                  :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
-                                [equation] outputs)))
+                   (generated-map-program values id
+                                          (assoc-in attributes [:attributes :stable-array-captures] captures)
+                                          arrays captures region outputs capacity-facts))
         ;; Reuse fixed fresh interface IDs as lexical parameters, not conventional stems
         ;; which could capture a source extent or input of the same name.
         destination (with-meta zero-gradient {:raster.type/tag (dtype/array-tag-for-dtype dt)})
