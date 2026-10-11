@@ -1121,8 +1121,7 @@
   "Execute a recorded command graph once (synchronous). Reads current buffer contents."
   ([sess] (replay! sess :graph))
   ([sess graph-key]
-   (locking sess
-   (assert-session-open! sess)
+   (with-session-use sess
    (let [device-id (:device-id @sess)
          entry (observation/replay-detail :graph-resolution
                  (let [entry (or (get-in @sess [:graphs graph-key])

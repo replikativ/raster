@@ -702,6 +702,73 @@
           (is (not (:closed? @sess)))
           (gpu/close-session! sess))))))
 
+(deftest recorded-replay-retains-root-owners-through-backend-and-profile-reset
+  (doseq [backend [:ocl :ze]
+          stage ["replay-graph!" "reset-graph-events!"]
+          fail? [false true]]
+    (with-session-backend
+      backend {}
+      (fn [{:keys [sess releases state arena-closes]}]
+        (gpu/alloc! sess {:root [:float 4 nil]})
+        (let [graph-releases (atom 0)
+              graph-owner (cleanup/owner [{:id :recording
+                                          :release #(swap! graph-releases inc)}])
+              root-owner (get-in @sess [:buffer-owners :root])
+              primary (ex-info "recorded replay callback failed" {:stage stage})
+              calls (atom [])
+              refusals (atom [])
+              resolver-var (ns-resolve 'raster.gpu.core 'rt-resolve)
+              resolver @resolver-var
+              soft-resolver-var (ns-resolve 'raster.gpu.core 'rt-resolve-soft)
+              soft-resolver @soft-resolver-var
+              entry {::gpu/recorded-graph true ::cleanup/owner graph-owner
+                     :replay-graph :recorded :profile? true}]
+          (swap! sess assoc-in [:graphs :recorded] entry)
+          (try
+            (with-redefs-fn
+              {resolver-var
+               (fn [device name]
+                 (if (contains? #{"replay-graph!" "reset-graph-events!"} name)
+                   (fn [graph]
+                     (is (= :recorded graph))
+                     (swap! calls conj name)
+                     (when (= stage name)
+                       (let [before @sess]
+                         (swap! refusals into
+                                [(error-of #(gpu/close-session! sess))
+                                 (error-of #(gpu/free-buffer! sess :root))])
+                         (is (= before @sess))
+                         (is (= :live (:phase (cleanup/status graph-owner))))
+                         (is (= :live (:phase (cleanup/status root-owner))))
+                         (is (empty? @releases))
+                         (is (= 0 @graph-releases @arena-closes))
+                         (is (= 1 (root/lease-count state))))
+                       (when fail? (throw primary)))
+                     :completed)
+                   (resolver device name)))
+               soft-resolver-var
+               (fn [device name]
+                 (if (= "reset-graph-events!" name)
+                   (@resolver-var device name)
+                   (soft-resolver device name)))}
+              (fn []
+                (let [result (try (gpu/replay! sess :recorded)
+                                  (catch Throwable error error))]
+                  (if fail?
+                    (is (identical? primary result))
+                    (is (= :completed result))))))
+            (is (= [:reentrant-root-lifecycle :reentrant-root-lifecycle]
+                   (mapv #(-> % ex-data :reason) @refusals)))
+            (is (= (if (and fail? (= stage "replay-graph!"))
+                     ["replay-graph!"]
+                     ["replay-graph!" "reset-graph-events!"])
+                   @calls))
+            (is (identical? entry (get-in @sess [:graphs :recorded])))
+            (is (identical? root-owner (get-in @sess [:buffer-owners :root])))
+            (finally (gpu/close-session! sess)))
+          (is (= 1 @graph-releases @arena-closes (count @releases)))
+          (is (zero? (root/lease-count state))))))))
+
 (deftest publication-watch-cannot-reenter-a-range-transfer
   (doseq [backend [:ocl :ze]]
     (with-session-backend
