@@ -70,9 +70,12 @@
         result (first (:results equation))]
     (is (= ['a 'gain 'out 'scales] (:operands equation)))
     (is (= #{:memory/read :memory/write} (:effects equation)))
-    (is (= {:dtype :byte :shape ['?]} (select-keys (get-in p [:values 'a]) [:dtype :shape])))
-    (doseq [id ['scales 'out result]]
-      (is (= {:dtype :float :shape ['?]} (select-keys (get-in p [:values id]) [:dtype :shape]))))
+    (is (= {:dtype :byte :shape '[(unknown-dimension a)]}
+           (select-keys (get-in p [:values 'a]) [:dtype :shape])))
+    (is (= [:binding 'result] result))
+    (doseq [[id storage-owner] [['scales 'scales] ['out 'out] [result 'result]]]
+      (is (= {:dtype :float :shape [(list 'unknown-dimension storage-owner)]}
+             (select-keys (get-in p [:values id]) [:dtype :shape]))))
     (is (= {:dtype :int :shape []} (select-keys (get-in p [:values 'gain]) [:dtype :shape])))))
 
 (deftest an-ordinary-binding-is-silent
