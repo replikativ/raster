@@ -10,6 +10,11 @@
   (n/+ (n/+ (n/* x x) (n/* x y)) x))
 (deftm float-affine [x :- Float y :- Float] :- Float
   (n/+ (n/* x y) x))
+(deftm subtract-aliases [x :- Double y :- Double] :- Double
+  (let [product (n/* x y)
+        alias product
+        difference (n/- alias x)]
+    (n/- difference)))
 
 (def effect-count (atom 0))
 (deftm effectful-scalar [x :- Double] :- Double
@@ -58,6 +63,12 @@
     (is (every? #(instance? Float %) result))
     (is (= [(float 8.0) (float 1.5)] jresult))
     (is (every? #(instance? Float %) jresult))))
+
+(deftest normalized-scalar-public-subtraction-and-aliases
+  (let [vg (reverse/value+grad #'subtract-aliases :representation :normalized-scalar)
+        directional (jvp/jvp #'subtract-aliases :representation :normalized-scalar)]
+    (is (= [-4.0 -2.0 -2.0] (vg 2.0 3.0)))
+    (is (= [-4.0 -0.5] (directional 2.0 3.0 0.5 -0.25)))))
 
 (deftest normalized-scalar-public-options-never-fall-back
   (is (= :ad-source-jvp-options

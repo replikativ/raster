@@ -1,9 +1,26 @@
 # Normalized AD design proposal
 
-Status: proposed architecture for discussion, assessed against Raster main
-`642b5f0c0aad7c49f223357a796ce09c900e7c1c`. This is not an implemented AD dialect or a
-replacement for the compiler campaign. The unpublished scoped-helper experiment is held by
-a checkpoint refusal regression.
+Status: architecture assessed against Raster main
+`642b5f0c0aad7c49f223357a796ce09c900e7c1c`, with an initial opt-in scalar implementation.
+This is not a replacement for the compiler campaign or completion of normalized AD. The
+unpublished scoped-helper experiment remains held by a checkpoint refusal regression.
+
+The first implementation accepts homogeneous Float/Double scalar literals, aliases, binary
+addition/multiplication, unary/binary subtraction and inactive scalar precision casts.
+`jvp` and `value+grad` accept `:representation :normalized-scalar`; `:wrt` selects the
+active parameter indices. The unchanged source route remains the default. Effects, helpers
+without admitted identities, arrays, conditional/loop regions and active precision changes
+refuse. Explicit `:compile? true` also refuses; compiler construction inside source deftms
+retains its existing closed option gate rather than silently selecting another representation.
+
+The implementation reuses TypedSOAC scalar projection and existing forward/transpose
+templates. Coefficient residuals and program interfaces are checked, with compiler/template
+revisions and the existing metadata-sensitive semantic fingerprint bound to the bundle.
+This is structural producer validation, not a proof of user-supplied derivative rules.
+
+Initial warm validation: 12 focused tests / 74 assertions and 69 affected tests / 525 assertions
+pass. Independent review approved the production implementation at `5bf179dd`; the subsequent
+test-only control adds subtraction and lexical aliases. Fresh CI remains a separate gate.
 
 Raster should differentiate a checked, unscheduled numerical program with explicit value,
 control, conversion and effect contracts. Forward and reverse AD should consume the same
