@@ -1341,16 +1341,17 @@
     out))
 
 (defn- marginalize-example
-  "`ex` with its states replaced by `states`, then `k` of its variables,
-  chosen at random, MARGINALIZED and removed (`marginalize-graph`, with
-  fill-in)."
+  "`ex` with its states replaced by `states`, then `k` more of its variables,
+  chosen at random among those not marginalized already, MARGINALIZED; all
+  marginalized variables are removed (`marginalize-graph`, with fill-in)."
   [ex states k ^java.util.Random rng]
-  (if (zero? k)
-    (assoc ex :states states)
-    (let [n (long (:n-vars ex))
-          chosen (set (take k (sort-by (fn [_] (.nextDouble rng)) (range n))))
-          st (aclone ^longs states)]
-      (doseq [i chosen] (aset st (int i) (long MARGINALIZED)))
+  (let [n (long (:n-vars ex))
+        st (aclone ^longs states)
+        kept (filterv #(not= MARGINALIZED (aget st (int %))) (range n))
+        chosen (take k (sort-by (fn [_] (.nextDouble rng)) kept))]
+    (doseq [i chosen] (aset st (int i) (long MARGINALIZED)))
+    (if (= n (count kept) (+ (count kept) (count chosen)))
+      (assoc ex :states st)
       (let [mg (marginalize-graph (:values ex) (:spaces ex) st (:src-edges ex) (:dst-edges ex) n (:n-edges ex))]
         {:values (:values mg) :spaces (:spaces mg) :states (:states mg)
          :src-edges (:src-edges mg) :dst-edges (:dst-edges mg)
@@ -1372,6 +1373,8 @@
          _ (when-not (apply = (map #(long (:n-vars %)) raw))
              (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars raw)})))
          exs (mapv #(marginalize-example % (condition-states (:states %) mask-mix rng) marginalized rng) raw)
+         _ (when-not (apply = (map #(long (:n-vars %)) exs))
+             (throw (ex-info "Marginalization left examples of different sizes" {:sizes (map :n-vars exs)})))
          states (mapv :states exs)
          n-per (long (:n-vars (first exs)))
          ts (vec (repeatedly batch #(.nextInt rng timesteps)))
@@ -1399,6 +1402,13 @@
      node-example to-cf to-nm
      (long batch) n-per (long (reduce + (map :n-edges exs)))])))
 
+(deftm ema-update!
+  "ema ← mu·ema + (1 − mu)·w, in place."
+  (All [T] [ema :- (Array T) w :- (Array T) mu :- Double n :- Long] :- (Array T)
+       (dotimes [i n]
+         (aset ema i (n/+ (n/* mu (aget ema i)) (n/* (n/- 1.0 mu) (aget w i)))))
+       ema))
+
 (defn train-gsdm
   "Train a GSDM on fresh examples of `problem` with the compiled batched
   train step (Adam). Options: :config (`make-gsdm-config`), :batch (32),
@@ -1424,10 +1434,8 @@
         ;; the EMA of every weight array, with the usual warm-up of its rate
         update-ema! (fn [step]
                       (let [mu (min (double ema-rate) (/ (+ 1.0 step) (+ 10.0 step)))]
-                        (doseq [[k ^doubles e] ema
-                                :let [^doubles a (get weights k)]]
-                          (dotimes [i (alength e)]
-                            (aset e i (+ (* mu (aget e i)) (* (- 1.0 mu) (aget a i))))))))
+                        (doseq [[k e] ema]
+                          (ema-update! e (get weights k) mu (alength ^doubles e)))))
         losses (vec (for [step (range 1 (inc steps))]
                       (let [loss (apply train-fn w (:m state) (:v state)
                                         (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng

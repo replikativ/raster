@@ -26,7 +26,7 @@
          ;; :main-opts (-e :perf); `-X:test` reads :exec-fn +
          ;; :exec-args, so the same exclusion goes there as {:excludes [:perf]}.
          ;; ^:statistical tests train models for minutes and check them against
-         ;; exact posteriors; run them with -M:statistical.
+         ;; exact posteriors; run them with -M:test:statistical.
          :main-opts ["-m" "cognitect.test-runner" "-e" ":perf" "-e" ":statistical"]
          :exec-fn cognitect.test-runner.api/test
          :exec-args {:excludes [:perf :statistical]}}

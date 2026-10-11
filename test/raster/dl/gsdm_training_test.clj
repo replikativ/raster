@@ -1,7 +1,7 @@
 (ns raster.dl.gsdm-training-test
   "GSDM trained on a linear-Gaussian model against its exact posterior.
   ^:statistical: minutes of training, excluded from -M:test; run with
-  -M:statistical."
+  -M:test:statistical."
   (:require [clojure.test :refer [deftest is]]
             [raster.dl.diffusion :as diff]
             [raster.dl.gsdm :as gsdm]))

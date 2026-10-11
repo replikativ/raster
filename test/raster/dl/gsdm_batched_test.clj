@@ -115,3 +115,19 @@
     ;; the fully connected graph on the 2 kept variables, self-loops included
     (is (= (* 6 4) n-edges))
     (is (every? true? (map #(= (quot %1 2) (quot %2 2)) src dst)))))
+
+(deftest given-marginalized-variables-are-always-removed
+  ;; a problem whose default states already marginalize variable 2
+  (let [base (gsdm/make-linear-gaussian-problem 3)
+        problem (fn [rng] (let [ex (base rng) st (aclone ^longs (:states ex))]
+                            (aset st 2 (long gsdm/MARGINALIZED))
+                            (assoc ex :states st)))
+        ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 100))
+        n-per-of (fn [k] (nth (gsdm/training-batch problem 4 ac {:posterior 1.0} emb-dim (java.util.Random. 5) k) 12))]
+    (is (= 3 (n-per-of 0)))
+    (is (= 2 (n-per-of 1)))))
+
+(deftest ema-update
+  (let [e (double-array [1.0 2.0]) w (double-array [3.0 6.0])]
+    (gsdm/ema-update! e w 0.75 2)
+    (is (= [1.5 3.0] (vec e)))))
