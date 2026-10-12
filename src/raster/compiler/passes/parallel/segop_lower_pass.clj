@@ -277,7 +277,10 @@
                  ;; A body-position result is already an internal compiler identity and has no
                  ;; user binding whose successive definitions need disambiguation. Keeping that
                  ;; symbol also matches the typed reduction component's physical result contract.
-                 results (if (= :body (first (:site equation)))
+                 ;; Imported packets already own validated, fresh SSA result IDs. A second
+                 ;; wrapping would rename their algorithm while leaving scheduled writers behind.
+                 results (if (or (= :body (first (:site equation)))
+                                 (= :typed-soac (get-in equation [:provenance :source-dialect])))
                            source-results
                            (mapv (fn [source-id] [:binding source-id]) source-results))
                  values-with-operands

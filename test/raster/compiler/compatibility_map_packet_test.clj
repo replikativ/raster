@@ -185,9 +185,9 @@
     (without-legacy-maps
      #(let [packet (:form (slp/segop-lower-pass source options))
             right (last (map-equations packet))]
-        (is (= :float (get-in packet [:values [:binding 'left] :dtype])))
+        (is (= :float (get-in packet [:values 'left :dtype])))
         (is (= :float (get-in (dialect/facts (:physical-algorithm right)) [:values 'left :dtype])))
-        (is (some #{[:binding 'left]} (:operands right)))
+        (is (some #{'left} (:operands right)))
         (assert-equation-contracts packet)
         (let [a (double-array [1.00000001 -3.5])
               original (eval (list 'fn ['a 'n] source))
@@ -201,7 +201,7 @@
     (without-legacy-maps
      #(let [packet (:form (slp/segop-lower-pass source options))
             consumer (last (:equations packet))
-            retained-dtype (get-in packet [:values [:binding 'left] :dtype])
+            retained-dtype (get-in packet [:values 'left :dtype])
             operation (first (:operations consumer))
             artifact (segop-cl/generate-scheduled-segmap-kernel
                       operation :dtype :double :scalar-types {'n :long}
@@ -210,7 +210,7 @@
         (is (some? (:algorithm consumer)) "consumer obtains actual typed admission, not a label")
         (is (= :typed-soac (:algorithm-dialect operation)))
         (is (= :float retained-dtype))
-        (is (some #{[:binding 'left]} (:operands consumer)))
+        (is (some #{'left} (:operands consumer)))
         (is (= :float (get abi 'left)))
         (is (= :double (get abi 'out)))
         (doseq [expression [source (:source packet)]]

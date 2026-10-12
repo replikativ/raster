@@ -109,9 +109,9 @@
         right (program/equation-for-binding packet 'right
                                            (get (into {} (map vec (partition 2 (second (:source packet))))) 'right))]
     (is (= 2 (get-in result [:stats :typed-soac-reused])))
-    (is (= :long (get-in packet [:values [:binding 'left] :dtype])))
+    (is (= :long (get-in packet [:values 'left :dtype])))
     (is (= :long (get-in (dialect/facts (:physical-algorithm right)) [:values 'left :dtype])))
-    (is (some #{[:binding 'left]} (:operands right)))
+    (is (some #{'left} (:operands right)))
     (let [original (eval (list 'fn ['n] source))
           transformed (eval (list 'fn ['n] (:source packet)))]
       (doseq [n [0 1 5]]
@@ -134,7 +134,7 @@
             transformed (eval (list 'fn ['a 'n] (:source packet)))]
         (is (= [:block-local :cross-block] (mapv :phase operations)))
         (is (= [:long :long] (mapv :dtype operations)))
-        (is (= :long (get-in packet [:values [:binding 'result] :dtype])))
+        (is (= :long (get-in packet [:values 'result :dtype])))
         (is (= 'clojure.core/unchecked-add (:combine terminal-plan)))
         (is (= 'clojure.core/unchecked-add
                (first (:lambda (segop/scalar-reduce-op terminal)))))

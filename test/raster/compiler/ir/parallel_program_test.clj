@@ -55,11 +55,11 @@
     (is (= :segop (:dialect p)))
     (is (= [:binding 'total] (:site equation)))
     (is (= ['n 'values] (:inputs p)))
-    (is (= [[:binding 'total]] (:outputs p)))
+    (is (= ['total] (:outputs p)))
     (is (= [reduce-source] (mapv :source (:equations p))))
     (is (every? av/abstract-value? (vals (:values p))))
     (is (= ['n] (:shape (get (:values p) 'values))))
-    (is (= [] (:shape (get (:values p) [:binding 'total]))))
+    (is (= [] (:shape (get (:values p) 'total))))
     (is (= {'n :int 'values :double}
            (program/declared-value-types (assoc-in p [:values 'n :dtype] :int)
                                          ['n 'values])))
