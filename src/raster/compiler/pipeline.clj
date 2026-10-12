@@ -1577,6 +1577,20 @@
      raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
      raster.compiler.pipeline/invoke-scheduled-executable!})
 
+(defn- eliminate-dead-resident-bindings
+  "Conservatively retain emitted submissions without reanalyzing driver implementations.
+   This is a DCE retention boundary, not an admission rule: extraction still validates marker
+   arity, artifacts and ABI. Argument dependencies and all other effect analysis remain in DCE."
+  [form]
+  (if (and (seq? form) (#{'let* 'let} (first form)))
+    (let [roots (into #{} (keep (fn [[sym expr]]
+                                (when (and (seq? expr)
+                                           (contains? gpu-invoke-heads (first expr)))
+                                  sym)))
+                      (partition 2 (second form)))]
+      (dce/eliminate-dead-bindings form :root-pred roots))
+    {:form form :stats {:bindings-removed 0}}))
+
 (def ^:private gpu-array-alloc-heads
   '#{double-array float-array int-array long-array byte-array
      clojure.core/double-array clojure.core/float-array
@@ -2133,19 +2147,10 @@
                             (:stages emission-diagnostic))
              :stats (merge (:stats pre-diagnostic) (:stats semantic-diagnostic)
                            (:stats emission-diagnostic))}))
-        ;; Final DCE before resident extraction. The pre-SOA :dce runs right after AD
-        ;; lowering, while the value+grad result vector [loss dx ... dA dB] still makes
-        ;; every parameter gradient look live. By here the vector is gone and only the
-        ;; gradients the caller actually consumed (dA, dB via SGD) reach the result —
-        ;; so an UNUSED input/other-arg gradient (e.g. the input gradient dx in a single
-        ;; training step: qlinear-q8-dx + the x-path GEMMs + their grad-acc) is now
-        ;; provably dead. eliminate-dead-bindings drops the pure grad-acc and cascades
-        ;; through the dead GEMM/kernel stores (their outputs are read only by the dead
-        ;; grad-acc), leaving a lean straight-line program. Without this, that dead
-        ;; grad-acc (a non-kernel array op) defeats resident extraction.
-        form (if (and (seq? form) (#{'let* 'let} (first form)))
-               (:form (dce/eliminate-dead-bindings form))
-               form)
+        ;; Final host cleanup after emission retains submissions as conservative roots. Dead
+        ;; numerical operations belong to semantic DCE, where mutation/effect evidence exists;
+        ;; inspecting driver bodies here is neither a sound local-write proof nor bounded work.
+        form (:form (eliminate-dead-resident-bindings form))
         _ (when (System/getProperty "raster.debug.preextract")
             (binding [*out* *err*]
               (println "=== PRE-EXTRACT ===") (println (pr-str form)) (println "=== END-PRE-EXTRACT ===")))
