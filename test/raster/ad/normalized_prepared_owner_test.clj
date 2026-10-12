@@ -6,6 +6,7 @@
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inference]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.core :as core]
             [raster.numeric :as n]))
 
 (def ^:dynamic receiver nil)
@@ -19,6 +20,9 @@
 (defn- arguments [prepared]
   (mapv {'n (long 2) 'x (double-array [2.0 -3.0])} (:inputs prepared)))
 (defn- selected []
+  ;; Select a stable implementation, not a first-call stub that this fixture's
+  ;; own preparation subsequently replaces. No numerical invocation is needed.
+  (core/ensure-bytecode-implementation! #'n/_star__m_double_double-impl)
   (:typed-impl (dispatch/selected-call-signature
                'raster.numeric/* '[double double]
                (inference/registered-call-selection 'raster.numeric/* '[double double]))))
