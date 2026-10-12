@@ -32,6 +32,11 @@
     (fail! :ad-map-runtime-scalar {:role role :dtype dt :actual-class (some-> value class .getName)}))
   value)
 
+(defn- differential-value! [value abstract-value extent role]
+  (if (= [] (:shape abstract-value))
+    (scalar! value (:dtype abstract-value) role)
+    (array! value (:dtype abstract-value) extent role)))
+
 (defn prepare
   "Compile existing primal/linear/transpose host projections once.
 
@@ -39,11 +44,13 @@
   an ordered argument vector and returns [output pullback]; pullback takes an
   explicit dy array (map) or exactly typed scalar seed (sum), and returns positional cotangents
   (nil for excluded arrays and scalar inputs).
-  (:jvp prepared) takes the argument vector and an explicit dx array and returns
+  (:jvp prepared) takes the argument vector and an explicit tangent in the active value's
+  retained space (array, or scalar capture for an ordered map sum) and returns
   [output tangent], both scalar for a sum. No data or index array may be mutated concurrently
   with primal execution.
   Pullbacks privately own fresh coefficient snapshots, including required excluded-array
-  elements, not any mutable source array. Exactly one source array is active.
+  elements, not any mutable source array. Exactly one source value is active; scalar-capture
+  cotangents use the source's ordered sum rather than a new reduction policy.
   Indexed maps privately snapshot Int/Long indices after checking every bound in its original
   width. Their explicit data tangent has data capacity, their seed has output extent, and each
   pullback owns a new typed-zero data gradient. No source data, indices or returned output is saved.
@@ -175,6 +182,8 @@
                                   (case dt :float (float-array capacity) :double (double-array capacity)))
                            seeded)
                   gradient (first (run pull seeded))]
+              (differential-value! gradient (get-in interface [:cotangent-result :value])
+                                   (if indexed? capacity extent) :gradient)
               (when indexed?
                 (array! gradient dt capacity :gradient)
                 (when-not (identical? gradient (get seeded (:value required-zero-gradient)))
@@ -184,6 +193,7 @@
      :jvp
      (fn [arguments dx]
        (let [{:keys [environment extent capacity]} (context arguments)]
-         (array! dx dt (if indexed? capacity extent) :tangent)
+         (differential-value! dx (get-in interface [:tangent-input :value])
+                              (if indexed? capacity extent) :tangent)
          (let [[output saved] (acquire environment)]
            [output (first (run push (assoc saved (get-in interface [:tangent-input :id]) dx)))])))}))

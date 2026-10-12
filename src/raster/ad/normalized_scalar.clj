@@ -704,14 +704,21 @@
                             (empty? (:effects extent-value)) (empty? (:attributes extent-value))))
                    (instance? clojure.lang.Namespace source-ns))
       (fail! :ad-normalized-map-boundary {:equation equation}))
-    (when-not (and (map? options) (set/subset? (set (keys options)) #{:active-array}))
+    (when-not (and (map? options) (set/subset? (set (keys options)) #{:active-array :active-input})
+                   (not (and (contains? options :active-array) (contains? options :active-input))))
       (fail! :ad-normalized-map-active-array {:options options :arrays arrays}))
-    (let [active-array (if (contains? options :active-array) (:active-array options)
-                         (when (= 1 (count arrays)) (first arrays)))
-          _ (when-not (some #(fingerprint/equivalent? active-array %) arrays)
-              (fail! :ad-normalized-map-active-array {:active-array active-array :arrays arrays}))
+    (let [requested (cond (contains? options :active-input) (:active-input options)
+                          (contains? options :active-array) (:active-array options)
+                          (= 1 (count arrays)) (first arrays))
+          ;; Options select a value ID, not a replacement typed expression. Preserve
+          ;; the actual source member and its metadata as the contract authority.
+          active-input (some #(when (= requested %) %)
+                             (if (contains? options :active-array) arrays (concat arrays captures)))
+          _ (when-not active-input
+              (fail! :ad-normalized-map-active-array {:active-input requested :arrays arrays :captures captures}))
           layout (soac/parameter-layout equation)
-          active-element (get (zipmap arrays (:elements layout)) active-array)
+          active-element (get (zipmap (concat arrays captures)
+                                     (concat (:elements layout) (:capture-parameters layout))) active-input)
           array-value (get values (first arrays))
           result-value (get values (first results))
           dt (:dtype array-value)
@@ -794,8 +801,10 @@
   "Linearize the typed scalar region of one pure, homogeneous functional map.
 
    Returns the existing scalar bundle, not array execution. One of at most two arrays
-   is active; the other array and scalar captures are excluded. Two arrays require
-   {:active-array source-value-id}. Retained dtypes are not storage-default guesses."
+   or one scalar capture is active; other inputs are excluded. :active-input selects its
+   outer source ID; :active-array is an array-only alias. This returns a scalar lane,
+   not a map gradient: scalar-active map programs require an enclosing ordered sum.
+   Retained dtypes are not storage-default guesses."
   ([map-program source-ns] (linearize-map-element map-program source-ns {}))
   ([map-program source-ns options]
    (let [{:keys [primal interface]} (project-map-element map-program source-ns nil options)]
@@ -839,10 +848,20 @@
     (fail! :ad-normalized-map-storage {:output value}))
   (assoc value :ownership :owned))
 
+(defn- derivative-map-operands [values pairs program]
+  ;; The scalar program retains its parameter identities; only their placement
+  ;; changes. SOAC's array-first/capture-second layout follows the existing AVs.
+  (let [scalar? (fn [[_ outer]] (= [] (:shape (get values outer))))
+        captures (filterv scalar? pairs)
+        arrays (filterv (complement scalar?) pairs)
+        ordered (into arrays captures)]
+    {:arrays (mapv second arrays) :captures (mapv second captures)
+     :lambda (scalar-program-lambda program (mapv first ordered) (soac/outputs program))}))
+
 (defn- lift-map-programs [bundle source interface]
   (let [equation (first (soac/equations source))
         {:keys [attributes arrays captures]} (soac/operation-parts equation)
-        {:keys [residual-arrays scalar-captures tangent-input cotangent-input
+        {:keys [active-input residual-arrays scalar-captures tangent-input cotangent-input
                 tangent-output gradient-output]} interface
         outputs (soac/outputs source)
         input-values (mapv #(get-in (soac/facts source) [:values %]) arrays)
@@ -860,51 +879,59 @@
         values (merge (:values (soac/facts source))
                       (zipmap (concat outputs residual-outputs [tangent-output gradient-output])
                               (repeat tensor))
-                      {tangent-input (assoc tensor :ownership :borrowed)
+                      {tangent-input (let [active (get-in (soac/facts source) [:values active-input])]
+                                       (if (= [] (:shape active)) active (assoc tensor :ownership :borrowed)))
                        cotangent-input (assoc tensor :ownership :borrowed)})
         make-map
         (fn [id arrays captures lambda outputs]
           (generated-map-program values id attributes arrays captures lambda outputs []))
         primal-results (into outputs residual-outputs)
         primal-yields (into (soac/outputs (:primal bundle)) coefficients)
-        derivative-captures (mapv scalar-captures scalar-coefficients)
-        derivative-parameters (fn [seed] (into [seed] (concat coefficients scalar-coefficients)))]
+        derivative-pairs (fn [seed outer]
+                           (into [[seed outer]]
+                                 (concat (map vector coefficients residual-outputs)
+                                         (map (fn [id] [id (get scalar-captures id)]) scalar-coefficients))))
+        push (derivative-map-operands values
+                                      (derivative-pairs (first (:tangent-inputs bundle)) tangent-input)
+                                      (:linear bundle))
+        pull (derivative-map-operands values (derivative-pairs (:cotangent-seed bundle) cotangent-input)
+                                      (:transpose bundle))]
     {:source source :interface interface
      :primal (make-map 'ad-map-primal arrays captures
                        (scalar-program-lambda (:primal bundle) (:params bundle) primal-yields)
                        primal-results)
-     :linear (make-map 'ad-map-linear (into [tangent-input] residual-outputs) derivative-captures
-                       (scalar-program-lambda (:linear bundle)
-                                              (derivative-parameters (first (:tangent-inputs bundle)))
-                                              (soac/outputs (:linear bundle)))
+     :linear (make-map 'ad-map-linear (:arrays push) (:captures push) (:lambda push)
                        [tangent-output])
-     :transpose (make-map 'ad-map-transpose (into [cotangent-input] residual-outputs)
-                          derivative-captures
-                          (scalar-program-lambda (:transpose bundle)
-                                                 (derivative-parameters (:cotangent-seed bundle))
-                                                 (soac/outputs (:transpose bundle)))
+     :transpose (make-map 'ad-map-transpose (:arrays pull) (:captures pull) (:lambda pull)
                           [gradient-output])}))
 
 (defn- validate-map-programs! [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} map-programs
         {:keys [primal] :as projected}
         (project-map-element source source-ns (first (soac/outputs (:primal bundle)))
-                             {:active-array (:active-array interface)})
+                             {:active-input (:active-input interface)})
         scalar-interface (:interface projected)
         interface (:interface map-programs)
+        source-parts (soac/operation-parts (first (soac/equations source)))
+        source-active (some #(when (= (:active-input interface) %) %)
+                            (concat (:arrays source-parts) (:captures source-parts)))
         {:keys [scalars arrays]} (map-residual-roles bundle source)
         ids (concat (vals (:residual-arrays interface))
                     (map interface [:tangent-input :cotangent-input :tangent-output :gradient-output]))]
     (when-not (and (fingerprint/equivalent? primal (:primal bundle))
+                   (fingerprint/equivalent? source-active (:active-input interface))
                    (fingerprint/equivalent? (select-keys bundle [:params :tags :active-inputs])
                                             (select-keys scalar-interface [:params :tags :active-inputs]))
-                   (= #{:active-array :residual-arrays :scalar-captures :tangent-input :cotangent-input
+                   (= #{:active-input :residual-arrays :scalar-captures :tangent-input :cotangent-input
                         :tangent-output :gradient-output} (set (keys interface)))
                    (fingerprint/equivalent? (set arrays) (set (keys (:residual-arrays interface))))
                    (fingerprint/equivalent? scalars (:scalar-captures interface))
                    (every? symbol? ids) (= (count ids) (count (distinct ids)))
                    (empty? (set/intersection (set ids) (set (keys (:values (soac/facts source)))))))
       (fail! :ad-normalized-map-interface {:interface interface :projected projected}))
+    (when (and (= [] (get-in (soac/facts source) [:values (:active-input interface) :shape]))
+               (not (:sum-programs bundle)))
+      (fail! :ad-normalized-map-scalar-requires-sum {:active-input (:active-input interface)}))
     (doseq [program (map map-programs [:primal :linear :transpose])] (soac/validate! program))
     ;; Fixed interface IDs make reconstruction deterministic. Exact semantic equality includes
     ;; expression metadata and float bits; no fresh AD generation or printed-string comparison.
@@ -912,25 +939,30 @@
       (fail! :ad-normalized-map-programs {:interface interface})))
   bundle)
 
-(defn linearize-map-program
-  "Lift one checked map's scalar bundle into ordinary primal/linear/transpose SOAC maps.
-   Primal exports fresh owned coefficient arrays; derivatives consume explicit dx/dy arrays.
-   Two-array maps require {:active-array source-value-id}; other inputs are excluded.
-   This builds programs only. Allocation, execution and asynchronous lifetimes are downstream."
-  ([source source-ns] (linearize-map-program source source-ns {}))
-  ([source source-ns options]
+(defn- build-map-programs
+  [source source-ns options]
    (let [bundle (linearize-map-element source source-ns options)
          equation (first (soac/equations source))
-         active-array (get (zipmap (:elements (soac/parameter-layout equation))
-                                  (:arrays (soac/operation-parts equation)))
+         layout (soac/parameter-layout equation)
+         parts (soac/operation-parts equation)
+         active-input (get (zipmap (concat (:elements layout) (:capture-parameters layout))
+                                  (concat (:arrays parts) (:captures parts)))
                            (first (:active-inputs bundle)))
          {:keys [scalars arrays]} (map-residual-roles bundle source)
-         interface {:active-array active-array
+         interface {:active-input active-input
                     :residual-arrays (into {} (map (fn [id] [id (gensym "ad_residual_")])) arrays)
                     :scalar-captures scalars
                     :tangent-input (gensym "ad_tangent_") :cotangent-input (gensym "ad_cotangent_")
                     :tangent-output (gensym "ad_push_") :gradient-output (gensym "ad_pull_")}
          bundle (assoc bundle :map-programs (lift-map-programs bundle source interface))]
+     bundle))
+
+(defn linearize-map-program
+  "Lift a checked homogeneous map with one active array. :active-input selects its outer ID;
+   :active-array is a compatibility option. Scalar capture activity needs an enclosing sum."
+  ([source source-ns] (linearize-map-program source source-ns {}))
+  ([source source-ns options]
+   (let [bundle (build-map-programs source source-ns options)]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 
 (defn- project-indexed-element
@@ -1247,7 +1279,7 @@
         map-interface (:interface map-programs)
         map-result (first (soac/outputs (:source map-programs)))
         result (first (soac/outputs source))
-        {:keys [seed tangent-result]} interface
+        {:keys [seed tangent-result gradient-result]} interface
         tangent-source (soac/remap-values source
                                          {map-result (:tangent-output map-interface)
                                           result tangent-result})
@@ -1269,17 +1301,34 @@
                             (update :values dissoc (:cotangent-input map-interface))
                             (assoc-in [:values seed] (get-in (soac/facts source) [:values result]))
                             (update :inputs #(conj (vec (remove #{(:cotangent-input map-interface)} %)) seed)))]
-    {:source source :interface interface
-     :primal (append-ordered-sum (:primal map-programs) reduction source result)
-     :linear (append-ordered-sum (:linear map-programs) tangent-reduction tangent-source tangent-result)
-     :transpose (soac/make transpose-facts [transpose-equation] (soac/outputs transpose))}))
+    (let [transpose (soac/make transpose-facts [transpose-equation] (soac/outputs transpose))
+          scalar-active? (= [] (get-in (soac/facts source) [:values (:active-input map-interface) :shape]))
+          gradient-source (when scalar-active?
+                            (soac/remap-values source {map-result (:gradient-output map-interface)
+                                                      result gradient-result}))]
+      {:source source :interface interface
+       :primal (append-ordered-sum (:primal map-programs) reduction source result)
+       :linear (append-ordered-sum (:linear map-programs) tangent-reduction tangent-source tangent-result)
+       :transpose (if scalar-active?
+                    (append-ordered-sum transpose (second (soac/equations gradient-source))
+                                        gradient-source gradient-result)
+                    transpose)})))
 
 (defn- validate-sum-programs! [{:keys [sum-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} sum-programs
         projected (sum-source-map source source-ns)
-        ids (map interface [:seed :tangent-result])]
+        ids (map interface [:seed :tangent-result])
+        map-value-ids (set (mapcat #(keys (:values (soac/facts %)))
+                                  (vals (select-keys (:map-programs bundle) [:primal :linear :transpose]))))
+        scalar-active? (= [] (get-in (soac/facts source)
+                                    [:values (get-in bundle [:map-programs :interface :active-input]) :shape]))]
     (when-not (and (fingerprint/equivalent? projected (get-in bundle [:map-programs :source]))
-                   (= #{:seed :tangent-result} (set (keys interface)))
+                   (= #{:seed :tangent-result :gradient-result} (set (keys interface)))
+                   (if scalar-active?
+                     (and (symbol? (:gradient-result interface))
+                          (not (contains? (into map-value-ids (concat ids (keys (:values (soac/facts source)))))
+                                          (:gradient-result interface))))
+                     (= (:gradient-result interface) (get-in bundle [:map-programs :interface :gradient-output])))
                    (every? symbol? ids) (= (count ids) (count (distinct ids)))
                    (empty? (set/intersection (set ids)
                                             (set (concat (keys (:values (soac/facts source)))
@@ -1300,8 +1349,12 @@
   ([source source-ns] (linearize-map-sum-program source source-ns {}))
   ([source source-ns options]
    (let [map-source (sum-source-map source source-ns)
-         bundle (linearize-map-program map-source source-ns options)
-         interface {:seed (gensym "ad_sum_seed_") :tangent-result (gensym "ad_sum_tangent_")}
+         bundle (build-map-programs map-source source-ns options)
+         map-interface (get-in bundle [:map-programs :interface])
+         scalar-active? (= [] (get-in (soac/facts map-source) [:values (:active-input map-interface) :shape]))
+         interface {:seed (gensym "ad_sum_seed_") :tangent-result (gensym "ad_sum_tangent_")
+                    :gradient-result (if scalar-active? (gensym "ad_sum_gradient_")
+                                         (:gradient-output map-interface))}
          bundle (assoc bundle :sum-programs (lift-sum-programs bundle source interface))]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 

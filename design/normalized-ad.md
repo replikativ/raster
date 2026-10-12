@@ -142,11 +142,38 @@ primal equality, independent density/probability-domain answers, analytic gradie
 differences, JVP/VJP pairing, unchanged input arrays and saved pullbacks after caller mutation.
 These are existing-program composition witnesses, not a nonlinear-loss importer or new rules.
 
-The witness does not differentiate a scalar Gaussian location/scale parameter, a vector-latent
-regression program or distribution records. Active scalar captures need a separately checked
-broadcast tangent and ordered reduction of lane cotangents. Binary logistic likelihood is not
+The prediction-array witness does not differentiate a scalar Gaussian parameter, a vector-latent
+regression program or distribution records. Binary logistic likelihood is not
 categorical SFT: grouped log-sum-exp, target gathers and the unchanged real model gate remain
 open. No family validator or construction evidence retires on the strength of this witness.
+
+## One active scalar capture in an ordered map sum
+
+`linearize-map-sum-program` accepts `{:active-input source-value-id}` to select one homogeneous
+Float/Double array or scalar capture. Existing `:active-array` remains an array-only option;
+the options cannot be combined. Selection names an existing source value, retaining that
+member's actual metadata and AV rather than trusting metadata supplied on an option symbol.
+The internal canonical interface now uses `:active-input`, not `:active-array`.
+
+Derivative operand placement is projected from retained AV shapes through one shared layout:
+arrays become pointwise element parameters and scalars become capture parameters. An active
+scalar therefore supplies one scalar tangent without a materialized broadcast array. Its
+transpose map produces per-lane contributions, then appends the exact original certified
+ordered reduction to obtain one scalar cotangent. Its identity, addition, Float checkpoints,
+iteration order and numerical attributes stay unchanged. The sum interface identifies the
+final `:gradient-result` explicitly for both array and scalar activity.
+
+Per-lane contributions are never certified as a standalone scalar gradient: the shared private
+builder attaches sum evidence before full validation, and standalone scalar-active map program
+construction refuses. The existing map-sum family, canonical envelope, host materializer and
+hot revision/dependency fence remain the authorities. No new family selector, activity pass,
+derivative registry, scalar gradient cache or reassociation permission is introduced.
+
+Gaussian location witnesses cover Float/Double scalar tangent and cotangent carriers, independent
+density/analytic/finite-difference checks, zero extent, transpose pairing, exact source reduction
+correspondence and mutation before first pullback. Observation arrays and scale remain excluded.
+Multiple active values, integral/extent captures, nonzero initializers, device execution,
+default-engine migration and general equation composition remain outside this checkpoint.
 
 ## Indexed-map construction checkpoint
 

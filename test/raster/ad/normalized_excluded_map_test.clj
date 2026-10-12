@@ -50,7 +50,7 @@
           [jvp-output tangent] ((:jvp prepared) arguments dx)
           coefficients (mapv (fn [x w] (if (= active 'xs) (* 2.0 x w) (* x x))) xs0 ws0)]
       (is (identical? program (get-in bundle [:map-programs :source])))
-      (is (= active (get-in bundle [:map-programs :interface :active-array])))
+      (is (= active (get-in bundle [:map-programs :interface :active-input])))
       (is (= (vec (v xs weights size)) (vec output) (vec jvp-output)))
       (is (= xs0 (vec xs)))
       (is (= ws0 (vec weights)))
@@ -126,7 +126,7 @@
       (is (= :ad-normalized-map-active-array
              (reason #(normalized/linearize-map-program program source-ns options)))))
     (let [bundle (build program 'xs)
-          changed (assoc-in bundle [:map-programs :interface :active-array] 'weights)
+          changed (assoc-in bundle [:map-programs :interface :active-input] 'weights)
           changed (assoc changed :certificate (#'normalized/certificate changed))]
       (is (= :ad-normalized-map-interface (reason #(normalized/validate! changed)))))
     (let [one (#'element/map-program :double)]
@@ -173,7 +173,7 @@
         current (revisions)
         invoke (ns-resolve 'raster.ad.normalized-map-runtime 'invoke)
         executions (atom 0)
-        forged (assoc-in bundle [:map-programs :interface :active-array] 'weights)
+        forged (assoc-in bundle [:map-programs :interface :active-input] 'weights)
         forged (assoc forged :certificate (#'normalized/certificate forged))]
     (with-redefs-fn {invoke (fn [& _] (swap! executions inc))}
       (fn []

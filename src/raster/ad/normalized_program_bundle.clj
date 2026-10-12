@@ -38,14 +38,15 @@
         programs (cond indexed? (:gather-programs bundle)
                        sum? (:sum-programs bundle) :else (:map-programs bundle))
         {:keys [source primal linear transpose required-zero-gradient]} programs
-        {:keys [active-array tangent-input tangent-output cotangent-input gradient-output
+        {:keys [active-input tangent-input tangent-output cotangent-input gradient-output
                 residual-arrays scalar-captures]} (get-in bundle [:map-programs :interface])
         indexed-interface (:interface programs)
         source-parts (when indexed? (soac/operation-parts (first (soac/equations source))))
         index-input (when indexed? (first (:arrays source-parts)))
-        active-array (if indexed? (first (:captures source-parts)) active-array)
+        active-input (if indexed? (first (:captures source-parts)) active-input)
         tangent-input (if indexed? (:tangent-input indexed-interface) tangent-input)
         gradient-output (if indexed? (:gradient-output indexed-interface) gradient-output)
+        gradient-output (if sum? (get-in programs [:interface :gradient-result]) gradient-output)
         tangent-output (if sum? (get-in bundle [:sum-programs :interface :tangent-result]) tangent-output)
         tangent-output (if indexed? (:tangent-output indexed-interface) tangent-output)
         cotangent-input (if sum? (get-in bundle [:sum-programs :interface :seed]) cotangent-input)
@@ -85,12 +86,12 @@
           {})]
     {:source source :primal primal :linear linear :transpose transpose
      :interface {:inputs (mapv #(value-interface source % %) inputs)
-                 :active-inputs [active-array]
+                 :active-inputs [active-input]
                  :primal-result (value-interface primal result result)
-                 :tangent-input (value-interface linear tangent-input active-array)
+                 :tangent-input (value-interface linear tangent-input active-input)
                  :tangent-result (value-interface linear tangent-output result)
                  :cotangent-input (value-interface transpose cotangent-input result)
-                 :cotangent-result (value-interface transpose gradient-output active-array)}
+                 :cotangent-result (value-interface transpose gradient-output active-input)}
      :residual-bindings residual-bindings :physical-bindings physical-bindings
      :derivation {:kind kind :bundle bundle}
      :source-ns (:source-ns bundle)}))

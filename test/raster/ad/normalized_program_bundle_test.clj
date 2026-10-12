@@ -134,7 +134,7 @@
         residual-id (first (vals (get-in b [:derivation :bundle :map-programs :interface :residual-arrays])))]
     (is (= :ad-normalized-map-active-array
            (reason #(canonical/validate!
-                     (recertify-evidence (assoc-in b [:derivation :bundle :map-programs :interface :active-array] 'other))))))
+                     (recertify-evidence (assoc-in b [:derivation :bundle :map-programs :interface :active-input] 'other))))))
     (is (= :ad-normalized-map-programs
            (reason #(canonical/validate!
                      (recertify-evidence
