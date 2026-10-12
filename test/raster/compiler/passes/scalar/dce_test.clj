@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.scalar.dce-test
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.compiler.passes.scalar.dce :as dce]))
+            [raster.compiler.passes.scalar.dce :as dce]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 ;; ================================================================
 ;; Dead binding removal
@@ -28,17 +29,17 @@
 
 (deftest mutation-facts-remain-fresh-after-effect-analysis
   (let [store '(late-effect buf)
-        predicate-var #'dce/keep-unconditionally?
+        descriptor-var #'effects/descriptor
         mutation-var #'dce/extract-mutation-targets
-        original-predicate @predicate-var original-mutation @mutation-var
+        original-descriptor @descriptor-var original-mutation @mutation-var
         initialized? (atom false) queries (atom [])
         form (list 'let* ['effect store 'result 0] 'result)
         result (with-redefs-fn
-                 {predicate-var
+                 {descriptor-var
                   (fn [expr]
                     (if (identical? expr store)
-                      (do (reset! initialized? true) true)
-                      (original-predicate expr)))
+                      (do (reset! initialized? true) {:effect :local :flags #{}})
+                      (original-descriptor expr)))
                   mutation-var
                   (fn [expr]
                     (if (identical? expr store)
@@ -117,6 +118,56 @@
     (is (= 0 (:bindings-removed stats)))
     (is (= '[checked (clojure.core/int x) result 0] (second lowered))
         "DCE must retain the possible exceptional control transfer")))
+
+(deftest checked-conversion-survives-dead-local-writes-and-allocation
+  (doseq [source
+          ['(let* [dead (clojure.core/double-array 1)
+                   effect (do (clojure.core/int x) (clojure.core/aset dead 0 1.0)) result 0] result)
+           '(let* [dead (clojure.core/double-array (clojure.core/int x)) result 0] result)]]
+    (let [lowered (:form (dce/eliminate-dead-bindings source))
+          run (fn [body x]
+                (eval (list 'let ['x x] body)))]
+      (is (= 0 (run source 1)))
+      (is (= 0 (run lowered 1)))
+      (is (thrown? ArithmeticException (run source 2147483648)))
+      (is (thrown? ArithmeticException (run lowered 2147483648))))))
+
+(deftest nonlocal-effects-survive-dead-local-writes-and-pure-callee-arguments
+  (doseq [source
+          ['(let* [dead (clojure.core/double-array 1)
+                   effect (do (clojure.core/println "opaque")
+                              (clojure.core/aset dead 0 1.0)) result 0] result)
+           '(let* [dead (clojure.core/double-array 1)
+                   effect (if positive?
+                            (do (clojure.core/println "branch") (clojure.core/aset dead 0 1.0))
+                            nil) result 0] result)
+           '(let* [dead (clojure.core/double-array 1)
+                   effect (loop [i 0]
+                            (if (< i 2)
+                              (do (clojure.core/println i) (clojure.core/aset dead 0 1.0)
+                                  (recur (inc i))) nil)) result 0] result)
+           '(let* [dead (clojure.core/double-array (do (clojure.core/println "argument") 1))
+                   result 0] result)]]
+    (let [lowered (:form (dce/eliminate-dead-bindings source))
+          run (fn [body positive?]
+                (let [writer (java.io.StringWriter.)
+                      value (binding [*out* writer]
+                              (eval (list 'let ['positive? positive?] body)))]
+                  {:value value :output (str writer)}))]
+      (doseq [condition [true false]]
+        (is (= (run source condition) (run lowered condition)))))))
+
+(deftest invk-pure-callee-transport-does-not-hide-argument-effects
+  ;; A compiler call marker, not an executable fake method: this is a denial control for
+  ;; retained original-op transport through the shared semantic-call/argument authority.
+  (let [call (with-meta
+               '(.invk zeros-like-implementation input (do (clojure.core/println "argument") 1))
+               {:raster.op/original 'raster.arrays/zeros-like})
+        source (list 'let* ['dead call 'result 0] 'result)
+        lowered (:form (dce/eliminate-dead-bindings source))]
+    (is (= :io (:effect (effects/descriptor call))))
+    (is (= source lowered))
+    (is (= (meta call) (meta (second (second lowered)))))))
 
 (deftest arraycopy-loop-mutation-preservation-test
   (let [emt @#'dce/extract-mutation-targets]
@@ -210,7 +261,7 @@
       (is (contains? (emt '(some.ns/unknown-mutator! a b c)) 'a))
       (is (contains? (emt '(some.ns/unknown-mutator! a b c)) 'b)))))
 
-(deftest dead-gemm-into-unread-buffer-is-eliminated-test
+(deftest unknown-gemm-effects-are-not-authorized-by-dead-output
   ;; End-to-end on the flat IR the AD transform produces for a frozen-weight dW:
   ;;   dW_buf = (alloc)              ; fresh
   ;;   _      = (dgemm-tn! dy x dW_buf …)
@@ -223,10 +274,23 @@
                     dx_buf)
         {:keys [form stats]} (dce/eliminate-dead-bindings form)
         kept (set (map first (partition 2 (second form))))]
-    (testing "the dW GEMM and its buffer are dead"
-      (is (not (contains? kept 'dW_buf)))
-      (is (not (contains? kept '_2)))
-      (is (= 2 (:bindings-removed stats))))
+    (testing "the foreign GEMM lacks a complete local-only effect proof"
+      (is (= :io (:effect (effects/descriptor
+                           '(raster.linalg.blas/dgemm-tn! dy x dW_buf 2 2 2 1.0 0.0)))))
+      (is (contains? kept 'dW_buf))
+      (is (contains? kept '_2))
+      (is (= 0 (:bindings-removed stats))))
     (testing "the dx GEMM (whose buffer IS read) survives"
       (is (contains? kept 'dx_buf))
       (is (contains? kept '_1)))))
+
+(deftest verified-local-write-into-unread-buffer-is-eliminated
+  (let [write '(clojure.core/aset dead 0 (+ (clojure.core/aget dy 0) (clojure.core/aget x 0)))
+        source (list 'let* ['live '(clojure.core/double-array 1)
+                           'write-live '(clojure.core/aset live 0 (clojure.core/aget dy 0))
+                           'dead '(clojure.core/double-array 1) 'write-dead write] 'live)
+        {lowered :form stats :stats} (dce/eliminate-dead-bindings source)
+        kept (set (take-nth 2 (second lowered)))]
+    (is (= {:effect :local :flags #{}} (effects/descriptor write)))
+    (is (= '#{live write-live} kept))
+    (is (= 2 (:bindings-removed stats)))))

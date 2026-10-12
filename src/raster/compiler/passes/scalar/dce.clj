@@ -177,15 +177,26 @@
 
 (defn- keep-unconditionally?
   "True if expr must be kept even if its result is unused.
-   Uses beichte: anything not proven pure is kept.
-   Locally-pure forms (allocations, .invk calls, par/reduce) are excluded —
-   they only need to survive if their result is referenced or they mutate
-   a live buffer."
+   Checked flags and nonlocal/unknown effects survive even with dead local writes.
+   Existing locally-pure conventions do not authorize discarding checked conversions.
+   Unflagged local mutation with identified targets is handled by backward liveness."
   [expr]
-  (and (not (locally-pure-form? expr))
-       (let [{:keys [effect flags]} (effects/descriptor expr)]
-         (or (not= :pure effect)
-             (seq flags)))))
+  (let [{:keys [effect flags]} (effects/descriptor expr)]
+    (or (seq flags)
+        (and (not (and (locally-pure-form? expr)
+                       ;; Callee purity does not erase evaluation of its arguments.
+                       ;; Use the same call/descriptor authorities, including .invk transport.
+                       (every? (fn [argument]
+                                 (let [{argument-effect :effect argument-flags :flags}
+                                       (effects/descriptor argument)]
+                                   (and (empty? argument-flags)
+                                        (= :pure argument-effect))))
+                               (descriptor/call-args expr))))
+             (or (not (contains? #{:pure :local} effect))
+                 (and (= :local effect)
+                      ;; Effect analysis may initialize operation descriptors. Requery targets
+                      ;; afterward rather than reuse the earlier mutation inventory.
+                      (empty? (extract-mutation-targets expr))))))))
 
 (defn- escaping-array-alias-init?
   "True if `init` binds a local to an ALIAS of escaping/caller-owned array memory:
@@ -264,10 +275,9 @@
                       ;; its optimizer update are both silently DCE'd.
                       (and (contains? all-mut-targets sym)
                            (escaping-array-alias-init? expr bound-syms))
-                      ;; Only seed opaque effects (no identifiable mutation targets).
-                      ;; Mutation effects are handled by mutates-live? in the backward pass.
-                      (and (keep-unconditionally? expr)
-                           (empty? (extract-mutation-targets expr))))
+                      ;; A local mutation set is not an exhaustive effect summary: I/O,
+                      ;; global mutation and checked conversions remain observable too.
+                      (keep-unconditionally? expr))
               (swap! live conj sym)))
         live-indices (atom #{})]
     (doseq [i (range (dec n) -1 -1)]

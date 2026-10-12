@@ -134,6 +134,23 @@ the lowered form returns zero. Existing effect evidence retains `:checked-source
 Repair this through that authority before claiming resident training acceptance; the cost increment
 does not fix it or justify weaker exception/effect semantics.
 
+### Observable effects are independent of local mutation targets
+
+DCE's unconditional-root predicate now consults the existing effect descriptor before applying
+purity conventions. Checked flags survive even in allocating expressions. Known-pure callees may
+still evaluate effectful arguments, so the shortcut requires independently pure, unflagged shared
+call arguments (including retained `.invk` transport). Nonlocal or unknown effects remain roots
+regardless of a dead local write; unflagged local mutations remain governed by target liveness.
+Mutation queries still follow descriptor analysis, preserving initialization-sensitive behavior.
+
+This repairs observable behavior, not a new numerical policy: checked cast-plus-dead-store and
+checked allocation arguments retain ArithmeticException; I/O survives plain, conditional and loop
+regions and allocation arguments. Caller-owned aliases and verified local dead writes keep their
+existing handling. Foreign GEMM calls whose current summary is `:io` now remain conservatively
+live; this can retain previously eliminated work until a shared local-only effect contract exists.
+No name-based exemption or numerical acceptance waiver is introduced. General exception/parallel
+effect completeness and retirement of existing locally-pure conventions remain separate gates.
+
 ### Independent distributed math intent reconciliation
 
 Distributed planning, readiness (including retained-output readiness), resident root/scratch
