@@ -6,10 +6,10 @@
             [raster.gpu.device-probe :as opencl-probe]
             [raster.dl.gpu-grad-parity :as level-zero]))
 
-(defn- check-scalar! [target]
+(defn- check-scalar! [target source]
   (let [runtime (case target :ocl:0 'raster.gpu.ocl-runtime :ze:0 'raster.gpu.ze-runtime)
         register! (requiring-resolve (symbol (str runtime) "register-kernel-dispatch!"))
-        scheduled (:form (lower/segop-lower-pass packet/source
+        scheduled (:form (lower/segop-lower-pass source
                                                 (assoc packet/options :target-device target)))
         emitted (opencl/opencl-pass scheduled :device-id target :dtype :float
                                    :compile-spirv? (= :ze:0 target) :min-elements 0)
@@ -26,10 +26,10 @@
 
 (deftest opencl-host-scalar-consumer-uses-imported-reduction-graph
   (if @opencl-probe/opencl-available?
-    (check-scalar! :ocl:0)
+    (doseq [source [packet/source packet/nested-source]] (check-scalar! :ocl:0 source))
     (opencl-probe/opencl-skip! "imported scalar reduction result identity")))
 
 (deftest level-zero-host-scalar-consumer-uses-imported-reduction-graph
   (if @level-zero/gpu-available?
-    (check-scalar! :ze:0)
+    (doseq [source [packet/source packet/nested-source]] (check-scalar! :ze:0 source))
     (level-zero/gpu-skip! "imported scalar reduction result identity")))

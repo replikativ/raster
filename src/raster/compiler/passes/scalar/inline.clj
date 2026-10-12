@@ -13,6 +13,8 @@
             [raster.compiler.core.numeric-constant :as constant]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.par :as par]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.core :as rcore]
             [raster.compiler.core.dispatch :as dispatch]))
 
@@ -1589,6 +1591,54 @@
       (with-meta (list* (if (= new-bindings (vec bindings-vec)) (first form) 'let*)
                         new-bindings final-body-expr)
         (meta form))))))
+
+(defn- expose-parallel-unary-spine
+  [expression visible-locals]
+  (loop [operand expression wrappers []]
+    (let [{:keys [semantic-op arguments implementation-op dispatch? lexical-callee]}
+          (op/call-description operand)]
+      (cond
+        (and (seq wrappers) (par/par-form? operand))
+        (let [result (with-meta (gensym "parallel_operand_")
+                       (select-keys (meta operand) [:raster.type/tag]))
+              rebuilt (reduce (fn [value wrapper]
+                                (util/remake-from wrapper (concat (butlast wrapper) [value])))
+                              result (rseq wrappers))]
+          (util/remake expression 'let* [result operand] rebuilt))
+
+        (and (= 1 (count arguments))
+             (op/scalar-op? semantic-op)
+             (not lexical-callee)
+             (symbol? implementation-op)
+             (not (contains? visible-locals implementation-op))
+             (not (contains? visible-locals semantic-op))
+             (or (not dispatch?) (namespace implementation-op))
+             (= :pure (effects/analyze-effect
+                       (util/remake-from operand
+                                         (concat (butlast operand) ['raster_scalar_operand__])))))
+        (recur (first arguments) (conj wrappers operand))
+
+        :else expression))))
+
+(defn expose-parallel-unary-spines
+  "Expose a parallel operand beneath a closed pure unary scalar chain exactly once.
+   Only whole binding initializers are visited. Calls retain their executable spelling and
+   metadata; lexical receivers, sibling operands, vectors and execution scopes stay opaque.
+   This is ordered ANF exposure, not algebraic reassociation or a parallel scheduling rule."
+  [expression external-locals]
+  (if-not (form/binding-form? expression)
+    expression
+    (let [[head bindings & body] expression
+          {:keys [pairs]}
+          (reduce (fn [{:keys [locals] :as state} [id initializer]]
+                    (-> state
+                        (update :pairs conj [id (expose-parallel-unary-spine initializer locals)])
+                        (update :locals conj id)))
+                  {:locals (into (set util/*shadowing-locals*) external-locals) :pairs []}
+                  (partition 2 bindings))]
+      (util/remake-from expression
+                        (concat [head (with-meta (vec (mapcat identity pairs)) (meta bindings))]
+                                body)))))
 
 (defn- try-resolve-dispatch
   "Try to resolve a generic deftm call using arg types from env.

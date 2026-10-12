@@ -14,6 +14,11 @@
 
 (def options {:dtype :float :target-device :ocl:0 :array-types {'xs :float}})
 
+(def nested-source
+  (let [leaf (get (into {} (map vec (partition 2 (second source)))) 'sum)]
+    (list 'let* ['prefix '(identity xs)
+                 'norm (list 'Math/sqrt (list 'double leaf))] 'norm)))
+
 (deftest imported-scalar-packet-keeps-one-logical-and-scheduled-result-identity
   (let [result (lower/segop-lower-pass source options)
         scheduled (:form result)
@@ -27,6 +32,19 @@
     (is (= ['sum] (mapv :id (:outputs kernel-graph))))
     (is (= scheduled (program/validate! scheduled)))
     (is (seq (:kernels emitted)))
+    (is (zero? (get-in emitted [:stats :fallback] 0)))))
+
+(deftest unary-scalar-consumer-retains-the-complete-reduction-packet
+  (let [result (lower/segop-lower-pass nested-source options)
+        scheduled (:form result)
+        equation (last (:equations scheduled))
+        emitted (opencl/opencl-pass scheduled :device-id :ocl:0 :dtype :float
+                                   :compile-spirv? false :min-elements 0)]
+    (is (= 1 (get-in result [:stats :typed-soac-reused])))
+    (is (= 1 (get-in result [:stats :typed-scalar-equations])))
+    (is (= [:binding 'norm] (get-in equation [:provenance :compatibility-source-site])))
+    (is (= scheduled (program/validate! scheduled)))
+    (is (seq (:dispatches emitted)))
     (is (zero? (get-in emitted [:stats :fallback] 0)))))
 
 (deftest input-shadowing-cannot-import-a-conflicting-typed-result

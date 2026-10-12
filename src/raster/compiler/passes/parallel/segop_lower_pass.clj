@@ -689,6 +689,16 @@
                                    :body-origin [:body (max 0 (dec original-body-count))]})
                       util/normalize-let-body
                       util/uniquify-rebindings)
+            exposed (inline/expose-parallel-unary-spines
+                     form (concat (keys (:scalar-types opts)) (keys (:array-types opts))
+                                  (keys (:values opts))))
+            form (util/uniquify-rebindings
+                  (inline/flatten-nested-lets
+                   exposed {:sequential-only? true
+                            :binding-origins (into {} (map (fn [[id _]]
+                                                           [id (:raster.compiler/lexical-origin (meta id))]))
+                                                   (partition 2 (second form)))
+                            :body-origin [:body (max 0 (dec original-body-count))]}))
             [let-sym bindings-vec & body-exprs] form
             pairs (partition 2 bindings-vec)
             device-id (:target-device opts)

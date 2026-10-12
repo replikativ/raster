@@ -24,6 +24,7 @@
             [raster.numeric]
             [raster.arrays]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.pipeline :as pipeline]
             [raster.ad.reverse :as rev]))
 
@@ -74,6 +75,67 @@
       (is (= 'gradient (#'inline/known-vg-element elements 'vg index))))
     (doseq [index [-1 2 'n '(long n) '(int 4294967296) '(float 1)]]
       (is (nil? (#'inline/known-vg-element elements 'vg index))))))
+
+(deftest pure-unary-spines-expose-the-parallel-leaf-once
+  (let [leaf '(raster.par/reduce acc 0.0 i 3 (+ acc (double i)))
+        wrapper (with-meta (list 'Math/sqrt (list 'double leaf)) {:source-marker :kept})
+        source (list 'let* ['value wrapper] 'value)
+        exposed (inline/expose-parallel-unary-spines source #{})
+        initializer (nth (second exposed) 1)
+        reference (eval (list 'fn [] source))
+        transformed (eval (list 'fn [] exposed))]
+    (is (= 'let* (first initializer)))
+    (is (= leaf (nth (second initializer) 1)))
+    (is (= (reference) (transformed)))
+    (is (= {:source-marker :kept} (meta (last initializer)))))
+  (let [leaf (with-meta '(raster.par/reduce acc (float 0.0) i 1 (float i))
+               {:tag 'float :raster.type/tag 'float})
+        wrapper (with-meta (list '.invk 'raster.numeric/sqrt_m_float-impl leaf)
+                  {:raster.op/original 'raster.numeric/sqrt :raster.type/tag 'float})
+        exposed (inline/expose-parallel-unary-spines (list 'let* ['value wrapper] 'value) #{})
+        initializer (nth (second exposed) 1)
+        binder (first (second initializer))
+        result (last initializer)]
+    (is (= 'float (:raster.type/tag (meta binder))))
+    (is (nil? (:tag (meta binder))) "do not introduce a JVM primitive let hint")
+    (is (= '.invk (first result)))
+    (is (= 'raster.numeric/sqrt_m_float-impl (second result)))
+    (is (= (meta wrapper) (meta result)))))
+
+(deftest unary-exposure-stops-at-unproved-calls-and-scopes
+  (let [leaf '(raster.par/reduce acc 0.0 i 3 (+ acc (double i)))
+        retained (with-meta (list '.invk 'raster.numeric/sqrt_m_float-impl leaf)
+                   {:raster.op/original 'raster.numeric/sqrt})
+        lexical (vary-meta retained assoc :raster.op/lexical-callee true)]
+    (doseq [[initializer locals]
+            [[(list '+ '(record! :first) leaf) #{}]
+             [(list 'double (list 'if 'condition leaf 0.0)) #{}]
+             [(list 'double (list 'let* ['local leaf] 'local)) #{}]
+             [(list 'double [leaf]) #{}]
+             [(list 'unregistered-helper leaf) #{}]
+             [(list 'double leaf) #{'double}]
+             [retained #{'raster.numeric/sqrt_m_float-impl}]
+             [lexical #{}]
+             [(list '.invk 'raster.numeric/sqrt_m_float-impl leaf) #{}]]]
+      (let [source (list 'let* ['result initializer] 'result)]
+        (is (= source (inline/expose-parallel-unary-spines source locals)))))
+    (let [source (list 'let* ['double '(fn* [x] x)
+                            'result (list 'double leaf)] 'result)]
+      (is (= source (inline/expose-parallel-unary-spines source #{}))))))
+
+(deftest unary-exposure-requires-purity-and-keeps-checked-wrapper-order
+  (let [leaf '(raster.par/reduce acc 0.0 i 3 (+ acc (double i)))
+        wrapper (list 'int leaf)
+        source (list 'let* ['value wrapper] 'value)]
+    (with-redefs [effects/analyze-effect (constantly :io)]
+      (is (= source (inline/expose-parallel-unary-spines source #{}))))
+    (let [exposed (inline/expose-parallel-unary-spines source #{})
+          initializer (nth (second exposed) 1)
+          [result parallel] (second initializer)]
+      (is (= leaf parallel))
+      (is (= (list 'int result) (last initializer)))
+      (is (= 1 (count (filter #(= leaf %) (tree-seq coll? seq exposed)))))
+      (is (= ((eval (list 'fn [] source))) ((eval (list 'fn [] exposed))))))))
 
 (deftm option-loss [x :- Double y :- Double] :- Double
   (+ (* x x) (* x y)))
