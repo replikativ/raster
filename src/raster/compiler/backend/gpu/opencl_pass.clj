@@ -1186,10 +1186,12 @@
                                                     scheduled
                                                     (let [typed-equation?
                                                           (and (:algorithm equation)
-                                                               (= :typed-soac
-                                                                  (get-in parallel-program
-                                                                          [:provenance
-                                                                           :source-dialect])))
+                                                               (or (= :typed-soac
+                                                                      (get-in parallel-program
+                                                                              [:provenance :source-dialect]))
+                                                                   (= :typed-soac
+                                                                      (get-in equation
+                                                                              [:provenance :source-dialect]))))
                                                           scalar-reduction?
                                                           (graph-reduction-equation? equation)]
                                                       (if (and typed-equation?
@@ -1247,6 +1249,8 @@
                                               (or (= :typed-soac
                                                      (get-in parallel-program
                                                              [:provenance :source-dialect]))
+                                                  (= :typed-soac
+                                                     (get-in equation [:provenance :source-dialect]))
                                                   (= :body (first (:site equation)))))
                                          scalar-reduction?
                                          (graph-reduction-equation? equation)]

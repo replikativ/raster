@@ -47,6 +47,27 @@
     (let [form (inline/flatten-nested-lets '(let* [unknown (unregistered-call)] unknown))]
       (is (nil? (:raster.type/tag (meta (first (second form)))))))))
 
+(deftest sequential-wrapper-normalization-preserves-order-and-hygiene
+  (doseq [source ['(let* [x 7 result (let* [x (+ x 1)] x)] result)
+                  '(let* [result (let* [x 7] x) x 11] [result x])
+                  '(let* [result (do (record! :prefix)
+                                    (let* [x (record! :body)] x)
+                                    (record! :suffix))] result)]]
+    (let [normalized (inline/flatten-nested-lets source {:sequential-only? true})
+          run (fn [expression]
+                (let [trace (atom [])
+                      f (eval (list 'fn '[record!] expression))
+                      value (f (fn [event] (swap! trace conj event) event))]
+                  [value @trace]))]
+      (is (= (run source) (run normalized)))))
+  (doseq [opaque ['(f (record! :first) (let* [x (record! :second)] x))
+                  '[(record! :first) (let* [x (record! :second)] x)]
+                  '(if c (let* [x 1] x) 0)
+                  '(loop* [i 0] (let* [x i] x))
+                  '(fn* [a] (let* [x a] x))]]
+    (let [source (list 'let* ['result opaque] 'result)]
+      (is (= source (inline/flatten-nested-lets source {:sequential-only? true}))))))
+
 (deftest value-gradient-projection-indices-use-checked-constant-evidence
   (let [elements {'vg ['primal 'gradient]}]
     (doseq [index [1 '(long 1) '(clojure.core/long 1) '(clojure.core/int (long 1))]]

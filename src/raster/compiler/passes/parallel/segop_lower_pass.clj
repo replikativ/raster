@@ -22,6 +22,7 @@
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
 
@@ -135,7 +136,8 @@
         provided (or (get declared-types type-id)
                      (when (symbol? type-id) (get declared-types (symbol (name type-id)))))
         value-dtype (or (if (contains? array-ids type-id)
-                         provided
+                         (or provided
+                             (some-> (types/sym-type-tag type-id) dtype/dtype-for-array-tag))
                          (declared-scalar-type! type-id provided dtype))
                         ;; Compatibility scheduling must retain integral source widths before
                         ;; re-entry into TypedSOAC. Floating specialization keeps its existing
@@ -184,8 +186,8 @@
   (reduce-kv
    (fn [values id contract]
      (if-let [prior (get values id)]
-       (if (= prior contract)
-         values
+       (if-let [refined (av/merge-refinement prior contract)]
+         (assoc values id refined)
          (throw (ex-info "parallel equations inferred incompatible contracts for one value"
                          {:reason :parallel-program-value-conflict
                           :id id :first prior :second contract})))
@@ -347,7 +349,7 @@
         primary-kind? (if (= 'write-region kind)
                         ;; A unique direct store is canonically a map, whereas
                         ;; indirect/reducing writes retain scatter/effect-map.
-                        #{'map 'scatter 'effect-map}
+                        #{'map 'scatter 'effect-map 'product-reduce}
                         #{kind})]
     (let [attempt (typed-route/attempt
                    (list 'let* [result source] result)
@@ -467,7 +469,8 @@
     (singleton-packet result source opts used 'map)
     ;; Let the verified region decide whether writes are unique, reducing, or an
     ;; ordered effect map. This selector does not infer a collision contract.
-    (or (par/par-map-void-form? source) (par/par-scatter-form? source))
+    (or (par/par-map-void-form? source) (par/par-scatter-form? source)
+        (par/par-product-reduce-form? source))
     (singleton-packet result source opts used 'write-region)
     (or (par/par-scan-form? source) (par/par-scan-exclusive-form? source))
     (singleton-packet result source opts used 'scan)
@@ -480,6 +483,8 @@
         produced (set (mapcat :results (:equations scheduled)))]
     (mapv (fn [equation]
             (let [graph (get-in equation [:attributes :kernel-graph])
+                  physical-results (set (equation-physical-results (:algorithm equation)))
+                  algorithm-values (:values (soac-dialect/facts (:algorithm equation)))
                   public-buffers (concat (:inputs graph) (:outputs graph))
                   buffer-ids (set (map :id (concat public-buffers (:temporaries graph))))]
               (doseq [{:keys [id]} public-buffers]
@@ -489,13 +494,15 @@
                                    :equation (:id equation) :value id}))))
             {:equation (-> equation
                            (assoc :id (swap! ids inc))
-                           (update :provenance assoc :compatibility-source-site primary-site))
+                           (update :provenance assoc :compatibility-source-site primary-site
+                                   :source-dialect :typed-soac))
              :operand-values (select-keys values (:operands equation))
              :result-values (select-keys values (:results equation))
-             :physical-values (select-keys values
-                                           (set/union buffer-ids
-                                                      (set/intersection produced
-                                                                        (set (:results equation)))))}))
+             :physical-values (merge-values (select-keys algorithm-values physical-results)
+                                     (select-keys values
+                                                  (set/union buffer-ids physical-results
+                                                             (set/intersection produced
+                                                                               (set (:results equation))))))}))
           (:equations scheduled))))
 
 (defn segop-lower-pass
@@ -653,7 +660,17 @@
       (let [original-source form
             original-binding-count (quot (count (second original-source)) 2)
             original-body-count (count (nnext original-source))
-            form (->> form
+            normalized (->> form util/normalize-let-body util/uniquify-rebindings)
+            binding-origins (into {}
+                                  (map-indexed
+                                   (fn [idx [sym _]]
+                                     [sym (if (< idx original-binding-count)
+                                            [:binding sym]
+                                            [:body (- idx original-binding-count)])])
+                                   (partition 2 (second normalized))))
+            form (->> (inline/flatten-nested-lets
+                       normalized {:sequential-only? true :binding-origins binding-origins
+                                   :body-origin [:body (max 0 (dec original-body-count))]})
                       util/normalize-let-body
                       util/uniquify-rebindings)
             [let-sym bindings-vec & body-exprs] form
@@ -668,6 +685,14 @@
                                      (assoc known id declared)
                                      known))
                                  (:scalar-types opts) pairs)
+            ;; Local primitive-array declarations are storage facts too. Retain them
+            ;; before independently admitting a later packet that captures that storage.
+            array-types (reduce (fn [known [id _]]
+                                  (if-let [declared (some-> (types/sym-type-tag id)
+                                                           dtype/dtype-for-array-tag)]
+                                    (if (contains? known id) known (assoc known id declared))
+                                    known))
+                                (:array-types opts) pairs)
             lowered (atom 0)
             graphs-lowered (atom 0)
           ;; Every par form the middle end could NOT represent, as data. Previously these went to
@@ -751,14 +776,12 @@
                                 (= :body (first site)) (update :body conj expression)
                                 row (update :equations conj row)))))))
             state (reduce process
-                          {:options (assoc opts :scalar-types scalar-types)
+                          {:options (assoc opts :scalar-types scalar-types :array-types array-types)
                            :pairs [] :body [] :equations []}
                           (concat (map-indexed
                                    (fn [idx [sym expression]]
                                      [[:binding sym] sym expression
-                                      (if (< idx original-binding-count)
-                                        [:binding sym]
-                                        [:body (- idx original-binding-count)])]) pairs)
+                                      (:raster.compiler/lexical-origin (meta sym))]) pairs)
                                   (map-indexed (fn [idx expression]
                                                  [[:body idx] (gensym "body_parallel_") expression
                                                   [:body (+ (max 0 (dec original-body-count)) idx)]])

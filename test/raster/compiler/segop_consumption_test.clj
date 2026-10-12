@@ -42,6 +42,33 @@
       (is (= '[(unknown-dimension o)] (get-in program [:values result-id :shape]))
           "the result envelope retains the source binding's storage identity"))))
 
+(deftest compatibility-retains-explicit-array-storage-not-the-default-element-type
+  (doseq [[tag expected] [['doubles :double] ['longs :long] ['ints :int] ['floats :float]]]
+    (let [id (with-meta 'scratch {:tag tag :raster.type/tag tag})
+          expression (list 'raster.par/map! id 'i 4 nil 0)
+          source (list 'let* ['result expression] 'result)
+          scheduled (with-redefs [slp/singleton-packet
+                                 (fn [& _] {:declined {:reason :test-legacy-boundary}})]
+                      (:form (slp/segop-lower-pass source {:target-device :ze:0 :dtype :float})))]
+      (is (= expected (get-in scheduled [:values id :dtype]))
+          "the retained array declaration owns storage; default kernel precision does not"))))
+
+(deftest independent-packets-capture-local-primitive-array-declarations
+  (let [counts (with-meta 'counts {:tag 'longs :raster.type/tag 'longs})
+        source (list 'let* ['prefix '(host-control out)
+                           counts '(clojure.core/long-array n)
+                           'result (list 'raster.par/map! 'out 'i 'n nil
+                                         (list 'float (list 'clojure.core/aget counts 'i)))] 'result)
+        scheduled (:form (slp/segop-lower-pass
+                          source {:target-device :ze:0 :dtype :float
+                                  :array-types {'out :float} :scalar-types {'n :long}}))
+        equation (first (filter #(seq (:operations %)) (:equations scheduled)))
+        algorithm (:algorithm equation)]
+    (is (= :typed-soac (:algorithm-dialect (first (:operations equation)))))
+    (is (= :long (get-in scheduled [:values counts :dtype])))
+    (is (= :long (get-in (raster.compiler.ir.soac-dialect/facts algorithm) [:values counts :dtype])))
+    (is (= :float (get-in (raster.compiler.ir.soac-dialect/facts algorithm) [:values 'out :dtype])))))
+
 (deftest compatibility-reentry-receives-pipeline-parameter-declarations
   (let [source '(let* [result (raster.par/map! out i n nil
                                 (clojure.core/aget input i))] result)
