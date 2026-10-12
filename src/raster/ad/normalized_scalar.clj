@@ -463,15 +463,16 @@
   (let [dependencies (atom {:dependencies {} :disagreements #{}})
         resolve-var (fn [sym] (when (symbol? sym) (ns-resolve source-ns sym)))]
     (letfn [(capture-var [sym]
-              (let [v (resolve-var sym)]
-                (when (var? v)
-                  ;; Realize the first-call JIT before capturing stable execution identity.
-                  ;; The existing independent post-capture proof is still required.
-                  (core/ensure-bytecode-implementation! v)
-                  (let [snapshot (dependency-snapshot v)]
+              (let [v (resolve-var sym)
+                    snapshot (when (var? v)
+                               ;; Realize before the first observation; never bless a later
+                               ;; replacement. The independent post-capture proof remains.
+                               (core/ensure-bytecode-implementation! v)
+                               (dependency-snapshot v))]
+                (when snapshot
                   (when-not (:bound? snapshot)
                     (fail! :ad-normalized-execution-callee {:callee sym}))
-                  (observe-dependency! dependencies sym snapshot)))))
+                  (observe-dependency! dependencies sym snapshot))))
             (capture [expression locals]
               (let [{:keys [implementation-op lexical-callee dispatch? operation]}
                     (descriptor/call-description expression)]
