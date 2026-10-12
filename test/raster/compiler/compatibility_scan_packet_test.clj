@@ -22,6 +22,11 @@
         'out 'acc 0.0 'i bound (if (= dtype :float) 'float 'double)
         '(+ acc (clojure.core/aget input i))))
 
+(defn- expected-refusal [refusal scan]
+  (assoc refusal :stage :typed-admission :sym 'result :source scan
+                 :op (first scan) :target-dialect :segop :device :cpu:0
+                 :dtype :double :fallback :none))
+
 (defn- reject-legacy-scans [f]
   (let [original soac/par-form->soac]
     (with-redefs [soac/par-form->soac
@@ -49,7 +54,7 @@
              packet (:form result)
              declines (get-in result [:stats :segops-declined])]
          (is (= :scan-not-associative (:reason expected)))
-         (is (= [(assoc expected :stage :typed-admission :sym 'result :source scan)] declines))
+         (is (= [(expected-refusal expected scan)] declines))
          (is (empty? (:equations packet)))
          (is (zero? (get-in result [:stats :kernel-graphs-lowered])))
          (is (= source (:source packet)))
@@ -73,7 +78,7 @@
                                       (reset! observed [form dt arrays options])
                                       {:declined refusal})]
            (let [result (lower/segop-lower-pass source opts)]
-             (is (= [(assoc refusal :stage :typed-admission :sym 'result :source scan)]
+             (is (= [(expected-refusal refusal scan)]
                     (get-in result [:stats :segops-declined])))
              (is (= source (get-in result [:form :source])))))))
       (is (= [source :double (:array-types opts)
@@ -104,7 +109,7 @@
              result (lower/segop-lower-pass source opts)
              packet (:form result)]
          (if-let [refusal (:declined expected)]
-           (do (is (= [(assoc refusal :stage :typed-admission :sym 'result :source scan)]
+           (do (is (= [(expected-refusal refusal scan)]
                       (get-in result [:stats :segops-declined])))
                (is (empty? (:equations packet))))
            (do (is (some? (:program expected)))

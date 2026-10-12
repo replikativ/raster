@@ -134,15 +134,21 @@
 (deftest an-unrepresentable-par-form-becomes-a-diagnostic
   (testing "a par form with no lowering rule is the case that used to vanish onto stderr"
     (let [st (stats-of '(let* [o (raster.par/scatter! O IDX V 256)] o))
-          d (first (:segops-declined st))]
+          diagnostics (:segops-declined st)]
       (is (zero? (:segops-lowered st)))
-      (is (= 1 (count (:segops-declined st))))
+      (is (= [:typed-admission :soac] (mapv :stage diagnostics)))
+      (is (= :compatibility-lowering (:fallback (first diagnostics))))
       (testing "…and it names what §3.5 asks for"
+        (doseq [d diagnostics]
         (is (= 'raster.par/scatter! (:op d)) "the operation")
-        (is (contains? #{:soac :segop} (:stage d)) "which conversion")
+        (is (= 'o (:sym d)) "the source binding")
+        (is (= '(raster.par/scatter! O IDX V 256) (:source d)))
+        (is (contains? #{:typed-admission :soac :segop} (:stage d)) "which conversion")
         (is (= :segop (:target-dialect d)) "the target dialect")
+        (is (= :cpu:0 (:device d)))
+        (is (= :double (:dtype d)))
         (is (some? (:reason d)) "the missing rule")
-        (is (some? (:fallback d)) "and what happens instead — a stated outcome, not an absence")))))
+        (is (some? (:fallback d)) "and what happens instead — a stated outcome, not an absence"))))))
 
 (deftest direct-offset-map-enters-the-typed-boundary-before-compatibility
   (let [source '(raster.par/map! out i n :offset base float (aget x i))

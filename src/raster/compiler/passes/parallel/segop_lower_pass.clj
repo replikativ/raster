@@ -27,20 +27,21 @@
 
 (def ^:private id-counter (atom 0))
 
+(defn- diagnostic-context
+  [sym source stage device-id dtype fallback]
+  {:op (when (seq? source) (first source))
+   :sym sym :source source :stage stage :target-dialect :segop
+   :device (or device-id :cpu:0) :dtype (or dtype :double)
+   :fallback fallback})
+
 (defn- diagnostic
   "The structured record north-star §3.5 asks for in place of a warning: WHICH operation, in which
    binding, for which target dialect and device, what rule was missing, and what happens instead."
   [sym form stage ^Exception e device-id dtype]
-  {:op (when (seq? form) (first form))
-   :sym sym
-   :stage stage                     ; :soac (par form → SOAC) or :segop (SOAC → SegOp)
-   :target-dialect :segop
-   :device (or device-id :cpu:0)
-   :dtype (or dtype :double)
-   :reason (or (:reason (ex-data e)) :no-lowering-rule)
-   :message (.getMessage e)
-   ;; a fallback is a stated outcome, not the absence of one
-   :fallback :backend-relowers-or-uses-specialized-codegen})
+  (assoc (diagnostic-context sym form stage device-id dtype
+                             :backend-relowers-or-uses-specialized-codegen)
+         :reason (or (:reason (ex-data e)) :no-lowering-rule)
+         :message (.getMessage e)))
 
 (defn- lower-attempt
   "Lower a par form to SegOp records via the SOAC intermediate.
@@ -724,16 +725,20 @@
                                                     (when (= [] (:shape value))
                                                       [id (:dtype value)])))
                                          (:values (:program packet))))))
-                  (let [_ (when-let [refusal (:declined packet)]
-                            (swap! declined conj (assoc refusal :stage :typed-admission
-                                                      :sym sym :source expression)))
-                        current-scalar-types (:scalar-types options)
+                  (let [current-scalar-types (:scalar-types options)
                         ;; A recognized scan's typed refusal is its admission decision, not
                         ;; permission to rediscover weaker semantics through compatibility SOAC.
                         ;; Other parallel families retain their existing fallback boundary.
                         typed-scan-declined? (and (:declined packet)
                                                   (or (par/par-scan-form? expression)
                                                       (par/par-scan-exclusive-form? expression)))
+                        _ (when-let [refusal (:declined packet)]
+                            (swap! declined conj
+                                   (merge refusal
+                                          (diagnostic-context sym expression :typed-admission
+                                                              device-id dtype
+                                                              (if typed-scan-declined?
+                                                                :none :compatibility-lowering)))))
                         lowered-values (when-not typed-scan-declined?
                                          (attempt sym expression options))
                         row (when lowered-values
