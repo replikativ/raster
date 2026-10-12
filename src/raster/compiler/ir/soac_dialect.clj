@@ -2859,3 +2859,60 @@
    :diagnostics (vec diagnostics)
    :provenance provenance
    :attributes attributes})
+
+(defn append-pure-spines
+  "Append two validated single-equation pure spines at an explicit consumer→producer boundary.
+   Shared value facts must already agree; this operation infers neither types nor ownership.
+   Numerical attributes, equation facts and provenance remain explicit. Output order is caller
+   supplied and checked by the ordinary TypedSOAC validator. Opaque extension facts must not
+   encode value IDs: only the dialect's declared schemas can be remapped. No runtime route
+   is introduced."
+  [producer consumer boundary program-outputs]
+  (validate! producer)
+  (validate! consumer)
+  (let [pf (facts producer) cf (facts consumer)
+        consumer-inputs (set (:inputs cf)) producer-outputs (set (outputs producer))
+        producer-definitions (set (mapcat #(nth % 2) (equations producer)))]
+    (doseq [p [producer consumer]
+            :let [f (facts p) es (equations p)]]
+      (when-not (and (= 1 (count es)) (empty? (:effects f)) (empty? (:aliases f))
+                     (every? #(and (empty? (get-in f [:equations (second %) :aliases]))
+                                   (empty? (result-storage f (second %)))) es))
+        (fail! :typed-soac-composition-boundary
+               "pure spine append requires single-equation programs without effects or physical bindings"
+               {:program p})))
+    (when-not (and (map? boundary)
+                   (every? (fn [[from to]] (and (contains? consumer-inputs from)
+                                              (contains? producer-outputs to))) boundary)
+                   (set/subset? (set/intersection consumer-inputs producer-definitions)
+                                (set (keys boundary))))
+      (fail! :typed-soac-composition-boundary "composition requires explicit exact boundary IDs"
+             {:boundary boundary :producer-outputs producer-outputs :consumer-inputs consumer-inputs}))
+    (let [consumer (remap-values consumer boundary)
+          cf (facts consumer)
+          equations (into (vec (equations producer)) (equations consumer))
+          definitions (set (mapcat #(nth % 2) equations))
+          merge-exact
+          (fn [facet left right]
+            (doseq [id (set/intersection (set (keys left)) (set (keys right)))]
+              (when-not (semantic/equivalent? (get left id) (get right id))
+                (fail! :typed-soac-composition-facts "shared composition facts disagree"
+                       {:facet facet :id id :left (get left id) :right (get right id)})))
+            (merge left right))]
+      ;; Unknown program-level facets must not disappear from the consumer. The only
+      ;; merged facets are explicit interfaces, values, equations, diagnostics and provenance;
+      ;; empty aliases were independently checked above.
+      (let [contract #(dissoc % :values :inputs :equations :diagnostics :provenance :aliases)]
+        (when-not (semantic/equivalent? (contract pf) (contract cf))
+          (fail! :typed-soac-composition-numerics "program contracts must agree before composition"
+                 {:producer (contract pf) :consumer (contract cf)})))
+      ;; Duplicate equation IDs must not disappear into a map merge before make validates.
+      (when (seq (set/intersection (set (keys (:equations pf))) (set (keys (:equations cf)))))
+        (fail! :typed-soac-equation-ids "equation IDs must be disjoint across composed spines" {}))
+      (make (-> pf
+                (assoc :values (merge-exact :values (:values pf) (:values cf))
+                       :inputs (vec (remove definitions (distinct (concat (:inputs pf) (:inputs cf)))))
+                       :equations (merge (:equations pf) (:equations cf))
+                       :diagnostics (into (vec (:diagnostics pf)) (:diagnostics cf))
+                       :provenance (merge-exact :provenance (:provenance pf) (:provenance cf))))
+            equations program-outputs))))

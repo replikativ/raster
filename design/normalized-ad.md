@@ -11,6 +11,8 @@ Indexed pullbacks additionally require private index snapshots and a fresh typed
 gradient owner on every call. These are sequential lifetime contracts, not concurrent mutation
 or asynchronous ownership guarantees.
 
+Checked two-equation pure-spine append now builds the admitted map→ordered-sum programs;
+it is not yet a general differentiation rule for arbitrary equation chains.
 General equation composition, conditional/loop AD regions, device execution of these normalized
 families and default-engine migration remain separate gates. Existing real-weight training
 acceptance is still open. The sections below describe the individual construction checkpoints;
@@ -618,6 +620,19 @@ merely because execution no longer reads their storage representation. Indexed d
 and result IDs remain distinct, and every pullback allocates a fresh typed-zero destination.
 No caller array is retained as a residual. This does not add a runtime mode or general AD
 composition.
+
+Construction uses `soac/append-pure-spines` instead of a family-local right-biased fact
+merge. The consumer→producer boundary is explicit, including identity mappings. Both
+inputs are validated single-equation pure programs without aliases or physical result
+bindings. Shared AbstractValues and provenance must agree exactly; equation IDs remain
+disjoint, remaining program contracts must match, and ordinary validation checks the
+combined definition/use scope and caller-supplied output order. This operation neither
+infers ownership nor grants reassociation. The AD adapter separately proves its existing
+functional source-result projection from unspecified/owned to owned before composition;
+borrowed or external results refuse. Source facts remain unchanged. Unknown program
+facets cannot be silently dropped from the consumer. Opaque extension contracts are
+preserved but cannot contain value IDs requiring remapping: such schemas need an explicit
+dialect remapping rule first.
 
 Shared
 host materialization assembles the tuple map and original reduction in equation order,

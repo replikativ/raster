@@ -811,6 +811,11 @@
        :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
      [equation] outputs)))
 
+(defn- owned-functional-result! [value]
+  (when-not (contains? #{nil :owned} (:ownership value))
+    (fail! :ad-normalized-map-storage {:output value}))
+  (assoc value :ownership :owned))
+
 (defn- lift-map-programs [bundle source interface]
   (let [equation (first (soac/equations source))
         {:keys [attributes arrays captures]} (soac/operation-parts equation)
@@ -827,7 +832,7 @@
             (fail! :ad-normalized-map-storage {:inputs input-values :output output-value}))
         coefficients (vec (filter #(contains? residual-arrays %) (:residuals bundle)))
         scalar-coefficients (vec (filter #(contains? scalar-captures %) (:residuals bundle)))
-        tensor (assoc output-value :ownership :owned)
+        tensor (owned-functional-result! output-value)
         residual-outputs (mapv residual-arrays coefficients)
         values (merge (:values (soac/facts source))
                       (zipmap (concat outputs residual-outputs [tangent-output gradient-output])
@@ -1191,24 +1196,27 @@
           (soac/make view-facts [map-equation] (nth map-equation 2)))
         view))))
 
-(defn- compose-sum [map-program reduction source result]
-  (let [map-equation (first (soac/equations map-program))
-        equations [map-equation reduction]
-        inputs (:inputs (soac/facts map-program))
-        outputs (into [result] (rest (soac/outputs map-program)))
-        values (merge (:values (soac/facts source)) (:values (soac/facts map-program)))]
-    (soac/make
-     (soac/default-program-facts
-      {:values (select-keys values (concat inputs (mapcat #(nth % 2) equations)))
-       :inputs inputs
-       :equations {(second map-equation) (get-in (soac/facts map-program) [:equations (second map-equation)])
-                   ;; The original checked envelope remains in :sum-programs/:source. This
-                   ;; generated program has no scalar prefix to stage: omit only the exact
-                   ;; frontend bookkeeping facet already checked by sum-source-map.
-                   (second reduction) (assoc (get-in (soac/facts source) [:equations (second reduction)])
-                                             :attributes {})}
-       :attributes {:source-arithmetic numerics/retained-source-arithmetic}})
-     equations outputs)))
+(defn- append-ordered-sum [map-program reduction source result]
+  (let [[boundary] (:arrays (soac/operation-parts reduction))
+        source-value (get-in (soac/facts source) [:values boundary])
+        producer-value (get-in (soac/facts map-program) [:values boundary])
+        owned-value (owned-functional-result! source-value)
+        view (soac/equation-subprogram source reduction)]
+    ;; Map lifting already proves this exact source→generated owned result relation.
+    ;; Do not generalize it into an ownership wildcard or right-biased value merge.
+    (when-not (and (= boundary (first (soac/outputs map-program)))
+                   (fingerprint/equivalent? owned-value producer-value))
+      (fail! :ad-normalized-sum-boundary {:boundary boundary :source source-value :producer producer-value}))
+    (let [facts (-> (soac/facts view)
+                    (assoc-in [:values boundary] owned-value)
+                    ;; Only the frontend bookkeeping already checked by sum-source-map is
+                    ;; omitted; equation provenance, numerical operation attributes stay exact.
+                    (assoc-in [:equations (second reduction) :attributes] {})
+                    (assoc :attributes {:source-arithmetic numerics/retained-source-arithmetic}))]
+      (soac/append-pure-spines map-program
+                               (soac/make facts [reduction] (soac/outputs view))
+                               {boundary boundary}
+                               (into [result] (rest (soac/outputs map-program)))))))
 
 (defn- lift-sum-programs [bundle source interface]
   (let [[_ reduction] (soac/equations source)
@@ -1239,8 +1247,8 @@
                             (assoc-in [:values seed] (get-in (soac/facts source) [:values result]))
                             (update :inputs #(conj (vec (remove #{(:cotangent-input map-interface)} %)) seed)))]
     {:source source :interface interface
-     :primal (compose-sum (:primal map-programs) reduction source result)
-     :linear (compose-sum (:linear map-programs) tangent-reduction tangent-source tangent-result)
+     :primal (append-ordered-sum (:primal map-programs) reduction source result)
+     :linear (append-ordered-sum (:linear map-programs) tangent-reduction tangent-source tangent-result)
      :transpose (soac/make transpose-facts [transpose-equation] (soac/outputs transpose))}))
 
 (defn- validate-sum-programs! [{:keys [sum-programs source-ns] :as bundle}]
