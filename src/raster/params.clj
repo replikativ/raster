@@ -451,10 +451,14 @@
                      :adam (map (fn [[i l]] `(raster.dl.optim/adam-step!
                                               ~(:sym l) ~(d-sym i l) ~(fld 'm-cont l) ~(fld 'v-cont l)
                                               (raster.arrays/alength ~(:sym l))
-                                              ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t))
+                                              (raster.numeric/oftype ~(:sym l) ~'lr)
+                                              (raster.numeric/oftype ~(:sym l) ~'beta1)
+                                              (raster.numeric/oftype ~(:sym l) ~'beta2)
+                                              (raster.numeric/oftype ~(:sym l) ~'eps) ~'adam-t))
                                 param-pairs)
                      :sgd  (map (fn [[i l]] `(raster.dl.optim/sgd-step!
-                                              ~(:sym l) ~(d-sym i l) (raster.arrays/alength ~(:sym l)) ~'lr))
+                                              ~(:sym l) ~(d-sym i l) (raster.arrays/alength ~(:sym l))
+                                              (raster.numeric/oftype ~(:sym l) ~'lr)))
                                 param-pairs))]
     `(~'let [~@unpacks
              ~'__vg-out ~vg-call
