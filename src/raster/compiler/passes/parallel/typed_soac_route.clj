@@ -1212,7 +1212,9 @@
 
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
-   no parallel binding is in this closed subset."
+   no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
+   through the same frontend; their caller must independently certify purity and storage algebra.
+   It does not authorize a device schedule or alter default scalar-only admission."
   ([form dtype]
    (attempt form dtype {}))
   ([form dtype array-types]
@@ -1220,7 +1222,7 @@
   ([form dtype array-types {:keys [resident-reductions? resident-initialization?
                                    resident-uniform-input-loads?
                                    scalar-types values abstract-machine segmented-plans?
-                                   preserve-declared-array-storage?]
+                                   preserve-declared-array-storage? host-scalars?]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (let [form (frontend/normalize-source form {:array-types array-types
@@ -1228,6 +1230,7 @@
        (try
          (let [frontend-options {:dtype dtype :array-types array-types
                                  :scalar-types scalar-types :values values
+                                 :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}
                projection (when segmented-plans?
@@ -1251,11 +1254,12 @@
                        :resident-initialization? resident-initialization?
                        :resident-uniform-input-loads? resident-uniform-input-loads?
                        :abstract-machine abstract-machine})]
-                 (if (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
+                 (if (and (not host-scalars?)
+                          (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
                                              :segmented-reduce :contract :product-reduce
                                              :segmented-fold-map :scan}
                                            (:kind (fusion/equation-info %)))
-                               (dialect/equations typed-result))
+                               (dialect/equations typed-result)))
                    {:declined {:reason :no-certified-parallel-equation
                                :stats typed-stats}}
                    (if decline

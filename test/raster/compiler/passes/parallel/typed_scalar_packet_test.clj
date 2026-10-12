@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.typed-scalar-packet-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.opencl-pass :as opencl]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as lower]))
@@ -13,6 +14,57 @@
      norm))
 
 (def options {:dtype :float :target-device :ocl:0 :array-types {'xs :float}})
+
+(def causal-source
+  '(let* [^{:raster.type/tag long} n (clojure.core/long (clojure.core/alength xs))
+          sum (raster.par/reduce acc (float 0.0) i n
+                                (+ acc (* (float (aget xs i)) (float (aget xs i)))))
+          norm (Math/sqrt (double sum))]
+     norm))
+
+(deftest compatibility-composition-retains-certified-host-length-equations
+  (let [result (lower/segop-lower-pass causal-source
+                                       (assoc options :values {'xs (av/tensor {:dtype :float :shape [32]})}))
+        scheduled (:form result)
+        {:keys [body graph]} (graph/make-for-equation scheduled (last (:equations scheduled)))]
+    (is (= 1 (get-in result [:stats :segops-lowered])))
+    (is (= 1 (get-in result [:stats :typed-soac-reused])))
+    (is (= 1 (get-in result [:stats :typed-scalar-equations])))
+    (is (= [32] (get-in scheduled [:values 'xs :shape])))
+    (is (= ['n] (:results (first (:equations body)))))
+    (is (true? (get-in body [:equations 0 :attributes :host-only])))
+    (is (= {'n '(extent xs)} (graph/derived-scalar-expressions (:values body) (:equations body))))
+    (is (= 'n (:elements (first (:inputs graph)))))))
+
+(deftest unsupported-host-bindings-remain-outside-the-certified-packet
+  (doseq [expression ['(clojure.core/long (do (swap! counter inc) (clojure.core/alength xs)))
+                      '(clojure.core/long (clojure.core/aget xs 0))
+                      '(clojure.core/long (clojure.core/double (clojure.core/alength xs)))
+                      '(clojure.core/long (clojure.core/int (clojure.core/long (clojure.core/alength xs))))]]
+    (let [source (list 'let* [(with-meta 'n {:raster.type/tag 'long}) expression] 'n)
+          result (lower/segop-lower-pass source options)]
+      (is (zero? (get-in result [:stats :typed-scalar-equations])))
+      (is (= expression (second (second (:source (:form result)))))))))
+
+(deftest retaining-a-pure-tail-does-not-remove-or-replay-an-earlier-effect
+  (let [source '(let* [^{:raster.type/tag long} n
+                       (do (swap! counter inc) (clojure.core/long (clojure.core/alength xs)))] n)
+        normalized (:source (:form (lower/segop-lower-pass source options)))
+        counter (atom 0)
+        execute (eval (list 'fn '[xs counter] normalized))]
+    (is (= 3 (execute (float-array 3) counter)))
+    (is (= 1 @counter))))
+
+(deftest host-only-proof-is-opt-in-and-does-not-count-as-parallel-work
+  (let [source '(let* [^{:raster.type/tag long} n (clojure.core/long (clojure.core/alength xs))] n)
+        default (raster.compiler.passes.parallel.typed-soac-route/attempt
+                 source :float {'xs :float})
+        result (lower/segop-lower-pass source options)]
+    (is (nil? (:program default)))
+    (is (= 1 (get-in result [:stats :typed-scalar-equations])))
+    (is (zero? (get-in result [:stats :segops-lowered])))
+    (is (zero? (get-in result [:stats :typed-soac-reused])))
+    (is (= 3 ((eval (list 'fn '[xs] (:source (:form result)))) (float-array 3))))))
 
 (def nested-source
   (let [leaf (get (into {} (map vec (partition 2 (second source)))) 'sum)]

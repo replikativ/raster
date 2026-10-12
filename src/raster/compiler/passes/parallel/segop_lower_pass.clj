@@ -21,8 +21,10 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
+            [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
 
@@ -357,9 +359,11 @@
   "Admit, freshen and schedule the complete typed singleton, including host SSA."
   [result source opts used kind]
   (let [packet-stage (case kind reduce :typed-reduction-packet
+                               scalar :typed-scalar-packet
                                map :typed-map-packet scan :typed-scan-packet
                                write-region :typed-write-packet)
         source-stage (case kind reduce :typed-reduction-source
+                               scalar :typed-scalar-source
                                map :typed-map-source scan :typed-scan-source
                                write-region :typed-write-source)
         primary-kind? (if (= 'write-region kind)
@@ -370,9 +374,10 @@
     (let [attempt (typed-route/attempt
                    (list 'let* [result source] result)
                    (or (:dtype opts) :double) (:array-types opts)
-                   {:scalar-types (:scalar-types opts)
-                    :values (:values opts)
-                    :resident-reductions? (true? (:resident-reductions? opts))})]
+                   (cond-> {:scalar-types (:scalar-types opts)
+                            :values (:values opts)
+                            :resident-reductions? (true? (:resident-reductions? opts))}
+                     (= 'scalar kind) (assoc :host-scalars? true)))]
       (if (:declined attempt)
         {:declined (:declined attempt)}
         (let [packet (:program attempt)
@@ -466,7 +471,15 @@
                 (throw (ex-info "typed write packet lacks its complete physical storage relation"
                                 {:reason :raster/bug :stage packet-stage :source source
                                  :results (:results primary) :storage storage :physical physical})))))
-          {:program scheduled :pairs pairs :body body :primary primary})))))
+          (when (or (not= 'scalar kind)
+                    (and (every? #(and (true? (get-in % [:attributes :host-only]))
+                                      (empty? (:operations %)) (empty? (:effects %)))
+                                 (:equations scheduled))
+                         (let [definitions (equation-graph/derived-scalar-expressions
+                                            (:values scheduled) (:equations scheduled))]
+                           (every? #(contains? definitions %)
+                                   (mapcat :results (:equations scheduled))))))
+            {:program scheduled :pairs pairs :body body :primary primary}))))))
 
 (defn- reduction-packet [result source opts used]
   (when (par/par-reduce-form? source)
@@ -490,6 +503,12 @@
     (singleton-packet result source opts used 'write-region)
     (or (par/par-scan-form? source) (par/par-scan-exclusive-form? source))
     (singleton-packet result source opts used 'scan)
+    ;; Preserve certified host extent equations in source order. They are proof terms,
+    ;; not parallel work; unknown/effectful host code remains outside the packet boundary.
+    (and (contains? #{:int :long}
+                    (declared-scalar-type! result (get (:scalar-types opts) result) (:dtype opts)))
+         (= :pure (effects/analyze-effect source)))
+    (singleton-packet result source opts used 'scalar)
     :else (reduction-packet result source opts used)))
 
 (defn- packet-equations
@@ -742,10 +761,11 @@
                         packet-pairs (:pairs packet)
                         body? (= :body (first site))
                         packet-body (:body packet)]
-                    (swap! lowered inc)
+                    (when (some #(seq (get-in % [:equation :operations])) rows)
+                      (swap! lowered inc)
+                      (swap! typed-count inc))
                     (swap! graphs-lowered +
                            (count (filter #(get-in % [:equation :attributes :kernel-graph]) rows)))
-                    (swap! typed-count inc)
                     (swap! scalar-count + (count (filter #(get-in % [:equation :attributes :host-only]) rows)))
                     (-> state
                         (update :pairs into packet-pairs)

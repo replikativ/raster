@@ -5982,7 +5982,7 @@
 
 (defn- form->program*
   [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
-                 preserve-declared-array-storage?]
+                 preserve-declared-array-storage? host-scalars?]
            :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [_ (validate-declared-array-values! array-types values)
@@ -5996,7 +5996,8 @@
                          values)]
       (when (and (even? (count bindings))
                  (seq descriptions)
-                 (some semantic-description? descriptions)
+                 (or (some semantic-description? descriptions)
+                     (and host-scalars? (every? #(= :scalar (:kind %)) descriptions)))
                  (or segmented-plans?
                      (not-any? swr-description? descriptions))
                  ;; Body expressions are projected as host results, not equations. They therefore

@@ -124,7 +124,7 @@
     (is (= [32] (get-in scheduled [:values 'xs :shape])))
     (is (= {'n '(extent xs)}
            (equation-graph/derived-scalar-expressions (:values body) (:equations body))))
-    (is (= '(extent xs) (:elements (first (:inputs graph)))))
+    (is (= 'n (:elements (first (:inputs graph)))))
     (is (empty? (:preconditions graph)))))
 
 (deftest backing-length-alias-requires-an-exact-integral-spine
@@ -181,7 +181,7 @@
         scheduled (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))
         equations (filterv (comp seq :operations) (:equations scheduled))
         {:keys [graph]} (equation-graph/make-for-equations scheduled equations)]
-    (is (= '(extent xs) (:elements (first (:inputs graph)))))
+    (is (= 'n (:elements (first (:inputs graph)))))
     (is (some #(and (= 'n (:expression %)) (= 'minimum (:value %)))
               (:preconditions graph)))
     (is (= :kernel-precondition-failed
@@ -190,6 +190,35 @@
                         (fn [leaf] (case leaf (extent xs) 5 minimum 6 n 5))))))
     (is (true? (precondition/check! (:preconditions graph)
                                    (fn [leaf] (case leaf (extent xs) 7 minimum 6 n 7)))))))
+
+(defn- two-length-aliases [last-operation]
+  (let [source (list 'let* ['n1 '(clojure.core/long (clojure.core/alength xs))
+                            'n2 '(clojure.core/long (clojure.core/alength xs))
+                            'first-result '(raster.par/reduce acc 0.0 i n1 (+ acc (aget xs i)))
+                            'result last-operation] 'result)
+        options {:dtype :double :target-device :ocl:0 :array-types {'xs :double}
+                 :values {'xs (av/tensor {:dtype :double :shape [32]})}}
+        typed (frontend/form->program source options)
+        scheduled (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))]
+    (:graph (equation-graph/make-for-equations
+             scheduled (filterv (comp seq :operations) (:equations scheduled))))))
+
+(deftest source-proven-aliases-still-guard-independent-runtime-read-bounds
+  (let [graph (two-length-aliases '(raster.par/reduce acc 0.0 j n2 (+ acc (aget xs j))))]
+    (is (= 'n1 (:elements (first (:inputs graph)))))
+    (is (some #(= {:expression 'n1 :op :>= :value 'n2} %) (:preconditions graph)))
+    (is (= :kernel-precondition-failed
+           (reason-of #(precondition/check! (:preconditions graph) {'n1 5 'n2 100}))))
+    (is (true? (precondition/check! (:preconditions graph) {'n1 5 'n2 5})))))
+
+(deftest source-proven-aliases-do-not-change-output-or-temporary-sizing
+  (let [mapped (two-length-aliases '(raster.par/pmap j n2 double 1.0))
+        reduced (two-length-aliases '(raster.par/reduce acc 0.0 j n2 (+ acc (double j))))
+        temporary-references (map #(launch/expression-references (:elements %)) (:temporaries reduced))]
+    (is (= 'n2 (:elements (first (filter #(= 'result (:id %)) (:outputs mapped))))))
+    (is (some #(contains? % 'n1) temporary-references))
+    (is (some #(contains? % 'n2) temporary-references))
+    (is (not-any? #(some launch/backing-extent-id %) temporary-references))))
 
 (deftest contiguous-equations-form-one-exact-semantic-source-graph
   (let [scheduled (scheduled-three-maps)

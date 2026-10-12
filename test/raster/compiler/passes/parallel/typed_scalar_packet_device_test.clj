@@ -12,11 +12,11 @@
             [raster.gpu.device-probe :as opencl-probe]
             [raster.dl.gpu-grad-parity :as level-zero]))
 
-(defn- check-scalar! [target source]
+(defn- check-scalar! [target source & [options]]
   (let [runtime (case target :ocl:0 'raster.gpu.ocl-runtime :ze:0 'raster.gpu.ze-runtime)
         register! (requiring-resolve (symbol (str runtime) "register-kernel-dispatch!"))
         scheduled (:form (lower/segop-lower-pass source
-                                                (assoc packet/options :target-device target)))
+                                                (assoc (merge packet/options options) :target-device target)))
         emitted (opencl/opencl-pass scheduled :device-id target :dtype :float
                                    :compile-spirv? (= :ze:0 target) :min-elements 0)
         execute (eval (list 'fn '[xs] (:form emitted)))]
@@ -50,7 +50,7 @@
                                             :scheduled-equation-algorithm algorithm
                                             :scheduled-equation-body body)]
     (is (= [32] (get-in scheduled [:values 'xs :shape])))
-    (is (= '(extent xs) (:elements (first (:inputs emitted)))))
+    (is (= 'n (:elements (first (:inputs emitted)))))
     (gpu/with-gpu-session [session target]
       (doseq [values [[-1 2 3.5] [7 -4 0.5] [] (repeat 1025 1)]]
         (let [input (float-array values)
@@ -59,10 +59,19 @@
               n (count values)
               expected (reduce + 0.0 (map #(* (double %) (double %)) values))]
           (gpu/alloc! session {input-key [:float n input] output-key [:float 1 nil]})
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (gpu/bind-kernel-graph! session :oversized-backing-bound emitted
+                                              {'xs input-key 'sum output-key}
+                                              {'n {:type :long :value (inc n)}})))
+          (when (pos? n)
+            (let [short-view (gpu/buffer-view session input-key {:shape [(dec n)]})]
+              (is (thrown? clojure.lang.ExceptionInfo
+                           (gpu/bind-kernel-graph! session :short-backing-view emitted
+                                                  {'xs short-view 'sum output-key}
+                                                  {'n {:type :long :value n}})))))
           (let [handle (gpu/bind-kernel-graph! session :backing-length emitted
                                              {'xs input-key 'sum output-key}
-                                             {'n {:type :long :value n}
-                                              '(extent xs) {:type :long :value n}})]
+                                             {'n {:type :long :value n}})]
             (try
               (gpu/run-kernel-graph! session handle)
               (is (< (Math/abs (- expected (double (first (gpu/download session output-key))))) 1.0e-6))
@@ -72,11 +81,15 @@
 (deftest opencl-host-scalar-consumer-uses-imported-reduction-graph
   (if @opencl-probe/opencl-available?
     (do (doseq [source [packet/source packet/nested-source]] (check-scalar! :ocl:0 source))
+        (check-scalar! :ocl:0 packet/causal-source
+                       {:values {'xs (av/tensor {:dtype :float :shape [32]})}})
         (check-backing-length! :ocl:0))
     (opencl-probe/opencl-skip! "imported scalar reduction result identity")))
 
 (deftest level-zero-host-scalar-consumer-uses-imported-reduction-graph
   (if @level-zero/gpu-available?
     (do (doseq [source [packet/source packet/nested-source]] (check-scalar! :ze:0 source))
+        (check-scalar! :ze:0 packet/causal-source
+                       {:values {'xs (av/tensor {:dtype :float :shape [32]})}})
         (check-backing-length! :ze:0))
     (level-zero/gpu-skip! "imported scalar reduction result identity")))

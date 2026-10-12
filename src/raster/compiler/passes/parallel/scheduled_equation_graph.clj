@@ -29,6 +29,11 @@
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :pass :scheduled-equation-graph))))
 
+(defn- backing-independent-definitions [definitions]
+  (into {} (remove (fn [[_ expression]]
+                     (some launch/backing-extent-id (launch/expression-references expression))))
+        definitions))
+
 (defn- value-elements
   [values derived-scalars value]
   (let [dimension-value (fn [dimension]
@@ -44,7 +49,10 @@
     ;; those identities as checked launch algebra (notably normalised `rstr_extent_n` values).
     ;; Rebind that compiler-owned definition here, where graph allocation becomes concrete, so a
     ;; KernelBody's source-derived storage certificate and the graph describe the same extent.
-    (launch/rebind-expression elements derived-scalars)))
+    ;; Runtime sizing retains its original public scalar identity for any backing-dependent
+    ;; definition. Source-proven n1=n2 does not let an allocation sized by n2 use caller n1.
+    ;; Full definitions remain available independently for closed KernelBody proof comparison.
+    (launch/rebind-expression elements (backing-independent-definitions derived-scalars))))
 
 (defn- integral-scalar-value?
   [value]
@@ -385,6 +393,12 @@
          (nil? (:logical-layout value))
          (= id (launch/backing-extent-id requirement)))))
 
+(defn- backing-length-alias [definitions expression]
+  (when-let [backing-id (launch/backing-extent-id expression)]
+    (some (fn [[scalar definition]]
+            (when (= backing-id (launch/backing-extent-id definition)) scalar))
+          (sort-by (comp str key) definitions))))
+
 (defn input-storage-context
   "Project known dense input storage and scalar definitions from one exact causal equation slice.
    Unknown allocation extents remain unknown; neither future equations nor iteration size supplies them."
@@ -659,12 +673,12 @@
                                             (some #(not (contains? optional-reads %))
                                                   (:inputs operation)))
                                    (map-body/static-read-requirements operation map-read-options))
-                    derived (merge-with (fn [left right]
+                    source-requirements (merge-with (fn [left right]
                                           (if (= left right) left (launch/maximum left right)))
                                         optional-reads static-reads)
                     derived (into {} (map (fn [[id extent]]
                                             [id (launch/rebind-expression extent derived-scalars)]))
-                                  derived)
+                                  source-requirements)
                     _ (doseq [id marked-inputs
                               :when (not (contains? derived id))]
                           (fail! :scheduled-equation-read-capacity
@@ -672,7 +686,11 @@
                                  {:operation (:id operation) :phase (:phase operation)
                                   :input id :source operation}))]
                 (merge-with into requirements
-                            (into {} (map (fn [[id extent]] [id [extent]])) derived)))
+                            ;; Source bounds remain runtime obligations even when the retained
+                            ;; host program proves two aliases name the same backing length.
+                            (into {} (map (fn [[id extent]]
+                                            [id (vec (distinct [(get source-requirements id) extent]))]))
+                                  derived)))
               requirements)))
           (merge-with into
                       (contraction-read-requirements algorithm retained-equations)
@@ -685,12 +703,16 @@
          buffer-specs (reduce-kv
                        (fn [specs id requirements]
                          (cond
-                           (some #(exact-external-backing-read?
+                           (some #(and (exact-external-backing-read?
                                    values inputs written-storage
-                                   id %) requirements)
-                           ;; One exact backing read establishes allocation identity. Other
-                           ;; independent minima remain preconditions, not a fabricated maximum.
-                           (assoc-in specs [id :elements] (list 'extent id))
+                                   id %)
+                                       (backing-length-alias derived-scalars %)) requirements)
+                           ;; Required capacity is a checked public scalar, not an opaque actual
+                           ;; allocation identity. The retained source proof still relates it to
+                           ;; backing length for KernelBody closure. Every other source bound
+                           ;; remains a runtime minimum, including independently supplied aliases.
+                           (assoc-in specs [id :elements]
+                                     (backing-length-alias derived-scalars (list 'extent id)))
 
                            (not (unresolved-capacity?
                                     id (get values id) (get-in specs [id :elements])))
@@ -757,13 +779,16 @@
                             (fn [expression]
                               ;; Preconditions close over integral SSA slots, not opaque
                               ;; buffer identities. Replay the already-proved host length alias.
-                              (if-let [backing-id (launch/backing-extent-id expression)]
-                                (or (some (fn [[scalar definition]]
-                                            (when (= backing-id (launch/backing-extent-id definition)) scalar))
-                                          (sort-by (comp str key) derived-scalars))
-                                    expression)
+                              (if (launch/backing-extent-id expression)
+                                (or (backing-length-alias derived-scalars expression) expression)
                                 expression))]
-                        (when-not (map-reads/capacity-covers? capacity required)
+                        (when-not (or (map-reads/capacity-covers? capacity required)
+                                      ;; Only a projected backing leaf is compile-time equality.
+                                      ;; A public scalar requirement must be checked at binding,
+                                      ;; even if source host equations prove it aliases capacity.
+                                      (and (launch/backing-extent-id required)
+                                           (map-reads/capacity-covers?
+                                            (launch/rebind-expression capacity derived-scalars) required)))
                           {:expression (checked-expression capacity) :op :>=
                            :value (checked-expression required)}))))
               distinct
