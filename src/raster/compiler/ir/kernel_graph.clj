@@ -10,7 +10,8 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-precondition :as precondition]
-            [raster.compiler.ir.segop :as segop]))
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.static-validation :as validation]))
 
 (defrecord GraphBuffer [id dtype elements memory-space role])
 (defrecord GraphScalar [id dtype])
@@ -215,7 +216,7 @@
                                :expected-kind expected-kind})))))))
     graph))
 
-(defn validate!
+(defn- validate-uncached!
   "Validate a KernelGraph and return it unchanged.
 
    Besides structural checks this proves the property that motivated the first graph conversion:
@@ -382,6 +383,11 @@
             (throw (ex-info "kernel graph does not write every output"
                             {:outputs output-ids :written graph-writes}))))))
     graph))
+
+(defn validate!
+  "Validate structure, temporary initialization and dependency hazards of a KernelGraph."
+  [graph]
+  (validation/validate validate-uncached! graph))
 
 (defn make
   "Construct and verify a scheduled KernelGraph from explicit compiler values."

@@ -38,6 +38,7 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
+            [raster.compiler.ir.static-validation :as validation]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
             [raster.gpu.measurement :as measurement]
@@ -2293,7 +2294,7 @@
 
 (declare run-kernel-graph!)
 
-(defn invoke-staged-executable!
+(defn- invoke-staged-executable-in-context!
   "Execute a registered KernelDispatch through the common KernelExecutable session machinery.
 
    This is the ordinary compiled-function staging contract: JVM primitive arrays are copied in
@@ -2302,7 +2303,7 @@
    execution belongs to compile-gpu-program plus LinkPlan, which uses the same executable binder.
    Optional :none result policy copies every write back but returns nil for effect-only calls."
   ([device-id dispatch-id runtime-arguments]
-   (invoke-staged-executable! device-id dispatch-id runtime-arguments :single))
+   (invoke-staged-executable-in-context! device-id dispatch-id runtime-arguments :single))
   ([device-id dispatch-id runtime-arguments result-policy]
   (when-not (contains? #{:single :none} result-policy)
     (throw (ex-info "unsupported staged executable result policy" {:result-policy result-policy})))
@@ -2343,6 +2344,16 @@
                   :when (and write? (not resident?))]
             (download-range! session key value {:elements elements})))
         (when (= :single result-policy) (some-> (first result-pairs) second)))))))
+
+(defn invoke-staged-executable!
+  "Stage a registered executable with request-local static validation reuse.
+   Scalars, applicability, capacities, aliases and resource lifetimes are checked each call.
+   Host arrays are copied in/out; borrowed resident buffers retain their existing ownership."
+  ([device-id dispatch-id runtime-arguments]
+   (invoke-staged-executable! device-id dispatch-id runtime-arguments :single))
+  ([device-id dispatch-id runtime-arguments result-policy]
+   (validation/with-validation-scope
+    #(invoke-staged-executable-in-context! device-id dispatch-id runtime-arguments result-policy))))
 
 (defn kernel-graph-execution-plan
   "Return the pure backend-neutral queue/event plan for a bound KernelGraph."

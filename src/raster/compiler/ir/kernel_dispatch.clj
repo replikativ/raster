@@ -10,7 +10,8 @@
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.kernel-precondition :as precondition]
-            [raster.compiler.ir.semantic-fingerprint :as fingerprint]))
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
+            [raster.compiler.ir.static-validation :as validation]))
 
 (defrecord KernelDispatch
            [id
@@ -180,7 +181,7 @@
       (throw (ex-info "kernel dispatch has an unsupported selector"
                       {:id (:id dispatch) :selector (:selector dispatch)})))))
 
-(defn validate!
+(defn- validate-uncached!
   "Validate a dispatch and return it unchanged.
 
    Alternatives must have unique strategy identities and identical target, ABI, compiler argument
@@ -237,6 +238,11 @@
         (throw (ex-info "kernel dispatch metadata must be maps"
                         {:id id :field field :value value}))))
     dispatch))
+
+(defn validate!
+  "Validate alternative interfaces and selectors; runtime admission remains a separate check."
+  [dispatch]
+  (validation/validate validate-uncached! dispatch))
 
 (defn make
   [{:keys [id alternatives default-strategy selector provenance attributes]

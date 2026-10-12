@@ -9,7 +9,8 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.static-validation :as validation]))
 
 (defn kernel-executable?
   [value]
@@ -122,7 +123,7 @@
                              :node id :expected scalar-uses :actual actual-scalar-uses}))))))
     graph))
 
-(defn validate!
+(defn- validate-uncached!
   "Validate an emitted executable and return it unchanged."
   [executable]
   (case (kind executable)
@@ -151,6 +152,11 @@
       graph)
     (throw (ex-info "kernel executable must be an artifact or graph"
                     {:executable executable :actual (type executable)}))))
+
+(defn validate!
+  "Validate the complete static executable contract, returning the exact executable unchanged."
+  [executable]
+  (validation/validate validate-uncached! executable))
 
 (defn target [executable]
   (:target (first (artifacts (validate! executable)))))

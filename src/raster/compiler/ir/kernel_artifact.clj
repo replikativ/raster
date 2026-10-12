@@ -10,7 +10,8 @@
   (:require [clojure.string :as str]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.kernel-precondition :as precondition]))
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.static-validation :as validation]))
 
 (defrecord KernelArtifact
            [kernel-name   ;; emitted entry-point string
@@ -56,7 +57,7 @@
   (let [contract (compilation artifact)]
     (cond-> identity (seq contract) (assoc :compilation contract))))
 
-(defn validate!
+(defn- validate-uncached!
   "Validate `artifact` and return it unchanged. Validation includes the emitted target C-family
    signature, so no unverified KernelArtifact can enter a runtime registry."
   [artifact]
@@ -107,6 +108,11 @@
       (throw (ex-info "kernel artifact SPIR-V payload must be a non-empty byte array"
                       {:reason :kernel-artifact-spirv-payload :kernel-name kernel-name})))
     artifact))
+
+(defn validate!
+  "Validate an artifact; exact successful structural checks may be reused within one request."
+  [artifact]
+  (validation/validate validate-uncached! artifact))
 
 (defn make
   "Construct and verify a KernelArtifact.  Optional sections default to empty values, but launch
