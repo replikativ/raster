@@ -82,7 +82,7 @@
                 buffer-slots (for [artifact (:kernels emitted)
                                    slot (:abi artifact)
                                    :when (not= :scalar (:kind slot))] slot)]
-            (is (= :float (get-in packet [:values [:binding 'left] :dtype])))
+        (is (= :float (get-in packet [:values 'left :dtype])))
             (when (= kind :legacy-consumer)
               (is (some? (:algorithm (last (:equations packet))))
                   "dense map! retains its actual typed storage contract"))
