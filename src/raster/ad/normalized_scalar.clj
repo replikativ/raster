@@ -30,6 +30,38 @@
   (throw (ex-info "program is outside the checked normalized scalar AD boundary"
                   (assoc data :reason reason :representation :normalized-scalar))))
 
+(def ^:private ^:dynamic *proof-dependencies* nil)
+
+(defn- same-dependency? [a b]
+  (and (identical? (:var a) (:var b))
+       (= (:bound? a) (:bound? b))
+       (identical? (:value a) (:value b))
+       (= (:metadata a) (:metadata b))))
+
+(defn- observe-dependency!
+  "Keep the first effective observation, never bless a later replacement.
+   Collection is request-local; refusal is deferred to preserve earlier diagnostics."
+  [observations sym snapshot]
+  (swap! observations
+         (fn [state]
+           (if-let [first-observation (get-in state [:dependencies sym])]
+             (cond-> state
+               (not (same-dependency? first-observation snapshot))
+               (update :disagreements conj sym))
+             (assoc-in state [:dependencies sym] snapshot)))))
+
+(defn- dependency-snapshot [v]
+  (let [is-bound (bound? v)]
+    {:var v :bound? is-bound :value (when is-bound (var-get v)) :metadata (meta v)}))
+
+(defn- check-dependencies! [observations source-ns]
+  (let [{:keys [dependencies disagreements]} @observations]
+    (doseq [[sym snapshot] dependencies]
+      (let [v (ns-resolve source-ns sym)]
+        (when-not (and (not (contains? disagreements sym))
+                       (var? v) (same-dependency? snapshot (dependency-snapshot v)))
+          (fail! :ad-normalized-execution-callee {:callee sym}))))))
+
 (defn- scalar-dtype! [value]
   (av/validate! value)
   (when-not (and (= :tensor (:kind value)) (= [] (:shape value))
@@ -88,14 +120,21 @@
    Runtime implementation objects are compared here, never serialized as AD identities."
   [call argument-dtypes result-dtype]
   (let [{:keys [operation dispatch? implementation-op]} call
-        operation-var (when (symbol? operation) (resolve operation))]
-    (when (or dispatch? (:raster.core/dispatch-table (meta operation-var)))
+        operation-var (when (symbol? operation) (resolve operation))
+        operation-snapshot (when (var? operation-var) (dependency-snapshot operation-var))]
+    (when (and *proof-dependencies* operation-snapshot)
+      (observe-dependency! *proof-dependencies* operation operation-snapshot))
+    (when (or dispatch? (:raster.core/dispatch-table (:metadata operation-snapshot)))
       (let [argument-tags (mapv tag argument-dtypes)
             selected (dispatch/selected-call-signature
                       operation argument-tags
                       (inference/registered-call-selection operation argument-tags))
             implementation-var (when (and dispatch? (symbol? implementation-op))
-                                 (resolve implementation-op))]
+                                 (resolve implementation-op))
+            implementation-snapshot (when (var? implementation-var)
+                                      (dependency-snapshot implementation-var))]
+        (when (and *proof-dependencies* implementation-snapshot)
+          (observe-dependency! *proof-dependencies* implementation-op implementation-snapshot))
         ;; This scalar vertical admits exact registered homogeneous methods only.
         ;; Promotion or a merely applicable parametric template is not a proof.
         (when-not (and (= :registered (:selection selected))
@@ -103,9 +142,9 @@
                        (= (tag result-dtype) (:return-tag selected))
                        (not (some some? (:promotion-casts selected)))
                        (or (not dispatch?)
-                           (and (var? implementation-var) (bound? implementation-var)
+                           (and (var? implementation-var) (:bound? implementation-snapshot)
                                 (some? (:typed-impl selected))
-                                (identical? @implementation-var (:typed-impl selected)))))
+                                (identical? (:value implementation-snapshot) (:typed-impl selected)))))
           (fail! :ad-normalized-call-contract
                  {:operation operation :implementation implementation-op
                   :arguments argument-tags :result (tag result-dtype)
@@ -421,7 +460,7 @@
    Scope decomposition is owned by form/scope-info. This is a sequential staleness
    fence, not a concurrent Var-mutation/ABA or callable-internal-mutation guarantee."
   [source-ns expected projections]
-  (let [dependencies (atom {})
+  (let [dependencies (atom {:dependencies {} :disagreements #{}})
         resolve-var (fn [sym] (when (symbol? sym) (ns-resolve source-ns sym)))]
     (letfn [(capture-var [sym]
               (let [v (resolve-var sym)]
@@ -429,10 +468,10 @@
                   ;; Realize the first-call JIT before capturing stable execution identity.
                   ;; The existing independent post-capture proof is still required.
                   (core/ensure-bytecode-implementation! v)
-                  (when-not (bound? v)
+                  (let [snapshot (dependency-snapshot v)]
+                  (when-not (:bound? snapshot)
                     (fail! :ad-normalized-execution-callee {:callee sym}))
-                  (swap! dependencies assoc sym
-                         {:var v :value (var-get v) :metadata (meta v)}))))
+                  (observe-dependency! dependencies sym snapshot)))))
             (capture [expression locals]
               (let [{:keys [implementation-op lexical-callee dispatch? operation]}
                     (descriptor/call-description expression)]
@@ -464,15 +503,11 @@
                 (coll? expression) (doseq [e expression] (visit e locals))))]
       (doseq [{:keys [parameters body]} projections]
         (visit body (set parameters))))
-    (let [dependencies @dependencies]
-      (fn []
-        (when-not (= expected (revisions))
-          (fail! :ad-normalized-stale-rules {:expected expected :actual (revisions)}))
-        (doseq [[sym {:keys [var value metadata]}] dependencies]
-          (when-not (and (identical? var (resolve-var sym)) (bound? var)
-                         (identical? value (var-get var)) (= metadata (meta var)))
-            (fail! :ad-normalized-execution-callee {:callee sym})))
-        true))))
+    (fn []
+      (when-not (= expected (revisions))
+        (fail! :ad-normalized-stale-rules {:expected expected :actual (revisions)}))
+      (check-dependencies! dependencies source-ns)
+      true)))
 
 (defn- certificate [bundle]
   (fingerprint/fingerprint
@@ -510,7 +545,8 @@
            cotangent-seed source-ns] :as bundle}]
   (when-not (instance? clojure.lang.Namespace source-ns)
     (fail! :ad-normalized-bundle-interface {:source-ns source-ns}))
-  (binding [*ns* source-ns]
+  (binding [*ns* source-ns
+            *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
     (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
       (fail! :ad-normalized-stale-rules {:expected (select-keys bundle [:template-revision :compiler-revision])
                                          :actual (revisions)}))
@@ -548,6 +584,9 @@
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
     (validate-derivation! bundle)
+    ;; Only successful existing proofs reach this sequential identity fence.
+    ;; It neither skips proof replay nor bridges separate preparation phases.
+    (check-dependencies! *proof-dependencies* source-ns)
     bundle))
 
 (defn- build-bundle [primal {:keys [params tags active-inputs source-ns]} revision]

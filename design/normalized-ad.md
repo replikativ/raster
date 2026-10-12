@@ -548,9 +548,18 @@ snapshot and fresh-zero ownership checks remain. Original projection failures st
 Extending indexed source admission beyond this lambda requires revisiting dependency capture.
 Its physical typed-zero binding is an obligation checked against the canonical
 transpose destination/result alias, not an allocation receipt.
-The delegated validator replays existing registered scalar derivative rules during
-preparation with their exact recorded typed IDs; that correspondence is not independent
-proof of custom-rule mathematics and adds no hot replay. This adds no cache,
+Full scalar validation replays the existing registered derivative rules with the exact
+recorded typed IDs. Within each proof, a request-local collector retains the first resolved
+operation/receiver Var, effective value and metadata actually used by the selected-call
+checks. Later disagreements cannot replace that observation. After the original validation,
+certificate and derivation checks succeed, the proof rechecks those identities; earlier
+refusals and callback exceptions retain precedence. Execution capture shares the same
+first-observation comparison, without a serialized receipt or validation cache.
+This strengthens each proof's sequential lifetime only: it does not span separate proof
+and projection phases, establish concurrent/ABA safety, or independently prove custom-rule
+mathematics. Indexed direct-read admission is not covered by this scalar observation
+collector; its original read remains a dependency of the prepared execution guard.
+Both adapter proofs and the post-capture proof remain required. This adds no cache,
 GPU session or derivative rule owner. General loops, public `deftm` convenience,
 higher-order AD of runtime closures and asynchronous residual ownership remain
 separate capability gates.
