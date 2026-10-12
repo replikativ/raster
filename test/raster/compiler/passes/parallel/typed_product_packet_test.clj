@@ -123,3 +123,16 @@
                           (assoc known :ownership :borrowed)
                           (assoc known :logical-layout {:strides [2]})]]
       (is (thrown? clojure.lang.ExceptionInfo (join known incompatible))))))
+
+(deftest physical-views-do-not-redeclare-a-causal-logical-extent
+  (let [definition (av/tensor {:dtype :double :shape ['rows]})
+        later-view (av/tensor {:dtype :double :shape ['allocation-length]})
+        values {'bias definition}
+        equation {:id :later-update}]
+    (is (= values (#'lower/merge-physical-views values {'bias later-view} equation)))
+    (is (= {'fresh later-view}
+           (#'lower/merge-physical-views {} {'fresh later-view} equation)))
+    (doseq [conflict [(assoc later-view :dtype :float)
+                      (assoc later-view :representation {:kind :quantized :scheme :q4-k})]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (#'lower/merge-physical-views values {'bias conflict} equation))))))

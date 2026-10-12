@@ -751,12 +751,19 @@
            (:raster.op/original (meta producer)))
         "the canonical producer retains diagnostic source provenance")
     (is (= :segop (:dialect scheduled)))
-    (is (= 1 (count (:equations scheduled))))
+    (is (= 2 (count (:equations scheduled))))
     (is (segop/seg-contract? (-> scheduled :equations first :operations first))
         "compatibility scheduling consumes the retained semantic contraction")
-    (is (= unsupported-consumer
-           (-> scheduled :source second (nth 3)))
-        "the actual declining stage stays visible at its original binding")))
+    (is (segop/seg-red? (-> scheduled :equations second :operations first))
+        "sequential-wrapper normalization independently admits the consumer's reduction")
+    (is (= [:binding 'mean]
+           (get-in scheduled [:equations 1 :provenance :compatibility-source-site])))
+    (let [bindings (second (:source scheduled))
+          original (eval (list 'fn '[C n] unsupported-consumer))
+          exposed (eval (list 'fn '[C n] (list 'let* (vec (drop 2 bindings)) 'mean)))]
+      (is (= (original (float-array [-1 2 3.5]) 3)
+             (exposed (float-array [-1 2 3.5]) 3))
+          "the still-host-controlled scalar projection retains the consumer's result"))))
 
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)

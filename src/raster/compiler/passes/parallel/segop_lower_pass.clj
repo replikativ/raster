@@ -250,6 +250,19 @@
         values (:operations equation))))
    values equations))
 
+(defn- merge-physical-views
+  "Import a packet's physical access view without replacing an earlier causal value contract.
+   The retained algorithm and graph range certificates still own each read/write footprint."
+  [values physical-values equation]
+  (reduce-kv
+   (fn [values id view]
+     (if-let [definition (get values id)]
+       (do (ensure-use-compatible! id definition view
+                                   {:equation-id (:id equation) :role :physical-storage-view})
+           values)
+       (assoc values id view)))
+   values (or physical-values {})))
+
 (defn- build-program
   [source lowered-equations declined device-id dtype]
   (let [{:keys [equations values]}
@@ -280,7 +293,7 @@
                                                           :equation-source (:source equation)})
                                  values)
                              (merge-values values {value-id (get operand-values source-id)})))
-                         (merge-values (:values state) (or physical-values {}))
+                         (merge-physical-views (:values state) physical-values equation)
                          (map vector (:operands equation) operands))
                  values-with-results
                  (reduce (fn [values [source-id value-id]]
@@ -780,8 +793,11 @@
                            :pairs [] :body [] :equations []}
                           (concat (map-indexed
                                    (fn [idx [sym expression]]
-                                     [[:binding sym] sym expression
-                                      (:raster.compiler/lexical-origin (meta sym))]) pairs)
+                                     (let [origin (:raster.compiler/lexical-origin (meta sym))
+                                           sym (with-meta sym
+                                                 (not-empty (dissoc (meta sym)
+                                                                   :raster.compiler/lexical-origin)))]
+                                       [[:binding sym] sym expression origin])) pairs)
                                   (map-indexed (fn [idx expression]
                                                  [[:body idx] (gensym "body_parallel_") expression
                                                   [:body (+ (max 0 (dec original-body-count)) idx)]])
