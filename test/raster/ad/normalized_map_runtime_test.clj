@@ -85,7 +85,7 @@
 (deftest runtime-does-not-sidestep-bundle-validation
   (let [checked (bundle (#'element/map-program :double))]
     (is (some? (reason #(runtime/prepare (assoc checked :certificate {})))))
-    (is (= :ad-map-runtime-bundle
+    (is (= :ad-program-bundle-scope
            (reason #(runtime/prepare (normalized/linearize-map-element
                                       (#'element/map-program :double)
                                       (the-ns 'raster.ad.normalized-map-runtime-test))))))))

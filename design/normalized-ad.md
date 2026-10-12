@@ -14,6 +14,22 @@ Indexed pullbacks additionally require private index snapshots and a fresh typed
 gradient owner on every call. These are sequential lifetime contracts, not concurrent mutation
 or asynchronous ownership guarantees.
 
+`normalized-program-bundle/adapt` is the single strict evidence-to-owner boundary. It recognizes
+only the exact existing map, map-sum or indexed facet set; missing, nil and mixed facets refuse.
+Named adapters delegate to the same construction/validation authority. Runtime `prepare-owner`
+accepts and independently validates a canonical owner, while compatibility `prepare` performs
+canonical adaptation first. Runtime no longer interprets legacy evidence facets to select an
+adapter or admit a family. It still enforces kind-specific numerical/physical requirements.
+
+Both entries use one private consumer of freshly validated owners, retaining independent
+post-callee-capture validation. Compatibility preparation keeps its existing three scalar
+evidence validations; direct owner preparation performs two. These are preparation-only,
+not hot-call replay. This cleanup introduces no proof-skipping flag, public trusted receipt
+or validation cache. Invalid evidence passed
+to compatibility preparation now reports canonical `:ad-program-bundle-scope`, replacing the
+runtime's `:ad-map-runtime-bundle`/`:ad-map-runtime-composition` classifications. Execution and
+gradient semantics are unchanged; general equation composition and default AD migration remain open.
+
 Checked two-equation pure-spine append now builds the admitted map→ordered-sum programs;
 it is not yet a general differentiation rule for arbitrary equation chains.
 General equation composition, conditional/loop AD regions, device execution of these normalized

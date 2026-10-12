@@ -22,9 +22,9 @@
 (deftest indexed-execution-is-owned-by-the-canonical-envelope
   (let [evidence (bundle :double :long 'n 'm)
         owner (atom nil) validated (atom []) materializations (atom 0)
-        adapt canonical/adapt-indexed-map validate canonical/validate!
+        adapt canonical/adapt validate canonical/validate!
         materialize route/materialize-host-program]
-    (with-redefs [canonical/adapt-indexed-map
+    (with-redefs [canonical/adapt
                   (fn [b] (let [result (adapt b)] (reset! owner result) result))
                   canonical/validate!
                   (fn [b] (swap! validated conj b) (validate b))
@@ -42,7 +42,7 @@
         (is (= [0.0 3.0 0.0] (vec g)))
         (is (= [0.5 0.5] (vec tangent)))
         (is (= (mapv :id (get-in @owner [:interface :inputs])) (:inputs prepared)))
-        (is (= 2 preparation-proofs) "adapter canonical proof plus independent post-capture proof")
+        (is (= 2 preparation-proofs) "adapter canonical proof and independent post-capture proof")
         (is (= preparation-proofs (count @validated)) "no hot canonical proof replay")
         (is (= 3 preparation-materializations @materializations) "only three generated projections, none hot")
         (is (every? #(identical? @owner %) @validated)
@@ -83,7 +83,7 @@
                      (assoc-in owner [:physical-bindings destination :consumer :result] destination)]]
       (let [changed (assoc changed :certificate (#'canonical/certificate changed))
             compiled (atom 0)]
-        (with-redefs-fn {#'canonical/adapt-indexed-map (constantly changed)
+        (with-redefs-fn {#'canonical/adapt (constantly changed)
                         #'runtime/compile-projection (fn [& _] (swap! compiled inc))}
           #(do
              (is (= :ad-program-bundle-correspondence (reason (fn [] (runtime/prepare evidence)))))
@@ -271,7 +271,7 @@
     (is (= [0.0 3.0 0.0] (vec (gradient prepared pb (double-array [1.0 2.0])))))
     (is (some? (reason #(runtime/prepare (assoc-in b [:gather-programs :required-zero-gradient :exclusive] false)))))
     (doseq [facet [:map-programs :sum-programs]]
-      (is (= :ad-map-runtime-composition (reason #(runtime/prepare (assoc b facet {}))))))
+      (is (= :ad-program-bundle-scope (reason #(runtime/prepare (assoc b facet {}))))))
     (with-redefs-fn {revisions (constantly (update revision :template-revision inc)) invoke (fn [& _] (swap! calls inc))}
       (fn []
         (is (= :ad-normalized-stale-rules (reason #((:vjp prepared) arguments))))

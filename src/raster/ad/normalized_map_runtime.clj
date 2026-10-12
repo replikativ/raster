@@ -37,8 +37,8 @@
     (scalar! value (:dtype abstract-value) role)
     (array! value (:dtype abstract-value) extent role)))
 
-(defn prepare
-  "Compile existing primal/linear/transpose host projections once.
+(defn- prepare-validated-owner
+  "Compile a freshly validated canonical owner's host projections once.
 
   Returns {:inputs ordered-source-ids :vjp fn :jvp fn}. (:vjp prepared) takes
   an ordered argument vector and returns [output pullback]; pullback takes an
@@ -55,19 +55,8 @@
   width. Their explicit data tangent has data capacity, their seed has output extent, and each
   pullback owns a new typed-zero data gradient. No source data, indices or returned output is saved.
   This is not implicit-seed value+grad, device execution, or general loop AD."
-  [bundle]
-  (when (and (:gather-programs bundle)
-             (or (contains? bundle :map-programs) (contains? bundle :sum-programs)))
-    (fail! :ad-map-runtime-composition {:facets (set (keys (select-keys bundle [:map-programs :sum-programs :gather-programs])))}))
-  (when-not (or (:map-programs bundle) (:gather-programs bundle))
-    (normalized/validate! bundle)
-    (fail! :ad-map-runtime-bundle {}))
+  [owner]
   (let [expected (normalized/revisions)
-        ;; Legacy evidence is admitted only here. Execution below consumes one canonical
-        ;; program/interface/residual owner, including indexed physical obligations.
-        owner ((cond (:gather-programs bundle) canonical/adapt-indexed-map
-                     (:sum-programs bundle) canonical/adapt-map-sum
-                     :else canonical/adapt-map) bundle)
         indexed? (= :checked-scalar-indexed-map (get-in owner [:derivation :kind]))
         sum? (= :checked-scalar-map-sum (get-in owner [:derivation :kind]))
         {:keys [source primal linear transpose interface residual-bindings physical-bindings]} owner
@@ -197,3 +186,21 @@
                               (if indexed? capacity extent) :tangent)
          (let [[output saved] (acquire environment)]
            [output (first (run push (assoc saved (get-in interface [:tangent-input :id]) dx)))])))}))
+
+(defn prepare-owner
+  "Validate a canonical owner and prepare CPU execution through the common private consumer.
+   Returns ordered :inputs, :vjp and :jvp closures. Tangents/seeds use their retained scalar
+   or array spaces; excluded gradient slots are nil. Saved pullbacks own coefficient/index
+   snapshots, not caller arrays. Concurrent input mutation is forbidden. Indexed gradients
+   receive fresh exclusive typed-zero owners. Epoch and executable identities are fenced.
+   No default AD migration, implicit seed, device execution or general equation composition."
+  [owner]
+  (prepare-validated-owner (canonical/validate! owner)))
+
+(defn prepare
+  "Compatibility entry for checked derivation evidence. Canonical adaptation owns family
+   admission; prepare-owner owns host execution. See prepare-owner for value/lifetime contracts."
+  [bundle]
+  ;; Adaptation has just performed independent canonical validation. Reuse the private
+  ;; consumer, not a skip flag: both public entries retain the post-capture proof/fence.
+  (prepare-validated-owner (canonical/adapt bundle)))

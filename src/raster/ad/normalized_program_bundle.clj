@@ -9,22 +9,21 @@
 (defn- fail! [reason data]
   (throw (ex-info "Invalid normalized program bundle" (assoc data :reason reason))))
 
+(defn- evidence-kind! [bundle]
+  (let [facets (select-keys bundle [:map-programs :sum-programs :gather-programs])
+        kind (case (set (keys facets))
+               #{:map-programs} :checked-scalar-map
+               #{:map-programs :sum-programs} :checked-scalar-map-sum
+               #{:gather-programs} :checked-scalar-indexed-map
+               nil)]
+    (when-not (and kind (every? map? (vals facets)))
+      (fail! :ad-program-bundle-scope {:facets (set (keys facets))}))
+    kind))
+
 (defn- checked-evidence! [bundle kind]
-  (when (and (= :checked-scalar-indexed-map kind)
-             (or (contains? bundle :map-programs) (contains? bundle :sum-programs)))
-    (fail! :ad-program-bundle-scope {}))
+  (when-not (= kind (evidence-kind! bundle))
+    (fail! :ad-program-bundle-scope {:kind kind}))
   (scalar/validate! bundle)
-  (when-not (case kind
-              :checked-scalar-map (and (:map-programs bundle)
-                                      (not (contains? bundle :sum-programs))
-                                      (not (contains? bundle :gather-programs)))
-              :checked-scalar-map-sum (and (:map-programs bundle) (:sum-programs bundle)
-                                          (not (contains? bundle :gather-programs)))
-              :checked-scalar-indexed-map (and (:gather-programs bundle)
-                                              (not (contains? bundle :map-programs))
-                                              (not (contains? bundle :sum-programs)))
-              false)
-    (fail! :ad-program-bundle-scope {}))
   bundle)
 
 (defn- value-interface [program id source]
@@ -134,15 +133,25 @@
       (fail! :ad-program-bundle-certificate {})))
   bundle)
 
+(defn- adapt-kind [bundle kind]
+  (let [result (program-envelope (checked-evidence! bundle kind) kind)]
+    ;; Retain independent final validation and epoch/definition checks. Consolidating
+    ;; the boundary is not permission to skip derivation replay during preparation.
+    (validate! (assoc result :certificate (certificate result)))))
+
+(defn adapt
+  "Admit exact checked evidence through the one canonical owner boundary.
+   Missing, nil or mixed family facets refuse before materialization. No execution occurs."
+  [bundle]
+  (adapt-kind bundle (evidence-kind! bundle)))
+
 (defn adapt-map
   "Adapt one existing admitted map to canonical TypedSOAC primal/linear/transpose programs.
    Existing map APIs/runtimes remain unchanged; sum/indexed/composed programs are not admitted.
    No allocation or execution occurs. The evidence is transitional and may be retired only
    after a common program validator owns the same source/derivative/ownership obligations."
   [bundle]
-  (let [kind :checked-scalar-map
-        result (program-envelope (checked-evidence! bundle kind) kind)]
-    (validate! (assoc result :certificate (certificate result)))))
+  (adapt-kind bundle :checked-scalar-map))
 
 (defn adapt-map-sum
   "Adapt an existing checked map→ordered sum without changing its reduction or execution.
@@ -150,9 +159,7 @@
    retain their original tuple-map producers. Indexed/ambiguous evidence refuses. No new
    composition, rules, reassociation permission, physical obligations or runtime mode is added."
   [bundle]
-  (let [kind :checked-scalar-map-sum
-        result (program-envelope (checked-evidence! bundle kind) kind)]
-    (validate! (assoc result :certificate (certificate result)))))
+  (adapt-kind bundle :checked-scalar-map-sum))
 
 (defn adapt-indexed-map
   "Project existing checked functional indexed-map programs without changing execution.
@@ -161,6 +168,4 @@
    destination/result alias; they are obligations, never allocation or initialization receipts.
    Data and result extents remain distinct. Map/sum mixtures refuse."
   [bundle]
-  (let [kind :checked-scalar-indexed-map
-        result (program-envelope (checked-evidence! bundle kind) kind)]
-    (validate! (assoc result :certificate (certificate result)))))
+  (adapt-kind bundle :checked-scalar-indexed-map))
