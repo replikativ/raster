@@ -474,6 +474,19 @@
                            :return-tag return-tag}
                           e))))))))))
 
+(clojure.core/defn ^:no-doc ensure-bytecode-implementation!
+  "Realize an existing lazy typed implementation without invoking its numerical body.
+   Uses the same first-call lock and failure policy as ordinary deftm dispatch."
+  [impl-var]
+  (when (::jit-spec (meta impl-var))
+    (locking impl-var
+      (when-let [spec (::jit-spec (meta impl-var))]
+        (do-bytecode-upgrade!
+         impl-var (:mangled-sym spec) (:params spec) (:tags spec) (:return-tag spec)
+         (:walked-body spec) (the-ns (:source-ns-name spec)) (:typed-iface-name spec)
+         :annotations (:annotations spec) :source-body (:source-body spec))
+        (alter-meta! impl-var dissoc ::jit-spec)))))
+
 ;; ================================================================
 ;; Walked body registry — avoids quoting large walked bodies into
 ;; macro expansions, which would hit Clojure's 64KB method limit when
@@ -824,17 +837,7 @@
                 `(defn ~mangled ~@(when docstring [docstring])
                    [~'& ~args-sym]
                    (let [iv# (resolve '~impl-var-sym)]
-                     (when (::jit-spec (meta iv#))
-                       (locking iv#
-                         (when-let [spec# (::jit-spec (meta iv#))]
-                           (do-bytecode-upgrade!
-                            iv# (:mangled-sym spec#)
-                            (:params spec#) (:tags spec#) (:return-tag spec#)
-                            (:walked-body spec#) (the-ns (:source-ns-name spec#))
-                            (:typed-iface-name spec#)
-                            :annotations (:annotations spec#)
-                            :source-body (:source-body spec#))
-                           (alter-meta! iv# dissoc ::jit-spec))))
+                     (ensure-bytecode-implementation! iv#)
                      (apply (deref iv#) ~args-sym))))
           ;; No typed interface (rare): must use Clojure-compiled defn
               `(defn ~mangled ~@(when docstring [docstring]) ~hinted-params ~@walked-body))
@@ -869,17 +872,7 @@
                      impl-var-sym (symbol (str (ns-name *ns*)) (str mangled-impl-var))
                  ;; JIT trigger: check ::jit-spec, compile, swap
                      jit-trigger `(when-let [iv# (resolve '~impl-var-sym)]
-                                    (when (::jit-spec (meta iv#))
-                                      (locking iv#
-                                        (when-let [spec# (::jit-spec (meta iv#))]
-                                          (do-bytecode-upgrade!
-                                           iv# (:mangled-sym spec#)
-                                           (:params spec#) (:tags spec#) (:return-tag spec#)
-                                           (:walked-body spec#) (the-ns (:source-ns-name spec#))
-                                           (:typed-iface-name spec#)
-                                           :annotations (:annotations spec#)
-                                           :source-body (:source-body spec#))
-                                          (alter-meta! iv# dissoc ::jit-spec)))))]
+                                    (ensure-bytecode-implementation! iv#))]
                  [`(import ~typed-iface-name)
               ;; Minimal deftype: .invk triggers JIT then delegates to boxed defn.
               ;; The defn stub also triggers JIT, so double-trigger is safe (locking).
@@ -913,17 +906,7 @@
                                          `(fn [~'& ~'args]
                                         ;; Trigger lazy JIT if not yet compiled
                                             (let [iv# (var ~mangled-impl-var)]
-                                              (when (::jit-spec (meta iv#))
-                                                (locking iv#
-                                                  (when-let [spec# (::jit-spec (meta iv#))]
-                                                    (do-bytecode-upgrade!
-                                                     iv# (:mangled-sym spec#)
-                                                     (:params spec#) (:tags spec#) (:return-tag spec#)
-                                                     (:walked-body spec#) (the-ns (:source-ns-name spec#))
-                                                     (:typed-iface-name spec#)
-                                                     :annotations (:annotations spec#)
-                                                     :source-body (:source-body spec#))
-                                                    (alter-meta! iv# dissoc ::jit-spec)))))
+                                              (ensure-bytecode-implementation! iv#))
                                         ;; Route through -impl (after JIT: compiled class with IFn)
                                             (apply (deref (var ~mangled-impl-var)) ~'args))
                                          nil)

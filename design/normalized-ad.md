@@ -516,6 +516,10 @@ private canonical program owner. Full producer/rule validation runs during prepa
 Hot primal/JVP/pullback calls use existing compiler/template epochs and effective
 executable Var identity checks before and after execution, rather than repeating
 full validation or materialization. Dynamic Var bindings are part of effective identity;
+Preparation realizes pending typed callees through the existing first-call JIT owner,
+without invoking their numerical bodies, before capturing identity. The generated AD
+runtime dependency is loaded before bundle epochs are established. The post-capture
+proof still checks the realized selected implementation; a later replacement refuses.
 persistent alias root replacement therefore refuses even without an epoch change.
 This is a sequential fence, not a concurrent raw Var mutation/ABA or callable-internal
 mutation guarantee. Indexed execution retains its existing per-invocation validation.

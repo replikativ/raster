@@ -6,6 +6,9 @@
    The closed first vertical deliberately rejects effects, scopes and active precision changes."
   (:require [clojure.set :as set]
             [raster.ad.templates :as templates]
+            ;; Existing rule emitters produce grad-acc; its runtime Var must exist
+            ;; before source/rule epochs and executable dependencies are captured.
+            [raster.ad.reverse]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.dispatch :as dispatch]
@@ -423,6 +426,9 @@
     (letfn [(capture-var [sym]
               (let [v (resolve-var sym)]
                 (when (var? v)
+                  ;; Realize the first-call JIT before capturing stable execution identity.
+                  ;; The existing independent post-capture proof is still required.
+                  (core/ensure-bytecode-implementation! v)
                   (when-not (bound? v)
                     (fail! :ad-normalized-execution-callee {:callee sym}))
                   (swap! dependencies assoc sym
