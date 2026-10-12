@@ -109,6 +109,88 @@
     (catch clojure.lang.ExceptionInfo exception
       (:reason (ex-data exception)))))
 
+(defn- backing-length-program [length-expression]
+  (let [source (list 'let* ['n length-expression
+                            'result '(raster.par/reduce acc 0.0 i n (+ acc (aget xs i)))]
+                     'result)
+        options {:dtype :double :target-device :ocl:0 :array-types {'xs :double}
+                 :values {'xs (av/tensor {:dtype :double :shape [32]})}}
+        typed (frontend/form->program source options)]
+    (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))))
+
+(deftest exact-backing-length-does-not-equate-logical-shape-and-allocation
+  (let [scheduled (backing-length-program '(clojure.core/long (clojure.core/alength xs)))
+        {:keys [body graph]} (equation-graph/make-for-equation scheduled (last (:equations scheduled)))]
+    (is (= [32] (get-in scheduled [:values 'xs :shape])))
+    (is (= {'n '(extent xs)}
+           (equation-graph/derived-scalar-expressions (:values body) (:equations body))))
+    (is (= '(extent xs) (:elements (first (:inputs graph)))))
+    (is (empty? (:preconditions graph)))))
+
+(deftest backing-length-alias-requires-an-exact-integral-spine
+  (doseq [expression ['(clojure.core/long (clojure.core/dec (clojure.core/alength xs)))
+                      '(clojure.core/long (clojure.core/min 32 (clojure.core/alength xs)))
+                      '(clojure.core/long (clojure.core/double (clojure.core/alength xs)))]]
+    (let [scheduled (backing-length-program expression)
+          {:keys [body graph]} (equation-graph/make-for-equation scheduled (last (:equations scheduled)))]
+      (is (empty? (equation-graph/derived-scalar-expressions (:values body) (:equations body))))
+      (is (= 32 (:elements (first (:inputs graph)))))
+      (is (seq (:preconditions graph))))))
+
+(deftest backing-length-proof-preserves-width-and-qualified-identity
+  (let [values {'xs (av/tensor {:dtype :double :shape [32]})
+                'n (av/tensor {:dtype :long :shape []})}
+        prove #(deref #'equation-graph/backing-length-definition)
+        length '(clojure.core/alength xs)
+        exact (soac/scalar-convert {:source-dtype :int :target-dtype :long
+                                   :rounding :exact :overflow :exact
+                                   :source-op 'clojure.core/long} length)]
+    (is (= ['n '(extent xs)] ((prove) values ['xs] 'n exact)))
+    (is (= ['n '(extent xs)]
+           ((prove) values ['xs] 'n '(clojure.core/long (clojure.core/long (clojure.core/alength xs))))))
+    (doseq [expression ['(clojure.core/long (alength xs))
+                        '(clojure.core/long (clojure.core/alength other))
+                        '(clojure.core/long (clojure.core/int (clojure.core/long (clojure.core/alength xs))))
+                        (with-meta '(clojure.core/long (clojure.core/alength xs))
+                          {:raster.op/lexical-callee true})]]
+      (is (nil? ((prove) values ['xs] 'n expression))))
+    (is (nil? ((prove) (assoc-in values ['n :shape] [1]) ['xs] 'n exact)))))
+
+(deftest exact-backing-refinement-is-read-only-external-plain-storage
+  (let [plain (av/tensor {:dtype :double :shape [32]})
+        eligible? (deref #'equation-graph/exact-external-backing-read?)]
+    (is (true? (eligible? {'xs plain} #{'xs} #{} 'xs '(extent xs))))
+    (doseq [[values inputs writes requirement]
+            [[{'xs plain} #{} #{} '(extent xs)]
+             [{'xs plain} #{'xs} #{'xs} '(extent xs)]
+             [{'xs plain} #{'xs} #{} '(extent other)]
+             [{'xs plain} #{'xs} #{} 32]
+             [{'xs (assoc plain :logical-layout :strided)} #{'xs} #{} '(extent xs)]
+             [{'xs (assoc plain :representation {:kind :quantized})} #{'xs} #{} '(extent xs)]]]
+      (is (not (eligible? values inputs writes 'xs requirement))))))
+
+(deftest backing-allocation-identity-does-not-swallow-an-independent-minimum
+  (let [source '(let* [n (clojure.core/long (clojure.core/alength xs))
+                       sum (raster.par/reduce acc 0.0 i n (+ acc (aget xs i)))
+                       result (raster.par/pmap j minimum double (aget xs j))]
+                 result)
+        options {:dtype :double :target-device :ocl:0 :array-types {'xs :double}
+                 :scalar-types {'minimum :long}
+                 :values {'xs (av/tensor {:dtype :double :shape [32]})}}
+        typed (frontend/form->program source options)
+        scheduled (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))
+        equations (filterv (comp seq :operations) (:equations scheduled))
+        {:keys [graph]} (equation-graph/make-for-equations scheduled equations)]
+    (is (= '(extent xs) (:elements (first (:inputs graph)))))
+    (is (some #(and (= 'n (:expression %)) (= 'minimum (:value %)))
+              (:preconditions graph)))
+    (is (= :kernel-precondition-failed
+           (reason-of #(precondition/check!
+                        (:preconditions graph)
+                        (fn [leaf] (case leaf (extent xs) 5 minimum 6 n 5))))))
+    (is (true? (precondition/check! (:preconditions graph)
+                                   (fn [leaf] (case leaf (extent xs) 7 minimum 6 n 7)))))))
+
 (deftest contiguous-equations-form-one-exact-semantic-source-graph
   (let [scheduled (scheduled-three-maps)
         equations (subvec (:equations scheduled) 0 2)

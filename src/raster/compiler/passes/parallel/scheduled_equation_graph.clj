@@ -6,6 +6,8 @@
    contracts; source spelling and operation-family names play no role."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-closure :as contraction-closure]
@@ -94,12 +96,51 @@
             [(first results)
              (util/subst-syms substitutions (first body-results))]))))))
 
+(defn- backing-length-definition
+  "Prove only an exact length/cast spine, not arbitrary arithmetic over a tensor capture.
+   Allocation extents are long runtime identities; logical tensor shape is not consulted."
+  [values captures result expression]
+  (letfn [(length-proof [form]
+            (if-let [{:keys [attributes operand]} (conversion/canonical-parts form)]
+              (when-let [[id source] (length-proof operand)]
+                (when (and (= source (:source-dtype attributes))
+                           (contains? #{:int :long} (:target-dtype attributes))
+                           (= [:exact :exact] [(:rounding attributes) (:overflow attributes)]))
+                  [id (:target-dtype attributes)]))
+              (let [operation (descriptor/semantic-op form)
+                    arguments (descriptor/call-args form)]
+                (when (= 1 (count arguments))
+                  (let [argument (first arguments)
+                        dimension-rule (descriptor/get-dim-rule operation)
+                        dimension (when dimension-rule
+                                    (dimension-rule arguments {} (set captures)))
+                        target (some-> operation descriptor/cast-result-tag
+                                       dtype/dtype-for-scalar-tag dtype/canon)]
+                    (cond
+                      ;; The qualified descriptor owns this array-length identity. A local or
+                      ;; bare function named alength has no such rule and cannot supply proof.
+                      (and (= dimension (list 'clojure.core/alength argument))
+                           (symbol? argument) (contains? (set captures) argument)
+                           (= :tensor (:kind (get values argument)))
+                           (seq (:shape (get values argument))))
+                      [argument :int]
+
+                      (contains? #{:int :long} target)
+                      (when-let [[id source] (length-proof argument)]
+                        (when (= [:exact :exact] (conversion/policy source target))
+                          [id target]))))))))]
+    (when-let [[id result-dtype] (length-proof expression)]
+      (when (and (integral-scalar-value? (get values result))
+                 (= :long result-dtype (some-> (get values result) :dtype dtype/canon)))
+        [result (list 'extent id)]))))
+
 (defn- launch-definition
   [values bindings equation]
   (when-let [[result expression] (scalar-result-expression equation)]
     (let [{:keys [captures]} (soac/operation-parts
                               (first (soac/equations (:algorithm equation))))]
-      (when (and (integral-scalar-value? (get values result))
+      (or (backing-length-definition values captures result expression)
+          (when (and (integral-scalar-value? (get values result))
                  (every? #(integral-scalar-value? (get values %)) captures))
         (try
           (let [narrowing-cast?
@@ -134,7 +175,7 @@
           ;; Scalar equations also represent ordinary arithmetic.  Only the monotone, integral
           ;; subset accepted by KernelLaunch is an allocation definition; other scalar work stays
           ;; opaque at this boundary exactly as before.
-          (catch clojure.lang.ExceptionInfo _ nil))))))
+          (catch clojure.lang.ExceptionInfo _ nil)))))))
 
 (defn derived-scalar-expressions
   "Derive replayable graph-storage expressions from ordered, already-validated scalar equations.
@@ -336,6 +377,14 @@
      :elements (value-elements values derived-scalars value)
      :memory-space (or (:memory-space value) :device)}))
 
+(defn- exact-external-backing-read?
+  [values inputs written-storage id requirement]
+  (let [value (get values id)]
+    (and (contains? inputs id) (not (contains? written-storage id))
+         (= {:kind :plain} (:representation value))
+         (nil? (:logical-layout value))
+         (= id (launch/backing-extent-id requirement)))))
+
 (defn input-storage-context
   "Project known dense input storage and scalar definitions from one exact causal equation slice.
    Unknown allocation extents remain unknown; neither future equations nor iteration size supplies them."
@@ -431,7 +480,7 @@
           [] values))
 
 (defn- public-scalars
-  [scheduled operations buffer-specs]
+  [scheduled operations buffer-specs preconditions]
   (let [operation-required (reduce set/union #{} (map segop/operation-scalars operations))
         ;; KernelLaunch intentionally permits a compound list identity such as `(extent input)`
         ;; as one resolver-owned leaf.  It is not a graph scalar and must not be destructured or
@@ -443,7 +492,11 @@
               (reduce set/union #{}
                       (map #(launch/expression-references (:elements %))
                            (vals buffer-specs))))
-        required (set/union operation-required storage-required)
+        condition-required (reduce set/union #{}
+                                   (mapcat (fn [{:keys [expression value]}]
+                                             [(launch/expression-references expression)
+                                              (launch/expression-references value)]) preconditions))
+        required (set/union operation-required storage-required condition-required)
         ordered (ordered-distinct
                  (concat (filter required (:inputs scheduled))
                          (sort-by pr-str (remove (set (:inputs scheduled)) required))))
@@ -458,7 +511,7 @@
                 (fail! :scheduled-equation-scalar-shape
                        "scheduled scalar dependency must have scalar shape"
                        {:value id :shape (:shape value)}))
-              (when (and (contains? storage-required id)
+              (when (and (or (contains? storage-required id) (contains? condition-required id))
                          (not (integral-scalar-value? value)))
                 (fail! :scheduled-equation-storage-scalar
                        "graph storage algebra must close over a declared integral scalar"
@@ -511,6 +564,7 @@
                      :algorithm-outputs (soac/outputs algorithm)
                      :scheduled-outputs (:outputs scheduled)}))
          operations (vec (mapcat :operations numerical-equations))
+         written-storage (reduce set/union #{} (map segop/operation-outputs operations))
          _ (when (empty? operations)
              (fail! :scheduled-equation-empty
                     "a KernelGraph requires at least one scheduled operation" {}))
@@ -563,7 +617,12 @@
          read-requirements
          (reduce
           (fn [requirements [operation certificate]]
-            (let [marked-inputs
+            (let [fold-reads (map-reads/fold-read-requirements operation map-read-options)
+                  backing-read? (fn [[id extent]]
+                                  (exact-external-backing-read?
+                                   values inputs written-storage
+                                   id (launch/rebind-expression extent derived-scalars)))
+                  marked-inputs
                   (set/intersection
                    (set (:inputs operation))
                    (set (mapcat #(get-in (soac/operation-parts %)
@@ -571,6 +630,7 @@
                                 (filter #(= (second %) (:algorithm-equation operation))
                                         retained-equations))))]
             (if (and (or (seq marked-inputs)
+                         (some backing-read? (concat (:requirements certificate) fold-reads))
                          (some (fn [id]
                              (unresolved-capacity? id (get values id)
                                                    (get-in buffer-specs [id :elements])))
@@ -582,8 +642,7 @@
                                 (and (= {:kind :plain} (:representation value))
                                      (nil? (:logical-layout value))))))
                         (:inputs operation)))
-              (let [fold-reads (map-reads/fold-read-requirements operation map-read-options)
-                    pure-map? (and (segop/seg-map? operation)
+              (let [pure-map? (and (segop/seg-map? operation)
                                    (:out-sym operation)
                                    (not (seq (get-in operation [:scalar-region :effects]))))
                     independent-reads (when pure-map?
@@ -603,6 +662,9 @@
                     derived (merge-with (fn [left right]
                                           (if (= left right) left (launch/maximum left right)))
                                         optional-reads static-reads)
+                    derived (into {} (map (fn [[id extent]]
+                                            [id (launch/rebind-expression extent derived-scalars)]))
+                                  derived)
                     _ (doseq [id marked-inputs
                               :when (not (contains? derived id))]
                           (fail! :scheduled-equation-read-capacity
@@ -622,9 +684,19 @@
           (map vector operations read-capacity-certificates))
          buffer-specs (reduce-kv
                        (fn [specs id requirements]
-                         (if (not (unresolved-capacity?
+                         (cond
+                           (some #(exact-external-backing-read?
+                                   values inputs written-storage
+                                   id %) requirements)
+                           ;; One exact backing read establishes allocation identity. Other
+                           ;; independent minima remain preconditions, not a fabricated maximum.
+                           (assoc-in specs [id :elements] (list 'extent id))
+
+                           (not (unresolved-capacity?
                                     id (get values id) (get-in specs [id :elements])))
                            specs
+
+                           :else
                            (let [extents (vec (distinct requirements))
                                  required (if (= 1 (count extents)) (first extents)
                                               (apply launch/maximum extents))]
@@ -680,12 +752,23 @@
                                         (throw error))))))
                               retained-equations))
               (keep (fn [[id required]]
-                      (let [capacity (get-in buffer-specs [id :elements])]
+                      (let [capacity (get-in buffer-specs [id :elements])
+                            checked-expression
+                            (fn [expression]
+                              ;; Preconditions close over integral SSA slots, not opaque
+                              ;; buffer identities. Replay the already-proved host length alias.
+                              (if-let [backing-id (launch/backing-extent-id expression)]
+                                (or (some (fn [[scalar definition]]
+                                            (when (= backing-id (launch/backing-extent-id definition)) scalar))
+                                          (sort-by (comp str key) derived-scalars))
+                                    expression)
+                                expression))]
                         (when-not (map-reads/capacity-covers? capacity required)
-                          {:expression capacity :op :>= :value required}))))
+                          {:expression (checked-expression capacity) :op :>=
+                           :value (checked-expression required)}))))
               distinct
               vec)
-         scalars (public-scalars scheduled operations buffer-specs)]
+         scalars (public-scalars scheduled operations buffer-specs capacity-preconditions)]
      (let [kernel-graph
            (graph/from-segops
             operations
