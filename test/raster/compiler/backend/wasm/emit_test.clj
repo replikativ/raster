@@ -200,6 +200,15 @@
       (is (= 7.0 (.readDouble mem 0)))
       (is (= 3.0 (.readDouble mem 8))))))
 
+(deftest literal-nil-is-void-only-in-result-position
+  (let [module (we/compile-kernel {:name "nil_tail" :params [] :ir nil :mem-pages 1})
+        inst (instantiate (:bytes module))]
+    (is (= [] (:result-types module)))
+    (is (nil? (.apply (.export inst "nil_tail") (long-array []))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (we/compile-kernel {:name "nil_operand" :params [] :ir '(+ nil 1)
+                                     :mem-pages 1})))))
+
 ;; 1B mechanism: a non-intrinsic deftm callee compiled as its own wasm function,
 ;; invoked via `call` (not inlined). A caller (.invk callee-key args) whose op is
 ;; non-intrinsic and whose key is in the module's fn-index emits a wasm call; the

@@ -1000,6 +1000,9 @@
    (void), when (void), and scalar value expressions."
   [ctx node]
   (cond
+    ;; Literal nil is a void tail, not a scalar with a missing retained dtype.
+    ;; Value-position nil remains unsupported by emit-val/infer-vt.
+    (nil? node) [[] nil]
     (and (seq? node) (= 'dotimes (first node))) [(emit-dotimes ctx node) nil]
     ;; void `if` (no else) in tail position — a macroexpanded `when`/`when-let`.
     (and (seq? node) (= 'if (first node)) (= 3 (count node))) [(emit-effect ctx node) nil]
