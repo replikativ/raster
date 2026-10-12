@@ -30,6 +30,13 @@ to compatibility preparation now reports canonical `:ad-program-bundle-scope`, r
 runtime's `:ad-map-runtime-bundle`/`:ad-map-runtime-composition` classifications. Execution and
 gradient semantics are unchanged; general equation composition and default AD migration remain open.
 
+The existing public `:normalized-scalar` JVP and reverse entries share one internal runtime
+lifecycle. Their distinct body projection, compiler adapters and metadata remain unchanged;
+effective-callee capture precedes independent selected-call validation, compilation and every
+invocation retain pre/post fences, and original compilation/execution failures propagate.
+This removes duplicated lifecycle code, not scalar proof checks or the source/default route.
+It is a sequential staleness contract, not protection against concurrent mutation or ABA.
+
 Checked two-equation pure-spine append now builds the admitted map→ordered-sum programs;
 it is not yet a general differentiation rule for arbitrary equation chains.
 General equation composition, conditional/loop AD regions, device execution of these normalized

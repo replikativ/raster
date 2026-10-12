@@ -1419,3 +1419,24 @@
                                       (bindings (:transpose bundle))))
                   (into [(first (soac/outputs (:primal bundle)))]
                         (map gradients (:params bundle))))])))
+
+(defn ^:no-doc guarded-runtime
+  "Internal lifecycle for an already derived scalar projection and its compiler adapter.
+   Capture effective callees, independently revalidate their selected identities, and fence
+   compilation/publication and every invocation. The adapter thunk creates the existing runtime
+   function and must compile the supplied body. It is never user/serialized input and grants
+   no source, operation or numerical capability. Original failures propagate.
+   This is the existing sequential staleness contract, not concurrent mutation protection."
+  [bundle parameters body compile-runtime]
+  (let [source-ns (:source-ns bundle)
+        guard! (execution-guard source-ns (select-keys bundle [:template-revision :compiler-revision])
+                                [{:parameters parameters :body body}])
+        _ (validate! bundle)
+        _ (guard!)
+        runtime-fn (binding [*ns* source-ns] (compile-runtime))
+        _ (guard!)]
+    (fn [& args]
+      (guard!)
+      (let [result (apply runtime-fn args)]
+        (guard!)
+        result))))

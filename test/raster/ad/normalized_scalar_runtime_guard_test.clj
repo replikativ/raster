@@ -47,6 +47,26 @@
                  (count (:raster.core/deftm-tags (meta f)))))
           (is (= 1 (count (:raster.core/deftm-walked-body (meta f))))))))))
 
+(deftest both-public-directions-use-one-runtime-lifecycle-with-existing-proof-counts
+  (doseq [[construct arguments expected _] (constructors)]
+    (let [calls (atom 0) validations (atom 0)
+          prepare normalized/guarded-runtime validate normalized/validate!]
+      (with-redefs [normalized/guarded-runtime
+                    (fn [bundle parameters body compile-runtime]
+                      (swap! calls inc)
+                      (prepare bundle parameters body
+                               (fn []
+                                 (is (identical? (:source-ns bundle) *ns*)
+                                     "runtime compilation retains source namespace")
+                                 (compile-runtime))))
+                    normalized/validate! (fn [bundle] (swap! validations inc) (validate bundle))]
+        (let [f (construct)]
+          (is (= 1 @calls))
+          (is (= 3 @validations) "construction, body projection, and post-capture proof remain")
+          (is (= expected (apply f arguments)))
+          (is (= 1 @calls))
+          (is (= 3 @validations)))))))
+
 (deftest epochs-and-effective-callees-refuse-before-execution
   (doseq [[construct arguments _ _] (constructors)]
     (let [f (construct) revision (normalized/revisions)]
