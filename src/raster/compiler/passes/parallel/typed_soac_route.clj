@@ -557,9 +557,14 @@
                     (list 'let* (vec (mapcat identity pairs)) (mapv symbols output-values)))}
       (seq physical-inputs) (assoc :physical-inputs physical-inputs))))
 
-(defn- materialize-host-program
+(defn- plain-host-value? [value]
+  (and (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
+       (nil? (:logical-layout value)) (contains? #{nil :host} (:memory-space value))
+       (nil? (:placement value)) (nil? (:sharding value))
+       (empty? (:effects value)) (empty? (:attributes value))))
+
+(defn- admit-host-map-program!
   [program reduce?]
-  (dialect/validate! program)
   (let [facts (dialect/facts program)
         equations (dialect/equations program)
         equation (first equations)
@@ -576,14 +581,7 @@
         outputs (dialect/outputs program)
         extent (:extent attributes)
         extent-value (get-in facts [:values extent])
-        operands (concat arrays captures map-results reduction-results)
-        plain-host? (fn [value]
-                      (and (= :tensor (:kind value))
-                           (= {:kind :plain} (:representation value))
-                           (nil? (:logical-layout value))
-                           (contains? #{nil :host} (:memory-space value))
-                           (nil? (:placement value)) (nil? (:sharding value))
-                           (empty? (:effects value)) (empty? (:attributes value))))]
+        operands (concat arrays captures map-results reduction-results)]
     (when-not (and (= (if reduce? 2 1) (count equations)) (= 'map kind)
                    (= outputs (if reduce? (into (vec reduction-results) (rest map-results)) map-results))
                    (empty? (:effects facts)) (empty? (:aliases facts))
@@ -621,12 +619,12 @@
                                (mapv #(get-in facts [:values % :dtype]) reduction-results))
                             (= [] (get-in facts [:values (first reduction-results) :shape]))))
                    (or (integer? extent)
-                       (and (plain-host? extent-value) (= [] (:shape extent-value))
+                       (and (plain-host-value? extent-value) (= [] (:shape extent-value))
                             (dtype/known? (:dtype extent-value))
                             (dtype/integral? (:dtype extent-value))))
                    (every? (fn [id]
                              (let [value (get-in facts [:values id])]
-                               (and (plain-host? value)
+                               (and (plain-host-value? value)
                                     (contains? #{:float :double} (:dtype value))))) operands)
                    (every? #(= (dialect/extent-shape extent) (get-in facts [:values % :shape]))
                            (concat arrays map-results))
@@ -646,29 +644,29 @@
                        :index (:index attributes)})))
     ;; Exact IDs may be keywords/vectors; they are not source expressions. Renaming every outer
     ;; value also avoids source-level collisions with casts and the map's lexical binders.
-    (host-projection program [] outputs)))
+    {:physical-inputs [] :output-values outputs}))
+
+(defn- project-admitted-host [program {:keys [physical-inputs output-values]}]
+  (host-projection program physical-inputs output-values))
 
 (defn materialize-host-map
   "Project one pure functional map to fresh host primitive arrays using existing realization.
    Returns ordered :inputs/:outputs, :parameters, exact :value-symbols and retained :body.
    This constructs source, not execution; placement, storage and unknown facets refuse."
   [program]
-  (materialize-host-program program false))
+  (dialect/validate! program)
+  (project-admitted-host program (admit-host-map-program! program false)))
 
 (defn materialize-host-map-reduce
   "Project one pure map followed by one certified scalar reduction in original source order.
    Tuple map results may retain fresh residual arrays beside the scalar result. Numerical AD
    admission belongs to its checked bundle, not this structural host/source materializer."
   [program]
-  (materialize-host-program program true))
-
-(defn materialize-host-indexed-map
-  "Host source projection for checked rank-one indexed maps or sequential ordered stores.
-   Unlike the pure homogeneous map API, this admits integral pointwise indices and stable
-   primitive array captures. Ordered stores require caller-supplied physical storage; this
-   function neither allocates nor initializes it. Logical effect bindings still evaluate nil."
-  [program]
   (dialect/validate! program)
+  (project-admitted-host program (admit-host-map-program! program true)))
+
+(defn- admit-host-indexed-map-program!
+  [program]
   (let [facts (dialect/facts program)
         [equation] (dialect/equations program)
         {:keys [kind attributes arrays captures destinations lambda]} (when equation (dialect/operation-parts equation))
@@ -678,10 +676,6 @@
         physical (when equation (dialect/physical-results facts equation))
         effect? (= 'effect-map kind)
         {:keys [locals body-results]} (when lambda (dialect/lambda-parts lambda))
-        plain? (fn [v] (and (= :tensor (:kind v)) (= {:kind :plain} (:representation v))
-                            (nil? (:logical-layout v)) (contains? #{nil :host} (:memory-space v))
-                            (nil? (:placement v)) (nil? (:sharding v))
-                            (empty? (:effects v)) (empty? (:attributes v))))
         extent (:extent attributes)
         extent-value (get-in facts [:values extent])
         ids (concat arrays captures outputs destinations)]
@@ -691,11 +685,11 @@
           (set/subset? (set (keys (:attributes facts))) #{:source-arithmetic})
           (= numerics/retained-source-arithmetic (get-in facts [:attributes :source-arithmetic]))
           (empty? (:aliases facts)) (empty? locals)
-          (every? #(and (plain? (get-in facts [:values %]))
+          (every? #(and (plain-host-value? (get-in facts [:values %]))
                         (contains? #{:float :double :int :long} (get-in facts [:values % :dtype]))
                         (= 1 (count (get-in facts [:values % :shape])))) ids)
           (or (and (integer? extent) (<= 0 extent Integer/MAX_VALUE))
-              (and (plain? extent-value) (= [] (:shape extent-value))
+              (and (plain-host-value? extent-value) (= [] (:shape extent-value))
                    (contains? #{:int :long} (:dtype extent-value))))
           (every? #(= (dialect/extent-shape extent) (get-in facts [:values % :shape])) arrays)
           (not (contains? '#{float double int long} (:index attributes)))
@@ -727,7 +721,41 @@
                  (every? #(= (dialect/extent-shape extent) (get-in facts [:values % :shape])) outputs))))
       (throw (ex-info "program cannot be materialized as a checked indexed host region"
                       {:reason :typed-soac-host-indexed-boundary :equation equation})))
-    (host-projection program (if effect? destinations []) (if effect? physical outputs))))
+    {:physical-inputs (if effect? destinations []) :output-values (if effect? physical outputs)}))
+
+(defn materialize-host-indexed-map
+  "Host source projection for checked rank-one indexed maps or sequential ordered stores.
+   Unlike the pure homogeneous map API, this admits integral pointwise indices and stable
+   primitive array captures. Ordered stores require caller-supplied physical storage; this
+   function neither allocates nor initializes it. Logical effect bindings still evaluate nil."
+  [program]
+  (dialect/validate! program)
+  (project-admitted-host program (admit-host-indexed-map-program! program)))
+
+(defn materialize-host-program
+  "Project the existing bounded primitive host subset by its actual TypedSOAC operations.
+   Admits only one map, one map→scalar reduction, or one sequential indexed effect map.
+   Uses the same strict operation/physical-owner checks as the specialized public APIs;
+   arbitrary equation chains and new numerical semantics are not admitted."
+  [program]
+  (dialect/validate! program)
+  (let [equations (dialect/equations program)
+        kinds (mapv dialect/operation-kind equations)
+        {:keys [arrays captures]} (when-let [equation (first equations)]
+                                   (dialect/operation-parts equation))
+        values (:values (dialect/facts program))
+        ;; Select from declared operand roles/types, never AD derivation-family labels.
+        ;; Selection grants no authority: the selected operation boundary still checks all facts.
+        indexed? (or (some #(contains? #{:int :long} (:dtype (get values %))) arrays)
+                     (some #(seq (:shape (get values %))) captures))
+        admitted (case kinds
+                   [map] (if indexed? (admit-host-indexed-map-program! program)
+                                      (admit-host-map-program! program false))
+                   [map reduce] (admit-host-map-program! program true)
+                   [effect-map] (admit-host-indexed-map-program! program)
+                   (throw (ex-info "unsupported primitive host program topology"
+                                   {:reason :typed-soac-host-program-topology :operations kinds})))]
+    (project-admitted-host program admitted)))
 
 (defn- required-host-bindings
   "Return the transitive source bindings needed by host materialization.

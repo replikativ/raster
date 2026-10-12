@@ -23,12 +23,12 @@
   (let [evidence (bundle :double :long 'n 'm)
         owner (atom nil) validated (atom []) materializations (atom 0)
         adapt canonical/adapt-indexed-map validate canonical/validate!
-        materialize route/materialize-host-indexed-map]
+        materialize route/materialize-host-program]
     (with-redefs [canonical/adapt-indexed-map
                   (fn [b] (let [result (adapt b)] (reset! owner result) result))
                   canonical/validate!
                   (fn [b] (swap! validated conj b) (validate b))
-                  route/materialize-host-indexed-map
+                  route/materialize-host-program
                   (fn [p] (swap! materializations inc) (materialize p))]
       (let [prepared (runtime/prepare evidence)
             preparation-proofs (count @validated)

@@ -32,9 +32,9 @@
 
 (deftest proofs-and-materialization-are-prepare-only
   (let [bundle (build) validations (atom 0) projections (atom 0)
-        validate normalized/validate! materialize route/materialize-host-map]
+        validate normalized/validate! materialize route/materialize-host-program]
     (with-redefs [normalized/validate! (fn [b] (swap! validations inc) (validate b))
-                  route/materialize-host-map (fn [p] (swap! projections inc) (materialize p))]
+                  route/materialize-host-program (fn [p] (swap! projections inc) (materialize p))]
       (let [prepared (runtime/prepare bundle)
             proof-count @validations projection-count @projections
             args (arguments prepared)

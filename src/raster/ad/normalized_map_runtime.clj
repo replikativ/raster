@@ -10,11 +10,6 @@
   (throw (ex-info "Arguments are outside the checked map AD runtime boundary"
                   (assoc data :reason reason))))
 
-(defn- projection [program indexed?]
-  ((if indexed? route/materialize-host-indexed-map
-                       (if (= 2 (count (soac/equations program)))
-                         route/materialize-host-map-reduce route/materialize-host-map)) program))
-
 (defn- compile-projection [projection source-ns]
   (assoc projection :execute
            (binding [*ns* source-ns]
@@ -86,7 +81,7 @@
                                          (when (= gradient-id (get-in binding [:consumer :result]))
                                            (:requirement binding)))
                                        physical-bindings))
-        projections (mapv #(projection % indexed?) [primal linear transpose])
+        projections (mapv route/materialize-host-program [primal linear transpose])
         source-dependencies (if indexed?
                               ;; Admission requires a single direct read and EMPTY locals.
                               ;; The scalar identity lane omits this executable read/alias.

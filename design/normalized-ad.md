@@ -7,6 +7,9 @@ The checked scalar lane supplies derivation evidence to three bounded host famil
 map followed by ordered additive sum, and functional indexed map. Those families now execute
 through one canonical program/interface/residual owner. Preparation retains full validation;
 hot calls check compiler/rule epochs and captured executable identities without replaying proofs.
+Host projection selects from actual TypedSOAC operations and declared operand roles, rather
+than AD derivation-family labels. Its bounded map, map→reduce and indexed-store admission
+checks remain separate from derivative validation; arbitrary equation chains still refuse.
 Indexed pullbacks additionally require private index snapshots and a fresh typed-zero physical
 gradient owner on every call. These are sequential lifetime contracts, not concurrent mutation
 or asynchronous ownership guarantees.
@@ -657,3 +660,12 @@ the excluded array, scalar captures and extent retain nil slots. Multiple active
 reductions and general map composition remain separate capability gates. The unchanged
 real Gemma gate remains FAILED (11/28 adapter components); this map witness is not a
 replacement objective or model acceptance result.
+
+## Operation-driven primitive host projection
+
+The primitive host projection has one operation-driven entry and one source assembly owner.
+Specialized map/map-reduction/indexed APIs keep their existing strict admission contracts.
+Shared plain-host AbstractValue checks are factored once; numerical order, fresh outputs,
+stable array captures and caller-owned indexed transpose destinations are still checked at
+their respective operation boundaries. This does not generalize the accepted topology or
+derive AD rules from mere structural source realizability.
