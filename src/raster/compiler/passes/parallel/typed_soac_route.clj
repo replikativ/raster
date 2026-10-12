@@ -159,7 +159,12 @@
                             #{(or (get-in placement-facts [:provenance :source-binding-id])
                                   (get-in placement-facts [:provenance :legacy-soac-id])
                                   equation-id)})
-        placement (apply max constituent-ids)]
+        ;; Fusion records its actual surviving/consumer boundary independently of ancestry.
+        ;; Horizontal fusion may move a later map to an earlier site; placing it at the maximum
+        ;; constituent instead would move its earlier result past an intervening reader.
+        placement (or (get-in placement-facts [:provenance :source-binding-id])
+                      (get-in placement-facts [:provenance :legacy-soac-id])
+                      (apply max constituent-ids))]
     (case kind
       scalar
       (let [_ (when-not (= 1 (count results))

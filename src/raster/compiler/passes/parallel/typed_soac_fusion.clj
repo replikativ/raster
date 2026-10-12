@@ -483,7 +483,10 @@
   [left right fused-kind]
   (let [ids (vec (distinct (concat (:fused-equations left)
                                    (:fused-equations right))))]
-    (assoc (merge left right)
+    ;; The left argument is the surviving execution boundary. Constituents retain complete
+    ;; ancestry separately; the last merged parent is not the fused operation's source site.
+    (assoc (merge (dissoc (merge left right) :source-binding-id :legacy-soac-id)
+                  (select-keys left [:source-binding-id :legacy-soac-id]))
            :fusion fused-kind
            :fused-equations ids)))
 
@@ -533,6 +536,10 @@
                                          [:result-storage :host-binding])
         facts (assoc-in facts [:equations producer-id]
                         (assoc producer
+                               :provenance (merge (dissoc (:provenance producer)
+                                                          :source-binding-id :legacy-soac-id)
+                                                  (select-keys (:provenance consumer)
+                                                               [:source-binding-id :legacy-soac-id]))
                                :effects (:effects consumer)
                                :aliases (:aliases consumer)
                                :attributes (merge (:attributes producer)

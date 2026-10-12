@@ -1129,6 +1129,41 @@
     (is (identical? out (execute out)))
     (is (= 0.0 (double (aget out 0))))))
 
+(deftest horizontal-materialization-preserves-intervening-readers
+  (let [source '(let* [u (raster.par/pmap i n float (* (clojure.core/aget a i) 2.0))
+                       observed (raster.par/reduce acc 0.0 j n
+                                                  (+ acc (clojure.core/aget u j)))
+                       v (raster.par/pmap k n float (+ (clojure.core/aget b k) 1.0))]
+                      [observed u v])
+        {:keys [program stats]} (route/attempt source :float {'a :float 'b :float})
+        materialized (:source program)
+        run (fn [body]
+              ((eval (list 'fn '[a b n] body))
+               (float-array [1.0 2.0 3.0]) (float-array [4.0 5.0 6.0]) 3))
+        normalize (fn [[total u v]] [(double total) (mapv double u) (mapv double v)])]
+    (is (= 1 (:horizontal stats)))
+    (is (= [12.0 [2.0 4.0 6.0] [5.0 6.0 7.0]] (normalize (run source))))
+    (is (= (normalize (run source)) (normalize (run materialized))))))
+
+(deftest horizontal-materialization-retains-prior-vertical-placement
+  (let [source '(let* [tmp (raster.par/pmap i n float (+ (clojure.core/aget a i) 1.0))
+                       shift (clojure.core/double coefficient)
+                       u (raster.par/pmap j n float (+ (clojure.core/aget tmp j) shift))
+                       observed (raster.par/reduce acc 0.0 k n
+                                                  (+ acc (clojure.core/aget u k)))
+                       v (raster.par/pmap l n float (+ (clojure.core/aget b l) 1.0))]
+                      [observed u v])
+        {:keys [program stats]} (route/attempt source :float {'a :float 'b :float}
+                                              {:scalar-types {'n :long 'coefficient :double}})
+        run (fn [body]
+              ((eval (list 'fn '[a b n coefficient] body))
+               (float-array [1.0 2.0]) (float-array [4.0 5.0]) 2 3.0))
+        normalize (fn [[total u v]] [(double total) (mapv double u) (mapv double v)])]
+    (is (pos? (:vertical stats)))
+    (is (= 1 (:horizontal stats)))
+    (is (= [11.0 [5.0 6.0] [5.0 6.0]] (normalize (run source))))
+    (is (= (normalize (run source)) (normalize (run (:source program)))))))
+
 (deftest typed-horizontal-fusion-lowers-to-one-explicit-multi-output-segmap
   (let [{:keys [program stats]} (route/attempt
                                  horizontal-maps :float {'a :float 'b :float})

@@ -25,6 +25,18 @@
                                    :array-types array-types
                                    :scalar-types scalar-types})))
 
+(deftest fusion-placement-belongs-only-to-the-surviving-boundary
+  (doseq [left [{:source-binding-id 2}
+                {:legacy-soac-id 2}
+                {}]]
+    (let [merged (#'typed-fusion/merge-provenance
+                  (assoc left :fused-equations [2])
+                  {:source-binding-id 5 :legacy-soac-id 5 :fused-equations [5]}
+                  :horizontal-map)]
+      (is (= left (select-keys merged [:source-binding-id :legacy-soac-id])))
+      (is (= [2 5] (:fused-equations merged)))
+      (is (= :horizontal-map (:fusion merged))))))
+
 (deftest map-map-fusion-has-the-certified-functional-result
   (let [typed-input (source-program map-map-source {'x :float})
         [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)

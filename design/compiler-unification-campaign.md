@@ -151,6 +151,16 @@ live; this can retain previously eliminated work until a shared local-only effec
 No name-based exemption or numerical acceptance waiver is introduced. General exception/parallel
 effect completeness and retirement of existing locally-pure conventions remain separate gates.
 
+Cold CI exposed a materialization bug once DCE correctly retained a primal reduction: horizontal
+fusion kept its earlier logical execution boundary, but source reconstruction placed it at the
+latest constituent ID, after an intervening reader. Fusion ancestry is not execution placement.
+Merged provenance now retains only the surviving equation's placement keys; a transferred result
+explicitly adopts its consumer's boundary. Source reconstruction uses that existing source point,
+with the historical ancestry fallback only for facts lacking a retained point. Independent JVM
+comparisons cover intervening readers and a preceding vertical fusion with a later scalar
+dependency; mixed legacy/current provenance cannot inherit the removed parent's placement.
+The public mixed-storage gradient compile and device parity fixtures remain required gates.
+
 ### Independent distributed math intent reconciliation
 
 Distributed planning, readiness (including retained-output readiness), resident root/scratch
