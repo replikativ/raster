@@ -709,13 +709,13 @@
   For each pair e and slice s, computes dot product of slice-dim elements
   from A (at idx-a[e]) and B (at idx-b[e]).
   n-a, n-b: number of entities in A, B (for backward allocation)."
-  [A :- (Array double) B :- (Array double)
+  (All [T] [A :- (Array T) B :- (Array T)
    idx-a :- (Array long) idx-b :- (Array long)
    n-a :- Long n-b :- Long n-pairs :- Long
    slice-dim :- Long total-dim :- Long n-slices :- Long]
-  :- (Array double)
+  :- (Array T)
   (let [n-out (* n-pairs n-slices)
-        out (double-array n-out)]
+        out (alloc-like A n-out)]
     (par/map!
      out o n-out nil
      (let [e (quot o n-slices)
@@ -726,17 +726,16 @@
            off-b (+ (* ib (int total-dim)) (* s (int slice-dim)))]
        (par/reduce acc 0.0 d slice-dim
                    (+ acc (* (aget A (+ off-a d))
-                             (aget B (+ off-b d)))))))))
-
+                             (aget B (+ off-b d))))))))))
 (deftm indexed-dot-dA
   "Backward for A in indexed-dot.
   dA[idx-a[e]*total-dim+s*slice-dim+d] += dy[e*n-slices+s] * B[idx-b[e]*total-dim+s*slice-dim+d]"
-  [dy :- (Array double) B :- (Array double)
+  (All [T] [dy :- (Array T) B :- (Array T)
    idx-a :- (Array long) idx-b :- (Array long)
    n-a :- Long n-pairs :- Long
    slice-dim :- Long total-dim :- Long n-slices :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-a total-dim))]
+  :- (Array T)
+  (let [out (alloc-like dy (* n-a total-dim))]
     (dotimes [e n-pairs]
       (let [ia (aget idx-a e)
             ib (aget idx-b e)]
@@ -750,17 +749,16 @@
                 (aset out a-idx
                       (+ (aget out a-idx)
                          (* coeff (aget B b-idx))))))))))
-    out))
-
+    out)))
 (deftm indexed-dot-dB
   "Backward for B in indexed-dot.
   dB[idx-b[e]*total-dim+s*slice-dim+d] += dy[e*n-slices+s] * A[idx-a[e]*total-dim+s*slice-dim+d]"
-  [dy :- (Array double) A :- (Array double)
+  (All [T] [dy :- (Array T) A :- (Array T)
    idx-a :- (Array long) idx-b :- (Array long)
    n-b :- Long n-pairs :- Long
    slice-dim :- Long total-dim :- Long n-slices :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-b total-dim))]
+  :- (Array T)
+  (let [out (alloc-like dy (* n-b total-dim))]
     (dotimes [e n-pairs]
       (let [ia (aget idx-a e)
             ib (aget idx-b e)]
@@ -774,8 +772,7 @@
                 (aset out b-idx
                       (+ (aget out b-idx)
                          (* coeff (aget A a-idx))))))))))
-    out))
-
+    out)))
 ;; ================================================================
 ;; scatter-mul-add: weighted scatter (multi-head aware)
 ;; out[dst[e]*total-dim+s*slice-dim+d] += coeffs[e*n-slices+s]
@@ -787,12 +784,12 @@
   For each pair e, slice s, and dim d:
     out[dst[e]*total-dim+s*slice-dim+d] += coeffs[e*n-slices+s] * src[src[e]*total-dim+s*slice-dim+d]
   n-dst, n-src: entity counts for output allocation and backward."
-  [coeffs :- (Array double) src :- (Array double)
+  (All [T] [coeffs :- (Array T) src :- (Array T)
    dst-indices :- (Array long) src-indices :- (Array long)
    n-dst :- Long n-src :- Long n-pairs :- Long
    slice-dim :- Long total-dim :- Long n-slices :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-dst total-dim))]
+  :- (Array T)
+  (let [out (alloc-like coeffs (* n-dst total-dim))]
     (dotimes [e n-pairs]
       (let [dst-node (aget dst-indices e)
             src-node (aget src-indices e)]
@@ -806,17 +803,16 @@
                 (aset out dst-idx
                       (+ (aget out dst-idx)
                          (* w (aget src src-idx))))))))))
-    out))
-
+    out)))
 (deftm scatter-mul-add-d-coeffs
   "Backward for coeffs in scatter-mul-add.
   d_coeffs[e*n-slices+s] = Σ_d dy[dst[e]*td+s*sd+d] * src[src[e]*td+s*sd+d]"
-  [dy :- (Array double) src :- (Array double)
+  (All [T] [dy :- (Array T) src :- (Array T)
    dst-indices :- (Array long) src-indices :- (Array long)
    n-pairs :- Long slice-dim :- Long total-dim :- Long n-slices :- Long]
-  :- (Array double)
+  :- (Array T)
   (let [n-out (* n-pairs n-slices)
-        out (double-array n-out)]
+        out (alloc-like dy n-out)]
     (par/map!
      out o n-out nil
      (let [e (quot o n-slices)
@@ -827,17 +823,16 @@
            off-src (+ (* src-node (int total-dim)) (* s (int slice-dim)))]
        (par/reduce acc 0.0 d slice-dim
                    (+ acc (* (aget dy (+ off-dst d))
-                             (aget src (+ off-src d)))))))))
-
+                             (aget src (+ off-src d))))))))))
 (deftm scatter-mul-add-d-src
   "Backward for src in scatter-mul-add.
   d_src[src[e]*td+s*sd+d] += coeffs[e*ns+s] * dy[dst[e]*td+s*sd+d]"
-  [dy :- (Array double) coeffs :- (Array double)
+  (All [T] [dy :- (Array T) coeffs :- (Array T)
    dst-indices :- (Array long) src-indices :- (Array long)
    n-src :- Long n-pairs :- Long
    slice-dim :- Long total-dim :- Long n-slices :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-src total-dim))]
+  :- (Array T)
+  (let [out (alloc-like dy (* n-src total-dim))]
     (dotimes [e n-pairs]
       (let [dst-node (aget dst-indices e)
             src-node (aget src-indices e)]
@@ -851,8 +846,7 @@
                 (aset out src-idx
                       (+ (aget out src-idx)
                          (* w (aget dy dst-idx))))))))))
-    out))
-
+    out)))
 ;; ================================================================
 ;; scale-clamp-exp: out[i] = exp(clamp(x[i]*scale, -bound, bound))
 ;; Separates attention nonlinearity from dot product.
@@ -861,19 +855,18 @@
 (deftm scale-clamp-exp
   "Pointwise scale, clamp, and exp.
   out[i] = exp(clamp(x[i] * scale, -clamp-bound, clamp-bound))"
-  [x :- (Array double) scale :- Double
+  (All [T] [x :- (Array T) scale :- Double
    clamp-bound :- Double n :- Long]
-  :- (Array double)
+  :- (Array T)
   (broadcast [x]
-             (m/exp (n/min clamp-bound (n/max (- clamp-bound) (* x scale))))))
-
+             (m/exp (n/min clamp-bound (n/max (- clamp-bound) (* x scale)))))))
 (deftm scale-clamp-exp-backward
   "Backward for scale-clamp-exp.
   dx[i] = dy[i] * out[i] * scale * (|x[i]*scale| <= bound ? 1 : 0)"
-  [dy :- (Array double) x :- (Array double) result :- (Array double)
+  (All [T] [dy :- (Array T) x :- (Array T) result :- (Array T)
    scale :- Double clamp-bound :- Double n :- Long]
-  :- (Array double)
-  (let [out (double-array n)]
+  :- (Array T)
+  (let [out (alloc-like dy n)]
     (dotimes [i n]
       (let [raw (* (aget x i) scale)
             clamp-mask (if (and (>= raw (- clamp-bound)) (<= raw clamp-bound)) 1.0 0.0)]
@@ -881,8 +874,7 @@
               (* (* (aget dy i)
                     (aget result i))
                  (* scale clamp-mask)))))
-    out))
-
+    out)))
 ;; ================================================================
 ;; reduce-axis: out[d] = Σ_b src[b*n-cols+d]
 ;; Sum-reduce along first axis.
@@ -920,11 +912,11 @@
   "Divide array by per-segment scalars with broadcast over slice dimension.
   out[node*emb-dim+head*dk+d] = wV[...] / (Z[node*n-heads+head] + eps)
   Generic enough for any per-segment normalization (attention, layer-norm, etc.)."
-  [wV :- (Array double) Z :- (Array double)
+  (All [T] [wV :- (Array T) Z :- (Array T)
    n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
-  :- (Array double)
+  :- (Array T)
   (let [dk (quot emb-dim n-heads)
-        out (double-array (* n-nodes emb-dim))]
+        out (alloc-like wV (* n-nodes emb-dim))]
     (dotimes [node n-nodes]
       (dotimes [head n-heads]
         (let [z (+ (aget Z (+ (* node (int n-heads)) head)) eps)
@@ -933,15 +925,14 @@
             (let [idx (+ off d)]
               (aset out idx
                     (/ (aget wV idx) z)))))))
-    out))
-
+    out)))
 (deftm segment-div-dwV
   "Backward for wV: dwV[i] = dy[i] / (Z[n*nh+h] + eps)"
-  [dy :- (Array double) Z :- (Array double)
+  (All [T] [dy :- (Array T) Z :- (Array T)
    n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
-  :- (Array double)
+  :- (Array T)
   (let [dk (quot emb-dim n-heads)
-        dwV (double-array (* n-nodes emb-dim))]
+        dwV (alloc-like dy (* n-nodes emb-dim))]
     (dotimes [node n-nodes]
       (dotimes [head n-heads]
         (let [z (+ (aget Z (+ (* node (int n-heads)) head)) eps)
@@ -950,19 +941,18 @@
             (let [idx (+ off d)]
               (aset dwV idx
                     (/ (aget dy idx) z)))))))
-    dwV))
-
+    dwV)))
 (deftm segment-div-jvp-dZ
   "Forward tangent (JVP, §13 A3) of segment-div in the Z direction — the
   quotient rule's second term: out = wV/(Z+eps) so
     d_i = −out_i·dZ_seg/(Z_seg+eps) = −wV_i·dZ_seg/(Z_seg+eps)².
   (The wV-direction term dwV/(Z+eps) is segment-div itself — linear in wV;
   see the :jvp-fn registration below.) Mirrors segment-div's loop structure."
-  [wV :- (Array double) dZ :- (Array double) Z :- (Array double)
+  (All [T] [wV :- (Array T) dZ :- (Array T) Z :- (Array T)
    n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
-  :- (Array double)
+  :- (Array T)
   (let [dk (quot emb-dim n-heads)
-        out (double-array (* n-nodes emb-dim))]
+        out (alloc-like wV (* n-nodes emb-dim))]
     (dotimes [node n-nodes]
       (dotimes [head n-heads]
         (let [z-idx (+ (* node (int n-heads)) head)
@@ -972,16 +962,15 @@
           (dotimes [d dk]
             (let [idx (+ off d)]
               (aset out idx (* (aget wV idx) factor)))))))
-    out))
-
+    out)))
 (deftm segment-div-dZ
   "Backward for Z: dZ[n*nh+h] = -sum_d(dy[..] * wV[..] / z²)"
-  [dy :- (Array double) wV :- (Array double) Z :- (Array double)
+  (All [T] [dy :- (Array T) wV :- (Array T) Z :- (Array T)
    n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
-  :- (Array double)
+  :- (Array T)
   (let [dk (quot emb-dim n-heads)
         n-segments (* n-nodes n-heads)
-        dZ (double-array n-segments)]
+        dZ (alloc-like dy n-segments)]
     (par/map!
      dZ z-idx n-segments nil
      (let [node (quot z-idx n-heads)
@@ -992,8 +981,7 @@
        (- (/ (par/reduce acc 0.0 d dk
                           (+ acc (* (aget dy (+ off d))
                                     (aget wV (+ off d)))))
-             z2))))))
-
+             z2)))))))
 ;; ================================================================
 ;; flat-embed-op: out[v*d+j] = values[v]*We[j] + be[j]
 ;;                            + space_emb[spaces[v]*d+j]
@@ -1004,12 +992,12 @@
 (deftm flat-embed-op
   "Embed flat variable values into embedding space.
   Combines value projection, space embedding, state embedding, and position embedding (all additive)."
-  [values :- (Array double) space-emb :- (Array double) spaces :- (Array long)
-   state-emb :- (Array double) states :- (Array long) pos-emb :- (Array double)
-   We :- (Array double) be :- (Array double)
+  (All [T] [values :- (Array T) space-emb :- (Array T) spaces :- (Array long)
+   state-emb :- (Array T) states :- (Array long) pos-emb :- (Array T)
+   We :- (Array T) be :- (Array T)
    n-vars :- Long emb-dim :- Long n-spaces :- Long n-states :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-vars emb-dim))]
+  :- (Array T)
+  (let [out (alloc-like values (* n-vars emb-dim))]
     (dotimes [v n-vars]
       (let [val-v (aget values v)
             sp (aget spaces v)
@@ -1021,43 +1009,39 @@
                 state-e (aget state-emb (+ (* st (int emb-dim)) d))
                 pos-e (aget pos-emb idx)]
             (aset out idx (+ val-emb space-e state-e pos-e))))))
-    out))
-
+    out)))
 (deftm flat-embed-d-values
   "Backward for values: d_values[v] = sum_d(dy[v*d+j] * We[j])"
-  [dy :- (Array double) We :- (Array double)
+  (All [T] [dy :- (Array T) We :- (Array T)
    n-vars :- Long emb-dim :- Long]
-  :- (Array double)
-  (let [out (double-array n-vars)]
+  :- (Array T)
+  (let [out (alloc-like dy n-vars)]
     (par/map!
      out v n-vars nil
      (let [off (* v (int emb-dim))]
        (par/reduce acc 0.0 d emb-dim
                    (+ acc (* (aget dy (+ off d))
-                             (aget We d))))))))
-
+                             (aget We d)))))))))
 (deftm flat-embed-dWe
   "Backward for We: dWe[j] = sum_v(dy[v*d+j] * values[v])"
-  [dy :- (Array double) values :- (Array double)
+  (All [T] [dy :- (Array T) values :- (Array T)
    n-vars :- Long emb-dim :- Long]
-  :- (Array double)
-  (let [out (double-array emb-dim)]
+  :- (Array T)
+  (let [out (alloc-like dy emb-dim)]
     (par/map!
      out d emb-dim nil
      (par/reduce acc 0.0 v n-vars
                  (+ acc (* (aget dy (+ (* v (int emb-dim)) d))
-                           (aget values v)))))))
-
+                           (aget values v))))))))
 (deftm flat-embed-dbe
   "Backward for be: dbe[j] = sum_v(dy[v*d+j])"
-  [dy :- (Array double) n-vars :- Long emb-dim :- Long]
-  :- (Array double)
-  (let [out (double-array emb-dim)]
+  (All [T] [dy :- (Array T) n-vars :- Long emb-dim :- Long]
+  :- (Array T)
+  (let [out (alloc-like dy emb-dim)]
     (par/map!
      out d emb-dim nil
      (par/reduce acc 0.0 v n-vars
-                 (+ acc (aget dy (+ (* v (int emb-dim)) d)))))))
-
+                 (+ acc (aget dy (+ (* v (int emb-dim)) d))))))))
 (deftm flat-embed-d-space-emb
   "Backward for space-emb: d_se[spaces[v]*d+j] += dy[v*d+j]"
   (All [T] [dy :- (Array T) spaces :- (Array long)
@@ -1081,49 +1065,48 @@
 ;; ================================================================
 
 (deftm dot-rows
-  [h :- (Array double) W :- (Array double) bias :- (Array double)
+  (All [T] [h :- (Array T) W :- (Array T) bias :- (Array T)
    n-rows :- Long dim :- Long]
-  :- (Array double)
-  (let [out (double-array n-rows)]
+  :- (Array T)
+  (let [out (alloc-like h n-rows)]
     (par/map!
      out v n-rows nil
      (+ (par/reduce acc 0.0 d dim
                     (+ acc (* (aget h (+ (* v (int dim)) d))
                               (aget W d))))
-        (aget bias 0)))))
-
+        (aget bias 0))))))
 (deftm dot-rows-dh
   "Backward for h: dh[v*d+j] = dy[v] * W[j]"
-  [dy :- (Array double) W :- (Array double)
+  (All [T] [dy :- (Array T) W :- (Array T)
    n-rows :- Long dim :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-rows dim))]
+  :- (Array T)
+  (let [out (alloc-like dy (* n-rows dim))]
     (dotimes [v n-rows]
       (let [dy-v (aget dy v)]
         (dotimes [d dim]
           (aset out (+ (* v (int dim)) d)
                 (* dy-v (aget W d))))))
-    out))
-
+    out)))
 (deftm dot-rows-dW
   "Backward for W: dW[j] = sum_v(dy[v] * h[v*d+j])"
-  [dy :- (Array double) h :- (Array double)
+  (All [T] [dy :- (Array T) h :- (Array T)
    n-rows :- Long dim :- Long]
-  :- (Array double)
-  (let [out (double-array dim)]
+  :- (Array T)
+  (let [out (alloc-like dy dim)]
     (par/map!
      out d dim nil
      (par/reduce acc 0.0 v n-rows
                  (+ acc (* (aget dy v)
-                           (aget h (+ (* v (int dim)) d))))))))
-
+                           (aget h (+ (* v (int dim)) d)))))))))
 (deftm dot-rows-dbias
   "Backward for bias: dbias[0] = sum_v(dy[v])"
-  [dy :- (Array double) n-rows :- Long]
-  :- (Array double)
-  (par/map [output 1]
-           (par/reduce acc 0.0 v n-rows
-                       (+ acc (aget dy v)))))
+  (All [T] [dy :- (Array T) n-rows :- Long]
+       :- (Array T)
+       (let [out (alloc-like dy 1)]
+         (par/map! out o 1 nil
+                   (par/reduce acc 0.0 v n-rows
+                               (+ acc (aget dy v))))
+         out)))
 
 ;; ================================================================
 ;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]=0)
@@ -1138,9 +1121,9 @@
   implementation-defined parallel tree (the same numerical contract used by accelerator loss
   reductions generally); the count remains exact. The singleton partials are compiler-owned
   scratch, while the public result remains the caller's stable resident buffer."
-  [pred :- (Array double) target :- (Array double)
-   states :- (Array long) out :- (Array double) n :- Long]
-  :- Void
+  (All [T] [pred :- (Array T) target :- (Array T)
+            states :- (Array long) out :- (Array T) n :- Long]
+       :- Void
   (let [sums (double-array 1)
         counts (long-array 1)]
     (par/product-reduce!
@@ -1161,24 +1144,24 @@
        (aset out output
              (if (> count 0)
                (/ (aget sums 0) (double count))
-               0.0))))))
+               0.0)))))))
 
 (deftm masked-mse-loss
-  [pred :- (Array double) target :- (Array double)
-   states :- (Array long) n :- Long]
-  :- Double
-  (let [out (double-array 1)
-        _ (masked-mse-loss-into! pred target states out n)]
-    (aget out 0)))
+  (All [T] [pred :- (Array T) target :- (Array T)
+            states :- (Array long) n :- Long]
+       :- Double
+       (let [out (alloc-like pred 1)
+             _ (masked-mse-loss-into! pred target states out n)]
+         (double (aget out 0)))))
 
 (deftm masked-mse-loss-backward
   "Backward for pred in masked-mse-loss.
   d_pred[i] = 2*(pred[i]-target[i])/cnt * dy where states[i]=0, else 0."
-  [dy :- Double pred :- (Array double) target :- (Array double)
+  (All [T] [dy :- Double pred :- (Array T) target :- (Array T)
    states :- (Array long) n :- Long]
-  :- (Array double)
+  :- (Array T)
   (let [counts (long-array 1)
-        out (double-array n)]
+        out (alloc-like pred n)]
     (par/product-reduce!
      [counts]
      [[count (long 0) :long]]
@@ -1192,7 +1175,7 @@
      {:associative? true :commutative? true
       :overflow :wrap :order :implementation-defined})
     (par/map!
-     out i n double
+     out i n nil
      (let [count (aget counts 0)]
        (if (> count 0)
          (if (== (aget states i) 0)
@@ -1200,8 +1183,7 @@
               (- (aget pred i) (aget target i)))
            0.0)
          0.0)))
-    out))
-
+    out)))
 ;; ================================================================
 ;; Flat AD templates
 ;;
