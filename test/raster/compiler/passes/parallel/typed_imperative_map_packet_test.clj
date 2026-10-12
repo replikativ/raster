@@ -4,7 +4,8 @@
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.passes.parallel.segop-lower-pass :as lower]))
+            [raster.compiler.passes.parallel.segop-lower-pass :as lower]
+            [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
 (defn- options [dt]
   {:dtype dt :target-device :ze:0
@@ -54,3 +55,13 @@
     (with-redefs-fn {#'lower/singleton-packet (fn [& _] (reset! called true))}
       #(is (nil? (#'lower/selected-operation-packet 'result expression (options :float) (atom #{})))))
     (is (false? @called))))
+
+(deftest typed-map-admission-does-not-swallow-implementation-failures
+  (doseq [failure [(ex-info "typed invariant" {:reason :raster/bug})
+                   (ex-info "typed invariant" {:reason :raster/fatal})
+                   (NullPointerException. "typed implementation bug")]]
+    (with-redefs [route/attempt (fn [& _] (throw failure))]
+      (is (identical? failure
+                      (try (lower/segop-lower-pass (source :float) (options :float))
+                           nil
+                           (catch Throwable observed observed)))))))

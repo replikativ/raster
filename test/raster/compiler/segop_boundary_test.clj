@@ -228,7 +228,8 @@
     (doseq [reason [:raster/fatal :raster/bug]]
       (let [failure (ex-info "injected compiler invariant" {:reason reason})
             observed
-            (with-redefs [soac/par-form->soac (fn [& _] (throw failure))]
+            (with-redefs [slp/singleton-packet (fn [& _] {:declined {:reason :test-legacy-boundary}})
+                          soac/par-form->soac (fn [& _] (throw failure))]
               (try (stats-of '(let* [o (raster.par/map! O i 256 nil i)] o))
                    nil
                    (catch clojure.lang.ExceptionInfo exception exception)))]
@@ -237,7 +238,8 @@
 
 (deftest implementation-exceptions-are-not-conversion-declines
   (testing "an implementation bug in par→SOAC escapes instead of silently selecting a fallback"
-    (with-redefs [soac/par-form->soac
+    (with-redefs [slp/singleton-packet (fn [& _] {:declined {:reason :test-legacy-boundary}})
+                  soac/par-form->soac
                   (fn [& _] (throw (NullPointerException. "simulated compiler bug")))]
       (is (thrown-with-msg? NullPointerException #"simulated compiler bug"
                             (stats-of '(let* [o (raster.par/map! O i 256 nil i)] o))))))

@@ -31,7 +31,9 @@
 (defn- norm [src] (str/replace (str src) #"_\d{3,}" "_N"))
 
 (deftest compatibility-unknown-storage-retains-its-exact-value-identity
-  (let [program (lowered map-form)]
+  (let [program (with-redefs [slp/singleton-packet
+                             (fn [& _] {:declined {:reason :test-legacy-boundary}})]
+                  (lowered map-form))]
     (doseq [id '[X O]]
       (is (= [(list 'unknown-dimension id)] (get-in program [:values id :shape]))
           "unknown storage is not a free scalar named ? or the output iteration extent"))
@@ -120,6 +122,7 @@
     (let [calls (atom [])
           orig raster.compiler.passes.parallel.soac-lower/lower-soac]
       (with-redefs [typed-frontend/form->program (fn [& _] nil)
+                    slp/singleton-packet (fn [& _] {:declined {:reason :test-legacy-boundary}})
                     raster.compiler.passes.parallel.soac-lower/lower-soac
                     (fn [soac device-id & opts] (swap! calls conj device-id) (apply orig soac :ze:0 opts))]
         (op/opencl-pass map-form :device-id :ze:1 :dtype :double :min-elements 0))
@@ -216,6 +219,7 @@
 (deftest jvm-simd-does-not-turn-an-implementation-bug-into-scalar-fallback
   (testing "an unstructured re-lowering exception is a compiler bug, not an unsupported SIMD form"
     (with-redefs [typed-frontend/form->program (fn [& _] nil)
+                  slp/singleton-packet (fn [& _] {:declined {:reason :test-legacy-boundary}})
                   soac/par-form->soac
                   (fn [& _] (throw (NullPointerException. "simulated SIMD lowering bug")))]
       (is (thrown-with-msg? NullPointerException #"simulated SIMD lowering bug"

@@ -2412,6 +2412,26 @@
             (diagnostic->pipeline-map raw-form :opencl compiler-diagnostic))
            (count (:allocs prog))))})))
 
+(defn- realize-identity-tail
+  "Expose an uncoerced final initializer at the source projection's tail.
+
+   Keep preceding bindings and their order. Do not remove typed binding boundaries or
+   search unrelated initializers for a loop; typed packet witnesses remain unchanged."
+  [expression]
+  (if (and (seq? expression) (form/let-head? (first expression))
+           (= 3 (count expression)) (vector? (second expression))
+           (pos? (count (second expression))) (even? (count (second expression))))
+    (let [bindings (second expression)
+          binder (nth bindings (- (count bindings) 2))
+          initializer (peek bindings)]
+      (if (and (symbol? binder) (= binder (nth expression 2))
+               (nil? (:tag (meta binder))) (nil? (:raster.type/tag (meta binder))))
+        (if (= 2 (count bindings))
+          (recur initializer)
+          (with-meta (list (first expression) (pop (pop bindings)) initializer) (meta expression)))
+        expression))
+    expression))
+
 (defn- wasm-kernel-spec
   "Front-half for one deftm var → {:name :params :ir :simd?} ready for the wasm
    emitter: walker → forward-passes → soa-lower (value-type SoA → per-field arrays)."
@@ -2460,7 +2480,8 @@
         wasm-skip-head? (fn [h] (= "dotimes" (clojure.core/name h)))
         expanded-body (binding [*ns* (or source-ns *ns*)]
                         (mex/resugar-interop
-                         (mex/macroexpand-all-preserving lowered-body wasm-skip-head?)))]
+                         (mex/macroexpand-all-preserving
+                          (realize-identity-tail lowered-body) wasm-skip-head?)))]
     {:name (or name (str (:name (meta resolved))))
      :params lowered-params :ir expanded-body :simd? wasm-simd?
      ;; the ORIGINAL (pre-lowering) semantic signature — for the cljs marshaling

@@ -85,13 +85,14 @@
 ;; ================================================================
 
 (defn- sgd-helper-names
-  "Identify SGD update helpers by structure: contains loop* and alength.
-   Par-extracted helpers carry their free variables as params (variable count)."
+  "Identify this fixture's SGD helpers by counted loop, store and learning-rate capture.
+   Typed admission may hoist alength into a scalar extent outside the helper."
   [diag]
   (for [[name info] (:helper-map diag)
         :let [expr (:expr info)]
         :when (and (form-contains-name? expr "loop*")
-                   (form-contains-name? expr "alength"))]
+                   (form-contains-name? expr "aset")
+                   (contains? (util/free-syms expr) 'lr))]
     name))
 
 (deftest compiled-bytecode-quality-test

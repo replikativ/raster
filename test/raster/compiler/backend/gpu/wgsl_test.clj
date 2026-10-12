@@ -19,6 +19,21 @@
     (raster.arrays/aset out i (raster.numeric/+ (raster.numeric/* s (raster.arrays/aget x i))
                                                 (raster.arrays/aget y i)))))
 
+(deftest identity-tail-projection-preserves-prefixes-and-conversion-boundaries
+  (let [realize (ns-resolve 'raster.compiler.pipeline 'realize-identity-tail)
+        source '(let* [prefix (record! :prefix) result (record! :result)] result)
+        projected (realize source)
+        run (fn [expression]
+              (let [events (atom [])
+                    execute (eval (list 'fn '[record!] expression))]
+                [(execute (fn [event] (swap! events conj event) event)) @events]))]
+    (is (= '(let* [prefix (record! :prefix)] (record! :result)) projected))
+    (is (= [:result [:prefix :result]] (run source) (run projected)))
+    (doseq [unchanged ['(let* [result (record! :result)] (consume result))
+                      '(let* [^long result (record! :result)] result)
+                      '(let* [result (record! :result)] (record! :after) result)]]
+      (is (= unchanged (realize unchanged))))))
+
 (deftest vadd-wgsl-structure
   (testing "elementwise f32 map → WGSL compute shader"
     (let [{:keys [wgsl array-params scalar-params n-sym]} (pl/compile-wgsl #'wgsl-vadd!)]

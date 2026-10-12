@@ -16,6 +16,7 @@
    / Math / scalar. Reductions + i32 fixed-point atomic scatter are a follow-on."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.backend.intrinsics :as ix]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
@@ -96,8 +97,10 @@
     (symbol? expr) (let [n (name expr)] (if (contains? scalars n) (str "U." n) n))
     (and (seq? expr) (= 'clojure.core/aget (first expr)))
     (str (name (second expr)) "[" (emit-expr (nth expr 2) env) "]")
-    (and (seq? expr) (#{'long 'int} (first expr))) (str "i32(" (emit-expr (second expr) env) ")")
-    (and (seq? expr) (#{'float 'double} (first expr))) (str "f32(" (emit-expr (second expr) env) ")")
+    (and (seq? expr) (#{'long 'int} (descriptor/cast-result-tag (first expr))))
+    (str "i32(" (emit-expr (second expr) env) ")")
+    (and (seq? expr) (#{'float 'double} (descriptor/cast-result-tag (first expr))))
+    (str "f32(" (emit-expr (second expr) env) ")")
     (and (seq? expr) (= 'if (first expr)))
     (let [[_ c t e] expr] (str "select(" (emit-expr e env) ", " (emit-expr t env)
                                ", " (emit-expr c env) ")"))
