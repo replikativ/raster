@@ -29,7 +29,9 @@
     (with-redefs [soac/par-form->soac
                   (fn [& arguments]
                     (let [expression (second arguments)]
-                      (when (par/par-map-pure-form? expression)
+                      (when (or (par/par-map-pure-form? expression)
+                                (and (par/par-map-form? expression)
+                                     (not (contains? (par/extract-par-map-info expression) :offset))))
                         (throw (AssertionError. "admitted map reached legacy semantic inference")))
                       (apply original arguments)))]
       (f))))
@@ -192,9 +194,9 @@
               transformed (eval (list 'fn ['a 'n] (:source packet)))]
           (is (= (vec (original a 2)) (vec (transformed a 2)))))))))
 
-(deftest legacy-consumer-retains-the-admitted-map-storage-contract
-  ;; map! remains outside this singleton migration. Its compatibility equation must consume
-  ;; the preceding pmap's Float storage, rather than reconstructing it as the Double default.
+(deftest imperative-consumer-retains-the-admitted-map-storage-contract
+  ;; The dense map! now imports the same singleton packet as pmap. Its typed equation must
+  ;; consume the preceding pmap's Float storage, not the compilation's Double default.
   (let [source (:legacy-consumer float-map-sources)]
     (without-legacy-maps
      #(let [packet (:form (slp/segop-lower-pass source options))
@@ -205,7 +207,8 @@
                       operation :dtype :double :scalar-types {'n :long}
                       :array-types {'left retained-dtype 'out :double})
             abi (into {} (map (juxt :name :dtype)) (:abi artifact))]
-        (is (nil? (:algorithm consumer)) "legacy consumer is not relabelled as typed admission")
+        (is (some? (:algorithm consumer)) "consumer obtains actual typed admission, not a label")
+        (is (= :typed-soac (:algorithm-dialect operation)))
         (is (= :float retained-dtype))
         (is (some #{[:binding 'left]} (:operands consumer)))
         (is (= :float (get abi 'left)))

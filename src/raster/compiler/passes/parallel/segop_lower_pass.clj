@@ -430,6 +430,14 @@
 (defn- selected-operation-packet [result source opts used]
   (cond
     (par/par-map-pure-form? source) (singleton-packet result source opts used 'map)
+    ;; A surrounding host-controlled program may decline whole-program admission while
+    ;; this dense destination-writing map is independently representable. Keep its typed
+    ;; regions/storage relation through the same singleton authority as a pure map; the
+    ;; compatibility SoacMap projection cannot carry nested Fold terms. Offset maps remain
+    ;; scatter operations and must not be relabeled as dense maps here.
+    (and (par/par-map-form? source)
+         (not (contains? (par/extract-par-map-info source) :offset)))
+    (singleton-packet result source opts used 'map)
     (or (par/par-scan-form? source) (par/par-scan-exclusive-form? source))
     (singleton-packet result source opts used 'scan)
     :else (reduction-packet result source opts used)))
