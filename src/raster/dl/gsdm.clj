@@ -732,14 +732,36 @@
 (defn make-gsdm-config
   "Create GSDM model configuration.
   Returns a map describing the architecture."
-  [& {:keys [emb-dim n-heads n-layers n-spaces n-states timesteps]
-      :or {emb-dim 64 n-heads 2 n-layers 12 n-spaces 4 n-states N-STATES timesteps 1000}}]
+  [& {:keys [emb-dim n-heads n-layers n-spaces n-states timesteps parametrization sigma-data]
+      :or {emb-dim 64 n-heads 2 n-layers 12 n-spaces 4 n-states N-STATES timesteps 1000
+           parametrization :skip sigma-data 1.0}}]
   {:emb-dim emb-dim
    :n-heads n-heads
    :n-layers n-layers
    :n-spaces n-spaces
    :n-states n-states
-   :timesteps timesteps})
+   :timesteps timesteps
+   :parametrization parametrization
+   :sigma-data sigma-data})
+
+(defn preconditioning
+  "How the network F sees and predicts a latent variable at noise level
+  alpha-cumprod a: its input is c-in·x_t and the x0 prediction
+  c-skip·x_t + c-out·F (Karras et al. 2022, in variance-preserving form
+  with data scale σ_d = :sigma-data). Under :skip, at low noise the
+  prediction is x_t up to a small correction, which a network reproduces
+  far better than the identity itself; training F against
+  (x0 − c-skip·x_t)/c-out weights the x0 error by 1/c-out². :x0 is plain
+  x0 prediction: {1, 0, 1}."
+  [config a]
+  (let [a (double a)]
+    (case (:parametrization config :skip)
+      :x0 {:c-in 1.0 :c-skip 0.0 :c-out 1.0}
+      :skip (let [sd (double (:sigma-data config 1.0))
+                  denom (+ (- 1.0 a) (* a sd sd))]
+              {:c-in (/ 1.0 (Math/sqrt denom))
+               :c-skip (/ (* sd sd (Math/sqrt a)) denom)
+               :c-out (/ (* sd (Math/sqrt (- 1.0 a))) (Math/sqrt denom))}))))
 
 (defn init-gsdm-weights
   "Initialize all GSDM weights.
@@ -956,9 +978,19 @@
               _ (dotimes [i mg-n-vars]
                   (when (clamped? (aget mg-states i))
                     (aset x i (aget mg-values i))))
-              ;; Predict x0 from current x_t
-              pred-x0 (gsdm-forward-dynamic weights config x mg-spaces mg-states
-                                            (double step) mg-src mg-dst mg-n-vars mg-n-edges mg-pos-emb)
+              ;; Predict x0 from current x_t: c-skip·x_t + c-out·F(c-in·x_t)
+              {:keys [c-in c-skip c-out]} (preconditioning config (aget ^doubles alphas-cumprod step))
+              input (double-array mg-n-vars)
+              _ (dotimes [i mg-n-vars]
+                  (aset input i (if (clamped? (aget mg-states i))
+                                  (aget x i)
+                                  (* (double c-in) (aget x i)))))
+              out ^doubles (gsdm-forward-dynamic weights config input mg-spaces mg-states
+                                                 (double step) mg-src mg-dst mg-n-vars mg-n-edges mg-pos-emb)
+              pred-x0 (let [p (double-array mg-n-vars)]
+                        (dotimes [i mg-n-vars]
+                          (aset p i (+ (* (double c-skip) (aget x i)) (* (double c-out) (aget out i)))))
+                        p)
               ;; Clamp the prediction at clamped positions
               _ (dotimes [i mg-n-vars]
                   (when (clamped? (aget mg-states i))
@@ -1386,14 +1418,16 @@
   "Arguments of the batched loss (after the weights) for `batch` fresh
   examples of `problem` (a fn of an rng, as `make-linear-gaussian-problem`),
   each with its own condition mask and timestep t uniform on the schedule:
-  latent variables are noised to x_t, clamped ones keep x0, and the target is
-  x0. With `marginalized` k > 0, each example also marginalizes its own k
-  random variables, so all keep the same size. Every example of the problem
-  must have the same number of variables."
-  ([problem batch alphas-cumprod mask-mix emb-dim rng]
-   (training-batch problem batch alphas-cumprod mask-mix emb-dim rng 0))
-  ([problem batch alphas-cumprod mask-mix emb-dim ^java.util.Random rng marginalized]
-   (let [timesteps (alength ^doubles alphas-cumprod)
+  latent variables are noised to x_t and enter as c-in·x_t, clamped ones keep
+  x0, and the target of a latent variable is (x0 − c-skip·x_t)/c-out
+  (`preconditioning` under `config`). With `marginalized` k > 0, each
+  example also marginalizes its own k random variables, so all keep the same
+  size. Every example of the problem must have the same number of variables."
+  ([problem batch alphas-cumprod mask-mix config rng]
+   (training-batch problem batch alphas-cumprod mask-mix config rng 0))
+  ([problem batch alphas-cumprod mask-mix config ^java.util.Random rng marginalized]
+   (let [emb-dim (long (:emb-dim config))
+         timesteps (alength ^doubles alphas-cumprod)
          raw (vec (repeatedly batch #(problem rng)))
          _ (when-not (apply = (map #(long (:n-vars %)) raw))
              (throw (ex-info "A batch needs examples of one size" {:sizes (map :n-vars raw)})))
@@ -1403,22 +1437,28 @@
          states (mapv :states exs)
          n-per (long (:n-vars (first exs)))
          ts (vec (repeatedly batch #(.nextInt rng timesteps)))
+         ;; [network input, target] per example
          noised (mapv (fn [ex st t]
                        (let [x0 ^doubles (:values ex)
                              a (aget ^doubles alphas-cumprod t)
-                             xt (double-array n-per)]
+                             {:keys [c-in c-skip c-out]} (preconditioning config a)
+                             input (double-array n-per)
+                             target (double-array n-per)]
                          (dotimes [i n-per]
-                           (aset xt i (if (clamped? (aget ^longs st i))
-                                        (aget x0 i)
-                                        (+ (* (Math/sqrt a) (aget x0 i))
-                                           (* (Math/sqrt (- 1.0 a)) (.nextGaussian rng))))))
-                         xt))
+                           (if (clamped? (aget ^longs st i))
+                             (do (aset input i (aget x0 i))
+                                 (aset target i (aget x0 i)))
+                             (let [xt (+ (* (Math/sqrt a) (aget x0 i))
+                                         (* (Math/sqrt (- 1.0 a)) (.nextGaussian rng)))]
+                               (aset input i (* (double c-in) xt))
+                               (aset target i (/ (- (aget x0 i) (* (double c-skip) xt)) (double c-out))))))
+                         [input target]))
                      exs states ts)
         offsets (map #(* % n-per) (range batch))
         {:keys [node-example to-cf to-nm]} (batch-layout batch n-per emb-dim)]
-    [(double-array (mapcat seq noised))
+    [(double-array (mapcat (comp seq first) noised))
      (long-array (mapcat (comp seq :spaces) exs))
-     (double-array (mapcat (comp seq :values) exs))
+     (double-array (mapcat (comp seq second) noised))
      (long-array (mapcat seq states))
      (double-array (mapcat (comp seq :pos-emb) exs))
      (long-array (mapcat (fn [ex o] (map #(+ % o) (:src-edges ex))) exs offsets))
@@ -1463,7 +1503,7 @@
                           (ema-update! e (get weights k) mu (- 1.0 mu) (alength ^doubles e)))))
         losses (vec (for [step (range 1 (inc steps))]
                       (let [loss (apply train-fn w (:m state) (:v state)
-                                        (concat (training-batch problem batch alphas-cumprod mask-mix emb-dim rng
+                                        (concat (training-batch problem batch alphas-cumprod mask-mix config rng
                                                                 (.nextInt rng (inc (int max-marginalized))))
                                                 [(double max-grad-norm) (double lr) 0.9 0.999 1e-8 step]))]
                         (update-ema! step)

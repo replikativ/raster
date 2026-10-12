@@ -20,10 +20,10 @@
                               0)))))
 
 (deftest ^:statistical posterior-of-a-linear-gaussian
-  ;; At this CPU budget (6000 steps of 32, emb 32, 2 layers) the trained
-  ;; model is within about 0.2–0.6 posterior sds and 0.6–0.9 of the sd; the
-  ;; bounds catch gross errors (an untrained or mis-conditioned model lands
-  ;; several sds off with a fraction of the sd), not fine calibration.
+  ;; At this CPU budget (6000 steps of 32, emb 32, 2 layers; skip
+  ;; preconditioning) seeds 4–7 land within 0.07 posterior sds of the mean
+  ;; with 0.94–1.0 of the sd; 400 draws carry standard errors of about 0.05
+  ;; and 0.035. Plain x0 prediction lands up to 0.4 sds off, shrunk towards 0.
   (let [cfg (gsdm/make-gsdm-config :n-layers 2 :emb-dim 32 :n-heads 2 :n-spaces 1)
         betas (diff/cosine-beta-schedule 100)
         {:keys [ema-weights]} (gsdm/train-gsdm (gsdm/make-linear-gaussian-problem 3)
@@ -34,5 +34,5 @@
             exact (/ (/ (reduce + xs) 0.25) 13.0)
             m (/ (reduce + zs) (count zs))
             s (Math/sqrt (/ (reduce + (map #(let [e (- % m)] (* e e)) zs)) (dec (count zs))))]
-        (is (< (Math/abs (/ (- m exact) posterior-sd)) 1.0) (str xs " mean " m " vs " exact))
-        (is (< 0.6 (/ s posterior-sd) 1.4) (str xs " sd " s " vs " posterior-sd))))))
+        (is (< (Math/abs (/ (- m exact) posterior-sd)) 0.25) (str xs " mean " m " vs " exact))
+        (is (< 0.85 (/ s posterior-sd) 1.15) (str xs " sd " s " vs " posterior-sd))))))

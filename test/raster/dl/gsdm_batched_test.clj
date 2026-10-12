@@ -77,16 +77,16 @@
 (deftest training-batches
   (let [problem (gsdm/make-linear-gaussian-problem 3)
         ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 100))
-        [xt spaces x0 states pos-emb src dst t-emb node-example _ _ b n-per n-edges]
-        (gsdm/training-batch problem 5 ac {:posterior 1.0} emb-dim (java.util.Random. 2))]
+        [xt spaces target states pos-emb src dst t-emb node-example _ _ b n-per n-edges]
+        (gsdm/training-batch problem 5 ac {:posterior 1.0} cfg (java.util.Random. 2))]
     (is (= [5 4 (* 5 16)] [b n-per n-edges]))
     (is (= [20 20 20 20 (* 20 emb-dim) 80 80 (* 5 emb-dim) 20]
-           (mapv alength [xt spaces x0 states pos-emb src dst t-emb node-example])))
-    (testing "clamped variables keep x0, latent ones are noised"
+           (mapv alength [xt spaces target states pos-emb src dst t-emb node-example])))
+    (testing "clamped variables keep x0 as input and target, latent ones are noised"
       (doseq [i (range 20)]
         (if (gsdm/clamped? (aget ^longs states i))
-          (is (== (aget ^doubles x0 i) (aget ^doubles xt i)))
-          (is (not= (aget ^doubles x0 i) (aget ^doubles xt i))))))
+          (is (== (aget ^doubles target i) (aget ^doubles xt i)))
+          (is (not= (aget ^doubles target i) (aget ^doubles xt i))))))
     (testing "edges stay within their example"
       (is (every? true? (map #(= (quot %1 4) (quot %2 4)) src dst)))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"one size"
@@ -95,7 +95,30 @@
                                                    k (atom 0)]
                                                (fn [rng] (if (even? (swap! k inc)) (a rng) (c rng))))
                                              2 (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 10))
-                                             gsdm/default-mask-mix emb-dim (java.util.Random. 1)))))
+                                             gsdm/default-mask-mix cfg (java.util.Random. 1)))))
+
+(deftest preconditioning
+  (testing "at unit data scale: input x_t, prediction √a·x_t + √(1−a)·F"
+    (let [{:keys [c-in c-skip c-out]} (gsdm/preconditioning cfg 0.36)]
+      (is (< (Math/abs (- c-in 1.0)) 1e-12))
+      (is (< (Math/abs (- c-skip 0.6)) 1e-12))
+      (is (< (Math/abs (- c-out 0.8)) 1e-12))))
+  (testing "plain x0 prediction"
+    (is (= {:c-in 1.0 :c-skip 0.0 :c-out 1.0} (gsdm/preconditioning (assoc cfg :parametrization :x0) 0.36)))))
+
+(deftest preconditioned-targets
+  ;; one noise level and known x0: c-skip·x_t + c-out·target recovers x0
+  (let [base (gsdm/make-linear-gaussian-problem 3)
+        problem (fn [rng] (assoc (base rng) :values (double-array [1.0 2.0 3.0 4.0])))
+        ac (double-array [0.64])]
+    (doseq [config [(assoc cfg :sigma-data 2.0) (assoc cfg :parametrization :x0)]]
+      (let [{:keys [c-in c-skip c-out]} (gsdm/preconditioning config 0.64)
+            [input _ target states] (gsdm/training-batch problem 3 ac {:joint 1.0} config (java.util.Random. 7))]
+        (doseq [i (range 12)]
+          (let [x0 (double (inc (mod i 4)))
+                xt (/ (aget ^doubles input i) c-in)]
+            (is (not (gsdm/clamped? (aget ^longs states i))))
+            (is (< (Math/abs (- x0 (+ (* c-skip xt) (* c-out (aget ^doubles target i))))) 1e-12))))))))
 
 (deftest ^:compiled the-compiled-batch-is-its-examples
   (let [w (gsdm/flat->tree (gsdm/init-gsdm-weights cfg) n-layers)
@@ -108,7 +131,7 @@
   (let [problem (gsdm/make-linear-gaussian-problem 3)
         ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 100))
         [xt _ _ states _ src dst _ node-example _ _ b n-per n-edges]
-        (gsdm/training-batch problem 6 ac gsdm/default-mask-mix emb-dim (java.util.Random. 4) 2)]
+        (gsdm/training-batch problem 6 ac gsdm/default-mask-mix cfg (java.util.Random. 4) 2)]
     (is (= [6 2] [b n-per]))
     (is (= 12 (alength ^doubles xt) (alength ^longs states) (alength ^longs node-example)))
     (is (not-any? #(= gsdm/MARGINALIZED %) (vec states)))
@@ -123,7 +146,7 @@
                             (aset st 2 (long gsdm/MARGINALIZED))
                             (assoc ex :states st)))
         ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 100))
-        n-per-of (fn [k] (nth (gsdm/training-batch problem 4 ac {:posterior 1.0} emb-dim (java.util.Random. 5) k) 12))]
+        n-per-of (fn [k] (nth (gsdm/training-batch problem 4 ac {:posterior 1.0} cfg (java.util.Random. 5) k) 12))]
     (is (= 3 (n-per-of 0)))
     (is (= 2 (n-per-of 1)))))
 
@@ -140,6 +163,6 @@
                             (aset st 0 (long gsdm/MARGINALIZED))
                             (assoc ex :states st)))
         ac (diff/compute-alphas-cumprod (diff/cosine-beta-schedule 10))
-        pos-emb (nth (gsdm/training-batch problem 1 ac {:posterior 1.0} emb-dim (java.util.Random. 6) 0) 4)
+        pos-emb (nth (gsdm/training-batch problem 1 ac {:posterior 1.0} cfg (java.util.Random. 6) 0) 4)
         full (gsdm/compute-position-embeddings (long-array 4) 4 emb-dim)]
     (is (= (vec (java.util.Arrays/copyOfRange ^doubles full emb-dim (* 4 emb-dim))) (vec pos-emb)))))
