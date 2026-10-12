@@ -134,6 +134,20 @@ and snapshot ownership. This is not general surface math coverage: bodies requir
 mixed-precision conversions can still decline. It changes neither default source AD, device
 execution, reassociation permission nor the unchanged model-scale acceptance gate.
 
+Actual `deftm` Gaussian observation scores (Double) and binary-logistic scores (Float/Double)
+now exercise this lane through the frontend's two-equation map→ordered-sum program, canonical
+envelope projection, and prepared host execution. The prediction array is the single active
+space; observations and the Gaussian scale are excluded. Empty and small inputs check ordinary
+primal equality, independent density/probability-domain answers, analytic gradients, finite
+differences, JVP/VJP pairing, unchanged input arrays and saved pullbacks after caller mutation.
+These are existing-program composition witnesses, not a nonlinear-loss importer or new rules.
+
+The witness does not differentiate a scalar Gaussian location/scale parameter, a vector-latent
+regression program or distribution records. Active scalar captures need a separately checked
+broadcast tangent and ordered reduction of lane cotangents. Binary logistic likelihood is not
+categorical SFT: grouped log-sum-exp, target gathers and the unchanged real model gate remain
+open. No family validator or construction evidence retires on the strength of this witness.
+
 ## Indexed-map construction checkpoint
 
 `linearize-indexed-map-program` constructs ordinary SOAC programs in the existing certified
