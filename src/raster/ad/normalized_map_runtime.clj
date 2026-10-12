@@ -70,7 +70,7 @@
         sum? (= :checked-scalar-map-sum (get-in owner [:derivation :kind]))
         {:keys [source primal linear transpose interface residual-bindings physical-bindings]} owner
         seed-id (get-in interface [:cotangent-input :id])
-        {:keys [arrays captures attributes]} (soac/operation-parts (first (soac/equations source)))
+        {:keys [arrays captures attributes lambda]} (soac/operation-parts (first (soac/equations source)))
         inputs (mapv :id (:inputs interface))
         values (:values (soac/facts source))
         active (first (:active-inputs interface))
@@ -87,13 +87,18 @@
                                            (:requirement binding)))
                                        physical-bindings))
         projections (mapv #(projection % indexed?) [primal linear transpose])
-        guard! (if indexed? #(canonical/validate! owner)
-                   (normalized/execution-guard
-                    (:source-ns owner) expected
-                    (conj projections (normalized/execution-source (get-in owner [:derivation :bundle])))))
+        source-dependencies (if indexed?
+                              ;; Admission requires a single direct read and EMPTY locals.
+                              ;; The scalar identity lane omits this executable read/alias.
+                              ;; Capture its original checked lambda, not another importer.
+                              (let [{:keys [parameters body-results]} (soac/lambda-parts lambda)]
+                                {:parameters parameters :body body-results})
+                              (normalized/execution-source (get-in owner [:derivation :bundle])))
+        guard! (normalized/execution-guard (:source-ns owner) expected
+                                          (conj projections source-dependencies))
         ;; Bind the captured effective callees to the existing selected-call proof,
         ;; rather than blessing a mutation between adaptation and identity capture.
-        _ (when-not indexed? (canonical/validate! owner))
+        _ (canonical/validate! owner)
         _ (guard!)
         compiled (mapv #(compile-projection % (:source-ns owner)) projections)
         _ (guard!)

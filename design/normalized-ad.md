@@ -539,9 +539,14 @@ runtime dependency is loaded before bundle epochs are established. The post-capt
 proof still checks the realized selected implementation; a later replacement refuses.
 persistent alias root replacement therefore refuses even without an epoch change.
 This is a sequential fence, not a concurrent raw Var mutation/ABA or callable-internal
-mutation guarantee. Indexed execution performs full canonical validation before and
-after compilation and successful projection calls; original projection failures remain
-primary. Its physical typed-zero binding is an obligation checked against the canonical
+mutation guarantee. Indexed preparation uses the same fence, capturing the exact original
+read/alias from its checked single-read, empty-local source lambda as well as the three
+generated host projections. The scalar identity lane alone is not source dependency evidence.
+Full canonical validation after capture binds that fence to the accepted program and physical
+contracts. Indexed hot calls perform no proof replay or materialization; exact carrier/bounds,
+snapshot and fresh-zero ownership checks remain. Original projection failures stay primary.
+Extending indexed source admission beyond this lambda requires revisiting dependency capture.
+Its physical typed-zero binding is an obligation checked against the canonical
 transpose destination/result alias, not an allocation receipt.
 The delegated validator replays existing registered scalar derivative rules during
 preparation with their exact recorded typed IDs; that correspondence is not independent
