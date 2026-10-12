@@ -338,9 +338,16 @@
   "Admit, freshen and schedule the complete typed singleton, including host SSA."
   [result source opts used kind]
   (let [packet-stage (case kind reduce :typed-reduction-packet
-                               map :typed-map-packet scan :typed-scan-packet)
+                               map :typed-map-packet scan :typed-scan-packet
+                               write-region :typed-write-packet)
         source-stage (case kind reduce :typed-reduction-source
-                               map :typed-map-source scan :typed-scan-source)]
+                               map :typed-map-source scan :typed-scan-source
+                               write-region :typed-write-source)
+        primary-kind? (if (= 'write-region kind)
+                        ;; A unique direct store is canonically a map, whereas
+                        ;; indirect/reducing writes retain scatter/effect-map.
+                        #{'map 'scatter 'effect-map}
+                        #{kind})]
     (let [attempt (typed-route/attempt
                    (list 'let* [result source] result)
                    (or (:dtype opts) :double) (:array-types opts)
@@ -380,9 +387,12 @@
               locals (disj (set (concat (map first source-pairs)
                                        (mapcat :results (:equations packet)))) result)
               fresh (fn [id]
-                      (loop [candidate (with-meta (gensym (str (name id) "_")) (meta id))]
-                        (if (contains? @used candidate) (recur (gensym (str (name id) "_")))
-                            (do (swap! used conj candidate) candidate))))
+                      ;; Logical effect results are structural value ids, not source locals.
+                      ;; Freshen them without assuming every value id implements Named.
+                      (let [prefix (if (instance? clojure.lang.Named id) (name id) "effect_result")]
+                        (loop [candidate (with-meta (gensym (str prefix "_")) (meta id))]
+                          (if (contains? @used candidate) (recur (gensym (str prefix "_")))
+                              (do (swap! used conj candidate) candidate)))))
               rename (into {} (map #(vector % (fresh %))) locals)
               rename-id #(get rename % %)
               pairs (mapv (fn [[id expression]]
@@ -411,16 +421,32 @@
                                    :values values :inputs (mapv rename-id (:inputs packet))
                                    :outputs (mapv rename-id (:outputs packet)) :equations equations)
               scheduled (:form (segop-lower-pass packet opts))
-              primary (some #(when (and (= [result] (:results %))
-                                        (= kind (soac-dialect/operation-kind
-                                                    (first (soac-dialect/equations (:algorithm %)))))) %)
-                            (:equations scheduled))]
+              parallel-equations (filterv #(seq (:operations %)) (:equations scheduled))
+              primary (if (= 'write-region kind)
+                        (when (= 1 (count parallel-equations)) (first parallel-equations))
+                        (some #(when (and (= [result] (:results %))
+                                          (primary-kind? (soac-dialect/operation-kind
+                                                          (first (soac-dialect/equations (:algorithm %)))))) %)
+                              (:equations scheduled)))]
           (when-not (and primary
-                         (= kind (soac-dialect/operation-kind
-                                     (first (soac-dialect/equations (:algorithm primary)))))
-                         (= [result] (:results primary)))
+                         (primary-kind? (soac-dialect/operation-kind
+                                         (first (soac-dialect/equations (:algorithm primary)))))
+                         ;; Effect regions may write several arrays. The isolated packet's
+                         ;; unique parallel equation, not an invented result, owns the region.
+                         (or (= 'write-region kind) (= [result] (:results primary))))
             (throw (ex-info (str "typed " (name kind) " packet lost its result equation")
                             {:reason :raster/bug :stage packet-stage :source source})))
+          (when (= 'write-region kind)
+            (let [storage (get-in primary [:attributes :result-storage])
+                  physical (equation-physical-results (:algorithm primary))]
+              (when-not (and (seq storage)
+                             (= (count (:results primary)) (count storage))
+                             (every? #(and (symbol? (:destination %))
+                                           (contains? #{:write :read-write} (:access %))) storage)
+                             (= physical (mapv :destination storage)))
+                (throw (ex-info "typed write packet lacks its complete physical storage relation"
+                                {:reason :raster/bug :stage packet-stage :source source
+                                 :results (:results primary) :storage storage :physical physical})))))
           {:program scheduled :pairs pairs :body body :primary primary})))))
 
 (defn- reduction-packet [result source opts used]
@@ -438,6 +464,10 @@
     (and (par/par-map-form? source)
          (not (contains? (par/extract-par-map-info source) :offset)))
     (singleton-packet result source opts used 'map)
+    ;; Let the verified region decide whether writes are unique, reducing, or an
+    ;; ordered effect map. This selector does not infer a collision contract.
+    (or (par/par-map-void-form? source) (par/par-scatter-form? source))
+    (singleton-packet result source opts used 'write-region)
     (or (par/par-scan-form? source) (par/par-scan-exclusive-form? source))
     (singleton-packet result source opts used 'scan)
     :else (reduction-packet result source opts used)))

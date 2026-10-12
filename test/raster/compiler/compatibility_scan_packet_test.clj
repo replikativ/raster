@@ -130,7 +130,7 @@
                                       (apply original args))]
       (let [result (lower/segop-lower-pass (list 'let* ['result scatter] 'result) (options :double))]
         (is (= [scatter] @calls))
-        (is (= :soac (:stage (first (get-in result [:stats :segops-declined])))))))))
+        (is (some #(= :soac (:stage %)) (get-in result [:stats :segops-declined])))))))
 
 (deftest scans-import-complete-typed-packets-and-caller-capacities
   (reject-legacy-scans
