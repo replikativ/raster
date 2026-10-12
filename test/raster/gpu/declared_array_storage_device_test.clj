@@ -84,8 +84,8 @@
                                    :when (not= :scalar (:kind slot))] slot)]
             (is (= :float (get-in packet [:values [:binding 'left] :dtype])))
             (when (= kind :legacy-consumer)
-              (is (nil? (:algorithm (last (:equations packet))))
-                  "map! remains an honest legacy consumer"))
+              (is (some? (:algorithm (last (:equations packet))))
+                  "dense map! retains its actual typed storage contract"))
             (is (some #(= :float (:dtype %)) buffer-slots)
                 "the physical ABI contains Float storage under the Double default")
             (when (not= kind :float-result)
