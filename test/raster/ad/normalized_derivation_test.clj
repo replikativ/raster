@@ -160,13 +160,13 @@
                [emitted tangent]))))]
       (let [b (build)]
         (is (identical? b (normalized/validate! b)))
-        ;; The existing lookup delegates the qualified spelling to its canonical rule.
-        ;; Observe both wrappers without mistaking spelling for different emitter state.
-        (is (= 6 (count @observations)))
-        (is (= (vec (mapcat identity (repeat 3 '[* raster.numeric/*])))
+        ;; Canonical alias lookup is internal: each actual producer/replay emission
+        ;; crosses the public callback once with identical state and typed requests.
+        (is (= 3 (count @observations)))
+        (is (= (vec (repeat 3 'raster.numeric/*))
                (mapv :operation @observations)))
         (is (seq (:requests (first @observations))))
-        (is (apply = (partition 2 @observations)))
+        (is (apply = @observations))
         (is (apply = (map #(dissoc % :operation) @observations))))))
   (let [b (build) actual templates/op-jvp-fn]
     (with-redefs [templates/op-jvp-fn

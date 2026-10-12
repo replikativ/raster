@@ -1456,6 +1456,31 @@
                          " on " canonical-op)
                     {:op canonical-op :class class}))))
 
+(defn- resolve-forward-template-in
+  "Resolve existing forward facets against one immutable registry snapshot."
+  [registry op seen]
+  (when-let [[template canonical] (resolve-template-in registry op)]
+    (when-not (contains? seen canonical)
+      (if (or (:jvp-fn template) (:structure template))
+        [template canonical]
+        (let [seen (conj seen canonical)
+              targets (cond-> []
+                        (get qualified->base-op canonical)
+                        (conj (get qualified->base-op canonical))
+                        (and (qualified-symbol? canonical) (= "raster.math" (namespace canonical)))
+                        (conj (symbol "Math" (name canonical)))
+                        (and (qualified-symbol? canonical) (= "clojure.core" (namespace canonical)))
+                        (conj (symbol (name canonical))))]
+          (some #(resolve-forward-template-in registry % seen) (distinct targets)))))))
+
+(defn resolve-forward-template
+  "Return [template canonical-op] owning an explicit JVP or structure facet, or nil.
+   Copied structureless aliases follow the same fallback as op-jvp-fn; explicit alias facets
+   remain authoritative. Resolution uses one registry snapshot and creates no cached rule.
+   This is rule availability/structure evidence, not purity, scalar typing or numerical proof."
+  [op]
+  (resolve-forward-template-in @template-registry op #{}))
+
 (defn op-jvp-fn
   "The op's forward-mode (JVP) rule: an explicit :jvp-fn facet, or one derived
   (and cached) from its :structure tag. Returns nil when the op has neither —
@@ -1467,7 +1492,7 @@
   [op]
   (loop []
     (let [registry @template-registry]
-      (when-let [[template canonical] (resolve-template-in registry op)]
+      (when-let [[template canonical] (resolve-forward-template-in registry op #{})]
         (cond
           (:jvp-fn template) (:jvp-fn template)
           (:structure template)
@@ -1477,21 +1502,7 @@
             (if (compare-and-set! template-registry registry
                                   (assoc-in registry [canonical :jvp-fn] f))
               f
-              (recur)))
-          :else
-          (or
-            ;; alias → base fallbacks
-            (when-let [base (get qualified->base-op canonical)]
-              (op-jvp-fn base))
-            (when (and (qualified-symbol? canonical)
-                       (= "raster.math" (namespace canonical)))
-              (let [interop (symbol "Math" (name canonical))]
-                (when (get-template interop) (op-jvp-fn interop))))
-            (when (and (qualified-symbol? canonical)
-                       (= "clojure.core" (namespace canonical))
-                       (not= canonical (symbol (name canonical))))
-              (let [bare (symbol (name canonical))]
-                (when (get-template bare) (op-jvp-fn bare))))))))))
+              (recur))))))))
 
 ;; ================================================================
 ;; §13 A4 — explicit :jvp-fn for backward kernels whose Jacobian structure

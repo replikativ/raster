@@ -109,6 +109,14 @@ with current registered derivative arithmetic is not independent proof of its ma
 nor floating reassociation permission or completion of the AD/training migration. Exact SFT
 and the unchanged Gemma FAILED gate (11/28) remain independent obligations.
 
+Forward-rule lookup now exposes one snapshot-based owner query shared by JVP derivation.
+Structureless copied aliases follow the existing canonical fallback; an alias's explicit
+JVP or structure facet stays authoritative. Derived callbacks are cached at that resolved
+owner only after a successful registry compare-and-set; replacement forces a fresh lookup.
+The query supplies availability and structure, not purity, scalar signature or numerical
+proof. Nonlinear scalar admission still needs those independent facts and tangent-linearity
+checks. This prerequisite does not admit exp/log into the current normalized arithmetic lane.
+
 ## Indexed-map construction checkpoint
 
 `linearize-indexed-map-program` constructs ordinary SOAC programs in the existing certified
