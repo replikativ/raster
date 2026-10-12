@@ -1,5 +1,21 @@
 # Normalized AD design proposal
 
+## Current implementation boundary
+
+Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
+The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
+map followed by ordered additive sum, and functional indexed map. Those families now execute
+through one canonical program/interface/residual owner. Preparation retains full validation;
+hot calls check compiler/rule epochs and captured executable identities without replaying proofs.
+Indexed pullbacks additionally require private index snapshots and a fresh typed-zero physical
+gradient owner on every call. These are sequential lifetime contracts, not concurrent mutation
+or asynchronous ownership guarantees.
+
+General equation composition, conditional/loop AD regions, device execution of these normalized
+families and default-engine migration remain separate gates. Existing real-weight training
+acceptance is still open. The sections below describe the individual construction checkpoints;
+an adapter's lack of runtime effects does not mean its checked envelope is unused by the runtime.
+
 ## Equation projection and shape facts
 
 `soac/equation-subprogram(s)` keeps executable inputs distinct from shape-only facts. When an
@@ -55,7 +71,8 @@ stream described below. This establishes correspondence to the currently registe
 not independent proof of custom-rule mathematics or a capability granted by producer certification.
 
 This thin migration adapter adds no runtime mode, parser, rule registry, cache, equation
-composition or fusion permission. Old APIs and runtimes remain unchanged. The nested evidence
+composition or fusion permission. The adapter itself does not change source admission or public
+surface semantics. The nested evidence
 and family validators may retire only after a common program validator independently owns the
 same source/derivative/residual obligations and the existing numerical/refusal gates agree.
 `adapt-map-sum` uses the same canonical projection for an existing admitted map→ordered sum.
@@ -82,8 +99,9 @@ rules. Full typed programs, tangent/seed IDs and residual ordering must agree se
 Rule/definition epochs are checked before and after replay. Existing bundles without generation
 evidence refuse rather than receiving a new certificate or inferred proof.
 
-This deliberately replays rule emitters on every validation, including runtime primal and
-pullback boundaries; there is no opaque validation cache or safety skip. Emitters must remain
+Every explicit validation replays rule emitters; there is no opaque validation cache or safety
+skip. Prepared host family execution instead uses the captured lifetime fence described above,
+without invoking full validation on each primal or pullback call. Emitters must remain
 deterministic under their registered contract, and their original failures propagate. Agreement
 with current registered derivative arithmetic is not independent proof of its mathematics,
 nor floating reassociation permission or completion of the AD/training migration. Exact SFT
@@ -118,7 +136,7 @@ mutated during acquisition. Device execution, gather→sum and public-engine int
 separate gates. The unchanged real-weight Gemma gate remains FAILED (11/28); host indexed-map
 controls are not model or exact SFT acceptance.
 
-Status: architecture assessed against Raster main
+Initial assessment checkpoint: Raster main
 `642b5f0c0aad7c49f223357a796ce09c900e7c1c`, with an initial opt-in scalar implementation.
 This is not a replacement for the compiler campaign or completion of normalized AD. The
 unpublished scoped-helper experiment remains held by a checkpoint refusal regression.
