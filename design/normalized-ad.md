@@ -118,7 +118,21 @@ JVP or structure facet stays authoritative. Derived callbacks are cached at that
 owner only after a successful registry compare-and-set; replacement forces a fresh lookup.
 The query supplies availability and structure, not purity, scalar signature or numerical
 proof. Nonlinear scalar admission still needs those independent facts and tangent-linearity
-checks. This prerequisite does not admit exp/log into the current normalized arithmetic lane.
+checks.
+
+The homogeneous scalar lane now admits unary elementwise operations when that owner declares
+exact unary elementwise structure and supplies reverse rules, the canonical scalar descriptor
+recognizes the operation, and existing effect analysis proves purity. Selected method signatures
+must agree with retained Float/Double facts. Java Math's Double results cannot acquire Float
+semantics merely from caller annotations. There is no second math whitelist or rule registry.
+Nonlinear operations may compute frozen coefficients, but may not consume tangents in a linear
+program; even `exp(0)` is a coefficient, not an identically zero linear map. Rule replacement
+invalidates old bundles and replay uses the new declared rule identity.
+
+Exp/log host-map witnesses check both carriers, independent finite differences, JVP/VJP pairing
+and snapshot ownership. This is not general surface math coverage: bodies requiring unsupported
+mixed-precision conversions can still decline. It changes neither default source AD, device
+execution, reassociation permission nor the unchanged model-scale acceptance gate.
 
 ## Indexed-map construction checkpoint
 

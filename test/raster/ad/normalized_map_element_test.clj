@@ -152,7 +152,7 @@
   (is (some? (reason #(bundle (map-program :double {:body '(raster.numeric/+ element i)})))))
   (is (some? (reason #(bundle (map-program :double {:body '(clojure.core/aget x i)})))))
   (is (= :ad-normalized-operation
-         (reason #(bundle (map-program :double {:body '(Math/sin element)})))))
+         (reason #(bundle (map-program :double {:body '(Math/pow element element)})))))
   (is (some? (reason #(bundle (map-program :double {:body '(float element)}))))))
 
 (deftest map-element-does-not-drop-numerical-policy-or-storage-evidence

@@ -23,6 +23,7 @@
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.core :as core]))
 
@@ -95,16 +96,25 @@
                         (descriptor/subtraction-op? operation) '-
                         (descriptor/multiplication-op? operation) '*
                         (descriptor/division-op? operation) '/)
-        cast-tag (descriptor/cast-result-tag operation)]
+        cast-tag (descriptor/cast-result-tag operation)
+        [forward-template forward-owner] (when-not (or canonical cast-tag)
+                                            (templates/resolve-forward-template operation))
+        unary? (and (= 1 (count arguments) (count (:params forward-template)))
+                    (= {:class :elementwise :in #{0}} (:structure forward-template))
+                    (descriptor/scalar-op? forward-owner)
+                    (= :pure (effects/analyze-effect expression))
+                    (:grads-fn forward-template))]
     (when (or lexical-callee (nil? operation))
       (fail! :ad-normalized-callee {:expression expression :call call}))
     (when-not (or (and (contains? '#{+ - * /} canonical)
                        (contains? #{1 2} (count arguments))
                        (or (= 2 (count arguments)) (= '- canonical)))
-                  (and (contains? '#{float double} cast-tag) (= 1 (count arguments))))
+                  (and (contains? '#{float double} cast-tag) (= 1 (count arguments)))
+                  unary?)
       (fail! :ad-normalized-operation {:expression expression :operation operation}))
-    (assoc call :template template :template-identity template-identity
-           :canonical canonical :cast-tag cast-tag)))
+    (assoc call :template (if unary? forward-template template)
+           :template-identity (if unary? forward-owner template-identity)
+           :canonical (if unary? :nonlinear-unary canonical) :cast-tag cast-tag)))
 
 (defn- equation-expression [equation]
   (let [{:keys [kind captures lambda]} (soac/operation-parts equation)]
@@ -119,11 +129,21 @@
   "Check retained calls against the existing non-invoking dispatch authority.
    Runtime implementation objects are compared here, never serialized as AD identities."
   [call argument-dtypes result-dtype]
-  (let [{:keys [operation dispatch? implementation-op]} call
+  (let [{:keys [operation dispatch? implementation-op canonical arguments]} call
         operation-var (when (symbol? operation) (resolve operation))
         operation-snapshot (when (var? operation-var) (dependency-snapshot operation-var))]
     (when (and *proof-dependencies* operation-snapshot)
       (observe-dependency! *proof-dependencies* operation operation-snapshot))
+    (when (and (= :nonlinear-unary canonical)
+               (not (or dispatch? (:raster.core/dispatch-table (:metadata operation-snapshot)))))
+      ;; Java primitives need the existing reflected return signature, not merely
+      ;; homogeneous caller assertions. Math/exp(Float) cannot acquire Float semantics.
+      (let [native-result (inference/static-method-return-tag
+                           operation arguments (zipmap arguments (mapv tag argument-dtypes)))]
+        (when-not (= (tag result-dtype) native-result)
+          (fail! :ad-normalized-call-contract
+                 {:operation operation :arguments (mapv tag argument-dtypes)
+                  :result (tag result-dtype) :native-result native-result}))))
     (when (or dispatch? (:raster.core/dispatch-table (:metadata operation-snapshot)))
       (let [argument-tags (mapv tag argument-dtypes)
             selected (dispatch/selected-call-signature
@@ -250,6 +270,8 @@
                                (fail! :ad-normalized-nonlinear {:result result :expression expression}))
                              (when (and (= '/ canonical) (= :linear (second kinds)))
                                (fail! :ad-normalized-nonlinear {:result result :expression expression}))
+                             (when (and (= :nonlinear-unary canonical) linear?)
+                               (fail! :ad-normalized-nonlinear {:result result :expression expression}))
                              (when (and cast-tag linear?
                                         (not= (expression-dtype values (first arguments))
                                               (:dtype (get values result))))
@@ -258,6 +280,7 @@
                                         (some #{:coefficient} kinds))
                                (fail! :ad-normalized-affine-offset {:expression expression}))
                              (cond linear? :linear
+                                   (= :nonlinear-unary canonical) :coefficient
                                    (and (not (contains? '#{* /} canonical)) (every? #{:zero} kinds)) :zero
                                    :else :coefficient))
                            (if (number? expression) (if (zero? expression) :zero :coefficient)
