@@ -539,7 +539,10 @@ runtime dependency is loaded before bundle epochs are established. The post-capt
 proof still checks the realized selected implementation; a later replacement refuses.
 persistent alias root replacement therefore refuses even without an epoch change.
 This is a sequential fence, not a concurrent raw Var mutation/ABA or callable-internal
-mutation guarantee. Indexed execution retains its existing per-invocation validation.
+mutation guarantee. Indexed execution performs full canonical validation before and
+after compilation and successful projection calls; original projection failures remain
+primary. Its physical typed-zero binding is an obligation checked against the canonical
+transpose destination/result alias, not an allocation receipt.
 The delegated validator replays existing registered scalar derivative rules during
 preparation with their exact recorded typed IDs; that correspondence is not independent
 proof of custom-rule mathematics and adds no hot replay. This adds no cache,
@@ -567,7 +570,17 @@ fresh interfaces and construction correspondence, including semantic metadata an
 owned residuals. Known frontend binding bookkeeping is projected only after its
 complete two-binding envelope and absent host activity have been checked; unknown
 attributes are not stripped. No derivative rules or numerical interpreter are added.
-The existing host consumer now chooses the checked sum programs when present. Shared
+The host consumer adapts admitted legacy evidence once at its preparation boundary. All
+three supported families then execute the canonical primal/linear/transpose programs,
+ordered input/value interfaces, owned residual bindings and physical requirements. It
+does not rebuild a separate runtime interface or execute a legacy program facet. Family
+source/derivative validators remain the mathematical authority; they cannot be retired
+merely because execution no longer reads their storage representation. Indexed destination
+and result IDs remain distinct, and every pullback allocates a fresh typed-zero destination.
+No caller array is retained as a residual. This does not add a runtime mode or general AD
+composition.
+
+Shared
 host materialization assembles the tuple map and original reduction in equation order,
 with one exact-ID source transport; it adds no numerical evaluator or reduction loop.
 The generated reduction projects only the exact frontend prefix bookkeeping already

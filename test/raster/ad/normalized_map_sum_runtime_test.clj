@@ -135,7 +135,7 @@
         revisions (ns-resolve 'raster.ad.normalized-scalar 'revisions)
         current (revisions)
         invoke (ns-resolve 'raster.ad.normalized-map-runtime 'invoke)
-        executable (ns-resolve 'raster.ad.normalized-map-runtime 'executable)
+        compile-projection (ns-resolve 'raster.ad.normalized-map-runtime 'compile-projection)
         executions (atom 0)]
     (with-redefs-fn {revisions (constantly (update current :compiler-revision inc))
                     invoke (fn [& _] (swap! executions inc))}
@@ -144,7 +144,7 @@
         (is (= :ad-normalized-stale-rules (reason #((:jvp prepared) arguments (double-array 1)))))
         (is (= :ad-normalized-stale-rules (reason #(pullback 1.0))))
         (is (zero? @executions))))
-    (with-redefs-fn {executable (fn [& _] (swap! executions inc))}
+    (with-redefs-fn {compile-projection (fn [& _] (swap! executions inc))}
       (fn []
         (let [forged (assoc-in bundle [:sum-programs :interface :seed] 'xs)
               forged (assoc forged :certificate (#'normalized/certificate forged))]

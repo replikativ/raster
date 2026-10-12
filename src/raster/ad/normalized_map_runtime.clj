@@ -20,9 +20,6 @@
            (binding [*ns* source-ns]
              (eval (list 'fn (:parameters projection) (:body projection))))))
 
-(defn- executable [program source-ns indexed?]
-  (compile-projection (projection program indexed?) source-ns))
-
 (defn- invoke [executable values]
   (apply (:execute executable) (mapv values (concat (:inputs executable) (:physical-inputs executable)))))
 
@@ -63,48 +60,49 @@
   (when-not (or (:map-programs bundle) (:gather-programs bundle))
     (normalized/validate! bundle)
     (fail! :ad-map-runtime-bundle {}))
-  (let [indexed? (contains? bundle :gather-programs)
-        sum? (contains? bundle :sum-programs)
-        expected (normalized/revisions)
-        owner (when-not indexed? ((if sum? canonical/adapt-map-sum canonical/adapt-map) bundle))
-        _ (when indexed? (normalized/validate! bundle))
-        programs (if indexed? (:gather-programs bundle) owner)
-        interface (if indexed? (:interface programs)
-                      {:active-array (first (get-in owner [:interface :active-inputs]))
-                       :tangent-input (get-in owner [:interface :tangent-input :id])
-                       :cotangent-input (get-in owner [:interface :cotangent-input :id])
-                       :residual-arrays (into {} (keep (fn [[coefficient residual]]
-                                                        (when (= :owned-array (:storage residual))
-                                                          [coefficient (:id residual)])))
-                                             (:residual-bindings owner))})
-        {:keys [source primal linear transpose required-zero-gradient]} programs
-        seed-id (:cotangent-input interface)
+  (let [expected (normalized/revisions)
+        ;; Legacy evidence is admitted only here. Execution below consumes one canonical
+        ;; program/interface/residual owner, including indexed physical obligations.
+        owner ((cond (:gather-programs bundle) canonical/adapt-indexed-map
+                     (:sum-programs bundle) canonical/adapt-map-sum
+                     :else canonical/adapt-map) bundle)
+        indexed? (= :checked-scalar-indexed-map (get-in owner [:derivation :kind]))
+        sum? (= :checked-scalar-map-sum (get-in owner [:derivation :kind]))
+        {:keys [source primal linear transpose interface residual-bindings physical-bindings]} owner
+        seed-id (get-in interface [:cotangent-input :id])
         {:keys [arrays captures attributes]} (soac/operation-parts (first (soac/equations source)))
-        inputs (:inputs (soac/facts source))
+        inputs (mapv :id (:inputs interface))
         values (:values (soac/facts source))
-        active (if indexed? (first captures) (:active-array interface))
+        active (first (:active-inputs interface))
         dt (:dtype (get values active))
         extent-id (:extent attributes)
         capacity-id (when indexed? (first (:shape (get values active))))
-        projections (when-not indexed? (mapv #(projection % false) [primal linear transpose]))
-        guard! (if indexed? #(normalized/validate! bundle)
+        owned-residuals (into {} (filter (fn [[_ residual]] (= :owned-array (:storage residual))))
+                              residual-bindings)
+        index-snapshot (when indexed? (:id (get owned-residuals (first arrays))))
+        gradient-id (get-in interface [:cotangent-result :id])
+        required-zero-gradient (when indexed?
+                                 (some (fn [[_ binding]]
+                                         (when (= gradient-id (get-in binding [:consumer :result]))
+                                           (:requirement binding)))
+                                       physical-bindings))
+        projections (mapv #(projection % indexed?) [primal linear transpose])
+        guard! (if indexed? #(canonical/validate! owner)
                    (normalized/execution-guard
                     (:source-ns owner) expected
                     (conj projections (normalized/execution-source (get-in owner [:derivation :bundle])))))
         ;; Bind the captured effective callees to the existing selected-call proof,
         ;; rather than blessing a mutation between adaptation and identity capture.
-        _ (when-not indexed? (canonical/validate! owner) (guard!))
-        compiled (if indexed?
-                   (mapv #(executable % (:source-ns bundle) true) [primal linear transpose])
-                   (mapv #(compile-projection % (:source-ns owner)) projections))
-        _ (when-not indexed? (guard!))
+        _ (when-not indexed? (canonical/validate! owner))
+        _ (guard!)
+        compiled (mapv #(compile-projection % (:source-ns owner)) projections)
+        _ (guard!)
         [primal push pull] compiled
-        run (if indexed? (fn [executable environment] (invoke executable environment))
-                (fn [executable environment]
-                  (guard!)
-                  (let [result (invoke executable environment)]
-                    (guard!)
-                    result)))
+        run (fn [executable environment]
+              (guard!)
+              (let [result (invoke executable environment)]
+                (guard!)
+                result))
         context
         (fn [arguments]
           (guard!)
@@ -153,13 +151,13 @@
           (let [results (run primal environment)
                 ;; Keep only immutable scalar captures/extent and freshly owned
                 ;; residual outputs. No mutable source array or returned y is a pullback input.
-                residual-ids (if indexed? [(:index-snapshot interface)] (vals (:residual-arrays interface)))
+                residual-ids (map :id (vals owned-residuals))
                 saved (merge (apply dissoc environment (if indexed? (concat arrays captures) arrays))
                              (select-keys (zipmap (:outputs primal) results) residual-ids))]
             (when indexed?
               (let [extent (if (integer? extent-id) extent-id (get environment extent-id))]
                 (array! (first results) dt extent :primal-output)
-                (array! (get saved (:index-snapshot interface))
+                (array! (get saved index-snapshot)
                         (:dtype (get values (first arrays))) extent :index-snapshot)))
             [(first results) saved]))]
     {:inputs inputs
@@ -180,12 +178,12 @@
               (when indexed?
                 (array! gradient dt capacity :gradient)
                 (when-not (identical? gradient (get seeded (:value required-zero-gradient)))
-                  (fail! :ad-map-runtime-physical-owner {:output (:gradient-output interface)})))
-              (when-not indexed? (guard!))
+                  (fail! :ad-map-runtime-physical-owner {:output gradient-id})))
+              (guard!)
               (mapv #(when (= active %) gradient) inputs)))]))
      :jvp
      (fn [arguments dx]
        (let [{:keys [environment extent capacity]} (context arguments)]
          (array! dx dt (if indexed? capacity extent) :tangent)
          (let [[output saved] (acquire environment)]
-           [output (first (run push (assoc saved (:tangent-input interface) dx)))])))}))
+           [output (first (run push (assoc saved (get-in interface [:tangent-input :id]) dx)))])))}))

@@ -1,6 +1,7 @@
 (ns raster.ad.normalized-indexed-runtime-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.normalized-scalar :as normalized]
+            [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-map-runtime :as runtime]
             [raster.ad.normalized-indexed-map-test :as construction]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -15,6 +16,69 @@
 (defn- reason [f] (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 (defn- gradient [prepared pullback dy]
   (nth (pullback dy) (.indexOf ^java.util.List (:inputs prepared) 'data)))
+
+(deftest indexed-execution-is-owned-by-the-canonical-envelope
+  (let [evidence (bundle :double :long 'n 'm)
+        owner (atom nil) validated (atom [])
+        adapt canonical/adapt-indexed-map validate canonical/validate!]
+    (with-redefs [canonical/adapt-indexed-map
+                  (fn [b] (let [result (adapt b)] (reset! owner result) result))
+                  canonical/validate!
+                  (fn [b] (swap! validated conj b) (validate b))]
+      (let [prepared (runtime/prepare evidence)
+            input (args prepared {'n (long 2) 'indices (long-array [1 1])
+                                  'data (double-array [3.0 5.0 7.0])})
+            [output pb] ((:vjp prepared) input)
+            g (gradient prepared pb (double-array [1.0 2.0]))
+            [jy tangent] ((:jvp prepared) input (double-array [0.25 0.5 0.75]))]
+        (is (= [5.0 5.0] (vec output) (vec jy)))
+        (is (= [0.0 3.0 0.0] (vec g)))
+        (is (= [0.5 0.5] (vec tangent)))
+        (is (= (mapv :id (get-in @owner [:interface :inputs])) (:inputs prepared)))
+        (is (> (count @validated) 3) "indexed hot boundaries still perform full validation")
+        (is (every? #(identical? @owner %) @validated)
+            "preparation and execution validate the same canonical owner, not a legacy facet")))))
+
+(deftest indexed-success-is-fenced-and-original-failure-remains-primary
+  (let [prepared (runtime/prepare (bundle :double :long 'n 'm))
+        input (args prepared {'n (long 1) 'indices (long-array [0]) 'data (double-array [2.0 3.0])})
+        [_ pb] ((:vjp prepared) input)
+        invoke-var #'runtime/invoke invoke @invoke-var
+        baseline (normalized/revisions)]
+    (doseq [operation [#((:vjp prepared) input)
+                       #((:jvp prepared) input (double-array 2))
+                       #(pb (double-array [1.0]))]]
+      (let [current (atom baseline)]
+        (with-redefs-fn {#'normalized/revisions #(deref current)
+                        invoke-var (fn [& xs]
+                                     (let [result (apply invoke xs)]
+                                       (swap! current update :template-revision inc)
+                                       result))}
+          #(is (= :ad-normalized-stale-rules (reason operation))))))
+    (let [current (atom baseline) failure (ex-info "original indexed projection failure" {})]
+      (with-redefs-fn {#'normalized/revisions #(deref current)
+                      invoke-var (fn [& _]
+                                   (swap! current update :template-revision inc)
+                                   (throw failure))}
+        #(is (identical? failure (try ((:vjp prepared) input) nil (catch Throwable e e))))))))
+
+(deftest canonical-runtime-contract-tampering-refuses-before-compilation
+  (let [evidence (bundle :double :long 'n 'm)
+        owner (canonical/adapt-indexed-map evidence)
+        [destination _] (first (:physical-bindings owner))]
+    (doseq [changed [(assoc-in owner [:interface :active-inputs] '[indices])
+                     (assoc-in owner [:interface :cotangent-input :value :shape] '[m])
+                     (assoc-in owner [:residual-bindings 'indices :origin :input] 'data)
+                     (assoc-in owner [:residual-bindings 'indices :id] 'data)
+                     (assoc-in owner [:physical-bindings destination :requirement :exclusive] false)
+                     (assoc-in owner [:physical-bindings destination :consumer :result] destination)]]
+      (let [changed (assoc changed :certificate (#'canonical/certificate changed))
+            compiled (atom 0)]
+        (with-redefs-fn {#'canonical/adapt-indexed-map (constantly changed)
+                        #'runtime/compile-projection (fn [& _] (swap! compiled inc))}
+          #(do
+             (is (= :ad-program-bundle-correspondence (reason (fn [] (runtime/prepare evidence)))))
+             (is (zero? @compiled))))))))
 
 (deftest indexed-runtime-owns-snapshot-and-every-pullback-destination
   (doseq [[dt array cast] [[:double double-array double] [:float float-array float]]
