@@ -6,6 +6,50 @@
 ;; Dead binding removal
 ;; ================================================================
 
+(deftest per-binding-syntactic-free-symbols-are-derived-once
+  (let [store '(clojure.core/aset buf 0 1.0)
+        compute '(+ x 2)
+        form (with-meta (list 'let* ['effect store 'result compute] 'result)
+               {:source :dce-once})
+        free-var #'dce/free-syms
+        original-free @free-var
+        free-calls (atom {})
+        observe (fn [calls original expr]
+                  (when (or (identical? expr store) (identical? expr compute))
+                    (swap! calls update expr (fnil inc 0)))
+                  (original expr))
+        result (with-redefs-fn
+                 {free-var #(observe free-calls original-free %)}
+                 #(dce/eliminate-dead-bindings form))]
+    (is (= form (:form result)))
+    (is (= (meta form) (meta (:form result))))
+    (is (= {store 1 compute 1} @free-calls))
+    (is (= {:bindings-removed 0} (:stats result)))))
+
+(deftest mutation-facts-remain-fresh-after-effect-analysis
+  (let [store '(late-effect buf)
+        predicate-var #'dce/keep-unconditionally?
+        mutation-var #'dce/extract-mutation-targets
+        original-predicate @predicate-var original-mutation @mutation-var
+        initialized? (atom false) queries (atom [])
+        form (list 'let* ['effect store 'result 0] 'result)
+        result (with-redefs-fn
+                 {predicate-var
+                  (fn [expr]
+                    (if (identical? expr store)
+                      (do (reset! initialized? true) true)
+                      (original-predicate expr)))
+                  mutation-var
+                  (fn [expr]
+                    (if (identical? expr store)
+                      (do (swap! queries conj @initialized?)
+                          (if @initialized? '#{buf} #{}))
+                      (original-mutation expr)))}
+                 #(dce/eliminate-dead-bindings form))]
+    (is (= form (:form result)))
+    (is (= {:bindings-removed 0} (:stats result)))
+    (is (= [false true true] @queries))))
+
 (deftest mutation-targets-traverse-maps-test
   ;; Regression: extract-mutation-targets must descend into map literals. A `case*`
   ;; clause map {hash [test (aset buf …)]} can hold a mutation; missing it made DCE

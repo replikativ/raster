@@ -242,8 +242,11 @@
         n (count pairs)
         bound-syms (set (map first pairs))
         body-free (apply clojure.set/union #{} (map free-syms body-exprs))
+        ;; Syntactic free symbols belong to this immutable let only. Mutation/effect queries
+        ;; below remain fresh: effect analysis can initialize operation descriptors.
+        binding-free-sets (mapv #(free-syms (second %)) pairs)
         binding-free (apply clojure.set/union #{}
-                            (map #(free-syms (second %)) pairs))
+                            binding-free-sets)
         let-free (clojure.set/difference
                   (clojure.set/union body-free binding-free)
                   bound-syms)
@@ -282,10 +285,10 @@
                                (some @live mutation-targets))
             opaque-effect-refs-live? (and effect-binding?
                                           (not has-mutation-targets?)
-                                          (some @live (free-syms expr)))]
+                                          (some @live (nth binding-free-sets i)))]
         (when (or referenced? opaque-effect-refs-live? mutates-live?)
           (swap! live-indices conj i)
-          (swap! live into (free-syms expr)))))
+          (swap! live into (nth binding-free-sets i)))))
     (let [live-pairs (keep-indexed (fn [i pair]
                                      (when (contains? @live-indices i) pair))
                                    pairs)

@@ -1265,8 +1265,8 @@
            :let [producer (nth infos producer-index)
                  produced (first (:results producer))
                  ;; This proof depends on the producer and this immutable program,
-                 ;; not on the consumer. Keep it lazy to preserve the original
-                 ;; admission order, and share it only within this enumeration.
+                 ;; not on the consumer. Force it only for a matching dataflow/extent pair,
+                 ;; and share it only within this enumeration.
                  exceptional? (delay (exceptional-conversion-region? program producer))]
            consumer-index (range (inc producer-index) (count infos))
            :let [consumer (nth infos consumer-index)]
@@ -1274,6 +1274,11 @@
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
            :when (contains? #{:map :reduce :scan} (:kind consumer))
+           ;; These pure structural filters cannot authorize fusion. Reject unrelated pairs
+           ;; before analyzing scalar effects, which can recursively analyze helper bodies.
+           :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
+           :when (pos? (get uses produced 0))
+           :when (some #{produced} (:arrays consumer))
            ;; Per-lane fusion would interleave a trapping producer with later caller-visible
            ;; consumer writes. Preserve the materialized equation-completion boundary.
            :when (not @exceptional?)
@@ -1285,9 +1290,6 @@
            :when (or (contains? #{:reduce :scan} (:kind consumer))
                      (and (empty? (:locals producer)) (empty? (:locals consumer)))
                      (some? (value-scalar-dtype program produced)))
-           :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
-           :when (pos? (get uses produced 0))
-           :when (some #{produced} (:arrays consumer))
            :when (reorder-barrier-free? program producer-index consumer-index)
            :when (host-barrier-free? program producer consumer)
            :when (fusible-equation? program (:id producer))

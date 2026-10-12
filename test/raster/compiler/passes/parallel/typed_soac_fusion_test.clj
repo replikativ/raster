@@ -112,6 +112,46 @@
                               {'x :float})
               nil))))))
 
+(deftest unrelated-vertical-pairs-never-force-effect-analysis
+  (let [proof-var #'typed-fusion/exceptional-conversion-region?]
+    (doseq [[source arrays scalars]
+            [['(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))
+                      v (raster.par/pmap j n float (+ (aget b j) 2.0))] [u v])
+              {'a :float 'b :float} {'n :long}]
+             ['(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))
+                      v (raster.par/pmap j m float (+ (aget u j) 2.0))] v)
+              {'a :float} {'n :long 'm :long}]]]
+      (let [program (source-program source arrays scalars)]
+        (is (empty?
+             (with-redefs-fn
+               {proof-var (fn [& _] (throw (ex-info "unrelated scalar proof was forced" {})))}
+               #(#'typed-fusion/vertical-candidates program nil))))))))
+
+(deftest structural-prefilter-preserves-ordered-matching-candidates
+  (let [program (source-program
+                 '(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))
+                         unrelated (raster.par/pmap j n float (+ (aget b j) 2.0))
+                         v (raster.par/pmap k n float (+ (aget u k) 3.0))]
+                        [unrelated v])
+                 {'a :float 'b :float})
+        calls (atom [])
+        proof-var #'typed-fusion/exceptional-conversion-region?
+        original @proof-var
+        enumerate #(#'typed-fusion/vertical-candidates program nil)
+        candidates (with-redefs-fn
+                     {proof-var (fn [p producer]
+                                  (swap! calls conj (:id producer))
+                                  (original p producer))}
+                     enumerate)]
+    (is (= [[0 2]] (mapv (juxt :producer-index :consumer-index) candidates)))
+    (is (= 1 (count @calls)))
+    (reset! calls [])
+    (is (empty? (with-redefs-fn
+                  {proof-var (fn [_ producer] (swap! calls conj (:id producer)) true)}
+                  enumerate)))
+    (is (= 1 (count @calls)))
+    (is (= 3 (count (dialect/equations program))))))
+
 (deftest horizontal-candidate-enumeration-checks-each-map-once
   (let [program (source-program
                  '(let* [u (raster.par/pmap i n float (+ (aget a i) 1.0))

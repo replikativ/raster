@@ -1,5 +1,139 @@
 # Compiler unification campaign
 
+## October 13 reconciled execution plan
+
+This checkpoint preserves the original eight-item campaign. The entries below are completion
+obligations, not claims that their already-landed foundations must be implemented again. Historical
+receipts remain below; fresh acceptance must distinguish compile-only, hardware-free simulation,
+co-located execution and actual multi-device measurements. Normalized AD and memory planning are
+cross-cutting parts of this campaign, not competing replacements for it.
+
+### Current checkpoint
+
+- Main contains #1333 and #1334, each squash-merged only after all seven exact-head CI gates passed.
+  Generated optimizer scalars follow each parameter leaf's precision. Successful static executable
+  validation is reused only within a bounded, thread-confined staged request; dynamic checks remain.
+- The corrected 2-layer, 32-dimensional Float GSDM train step compiles on Level Zero. Three seeded
+  single-example steps execute and produce finite values. FP64 gradients and sampled central
+  differences support the conditioning diagnosis, but FP32 near-zero key-bias gradients cause
+  Adam-sensitive weight differences. This does not establish trajectory or statistical parity.
+- Preliminary instrumented staging time improved from roughly 3.5–3.7 seconds to 1.7–2.0 seconds.
+  This remains far too slow for the tiny workload and is not a controlled throughput benchmark.
+  The step still crosses many separately staged graph boundaries.
+- Whole-program resident compilation was interrupted at its 590-second diagnostic limit. Stack
+  samples reached TypedSOAC fusion and final scalar DCE. No resident program or structured compiler
+  refusal was obtained. Separate pass costs before another full-model attempt.
+- The first bounded fusion baseline uses 8/16/32 independent maps with distinct extents and zero
+  vertical candidates. Current enumeration nevertheless executes 7/15/31 producer exception
+  analyses. This establishes avoidable analysis calls for that fixture, not the cause of the full
+  timeout or a measured speedup. Retain candidate order and trapping controls when changing it.
+- Normalized AD remains opt-in for bounded scalar/map/map-sum/indexed families. General equation
+  composition, device execution, recurrence residuals and default migration remain open. The last
+  recorded unchanged real Gemma gate failed 11 of 28 adapter checks; it requires a fresh coherent
+  reproduction, not substitution by a microtest or a relaxed numerical oracle.
+
+### Original campaign obligations
+
+| Item | Landed foundation | Remaining completion gate |
+|---|---|---|
+| 1. CI and coverage | Seven CI gates, vendor source compilation, targeted native/differential tests | Reconcile skipped tests and environment prerequisites; partition by affected compiler layer; retain cold-load, negative-admission and CPU/device controls. |
+| 2. Compatibility and debt ledger | Executable compatibility inventory and many bounded retirements | Re-audit reachable production paths and dependent packages; give every remaining adapter an owner and removal gate; remove covered dead code and duplicate tests without losing distinct oracles. |
+| 3. Direct TypedSOAC migration | Typed packets, ordered ABI, graph/body emission, retained dtype/effect/storage evidence | Close remaining source/semantic composition boundaries, bound compilation cost and remove migrated re-lowerings; demonstrate the same numerical intent through JVM/C and GPU routes with precise refusals. |
+| 4. Portable source compilation | OpenCL/Level Zero execution and CUDA/HIP compile gates | Keep actual public workload fixtures portable and distinguish source compilation from runtime/device evidence; coordinate the external CUDA runtime work against the common contracts. Cloud hardware is not a prerequisite for this local campaign. |
+| 5. Reusable training | AD rules, opt-in normalized bundles, artifacts, generated updates, GSDM staged execution | A resident forward/VJP/update composition, normalized AD migration gates, unchanged generated SFT and real-weight numerical acceptance, and measured steady execution. GSDM, Gemma and density/PDE derivatives are complementary controls. |
+| 6. Hardware-free distributed planning | Topology, physical service lanes, route evidence, root/scratch budgets, simulation/certificates | Fresh topology/dependency/capacity/collective/halo/drift counterexamples; independently check cost, numerical intent and ownership witnesses. Analytical forecasts must remain distinct from measured fabric performance. |
+| 7. Data parallelism and halos | Co-located update/collective and numerical halo demonstrations | Close public compiler-to-plan-to-runtime composition with device-scoped views, completion and cleanup; check nonuniform partitions and exact byte accounting. Do not claim multi-host transport or overlap from one laptop. |
+| 8. Durable and multilevel simulation | Manifests, mmap lease tests, checkpoint/restart and AMR provider slices | Fresh-owner restore/publication with producer geometry, time and lineage; numerical restart/branch and declared conservation/convergence/fidelity oracles; reject corrupt, incompatible or prematurely released state. |
+
+### Execution order
+
+1. **Bound local compilation work (items 1–3).** Profile scalar-effect analysis, fusion candidate
+   enumeration and final DCE separately on increasing, bounded components. Retain the candidate
+   order, checked-conversion completion boundaries, effects and source provenance. Reuse existing
+   analysis authorities; do not introduce an operation registry or persistent proof-skipping cache.
+   Gate: repeatable cold/warm pass measurements, unchanged admitted/refused cases and numerical
+   controls, followed by a bounded full-model compile rather than another blind timeout.
+2. **Close resident training composition (items 3 and 5).** Use the existing EmittedParallelProgram,
+   preparation plan, KernelExecutable and LinkPlan boundaries to keep intermediates resident and
+   separate preparation from replay. Do not invent a GSDM session or linker. Gate: explicit
+   parameter/state/data bindings, scalar results, alias/capacity/release counterexamples, CPU/device
+   comparisons and reported kernel/allocation/transfer counts. Repeated calls must not rebind and
+   restage every leaf. Resident execution alone does not close AD or performance acceptance.
+3. **Continue normalized AD consolidation (item 5, with item 3).** Follow `normalized-ad.md`: checked
+   source/primal/residual/linear/transpose programs, common equation composition, then the existing
+   map/gather/reduce/contraction rules and ordered recurrence contracts. Keep source AD as the
+   independent default oracle until each migrated family passes its gates. Gate: analytic/finite
+   differences, JVP–VJP pairing, `:wrt`, mixed storage, zero domains, overwrite/tape lifetime and
+   higher-order refusal/correctness checks. Arbitrary loops need not be accepted to finish the
+   supported-language campaign, but must never silently differentiate to zero.
+   Residual replay must identify the correct mutation version: ownership alone cannot authorize
+   recomputation or remove an overwrite refusal. Retire a source rule only after common validators
+   own equivalent obligations, including cold-load/cache-invalidation and independent refusal tests.
+4. **Close local workload acceptance and measure (items 1–5).** Re-run unchanged real Gemma and
+   generated SFT gates in a coherent compiler; add bounded GSDM trajectory/statistical checks;
+   validate density composition, city kernels and a PDE rollout. Measure compile, preparation,
+   host submission, transfer and device execution separately. Compare matched dtypes, numerical
+   modes and residency against the relevant external baselines outside the hot loop. Only then
+   tune schedules or expand precision policies. No peak/SOTA claim follows from emitted-source
+   correctness alone.
+5. **Consolidate the reached vertical (items 1–4).** Audit source-to-typed-to-schedule-to-body-to-ABI
+   coverage; remove only the duplicate paths and tests whose independent obligations are covered.
+   Update dependent-package compatibility notes and verify public OpenCL/CUDA/HIP compilation.
+   Keep the external CUDA contributor informed of shared binder/ABI/ownership changes; GPU runtime
+   parity and performance require its device measurements, not assumptions from this Intel GPU.
+6. **Reconcile and finish distributed obligations (items 6–8).** First refresh the existing simulator
+   and memory/route certificates, then public data-parallel/halo execution, then durable restart and
+   the multilevel/AMR numerical vertical. Reuse the same value/version/access/completion facts.
+   Gate each stage with hardware-free negative controls plus available local execution; explicitly
+   defer real-fabric throughput, congestion calibration and larger physical deployments.
+
+Memory planning is interleaved wherever residency, residuals, views or transfers expose a missing
+obligation: observe, connect witnesses, shadow-plan, enable one proved reuse, then retire the old
+guess. Distributed cost models may refine a legal plan, never its semantics or ownership proof.
+Before enabling reuse, retain initialized-read, escaped-output/AD-tape and in-flight-transfer
+obligations, as well as source-visible `alength` and view-range semantics. A logical tensor shape
+must not replace a physical capacity or release/completion witness.
+
+### Rhythm and stopping rules
+
+- Keep one primary implementation slice and at most one focused review at a pivotal boundary.
+  Use the bounded warm REPL for affected tests; restart after genuinely stale signatures, not for
+  every test. Send the full suites to CI and fix actual failures before landing.
+- Record each slice's input/output contract, admitted and refused cases, numerical oracle,
+  physical obligations, compile/preparation/runtime measurements and removal target. If a slice
+  cannot name those, narrow it before adding code.
+- Squash only the reviewed exact head after all seven checks exist and pass. Continue independent
+  work while CI runs; do not accumulate unreviewed PRs or confuse a merge with a release.
+- Stop for user review only for material surface/numerical semantics changes, weaker acceptance,
+  a new major dependency/target commitment or external resources/authority. Report such choices
+  explicitly. Neither timeouts nor missing hardware justify bypassing a verifier.
+- Completion requires fresh evidence for every original campaign gate and a documented remaining
+  frontier. Frontier-scale training, PTX-specific peak tuning, FPGA support, learned planners and
+  production data-center deployment remain north-star extensions, not implied claims of this
+  laptop campaign.
+
+### Bounded compile-cost increment
+
+Vertical candidate enumeration now rejects extent/dataflow mismatches before forcing its existing
+producer exceptional-conversion proof. Eligible pair order and all effect, completion, capture and
+placement guards remain. Independent maps with zero vertical candidates now force zero proofs
+instead of 7/15/31 for 8/16/32 maps; the matching-chain and trapping controls remain unchanged.
+This is an analysis-call reduction, not evidence that the full resident compile now finishes.
+
+DCE reuses only per-binding syntactic free-symbol sets inside its immutable input let. Mutation and
+effect queries retain their original phases and order: effect analysis may initialize descriptors,
+and descriptor effects do not all share the intrinsic revision counter. A controlled initialization
+test therefore requires subsequent mutation queries to remain fresh. Differential alias, dead-local
+buffer and mixed-effect forms match the previous pass. Focused fusion/placement/matrix-input/
+epilogue/DCE suites pass 83 tests / 484 assertions in the warm REPL; cold CI remains separate.
+
+Those differential controls also expose a pre-existing correctness gap: a checked cast or I/O
+followed by a dead-local store is removed because known mutation targets suppress independent
+observable effects. With `x = 2147483648`, a source cast-plus-store throws ArithmeticException while
+the lowered form returns zero. Existing effect evidence retains `:checked-source-cast` or `:io`.
+Repair this through that authority before claiming resident training acceptance; the cost increment
+does not fix it or justify weaker exception/effect semantics.
+
 ### Independent distributed math intent reconciliation
 
 Distributed planning, readiness (including retained-output readiness), resident root/scratch
