@@ -161,6 +161,16 @@ comparisons cover intervening readers and a preceding vertical fusion with a lat
 dependency; mixed legacy/current provenance cannot inherit the removed parent's placement.
 The public mixed-storage gradient compile and device parity fixtures remain required gates.
 
+Physical destination availability also constrains horizontal placement. The left site remains
+preferred. When later private destinations are not allocated yet, a right-site fusion is legal
+only if every destination is available there, no intervening equation references the left results
+or storage, and all delayed left stores are allocation-backed private writes. Caller-visible
+stores cannot move after an allocation that may fail. Missing allocation/input origin evidence
+declines motion. Logical equation order and retained source placement move together; allocation
+evaluation is not hoisted. Independent materialized-source/JVM controls check both reader denial
+and caller writes completed before NegativeArraySizeException. The existing three-layout SDPA
+integration retains its fused schedule rather than introducing a workload-specific rule.
+
 ### Independent distributed math intent reconciliation
 
 Distributed planning, readiness (including retained-output readiness), resident root/scratch

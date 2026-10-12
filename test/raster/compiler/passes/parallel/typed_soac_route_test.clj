@@ -1164,6 +1164,55 @@
     (is (= [11.0 [5.0 6.0] [5.0 6.0]] (normalize (run source))))
     (is (= (normalize (run source)) (normalize (run (:source program)))))))
 
+(deftest horizontal-materialization-waits-for-local-destinations-without-crossing-readers
+  (doseq [reader? [false :logical :physical]]
+    (let [source (list 'let*
+                       (vec (concat
+                             '[out-a (clojure.core/float-array n)
+                               u (raster.par/map! out-a i n float
+                                                  (* (clojure.core/aget a i) 2.0))]
+                             (when reader?
+                               ['observed
+                                (walk/postwalk-replace
+                                 {'reader-buffer (if (= :physical reader?) 'out-a 'u)}
+                                 '(raster.par/reduce acc 0.0 j n
+                                                    (+ acc (clojure.core/aget reader-buffer j))))])
+                             '[out-b (clojure.core/float-array n)
+                               v (raster.par/map! out-b k n float
+                                                  (+ (clojure.core/aget b k) 1.0))]))
+                       (if reader? '[observed u v] '[u v]))
+          {:keys [program stats]} (route/attempt source :float {'a :float 'b :float}
+                                                {:scalar-types {'n :long}})
+          run (fn [body]
+                ((eval (list 'fn '[a b n] body))
+                 (float-array [1.0 2.0]) (float-array [4.0 5.0]) 2))
+          normalize (fn [values] (mapv #(if (number? %) (double %) (mapv double %)) values))]
+      (is (= (if reader? 0 1) (:horizontal stats)))
+      (is (= (if reader? [6.0 [2.0 4.0] [5.0 6.0]] [[2.0 4.0] [5.0 6.0]])
+             (normalize (run source))))
+      (is (= (normalize (run source)) (normalize (run (:source program))))))))
+
+(deftest horizontal-placement-does-not-delay-caller-writes-past-allocation-failure
+  (let [source '(let* [u (raster.par/map! out i n float
+                                          (* (clojure.core/aget a i) 2.0))
+                       out-b (clojure.core/float-array allocated-n)
+                       v (raster.par/map! out-b k n float
+                                          (+ (clojure.core/aget b k) 1.0))]
+                      [u v])
+        {:keys [program stats]} (route/attempt source :float {'a :float 'b :float 'out :float}
+                                              {:scalar-types {'n :long 'allocated-n :long}})
+        run (fn [body]
+              (let [out (float-array 2)
+                    status (try
+                             ((eval (list 'fn '[a b out n allocated-n] body))
+                              (float-array [1.0 2.0]) (float-array [4.0 5.0]) out 2 -1)
+                             :returned
+                             (catch NegativeArraySizeException _ :allocation-failed))]
+                [status (mapv double out)]))]
+    (is (zero? (:horizontal stats)))
+    (is (= [:allocation-failed [2.0 4.0]] (run source)))
+    (is (= (run source) (run (:source program))))))
+
 (deftest typed-horizontal-fusion-lowers-to-one-explicit-multi-output-segmap
   (let [{:keys [program stats]} (route/attempt
                                  horizontal-maps :float {'a :float 'b :float})

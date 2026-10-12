@@ -1409,6 +1409,48 @@
                                         (:id producer) (:id consumer) fused-kind))]
       (rebuild-boundary program facts equations)))
 
+(defn- horizontal-placement-index
+  "Choose an execution boundary without hoisting destination allocations or crossing readers."
+  [program infos left-index right-index left-boundary right-boundary]
+  (let [facts (dialect/facts program)
+        site (fn [index]
+               (let [id (:id (nth infos index))]
+                 (or (get-in facts [:equations id :provenance :source-binding-id])
+                     (get-in facts [:equations id :provenance :legacy-soac-id]) id)))
+        allocations (into {} (map (juxt :destination :source-binding-id))
+                          (get-in facts [:attributes :allocations]))
+        inputs (set (:inputs facts))
+        source-bindings (get-in facts [:attributes :source-bindings])
+        external? (fn [destination]
+                    ;; Physical write-only parameters need not be logical SSA inputs. The
+                    ;; complete analyzed binding inventory proves them free; it also overrides
+                    ;; logical inputs for local read/write storage with missing allocation facts.
+                    (if (= :analyzed-source (get-in facts [:provenance :front-end]))
+                      (and (vector? source-bindings)
+                           (contains? (:values facts) destination)
+                           (not (some #{destination} source-bindings)))
+                      (contains? inputs destination)))
+        destinations (set/union (:destinations left-boundary) (:destinations right-boundary))
+        ready? (fn [index]
+                 (every? (fn [destination]
+                           (let [allocated-at (get allocations destination)]
+                             (if (contains? allocations destination)
+                               (and (some? allocated-at) (< allocated-at (site index)))
+                               (external? destination))))
+                         destinations))
+        left-produced (set/union (set (:results (nth infos left-index)))
+                                 (:destinations left-boundary))]
+    (cond
+      (ready? left-index) left-index
+      (and (ready? right-index)
+           ;; A later allocation may fail. Delay only private allocation-backed writes, never
+           ;; caller-visible stores whose completion would otherwise precede that failure.
+           (every? #(and (contains? allocations %)
+                         (some? (get allocations %))) (:destinations left-boundary))
+           (every? #(empty? (set/intersection left-produced (set (equation-references %))))
+                   (subvec (dialect/equations program) (inc left-index) right-index))) right-index
+      :else nil)))
+
 (defn- horizontal-candidate
   [program]
   (let [equations (dialect/equations program)
@@ -1455,13 +1497,16 @@
                            (let [index (get producer-index value)]
                              (or (nil? index) (< index left-index))))
                          right-uses)
-           ]
+           :let [placement-index (horizontal-placement-index
+                                  program infos left-index right-index left-boundary right-boundary)]
+           :when (some? placement-index)]
        {:left-index left-index :right-index right-index :left left :right right
+        :placement-index placement-index
         :left-boundary left-boundary :right-boundary right-boundary}))))
 
 (defn- fuse-horizontal-once
   [program]
-  (when-let [{:keys [left-index right-index left right left-boundary right-boundary]}
+  (when-let [{:keys [left-index right-index placement-index left right left-boundary right-boundary]}
              (horizontal-candidate program)]
     (let [left (freshen-parameters left "left")
           right (freshen-parameters right "right")
@@ -1500,12 +1545,21 @@
                          :locals (:locals canonical)
                          :body-results (:body-results canonical))
           equations (-> (dialect/equations program)
-                        (assoc left-index (emit-equation updated))
+                        (assoc placement-index (emit-equation updated))
                         (->> (keep-indexed (fn [index equation]
-                                             (when-not (= index right-index) equation)))
+                                             (when-not (= index (if (= placement-index left-index)
+                                                                 right-index left-index)) equation)))
                              vec))
           facts (merge-horizontal-facts (dialect/facts program) left right
-                                        left-boundary right-boundary)]
+                                        left-boundary right-boundary)
+          facts (if (= placement-index right-index)
+                  (assoc-in facts [:equations (:id left) :provenance]
+                            (merge (dissoc (get-in facts [:equations (:id left) :provenance])
+                                           :source-binding-id :legacy-soac-id)
+                                   (select-keys (get-in (dialect/facts program)
+                                                       [:equations (:id right) :provenance])
+                                                [:source-binding-id :legacy-soac-id])))
+                  facts)]
       (rebuild-boundary program facts equations))))
 
 (defn- placement-key
