@@ -9,10 +9,14 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
-            [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
+            [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
+            [raster.compiler.passes.scalar.effects :as effects]))
 
 (def resident-representation :resident-scalar-buffer)
 
@@ -136,6 +140,7 @@
   (and (= :tensor (:kind value))
        (= [] (:shape value))
        (keyword? (:dtype value)) (dtype/known? (:dtype value))
+       (= (:dtype value) (dtype/canon (:dtype value)))
        (= {:kind :plain} (:representation value))
        (nil? (:logical-layout value))
        (nil? (:memory-space value))
@@ -358,7 +363,457 @@
                (seq (:shape (get values array))))
       {:result (first results) :array array :index index})))
 
-(defn inline-uniform-input-loads
+(defn- exact-plain-tensor?
+  [value shape]
+  (if (empty? shape)
+    (exact-plain-scalar-value? value)
+    (and (= :tensor (:kind value))
+         (= shape (:shape value))
+         (keyword? (:dtype value)) (dtype/known? (:dtype value))
+         (= (:dtype value) (dtype/canon (:dtype value)))
+         (= {:kind :plain} (:representation value))
+         (nil? (:logical-layout value))
+         (nil? (:memory-space value))
+         (nil? (:placement value))
+         (nil? (:sharding value))
+         (nil? (:ownership value))
+         (empty? (:effects value))
+         (empty? (:attributes value)))))
+
+(defn- typed-scalar-effect-expression
+  "Restore validated lambda-parameter dtypes solely for the shared effect/exception proof.
+
+   TypedSOAC carries parameter types through capture AbstractValues rather than symbol metadata.
+   The effect authority intentionally treats an untyped integral cast as possibly checked, so
+   this proof view reattaches only those certified types.  The original expression is retained in
+   the generated typed local and no flag is waived or reconstructed from an expected result."
+  [facts info]
+  (let [pairs (map vector (:parameters info) (:captures info))
+        typed-symbols
+        (into {}
+              (keep (fn [[parameter capture]]
+                      (let [value (get-in facts [:values capture])
+                            tag (when (exact-plain-scalar-value? value)
+                                  (dtype/scalar-tag-for-dtype (:dtype value)))]
+                        (when (and (symbol? parameter) tag)
+                          [parameter (with-meta parameter
+                                       (merge (meta parameter)
+                                              {:tag tag :raster.type/tag tag}))]))))
+              pairs)]
+    (when (= (count pairs) (count typed-symbols))
+      (util/subst-syms typed-symbols (first (:body-results info))))))
+
+(defn- typed-scalar-expression-total?
+  "Ask the existing strict typed scalar lowerer to certify compound conversion boundaries.
+
+   `require-source-types?` is essential. The lowerer's source-type entry derives the top-level
+   dtype before lowering, so an enclosing result fact is never evidence for its operand. Any
+   emitted trapping operation refuses removability. This helper emits nothing and catches only an
+   ordinary coverage refusal."
+  [facts info expression]
+  (let [scalar-types
+        (into {}
+              (map (fn [[parameter capture]]
+                     [parameter (get-in facts [:values capture :dtype])]))
+              (map vector (:parameters info) (:captures info)))
+        result-dtype (get-in facts [:values (first (:results info)) :dtype])]
+    (when (and (every? (fn [[_ scalar-dtype]]
+                         (and (keyword? scalar-dtype) (dtype/known? scalar-dtype)
+                              (= scalar-dtype (dtype/canon scalar-dtype))))
+                       scalar-types)
+               (keyword? result-dtype) (= result-dtype (dtype/canon result-dtype)))
+      (try
+        (let [decline! (fn [rule message data]
+                         (throw (ex-info message (assoc data :reason rule))))
+              lowerer (scalar-expression/make-lowerer
+                       {:arrays #{} :array-types {} :scalar-types scalar-types
+                        :index-scope #{} :source-region [expression]
+                        :require-source-types? true
+                        :conversion-policy scalar-conversion/policy
+                        :lower-index (fn [& _]
+                                       (decline! :uniform-scalar-index
+                                                 "scalar closure arithmetic cannot lower an index"
+                                                 {:expression expression}))
+                        :decline! decline! :id-prefix "uniform-proof"})
+              derived ((:source-type lowerer) expression scalar-types)
+              lowered (when derived ((:lower lowerer) expression derived scalar-types))
+              operations (when lowered
+                           (tree-seq #(or (map? %) (sequential? %))
+                                     #(if (map? %) (vals %) (seq %))
+                                     (:operations lowered)))
+              trapping?
+              (some (fn [operation]
+                      (let [expression (:expression operation)
+                            result-type (:result-type expression)]
+                        (or (= :trap (get-in expression [:options :overflow]))
+                            (and (contains? #{:byte :int :long} result-type)
+                                 (contains? #{:quot :rem :mod :div} (:op expression))))))
+                    operations)]
+          (and (= result-dtype derived (:type lowered))
+               (not trapping?)))
+        (catch Exception _ false)))))
+
+(defn- removable-typed-scalar-expression?
+  [facts info expression]
+  (let [{:keys [effect flags]} (effects/descriptor expression)]
+    (and (= :pure effect)
+         (or (empty? flags) (= #{:checked-source-cast} flags))
+         (typed-scalar-expression-total? facts info expression))))
+
+(defn- pristine-scalar-equation?
+  "A scalar moved into the singleton device stage must already be a total removable binding.
+
+   Empty retained effects alone are not enough: the shared scalar effect authority must also prove
+   that evaluating the exact body has neither external effects nor exceptional-control flags.
+   Indexed reads are admitted only by the separately checked root-load grammar below."
+  [facts info root?]
+  (let [equation-facts (get-in facts [:equations (:id info)])
+        body (first (:body-results info))
+        effect-expression (typed-scalar-effect-expression facts info)
+        value (get-in facts [:values (first (:results info))])]
+    (and (= :scalar (:kind info))
+         (= 1 (count (:results info)))
+         (= 1 (count (:body-results info)))
+         (empty? (:locals info))
+         (empty? (:effects equation-facts))
+         (empty? (:aliases equation-facts))
+         (empty? (get-in equation-facts [:attributes :result-storage]))
+         (set/subset? (set (keys (:attributes equation-facts))) #{:source-prefix?})
+         (= #{:dtypes} (set (keys (:attributes info))))
+         (empty? (get-in info [:attributes :attributes]))
+         (= [(:dtype value)] (get-in info [:attributes :dtypes]))
+         (or root?
+             (and effect-expression
+                  (removable-typed-scalar-expression? facts info effect-expression)
+                  (not-any? descriptor/aget-call? (tree-seq coll? seq body))
+                  (not-any? (fn [form]
+                              (and (seq? form)
+                                   (descriptor/alloc-op? (descriptor/semantic-op form))))
+                             (tree-seq coll? seq body)))))))
+
+(defn- exact-zero-input-read
+  "Return the canonical input parameter read beneath at most one proved identity cast.
+
+   Frontend scalar equations retain explicit primitive identity casts.  The cast is peeled only
+   for admission: its complete original expression remains the first typed local in the new map."
+  [expression parameter input-dtype result-dtype]
+  (letfn [(lexical-call? [form]
+            (and (seq? form)
+                 (or (:raster.op/lexical-callee (meta form))
+                     (:raster.op/lexical-callee (meta (first form))))))
+          (read? [form]
+            (let [operation (descriptor/semantic-op form)
+                  arguments (vec (descriptor/call-args form))]
+              (and (= 'clojure.core/aget operation)
+                   (not (lexical-call? form))
+                   (= 2 (count arguments))
+                   (= parameter (first arguments))
+                   (= 0 (second arguments)))))]
+    (cond
+      (read? expression) expression
+
+      (and (seq? expression)
+           (not (lexical-call? expression))
+           (= 1 (count (descriptor/call-args expression))))
+      (let [operation (descriptor/semantic-op expression)
+            target (some-> operation descriptor/cast-result-tag
+                           dtype/dtype-for-scalar-tag dtype/canon)
+            operand (first (descriptor/call-args expression))]
+        (when (and (contains? '#{clojure.core/byte clojure.core/int clojure.core/long
+                                 clojure.core/float clojure.core/double} operation)
+                   (= input-dtype result-dtype target)
+                   (read? operand))
+          operand))
+
+      :else nil)))
+
+(defn- alias-component
+  "Compute the complete undirected component certified by equation alias facts."
+  [aliases value]
+  (let [neighbors
+        (reduce (fn [graph [left right]]
+                  (if (and (symbol? left) (symbol? right))
+                    (-> graph (update left (fnil conj #{}) right)
+                        (update right (fnil conj #{}) left))
+                    graph))
+                {} aliases)]
+    (loop [pending [value] seen #{}]
+      (if-let [current (peek pending)]
+        (if (contains? seen current)
+          (recur (pop pending) seen)
+          (recur (into (pop pending) (get neighbors current)) (conj seen current)))
+        seen))))
+
+(defn- exact-uniform-root
+  "Return the exact input[0] scalar boundary, or nil.
+
+   The public input keeps its truthful self-extent AbstractValue. The ordinary static map-read
+   proof later projects this literal zero access to a one-element KernelBody capacity obligation;
+   this pass never pretends that the public array's logical shape is `[1]`."
+  [facts info input-values written aliases outputs host-reads]
+  (let [{:keys [results captures parameters body-results]} info
+        result (first results)
+        array (first captures)
+        expression (first body-results)
+        input-value (get-in facts [:values array])
+        result-value (get-in facts [:values result])
+        input-dtype (some-> input-value :dtype dtype/canon)
+        result-dtype (some-> result-value :dtype dtype/canon)
+        read (exact-zero-input-read expression (first parameters) input-dtype result-dtype)]
+    (when (and (pristine-scalar-equation? facts info true)
+               (= 1 (count results) (count captures) (count parameters))
+               read
+               (contains? input-values array)
+               (empty? (set/intersection written (alias-component aliases array)))
+               (not (contains? outputs result))
+               (not (contains? host-reads result))
+               (exact-plain-tensor? input-value [(list 'extent array)])
+               (exact-plain-tensor? result-value [])
+               (= (dtype/canon (:dtype input-value))
+                  (dtype/canon (:dtype result-value))))
+      {:result result :array array :info info})))
+
+(defn- fresh-private-id
+  [reserved value ordinal]
+  (let [stem (str (name value) "__uniform_scalar_buffer")]
+    (loop [suffix ordinal]
+      (let [candidate (symbol (str stem "_" suffix))]
+        (if (contains? reserved candidate)
+          (recur (inc suffix))
+          candidate)))))
+
+(defn- allocate-private-id
+  [reserved value ordinal]
+  (let [id (fresh-private-id reserved value ordinal)]
+    [id (conj reserved id)]))
+
+(defn- uniform-scalar-closure
+  "Prove one contiguous evaluate-once scalar closure rooted at an input[0] read.
+
+   Every use is audited against original equation order. Closure values may feed later scalar
+   equations and ordinary map/effect-map captures only; at least two terminal uses or one genuine
+   dependent scalar is required so the existing direct single-use fast path remains unchanged."
+  [facts infos uses position-by-id outputs host-reads root]
+  (let [root-info (:info root)
+        root-id (:id root-info)
+        root-position (get position-by-id root-id)
+        scalar-infos
+        (loop [remaining (subvec infos (inc root-position))
+               known #{(:result root)} result [root-info]]
+          (if-let [info (first remaining)]
+            (if (and (= :scalar (:kind info))
+                     (some known (:captures info)))
+              (recur (subvec remaining 1)
+                     (into known (:results info)) (conj result info))
+              (recur (subvec remaining 1) known result))
+            result))
+        scalar-values (set (mapcat :results scalar-infos))
+        scalar-equations (set (map :id scalar-infos))
+        producer-position
+        (into {}
+              (mapcat (fn [info]
+                        (map (fn [result] [result (get position-by-id (:id info))])
+                             (:results info))))
+              infos)
+        positions (mapv position-by-id (map :id scalar-infos))
+        contiguous? (= positions (vec (range root-position (+ root-position (count positions)))))
+        sites (mapcat #(get uses % []) scalar-values)
+        info-by-id (into {} (map (juxt :id identity)) infos)
+        scalar-site?
+        (fn [[value {:keys [equation role]}]]
+          (and (= :capture role) (contains? scalar-equations equation)
+               (< (get producer-position value Long/MAX_VALUE)
+                  (get position-by-id equation -1))))
+        terminal-site?
+        (fn [[value {:keys [equation role]}]]
+          (and (= :capture role)
+               (contains? #{:map :effect-map} (:kind (get info-by-id equation)))
+               (< (get producer-position value Long/MAX_VALUE)
+                  (get position-by-id equation -1))))
+        terminal-sites (filter terminal-site? sites)
+        frontier (->> scalar-values
+                      (filter #(some terminal-site? (get uses % [])))
+                      (sort-by (fn [value]
+                                 (get position-by-id (:id (some (fn [info]
+                                                                  (when (some #{value} (:results info)) info))
+                                                                scalar-infos)))))
+                      vec)
+        external-captures
+        (set (mapcat (fn [info]
+                       (remove scalar-values (:captures info))) scalar-infos))
+        external-scalars (disj external-captures (:array root))
+        input-values (set (:inputs facts))]
+    (when (and contiguous?
+               (every? #(pristine-scalar-equation? facts % (= root-id (:id %))) scalar-infos)
+               (every? #(exact-plain-tensor? (get-in facts [:values (first (:results %))]) [])
+                       scalar-infos)
+               (not-any? outputs scalar-values)
+               (not-any? host-reads scalar-values)
+               (every? #(exact-plain-tensor? (get-in facts [:values %]) []) external-scalars)
+               (every? input-values external-captures)
+               (seq terminal-sites)
+               (every? #(or (scalar-site? %) (terminal-site? %)) sites)
+               (or (< 1 (count terminal-sites)) (< 1 (count scalar-infos))))
+      {:root root :infos scalar-infos :values scalar-values :equations scalar-equations
+       :frontier frontier :terminal-equations (set (map #(get-in % [1 :equation]) terminal-sites))})))
+
+(defn- singleton-closure-map
+  [facts closure reserved]
+  (let [{:keys [root infos frontier]} closure
+        root-info (first infos)
+        external-captures
+        (vec (distinct (mapcat (fn [info]
+                                (remove (:values closure) (:captures info))) infos)))
+        [index reserved] (allocate-private-id reserved 'uniform-index 0)
+        [capture-parameters reserved]
+        (reduce (fn [[parameters reserved] [ordinal capture]]
+                  (let [[parameter reserved]
+                        (allocate-private-id reserved
+                                             (symbol (str "uniform-capture-" (name capture)))
+                                             ordinal)]
+                    [(conj parameters parameter) reserved]))
+                [[] reserved] (map-indexed vector external-captures))
+        [frontier-map _reserved]
+        (reduce (fn [[mapping reserved] [ordinal value]]
+                  (let [[id reserved] (allocate-private-id reserved value ordinal)]
+                    [(assoc mapping value id) reserved]))
+                [{} reserved] (map-indexed vector frontier))
+        external-substitutions (zipmap external-captures capture-parameters)
+        locals
+        (mapv (fn [info]
+                (let [result (first (:results info))
+                      parameter-substitutions
+                      (into {}
+                            (map (fn [[parameter capture]]
+                                   [parameter (get external-substitutions capture capture)]))
+                            (map vector (:parameters info) (:captures info)))]
+                  {:id result :dtype (dtype/canon (get-in facts [:values result :dtype]))
+                   :init (util/subst-syms parameter-substitutions (first (:body-results info)))}))
+              infos)
+        results (mapv frontier-map frontier)
+        attributes {:index index :extent 1
+                    :attributes {:stable-array-captures [(:array root)]}}
+        operation (list 'map attributes [] external-captures
+                        (dialect/lambda-form capture-parameters
+                                             (dialect/emit-locals locals)
+                                             frontier))
+        equation (list '= (:id root-info) results operation)
+        old-facts (select-keys (:equations facts) (:equations closure))
+        root-equation-facts (get-in facts [:equations (:id root-info)])
+        equation-facts
+        (-> root-equation-facts
+            (assoc :effects #{} :aliases {})
+            (update :provenance assoc :pass :uniform-input-scalar-closure)
+            (update :attributes dissoc :result-storage :host-binding :host-bindings)
+            (assoc-in [:attributes :fusion/constituents] old-facts))
+        values
+        (into {}
+              (map (fn [[old new]]
+                     [new (av/tensor {:dtype (dtype/canon (get-in facts [:values old :dtype]))
+                                      :shape [1]})]))
+              (map (fn [old] [old (frontier-map old)]) frontier))]
+    {:equation equation :equation-facts equation-facts :values values
+     :frontier-map frontier-map :external-captures external-captures}))
+
+(defn- materialize-uniform-scalar-closure-candidate
+  [program]
+  (let [facts (dialect/facts program)
+        equations (dialect/equations program)
+        infos (mapv operation-info equations)
+        position-by-id (into {} (map-indexed (fn [index info] [(:id info) index])) infos)
+        uses (group-by first (use-sites equations))
+        input-values (set (:inputs facts))
+        outputs (set (dialect/outputs program))
+        host-reads (set (get-in facts [:attributes :host-read-values]))
+        written (set (concat (mapcat :destinations infos)
+                             (mapcat (fn [equation]
+                                       (map :destination
+                                            (or (dialect/result-storage facts (second equation)) [])))
+                                     equations)))
+        aliases (mapcat (comp seq :aliases) (vals (:equations facts)))
+        roots (keep #(exact-uniform-root facts % input-values written aliases outputs host-reads)
+                    infos)
+        closures (keep #(uniform-scalar-closure facts infos uses position-by-id outputs host-reads %)
+                       roots)]
+    ;; This first landing deliberately refuses to coordinate independent roots. One transaction
+    ;; owns one input read, its complete scalar closure and every terminal consumer.
+    (if-not (= 1 (count closures))
+      [program {:resident-uniform-input-closures 0 :resident-uniform-input-scalars 0}]
+      (try
+        (let [closure (first closures)
+            reserved (into (set (keys (:values facts)))
+                           (filter symbol? (tree-seq coll? seq equations)))
+            generated (singleton-closure-map facts closure reserved)
+            root-id (get-in closure [:root :info :id])
+            values (merge (apply dissoc (:values facts) (:values closure))
+                          (:values generated))
+            rewritten
+            (->> infos
+                 (keep (fn [info]
+                         (cond
+                           (= root-id (:id info)) (:equation generated)
+                           (contains? (:equations closure) (:id info)) nil
+                           (contains? (:terminal-equations closure) (:id info))
+                           (emit-equation
+                            (rewrite-lambda-captures
+                             info values
+                             (into {}
+                                   (map (fn [[old new]]
+                                          [old (list 'clojure.core/aget new 0)]))
+                                   (:frontier-map generated))
+                             (set (vals (:frontier-map generated)))))
+                           :else (emit-equation info))))
+                 vec)
+            equation-ids (set (map second rewritten))
+            definitions (set (mapcat #(nth % 2) rewritten))
+            references (set (mapcat (fn [equation]
+                                      (cond-> (dialect/operation-inputs equation)
+                                        (dialect/value-id? (dialect/operation-extent equation))
+                                        (conj (dialect/operation-extent equation))))
+                                    rewritten))
+            storage (set (mapcat (fn [equation]
+                                   (map :destination
+                                        (or (dialect/result-storage facts (second equation)) [])))
+                                 rewritten))
+            live-values (set/union definitions references storage outputs)
+            equation-facts
+            (-> (apply dissoc (:equations facts) (:equations closure))
+                (assoc root-id (:equation-facts generated))
+                (select-keys equation-ids))
+            new-facts
+            (-> facts
+                (assoc :values (select-keys values live-values)
+                       :inputs (vec (sort-by pr-str (set/difference references definitions))))
+                (assoc :equations equation-facts)
+                (assoc :effects (reduce set/union #{}
+                                        (map :effects (vals equation-facts))))
+                (assoc-in [:attributes :resident-uniform-input-scalar-closures]
+                          [{:root (get-in closure [:root :result])
+                            :input (get-in closure [:root :array])
+                            :frontier (mapv (:frontier-map generated)
+                                            (:frontier closure))}]))
+            result (dialect/make new-facts rewritten (dialect/outputs program))]
+          [(dialect/validate! result)
+           {:resident-uniform-input-closures 1
+            :resident-uniform-input-scalars (count (:values closure))}])
+        ;; Admission is transactional. A closure that the reconstructed TypedSOAC boundary cannot
+        ;; validate leaves the original program intact; no partially rewritten facts escape.
+        (catch Exception _
+          [program {:resident-uniform-input-closures 0
+                    :resident-uniform-input-scalars 0}])))))
+
+(defn- materialize-uniform-scalar-closure
+  [program]
+  ;; Validate the input outside the optional optimization transaction. Malformed input is never
+  ;; disguised as an optimization miss; any failure while proving or rebuilding a candidate is.
+  (let [program (dialect/validate! program)]
+    (try
+      (materialize-uniform-scalar-closure-candidate program)
+      (catch Exception _
+        [program {:resident-uniform-input-closures 0
+                  :resident-uniform-input-scalars 0}]))))
+
+(defn- inline-single-uniform-input-loads
   "Move a single-use uniform input load into its resident map/effect-map consumer.
 
    The input remains a stable, no-write-alias array capture. This is a device-side read of the
@@ -431,6 +886,16 @@
                                 (vec (sort-by pr-str removed))))]
         [(dialect/make facts rewritten (dialect/outputs program))
          {:resident-uniform-input-loads (count removed)}]))))
+
+(defn inline-uniform-input-loads
+  "Keep the direct single-use load fast path and additionally materialize one audited multi-use
+   scalar closure as an evaluate-once singleton map. Both transformations are GPU-route policy;
+   neither changes the JVM pipeline or the public invocation ABI."
+  [program]
+  (let [program (dialect/validate! program)
+        [program closure-stats] (materialize-uniform-scalar-closure program)
+        [program load-stats] (inline-single-uniform-input-loads program)]
+    [program (merge closure-stats load-stats)]))
 
 (defn realize
   "Return `[program stats]`, realizing every eligible audited scalar reduction.

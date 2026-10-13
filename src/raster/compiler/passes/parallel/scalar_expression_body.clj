@@ -1248,6 +1248,10 @@
       ;; Reserve at public region boundaries, not at every recursive child: identifiers are
       ;; scoped facts, and rescanning each subtree would make deeply nested lowering quadratic.
       {:fresh-binding fresh
+       ;; Owners that must validate a source conversion without contributing a consumer dtype
+       ;; may ask this same strict authority for the independently derived expression type.
+       :source-type (fn [expression env]
+                      (some-> (authoritative-source-type expression env) canon-type))
        :lower (fn [expression expected env]
                 ;; A proved coordinate may introduce owner SSA names after source projection.
                 (reserve! [expression (when-not (some? source-region) (keys env)) predicate])

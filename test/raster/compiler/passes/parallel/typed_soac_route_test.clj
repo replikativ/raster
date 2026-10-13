@@ -10,6 +10,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -617,6 +618,66 @@
     (is (nil? (execute x a b 4)))
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [4.0 9.0 16.0 25.0] (mapv double b)))))
+
+(deftest uniform-input-scalar-closure-keeps-one-private-source-ordered-producer
+  (let [source
+        '(let* [clock-value (clojure.core/long (clojure.core/aget time-buffer 0))
+                step (clojure.core/long
+                      (clojure.core/unchecked-add (clojure.core/long clock-value)
+                                                  (clojure.core/long 3)))
+                scaled (clojure.core/long
+                        (clojure.core/unchecked-multiply (clojure.core/long step)
+                                                        (clojure.core/long 2)))
+                effect-a (raster.par/map-void! i n
+                           (clojure.core/aset out-a i
+                             (clojure.core/unchecked-add
+                              (clojure.core/aget out-a i) step)))
+                effect-b (raster.par/map-void! i n
+                           (clojure.core/aset out-b i
+                             (clojure.core/unchecked-add
+                              (clojure.core/aget out-b i) scaled)))]
+           [effect-a effect-b])
+        {:keys [program stats]}
+        (route/attempt source :long
+                       {'time-buffer :long 'out-a :long 'out-b :long}
+                       {:scalar-types {'n :long}
+                        :values {'time-buffer
+                                 (av/tensor {:dtype :long
+                                             :shape '[(extent time-buffer)]})}
+                        :resident-uniform-input-loads? true})
+        algorithm (get-in program [:equations 0 :algorithm])
+        facts (dialect/facts algorithm)
+        frontier (get-in facts [:attributes :resident-uniform-input-scalar-closures 0 :frontier])
+        infos (map fusion/equation-info (dialect/equations algorithm))
+        singleton (first (filter #(= 1 (get-in % [:attributes :extent])) infos))
+        terminals (filter #(and (contains? #{:map :effect-map} (:kind %))
+                                (not= (:id singleton) (:id %))) infos)
+        source-bindings (partition 2 (second (:source program)))
+        source-ids (set (map first source-bindings))
+        source-position (into {} (map-indexed (fn [index [id _]] [id index])) source-bindings)
+        singleton-facts (get-in facts [:equations (:id singleton)])
+        constituents (get-in singleton-facts [:attributes :fusion/constituents])]
+    (is (= 1 (:resident-uniform-input-closures stats)))
+    (is (= (:id singleton) (:id (first infos)))
+        "the extent-one producer retains the removed root's source position")
+    (is (not-any? source-ids '[clock-value step scaled]))
+    (is (every? source-ids frontier)
+        "private frontier buffers are explicit source-local allocations")
+    (is (not-any? (set (concat (:inputs program) (:outputs program))) frontier)
+        "inner live-outs remain private at the whole-program public boundary")
+    (is (= :uniform-input-scalar-closure (get-in singleton-facts [:provenance :pass])))
+    (is (= 3 (count constituents))
+        "the source placement retains the exact three removed scalar constituents")
+    (is (every? (comp some? :source-binding-id :provenance val) constituents))
+    (is (< (apply min (map source-position frontier))
+           (min (source-position 'effect-a) (source-position 'effect-b)))
+        "the private producer remains at the removed root's pre-consumer source position")
+    (is (every? (fn [terminal]
+                  (not-any? #{'clock-value 'step 'scaled}
+                            (tree-seq coll? seq
+                                      [(:locals terminal) (:body-results terminal)])))
+                terminals))
+    (is (= algorithm (dialect/validate! algorithm)))))
 
 (deftest ordered-map-loop-retains-its-lexical-update-region
   (let [source '(let* [result
