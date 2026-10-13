@@ -908,6 +908,51 @@
                                       [:attributes :host-binding-ids]))
         realized (mapv #(realize-equation program %) (dialect/equations program))
         by-placement (group-by :placement realized)
+        ;; Fusion constituents are exact source bindings now owned by a realized typed equation.
+        ;; They must not re-enter the ordinary host dependency closure after staging/fusion has
+        ;; replaced their values with private buffers. A retained continuation that still reads
+        ;; one is unsupported unless realization explicitly projects that same scalar symbol.
+        constituent-entries
+        (mapcat #(seq (get-in % [:attributes :fusion/constituents]))
+                (vals (:equations (dialect/facts program))))
+        claimed-constituents
+        (filter #(contains? (:provenance (second %)) :source-binding-id)
+                constituent-entries)
+        source-bindings (get-in (dialect/facts program) [:attributes :source-bindings])
+        constituent-groups
+        (group-by #(get-in (second %) [:provenance :source-binding-id]) claimed-constituents)
+        malformed-constituents
+        (keep (fn [[constituent-id constituent-facts :as entry]]
+                (let [source-id (get-in constituent-facts [:provenance :source-binding-id])]
+                  (when-not (and (integer? source-id)
+                                 (<= 0 source-id) (< source-id (count original-pairs))
+                                 (vector? source-bindings)
+                                 (= :analyzed-source
+                                    (get-in constituent-facts [:provenance :front-end]))
+                                 (= constituent-id source-id)
+                                 (symbol? (first (nth original-pairs source-id)))
+                                 (some #{(first (nth original-pairs source-id))}
+                                       source-bindings))
+                    entry)))
+              claimed-constituents)
+        conflicting-constituents
+        (keep (fn [[source-id entries]]
+                (when (< 1 (count (distinct (map second entries)))) source-id))
+              constituent-groups)
+        _constituent-authority
+        (when (or (seq malformed-constituents) (seq conflicting-constituents))
+          (throw (ex-info "fusion constituent provenance does not identify exact source bindings"
+                          {:reason :typed-soac-unbound-scalar
+                           :invariant :realized-constituent-provenance
+                           :malformed (vec malformed-constituents)
+                           :conflicting-source-ids (vec conflicting-constituents)})))
+        realized-constituent-binding-ids (set (keys constituent-groups))
+        realized-constituent-symbols
+        (into #{}
+              (keep (fn [id]
+                      (when (and (integer? id) (<= 0 id) (< id (count original-pairs)))
+                        (first (nth original-pairs id)))))
+              realized-constituent-binding-ids)
         realized-host-symbols
         (into #{} (mapcat (fn [equation]
                             (keep (fn [[symbol _]] (when (symbol? symbol) symbol))
@@ -932,16 +977,40 @@
               original-pairs)
         host-bindings
         (required-host-bindings
-         (keep-indexed (fn [_ [symbol :as pair]]
+         (keep-indexed (fn [id [symbol :as pair]]
                          ;; A fused equation may be placed at a later constituent while
                          ;; defining a host symbol whose original source pair occurred earlier.
                          ;; That symbol is globally realized; retaining its old pair would execute
                          ;; the producer twice and bypass the fused schedule.
-                         (when-not (contains? realized-host-symbols symbol) pair))
+                         (when-not (or (contains? realized-host-symbols symbol)
+                                       (contains? realized-constituent-binding-ids id))
+                           pair))
                        original-pairs)
          (set/union physical-destinations
                     host-controlled-reads
                     (into #{} (mapcat util/free-syms) body)))
+        unprojected-constituent-symbols
+        (set/difference realized-constituent-symbols realized-host-symbols)
+        retained-host-expressions
+        (keep-indexed
+         (fn [id [symbol expression]]
+           (when (and (or (contains? host-bindings symbol)
+                          (contains? host-binding-ids id))
+                      (not (contains? realized-host-symbols symbol))
+                      (empty? (get by-placement id)))
+             expression))
+         original-pairs)
+        unresolved-constituents
+        (set/intersection
+         unprojected-constituent-symbols
+         (into (into #{} (mapcat util/free-syms) body)
+               (mapcat util/free-syms)
+               retained-host-expressions))
+        _ (when (seq unresolved-constituents)
+            (throw (ex-info "host continuation reads scalar bindings owned by typed realization"
+                            {:reason :typed-soac-unbound-scalar
+                             :invariant :realized-source-continuation
+                             :symbols (vec (sort-by pr-str unresolved-constituents))})))
         pairs
         (vec
          (mapcat
