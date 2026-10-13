@@ -294,12 +294,22 @@
      :buffers buffers}))
 
 (defn- evaluate-host-equations
-  [parallel-program buffers scalars evaluate-host]
+  [parallel-program projections buffers scalars evaluate-host]
   (let [values (:values parallel-program)]
     (reduce
      (fn [{:keys [scalars device-results host-steps] :as state} equation]
        (if-not (true? (get-in equation [:attributes :host-only]))
-         (update state :device-results into (:results equation))
+         (let [operation (first (:operations equation))
+               physical-results
+               (when (or (emitted-equation/emitted-equation? operation)
+                         (equation-dispatch/emitted-equation-dispatch? operation))
+                 ;; This exact-operation projection belongs to the independently checked
+                 ;; enclosing program. Logical results and their retained physical storage
+                 ;; are both device-produced; neither may feed a prelaunch host computation.
+                 (:physical-results (emitted-program/operation-projection
+                                     projections operation)))]
+           (update state :device-results into
+                   (concat (:results equation) (vals physical-results))))
          (do
            (when (seq (:effects equation))
              (fail! :emitted-program-host-effects
@@ -767,7 +777,7 @@
         {:keys [scalars host-steps]}
         (binding [*validated-boundary-projections* nil
                   *validated-projection-policy* nil]
-          (evaluate-host-equations parallel-program buffers scalar-values evaluate-host))]
+          (evaluate-host-equations parallel-program projections buffers scalar-values evaluate-host))]
     {:program parallel-program :projections projections :buffers buffers :scalars scalars
      :loop-scratch loop-scratch :host-steps host-steps :result-views result-views
      :caller-options caller-options}))
