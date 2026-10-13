@@ -32,6 +32,25 @@ cross-cutting parts of this campaign, not competing replacements for it.
   recorded unchanged real Gemma gate failed 11 of 28 adapter checks; it requires a fresh coherent
   reproduction, not substitution by a microtest or a relaxed numerical oracle.
 
+### Closed scheduling arithmetic safety
+
+KernelBody index arithmetic denotes exact integer scheduling computations realized
+at a declared machine width. A final zero, outer widening cast or inactive access
+mask cannot waive an overflowing evaluated prefix. Closed literal/cast/add/sub/mul
+trees use the existing bounded scalar-range proof, with recognition bounded before
+child enumeration; proof exhaustion is an explicit refusal, not assumed safety.
+Symbolic operands still need the separate actual lexical-guard/domain contract.
+
+Verifier and C-family index emission share the existing launch integer-literal
+width authority (Int when representable, otherwise Long). Emission delegates
+signed literal spelling, including Long minimum, to the existing typed literal
+emitter. This repairs an internal width disagreement, not source-level numerical
+policy or a new type-inference registry. Typed source arithmetic keeps its original
+checked/wrapping policy. Generated schedules must widen before multiplication;
+this gate alone neither enables the symbolic CUDA workloads nor proves all index
+arithmetic safe. Unchanged producer, inclusive-Long-loop and target source tests
+are distinct controls alongside the negative prefix, budget and metadata cases.
+
 ### CUDA integration: bounded authority audit, not a replacement campaign
 
 The October 13 compiler/runtime reviews of contributor PR #1338 (`063e7fc0`) identify

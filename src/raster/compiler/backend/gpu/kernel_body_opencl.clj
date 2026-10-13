@@ -12,6 +12,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.scalar-range :as scalar-range]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.kernel-body :as body]))
 
@@ -25,12 +26,12 @@
 (defn- target-name [value]
   (ce/c-symbol value))
 
-(declare emit-index-expression target-type)
+(declare emit-index-expression target-type emit-literal)
 
 (defn- index-expression-dtype
   [expression types]
   (cond
-    (integer? expression) :int
+    (integer? expression) (launch/typed-expression-dtype expression {})
     (value-id? expression)
     (or (get types expression)
         (throw (ex-info "index expression references a value with no declared dtype"
@@ -48,6 +49,8 @@
 (defn- emit-index-expression
   [expression env]
   (cond
+    (integer? expression)
+    (emit-literal {:value expression :type (launch/typed-expression-dtype expression {})})
     (number? expression) (str expression)
     (value-id? expression) (or (get env expression) (target-name expression))
     (record-kind? "IndexCast" expression)
@@ -92,15 +95,15 @@
     (into {} (map (fn [parameter] [(:id parameter) (ce/c-symbol (:id parameter))]))
           (:parameters kernel-body))))
   ([kernel-body parameter-names]
-  (let [kernel-body (body/validate! kernel-body)
-        stores (filter #(record-kind? "TileStore" %)
-                       (nested-operations (:operations kernel-body)))
-        regions (distinct (map :value-region stores))]
-    (when-not (= 1 (count regions))
-      (throw (ex-info "all matrix tile stores must carry the same scalar region"
-                      {:reason :raster/bug :regions (vec regions)})))
-    (when-let [region (first regions)]
-      (lower-scalar-ssa-region kernel-body region parameter-names)))))
+   (let [kernel-body (body/validate! kernel-body)
+         stores (filter #(record-kind? "TileStore" %)
+                        (nested-operations (:operations kernel-body)))
+         regions (distinct (map :value-region stores))]
+     (when-not (= 1 (count regions))
+       (throw (ex-info "all matrix tile stores must carry the same scalar region"
+                       {:reason :raster/bug :regions (vec regions)})))
+     (when-let [region (first regions)]
+       (lower-scalar-ssa-region kernel-body region parameter-names)))))
 
 (defn- require!
   [condition message data]
@@ -123,7 +126,7 @@
                    (= 1 (count (:operations region)))
                    (= (into {} (:expression operation))
                       (into {} (body/cast-expression (first (:parameters region))
-                                                       :half :nearest-even :ieee)))
+                                                     :half :nearest-even :ieee)))
                    (= (:result region) (get-in operation [:result :id])))
               (= :half (get input-dtypes role)))))]
     (require! (and (= :dpas (:family instruction))
@@ -145,8 +148,8 @@
               "Intel matrix lowering requires row-major lhs and a transformed load for transposed rhs"
               {:input-layouts input-layouts :input-regions input-regions})
     (require! (every? #(and (= (:lhs input-dtypes) (get-in % [:layout :dtype]))
-                           (or (nil? (:lhs input-regions))
-                               (= (layout/row-major [mi ki] :float) (:layout %)))) prefetches)
+                            (or (nil? (:lhs input-regions))
+                                (= (layout/row-major [mi ki] :float) (:layout %)))) prefetches)
               "Intel matrix prefetch layout must describe the input storage dtype"
               {:input-dtypes input-dtypes :prefetches prefetches})
     plan))
@@ -248,8 +251,8 @@
                                                       (lhs-input-value load "" "") " : (half)0)")))
                                      ");\n")))
                        (str (apply str
-                            (for [m ms]
-                              (str "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" kpos ", " (amul m) "), &a" m ");\n")))
+                                   (for [m ms]
+                                     (str "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" kpos ", " (amul m) "), &a" m ");\n")))
                             (apply str (for [m ms] (str "        sa" m " = as_short8(a" m ");\n")))))
                      (apply str
                             (for [m ms n ns]
@@ -642,10 +645,10 @@
                  " ? " (literal lower result-type)
                  " : (" (target-type result-type) ")" x ")"))
           (throw (ex-info "CUDA/HIP cannot preserve this saturating cast policy"
-                        {:reason :kernel-body-c-cast-policy
-                         :dialect (:id *scalar-dialect*)
-                         :source-type source-type :result-type result-type
-                         :rounding rounding :overflow overflow}))))
+                          {:reason :kernel-body-c-cast-policy
+                           :dialect (:id *scalar-dialect*)
+                           :source-type source-type :result-type result-type
+                           :rounding rounding :overflow overflow}))))
 
       ;; `:exact/:exact` is the KernelBody owner's proof that every runtime value is representable
       ;; by the result type. That proof makes both widening and narrowing ordinary value-
@@ -702,7 +705,7 @@
       (emit-cast
        (body/cast-expression
         (body/scalar-expression op :double
-          (mapv #(body/cast-expression % :double :exact :exact) (:arguments expression)))
+                                (mapv #(body/cast-expression % :double :exact :exact) (:arguments expression)))
         :float :nearest-even :ieee)
        context)
 
@@ -735,7 +738,7 @@
         (emit-cast
          (body/cast-expression
           (body/scalar-expression op :float
-            (mapv #(body/cast-expression % :float :exact :exact) (:arguments expression)))
+                                  (mapv #(body/cast-expression % :float :exact :exact) (:arguments expression)))
           :half :nearest-even :ieee)
          context)
         (str (intrinsics/c-floating-extremum-name op operand-type)
@@ -948,7 +951,7 @@
                           (contains? #{:float :predicate} (get-in % [:result :type])))
                     (:operations region))
             (every? #(or (not (record-kind? "ScalarExpr" %))
-                        (contains? #{:float :predicate} (:result-type %)))
+                         (contains? #{:float :predicate} (:result-type %)))
                     (tree-seq coll? seq (mapv :expression (:operations region))))
             (not-any? (set (:indices region))
                       (tree-seq coll? seq
@@ -1763,22 +1766,22 @@
                    *scalar-dialect* subgroup-size uses-subgroups?)]
     {:compilation (:compilation intrinsic-module)
      :source (str (c-dialect/preamble *scalar-dialect*
-                             {:uses-half? uses-half? :uses-double? uses-double?
-                              :uses-subgroups? uses-subgroups?})
-         helper-source
-         (when (seq helper-source) "\n")
-         attribute
-         (c-dialect/entry-prefix *scalar-dialect*) (target-name kernel-name) "(\n    "
-         (str/join ",\n    "
-                   (map #(c-dialect/parameter-declaration
-                          *scalar-dialect*
-                          (cond-> % (contains? stable-reads (:id %))
-                                  (assoc :restrict? true))
-                          (get parameter-names (:id %)))
-                        parameters))
-         ") {\n"
-         allocation-source index-source operation-source
-         "}\n")}))
+                                      {:uses-half? uses-half? :uses-double? uses-double?
+                                       :uses-subgroups? uses-subgroups?})
+                  helper-source
+                  (when (seq helper-source) "\n")
+                  attribute
+                  (c-dialect/entry-prefix *scalar-dialect*) (target-name kernel-name) "(\n    "
+                  (str/join ",\n    "
+                            (map #(c-dialect/parameter-declaration
+                                   *scalar-dialect*
+                                   (cond-> % (contains? stable-reads (:id %))
+                                           (assoc :restrict? true))
+                                   (get parameter-names (:id %)))
+                                 parameters))
+                  ") {\n"
+                  allocation-source index-source operation-source
+                  "}\n")}))
 
 (defn emit-scalar-module
   "Lower a verified scalar/control KernelBody directly to a C-family target dialect.

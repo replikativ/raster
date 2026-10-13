@@ -14,12 +14,32 @@
 
 (deftest scalar-source-assembly-preserves-context-order
   (with-redefs-fn {#'opencl/emit-scalar-operation
-                  (fn [operation context depth]
-                    [(str depth ":" context ":" operation ";") (inc context)])}
+                   (fn [operation context depth]
+                     [(str depth ":" context ":" operation ";") (inc context)])}
     (fn []
       (is (= ["" 7] (#'opencl/emit-scalar-operations [] 7 2)))
       (is (= ["2:7:a;2:8:b;2:9:c;" 10]
              (#'opencl/emit-scalar-operations ["a" "b" "c"] 7 2))))))
+
+(deftest large-index-literals-share-verifier-and-target-width-and-signed-spelling
+  (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
+    (binding [opencl/*scalar-dialect* (dialect/resolve! target)]
+      (is (= :long (#'opencl/index-expression-dtype 2147483648 {})))
+      (is (= :long (:type (#'body/expression-info! 2147483648 {}))))
+      (is (= (#'opencl/emit-literal {:value 2147483648 :type :long})
+             (#'opencl/emit-index-expression 2147483648 {})))
+      (is (= (#'opencl/emit-literal {:value Long/MIN_VALUE :type :long})
+             (#'opencl/emit-index-expression Long/MIN_VALUE {})))
+      (let [kernel (body/make
+                    {:id :large-literal
+                     :parameters [(body/->KernelParameter 'out :output :long [1] :global
+                                                          (layout/row-major [1] :long) :result)]
+                     :indices [(body/->IndexCompute 'offset 2147483648)]
+                     :operations [(body/->ScalarStore 'out [0] 'offset nil)]
+                     :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+            source (:source (opencl/emit-scalar-module "large_literal" kernel {:target-dialect target}))]
+        (is (re-find #"long(?: long)? rstr_offset = 2147483648L(?:L)?;" source))
+        (is (not (re-find #"int rstr_offset =" source)))))))
 
 (deftest elementary-math-accuracy-evidence-does-not-change-target-source
   (let [descriptor intrinsics/descriptor
@@ -36,7 +56,7 @@
                            [(body/->ScalarCompute (body/value 'result type) expression)
                             (body/->ScalarStore 'out [0] 'result nil)]))
             emit #(-> (opencl/emit-scalar-module "elementary_math" %
-                                               {:target-dialect target}) :source)
+                                                 {:target-dialect target}) :source)
             current (emit kernel)
             previous
             (with-redefs [intrinsics/descriptor
@@ -51,7 +71,7 @@
           target [:opencl-intel :opencl-portable :cuda :hip]]
     (let [kernel (fixtures/widened-math-body op)
           source (:source (opencl/emit-scalar-module "widened_math" kernel
-                                                   {:target-dialect target}))]
+                                                     {:target-dialect target}))]
       (is (str/includes? source (str (name op) "((double)(")))
       (if (contains? #{:opencl-intel :opencl-portable} target)
         (do (is (str/includes? source "cl_khr_fp64"))
@@ -59,7 +79,7 @@
             (is (str/includes? source "convert_float_rte(materialized)"))
             (when (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
               (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
-                                               "-fsyntax-only" "-" :in source)]
+                                                 "-fsyntax-only" "-" :in source)]
                 (is (zero? exit) err))))
         (is (str/includes? source "__double2float_rn("))))))
 
@@ -68,15 +88,15 @@
                (binding [opencl/*scalar-dialect* (dialect/resolve! target)]
                  (#'opencl/emit-intrinsic-expression
                   (body/scalar-expression op type
-                    (if (= :fma op)
-                      [(body/literal 1.0 type) (body/literal 2.0 type)
-                       (body/literal 3.0 type)]
-                      [(body/literal 1.0 type) (body/literal 2.0 type)]))
+                                          (if (= :fma op)
+                                            [(body/literal 1.0 type) (body/literal 2.0 type)
+                                             (body/literal 3.0 type)]
+                                            [(body/literal 1.0 type) (body/literal 2.0 type)]))
                   {:names {} :types {}})))]
     (doseq [[type spelling] [[:float "__fmul_rn("] [:double "__dmul_rn("]]]
       (is (str/starts-with? (emit :cuda :* type) spelling))
       (is (str/starts-with? (emit :hip :* type)
-                           (dialect/noncontracting-multiply-name (dialect/resolve! :hip) type)))
+                            (dialect/noncontracting-multiply-name (dialect/resolve! :hip) type)))
       (doseq [target [:opencl-intel :opencl-portable]]
         (is (str/includes? (emit target :* type) " * "))))
     (doseq [target [:opencl-intel :opencl-portable :cuda :hip]
@@ -223,18 +243,18 @@
     (is (= [:int]
            (#'opencl/wrapping-collective-requirements
             [(body/map->ForLoop {:operations [collective]
-                                :attributes {:source-proof irrelevant-proof}})])))))
+                                 :attributes {:source-proof irrelevant-proof}})])))))
 
 (deftest wrapping-collective-discovery-receives-operation-roots-once
   (let [kernel (scalar-kernel-body)
         discover @#'opencl/wrapping-collective-requirements
         calls (atom 0)]
     (with-redefs-fn {#'opencl/wrapping-collective-requirements
-                    (fn [operations]
-                      (swap! calls inc)
-                      (is (identical? (:operations kernel) operations)
-                          "do not recursively rediscover children from an already flattened walk")
-                      (discover operations))}
+                     (fn [operations]
+                       (swap! calls inc)
+                       (is (identical? (:operations kernel) operations)
+                           "do not recursively rediscover children from an already flattened walk")
+                       (discover operations))}
       #(opencl/emit-scalar-module "root_collective_discovery" kernel {}))
     (is (= 1 @calls))))
 
@@ -386,14 +406,14 @@
                   :index-scope #{'i} :lower-index (fn [value _] value)
                   :decline! decline!})
         lowered ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
-                 :int {'i :long})]
+                                  :int {'i :long})]
     (body/make
      {:id :bounded-byte-add
       :parameters [(body/->KernelParameter 'q :input :byte [16] :global
-                                            (layout/row-major [16] :byte) :input)
+                                           (layout/row-major [16] :byte) :input)
                    (body/->KernelParameter 'i :scalar :long [] nil nil :index)
                    (body/->KernelParameter 'out :output :int [1] :global
-                                            (layout/row-major [1] :int) :result)]
+                                           (layout/row-major [1] :int) :result)]
       :stable-reads [(body/stable-read 'q)]
       :operations (conj (vec (:operations lowered))
                         (body/->ScalarStore 'out [0] (:result lowered) nil))
@@ -407,7 +427,7 @@
     :parameters [(body/->KernelParameter 'a :scalar :int [] nil nil :left)
                  (body/->KernelParameter 'b :scalar :int [] nil nil :right)
                  (body/->KernelParameter 'out :output :int [1] :global
-                                          (layout/row-major [1] :int) :result)]
+                                         (layout/row-major [1] :int) :result)]
     :operations [(body/->ScalarCompute
                   (body/value 'result :int)
                   (body/scalar-expression
@@ -452,29 +472,29 @@
           operator [:min :max]
           make-body [fixtures/half-extremum-body fixtures/local-half-extremum-body]
           :let [source (opencl/emit-scalar-kernel "half_extremum"
-                         (make-body operator) {:target-dialect target})]]
+                                                  (make-body operator) {:target-dialect target})]]
     (is (str/includes? source (str "rstr_source_" (name operator) "_f32(")))
     (is (str/includes? source "if (isnan(a)) return a;"))
     (is (str/includes? source "signbit(a)"))
     (is (str/includes? source (if (= :opencl-portable target)
-                              "convert_half_rte(" "__float2half_rn(")))
+                                "convert_half_rte(" "__float2half_rn(")))
     (when (= :opencl-portable target)
       (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp16 : enable"))
       (when (command-available? "clang")
         (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
-                                         "-fsyntax-only" "-" :in source)]
+                                           "-fsyntax-only" "-" :in source)]
           (is (zero? exit) err))))))
 
 (deftest half-extrema-collectives-require-an-explicit-widening-schedule
   (doseq [[target width reason] [[:opencl-portable 16 :kernel-body-opencl-collective-dtype]
-                                [:cuda 32 :kernel-body-c-collective]
-                                [:hip 32 :kernel-body-c-collective]]
+                                 [:cuda 32 :kernel-body-c-collective]
+                                 [:hip 32 :kernel-body-c-collective]]
           operator [:min :max]]
     (is (= reason
            (try
              (opencl/emit-scalar-kernel "half_collective"
-               (fixtures/floating-extrema-collective-body :half operator width)
-               {:target-dialect target})
+                                        (fixtures/floating-extrema-collective-body :half operator width)
+                                        {:target-dialect target})
              nil
              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
 
@@ -494,7 +514,7 @@
         (is (str/includes? source (str "sub_group_reduce_" (name operator) "(")))
         (when (command-available? "clang")
           (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
-                                           "-fsyntax-only" "-" :in source)]
+                                             "-fsyntax-only" "-" :in source)]
             (is (zero? exit) err))))
       (let [helper (str "rstr_source_" (name operator) "_" (if (= :float type) "f32" "f64"))]
         (is (= 1 (count (re-seq (re-pattern (str helper "\\([^)]*\\) \\{")) source))))
@@ -730,9 +750,9 @@
                        '(clojure.core/- a b)
                        '(clojure.core/* a b)])
         lowered ((:lower lowerer) '(unchecked-add a b) :long
-                 {'a :long 'b :long})]
+                                  {'a :long 'b :long})]
     (is (every? #(= {:overflow :trap}
-                     (get-in % [:operations 0 :expression :options]))
+                    (get-in % [:operations 0 :expression :options]))
                 checked)
         "ordinary Clojure integer arithmetic is checked, never target-signed overflow")
     (is (= {:overflow :wrap}
@@ -745,7 +765,7 @@
                   :index-scope #{'i} :lower-index (fn [value _] value)
                   :decline! decline!})
         bounded ((:lower lowerer) '(clojure.core/+ (int (clojure.core/aget q i)) 7)
-                 :int {'i :long})
+                                  :int {'i :long})
         unknown ((:lower lowerer) '(clojure.core/+ a i) :long {'a :long 'i :long})
         proved-kernel (bounded-byte-add-kernel-body)
         opencl-source (opencl/emit-scalar-kernel
@@ -844,15 +864,15 @@
     (doseq [target [:opencl-portable :opencl-intel]]
       (let [source (opencl/emit-scalar-kernel "narrowing" kernel {:target-dialect target})
             second-source (opencl/emit-scalar-kernel "narrowing_second" kernel
-                                                    {:target-dialect target})]
+                                                     {:target-dialect target})]
         (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp64 : enable"))
         (is (str/includes? source "volatile double materialized = value;"))
         (is (= 2 (count (re-seq #"rstr_narrow_f64_f32_rte\(" source))))
         (is (str/includes? source " / 127.0"))
         (when (command-available? "clang")
           (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
-                                           "-fsyntax-only" "-"
-                                           :in (str source second-source))]
+                                             "-fsyntax-only" "-"
+                                             :in (str source second-source))]
             (is (zero? exit) err)))))
     (doseq [target [:cuda :hip]]
       (let [source (opencl/emit-scalar-kernel "narrowing" kernel {:target-dialect target})]

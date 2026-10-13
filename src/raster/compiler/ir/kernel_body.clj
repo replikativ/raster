@@ -1390,11 +1390,45 @@
                derived (scalar-range/for-dtype result-type)))
            (scalar-result-range canonical-op result-type infos))))}))
 
+(defn- closed-index-arithmetic
+  "Bound recognition by the shared proof budget and shared exact integer literal typing."
+  [expression]
+  (loop [remaining [expression] budget 128]
+    (cond
+      (empty? remaining) :closed
+      (zero? budget) :proof-budget
+      :else
+      (let [x (peek remaining) tail (pop remaining)]
+        (cond
+          (integer? x) (if (scalar-range/literal x (launch/typed-expression-dtype x {}))
+                         (recur tail (dec budget)) :literal-width)
+          (launch/index-cast? x) (recur (conj tail (:argument x)) (dec budget))
+          (and (launch/index-expr? x) (contains? #{:add :sub :mul} (:op x)))
+          (let [children (vec (take (inc budget) (:arguments x)))]
+            (if (> (+ (count tail) (count children)) (dec budget))
+              :proof-budget
+              (recur (into tail children) (dec budget))))
+          :else :open)))))
+
+(defn- check-closed-index-prefixes! [expression]
+  (when (or (integer? expression) (launch/index-expr? expression) (launch/index-cast? expression))
+    (let [scope (closed-index-arithmetic expression)]
+      (when (or (contains? #{:proof-budget :literal-width} scope)
+                (and (= :closed scope)
+                     (nil? (scalar-range/typed-index-range expression {} {}))))
+        (throw (ex-info "closed scheduling arithmetic lacks a representable intermediate prefix proof"
+                        {:reason :kernel-body-index-prefix :proof-scope scope
+                         :expression expression}))))))
+
 (defn- expression-info!
   [expression values]
+  ;; The existing interval verifier checks emitted evaluation prefixes, not just the final
+  ;; result. A zero factor, outer cast or inactive access mask cannot erase earlier overflow.
+  (check-closed-index-prefixes! expression)
   (cond
     (integer? expression)
-    {:type :int :uniformity all-uniform :range (scalar-range/literal expression :int)}
+    (let [type (launch/typed-expression-dtype expression {})]
+      {:type type :uniformity all-uniform :range (scalar-range/literal expression type)})
 
     (value-id? expression)
     (typed-info! values expression "index expression")
@@ -1546,7 +1580,7 @@
       (let [term (first (remove #{carry} operands))
             prefix (subvec operations 0 (- (count operations) 2))]
         (when (and (every? #(or (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" %)
-                               (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" %)) prefix)
+                                (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" %)) prefix)
                    (not-any? #{carry} (tree-seq coll? seq [prefix term])))
           ;; Outer ranges may originate in index arithmetic whose intermediate width was not
           ;; numerically proved. Reconstruct evidence from literals, storage dtypes and checked
@@ -1735,12 +1769,12 @@
                                         ;; This is an inductive claim, checked against the
                                         ;; backedge yield below. Unclaimed carries remain
                                         ;; conservative because a later iteration may diverge.
-                                        initial
-                                        (assoc initial :uniformity lane-varying)))])
+                                          initial
+                                          (assoc initial :uniformity lane-varying)))])
                                    iter-args initials))
             additive-ranges (try
                               (additive-loop-ranges! operation loop-values
-                                                    (assoc context :control-uniformity loop-control))
+                                                     (assoc context :control-uniformity loop-control))
                               ;; This optional derivation discards external range provenance.
                               ;; Failure under those weaker facts must not reject a body that
                               ;; ordinary validation can prove with its original environment.
@@ -1875,8 +1909,8 @@
                                       (let [initial (conservative-loop-info
                                                      initial (:type (:binding arg)))]
                                         (if (contains? uniform-iter-args (:id (:binding arg)))
-                                        initial
-                                        (assoc initial :uniformity lane-varying)))])
+                                          initial
+                                          (assoc initial :uniformity lane-varying)))])
                                    iter-args initials))
             body-values (validate-dataflow-operations!
                          (pop (:operations operation)) loop-values
@@ -2467,10 +2501,10 @@
                                         (:arguments offset))
                      _ (when-not (and (seq offset-arguments)
                                       (every? #(and (record-kind?
-                                                    "raster.compiler.ir.kernel_body.IndexCast" %)
-                                                   (= :long (:dtype %)) (= :exact (:overflow %))
-                                                   (or (integer? (:argument %))
-                                                       (value-id? (:argument %))))
+                                                     "raster.compiler.ir.kernel_body.IndexCast" %)
+                                                    (= :long (:dtype %)) (= :exact (:overflow %))
+                                                    (or (integer? (:argument %))
+                                                        (value-id? (:argument %))))
                                               offset-arguments))
                          (throw (ex-info "kernel buffer view must widen leaves before address arithmetic"
                                          {:reason :kernel-body-view-index-width :view view})))
@@ -2485,7 +2519,7 @@
                                 (= (first parent-shape)
                                    (launch-bound-value
                                     (nth (:group-count launch) group-axis))))
-                    (throw (ex-info
+                   (throw (ex-info
                            "kernel buffer view is not a launch-bounded contiguous leading slice"
                            {:view view :parent parent :launch launch
                             :required {:parent-shape '[extent & physical-view-shape]

@@ -13,6 +13,54 @@
 (def ^:private lhs-layout (layout/dot-operand 0 acc-layout 2 :half))
 (def ^:private rhs-layout (layout/dot-operand 1 acc-layout 2 :half))
 
+(deftest closed-scheduling-arithmetic-cannot-hide-overflowing-prefixes
+  (let [wide #(body/index-cast % :long :exact)
+        kernel #(body/make {:id :prefix-proof :indices [(body/->IndexCompute 'offset %)]
+                            :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+        unsafe [(body/expression :mul Integer/MAX_VALUE 2 0)
+                (body/expression :mul (wide Integer/MAX_VALUE) (wide Integer/MAX_VALUE) (wide 3) (wide 0))
+                (wide (body/expression :mul Integer/MAX_VALUE 2))]
+        safe [(body/expression :mul (wide Integer/MAX_VALUE) (wide 2))
+              (body/expression :mul 17 3 0)
+              (body/expression :mul 0 Integer/MAX_VALUE 2)
+              (body/expression :add -17 3 4)
+              2147483648
+              (wide 2147483648)
+              (wide (body/expression :sub 17 3))]]
+    ;; Unbounded reference confirms the otherwise hidden prefix exceeds its machine width.
+    (is (> (*' Integer/MAX_VALUE 2) Integer/MAX_VALUE))
+    (is (> (*' Integer/MAX_VALUE Integer/MAX_VALUE 3) Long/MAX_VALUE))
+    (doseq [expression unsafe]
+      (is (= :kernel-body-index-prefix
+             (try (kernel expression) :accepted
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (doseq [expression safe] (is (body/kernel-body? (kernel expression))))
+    (is (= :kernel-body-index-prefix
+           (try (kernel (inc (bigint Long/MAX_VALUE))) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :kernel-body-index-prefix
+           (try (kernel (wide (inc (bigint Long/MAX_VALUE)))) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (kernel (body/expression :add nil 1))))
+    (is (= :kernel-body-index-prefix
+           (try (kernel (apply body/expression :add (repeat 129 0))) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :kernel-body-index-prefix
+           (try (kernel (with-meta (first unsafe) {:range {:lower 0 :upper 0}})) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :kernel-body-index-prefix
+           (try
+             (body/make
+              {:id :masked-prefix
+               :parameters [(body/->KernelParameter 'out :output :int [1] :global
+                                                    (layout/row-major [1] :int) :result)]
+               :masks [(body/->Mask :inactive [(body/predicate :eq 0 1)])]
+               :operations [(body/->ScalarStore 'out [(first unsafe)] (body/literal 0 :int) :inactive)]
+               :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+             :accepted
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
 (deftest concrete-launches-must-fit-the-declared-hardware-index-width
   (doseq [[source dimension accepted rejected]
           [[:group :group-count (inc (long Integer/MAX_VALUE)) (+ 2 (long Integer/MAX_VALUE))]
@@ -35,9 +83,9 @@
   (let [kernel (body/make {:id :lane-range :indices [(body/->IndexBinding 'lane :lane 0)]
                            :launch (launch/spec {:workgroup-size [1 1 1] :group-count [1 1 1]})})]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"hardware index representation"
-                         (body/validate-launch-index-ranges!
-                          kernel (launch/geometry {:workgroup-size [2147483648 2147483648 4]
-                                                   :group-count [1 1 1]})))
+                          (body/validate-launch-index-ranges!
+                           kernel (launch/geometry {:workgroup-size [2147483648 2147483648 4]
+                                                    :group-count [1 1 1]})))
         "the proof product must not overflow host arithmetic")))
 
 (defn- minimal-body []
@@ -199,12 +247,12 @@
                     (body/make
                      {:id :typed-view
                       :parameters [(body/->KernelParameter 'A :input :float [2 'width] :global
-                                                            (layout/row-major [2 'width] :float) :input)
+                                                           (layout/row-major [2 'width] :float) :input)
                                    (body/->KernelParameter 'width :scalar extent-type [] nil nil :dimension)]
                       :indices [(body/->IndexBinding 'row :group 0)]
                       :views [(body/->BufferView 'slice 'A
-                                                (body/leading-slice-offset 'row ['width])
-                                                ['width] (layout/row-major ['width] :float))]
+                                                 (body/leading-slice-offset 'row ['width])
+                                                 ['width] (layout/row-major ['width] :float))]
                       :launch (launch/spec {:workgroup-size [1] :group-count [2]})}))]
     (doseq [extent-type [:int :long]]
       (is (body/kernel-body? (make-view extent-type))))
@@ -220,12 +268,12 @@
 
 (deftest scalar-regions-are-checked-against-the-ordered-kernel-abi
   (let [semantic-region (body/->ScalarRegion
-                ['value 'bias 'scale]
-                '(raster.numeric/* (raster.numeric/+ value (aget bias group-x)) scale)
-                [{:sym 'bias :map (axis-map/of-axes [['group-x 16]]) :dtype :half}]
-                :float)
+                         ['value 'bias 'scale]
+                         '(raster.numeric/* (raster.numeric/+ value (aget bias group-x)) scale)
+                         [{:sym 'bias :map (axis-map/of-axes [['group-x 16]]) :dtype :half}]
+                         :float)
         region (body/->ScalarSSARegion (:parameters semantic-region) (:operands semantic-region)
-                                      ['i 'j] :float [] 'value :float)
+                                       ['i 'j] :float [] 'value :float)
         kernel (-> (minimal-body)
                    (update :parameters into
                            [(body/->KernelParameter
@@ -237,8 +285,8 @@
     (testing "semantic source regions must be lowered before entering executable KernelBody"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be typed scalar SSA"
                             (body/validate! (assoc-in kernel
-                                                     [:operations 0 :operations 2 :value-region]
-                                                     semantic-region)))))
+                                                      [:operations 0 :operations 2 :value-region]
+                                                      semantic-region)))))
     (testing "operand identities occupy the ordered prefix after the accumulator"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered prefix"
                             (body/validate!
@@ -402,12 +450,12 @@
 
 (deftest physical-scalar-requirements-include-expression-valued-realizations
   (let [expression (body/scalar-expression :tanh :float [(body/literal 0.5 :float)]
-                     {:math-realization numerics/widened-target-library-math})]
+                                           {:math-realization numerics/widened-target-library-math})]
     (is (= #{:float :double}
            (body/required-scalar-dtypes [(body/->ScalarStore 'out [0] expression nil)])))
     (is (= #{:float}
            (body/required-scalar-dtypes [(body/scalar-expression :tanh :float
-                                          [(body/literal 0.5 :float)])])))
+                                                                 [(body/literal 0.5 :float)])])))
     (is (= #{} (body/required-scalar-dtypes [(body/literal true :predicate)])))))
 
 (deftest widened-library-realization-retains-a-closed-float-contract
@@ -415,7 +463,7 @@
     (let [arguments (vec (repeat (:arity (intrinsics/descriptor op))
                                  (body/literal 0.5 :float)))
           expression (body/scalar-expression op :float arguments
-                       {:math-realization numerics/widened-target-library-math})
+                                             {:math-realization numerics/widened-target-library-math})
           compute #(scalar-body [(body/->ScalarCompute (body/value 'result :float) %)])]
       (is (body/kernel-body? (compute expression)))
       (doseq [contract [(assoc numerics/widened-target-library-math :accuracy :correctly-rounded)
@@ -431,12 +479,12 @@
                  (scalar-body [(body/->ScalarCompute
                                 (body/value 'result dt)
                                 (body/scalar-expression op dt arguments
-                                  {:math-realization numerics/widened-target-library-math}))])))))
+                                                        {:math-realization numerics/widened-target-library-math}))])))))
 
 (deftest elementary-math-realization-is-explicit-not-a-bitwise-attestation
   (let [operators (into #{} (keep (fn [[op descriptor]]
-                                  (when (= :target-library (:kernel-body-math-realization descriptor))
-                                    op))) intrinsics/table)]
+                                    (when (= :target-library (:kernel-body-math-realization descriptor))
+                                      op))) intrinsics/table)]
     (is (= #{:sin :cos :tan :exp :log :pow :asin :acos :atan :atan2
              :sinh :cosh :tanh :asinh :acosh :atanh :cbrt :log2 :log10
              :exp2 :expm1 :log1p :hypot} operators))
