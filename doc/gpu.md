@@ -59,6 +59,29 @@ parameter tagged with an SoA type becomes multiple flat arrays in the kernel
 signature. Field access compiles to the correct array indexing, giving
 GPU-friendly coalesced memory access without manual data layout work.
 
+## Read-only aggregate input intent
+
+The explicit `:compiler :equation-first` route in `raster.gpu.compiled/lower`
+accepts complete public buffer-field paths in `:constants` and `:roles`:
+
+```clojure
+{:compiler :equation-first
+ :constants [[:state :labels]]
+ :roles {[:state :positions] :input}}
+```
+
+Paths follow the retained parameter projection, including nested fields and tree
+indices; they do not name generated kernel parameters. Whole-root symbol selectors
+still expand to retained buffer leaves. Scalar, unknown or ambiguous paths refuse,
+as do overlapping selectors requesting conflicting roles.
+
+A constant leaf is captured when the prepared program is instantiated; changing
+the original host array does not silently refresh it on replay. Rebind an input
+leaf through its full path, not a whole aggregate containing captured constants.
+This is read-only intent, not mutable aggregate ownership: field donation, outputs,
+taps and mutable aggregate writes remain unsupported. Field selectors on the
+legacy resident-descriptor compiler fail explicitly; select equation-first.
+
 ## SOAC Fusion
 
 The compiler builds a dependency graph of parallel operations and fuses

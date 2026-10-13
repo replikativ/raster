@@ -606,6 +606,10 @@
   (let [effective-roles (derive-roles donate constants roles)
         entries (fn [symbols from donated?]
                   (map (fn [s]
+                         (when (vector? s)
+                           (throw (ex-info "field selectors are supported only for equation-first roles and constants"
+                                           {:reason :compiled-field-selector-intent
+                                            :selector s :intent from})))
                          {:key (keyword (if donated? (str (name s) "'") (name s)))
                           :sym s :from from}) symbols))]
     {:donate donate :constants constants :outputs outputs :taps taps :roles roles
@@ -777,6 +781,46 @@
     (instance? clojure.lang.Named value) (keyword (name value))
     :else (keyword (str "result-" index))))
 
+(defn- resolve-equation-first-field-intent
+  "Resolve public root/path intent through retained parameter projection, never physical names.
+   This does not grant mutable ownership; the existing aggregate/role gates run afterward."
+  [projection public-bindings constants roles]
+  (let [leaves (:physical-parameters projection)
+        resolve-selector
+        (fn [selector]
+          (if-not (vector? selector)
+            [selector]
+            (let [matches (filterv (fn [{:keys [binding symbol] :as leaf}]
+                                     (when-let [path (materialization/projection-path leaf)]
+                                       (and (= selector (into [(keyword binding)] path))
+                                            (contains? public-bindings symbol)))) leaves)]
+              (when-not (= 1 (count matches))
+                (throw (ex-info "field selector must identify one retained public buffer leaf"
+                                {:reason :compiled-field-selector :selector selector
+                                 :matches (mapv :symbol matches)})))
+              [(:symbol (first matches))])))
+        expand (fn [selector]
+                 (if (vector? selector)
+                   (resolve-selector selector)
+                   (let [fields (filterv #(and (= selector (:binding %))
+                                               (materialization/projection-path %)) leaves)]
+                     (if (seq fields)
+                       (mapv :symbol (filter #(contains? public-bindings (:symbol %)) fields))
+                       [selector]))))
+        resolved-roles
+        (reduce-kv (fn [resolved selector role]
+                     (reduce (fn [resolved symbol]
+                               (when (and (contains? resolved symbol)
+                                          (not= role (get resolved symbol)))
+                                 (throw (ex-info "overlapping selectors request conflicting leaf roles"
+                                                 {:reason :compiled-field-role-conflict
+                                                  :selector selector :symbol symbol
+                                                  :roles #{role (get resolved symbol)}})))
+                               (assoc resolved symbol role))
+                             resolved (expand selector)))
+                   {} (or roles {}))]
+    {:constants (vec (mapcat expand constants)) :roles resolved-roles}))
+
 (defn- project-equation-first-boundary
   "Choose public roles and escaped outputs on the normalized candidate, before its sole proof."
   [raw-plan compilation args {:keys [donate constants outputs taps roles]}]
@@ -784,14 +828,16 @@
         projection (get-in invocation-plan [:attributes :parameter-projection])
         aggregate-leaves (group-by :binding (filter materialization/projection-path
                                                    (:physical-parameters projection)))
+        _ (when-let [selector (first (filter vector? donate))]
+            (throw (ex-info "aggregate field donation requires per-field ownership support"
+                            {:reason :compiled-field-selector-intent :selector selector :intent :donated})))
         _ (when (some aggregate-leaves (concat donate outputs taps))
             (throw (ex-info "aggregate donation and aggregate outputs require per-field ownership support"
                             {:reason :compiled-aggregate-output :aggregates (set (keys aggregate-leaves))})))
-        expand (fn [symbol] (if-let [leaves (get aggregate-leaves symbol)]
-                             (filterv #(contains? (get-in raw-plan [:attributes :public-buffer-bindings]) %)
-                                      (mapv :symbol leaves)) [symbol]))
-        constants (vec (mapcat expand constants))
-        roles (into {} (mapcat (fn [[symbol role]] (map #(vector % role) (expand symbol))) roles))
+        field-intent (resolve-equation-first-field-intent
+                      projection (get-in raw-plan [:attributes :public-buffer-bindings]) constants roles)
+        constants (:constants field-intent)
+        roles (:roles field-intent)
         attributes (:attributes raw-plan)
         public-bindings (:public-buffer-bindings attributes)
         public-defaults (:public-buffer-roles attributes)
@@ -1007,6 +1053,9 @@
   (case compiler
     :resident-descriptor
     (do
+      (when-let [selector (first (filter vector? (concat (:constants opts) (keys (:roles opts)))))]
+        (throw (ex-info "aggregate field intent requires the equation-first compiler"
+                        {:reason :compiled-field-selector-compiler :selector selector})))
       (when (contains? opts :scalar-math)
         (throw (ex-info "scalar math intent requires the equation-first vertical"
                         {:reason :compiled-resident-math-request})))

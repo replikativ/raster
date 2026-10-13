@@ -121,6 +121,43 @@
           (is (= (mapv float (range 17)) (vec (value/->host (:result result))))))
         (finally (compiled/close! program))))))
 
+(defn- run-field-intent-device [target]
+  (let [initial (state 1.0)
+        prepared (compiled/lower #'project-state! [initial (float-array 17) 17]
+                                 {:compiler :equation-first :target target :dtype :float
+                                  :constants [[:state :labels]]
+                                  :roles {[:state :positions] :input}})
+        entries (into {} (map (juxt :key :role)) (:in-tree prepared))
+        artifact (compiled/instantiate! prepared)]
+    (try
+      (is (= :constant (get entries [:state :labels])))
+      (is (= :input (get entries [:state :positions])))
+      ;; The initializer was copied during instantiation. Changing its host contents must not
+      ;; turn a captured field into an implicit per-replay input.
+      (java.util.Arrays/fill ^ints (.-labels initial) (int 900))
+      (doseq [offset [1.0 -2.0]]
+        (let [changed (state offset)
+              actual (value/->host (:result (artifact {[:state :positions] (.-positions changed)})))]
+          (is (= (oracle changed) (vec actual)))))
+      (is (= :compiled-aggregate-input-role
+             (reason #(artifact {:state initial}))))
+      (is (= :compiled-field-selector-compiler
+             (reason #(compiled/lower #'project-state! [initial (float-array 17) 17]
+                                     {:target target :dtype :float :constants [[:state :labels]]}))))
+      (is (= :compiled-aggregate-write
+             (reason #(compiled/lower #'write-state! [initial 17]
+                                     {:compiler :equation-first :target target :dtype :float
+                                      :roles {[:state :positions] :state}}))))
+      (finally (compiled/close! artifact)))))
+
+(deftest public-field-intent-preserves-resident-readonly-contracts
+  (if @ze/gpu-available?
+    (run-field-intent-device :ze:0)
+    (ze/gpu-skip! "per-field readonly intent on Level Zero"))
+  (if @opencl/opencl-available?
+    (run-field-intent-device :ocl:0)
+    (opencl/opencl-skip! "per-field readonly intent on OpenCL")))
+
 (deftest public-aggregate-on-opencl
   (if @opencl/opencl-available? (run-device :ocl:0)
       (opencl/opencl-skip! "public-aggregate-opencl")))
