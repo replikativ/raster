@@ -251,6 +251,53 @@
        :values {'time-buffer (av/tensor {:dtype :long
                                         :shape [(list 'extent 'time-buffer)]})}})))))
 
+(defn- canonical-double-pow-call [base exponent]
+  (with-meta (list '.invk 'raster.numeric/pow_m_double_double-impl base exponent)
+    {:raster.op/original 'raster.numeric/pow
+     :raster.op/resolved-callee 'raster.numeric/pow
+     :raster.type/tag 'double :tag 'double}))
+
+(defn- ordered-island-program
+  ([] (ordered-island-program {}))
+  ([{:keys [n] :or {n 'n}}]
+   (first
+    (fusion/fusion-fixpoint
+     (frontend/form->program
+      `(let* [~'clock-value (clojure.core/long (clojure.core/aget ~'time-buffer 0))
+              ~'gap (raster.par/map-void! ~'i ~n
+                      (clojure.core/aset ~'scratch ~'i
+                        (clojure.core/float
+                         (clojure.core/+ (clojure.core/aget ~'scratch ~'i) 1.0))))
+              ~(with-meta 'beta-checkpoint {:tag 'double}) (clojure.core/double ~'beta)
+              ~(with-meta 'powered {:tag 'double})
+              (clojure.core/double
+               ~(canonical-double-pow-call
+                 '(clojure.core/double beta-checkpoint)
+                 '(clojure.core/double clock-value)))
+              ~(with-meta 'checkpoint {:tag 'float}) (clojure.core/float ~'powered)
+              ~'effect-a (raster.par/map-void! ~'i ~n
+                          (clojure.core/aset ~'out-a ~'i
+                            (clojure.core/float
+                             (clojure.core/+ (clojure.core/aget ~'out-a ~'i) ~'powered))))
+              ~'effect-b (raster.par/map-void! ~'i ~n
+                          (clojure.core/aset ~'out-b ~'i
+                            (clojure.core/float
+                             (clojure.core/- (clojure.core/aget ~'out-b ~'i)
+                                             ~'checkpoint))))]
+         [~'gap ~'effect-a ~'effect-b])
+      {:dtype :float
+       :array-types {'time-buffer :long 'scratch :float 'out-a :float 'out-b :float}
+       :scalar-types (cond-> {'beta :double} (symbol? n) (assoc n :long))
+       :values {'time-buffer (av/tensor {:dtype :long
+                                        :shape [(list 'extent 'time-buffer)]})}})))))
+
+(defn- generated-stage [program pass]
+  (some (fn [equation]
+          (when (= pass (get-in (dialect/facts program)
+                                [:equations (second equation) :provenance :pass]))
+            equation))
+        (dialect/equations program)))
+
 (defn- singleton-map-equation [program]
   (some (fn [equation]
           (let [{:keys [kind attributes]} (fusion/equation-info equation)]
@@ -338,6 +385,101 @@
                   (remove #(= (:id info) (:id %)) terminal-infos))
           "the singleton producer remains before every consumer when terminal extents are zero")
       (is (= result (dialect/validate! result))))))
+
+(deftest ordered-uniform-scalar-islands-preserve-gaps-and-stage-each-island-once
+  (doseq [n ['n 0]]
+    (let [program (ordered-island-program {:n n})
+          original-facts (dialect/facts program)
+          original-position (into {} (map-indexed (fn [i equation] [(second equation) i]))
+                                  (dialect/equations program))
+          original-info (mapv fusion/equation-info (dialect/equations program))
+          original-root (some #(when (some #{'clock-value} (:results %)) %) original-info)
+          original-gap (some #(when (= 'gap (get-in original-facts
+                                                     [:equations (:id %) :attributes
+                                                      :host-binding])) %)
+                             original-info)
+          original-beta (some #(when (some #{'beta-checkpoint} (:results %)) %) original-info)
+          original-island (filterv #(some #{'powered 'checkpoint} (:results %)) original-info)
+          [result stats] (resident/inline-uniform-input-loads program)
+          facts (dialect/facts result)
+          root-equation (generated-stage result :ordered-uniform-scalar-root)
+          island-equation (generated-stage result :ordered-uniform-scalar-island)
+          root-info (fusion/equation-info root-equation)
+          island-info (fusion/equation-info island-equation)
+          root-buffer (first (:results root-info))
+          root-capture-index (.indexOf ^java.util.List (:captures island-info) root-buffer)
+          root-parameter (nth (:parameters island-info) root-capture-index)
+          frontier (vec (:results island-info))
+          positions (into {} (map-indexed (fn [i equation] [(second equation) i]))
+                          (dialect/equations result))
+          certificate (get-in facts [:attributes :resident-uniform-input-scalar-closures 0])
+          root-constituents (get-in facts [:equations (:id root-info)
+                                           :attributes :fusion/constituents])
+          island-constituents (get-in facts [:equations (:id island-info)
+                                             :attributes :fusion/constituents])]
+      (is (= 1 (:resident-uniform-input-closures stats)))
+      (is (= 1 (:resident-uniform-input-scalar-islands stats)))
+      (is (= 3 (:resident-uniform-input-scalars stats)))
+      (is (= ['time-buffer] (:captures root-info)))
+      (is (= 1 (count (:locals root-info))))
+      (is (= 2 (count (:locals island-info))))
+      (is (some #{'beta-checkpoint} (:captures island-info))
+          "the late map captures, but does not duplicate, the certified host scalar prefix")
+      (is (some #{(list 'clojure.core/aget root-parameter 0)}
+                (tree-seq coll? seq (mapv :init (:locals island-info))))
+          "the late stage explicitly reads the earlier private singleton buffer")
+      (is (= #{(:id original-root)} (set (keys root-constituents))))
+      (is (= (set (map :id original-island)) (set (keys island-constituents))))
+      (is (< (positions (:id root-info)) (positions (:id original-gap))
+             (positions (:id island-info)))
+          "the unrelated effect gap remains between its two original scalar islands")
+      (is (= (original-position (:id original-gap)) (positions (:id original-gap)))
+          "the first stage replaces one equation and does not move the gap")
+      (is (= (original-position (:id original-beta)) (positions (:id original-beta))))
+      (is (= :double (get-in facts [:values 'beta-checkpoint :dtype])))
+      (is (= [root-buffer] (:root-frontier certificate)))
+      (is (= (set frontier) (set (:frontier certificate))))
+      (is (= [:root :island] (mapv :kind (:stages certificate))))
+      (doseq [value (conj frontier root-buffer)]
+        (is (= [1] (get-in facts [:values value :shape]))))
+      (doseq [old '[clock-value powered checkpoint]]
+        (is (nil? (get-in facts [:values old]))))
+      (is (some #(= 'gap (get-in facts [:equations (second %) :attributes :host-binding]))
+                (dialect/equations result)))
+      (is (= result (dialect/validate! result))))))
+
+(deftest ordered-uniform-island-lowering-keeps-both-singleton-buffer-contracts
+  (let [[program _] (resident/inline-uniform-input-loads (ordered-island-program {:n 0}))
+        equations [(generated-stage program :ordered-uniform-scalar-root)
+                   (generated-stage program :ordered-uniform-scalar-island)]
+        facts (dialect/facts program)]
+    (doseq [equation equations]
+      (let [info (fusion/equation-info equation)
+            equation-id (:id info)
+            ids (concat (:captures info) (:results info))
+            values (select-keys (:values facts) ids)
+            stage (dialect/make
+                   (-> facts
+                       (assoc :values values :inputs (vec (:captures info))
+                              :equations {equation-id (get-in facts [:equations equation-id])}
+                              :effects #{})
+                       (assoc :attributes {}))
+                   [equation] (:results info))
+            operation (first (soac-lower/lower-typed-map stage :ocl:0 :dtype :float))
+            array-types (into {} (keep (fn [[id value]]
+                                         (when (seq (:shape value)) [id (:dtype value)]))) values)
+            scalar-types (into {} (keep (fn [[id value]]
+                                          (when (empty? (:shape value)) [id (:dtype value)]))) values)
+            artifact (segop-opencl/generate-scheduled-segmap-kernel
+                      operation :array-types array-types :scalar-types scalar-types)
+            kernel (get-in artifact [:attributes :kernel-body])
+            parameters (into {} (map (juxt :id identity)) (:parameters kernel))
+            stable (set (get-in info [:attributes :attributes :stable-array-captures]))]
+        (is (= 1 (get-in info [:attributes :extent])))
+        (is (seq stable))
+        (doseq [capture stable]
+          (is (= [1] (:shape (parameters capture)))
+              "each staged buffer read carries the exact one-element ABI footprint"))))))
 
 (deftest singleton-map-lowering-derives-the-existing-one-element-capacity-contract
   (let [program (uniform-clock-program {:n 0})
@@ -582,6 +724,134 @@
     (is (every? #(some (set (nth % 2)) '[left right])
                 (take 2 (dialect/equations result))))))
 
+(deftest ordered-island-refuses-an-asymmetric-second-exact-root
+  (let [program
+        (first
+         (fusion/fusion-fixpoint
+          (frontend/form->program
+           '(let* [left (clojure.core/long (clojure.core/aget first-clock 0))
+                   limit (clojure.core/long (clojure.core/aget second-clock 0))
+                   gap (raster.par/map-void! i limit
+                         (clojure.core/aset scratch i
+                           (clojure.core/float
+                            (clojure.core/+ (clojure.core/aget scratch i) 1.0))))
+                   step (clojure.core/double
+                         (clojure.core/+ (clojure.core/double left)
+                                         (clojure.core/double bias)))
+                   effect-a (raster.par/map-void! i n
+                              (clojure.core/aset out-a i
+                                (clojure.core/float
+                                 (clojure.core/+ (clojure.core/aget out-a i) step))))
+                   effect-b (raster.par/map-void! i n
+                              (clojure.core/aset out-b i
+                                (clojure.core/float
+                                 (clojure.core/+ (clojure.core/aget out-b i) step))))]
+              [gap effect-a effect-b])
+           {:dtype :float
+            :array-types {'first-clock :long 'second-clock :long
+                          'scratch :float 'out-a :float 'out-b :float}
+            :scalar-types {'n :long 'bias :double}
+            :values {'first-clock (av/tensor
+                                   {:dtype :long :shape '[(extent first-clock)]})
+                     'second-clock (av/tensor
+                                    {:dtype :long :shape '[(extent second-clock)]})}})))
+        _fixture (is (some? program) "asymmetric-root fixture must enter TypedSOAC")
+        [result stats] (when program (resident/inline-uniform-input-loads program))]
+    (is (zero? (:resident-uniform-input-closures stats)))
+    (is (= program result)
+        "an unsupported second exact root participates in multiplicity and blocks the transaction")))
+
+(deftest ordered-island-refuses-public-host-and-device-produced-scalar-dependencies
+  (let [program (ordered-island-program)
+        facts (dialect/facts program)
+        equations (dialect/equations program)
+        candidates
+        [[:public (dialect/make facts equations ['powered])]
+         [:host-read
+          (dialect/make (assoc-in facts [:attributes :host-read-values] ['powered])
+                        equations (dialect/outputs program))]]]
+    (doseq [[label candidate] candidates]
+      (let [[result stats] (#'resident/materialize-uniform-scalar-closure candidate)]
+        (is (zero? (:resident-uniform-input-closures stats)) (name label))
+        (is (= candidate result) (name label))))
+    (let [device-prefix
+          (first
+           (fusion/fusion-fixpoint
+            (frontend/form->program
+             '(let* [clock-value (clojure.core/long
+                                  (clojure.core/aget time-buffer 0))
+                     prior (raster.par/reduce acc (clojure.core/float 0.0) i n
+                             (clojure.core/+ (clojure.core/float acc)
+                                             (clojure.core/aget x i)))
+                     gap (raster.par/map-void! i n
+                           (clojure.core/aset scratch i
+                             (clojure.core/float
+                              (clojure.core/+ (clojure.core/aget scratch i) 1.0))))
+                     ^double step (clojure.core/double
+                                   (clojure.core/+ (clojure.core/double clock-value)
+                                                   (clojure.core/double prior)))
+                     effect-a (raster.par/map-void! i n
+                                (clojure.core/aset out-a i
+                                  (clojure.core/float
+                                   (clojure.core/+ (clojure.core/aget out-a i) step))))
+                     effect-b (raster.par/map-void! i n
+                                (clojure.core/aset out-b i
+                                  (clojure.core/float
+                                   (clojure.core/+ (clojure.core/aget out-b i) step))))]
+                [gap effect-a effect-b])
+             {:dtype :float
+              :array-types {'time-buffer :long 'x :float 'scratch :float
+                            'out-a :float 'out-b :float}
+              :scalar-types {'n :long}
+              :values {'time-buffer (av/tensor
+                                     {:dtype :long :shape '[(extent time-buffer)]})}})))
+          _fixture (is (some? device-prefix) "device-prefix fixture must enter TypedSOAC")
+          [result stats] (when device-prefix
+                           (resident/inline-uniform-input-loads device-prefix))]
+      (is (zero? (:resident-uniform-input-closures stats)))
+      (is (= device-prefix result)
+          "a scalar-looking capture backed by a reduction is not a retained host prefix"))))
+
+(deftest ordered-island-refuses-two-dependent-scalar-islands
+  (let [program
+        (first
+         (fusion/fusion-fixpoint
+          (frontend/form->program
+           '(let* [clock-value (clojure.core/long (clojure.core/aget time-buffer 0))
+                   gap-a (raster.par/map-void! i n
+                           (clojure.core/aset scratch i
+                             (clojure.core/float
+                              (clojure.core/+ (clojure.core/aget scratch i) 1.0))))
+                   first-step (clojure.core/double
+                               (clojure.core/+ (clojure.core/double clock-value)
+                                               (clojure.core/double bias)))
+                   effect-a (raster.par/map-void! i n
+                              (clojure.core/aset out-a i
+                                (clojure.core/float
+                                 (clojure.core/+ (clojure.core/aget out-a i) first-step))))
+                   gap-b (raster.par/map-void! i n
+                           (clojure.core/aset scratch i
+                             (clojure.core/float
+                              (clojure.core/+ (clojure.core/aget scratch i) 1.0))))
+                   second-step (clojure.core/double
+                                (clojure.core/* (clojure.core/double clock-value)
+                                                (clojure.core/double bias)))
+                   effect-b (raster.par/map-void! i n
+                              (clojure.core/aset out-b i
+                                (clojure.core/float
+                                 (clojure.core/+ (clojure.core/aget out-b i) second-step))))]
+              [gap-a effect-a gap-b effect-b])
+           {:dtype :float
+            :array-types {'time-buffer :long 'scratch :float 'out-a :float 'out-b :float}
+            :scalar-types {'n :long 'bias :double}
+            :values {'time-buffer (av/tensor
+                                   {:dtype :long :shape '[(extent time-buffer)]})}})))
+        _fixture (is (some? program) "multi-island fixture must enter TypedSOAC")
+        [result stats] (when program (resident/inline-uniform-input-loads program))]
+    (is (zero? (:resident-uniform-input-closures stats)))
+    (is (= program result)
+        "dependent scalar blocks separated by device equations are not merged or reordered")))
+
 (deftest singleton-stage-private-ids-share-one-collision-proof
   (let [reserved '#{uniform-index__uniform_scalar_buffer_0
                     clock-value__uniform_scalar_buffer_0}
@@ -590,6 +860,43 @@
     (is (= 'uniform-index__uniform_scalar_buffer_1 index))
     (is (= 'clock-value__uniform_scalar_buffer_1 frontier))
     (is (not= index frontier))))
+
+(deftest singleton-stage-capture-descriptors-are-complete-and-type-preserving
+  (let [program (ordered-island-program)
+        facts (dialect/facts program)
+        infos (mapv fusion/equation-info (dialect/equations program))
+        root-info (some #(when (some #{'clock-value} (:results %)) %) infos)
+        powered-info (some #(when (some #{'powered} (:results %)) %) infos)
+        root-stage {:infos [root-info] :frontier ['clock-value]
+                    :equations #{(:id root-info)} :pass :test}
+        island-stage {:infos [powered-info] :frontier ['powered]
+                      :equations #{(:id powered-info)} :pass :test}
+        ordinary {:logical 'beta-checkpoint :value 'beta-checkpoint :load? false}
+        load {:logical 'clock-value :value 'clock-buffer :load? true}
+        long-buffer {'clock-buffer (av/tensor {:dtype :long :shape [1]})}
+        build-root (fn [descriptors]
+                     (#'resident/singleton-scalar-stage
+                      facts (assoc root-stage :capture-descriptors descriptors
+                                   :stable-captures #{'time-buffer}) #{}))
+        build-island
+        (fn [facts descriptor stable values]
+          (#'resident/singleton-scalar-stage
+           facts (assoc island-stage :capture-descriptors [ordinary descriptor]
+                        :stable-captures stable :capture-values values) #{}))]
+    (is (thrown? clojure.lang.ExceptionInfo (build-root [])))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (build-root [{:logical 'time-buffer :value 'time-buffer :load? false}
+                              {:logical 'time-buffer :value 'time-buffer :load? false}])))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (build-root [{:logical 'time-buffer :value 'other :load? false}])))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (build-island facts load #{} long-buffer)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (build-island facts load #{'clock-buffer}
+                               {'clock-buffer (av/tensor {:dtype :float :shape [1]})})))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (build-island (assoc-in facts [:values 'clock-value :shape] [1])
+                               load #{'clock-buffer} long-buffer)))))
 
 (deftest result-transform-integral-casts-state-their-rounding
   (doseq [source [:int :long] target [:float :double]]

@@ -63,6 +63,19 @@
                       (float eps) adam-t)
     (double (clojure.core/nth vg 0))))
 
+(deftm joint-clipped-lora-adam-buffered-step
+  "The same training step, with the ordinary resident clock input changed between calls."
+  [A :- (Array float) B :- (Array float)
+   mA :- (Array float) vA :- (Array float)
+   mB :- (Array float) vB :- (Array float)
+   x :- (Array float) tgt :- (Array float)
+   rows :- Long in :- Long r :- Long out :- Long
+   max-grad-norm :- Double lr :- Double
+   beta1 :- Double beta2 :- Double eps :- Double time-buffer :- (Array long)] :- Double
+  (joint-clipped-lora-adam-step
+   A B mA vA mB vB x tgt rows in r out max-grad-norm lr beta1 beta2 eps
+   (arrays/aget time-buffer 0)))
+
 (defn inputs
   "Fresh arrays each time. Both adapters are nonzero, so both gradients are exercised."
   ([] (inputs 0))
@@ -132,23 +145,23 @@
            :B (float-array (map #(- (double %1) (* (double (float lr)) %2)) B dB)))))
 
 (defn joint-clipped-adam-oracle
-  "Independent real-arithmetic one-step oracle over the coordinate derivatives above. The final
+  "Independent real-arithmetic recurrence over the coordinate derivatives above. The final
    arrays are rounded to their declared Float storage; no Raster AD, clipping, or optimizer code
    participates."
-  [{:keys [A B max-grad-norm lr beta1 beta2 eps adam-t] :as input}]
+  [{:keys [A B mA vA mB vB max-grad-norm lr beta1 beta2 eps adam-t] :as input}]
   (let [{:keys [loss dA dB]} (oracle input)
         norm (Math/sqrt (+ (reduce + 0.0 (map #(* % %) dA))
                            (reduce + 0.0 (map #(* % %) dB))))
-        scale (min 1.0 (/ max-grad-norm norm))
+        scale (if (zero? norm) 1.0 (min 1.0 (/ max-grad-norm norm)))
         bc1 (- 1.0 (Math/pow beta1 adam-t))
         bc2 (- 1.0 (Math/pow beta2 adam-t))
         update
-        (fn [parameters gradients]
-          (let [moments (mapv (fn [gradient]
+        (fn [parameters gradients previous-m previous-v]
+          (let [moments (mapv (fn [gradient old-m old-v]
                                 (let [g (* scale gradient)]
-                                  [(* (- 1.0 beta1) g)
-                                   (* (- 1.0 beta2) g g)]))
-                              gradients)]
+                                  [(+ (* beta1 (double old-m)) (* (- 1.0 beta1) g))
+                                   (+ (* beta2 (double old-v)) (* (- 1.0 beta2) g g))]))
+                              gradients previous-m previous-v)]
             {:parameters
              (float-array
               (map (fn [parameter [m v]]
@@ -157,8 +170,8 @@
                    parameters moments))
              :m (float-array (map first moments))
              :v (float-array (map second moments))}))
-        a (update A dA)
-        b (update B dB)]
+        a (update A dA mA vA)
+        b (update B dB mB vB)]
     {:loss loss :gradient-norm norm :scale scale
      :A (:parameters a) :mA (:m a) :vA (:v a)
      :B (:parameters b) :mB (:m b) :vB (:v b)}))

@@ -657,13 +657,46 @@
       {:root root :infos scalar-infos :values scalar-values :equations scalar-equations
        :frontier frontier :terminal-equations (set (map #(get-in % [1 :equation]) terminal-sites))})))
 
-(defn- singleton-closure-map
-  [facts closure reserved]
-  (let [{:keys [root infos frontier]} closure
-        root-info (first infos)
-        external-captures
+(defn- singleton-scalar-stage
+  "Build one extent-one typed stage without deciding which scalar equations may be staged.
+
+   Capture descriptors map each original logical capture to its physical stage value. `:load?`
+   introduces the sole certified singleton-buffer read; ordinary scalar inputs remain parameters.
+   Placement facts and constituents belong only to this stage's removed equations."
+  [facts {:keys [infos frontier equations capture-descriptors capture-values
+                 stable-captures pass] :as stage}
+   reserved]
+  (let [root-info (first infos)
+        internal-values (set (mapcat :results infos))
+        external-logicals
         (vec (distinct (mapcat (fn [info]
-                                (remove (:values closure) (:captures info))) infos)))
+                                 (remove internal-values (:captures info))) infos)))
+        descriptor-by-logical (into {} (map (juxt :logical identity)) capture-descriptors)
+        _descriptor-coverage
+        (when-not (and (= (count capture-descriptors) (count descriptor-by-logical))
+                       (= (set external-logicals) (set (keys descriptor-by-logical))))
+          (throw (ex-info "singleton scalar stage requires one exact capture descriptor"
+                          {:reason :uniform-scalar-stage-capture-descriptors
+                           :expected external-logicals
+                           :actual (mapv :logical capture-descriptors)})))
+        descriptors (mapv descriptor-by-logical external-logicals)
+        certified-values (merge (:values facts) capture-values)
+        _load-authority
+        (doseq [{:keys [logical value load?] :as descriptor} descriptors]
+          (let [logical-value (get certified-values logical)
+                physical-value (get certified-values value)]
+            (when-not
+             (if load?
+               (and (contains? stable-captures value)
+                    (exact-plain-tensor? logical-value [])
+                    (exact-plain-tensor? physical-value [1])
+                    (= (dtype/canon (:dtype logical-value))
+                       (dtype/canon (:dtype physical-value))))
+               (= logical value))
+              (throw (ex-info "singleton capture descriptor lacks exact value authority"
+                              {:reason :uniform-scalar-stage-capture-authority
+                               :descriptor descriptor})))))
+        external-captures (vec (distinct (map :value descriptors)))
         [index reserved] (allocate-private-id reserved 'uniform-index 0)
         [capture-parameters reserved]
         (reduce (fn [[parameters reserved] [ordinal capture]]
@@ -673,12 +706,20 @@
                                              ordinal)]
                     [(conj parameters parameter) reserved]))
                 [[] reserved] (map-indexed vector external-captures))
-        [frontier-map _reserved]
+        [frontier-map reserved-after-frontier]
         (reduce (fn [[mapping reserved] [ordinal value]]
                   (let [[id reserved] (allocate-private-id reserved value ordinal)]
                     [(assoc mapping value id) reserved]))
                 [{} reserved] (map-indexed vector frontier))
-        external-substitutions (zipmap external-captures capture-parameters)
+        parameter-by-value (zipmap external-captures capture-parameters)
+        external-substitutions
+        (into {}
+              (map (fn [{:keys [logical value load?]}]
+                     (let [parameter (get parameter-by-value value)]
+                       [logical (if load?
+                                  (list 'clojure.core/aget parameter 0)
+                                  parameter)])))
+              descriptors)
         locals
         (mapv (fn [info]
                 (let [result (first (:results info))
@@ -692,18 +733,19 @@
               infos)
         results (mapv frontier-map frontier)
         attributes {:index index :extent 1
-                    :attributes {:stable-array-captures [(:array root)]}}
+                    :attributes {:stable-array-captures
+                                 (vec (filter stable-captures external-captures))}}
         operation (list 'map attributes [] external-captures
                         (dialect/lambda-form capture-parameters
                                              (dialect/emit-locals locals)
                                              frontier))
         equation (list '= (:id root-info) results operation)
-        old-facts (select-keys (:equations facts) (:equations closure))
+        old-facts (select-keys (:equations facts) equations)
         root-equation-facts (get-in facts [:equations (:id root-info)])
         equation-facts
         (-> root-equation-facts
             (assoc :effects #{} :aliases {})
-            (update :provenance assoc :pass :uniform-input-scalar-closure)
+            (update :provenance assoc :pass pass)
             (update :attributes dissoc :result-storage :host-binding :host-bindings)
             (assoc-in [:attributes :fusion/constituents] old-facts))
         values
@@ -713,7 +755,244 @@
                                       :shape [1]})]))
               (map (fn [old] [old (frontier-map old)]) frontier))]
     {:equation equation :equation-facts equation-facts :values values
-     :frontier-map frontier-map :external-captures external-captures}))
+     :frontier-map frontier-map :external-captures external-captures
+     :stage stage :reserved reserved-after-frontier}))
+
+(defn- singleton-closure-map
+  [facts closure reserved]
+  (let [external-logicals
+        (vec (distinct (mapcat (fn [info]
+                                (remove (:values closure) (:captures info)))
+                              (:infos closure))))]
+    (singleton-scalar-stage
+     facts
+     (assoc closure
+            :capture-descriptors
+            (mapv (fn [logical] {:logical logical :value logical :load? false})
+                  external-logicals)
+            :stable-captures #{(get-in closure [:root :array])}
+            :pass :uniform-input-scalar-closure)
+     reserved)))
+
+(defn- retained-host-scalar-prefix?
+  "Prove that `value` is an already evaluated host scalar, without importing its producer.
+
+   The recursive dependency graph must terminate at exact scalar program inputs. Every produced
+   value has one prior pristine scalar producer and every edge is source-order dominated. This
+   excludes rank-one reads, reductions, device equations, storage and dependencies on either
+   scalar stage while leaving the certified host prefix in its original evaluate-once position."
+  [facts producers position-by-id outputs host-reads forbidden value consumer-position]
+  (let [inputs (set (:inputs facts))]
+    (letfn [(eligible? [value consumer-position pending]
+              (let [actual (get-in facts [:values value])
+                    producer-pairs (get producers value)
+                    producer (second (first producer-pairs))]
+                (and (exact-plain-tensor? actual [])
+                     (not (contains? forbidden value))
+                     (not (contains? outputs value))
+                     (not (contains? host-reads value))
+                     (not (contains? pending value))
+                     (or (contains? inputs value)
+                         (and (= 1 (count producer-pairs))
+                              producer
+                              (= :scalar (:kind producer))
+                              (< (get position-by-id (:id producer) Long/MAX_VALUE)
+                                 consumer-position)
+                              (pristine-scalar-equation? facts producer false)
+                              (every? #(eligible?
+                                        % (get position-by-id (:id producer))
+                                        (conj pending value))
+                                      (:captures producer)))))))]
+      (eligible? value consumer-position #{}))))
+
+(defn- rebuild-uniform-scalar-stages
+  "Atomically replace audited scalar stages and rewrite only their certified terminal captures."
+  [program infos stages generated certificate stats]
+  (let [facts (dialect/facts program)
+        outputs (set (dialect/outputs program))
+        removed-equations (apply set/union (map :equations stages))
+        removed-values (apply set/union (map :values stages))
+        terminal-equations (apply set/union (map :terminal-equations stages))
+        generated-by-id (into {} (map (fn [item]
+                                        [(get-in item [:stage :infos 0 :id]) item]))
+                              generated)
+        replacements (apply merge (map :frontier-map generated))
+        stable-frontiers (set (vals replacements))
+        values (merge (apply dissoc (:values facts) removed-values)
+                      (apply merge (map :values generated)))
+        rewritten
+        (->> infos
+             (keep (fn [info]
+                     (if-let [item (get generated-by-id (:id info))]
+                       (:equation item)
+                       (cond
+                         (contains? removed-equations (:id info)) nil
+                         (contains? terminal-equations (:id info))
+                         (emit-equation
+                          (rewrite-lambda-captures
+                           info values
+                           (into {}
+                                 (map (fn [[old new]]
+                                        [old (list 'clojure.core/aget new 0)]))
+                                 replacements)
+                           stable-frontiers))
+                         :else (emit-equation info)))))
+             vec)
+        equation-ids (set (map second rewritten))
+        definitions (set (mapcat #(nth % 2) rewritten))
+        references (set (mapcat (fn [equation]
+                                  (cond-> (dialect/operation-inputs equation)
+                                    (dialect/value-id? (dialect/operation-extent equation))
+                                    (conj (dialect/operation-extent equation))))
+                                rewritten))
+        storage (set (mapcat (fn [equation]
+                               (map :destination
+                                    (or (dialect/result-storage facts (second equation)) [])))
+                             rewritten))
+        live-values (set/union definitions references storage outputs)
+        equation-facts
+        (-> (apply dissoc (:equations facts) removed-equations)
+            (merge (into {} (map (fn [item]
+                                   [(get-in item [:stage :infos 0 :id])
+                                    (:equation-facts item)]))
+                         generated))
+            (select-keys equation-ids))
+        new-facts
+        (-> facts
+            (assoc :values (select-keys values live-values)
+                   :inputs (vec (sort-by pr-str (set/difference references definitions))))
+            (assoc :equations equation-facts)
+            (assoc :effects (reduce set/union #{} (map :effects (vals equation-facts))))
+            (assoc-in [:attributes :resident-uniform-input-scalar-closures] certificate))
+        result (dialect/make new-facts rewritten (dialect/outputs program))]
+    [(dialect/validate! result) stats]))
+
+(defn- ordered-uniform-scalar-islands
+  "Recognize exactly one late contiguous scalar island depending on an earlier uniform root.
+
+   The equations between root and island are never moved or absorbed. External scalar captures
+   are either program inputs or uniquely produced by an earlier pristine scalar equation; their
+   producers stay in place."
+  [facts infos uses position-by-id outputs host-reads root]
+  (let [root-info (:info root)
+        root-value (:result root)
+        root-position (get position-by-id (:id root-info))
+        producers
+        (group-by first
+                  (mapcat (fn [info]
+                            (map (fn [result] [result info]) (:results info)))
+                          infos))
+        dependent-infos
+        (loop [remaining (subvec infos (inc root-position)) known #{root-value} result []]
+          (if-let [info (first remaining)]
+            (if (and (= :scalar (:kind info)) (some known (:captures info)))
+              (recur (subvec remaining 1) (into known (:results info)) (conj result info))
+              (recur (subvec remaining 1) known result))
+            result))
+        island-values (set (mapcat :results dependent-infos))
+        island-equations (set (map :id dependent-infos))
+        positions (mapv #(get position-by-id (:id %)) dependent-infos)
+        island-position (first positions)
+        contiguous? (and (seq positions)
+                         (= positions (vec (range island-position
+                                                  (+ island-position (count positions))))))
+        info-by-id (into {} (map (juxt :id identity)) infos)
+        producer-position (into {}
+                                (mapcat (fn [info]
+                                          (map (fn [result]
+                                                 [result (get position-by-id (:id info))])
+                                               (:results info))))
+                                infos)
+        scalar-site?
+        (fn [[value {:keys [equation role]}]]
+          (and (= :capture role)
+               (contains? island-equations equation)
+               (< (get producer-position value Long/MAX_VALUE)
+                  (get position-by-id equation -1))))
+        terminal-site?
+        (fn [[value {:keys [equation role]}]]
+          (and (= :capture role)
+               (contains? #{:map :effect-map} (:kind (get info-by-id equation)))
+               (< (get producer-position value Long/MAX_VALUE)
+                  (get position-by-id equation -1))))
+        root-sites (get uses root-value [])
+        island-sites (mapcat #(get uses % []) island-values)
+        terminal-sites (filter terminal-site? island-sites)
+        frontier (->> island-values
+                      (filter #(some terminal-site? (get uses % [])))
+                      (sort-by producer-position) vec)
+        external-captures
+        (set (mapcat (fn [info]
+                       (remove #(or (= root-value %) (contains? island-values %))
+                               (:captures info)))
+                     dependent-infos))
+        forbidden-prefix-values (conj island-values root-value)
+        eligible-external?
+        (fn [value]
+          (retained-host-scalar-prefix?
+           facts producers position-by-id outputs host-reads forbidden-prefix-values
+           value island-position))]
+    (when (and contiguous?
+               (< (inc root-position) island-position)
+               (every? #(pristine-scalar-equation? facts % false) dependent-infos)
+               (every? #(exact-plain-tensor? (get-in facts [:values (first (:results %))]) [])
+                       dependent-infos)
+               (not-any? outputs island-values)
+               (not-any? host-reads island-values)
+               (seq root-sites)
+               (every? scalar-site? root-sites)
+               (seq terminal-sites)
+               (every? #(or (scalar-site? %) (terminal-site? %)) island-sites)
+               (every? eligible-external? external-captures))
+      {:root root
+       :root-stage {:root root :infos [root-info] :values #{root-value}
+                    :equations #{(:id root-info)} :frontier [root-value]
+                    :terminal-equations #{}}
+       :island-stage {:root root :infos dependent-infos :values island-values
+                      :equations island-equations :frontier frontier
+                      :terminal-equations
+                      (set (map #(get-in % [1 :equation]) terminal-sites))}
+       :external-captures external-captures})))
+
+(defn- materialize-ordered-uniform-scalar-islands
+  [program infos candidate reserved]
+  (let [facts (dialect/facts program)
+        root-stage
+        (assoc (:root-stage candidate)
+               :capture-descriptors
+               [{:logical (get-in candidate [:root :array])
+                 :value (get-in candidate [:root :array]) :load? false}]
+               :stable-captures #{(get-in candidate [:root :array])}
+               :pass :ordered-uniform-scalar-root)
+        root-generated (singleton-scalar-stage facts root-stage reserved)
+        root-value (get-in candidate [:root :result])
+        root-buffer (get (:frontier-map root-generated) root-value)
+        island-stage
+        (assoc (:island-stage candidate)
+               :capture-descriptors
+               (into [{:logical root-value :value root-buffer :load? true}]
+                     (map (fn [value] {:logical value :value value :load? false}))
+                     (sort-by pr-str (:external-captures candidate)))
+               :stable-captures #{root-buffer}
+               :capture-values (:values root-generated)
+               :pass :ordered-uniform-scalar-island)
+        island-generated
+        (singleton-scalar-stage facts island-stage (:reserved root-generated))
+        stages [root-stage island-stage]
+        generated [root-generated island-generated]
+        terminal-frontier (mapv (:frontier-map island-generated) (:frontier island-stage))]
+    (rebuild-uniform-scalar-stages
+     program infos stages generated
+     [{:root root-value :input (get-in candidate [:root :array])
+       :root-frontier [root-buffer] :frontier terminal-frontier
+       :stages [{:kind :root :equation (get-in root-stage [:infos 0 :id])
+                 :frontier [root-buffer]}
+                {:kind :island :equation (get-in island-stage [:infos 0 :id])
+                 :frontier terminal-frontier}]}]
+     {:resident-uniform-input-closures 1
+      :resident-uniform-input-scalar-islands 1
+      :resident-uniform-input-scalars
+      (+ (count (:values root-stage)) (count (:values island-stage)))})))
 
 (defn- materialize-uniform-scalar-closure-candidate
   [program]
@@ -734,73 +1013,38 @@
         roots (keep #(exact-uniform-root facts % input-values written aliases outputs host-reads)
                     infos)
         closures (keep #(uniform-scalar-closure facts infos uses position-by-id outputs host-reads %)
-                       roots)]
-    ;; This first landing deliberately refuses to coordinate independent roots. One transaction
-    ;; owns one input read, its complete scalar closure and every terminal consumer.
-    (if-not (= 1 (count closures))
-      [program {:resident-uniform-input-closures 0 :resident-uniform-input-scalars 0}]
-      (try
+                       roots)
+        islands (when (= 1 (count roots))
+                  (keep #(ordered-uniform-scalar-islands
+                          facts infos uses position-by-id outputs host-reads %)
+                        roots))
+        reserved (into (set (keys (:values facts)))
+                       (filter symbol? (tree-seq coll? seq equations)))
+        miss [program {:resident-uniform-input-closures 0
+                       :resident-uniform-input-scalars 0}]]
+    ;; Preserve the established one-stage admission. The new two-island route additionally audits
+    ;; every exact root and activates only when there is exactly one, never coordinating roots.
+    (try
+      (cond
+        (and (= 1 (count roots)) (= 1 (count closures)))
         (let [closure (first closures)
-            reserved (into (set (keys (:values facts)))
-                           (filter symbol? (tree-seq coll? seq equations)))
-            generated (singleton-closure-map facts closure reserved)
-            root-id (get-in closure [:root :info :id])
-            values (merge (apply dissoc (:values facts) (:values closure))
-                          (:values generated))
-            rewritten
-            (->> infos
-                 (keep (fn [info]
-                         (cond
-                           (= root-id (:id info)) (:equation generated)
-                           (contains? (:equations closure) (:id info)) nil
-                           (contains? (:terminal-equations closure) (:id info))
-                           (emit-equation
-                            (rewrite-lambda-captures
-                             info values
-                             (into {}
-                                   (map (fn [[old new]]
-                                          [old (list 'clojure.core/aget new 0)]))
-                                   (:frontier-map generated))
-                             (set (vals (:frontier-map generated)))))
-                           :else (emit-equation info))))
-                 vec)
-            equation-ids (set (map second rewritten))
-            definitions (set (mapcat #(nth % 2) rewritten))
-            references (set (mapcat (fn [equation]
-                                      (cond-> (dialect/operation-inputs equation)
-                                        (dialect/value-id? (dialect/operation-extent equation))
-                                        (conj (dialect/operation-extent equation))))
-                                    rewritten))
-            storage (set (mapcat (fn [equation]
-                                   (map :destination
-                                        (or (dialect/result-storage facts (second equation)) [])))
-                                 rewritten))
-            live-values (set/union definitions references storage outputs)
-            equation-facts
-            (-> (apply dissoc (:equations facts) (:equations closure))
-                (assoc root-id (:equation-facts generated))
-                (select-keys equation-ids))
-            new-facts
-            (-> facts
-                (assoc :values (select-keys values live-values)
-                       :inputs (vec (sort-by pr-str (set/difference references definitions))))
-                (assoc :equations equation-facts)
-                (assoc :effects (reduce set/union #{}
-                                        (map :effects (vals equation-facts))))
-                (assoc-in [:attributes :resident-uniform-input-scalar-closures]
-                          [{:root (get-in closure [:root :result])
-                            :input (get-in closure [:root :array])
-                            :frontier (mapv (:frontier-map generated)
-                                            (:frontier closure))}]))
-            result (dialect/make new-facts rewritten (dialect/outputs program))]
-          [(dialect/validate! result)
+              generated (singleton-closure-map facts closure reserved)]
+          (rebuild-uniform-scalar-stages
+           program infos [closure] [generated]
+           [{:root (get-in closure [:root :result])
+             :input (get-in closure [:root :array])
+             :frontier (mapv (:frontier-map generated) (:frontier closure))}]
            {:resident-uniform-input-closures 1
-            :resident-uniform-input-scalars (count (:values closure))}])
-        ;; Admission is transactional. A closure that the reconstructed TypedSOAC boundary cannot
-        ;; validate leaves the original program intact; no partially rewritten facts escape.
-        (catch Exception _
-          [program {:resident-uniform-input-closures 0
-                    :resident-uniform-input-scalars 0}])))))
+            :resident-uniform-input-scalars (count (:values closure))}))
+
+        (and (empty? closures) (= 1 (count islands)))
+        (materialize-ordered-uniform-scalar-islands
+         program infos (first islands) reserved)
+
+        :else miss)
+      ;; Admission is transactional. A closure that the reconstructed TypedSOAC boundary cannot
+      ;; validate leaves the original program intact; no partially rewritten facts escape.
+      (catch Exception _ miss))))
 
 (defn- materialize-uniform-scalar-closure
   [program]

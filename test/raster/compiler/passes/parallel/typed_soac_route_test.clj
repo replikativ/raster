@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.typed-soac-route-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.backend.gpu.kernel-body-target :as body-target]
@@ -636,7 +637,7 @@
                            (clojure.core/aset out-b i
                              (clojure.core/unchecked-add
                               (clojure.core/aget out-b i) scaled)))]
-           [effect-a effect-b])
+           out-a)
         {:keys [program stats]}
         (route/attempt source :long
                        {'time-buffer :long 'out-a :long 'out-b :long}
@@ -678,6 +679,93 @@
                                       [(:locals terminal) (:body-results terminal)])))
                 terminals))
     (is (= algorithm (dialect/validate! algorithm)))))
+
+(defn- canonical-double-pow-call [base exponent]
+  (with-meta (list '.invk 'raster.numeric/pow_m_double_double-impl base exponent)
+    {:raster.op/original 'raster.numeric/pow
+     :raster.op/resolved-callee 'raster.numeric/pow
+     :raster.type/tag 'double :tag 'double}))
+
+(deftest ordered-uniform-scalar-islands-retain-two-distinct-source-placements
+  (let [source
+        (walk/postwalk-replace
+         {'ordered-pow-call
+          (canonical-double-pow-call '(clojure.core/double beta-checkpoint)
+                                     '(clojure.core/double clock-value))}
+         '(let* [clock-value (clojure.core/long (clojure.core/aget time-buffer 0))
+                gap (raster.par/map-void! i n
+                      (clojure.core/aset scratch i
+                        (clojure.core/float
+                         (clojure.core/+ (clojure.core/aget scratch i) 1.0))))
+                ^double beta-checkpoint (clojure.core/double beta)
+                ^double powered
+                (clojure.core/double ordered-pow-call)
+                ^float checkpoint (clojure.core/float powered)
+                effect-a (raster.par/map-void! i n
+                           (clojure.core/aset out-a i (clojure.core/float powered)))
+                effect-b (raster.par/map-void! i n
+                           (clojure.core/aset out-b i checkpoint))]
+           out-a))
+        {:keys [program stats]}
+        (route/attempt source :float
+                       {'time-buffer :long 'scratch :float 'out-a :float 'out-b :float}
+                       {:scalar-types {'n :long 'beta :double}
+                        :values {'time-buffer
+                                 (av/tensor {:dtype :long
+                                             :shape '[(extent time-buffer)]})}
+                        :resident-uniform-input-loads? true})
+        algorithms (mapv :algorithm (:equations program))
+        entries
+        (mapcat (fn [algorithm]
+                  (let [facts (dialect/facts algorithm)]
+                    (map (fn [equation]
+                           {:algorithm algorithm :facts facts
+                            :info (fusion/equation-info equation)})
+                         (dialect/equations algorithm))))
+                algorithms)
+        constituent-source-ids
+        (fn [{:keys [facts info]}]
+          (into #{}
+                (keep #(get-in % [:provenance :source-binding-id]))
+                (vals (get-in facts [:equations (:id info)
+                                     :attributes :fusion/constituents]))))
+        root-entry (some #(when (= :ordered-uniform-scalar-root
+                                    (get-in (:facts %) [:equations (get-in % [:info :id])
+                                                        :provenance :pass])) %)
+                         entries)
+        island-entry (some #(when (set/subset? #{3 4} (constituent-source-ids %)) %) entries)
+        certificates
+        (into []
+              (keep #(get-in (dialect/facts %) [:attributes
+                                                :resident-uniform-input-scalar-closures 0]))
+              algorithms)
+        certificate (first certificates)
+        root-frontier (set (:root-frontier certificate))
+        island-frontier (set (:frontier certificate))
+        source-bindings (partition 2 (second (:source program)))
+        source-ids (set (map first source-bindings))
+        source-position (into {} (map-indexed (fn [index [id _]] [id index])) source-bindings)
+        public-values (set (concat (:inputs program) (:outputs program)))]
+    (is (= 1 (:resident-uniform-input-scalar-islands stats)))
+    (is (= 3 (:resident-uniform-input-scalars stats)))
+    (is (every? #{certificate} certificates)
+        "component projection retains one consistent whole-program stage certificate")
+    (is (= #{:root :island} (set (map :kind (:stages certificate)))))
+    (is (= #{0} (constituent-source-ids root-entry)))
+    (is (set/subset? #{3 4} (constituent-source-ids island-entry))
+        "the routed island carrier preserves both removed scalar source sites")
+    (is (every? source-ids (set/union root-frontier island-frontier))
+        "both physical stages are explicit private source-local allocations")
+    (is (not-any? public-values (set/union root-frontier island-frontier)))
+    (is (not-any? source-ids '[clock-value powered checkpoint]))
+    (is (source-ids 'beta-checkpoint)
+        "the independently certified host-prefix producer remains a scalar source binding")
+    (is (< (apply min (map source-position root-frontier))
+           (source-position 'gap)
+           (source-position 'beta-checkpoint)
+           (apply min (map source-position island-frontier))
+           (source-position 'effect-a)))
+    (is (every? true? (map #(= % (dialect/validate! %)) algorithms)))))
 
 (deftest ordered-map-loop-retains-its-lexical-update-region
   (let [source '(let* [result
