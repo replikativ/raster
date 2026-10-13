@@ -134,7 +134,12 @@
 
 (defn compile-ptx
   "Compile generated CUDA C++ source for a virtual architecture such as `compute_80`.
-   Returns PTX bytes and the compiler log. A real device is not needed.
+   Returns PTX bytes, the compiler log and the complete executable option identity.
+   Implicit multiply/add contraction is disabled: shared numerical contracts retain
+   typed scalar evaluation (including result transforms under reassociated cores).
+   Explicit FMA and matrix instructions keep their declared fused semantics. This
+   conservative policy also applies to raw source transport; no fast-math flag is
+   inferred from a broad numerical mode. A real device is not needed.
    `:include-paths` are explicit CUDA toolkit header directories, not inferred from a
    device descriptor; they participate in the caller's compilation cache key."
   [source kernel-name virtual-architecture & {:keys [include-paths] :or {include-paths []}}]
@@ -150,7 +155,8 @@
     (let [program-pointer (.allocate arena ValueLayout/ADDRESS)
           src (.allocateFrom arena source)
           name (.allocateFrom arena kernel-name)
-          options (into [(str "--gpu-architecture=" virtual-architecture) "--std=c++17"]
+          options (into [(str "--gpu-architecture=" virtual-architecture) "--std=c++17"
+                         "--fmad=false"]
                         (map #(str "--include-path=" %) include-paths))
           option-pointer (pointer-array arena options)
           header-pointer (pointer-array arena (mapv second c-headers))
@@ -171,6 +177,7 @@
            :log log
            :virtual-architecture virtual-architecture
            :include-paths include-paths
+           :compiler-options options
            :virtual-header-version virtual-header-version
            :nvrtc-version (version)})
         (finally

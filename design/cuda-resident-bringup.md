@@ -42,6 +42,44 @@ this machine, without an NVIDIA device. This is transport evidence only.
 An NVRTC-equipped host should run the optional transport test with
 `RASTER_REQUIRE_NVRTC=1` so missing native coverage is a failure, not a skip.
 
+NVRTC now disables implicit multiply/add contraction with `--fmad=false` and returns
+the complete ordered `:compiler-options` with its existing compilation identity.
+Explicit FMA remains fused. A reassociated reduction or approximate matrix core does
+not by itself grant contraction of its surrounding typed scalar expressions. Native
+transport tests check exact/reassociated/bounded-error artifacts, include-path identity,
+and emitted PTX containing separate ordinary multiply/add plus explicit FMA. These are
+compiler-output checks, not CUDA device numerical or performance evidence.
+
+## Integrating the contributed CUDA runtime
+
+Sam (`nanparth`) contributed draft PR #1338. Integrate it as independently reviewed
+increments against current main, retaining original authorship for unchanged commits
+and explicit co-authorship/source-commit credit for extracted or reconciled changes.
+The exact reviewed source is `063e7fc0bd8e4e22ad4e743c39a2cb1cdaeb458c`;
+its hardware receipts do not automatically qualify a different integrated tree.
+
+1. Numerical compilation policy: NVRTC options and independently checkable source
+   rounding controls; no runtime registration. This is the first bounded increment.
+2. Hardware discovery: observed driver/device limits and provenance, with mocked
+   unavailable/partial probes; no catalogue estimates presented as measurements.
+3. Driver transport and runtime ownership: context restoration, allocation, views,
+   registration and destruction through the existing common ownership contracts.
+4. Transfers and asynchronous execution: exact slice bounds, atomic admission versus
+   retirement, host leases, completion, cancellation and rollback. The reviewed draft's
+   synchronous forged-range and copy-after-free counterexamples must be regressions
+   before affected runtime code is admitted.
+5. Shared compiler proof changes: separate retained scalar, guarded index/range and
+   scheduling increments. Reconcile newer upstream fixes rather than restoring the
+   contributed tree wholesale; retain OpenCL/Level Zero and independent refusal controls.
+6. Workload qualification: generated matrix/reduction/quantized/training replay on the
+   final integrated tree, followed by fresh CUDA device and sanitizer receipts from
+   the contributor's host. Compiler-only CI is not runtime or throughput acceptance.
+
+The original draft remains the contribution/evidence umbrella until all slices are
+accounted for. Do not merge it wholesale or enable a partially qualified CUDA backend.
+The sequence may be refined by dependencies found during extraction; this does not
+replace the general compiler-unification campaign or its unchanged numerical gates.
+
 Do not mark `:cuda` a resident backend merely because a library or `nvcc` is present.
 The backend entry must declare its memory space, coherence, slice ownership, transfer
 capabilities, event behavior and physical-queue facts. Unsupported graph or async operations
