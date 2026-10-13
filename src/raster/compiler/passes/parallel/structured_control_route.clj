@@ -6,6 +6,7 @@
    equation/value spine used by loop-free algorithms. Scheduling replaces a typed operation with a
    checked schedule; it does not reconstruct or recognize source-shaped compound operations."
   (:require [clojure.set :as set]
+            [raster.compiler.core.callee-identity :as callee-identity]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -456,75 +457,222 @@
         values (when facts (soac/equations algorithm)))))
    values equations))
 
+(defn- valid-scalar-cast-value?
+  "A return cast may disappear only when the typed value proves cast(T,T).
+
+   The AbstractValue, not a source hint or operation registry entry, owns the operand dtype. It
+   must be a valid effect-free rank-zero numeric tensor with a known dtype; aliases normalize
+   through the canonical dtype authority before comparison."
+  [value target-dtype]
+  (try
+    (and (= value (av/validate! value))
+         (= :tensor (:kind value))
+         (empty? (:shape value))
+         (empty? (:effects value))
+         (keyword? (:dtype value))
+         (dtype/known? (:dtype value))
+         (= (dtype/canon (:dtype value)) target-dtype))
+    (catch Exception _ false)))
+
+(defn- canonicalize-value-dtype
+  "Normalize only a known keyword dtype for producer/outer comparison; retain every other facet."
+  [value]
+  (if (and (av/abstract-value? value) (keyword? (:dtype value))
+           (dtype/known? (:dtype value)))
+    (update value :dtype dtype/canon)
+    value))
+
+(defn- certified-result-storage
+  "Return complete `{:entries [[result storage] ...] :host-binding ...}` groups from the
+   validated algorithm authority.
+
+   TypedSOAC owns storage and host binding in its inner equation facts. Generic SWR validates only
+   outer storage as part of its equation boundary, so it contributes no host-binding assertion.
+   Structured control currently has no result-storage projection; an outer attribute alone cannot
+   manufacture one."
+  [parallel-program equation]
+  (let [algorithm (:algorithm equation)]
+    (try
+      (when (typed-algorithm-boundary? (:values parallel-program) equation algorithm)
+        (cond
+          (soac/program-form? algorithm)
+          (let [facts (soac/facts algorithm)
+                outer-results (set (:results equation))]
+            (into []
+                  (keep (fn [inner]
+                          (let [equation-id (second inner)
+                                entries (mapv vector
+                                              (nth inner 2)
+                                              (soac/result-storage facts equation-id))]
+                            (when (some (comp outer-results first) entries)
+                              {:entries entries
+                               :host-binding
+                               (get-in facts [:equations equation-id
+                                              :attributes :host-binding])}))))
+                  (soac/equations algorithm)))
+
+          (swr/plan? algorithm)
+          [{:entries (mapv vector (:results equation)
+                           (get-in equation [:attributes :result-storage]))
+            :host-binding nil}]
+
+          :else []))
+      (catch Exception _ nil))))
+
+(defn- validated-produced-value
+  "Return a result's AbstractValue only when its unique typed producer certifies the same value.
+
+   The outer value table is not independently forgeable dtype authority. TypedSOAC and structured
+   control retain their own result values; generic SWR's checked equation boundary relates its
+   descriptor to the outer value."
+  [parallel-program result]
+  (let [producers (filterv #(some #{result} (:results %)) (:equations parallel-program))]
+    (when (= 1 (count producers))
+      (let [equation (first producers)
+            algorithm (:algorithm equation)
+            outer (get (:values parallel-program) result)
+            authoritative
+            (try
+              (when (typed-algorithm-boundary? (:values parallel-program) equation algorithm)
+                (cond
+                  (soac/program-form? algorithm) (get-in (soac/facts algorithm) [:values result])
+                  (control/loop-program? algorithm) (get (control/outer-values algorithm) result)
+                  (swr/plan? algorithm) outer
+                  :else nil))
+              (catch Exception _ nil))]
+        (when (and authoritative
+                   (= (canonicalize-value-dtype outer)
+                      (canonicalize-value-dtype authoritative)))
+          outer)))))
+
+(defn- source-result-projection
+  "Prove one complete source return and return `{:kind ... :outputs [...]}`, or nil.
+
+   Symbols are admitted only through typed results, certified physical destinations, exact lexical
+   aliases, or effect bindings. Vectors and nil recurse structurally. A unary primitive cast is an
+   identity only when retained walker identity agrees with fresh resolution in the original source
+   namespace, the head is not lexically shadowed, its operand projects to exactly one result, and
+   that result's validated rank-zero AbstractValue proves the same canonical numeric dtype.
+   Consequently spelling, source hints, forged metadata, and non-identity casts prove nothing."
+  [parallel-program {:keys [source-ns public-parameters active-params array-types]} expression]
+  (let [source (:source parallel-program)
+        bindings (second source)
+        outputs (set (mapcat :results (:equations parallel-program)))
+        aliases (into {} (keep (fn [[symbol expression]]
+                                 (when (symbol? expression) [symbol expression])))
+                      (partition 2 bindings))
+        lexical-heads (into (set (concat public-parameters active-params))
+                            (keep (fn [[symbol _]] (when (symbol? symbol) symbol)))
+                            (partition 2 bindings))
+        resolve-alias (fn [symbol]
+                        (loop [symbol symbol seen #{}]
+                          (cond
+                            (contains? seen symbol) nil
+                            (contains? aliases symbol) (recur (get aliases symbol)
+                                                             (conj seen symbol))
+                            (contains? outputs symbol) symbol
+                            :else symbol)))
+        equations (:equations parallel-program)
+        storage-groups (mapcat (partial certified-result-storage parallel-program) equations)
+        storage-entries (mapcat :entries storage-groups)
+        storage-source-kind (fn [storage]
+                              (case (:host-return storage)
+                                :buffer :buffer
+                                :effect :buffer
+                                nil))
+        stored-result-kinds (into {} (keep (fn [[result storage _]]
+                                             (when-let [kind (storage-source-kind storage)]
+                                               [result kind])))
+                                  storage-entries)
+        stored-results (into #{} (map first) storage-entries)
+        destinations (into {} (keep (fn [[result storage _]]
+                                      (when-let [kind (storage-source-kind storage)]
+                                        [(:destination storage)
+                                         {:output result :kind kind}])))
+                           storage-entries)
+        buffer-host-bindings
+        (into {}
+              (keep (fn [{:keys [entries host-binding]}]
+                      (when (and host-binding (= 1 (count entries))
+                                 (= :buffer (:host-return (second (first entries)))))
+                        [host-binding (ffirst entries)])))
+              storage-groups)
+        effect-bindings
+        (into #{}
+              (keep (fn [{:keys [entries host-binding]}]
+                      (when (and host-binding (seq entries)
+                                 (every? #(= :effect (:host-return (second %))) entries))
+                        host-binding)))
+              storage-groups)
+        symbol-output (fn [symbol]
+                        (let [symbol (resolve-alias symbol)]
+                          (cond
+                            (contains? effect-bindings symbol) {:kind :unit :outputs []}
+                            (contains? outputs symbol)
+                            (let [kind (cond
+                                         (contains? stored-result-kinds symbol)
+                                         (get stored-result-kinds symbol)
+                                         (contains? stored-results symbol) nil
+                                         (contains? array-types symbol) :buffer
+                                         :else :value)]
+                              (when kind {:kind kind :outputs [symbol]}))
+                            (contains? outputs (:output (get destinations symbol)))
+                            {:kind (:kind (get destinations symbol))
+                             :outputs [(:output (get destinations symbol))]}
+                            (contains? outputs (get buffer-host-bindings symbol))
+                            {:kind :buffer :outputs [(get buffer-host-bindings symbol)]}
+                            :else nil)))]
+    (letfn [(project [expression]
+              (cond
+                (symbol? expression)
+                (symbol-output expression)
+
+                (vector? expression)
+                (loop [remaining expression projected []]
+                  (if (seq remaining)
+                    (when-let [projection (project (first remaining))]
+                      (recur (next remaining) (into projected (:outputs projection))))
+                    {:kind :tuple :outputs projected}))
+
+                (nil? expression) {:kind :unit :outputs []}
+
+                (seq? expression)
+                (let [head (first expression)
+                      lexical-call? (or (:raster.op/lexical-callee (meta expression))
+                                        (:raster.op/lexical-callee (meta head)))
+                      canonical (when-not lexical-call?
+                                  (callee-identity/validated-source-callee
+                                   head source-ns lexical-heads))
+                      target-dtype (some-> canonical descriptor/cast-result-tag
+                                           dtype/dtype-for-scalar-tag)
+                      operand-projection (when (and target-dtype (= 2 (count expression)))
+                                           (project (second expression)))
+                      operand-output (when (and (= :value (:kind operand-projection))
+                                                (= 1 (count (:outputs operand-projection))))
+                                       (first (:outputs operand-projection)))
+                      value (validated-produced-value parallel-program operand-output)]
+                  (when (and operand-output
+                             (valid-scalar-cast-value? value (dtype/canon target-dtype)))
+                    operand-projection))
+
+                :else nil))]
+      (project expression))))
+
 (defn- validate-source-result!
   "Island live-outs are not evidence that the complete source return was lowered.
    Prove the return against logical results and the existing physical-storage relation
    before attaching a whole-program invocation contract. Never recognize an operation
    by its source name to manufacture a missing continuation."
-  [parallel-program {:keys [return-tag]}]
+  [parallel-program {:keys [return-tag] :as options}]
   (let [source (:source parallel-program)
         _ (when-not (and (seq? source) (contains? #{'let 'let*} (first source)))
             (fail! :structured-control-invocation-source
                    "an analyzed TypedSOAC program requires a flat retained host source boundary"
                    {:source source}))
         body (drop 2 source)
-        outputs (set (mapcat :results (:equations parallel-program)))
-        aliases (into {} (keep (fn [[symbol expression]]
-                                (when (symbol? expression) [symbol expression])))
-                      (partition 2 (second source)))
-        resolve-alias (fn [symbol]
-                        (loop [symbol symbol seen #{}]
-                          (cond
-                            (contains? outputs symbol) symbol
-                            (contains? seen symbol) nil
-                            (contains? aliases symbol) (recur (get aliases symbol) (conj seen symbol))
-                            :else symbol)))
-        equations (:equations parallel-program)
-        destinations (into {}
-                           (mapcat (fn [equation]
-                                     (let [storage (get-in equation [:attributes :result-storage])
-                                           binding (get-in equation [:attributes :host-binding])]
-                                       (concat
-                                        (map (fn [result storage]
-                                               [(:destination storage) result])
-                                             (:results equation) storage)
-                                        ;; A stored operation may return its buffer under a host
-                                        ;; binding distinct from its fresh logical SSA result.
-                                        (when (and binding (= 1 (count storage))
-                                                   (= :buffer (:host-return (first storage))))
-                                          [[binding (first (:results equation))]])))))
-                           equations)
-        effect-bindings (into #{}
-                              (keep (fn [equation]
-                                      (when (and (seq (get-in equation [:attributes :result-storage]))
-                                                 (every? #(= :effect (:host-return %))
-                                                         (get-in equation [:attributes :result-storage])))
-                                        (get-in equation [:attributes :host-binding]))))
-                              equations)
-        projection? (fn projection? [expression]
-                      (cond
-                        (symbol? expression)
-                        (let [expression (resolve-alias expression)]
-                          (or (contains? outputs expression)
-                              (contains? outputs (get destinations expression))
-                              (contains? effect-bindings expression)))
-                        (vector? expression) (every? projection? expression)
-                        (nil? expression) true
-                        :else false))
-        returned-values (fn returned-values [expression]
-                          (cond
-                            (symbol? expression)
-                            (let [expression (resolve-alias expression)]
-                              (cond
-                                (contains? effect-bindings expression) []
-                                (contains? outputs expression) [expression]
-                                (contains? outputs (get destinations expression))
-                                [(get destinations expression)]
-                                :else []))
-                            (vector? expression)
-                            (mapcat returned-values expression)
-                            :else []))]
-    (when-not (and (= 1 (count body)) (projection? (first body)))
+        projection (when (= 1 (count body))
+                     (source-result-projection parallel-program options (first body)))]
+    (when-not projection
       (fail! :structured-control-source-result
              "the complete source return is not represented by the typed program outputs"
              {:source-result (last body) :source-body (vec body)
@@ -536,7 +684,7 @@
     (assoc parallel-program :outputs
            (if (= 'void return-tag)
              []
-             (vec (distinct (returned-values (first body))))))))
+             (vec (distinct (:outputs projection)))))))
 
 (defn- validate-host-coverage!
   "Host-controlled bindings may remain in an island's retained source, but a complete

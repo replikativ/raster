@@ -887,6 +887,234 @@
     (is (some #{'size} prefix-symbols)
         "the same pure size is materialized before allocation and retained as graph proof")))
 
+(defn- retained-core-cast
+  [tag operand]
+  (list (with-meta (symbol (name tag))
+          {:raster.op/resolved-callee (symbol "clojure.core" (name tag))})
+        operand))
+
+(defn- scalar-reduction-program
+  [dtype]
+  (let [[source array-types scalar-types]
+        (case dtype
+          :double ['(let* [total (raster.par/reduce acc 0.0 i n
+                                                     (+ acc (clojure.core/aget x i)))]
+                      total)
+                   {'x :double} {'n :long}]
+          :float ['(let* [total (raster.par/reduce acc (float 0.0) i n
+                                                    (+ acc (clojure.core/aget x i)))]
+                     total)
+                  {'x :float} {'n :long}]
+          :long ['(let* [total (raster.par/reduce acc (long 0) i n
+                                                   (unchecked-add acc (long i)))]
+                    total)
+                 {} {'n :long}])
+        result (typed-route/attempt source dtype array-types {:scalar-types scalar-types})
+        parallel (:program result)]
+    (when-not parallel
+      (throw (ex-info "scalar reduction fixture was unexpectedly declined" result)))
+    (route/validate-typed-program! (assoc parallel :dialect :typed-parallel))))
+
+(defn- rank-zero-contract-program
+  []
+  (let [source '(let* [result (raster.par/contract out [] [[i n]]
+                                                   (* (clojure.core/aget x i)
+                                                      (clojure.core/aget y i)))]
+                  result)
+        parallel (:program (typed-route/attempt source :double
+                                                {'x :double 'y :double 'out :double}
+                                                {:scalar-types {'n :long}}))]
+    (route/validate-typed-program! (assoc parallel :dialect :typed-parallel))))
+
+(defn- with-source-return
+  [parallel expression]
+  (assoc parallel :source (list (first (:source parallel))
+                                (second (:source parallel))
+                                expression)))
+
+(defn- validate-source-return
+  ([parallel expression]
+   (validate-source-return parallel expression {}))
+  ([parallel expression options]
+   (#'route/validate-source-result!
+    (with-source-return parallel expression)
+    (merge {:source-ns *ns* :public-parameters '[x n]} options))))
+
+(deftest scalar-return-projection-requires-proved-identity-casts
+  (testing "canonical Double, Float, and Long identities preserve the exact logical output"
+    (doseq [dtype [:double :float :long]]
+      (let [parallel (scalar-reduction-program dtype)
+            output (first (:outputs parallel))
+            projected (validate-source-return parallel (retained-core-cast dtype output))]
+        (is (= [output] (:outputs projected)))
+        (is (= [] (get-in parallel [:values output :shape]))
+            "the admitted producer value is rank zero"))))
+  (testing "qualified core spelling retains the same independently resolved identity"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))
+          head (with-meta 'clojure.core/double
+                 {:raster.op/resolved-callee 'clojure.core/double})]
+      (is (= [output]
+             (:outputs (validate-source-return parallel (list head output)))))))
+  (testing "known dtype aliases normalize only at the equality comparison"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))
+          aliased (assoc-in parallel [:values output :dtype] :f64)
+          cast (retained-core-cast :double output)]
+      (is (= [output] (:outputs (validate-source-return aliased cast)))
+          "a known outer dtype alias agrees with the canonical inner producer")
+      (doseq [forged [(assoc-in aliased [:values output :ownership] :owned)
+                      (assoc-in aliased [:values output :representation] {:kind :forged})]]
+        (is (= :structured-control-source-result
+               (reason-of #(validate-source-return forged cast)))
+            "dtype normalization cannot conceal a changed AbstractValue facet"))))
+  (testing "tuple, nesting, nil, and exact aliases use the same recursive projection"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))
+          bindings (into (vec (second (:source parallel))) ['returned output])
+          expression [[(retained-core-cast :double 'returned)] nil output]
+          parallel (assoc parallel :source (list (first (:source parallel)) bindings expression))
+          projected (#'route/validate-source-result!
+                     parallel {:source-ns *ns* :public-parameters '[x n]})]
+      (is (= [output] (:outputs projected)))))
+  (testing "a real conversion is not erased"
+    (let [double-program (scalar-reduction-program :double)
+          float-program (scalar-reduction-program :float)
+          double-output (first (:outputs double-program))
+          float-output (first (:outputs float-program))]
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return
+                          double-program (retained-core-cast :float double-output)))))
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return
+                          float-program (retained-core-cast :double float-output)))))))
+  (testing "a singleton tuple is not the scalar value it contains"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))
+          tuple-cast (retained-core-cast :double [output])
+          nested-tuple-cast (retained-core-cast :double tuple-cast)]
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return parallel tuple-cast))))
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return parallel nested-tuple-cast))))))
+  (testing "only the validated producer value is dtype authority"
+    (let [parallel (scalar-reduction-program :float)
+          output (first (:outputs parallel))
+          forged (assoc-in parallel [:values output]
+                           (av/tensor {:dtype :double :shape []}))]
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return
+                          forged (retained-core-cast :double output))))
+          "forging the outer value table cannot turn Float-to-Double into cast(T,T)")))
+  (testing "non-scalar, unknown, effectful, and malformed actual values fail closed"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))
+          cast (retained-core-cast :double output)]
+      (doseq [value [(av/tensor {:dtype :double :shape [1]})
+                     (av/tensor {:dtype :unknown-numeric :shape []})
+                     (av/tensor {:dtype :double :shape [] :effects #{:memory/read}})
+                     {:kind :tensor :dtype :double :shape [] :effects #{}}]]
+        (is (= :structured-control-source-result
+               (reason-of #(validate-source-return (assoc-in parallel [:values output] value)
+                                                   cast))))))
+    (let [source '(let* [result (raster.par/map! out i n double
+                                                  (clojure.core/aget x i))]
+                         result)
+          parallel (:program (typed-route/attempt source :double
+                                                  {'x :double 'out :double}
+                                                  {:scalar-types {'n :long}}))
+          parallel (route/validate-typed-program! (assoc parallel :dialect :typed-parallel))
+          output (first (:outputs parallel))]
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return
+                          parallel (retained-core-cast :double output))))
+          "a valid array-producing equation is not a scalar cast identity")))
+  (testing "callee identity requires retained and fresh unshadowed agreement"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))
+          missing (list 'double output)
+          forged (list (with-meta 'double
+                         {:raster.op/resolved-callee 'clojure.core/float}) output)
+          lexical-head (list (with-meta (first (retained-core-cast :double output))
+                               {:raster.op/resolved-callee 'clojure.core/double
+                                :raster.op/lexical-callee true}) output)
+          lexical-form (with-meta (retained-core-cast :double output)
+                         {:raster.op/lexical-callee true})
+          lexical (update parallel :source
+                          (fn [[head bindings _]]
+                            (list head (into (vec bindings) ['double 'identity]) output)))]
+      (doseq [[program expression options]
+              [[parallel missing {}]
+               [parallel forged {}]
+               [parallel lexical-head {}]
+               [parallel lexical-form {}]
+               [lexical (retained-core-cast :double output) {}]
+               [parallel (retained-core-cast :double output)
+                {:public-parameters '[x n double]}]]]
+        (is (= :structured-control-source-result
+               (reason-of #(validate-source-return program expression options)))))
+      (let [ns-symbol (gensym "scalar-return-user-")
+            source-ns (create-ns ns-symbol)]
+        (try
+          (intern source-ns 'double identity)
+          (let [user-head (with-meta 'double
+                            {:raster.op/resolved-callee
+                             (symbol (str ns-symbol) "double")})]
+            (is (= :structured-control-source-result
+                   (reason-of #(validate-source-return
+                                parallel (list user-head output) {:source-ns source-ns})))))
+          (finally (remove-ns ns-symbol))))))
+  (testing "Void cannot make an unproved cast return valid"
+    (let [parallel (scalar-reduction-program :double)
+          output (first (:outputs parallel))]
+      (is (= :structured-control-source-result
+             (reason-of #(validate-source-return parallel (list 'double output)
+                                                 {:return-tag 'void})))))))
+
+(deftest rank-zero-buffer-returns-are-not-scalar-cast-operands
+  (let [parallel (rank-zero-contract-program)
+        output (-> parallel :equations first :results first)
+        host-binding (get-in parallel [:equations 0 :attributes :host-binding])
+        options {:source-ns *ns* :public-parameters '[x y out n]
+                 :array-types {'x :double 'y :double 'out :double}}
+        project (fn [program expression]
+                  (#'route/validate-source-result!
+                   (with-source-return program expression) options))]
+    (is (= [] (get-in parallel [:values output :shape]))
+        "the logical contraction result is rank zero")
+    (is (symbol? host-binding) "the retained source result is the certified host binding")
+    (doseq [expression (distinct [host-binding 'out])]
+      (is (= [output] (:outputs (project parallel expression)))
+          "plain result, destination, and certified host-binding returns remain valid")
+      (is (= :structured-control-source-result
+             (reason-of #(project parallel (retained-core-cast :double expression))))
+          "logical rank zero does not turn the source array carrier into a primitive scalar"))
+    (let [bindings (into (vec (second (:source parallel))) ['returned 'out])
+          aliased (assoc parallel :source
+                         (list (first (:source parallel)) bindings 'returned))]
+      (is (= [output] (:outputs (#'route/validate-source-result! aliased options))))
+      (is (= :structured-control-source-result
+             (reason-of #(#'route/validate-source-result!
+                          (with-source-return aliased (retained-core-cast :double 'returned))
+                          options)))))
+    (let [bindings (into (vec (second (:source parallel))) [host-binding 'out])
+          shadowed (assoc parallel :source
+                          (list (first (:source parallel)) bindings host-binding))]
+      (is (= [output] (:outputs (#'route/validate-source-result! shadowed options))))
+      (is (= :structured-control-source-result
+             (reason-of #(#'route/validate-source-result!
+                          (with-source-return shadowed (retained-core-cast :double host-binding))
+                          options)))
+          "an exact source alias wins over a coincident certified host-binding category"))
+    (let [forged (assoc-in parallel [:equations 0 :attributes :result-storage] [])]
+      (is (= :structured-control-source-result
+             (reason-of #(project forged (retained-core-cast :double host-binding))))
+          "dropping mutable outer storage cannot override the certified inner carrier"))
+    (let [forged (assoc-in parallel [:equations 0 :attributes :host-binding] 'forged-binding)]
+      (is (= :structured-control-source-result
+             (reason-of #(project forged 'forged-binding)))
+          "a mutable outer host binding cannot manufacture a return projection"))))
+
 (deftest island-live-outs-do-not-prove-whole-source-completion
   (let [options {:dtype :double :public-parameters '[x out n]
                  :array-types {'x :double 'out :double}
@@ -948,8 +1176,10 @@
                           (assoc complete :source '(let* [y (clojure.core/println x)] y))
                           options)))
           "a coincident binding site cannot authorize execution of a stale equation")
-      (doseq [replacement ['x 0.0]]
-        (is (= :structured-control-host-continuation
+      (doseq [[replacement reason]
+              [['x :structured-control-source-result]
+               [0.0 :structured-control-host-continuation]]]
+        (is (= reason
                (reason-of #(route/promote-program
                             (assoc complete :source (list 'let* ['y replacement] 'y)) options)))
             "removability cannot authorize a stale equation for a claimed binding")))))

@@ -12,7 +12,8 @@
   - Readable: each form handler is a separate, named function
   - Testable: handlers can be unit-tested with synthetic contexts
   - Extensible: new form types can be added via defmethod"
-  (:require [raster.compiler.core.op-descriptor :as descriptor]
+  (:require [raster.compiler.core.callee-identity :as callee-identity]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [clojure.string :as str]
@@ -1018,16 +1019,8 @@
   "Preserve execution spelling and derive pure callee evidence before scope is lost.
    Lexical bindings and failed resolution clear any incoming assertion."
   [callee ctx]
-  (if (symbol? callee)
-    (let [callee (vary-meta callee dissoc :raster.op/resolved-callee)
-          v (when-not (contains? (:type-env ctx) callee)
-              (binding [*ns* (the-ns (:source-ns ctx))]
-                (try (ns-resolve *ns* callee) (catch Exception _ nil))))]
-      (if (var? v)
-        (vary-meta callee assoc :raster.op/resolved-callee
-                   (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v)))))
-        callee))
-    callee))
+  (callee-identity/retain-source-callee-identity
+   callee (:source-ns ctx) (:type-env ctx)))
 
 (defn- load-transform-source
   "Resolve macros and free var names before load-lambda expansion, without assigning types.
