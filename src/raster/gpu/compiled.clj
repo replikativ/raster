@@ -781,6 +781,24 @@
     (instance? clojure.lang.Named value) (keyword (name value))
     :else (keyword (str "result-" index))))
 
+(defn- equation-first-field-leaf
+  "Resolve one canonical public aggregate selector to its retained buffer leaf."
+  [projection public-bindings selector]
+  (when-not (vector? selector)
+    (throw (ex-info "aggregate field selector must be a vector"
+                    {:reason :compiled-field-selector :selector selector})))
+  (let [matches
+        (filterv (fn [{:keys [binding symbol] :as leaf}]
+                   (when-let [path (materialization/projection-path leaf)]
+                     (and (= selector (into [(keyword binding)] path))
+                          (contains? public-bindings symbol))))
+                 (:physical-parameters projection))]
+    (when-not (= 1 (count matches))
+      (throw (ex-info "field selector must identify one retained public buffer leaf"
+                      {:reason :compiled-field-selector :selector selector
+                       :matches (mapv :symbol matches)})))
+    (first matches)))
+
 (defn- resolve-equation-first-field-intent
   "Resolve public root/path intent through retained parameter projection, never physical names.
    This does not grant mutable ownership; the existing aggregate/role gates run afterward."
@@ -790,15 +808,7 @@
         (fn [selector]
           (if-not (vector? selector)
             [selector]
-            (let [matches (filterv (fn [{:keys [binding symbol] :as leaf}]
-                                     (when-let [path (materialization/projection-path leaf)]
-                                       (and (= selector (into [(keyword binding)] path))
-                                            (contains? public-bindings symbol)))) leaves)]
-              (when-not (= 1 (count matches))
-                (throw (ex-info "field selector must identify one retained public buffer leaf"
-                                {:reason :compiled-field-selector :selector selector
-                                 :matches (mapv :symbol matches)})))
-              [(:symbol (first matches))])))
+            [(:symbol (equation-first-field-leaf projection public-bindings selector))]))
         expand (fn [selector]
                  (if (vector? selector)
                    (resolve-selector selector)
@@ -821,6 +831,51 @@
                    {} (or roles {}))]
     {:constants (vec (mapcat expand constants)) :roles resolved-roles}))
 
+(defn- equation-first-field-output-entries
+  "Resolve only exact vector output selectors. Whole aggregate outputs remain unsupported."
+  [projection public-bindings outputs]
+  (let [selectors (filterv vector? outputs)
+        entries (mapv (fn [selector]
+                        {:key selector
+                         :sym (:symbol (equation-first-field-leaf
+                                        projection public-bindings selector))
+                         :from :output})
+                      selectors)
+        duplicate-symbols (->> entries (map :sym) frequencies
+                               (keep (fn [[symbol n]] (when (< 1 n) symbol))) set)]
+    (when (seq duplicate-symbols)
+      (throw (ex-info "field outputs must identify distinct retained public leaves"
+                      {:reason :compiled-field-output-duplicates
+                       :selectors selectors :symbols duplicate-symbols})))
+    entries))
+
+(defn- validate-mutable-aggregate-aliases!
+  "Reject primitive-array aliases involving mutable aggregate leaves before final proof.
+
+   The current invocation materializer admits primitive arrays only. This identity check is not
+   authority for future DeviceArray or ranged MemorySegment inputs."
+  [projection public-bindings projected-arguments aggregate-leaves roles]
+  (let [mutable (into #{} (mapcat (fn [[_ leaves]]
+                                    (keep #(when (= :state (get roles (:symbol %))) (:symbol %))
+                                          leaves)))
+                      aggregate-leaves)]
+    (when (seq mutable)
+      (let [seen (java.util.IdentityHashMap.)]
+        (doseq [{:keys [symbol] :as leaf} (:physical-parameters projection)
+                :when (contains? public-bindings symbol)
+                :let [value (get projected-arguments symbol)
+                      path (if-let [projection-path (materialization/projection-path leaf)]
+                             (into [(keyword (:binding leaf))] projection-path)
+                             (keyword (name symbol)))]
+                :when (some? value)]
+          (if-let [previous (.get seen value)]
+            (when (or (contains? mutable symbol) (contains? mutable (:symbol previous)))
+              (throw (ex-info "mutable aggregate leaves cannot alias another public buffer"
+                              {:reason :compiled-aggregate-state-alias
+                               :left (:path previous) :right path
+                               :symbols #{(:symbol previous) symbol}})))
+            (.put seen value {:symbol symbol :path path})))))))
+
 (defn- project-equation-first-boundary
   "Choose public roles and escaped outputs on the normalized candidate, before its sole proof."
   [raw-plan compilation args {:keys [donate constants outputs taps roles]}]
@@ -828,29 +883,44 @@
         projection (get-in invocation-plan [:attributes :parameter-projection])
         aggregate-leaves (group-by :binding (filter materialization/projection-path
                                                    (:physical-parameters projection)))
+        aggregate-bindings (set (keys aggregate-leaves))
+        aggregate-symbols (into #{} (mapcat #(map :symbol %)) (vals aggregate-leaves))
         _ (when-let [selector (first (filter vector? donate))]
             (throw (ex-info "aggregate field donation requires per-field ownership support"
                             {:reason :compiled-field-selector-intent :selector selector :intent :donated})))
-        _ (when (some aggregate-leaves (concat donate outputs taps))
-            (throw (ex-info "aggregate donation and aggregate outputs require per-field ownership support"
-                            {:reason :compiled-aggregate-output :aggregates (set (keys aggregate-leaves))})))
+        _ (when-let [selector
+                     (first (filter #(or (contains? aggregate-bindings %)
+                                         (contains? aggregate-symbols %))
+                                    (concat donate (remove vector? outputs) taps)))]
+            (throw (ex-info "aggregate donation, whole aggregate outputs, and taps require additional ownership support"
+                            {:reason :compiled-aggregate-output :selector selector
+                             :aggregates aggregate-bindings})))
+        public-bindings (get-in raw-plan [:attributes :public-buffer-bindings])
         field-intent (resolve-equation-first-field-intent
-                      projection (get-in raw-plan [:attributes :public-buffer-bindings]) constants roles)
+                      projection public-bindings constants roles)
         constants (:constants field-intent)
         roles (:roles field-intent)
+        field-output-entries (equation-first-field-output-entries
+                              projection public-bindings outputs)
+        ordinary-outputs (remove vector? outputs)
         attributes (:attributes raw-plan)
-        public-bindings (:public-buffer-bindings attributes)
         public-defaults (:public-buffer-roles attributes)
         _ (doseq [[binding leaves] aggregate-leaves
                   leaf leaves
-                  :let [role (or (get roles (:symbol leaf))
+                  :when (contains? public-bindings (:symbol leaf))
+                  :let [requested-role (get roles (:symbol leaf))
+                        role (or requested-role
                                  (when (some #{(:symbol leaf)} constants) :constant)
                                  (get public-defaults (:symbol leaf)))]]
-            (when (or (contains? #{:state :output} (get public-defaults (:symbol leaf)))
-                      (and role (not (contains? #{:input :constant} role))))
-              (throw (ex-info "the initial aggregate vertical admits read-only fields only"
+            (when (or (and (contains? #{:state :output}
+                                      (get public-defaults (:symbol leaf)))
+                           (not= :state requested-role))
+                      (not (contains? #{:input :constant :state} role)))
+              (throw (ex-info "mutable aggregate fields require explicit :state intent"
                               {:reason :compiled-aggregate-write :parameter binding :field (:field leaf)
-                               :role role}))))
+                               :path (materialization/projection-path leaf)
+                               :role role :requested-role requested-role
+                               :default-role (get public-defaults (:symbol leaf))}))))
         public-symbols (set (keys public-bindings))
         requested-symbols (set (concat donate constants (keys roles)))
         unknown (set/difference requested-symbols public-symbols)
@@ -858,7 +928,7 @@
             (throw (ex-info "equation-first roles name non-buffer public parameters"
                             {:reason :compiled-equation-first-role-symbols
                              :symbols unknown :available public-symbols})))
-        request (boundary-request donate constants outputs taps roles)
+        request (boundary-request donate constants ordinary-outputs taps roles)
         effective-roles (merge public-defaults (:effective-roles request))
         token-roles (into {} (map (fn [[symbol role]]
                                     [(get public-bindings symbol) role]))
@@ -878,6 +948,8 @@
         projected-arguments (when projection
                               (zipmap (map :symbol (:physical-parameters projection))
                                       (materialization/parameter-arguments invocation-plan args)))
+        _ (validate-mutable-aggregate-aliases!
+           projection public-bindings projected-arguments aggregate-leaves roles)
         aggregate-scalars (into {}
                                 (map (fn [[binding leaves]]
                                        [binding (into {}
@@ -916,7 +988,8 @@
                               (equation-first-value plan (resolve-node value) nil)))
         project-entry (fn [{:keys [key sym from]}] (output-entry key sym from))
         donated-nodes (map project-entry (:donated-entries request))
-        explicit-nodes (map project-entry (:output-entries request))
+        ordinary-explicit-nodes (map project-entry (:output-entries request))
+        field-explicit-nodes (map project-entry field-output-entries)
         semantic-outputs (vec (:semantic-outputs attributes))
         semantic-nodes (map-indexed
                         (fn [index [value _]]
@@ -924,12 +997,19 @@
                            (equation-first-output-key value index (count semantic-outputs))
                            value :result))
                         semantic-outputs)
+        field-semantic-overlap (set/intersection (set (map :node field-explicit-nodes))
+                                                 (set (map :node semantic-nodes)))
+        _ (when (seq field-semantic-overlap)
+            (throw (ex-info "field outputs cannot duplicate semantic result storage"
+                            {:reason :compiled-field-output-semantic-overlap
+                             :nodes field-semantic-overlap})))
         tap-nodes (map project-entry (:tap-entries request))
         out-tree (reduce (fn [entries entry]
                            (if (some #(= (:node %) (:node entry)) entries)
                              entries
                              (conj entries entry)))
-                         [] (concat donated-nodes explicit-nodes semantic-nodes tap-nodes))
+                         [] (concat donated-nodes ordinary-explicit-nodes field-explicit-nodes
+                                    semantic-nodes tap-nodes))
         duplicate-keys (->> out-tree (map :key) frequencies
                             (keep (fn [[key count]] (when (< 1 count) key))) set)
         _ (when (seq duplicate-keys)
@@ -1048,7 +1128,12 @@
 
    `:compiler :equation-first` selects the typed SOAC→scheduled KernelBody→LinkPlan vertical.
    `:resident-descriptor` remains the default during migration. Selection is explicit: the
-   equation-first compiler never falls back to a resident descriptor after a coverage failure."
+   equation-first compiler never falls back to a resident descriptor after a coverage failure.
+
+   Equation-first aggregate roles/constants may name a logical root or an exact vector field path.
+   Written aggregate leaves require explicit `:state` intent. `:outputs` accepts exact vector paths
+   and returns flat path-keyed DeviceArrays; aggregate donation and whole-root output remain
+   unsupported ownership contracts."
   [fn-var args {:keys [compiler] :or {compiler :resident-descriptor} :as opts}]
   (case compiler
     :resident-descriptor

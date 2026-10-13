@@ -49,11 +49,47 @@
   (is (= {'state_positions :input 'state_labels :input}
          (:roles (resolve-intent [] {'state :input [:state :positions] :input})))))
 
-(deftest field-output-intent-remains-lazily-unsupported
-  (doseq [[option from] [[:donate :donated] [:outputs :output] [:taps :tap]]]
+(deftest field-donation-and-tap-intent-remain-lazily-unsupported
+  (doseq [[option from] [[:donate :donated] [:taps :tap]]]
     (let [opts {option [[:state :positions]]}
           request (#'compiled/boundary-request (:donate opts) nil (:outputs opts) (:taps opts) {})
           entry-key (case option :donate :donated-entries :outputs :output-entries :taps :tap-entries)
           error (try (vec (get request entry-key)) (catch clojure.lang.ExceptionInfo e e))]
       (is (= :compiled-field-selector-intent (:reason (ex-data error))))
       (is (= from (:intent (ex-data error)))))))
+
+(deftest exact-field-outputs-retain-public-path-keys
+  (is (= [{:key [:state :positions] :sym 'state_positions :from :output}
+          {:key [:weights :blocks 0 :values] :sym 'weights_0 :from :output}]
+         (#'compiled/equation-first-field-output-entries
+          projection buffers [[:state :positions] [:weights :blocks 0 :values]])))
+  (doseq [[selectors reason]
+          [[[[:state :positions] [:state :positions]] :compiled-field-output-duplicates]
+           [[[:state :width]] :compiled-field-selector]
+           [[[:state :missing]] :compiled-field-selector]]]
+    (let [error (try (#'compiled/equation-first-field-output-entries
+                      projection buffers selectors)
+                     (catch clojure.lang.ExceptionInfo e e))]
+      (is (= reason (:reason (ex-data error)))))))
+
+(deftest mutable-field-alias-check-is-cross-public-and-state-scoped
+  (let [positions (float-array 2)
+        labels (int-array 2)
+        other (float-array 2)
+        projected {'state_positions positions 'state_labels labels
+                   'other_positions other 'weights_0 (float-array 2)}]
+    (is (nil? (#'compiled/validate-mutable-aggregate-aliases!
+               projection buffers projected
+               {'state (take 3 (:physical-parameters projection))}
+               {'state_positions :state})))
+    (doseq [aliased [(assoc projected 'other_positions positions)
+                     (assoc projected 'weights_0 positions)]]
+      (let [error (try (#'compiled/validate-mutable-aggregate-aliases!
+                        projection buffers aliased
+                        {'state (take 3 (:physical-parameters projection))}
+                        {'state_positions :state})
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :compiled-aggregate-state-alias (:reason (ex-data error))))))
+    (is (nil? (#'compiled/validate-mutable-aggregate-aliases!
+               projection buffers (assoc projected 'other_positions positions)
+               {'state (take 3 (:physical-parameters projection))} {})))))

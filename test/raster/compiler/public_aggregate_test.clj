@@ -144,10 +144,11 @@
       (is (= :compiled-field-selector-compiler
              (reason #(compiled/lower #'project-state! [initial (float-array 17) 17]
                                      {:target target :dtype :float :constants [[:state :labels]]}))))
-      (is (= :compiled-aggregate-write
-             (reason #(compiled/lower #'write-state! [initial 17]
-                                     {:compiler :equation-first :target target :dtype :float
-                                      :roles {[:state :positions] :state}}))))
+      (let [mutable (compiled/lower #'write-state! [initial 17]
+                                    {:compiler :equation-first :target target :dtype :float
+                                     :roles {[:state :positions] :state}})]
+        (is (= :state (->> (:in-tree mutable)
+                           (filter #(= [:state :positions] (:key %))) first :role))))
       (finally (compiled/close! artifact)))))
 
 (deftest public-field-intent-preserves-resident-readonly-contracts
