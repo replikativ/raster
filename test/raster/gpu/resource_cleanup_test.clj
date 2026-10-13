@@ -4,6 +4,66 @@
 
 (defn- error-of [f] (try (f) nil (catch Throwable e e)))
 
+(deftest synchronous-use-reservation-refuses-concurrent-and-reentrant-retirement
+  (let [released (atom 0) owner (cleanup/owner [{:id :native :release #(swap! released inc)}])
+        entered (promise) proceed (promise)
+        worker (future (cleanup/using! owner
+                                      #(do (deliver entered true)
+                                           (deref proceed 5000 :timeout))))]
+    (try
+      (is (= true (deref entered 5000 :timeout)))
+      (let [error (error-of #(cleanup/release! owner))]
+        (is (= :owner-in-use (:reason (ex-data error))))
+        (is (true? (:cleanup-retry-safe? (ex-data error)))))
+      (is (= :live (:phase (cleanup/status owner))))
+      (is (zero? @released))
+      (finally (deliver proceed :finished)))
+    (is (= :finished (deref worker 5000 :timeout)))
+    (cleanup/using! owner
+                    #(is (= :owner-in-use (:reason (ex-data (error-of (fn [] (cleanup/release! owner))))))))
+    (cleanup/release! owner)
+    (is (= 1 @released))
+    (is (= :owner-releasing (:reason (ex-data (error-of #(cleanup/using! owner (fn [] :invalid)))))))))
+
+(deftest failed-synchronous-use-does-not-strand-a-reservation
+  (let [released (atom 0) owner (cleanup/owner [{:id :native :release #(swap! released inc)}])
+        primary (ex-info "operation failed" {})]
+    (is (identical? primary (error-of #(cleanup/using! owner (fn [] (throw primary))))))
+    (cleanup/release! owner)
+    (is (= 1 @released))))
+
+(deftest failed-use-publication-removes-its-exact-reservation
+  (let [owner (cleanup/owner []) primary (ex-info "watch failed after reserve" {})]
+    (add-watch (:state owner) :fault
+               (fn [_ _ before after]
+                 (when (and (empty? (::cleanup/uses before)) (seq (::cleanup/uses after)))
+                   (throw primary))))
+    (is (identical? primary (error-of #(cleanup/using! owner (fn [] :not-reached)))))
+    (is (empty? (::cleanup/uses @(:state owner))))
+    (cleanup/release! owner)
+    (is (= :released (:phase (cleanup/status owner))))))
+
+(deftest retained-uses-have-independent-exact-retirement-authority
+  (let [retired (atom 0) parent (cleanup/owner [{:id :memory :release #(swap! retired inc)}])
+        a (cleanup/retain-use! parent) b (cleanup/retain-use! parent)]
+    (cleanup/release! (::cleanup/owner a))
+    (is (= :owner-in-use (:reason (ex-data (error-of #(cleanup/release! parent))))))
+    (is (zero? @retired))
+    (cleanup/release! (::cleanup/owner b))
+    (cleanup/release! parent)
+    (is (= 1 @retired))))
+
+(deftest changed-reservation-publication-cannot-authorize-native-use
+  (let [parent (cleanup/owner []) reached (atom false)]
+    (add-watch (:state parent) :remove
+               (fn [_ _ _ after]
+                 (when (seq (::cleanup/uses after))
+                   (swap! (:state parent) dissoc ::cleanup/uses))))
+    (is (= :owner-use-generation-mismatch
+           (:reason (ex-data (error-of #(cleanup/using! parent (fn [] (reset! reached true))))))))
+    (is (false? @reached))
+    (cleanup/release! parent)))
+
 (deftest registry-replacement-admission-precedes-teardown
   (let [old {:id :old} registry (atom {:kernel old}) calls (atom 0)
         destroy! (fn [_] (swap! calls inc))]

@@ -8,6 +8,22 @@ runtime registration until the following acceptance gates pass.
 
 ## First device gate
 
+The memory-foundation integration keeps CUDA session registration disabled. It adds
+ordinal-zero allocation/views and checked synchronous ranges under the common root and
+cleanup authorities, not graph binding or public execution. `retain-use!` supplies an
+exact owner's lifetime lease; `using!` scopes one synchronously. Teardown refuses active
+leases without changing phase. Reservation precedes the root/queue monitor, avoiding
+owner/root lock inversion; no owner monitor is held through native work.
+
+Manufactured byte plans are normalized through the exact typed slice/host range contract
+before native contact. Copies use private pinned staging: a pageable “synchronous” upload
+can return before DMA completes ([CUDA synchronization rules](https://docs.nvidia.com/cuda/archive/12.5.1/cuda-driver-api/api-sync-behavior.html)).
+Completion, staging retirement and buffer-use retirement form one cleanup dependency plan.
+An uncertain copy outcome drains its actual default stream before cleanup, not the separate
+nonblocking execution stream. Failed completion retains the operation owner, pinned memory,
+buffer-use lease and supporting context without native retry. These are hardware-free
+contract/fault controls; the integrated CUDA host must independently check real execution.
+
 The independently integrated `raster.gpu.cuda-driver` leaf marshals native operations
 and brackets each calling thread's exact context. It does not register a resident backend.
 Native acquisition publication includes context restoration: allocations, modules, events

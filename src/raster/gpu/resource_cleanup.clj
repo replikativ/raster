@@ -95,16 +95,67 @@
                     {:reason :owner-releasing :pending (pending cleanup)})))
   cleanup)
 
+(declare build! release!)
+
+(defn retain-use!
+  "Atomically reserve an exact live owner's lifetime. The returned common Cleanup owner
+   releases that reservation; retain it through completion or unresolved rollback. Native
+   use holds no owner monitor. Teardown refuses active uses without changing owner phase."
+  [cleanup]
+  (let [state (:state cleanup) token (Object.) captured? (volatile! false)
+        lease (owner [{:id :owner-use
+                      :release #(locking state
+                                  (when (and @captured? (not (contains? (::uses @state) token)))
+                                    (throw (ex-info "Native use lost its exact reservation"
+                                                    {:reason :owner-use-generation-mismatch})))
+                                  (when (contains? (::uses @state) token)
+                                    (swap! state (fn [current]
+                                                   (let [uses (disj (::uses current) token)]
+                                                     (if (seq uses) (assoc current ::uses uses)
+                                                         (dissoc current ::uses)))))))}])]
+    (build! lease
+            #(do (locking state
+                   (assert-not-building! cleanup)
+                   (assert-live! cleanup)
+                   (swap! state update ::uses (fnil conj #{}) token)
+                   (when-not (contains? (::uses @state) token)
+                     (throw (ex-info "Native use reservation changed during publication"
+                                     {:reason :owner-use-generation-mismatch})))
+                   (assert-live! cleanup)
+                   (vreset! captured? true))
+                 {:parent cleanup})
+            nil)))
+
+(defn using!
+  "Reserve this exact owner's lifetime through one synchronous callback. Asynchronous
+   work must instead retain a retain-use! lease in its completion/rollback cleanup DAG."
+  [cleanup f]
+  (when-not (fn? f)
+    (throw (ex-info "Native use requires a callback" {:reason :invalid-cleanup-plan})))
+  (let [lease (retain-use! cleanup) failure (volatile! nil)]
+    (try (f)
+         (catch Throwable e (vreset! failure e) (throw e))
+         (finally
+           (try (release! (::owner lease))
+                (catch Throwable e
+                  (if-let [primary @failure]
+                    (when-not (identical? primary e) (.addSuppressed primary e))
+                    (throw e))))))))
+
 (defn release!
   "Release each currently independent resource, retaining only failed/blocked entries.
    Successful callbacks never run again. The first failure is rethrown with later independent
    failures suppressed. The owner stays non-live even after a failed attempt; subsequent calls
    retry explicitly retry-safe failures only. An unclassified/indeterminate failure is reported
-   again without retrying its callback. Calls serialize; recursive teardown is rejected."
+   again without retrying its callback. Active uses refuse before phase changes.
+   Calls serialize; recursive teardown is rejected."
   [cleanup]
   (let [state (:state cleanup)]
     (locking state
       (assert-not-building! cleanup)
+      (when (seq (::uses @state))
+        (throw (ex-info "Native owner has active uses"
+                        {:reason :owner-in-use :cleanup-retry-safe? true})))
       (when (= :releasing (:phase @state))
         (throw (ex-info "Recursive native owner teardown"
                         {:reason :recursive-cleanup})))
