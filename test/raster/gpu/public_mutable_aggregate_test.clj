@@ -203,7 +203,7 @@
                                     (assoc options :outputs
                                            [[:parameters :layer :weight]
                                             [:parameters :layer :weight]])))))
-    (is (= :compiled-field-output-semantic-overlap
+    (is (= :compiled-field-output-overlap
            (reason #(compiled/lower
                      #'fixture/return-weight! [(:parameters input) 4]
                      {:compiler :equation-first :target :ocl:0 :dtype :float

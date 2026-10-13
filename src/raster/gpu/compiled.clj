@@ -849,6 +849,15 @@
                        :selectors selectors :symbols duplicate-symbols})))
     entries))
 
+(defn- validate-field-output-nodes!
+  "Exact field outputs cannot be silently removed by ordinary output node deduplication."
+  [field-entries other-entries]
+  (let [overlap (set/intersection (set (map :node field-entries))
+                                  (set (map :node other-entries)))]
+    (when (seq overlap)
+      (throw (ex-info "field outputs cannot duplicate another requested output or semantic result"
+                      {:reason :compiled-field-output-overlap :nodes overlap})))))
+
 (defn- validate-mutable-aggregate-aliases!
   "Reject primitive-array aliases involving mutable aggregate leaves before final proof.
 
@@ -997,13 +1006,10 @@
                            (equation-first-output-key value index (count semantic-outputs))
                            value :result))
                         semantic-outputs)
-        field-semantic-overlap (set/intersection (set (map :node field-explicit-nodes))
-                                                 (set (map :node semantic-nodes)))
-        _ (when (seq field-semantic-overlap)
-            (throw (ex-info "field outputs cannot duplicate semantic result storage"
-                            {:reason :compiled-field-output-semantic-overlap
-                             :nodes field-semantic-overlap})))
         tap-nodes (map project-entry (:tap-entries request))
+        _ (validate-field-output-nodes!
+           field-explicit-nodes
+           (concat donated-nodes ordinary-explicit-nodes semantic-nodes tap-nodes))
         out-tree (reduce (fn [entries entry]
                            (if (some #(= (:node %) (:node entry)) entries)
                              entries

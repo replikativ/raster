@@ -72,6 +72,19 @@
                      (catch clojure.lang.ExceptionInfo e e))]
       (is (= reason (:reason (ex-data error)))))))
 
+(deftest exact-field-output-nodes-cannot-be-hidden-by-symbolic-aliases
+  (let [field {:key [:state :positions] :sym 'state_positions :node :p}]
+    (doseq [from [:output :tap :donated :result]]
+      (let [alias {:key :local-value :sym 'local-value :node :p :from from}
+            error (try (#'compiled/validate-field-output-nodes! [field] [alias])
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :compiled-field-output-overlap (:reason (ex-data error))))
+        (is (= #{:p} (:nodes (ex-data error))))))
+    (is (nil? (#'compiled/validate-field-output-nodes!
+               [field] [{:key :different :node :l}])))
+    (is (nil? (#'compiled/validate-field-output-nodes!
+               [] [{:key :one :node :p} {:key :two :node :p}])))))
+
 (deftest mutable-field-alias-check-is-cross-public-and-state-scoped
   (let [positions (float-array 2)
         labels (int-array 2)
