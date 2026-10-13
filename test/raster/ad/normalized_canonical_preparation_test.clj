@@ -14,25 +14,37 @@
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 (defn- plain [value] (if (number? value) value (vec value)))
 (defn- cases []
-  [[(normalized/linearize-map-program (#'maps/map-program :double {}) *ns*)
-    canonical/adapt-map {'n (long 2) 'x (double-array [2.0 -3.0])}
-    (double-array [0.5 -0.5]) (double-array [0.125 0.25])]
-   [(normalized/linearize-map-sum-program (#'sums/identity-source :double) *ns* {:active-input 'xs})
-    canonical/adapt-map-sum {'size (long 2) 'xs (double-array [2.0 -3.0]) 'weights (double-array 2)}
-    0.5 (double-array [0.125 0.25])]
-   [(#'indexed/bundle :double :long 'n 'm)
-    canonical/adapt-indexed-map {'n (long 2) 'm (long 3) 'indices (long-array [1 1])
-                               'data (double-array [3.0 5.0 7.0])}
-    (double-array [0.5 -0.5]) (double-array [0.125 0.25 0.5])]
-   [(normalized/linearize-map-sum-program (#'capture/source #'capture/gaussian-double :double)
-                                         *ns* {:active-input 'mu})
-    canonical/adapt-map-sum {'size (long 3) 'mu 0.25 'sigma 1.7
-                            'observations (double-array [0.5 -0.25 1.0])}
-    0.5 0.125]])
+  ;; Preparing a later family may register lazy numeric specializations. Build each
+  ;; witness immediately before using it; an eager vector would rightly stale earlier
+  ;; witnesses at that definition boundary. Keep stale-rule refusal tests independent.
+  [(fn [] [(normalized/linearize-map-program (#'maps/map-program :double {}) *ns*)
+           canonical/adapt-map {'n (long 2) 'x (double-array [2.0 -3.0])}
+           (double-array [0.5 -0.5]) (double-array [0.125 0.25])])
+   (fn [] [(normalized/linearize-map-sum-program (#'sums/identity-source :double) *ns* {:active-input 'xs})
+           canonical/adapt-map-sum {'size (long 2) 'xs (double-array [2.0 -3.0]) 'weights (double-array 2)}
+           0.5 (double-array [0.125 0.25])])
+   (fn [] [(#'indexed/bundle :double :long 'n 'm)
+           canonical/adapt-indexed-map {'n (long 2) 'm (long 3) 'indices (long-array [1 1])
+                                        'data (double-array [3.0 5.0 7.0])}
+           (double-array [0.5 -0.5]) (double-array [0.125 0.25 0.5])])
+   (fn [] [(normalized/linearize-map-sum-program (#'capture/source #'capture/gaussian-double :double)
+                                                 *ns* {:active-input 'mu})
+           canonical/adapt-map-sum {'size (long 3) 'mu 0.25 'sigma 1.7
+                                    'observations (double-array [0.5 -0.25 1.0])}
+           0.5 0.125])])
+
+(deftest case-table-does-not-eagerly-prepare-revision-bound-evidence
+  (let [premature (fn [& _] (throw (ex-info "eager evidence construction" {})))]
+    (with-redefs [normalized/linearize-map-program premature
+                  normalized/linearize-map-sum-program premature]
+      (let [builders (cases)]
+        (is (= 4 (count builders)))
+        (is (every? fn? builders))))))
 
 (deftest canonical-preparation-is-shared-by-every-existing-family
-  (doseq [[evidence named-adapter environment seed direction] (cases)]
-    (let [owner (canonical/adapt evidence)
+  (doseq [make-case (cases)]
+    (let [[evidence named-adapter environment seed direction] (make-case)
+          owner (canonical/adapt evidence)
           named (named-adapter evidence)
           prepared (with-redefs [canonical/adapt (fn [& _] (throw (ex-info "legacy admission consulted" {})))
                                  canonical/adapt-map (fn [& _] (throw (ex-info "map selector consulted" {})))
