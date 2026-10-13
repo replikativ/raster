@@ -61,12 +61,16 @@
 (def-split-cancelling-carry split-contextual-carry 0.0)
 (def-split-cancelling-carry split-explicit-double-carry (double 0.0))
 
-(defmacro def-weighted-carry [name stages]
-  (let [stage `(par/map! ~'out ~'t 1 nil
+(defmacro def-weighted-carry [name stages & [float-addition-boundary?]]
+  (let [weighted-term `(n/* ~'gain (double (aget ~'src ~'i)))
+        addition-term (if float-addition-boundary?
+                        `(float ~weighted-term)
+                        weighted-term)
+        stage `(par/map! ~'out ~'t 1 nil
                  (loop [~'i 0 ~'acc 0.0]
                    (if (< ~'i ~'cnt)
                      (recur (inc ~'i)
-                            (n/+ ~'acc (n/* ~'gain (double (aget ~'src ~'i)))))
+                            (n/+ ~'acc ~addition-term))
                      ~'acc)))]
     `(deftm ~name
        [~'src ~':- (~'Array ~'float) ~'cnt ~':- ~'Long ~'gain ~':- ~'Double]
@@ -75,8 +79,23 @@
          ~@(repeat stages stage)
          ~'out))))
 
-(def-weighted-carry unsplit-weighted-carry 1)
-(def-weighted-carry split-weighted-carry 4)
+(def-weighted-carry unsplit-weighted-carry 1 true)
+(def-weighted-carry split-weighted-carry 4 true)
+(def-weighted-carry unsplit-double-promoting-weighted-carry 1)
+(def-weighted-carry split-double-promoting-weighted-carry 4)
+
+(deftest known-double-weighted-operand-promotes-contextual-carry
+  ;; A contextual seed and Float output do not fix addition to Float when the
+  ;; unchanged weighted operand is Double. Preserve both method layouts.
+  (let [input (float-array [1.0e8 1.0 -1.0e8])]
+    (doseq [[v f] [[#'unsplit-double-promoting-weighted-carry
+                   unsplit-double-promoting-weighted-carry]
+                  [#'split-double-promoting-weighted-carry
+                   split-double-promoting-weighted-carry]]]
+      (let [compiled (pipeline/compile-aot v)]
+        (doseq [gain [1.0 2.0]]
+          (is (= [gain] (vec (f input 3 gain))))
+          (is (= [gain] (vec (compiled input 3 gain)))))))))
 
 (deftest helper-extraction-preserves-typed-mixed-precision-operands
   ;; The Double weighted term is converted at the retained Float addition,

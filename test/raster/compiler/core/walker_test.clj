@@ -1,6 +1,8 @@
 (ns raster.compiler.core.walker-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.walker :as walker]
+            [raster.compiler.core.inference :as inf]
+            [raster.core :as core :refer [deftm ftm]]
             [raster.arrays]
             [raster.sci.distributions]
             [raster.numeric]))
@@ -326,3 +328,122 @@
             walked (walker/walk form ctx)
             keys   (map first (partition 2 (drop 2 walked)))]
         (is (= [0 1] keys) (str head " keys stay literal (not (long 0)/(long 1))"))))))
+
+
+;; Known nested returns constrain scalar dispatch before contextual literal typing.
+(deftm nested-return-double-inverse
+  (All [T] [a :- (Array T) x :- Double eps :- Double] :- Double
+    (raster.numeric// 1.0 (raster.numeric/sqrt (raster.numeric/+ x eps)))))
+(deftm local-return-double-inverse
+  (All [T] [a :- (Array T) x :- Double eps :- Double] :- Double
+    (let [root (raster.numeric/sqrt (raster.numeric/+ x eps))]
+      (raster.numeric// 1.0 root))))
+(deftm explicit-return-double-inverse
+  (All [T] [a :- (Array T) x :- Double eps :- Double] :- Double
+    (raster.numeric// 1.0 (double (raster.numeric/sqrt (raster.numeric/+ x eps))))))
+(deftm nested-return-double-left
+  (All [T] [a :- (Array T) x :- Double eps :- Double] :- Double
+    (raster.numeric// (raster.numeric/sqrt (raster.numeric/+ x eps)) 3.0)))
+(deftm nested-return-double-reducible
+  (All [T] [a :- (Array T) x :- Double] :- Double
+    (raster.numeric/+ 1.0 (raster.numeric/sqrt x) 3.0)))
+(deftm nested-return-element-inverse
+  (All [T] [a :- (Array T) x :- T] :- T
+    (raster.numeric// 1.0000000596046448 (raster.numeric/sqrt x))))
+(deftm local-return-element-inverse
+  (All [T] [a :- (Array T) x :- T] :- T
+    (let [root (raster.numeric/sqrt x)]
+      (raster.numeric// 1.0000000596046448 root))))
+(deftm observed-double-return [seen :- Object x :- Double] :- Double
+  (do (swap! seen conj x) x))
+(deftm observed-double-return [seen :- String x :- Double] :- Float (float x))
+(deftm nested-return-observed-inverse
+  (All [T] [a :- (Array T) observe :- (Fn [Double] Double) x :- Double] :- Double
+    (raster.numeric// 1.0 (observe x))))
+(deftm nested-return-observed-pair
+  (All [T] [a :- (Array T) observe :- (Fn [Double] Double) x :- Double y :- Double] :- Double
+    (raster.numeric/+ (observe x) (observe y))))
+
+(deftest known-nested-return-constrains-both-operand-positions
+  (doseq [form ['(raster.numeric// 1.0 (raster.numeric/sqrt x))
+                '(raster.numeric// (raster.numeric/sqrt x) 3.0)]]
+    (let [walked (walker/walk-body form {:source-ns *ns* :type-env (te {'x 'double})
+                                       :element-dtype :float})]
+      (is (= 'double (:raster.type/tag (meta walked)))
+          "a Float surrounding array cannot narrow a declared Double return"))))
+
+(deftest known-nested-double-return-executes-the-declared-arithmetic
+  (binding [core/*compile-deftm-bytecode?* true core/*jit-simd?* false
+            core/*jit-silent-fallback?* false]
+    (doseq [a [(float-array 1) (double-array 1)]
+            x [0.0819668173789978 0.08658681511878967 0.0]]
+      (let [eps 1.0e-6 root (Math/sqrt (+ x eps)) expected (/ 1.0 root)
+            bits (Double/doubleToRawLongBits expected)]
+        (is (= bits (Double/doubleToRawLongBits (nested-return-double-inverse a x eps))))
+        (is (= bits (Double/doubleToRawLongBits (local-return-double-inverse a x eps))))
+        (is (= bits (Double/doubleToRawLongBits (explicit-return-double-inverse a x eps))))
+        (is (= (Double/doubleToRawLongBits (/ root 3.0))
+               (Double/doubleToRawLongBits (nested-return-double-left a x eps))))))))
+
+(deftest known-float-return-retains-contextual-literal-narrowing
+  (binding [core/*compile-deftm-bytecode?* true core/*jit-simd?* false
+            core/*jit-silent-fallback?* false]
+    (let [x (float 3.0) root (float (Math/sqrt (double x)))
+          expected (float (/ (double (float 1.0000000596046448)) (double root)))
+          widened (float (/ 1.0000000596046448 (double root)))
+          a (float-array 1)]
+      (is (not= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits widened))
+          "the witness distinguishes Float contextual literal arithmetic from widening")
+      (is (= (Float/floatToRawIntBits expected)
+             (Float/floatToRawIntBits (nested-return-element-inverse a x))))
+      (is (= (Float/floatToRawIntBits expected)
+             (Float/floatToRawIntBits (local-return-element-inverse a x)))))
+    (let [x 3.0 expected (/ 1.0000000596046448 (Math/sqrt x))]
+      (is (= (Double/doubleToRawLongBits expected)
+             (Double/doubleToRawLongBits (nested-return-element-inverse (double-array 1) x)))))))
+
+(deftest reducible-call-retains-nested-double-return-before-literal-narrowing
+  (binding [core/*compile-deftm-bytecode?* true core/*jit-simd?* false
+            core/*jit-silent-fallback?* false]
+    (doseq [a [(float-array 1) (double-array 1)] x [0.0819668173789978 3.0000000000000004]]
+      (is (= (Double/doubleToRawLongBits (+ (+ 1.0 (Math/sqrt x)) 3.0))
+             (Double/doubleToRawLongBits (nested-return-double-reducible a x)))))))
+
+(deftest nested-return-resolution-preserves-effect-order-and-single-evaluation
+  (binding [core/*compile-deftm-bytecode?* true core/*jit-simd?* false
+            core/*jit-silent-fallback?* false]
+    (let [seen (atom []) x 3.0000000000000004 a (float-array 1)
+          observe (ftm [v :- Double] :- Double (do (swap! seen conj v) v))]
+      (is (= (Double/doubleToRawLongBits (/ 1.0 x))
+             (Double/doubleToRawLongBits (nested-return-observed-inverse a observe x))))
+      (is (= [x] @seen))
+      (reset! seen [])
+      (is (= 7.0 (nested-return-observed-pair a observe 3.0 4.0)))
+      (is (= [3.0 4.0] @seen)))))
+
+(deftest nested-return-evidence-does-not-manufacture-an-unknown-type
+  (let [source '(identity unknown)
+        rewritten (walker/walk-body source {:source-ns *ns* :type-env {}})
+        walked (walker/walk-body (list 'raster.numeric// 1.0 source)
+                                  {:source-ns *ns* :type-env {} :element-dtype :float})]
+    (is (nil? (inf/infer-rewritten-tag rewritten source {})))
+    (is (= 'float (:raster.type/tag (meta walked)))
+        "characterize existing partial-resolution fallback without changing it")))
+
+
+(deftest object-generic-return-is-dynamic-across-specific-overloads
+  (let [opts {:source-ns (the-ns 'raster.compiler.core.walker-test)
+              :type-env (te {'seen 'Object 'x 'double}) :element-dtype :float}
+        source '(observed-double-return seen x)
+        walked (walker/walk-body source opts)
+        seen (atom []) x 3.0000000000000004
+        object-result (observed-double-return seen x)
+        specific-result (observed-double-return "specific subtype" x)]
+    (is (= #'observed-double-return (ns-resolve (:source-ns opts) (first walked)))
+        "Object upper bounds preserve live generic dispatch")
+    (is (nil? (:raster.type/tag (meta walked))))
+    (is (nil? (inf/infer-rewritten-tag walked source (:type-env opts))))
+    (is (instance? Double object-result))
+    (is (= (Double/doubleToRawLongBits x) (Double/doubleToRawLongBits object-result)))
+    (is (instance? Float specific-result))
+    (is (= [x] @seen))))

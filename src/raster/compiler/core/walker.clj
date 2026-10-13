@@ -1435,24 +1435,8 @@
         elem-dt (:element-dtype ctx)
         rewritten-args0 (walk-forms (vec (rest form)) ctx)
         original-args0 (vec (rest form))
-        ;; B3 — call-arg half of contextual literal typing: a floating-literal arg
-        ;; adopts the element dtype WHEN that yields a clean concrete overload
-        ;; (arithmetic, e.g. (* 0.044715 x:float) → [Float Float]). A call whose
-        ;; narrowed args only PROMOTE — a concrete non-T param like eps:Double —
-        ;; keeps the true-typed literal (the un-narrowed fallback below). Self-
-        ;; routing per call; the fallback is exactly the previous behavior.
-        narrowed-orig (when (and (= elem-dt :float)
-                                 (some #(instance? Double %) original-args0))
-                        (mapv #(narrow-fp-literal-form % elem-dt) original-args0))
-        use-narrowed? (and narrowed-orig
-                           (binding [*ns* source-ns]
-                             (when-let [r (inf/try-resolve-call fn-sym narrowed-orig type-env)]
-                               (and (not (:promotion-casts r))
-                                    (not (some #{'Object 'Number} (:tags r)))))))
-        rewritten-args (if use-narrowed?
-                         (mapv #(narrow-fp-literal-form % elem-dt) rewritten-args0)
-                         rewritten-args0)
-        original-args (if use-narrowed? narrowed-orig original-args0)
+        ;; Use return evidence from the already-walked operands before selecting
+        ;; an overload. A nested known return constrains dispatch just like a local.
         extra-tags (mapv (fn [orig rewr]
                            (or (inf/infer-aget-type orig type-env)
                                ;; An alias-qualified raster.arrays/aget may be walked to
@@ -1464,14 +1448,32 @@
                                (when (seq? rewr)
                                  (binding [*ns* source-ns]
                                    (inf/infer-rewritten-tag rewr orig type-env)))))
-                         original-args rewritten-args)]
+                         original-args0 rewritten-args0)
+        ;; B3 — call-arg half of contextual literal typing: a floating-literal arg
+        ;; adopts the element dtype WHEN that yields a clean concrete overload
+        ;; (arithmetic, e.g. (* 0.044715 x:float) → [Float Float]). A call whose
+        ;; narrowed args only PROMOTE — a concrete non-T param like eps:Double —
+        ;; keeps the true-typed literal (the un-narrowed fallback below). Self-
+        ;; routing per call; the fallback retains the true-typed literal.
+        narrowed-orig (when (and (= elem-dt :float)
+                                 (some #(instance? Double %) original-args0))
+                        (mapv #(narrow-fp-literal-form % elem-dt) original-args0))
+        use-narrowed? (and narrowed-orig
+                           (binding [*ns* source-ns]
+                             (when-let [r (inf/try-resolve-call fn-sym narrowed-orig type-env extra-tags)]
+                               (and (not (:promotion-casts r))
+                                    (not (some #{'Object 'Number} (:tags r)))))))
+        rewritten-args (if use-narrowed?
+                         (mapv #(narrow-fp-literal-form % elem-dt) rewritten-args0)
+                         rewritten-args0)
+        original-args (if use-narrowed? narrowed-orig original-args0)]
     ;; Reducible desugaring: when a reducible deftm (like +, *) is called
     ;; with >2 args and no exact-arity overload exists, desugar to nested
     ;; binary calls: (+ a b c) → (+ (+ a b) c). This matches the dispatch
     ;; function's runtime behavior and enables per-pair devirtualization.
     (if (and (> (count original-args) 2)
              (not (binding [*ns* source-ns]
-                    (inf/try-resolve-call fn-sym original-args type-env)))
+                    (inf/try-resolve-call fn-sym original-args type-env extra-tags)))
              (when-let [v (ns-resolve source-ns fn-sym)]
                (:raster.core/reducible (meta v))))
       ;; Desugar and re-walk the reduced form
@@ -1480,8 +1482,7 @@
         (walk reduced-form ctx))
       ;; Standard path: try exact arity resolution
       (if-let [resolved (binding [*ns* source-ns]
-                          (let [r (or (inf/try-resolve-call fn-sym original-args type-env)
-                                      (inf/try-resolve-call fn-sym original-args type-env extra-tags))]
+                          (let [r (inf/try-resolve-call fn-sym original-args type-env extra-tags)]
                             ;; Don't devirtualize to Object-tagged methods — they are
                             ;; untyped fallbacks that box everything. Number fallbacks
                             ;; are accepted since resolve-method-entry already prefers

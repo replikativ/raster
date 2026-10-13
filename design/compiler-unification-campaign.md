@@ -4499,3 +4499,21 @@ derive and retain the complete source scalar interface and per-node dependencies
 those constructors, then retire the ABI-only boundary with legacy/typed scan, carry,
 empty, mixed-storage and math-policy regressions. A present scalar table (including an
 empty one) with a missing node dependency contract must fail closed.
+
+### Retained nested operand evidence at scalar dispatch
+
+The shared source walker must consume already-proved operand return types before
+speculating about contextual literal narrowing or selecting an exact-arity overload.
+A known nested Double result remains Double even in a Float-array specialization;
+only a genuinely compatible Float operation adopts the contextual Float literal.
+This applies at the ordinary and reducible call boundaries, using the existing
+inference/dispatch authority rather than a new backend-local type reconstruction.
+
+The extracted correction from nanparth's #1338 tree (`063e7fc0`) is bounded to that
+selection order. Unknown results and Object upper bounds retain the current dynamic
+dispatch behavior; the change is not a claim of complete source inference. Tests
+compare exact floating bits, both operand positions, effect order/single evaluation,
+reducible calls, and split/unsplit loop carriers. Explicit Float addition boundaries
+and uncast Double promotion are distinct oracles, not interchangeable tolerances.
+The wider conditional-index proof, artifact quotienting, resident-scalar composition
+and unchanged real-model acceptance obligations remain open.
