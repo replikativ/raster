@@ -178,7 +178,7 @@ jobs:
           command: |
             sudo apt-get update
             sudo apt-get install -y ca-certificates curl gnupg libopenblas-dev liblapacke-dev \
-              clang ocl-icd-libopencl1 clinfo
+              clang gdb ocl-icd-libopencl1 clinfo
             if [ "${RASTER_CI_OPENCL_RUNTIME:-pocl}" = "intel" ]; then
               sudo update-ca-certificates
               curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
@@ -194,6 +194,7 @@ jobs:
       - run:
           name: Run OpenCL-gated tests on the CPU OpenCL device
           command: >-
+            RASTER_CI_DEBUG_NATIVE_EXIT=1
             RASTER_TEST_TIMING_REPORT="test-results/opencl-timings-${CIRCLE_NODE_INDEX}.edn"
             scripts/ci-opencl-cpu.sh
       - store_artifacts:

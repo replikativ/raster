@@ -131,4 +131,10 @@ for namespace in "${namespaces[@]}"; do
   runner_args+=("-n" "${namespace}")
 done
 
+if [[ "${RASTER_CI_DEBUG_NATIVE_EXIT:-0}" == 1 ]]; then
+  # Keep the CLI's alias/JVM argument authority rather than reconstructing a Java invocation.
+  # The adapter preserves child failures: passing assertions cannot waive a native crash.
+  export RASTER_CI_REAL_JAVA="${JAVA_CMD:-$(command -v java)}"
+  export JAVA_CMD="${PWD}/scripts/ci-debug-java.sh"
+fi
 clojure -M:test:ci-timed "${runner_args[@]}"
