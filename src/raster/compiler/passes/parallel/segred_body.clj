@@ -7,7 +7,8 @@
    workgroup. Scalar expressions become typed SSA operations; target emitters never recover either
    the algorithm or schedule from Clojure source spelling. Unsupported scalar regions decline
    explicitly; scheduled graphs have no source-shaped target fallback."
-  (:require [raster.compiler.backend.intrinsics :as intrinsics]
+  (:require [clojure.set :as set]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.scalar-conversion :as scalar-conversion]
             [raster.compiler.core.numeric-constant :as constant]
@@ -16,6 +17,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -99,6 +101,10 @@
                                {:operation (:id segred) :schedule (:schedule segred)
                                 :schedule-error (ex-data exception)})))
         result-region (get-in operator [:attributes :result-region])
+        result-operands (vec (:operands result-region))
+        result-operand-ids (set (map :sym result-operands))
+        resident-scalar-captures
+        (set (get-in operator [:attributes :resident-scalar-captures]))
         output (or out-sym (first outputs))
         declared-type (fn [id]
                         (some-> (or (get array-types id)
@@ -106,9 +112,10 @@
                                          (when (or (symbol? id) (keyword? id))
                                            (symbol (name id)))))
                                 dtype/canon))
-        input-types (mapv (fn [input]
-                            (or (declared-type input) accumulator-dtype))
-                          (:inputs segred))
+        primary-inputs (remove result-operand-ids (:inputs segred))
+        primary-input-types (mapv (fn [input]
+                                    (or (declared-type input) accumulator-dtype))
+                                  primary-inputs)
         output-type (or (declared-type output) accumulator-dtype)]
     (when-not (reduction/scalar? operator)
       (decline! :scalar-product-reduction
@@ -145,12 +152,29 @@
                             (contains? #{:single :cross-block} phase)
                             (contains? #{:float :double} output-type)
                             (= output-type (dtype/canon (:result-dtype result-region)))))
-                   (every? #{accumulator-dtype} input-types))
+                   (every? #{accumulator-dtype} primary-input-types))
       (decline! :uniform-scalar-storage
                 "portable scalar SegRed requires uniform input/accumulator storage and a certified floating terminal region"
                 {:operation (:id segred) :segred-dtype (:dtype segred)
-                 :accumulator-dtype accumulator-dtype :input-dtypes input-types
+                 :accumulator-dtype accumulator-dtype :input-dtypes primary-input-types
                  :output-dtype output-type}))
+    (when (seq result-operands)
+      (let [fold-uses (util/free-syms (:lambda (segop/scalar-reduce-op segred)))]
+        (when-not
+         (and (= (count result-operands) (count result-operand-ids))
+              (set/subset? result-operand-ids (set (:inputs segred)))
+              (set/subset? result-operand-ids resident-scalar-captures)
+              (empty? (set/intersection result-operand-ids fold-uses))
+              (every? (fn [{:keys [sym dtype map]}]
+                        (and (axis-map/singleton-broadcast? map)
+                             (keyword? dtype) (dtype/known? dtype)
+                             (= (dtype/canon dtype) (declared-type sym))))
+                      result-operands))
+          (decline! :full-reduction-result-operands
+                    "full-reduction result operands require distinct typed resident singleton captures used only by the terminal transform"
+                    {:segred-id (:id segred) :operands result-operands
+                     :inputs (:inputs segred) :resident-captures resident-scalar-captures
+                     :fold-uses fold-uses}))))
     (when-not (and (integer? workgroup-size) (pos? workgroup-size)
                    (zero? (bit-and workgroup-size (dec workgroup-size))))
       (decline! :workgroup-size
@@ -191,7 +215,7 @@
                  :reduction-physical-phase (get-in operator [:attributes :physical-phase])}))
     {:operator operator :component component :dtype accumulator-dtype :output-dtype output-type
      :workgroup-size workgroup-size :phase phase :output output
-     :result-region result-region :schedule schedule}))
+     :result-region result-region :result-operands result-operands :schedule schedule}))
 
 (defn- retained-expression-dtype
   "Read the walker/TypedClojure result fact carried by a scalar expression.
@@ -510,11 +534,13 @@
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
   `array-types` and `scalar-types` are authoritative ABI facts. Tensor element storage and the
-   accumulator remain uniform (int32/int64/FP32/FP64). Integral combines retain their certified
-   wrapping policy; integral scalar parameters may also participate in index expressions."
+   accumulator remain uniform (int32/int64/FP32/FP64). A certified resident singleton used only
+   by the terminal result region retains its own operand dtype. Integral combines retain their
+   certified wrapping policy; integral scalar parameters may also participate in index expressions."
   [segred out-sym & {:keys [dtype array-types scalar-types coordinate-proof scalar-math]
                      :or {dtype :double array-types {} scalar-types {}}}]
   (let [{validated-dtype :dtype output :output result-region :result-region
+         result-operands :result-operands
          output-dtype :output-dtype}
         (validate-scalar-segred! segred out-sym array-types)
         dtype (or validated-dtype (:dtype segred) dtype)
@@ -525,6 +551,8 @@
         ;; descriptor-derived block size and capped group count.
         workgroup-size (or (get-in segred [:grid :block-size]) 256)
         arrays (vec (sort-by name (:inputs segred)))
+        result-operand-ids (set (map :sym result-operands))
+        primary-arrays (vec (remove result-operand-ids arrays))
         scalars (vec (sort-by name (:scalars segred)))
         scalar-dtype (fn [id] (or (get scalar-types id)
                                   (get scalar-types (symbol (name id))) dtype))
@@ -534,7 +562,9 @@
         _ (when-not (and (contains? #{:int :long :float :double} (dtype/canon dtype))
                          (integer? workgroup-size) (pos? workgroup-size)
                          (zero? (bit-and workgroup-size (dec workgroup-size)))
-                         (every? #(= (dtype/canon dtype) (dtype/canon (array-dtype %))) arrays)
+                         (every? #(= (dtype/canon dtype)
+                                     (dtype/canon (array-dtype %)))
+                                 primary-arrays)
                          (every? #(dtype/known? (dtype/canon (scalar-dtype %))) scalars))
             (decline! :uniform-scalar-storage
                       "KernelBody scalar reduction requires a static power-of-two workgroup and uniform tensor storage"
@@ -554,7 +584,7 @@
             (when-not (and view
                            (zero? (:n-free coordinate-proof))
                            (= [index bound] [proof-index proof-bound])
-                           (= (set arrays) operand-ids)
+                           (= (set primary-arrays) operand-ids)
                            ;; Facts retain every load occurrence. Validate each occurrence rather
                            ;; than looking up by symbol, which would select only the first read of
                            ;; an array and could hide a later unproved coordinate.
@@ -567,7 +597,7 @@
               (decline! :contraction-coordinate-proof
                         "affine scalar-contraction coordinates disagree with retained facts"
                         {:segred-id (:id segred) :facts coordinate-proof
-                         :index index :bound bound :arrays arrays
+                         :index index :bound bound :arrays primary-arrays
                          :operator operator :identity identity :element element}))
             true))
         identity (constant/literal-or-original identity)
@@ -588,7 +618,9 @@
           ;; authorizes only that result; nested calls still need retained walker/TypedClojure
           ;; facts in lower-element-operations.
           :declared-result-dtype dtype
-          :arrays (set arrays) :scalars (set scalars)
+          :arrays (set primary-arrays)
+          :array-types (into {} (map (fn [id] [id (array-dtype id)])) primary-arrays)
+          :scalars (set scalars)
           :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
           :lower-load-index
           (fn [array source-coordinate _scope]
@@ -643,9 +675,10 @@
         parameters
         (vec (concat
               (map #(body/->KernelParameter
-                     % :input dtype [(if (contains? resident-scalar-captures %) 1 '_n_bound)] :global
+                     % :input (dtype/canon (array-dtype %))
+                     [(if (contains? resident-scalar-captures %) 1 '_n_bound)] :global
                      (layout/row-major [(if (contains? resident-scalar-captures %) 1 '_n_bound)]
-                                       dtype)
+                                       (dtype/canon (array-dtype %)))
                      :operand)
                    arrays)
               [(body/->KernelParameter output :output output-dtype [group-count] :global
@@ -653,10 +686,6 @@
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
-        _ (when (and result-region (seq (:operands result-region)))
-            (decline! :full-reduction-result-operands
-                      "full-reduction result transforms cannot address tensor operands"
-                      {:segred-id (:id segred) :operands (:operands result-region)}))
         transformed
         (when result-region
           (scalar-region-lower/lower
@@ -664,10 +693,12 @@
            {:accumulator final-value :accumulator-dtype dtype :store-dtype output-dtype
             :scalar-math scalar-math
             :parameters (into {} (map (fn [parameter] [(:id parameter) parameter])) parameters)
-            :coordinate-lower (fn [_]
-                                (decline! :full-reduction-result-operands
-                                          "full-reduction result transform has no tensor axes"
-                                          {:segred-id (:id segred)}))
+            :coordinate-lower (fn [operand-map]
+                                (if (axis-map/singleton-broadcast? operand-map)
+                                  (axis-map/coordinate-exprs operand-map)
+                                  (decline! :full-reduction-result-operands
+                                            "full-reduction result transform has no tensor axes"
+                                            {:segred-id (:id segred) :map operand-map})))
             :id-prefix "completed-reduction"}))
         stored-value (or (:result transformed) final-value)
         kernel-body

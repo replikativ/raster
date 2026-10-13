@@ -19,11 +19,14 @@
             [raster.compiler.backend.gpu.kernel-body-target :as kernel-target]
             [raster.compiler.backend.gpu.emitted-graph-interface :as emitted-interface]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
@@ -1319,6 +1322,82 @@
         (catch clojure.lang.ExceptionInfo exception
           (is (= :nonterminal-result-transform
                  (:missing-rule (ex-data exception)))))))))
+
+(deftest completed-scalar-reduction-loads-a-mixed-typed-resident-singleton
+  (let [step '(clojure.core/+ acc element)
+        transform (dialect/make-result-transform
+                   {:accumulator 'acc
+                    :expression '(clojure.core/+ acc
+                                                 (clojure.core/double
+                                                  (clojure.core/aget resident 0)))
+                    :operands [{:value 'resident :dtype :float
+                                :map (axis-map/singleton-broadcast)}]
+                    :scalars [] :result-dtype :double})
+        attributes {:index 'i :extent 32 :accumulators '[acc]
+                    :identities [0.0] :dtypes [:double]
+                    :algebra [(scan/certify-reassociation
+                               {:acc 'acc :init 0.0 :lambda step} :double)]
+                    :attributes {:stable-array-captures '[resident]}
+                    :result-transform transform}
+        resident-value (assoc (av/tensor {:dtype :float :shape []})
+                              :representation {:kind :resident-scalar-buffer :elements 1}
+                              :memory-space :device)
+        facts (dialect/default-program-facts
+               {:values {'a (av/tensor {:dtype :double :shape [32]})
+                         'resident resident-value
+                         'sum (av/tensor {:dtype :double :shape []})}
+                :inputs '[a resident]
+                :equations {'reduction (dialect/default-equation-facts)}})
+        equation (list '= 'reduction '[sum]
+                       (list 'reduce attributes '[a] '[resident]
+                             (dialect/lambda-form '[acc element resident-capture] [step])))
+        program (dialect/make facts [equation] '[sum])
+        terminal (first (lower/lower-typed-reduce program nil :dtype :double))
+        options {:array-types {'a :double 'resident :float 'sum :double}}
+        certificate (segred-body/schedule terminal nil options)
+        parameters (get-in certificate [:body :parameters])
+        resident-parameter (first (filter #(= 'resident (:id %)) parameters))
+        resident-load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                           (= 'resident (:buffer %)))
+                                     (get-in certificate [:body :operations])))]
+    (is (= :float (:dtype resident-parameter)))
+    (is (= [1] (:shape resident-parameter)))
+    (is (= #{'resident}
+           (get-in terminal [:reduction :attributes :resident-scalar-captures])))
+    (is (= (axis-map/singleton-broadcast)
+           (get-in terminal [:reduction :attributes :result-region :operands 0 :map])))
+    (is (contains? (:inputs terminal) 'resident))
+    (is (not (contains? (:scalars terminal) 'resident)))
+    (is (= [0] (:coordinates resident-load)))
+    (is (= :float (get-in resident-load [:result :type])))
+    (is (contains? (set (map :buffer (get-in certificate [:body :stable-reads])))
+                   'resident))
+    (let [missing-rule
+          (fn [candidate candidate-options]
+            (try
+              (segred-body/schedule candidate nil candidate-options)
+              nil
+              (catch clojure.lang.ExceptionInfo exception
+                (:missing-rule (ex-data exception)))))]
+      (is (= :full-reduction-result-operands
+             (missing-rule terminal (assoc-in options [:array-types 'resident] :double))))
+      (is (= :full-reduction-result-operands
+             (missing-rule (assoc-in terminal
+                                     [:reduction :attributes :resident-scalar-captures] #{})
+                           options)))
+      (is (= :full-reduction-result-operands
+             (missing-rule (assoc-in terminal
+                                     [:reduction :attributes :result-region :operands 0 :map]
+                                     (axis-map/of-axes [['i 32]]))
+                           options)))
+      (is (= :uniform-scalar-storage
+             (missing-rule terminal (assoc-in options [:array-types 'a] :float))))
+      (let [nonterminal (assoc terminal
+                               :phase :block-local
+                               :level (segop/->SegLevel :block :virtual)
+                               :schedule (segred-body/scalar-workgroup-tree-schedule
+                                          (:reduction terminal) (:grid terminal) :block-local))]
+        (is (= :nonterminal-result-transform (missing-rule nonterminal options)))))))
 
 (deftest completed-conversion-separates-terminal-storage-from-reduction-state
   (doseq [[source target] [[:float :double] [:double :float]]]

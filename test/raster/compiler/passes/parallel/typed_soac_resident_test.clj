@@ -194,4 +194,9 @@
     (is (seq transform-inputs))
     (doseq [value transform-inputs]
       (is (not (resident/resident-scalar-value? (get-in (dialect/facts result) [:values value])))))
+    (is (every? empty?
+                (map #(get-in (fusion/equation-info %)
+                              [:attributes :result-transform :operands])
+                     (dialect/equations result)))
+        "landing the resident operand substrate does not activate transform-use realization")
     (is (= result (dialect/validate! result)))))

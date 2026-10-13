@@ -35,6 +35,19 @@
   [groups]
   {:groups (mapv vec groups)})
 
+(defn singleton-broadcast
+  "The canonical map for a physical one-element vector which is independent of every
+   iteration axis.  Its one empty group is a rank-one physical dimension of extent one;
+   consequently `shape`, `coordinate-exprs` and `index-expr` derive `[1]`, `[0]` and `0`
+   without introducing a second indexing convention."
+  []
+  (of-groups [[]]))
+
+(defn singleton-broadcast?
+  "Whether `amap` is exactly the canonical axis-independent one-element vector map."
+  [amap]
+  (= (singleton-broadcast) amap))
+
 ;; ── queries ─────────────────────────────────────────────────────────────────────────
 (defn- mul
   "Product that folds literals and stays symbolic otherwise."

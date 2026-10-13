@@ -460,16 +460,17 @@
 (defn- axis-map!
   [operand]
   (let [groups (get-in operand [:map :groups])]
-    (when-not (and (vector? groups) (seq groups)
-                   (every? #(and (vector? %) (seq %)
-                                 (every? (fn [pair]
-                                           (and (vector? pair) (= 2 (count pair))
-                                                (value-id? (first pair))
-                                                (or (value-id? (second pair))
-                                                    (and (integer? (second pair))
-                                                         (pos? (second pair))))))
-                                         %))
-                           groups))
+    (when-not (or (axis-map/singleton-broadcast? (:map operand))
+                  (and (vector? groups) (seq groups)
+                       (every? #(and (vector? %) (seq %)
+                                     (every? (fn [pair]
+                                               (and (vector? pair) (= 2 (count pair))
+                                                    (value-id? (first pair))
+                                                    (or (value-id? (second pair))
+                                                        (and (integer? (second pair))
+                                                             (pos? (second pair))))))
+                                             %))
+                               groups)))
       (throw (ex-info "scalar-region operand requires a structured axis map"
                       {:operand operand})))
     (axis-map/shape (:map operand))))

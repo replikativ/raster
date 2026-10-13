@@ -325,14 +325,15 @@
                      (map :parameter operands) (map :parameter scalars)))
         axis-map? (fn [value]
                     (let [groups (:groups value)]
-                      (and (map? value) (vector? groups) (seq groups)
-                           (every? #(and (vector? %) (seq %)
-                                         (every? (fn [pair]
-                                                   (and (vector? pair) (= 2 (count pair))
-                                                        (value-id? (first pair))
-                                                        (extent? (second pair))))
-                                                 %))
-                                   groups))))]
+                      (or (axis-map/singleton-broadcast? value)
+                          (and (map? value) (vector? groups) (seq groups)
+                               (every? #(and (vector? %) (seq %)
+                                             (every? (fn [pair]
+                                                       (and (vector? pair) (= 2 (count pair))
+                                                            (value-id? (first pair))
+                                                            (extent? (second pair))))
+                                                     %))
+                                       groups)))))]
     (and (map? value)
          (vector? parameters) (seq parameters) (every? symbol? parameters)
          (= parameters expected-parameters)
@@ -1941,7 +1942,8 @@
 
       reduce
       (let [accumulators (:accumulators attributes)
-            transform (:result-transform attributes)]
+            transform (:result-transform attributes)
+            stable (set (get-in attributes [:attributes :stable-array-captures]))]
         (when-not (= accumulators (vec (take (count accumulators) parameters)))
           (fail! :typed-soac-reduce-accumulators
                  "reduce accumulator parameters must lead the lambda in declared order"
@@ -1972,13 +1974,16 @@
                      "reduce result transforms require explicit capture values"
                      {:equation equation-id :transform-captures transform-ids
                       :captures captures}))
-            ;; A full reduction has no remaining result axes with which to address a tensor.
-            ;; Tensor epilogues belong to segmented reductions; this scalar boundary accepts only
-            ;; uniform captures until an explicit scalar-load schedule exists.
-            (when (seq operand-ids)
+            ;; A full reduction has no remaining result axes.  Its sole operand form is an
+            ;; explicit one-element resident buffer whose canonical map derives coordinate zero
+            ;; without borrowing the completed reduction index.  Type/representation validation
+            ;; below proves that storage contract; arbitrary tensor operands remain segmented-only.
+            (when (or (not (set/subset? operand-ids stable))
+                      (some (comp not axis-map/singleton-broadcast? :map)
+                            (:operands transform)))
               (fail! :typed-soac-reduce-result-transform-operands
-                     "full-reduction result transforms cannot address tensor operands"
-                     {:equation equation-id :operands operand-ids}))
+                     "full-reduction result transforms accept only stable resident singleton operands"
+                     {:equation equation-id :operands (:operands transform) :stable stable}))
             (when (seq unbound)
               (fail! :typed-soac-result-transform-expression
                      "result-transform expressions may reference only their typed region boundary"
@@ -2260,15 +2265,27 @@
                    {:equation equation-id :id id :value value})))))
     (doseq [{:keys [value dtype] :as operand}
             (get-in attributes [:result-transform :operands])
-            :let [storage (get values value)]]
+            :let [storage (get values value)
+                  resident-singleton?
+                  (and (axis-map/singleton-broadcast? (:map operand))
+                       (= :tensor (:kind storage))
+                       (= [] (:shape storage))
+                       (= {:kind :resident-scalar-buffer :elements 1}
+                          (:representation storage))
+                       (= :device (:memory-space storage))
+                       (nil? (:logical-layout storage))
+                       (= dtype (:dtype storage)))]]
       (when (and storage
-                 (not (and (= :tensor (:kind storage))
-                           (seq (:shape storage))
-                           (= {:kind :plain} (:representation storage))
-                           (nil? (:logical-layout storage))
-                           (= dtype (:dtype storage)))))
+                 (not (if (= 'reduce kind)
+                        resident-singleton?
+                        (or (and (= :tensor (:kind storage))
+                                 (seq (:shape storage))
+                                 (= {:kind :plain} (:representation storage))
+                                 (nil? (:logical-layout storage))
+                                 (= dtype (:dtype storage)))
+                            resident-singleton?))))
         (fail! :typed-soac-result-transform-operand-type
-               "result-transform operands require plain tensor storage with their declared dtype"
+               "result-transform operands require matching plain tensor storage or an exact resident singleton"
                {:equation equation-id :operand operand :value storage})))
     (case kind
       scalar

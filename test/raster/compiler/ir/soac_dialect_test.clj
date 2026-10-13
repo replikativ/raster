@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [pattern.nanopass.dialect :as pattern-dialect]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
@@ -68,6 +69,69 @@
     (is (nil? (shape (assoc-in resident [:representation :elements] 2))))
     (is (nil? (shape (assoc resident :shape [1]))))
     (is (nil? (shape (assoc resident :logical-layout {:kind :strided}))))))
+
+(defn- resident-result-operand-program
+  ([] (resident-result-operand-program {}))
+  ([{:keys [resident operand-map operand-dtype stable]
+     :or {resident (assoc (av/tensor {:dtype :float :shape []})
+                          :representation {:kind :resident-scalar-buffer :elements 1}
+                          :memory-space :device)
+          operand-map (axis-map/singleton-broadcast)
+          operand-dtype :float
+          stable '[resident]}}]
+   (let [step '(clojure.core/+ acc element)
+         transform (dialect/make-result-transform
+                    {:accumulator 'acc
+                     :expression '(clojure.core/+ acc
+                                                  (clojure.core/double
+                                                   (clojure.core/aget resident 0)))
+                     :operands [{:value 'resident :dtype operand-dtype :map operand-map}]
+                     :scalars [] :result-dtype :double})
+         attributes {:index 'i :extent 'n :accumulators '[acc]
+                     :identities [0.0] :dtypes [:double]
+                     :algebra [(scan/certify-reassociation
+                                {:acc 'acc :init 0.0 :lambda step} :double)]
+                     :attributes {:stable-array-captures stable}
+                     :result-transform transform}
+         values {'n extent
+                 'x (av/tensor {:dtype :double :shape '[n]})
+                 'resident resident
+                 'sum (av/tensor {:dtype :double :shape []})}
+         facts (dialect/default-program-facts
+                {:values values :inputs '[n resident x]
+                 :equations {'reduction (dialect/default-equation-facts)}})
+         equation (list '= 'reduction '[sum]
+                        (list 'reduce attributes '[x] '[resident]
+                              (dialect/lambda-form '[acc element resident-capture] [step])))]
+     (dialect/make facts [equation] '[sum]))))
+
+(deftest full-reduction-result-operands-are-exact-resident-singletons
+  (let [program (resident-result-operand-program)]
+    (is (= program (dialect/validate! program)))
+    (is (= [1] (axis-map/shape (axis-map/singleton-broadcast))))
+    (is (= [0] (axis-map/coordinate-exprs (axis-map/singleton-broadcast))))
+    (is (zero? (axis-map/index-expr (axis-map/singleton-broadcast)))))
+  (doseq [[label options]
+          [[:plain {:resident (av/tensor {:dtype :float :shape []})}]
+           [:plain-vector {:resident (av/tensor {:dtype :float :shape [1]})}]
+           [:logical-vector
+            {:resident (assoc (av/tensor {:dtype :float :shape [1]})
+                              :representation {:kind :resident-scalar-buffer :elements 1}
+                              :memory-space :device)}]
+           [:wrong-elements
+            {:resident (assoc (av/tensor {:dtype :float :shape []})
+                              :representation {:kind :resident-scalar-buffer :elements 2}
+                              :memory-space :device)}]
+           [:wrong-memory
+            {:resident (assoc (av/tensor {:dtype :float :shape []})
+                              :representation {:kind :resident-scalar-buffer :elements 1}
+                              :memory-space :host)}]
+           [:wrong-dtype {:operand-dtype :double}]
+           [:ordinary-map {:operand-map (axis-map/of-axes [['i 'n]])}]
+           [:unstable {:stable []}]]]
+    (testing (name label)
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (resident-result-operand-program options))))))
 
 (deftest typed-soac-is-a-pattern-declared-recursive-dialect
   (let [program (map-program)]
