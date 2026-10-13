@@ -4,14 +4,21 @@
   (:require [clojure.string :as string]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.buffer-view :as view]
+            [raster.compiler.ir.kernel-abi :as abi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.cuda-driver :as driver]
             [raster.gpu.cuda-prepared-execution :as prepared-execution]
             [raster.gpu.cuda-transfer :as transfer]
+            [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.runtime-root :as root])
-  (:import [java.lang.foreign MemorySegment]))
+  (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
 
 (def state (atom {}))
+(def kernel-registry (atom {}))
+(def ^:dynamic *current-arena* nil)
 
 (defn include-paths-from-env
   "Pure compiler configuration policy. Explicit include-path options override this default."
@@ -284,3 +291,166 @@
    :async-h2d? true :async-d2h? true :peer-transfer? false :peer-mechanisms []
    :event-semantics :device-completion :host-lease-until-await? true
    :host-memory :any :physically-serialized? true})
+
+(defn expand-pointer-binding [{:keys [slots binding]} value]
+  (when-not (= 1 (count slots))
+    (throw (ex-info "CUDA composite pointer binding is unsupported"
+                    {:reason :cuda-unsupported-operation :backend :cuda :operation :expand-pointer-binding
+                     :binding binding})))
+  [(assert-buffer-live! value)])
+
+(defn make-kernel-arena! []
+  (ensure-init!)
+  (when-not (zero? (:device-ordinal @state))
+    (throw (ex-info "Public CUDA sessions require ordinal zero"
+                    {:reason :cuda-runtime-configuration-mismatch :requested-device-ordinal 0
+                     :active-device-ordinal (:device-ordinal @state)})))
+  (keyword (str "cuda-arena-" (random-uuid))))
+
+(defn register-kernel!
+  ([name kernel] (register-kernel! name kernel *current-arena*))
+  ([name kernel arena]
+   (artifact/validate! kernel)
+   (when-not (and (= name (:kernel-name kernel)) (= :cuda-c (:target kernel)))
+     (throw (ex-info "CUDA registration requires its named CUDA artifact" {:reason :cuda-artifact-target})))
+   (when (some #(contains? kernel %) [:arena-id ::cleanup/owner ::module])
+     (throw (ex-info "Registration cannot import native lifetime fields" {:reason :invalid-kernel-registration})))
+   (ensure-init!)
+   (cleanup/with-registry-use kernel-registry
+     (let [candidate (root/construct-child!
+                      state []
+                      (fn [_ entry] (assoc kernel :arena-id arena ::context (:context @(:projection entry))
+                                           ::compiled (atom nil))) nil)]
+       (cleanup/build!
+        (::cleanup/owner candidate)
+        #(do (cleanup/publish-replacement! kernel-registry [name] candidate
+                                           (fn [old] (cleanup/release! (::cleanup/owner old))))
+             candidate)
+        #(cleanup/retain-owned-entry! kernel-registry candidate))))
+   nil))
+
+(defn kernel-registry-entry [name] (get @kernel-registry name))
+(defn close-kernel-arena! [arena]
+  (cleanup/with-registry-use kernel-registry
+    (cleanup/release-entries! kernel-registry
+                              (filterv #(= arena (:arena-id (second %))) @kernel-registry)
+                              #(cleanup/release! (::cleanup/owner %)))) nil)
+
+(defn- compiled! [registered]
+  (cleanup/assert-live! (::cleanup/owner registered))
+  (let [slot (::compiled registered)]
+    (if @slot
+      @slot
+      (let [[major minor] (:compute-capability @state)
+            arch (str "compute_" major minor)
+            compiled (nvrtc/compile-artifact-ptx registered arch :include-paths (:include-paths @state))]
+        (clojure.core/reset! slot compiled)
+        compiled))))
+
+(defn- parameter! [arena slot value]
+  (let [scalar? (= :scalar (:kind slot))
+        layout (if scalar? (case (:kernel-dtype slot)
+                             :float ValueLayout/JAVA_FLOAT :double ValueLayout/JAVA_DOUBLE
+                             :int ValueLayout/JAVA_INT :long ValueLayout/JAVA_LONG
+                             :byte ValueLayout/JAVA_BYTE :half ValueLayout/JAVA_SHORT)
+                   ValueLayout/JAVA_LONG)
+        value (if scalar? (:value (call/validate-scalar-value! slot value)) (:device-pointer value))
+        cast-value (if scalar? (case (:kernel-dtype slot)
+                                 :float (float value) :double (double value) :int (int value)
+                                 :long (long value) :byte (byte value) :half (short value)) (long value))
+        segment (.allocate arena layout)]
+    (.set segment layout (long 0) cast-value) segment))
+
+(defn bind-kernel-call
+  ([kernel-call] (bind-kernel-call kernel-call {}))
+  ([kernel-call {:keys [adopt-cleanup! async?]}]
+   (when-not (or (nil? async?) (boolean? async?))
+     (throw (ex-info "CUDA asynchronous preparation requires a boolean"
+                     {:reason :cuda-preparation-options})))
+   (let [{:keys [kernel-name abi pairs pointer-pairs] :as plan} (call/binding-plan kernel-call)
+         registered (or (get @kernel-registry kernel-name)
+                        (throw (ex-info "Kernel not registered" {:kernel-name kernel-name})))
+         _ (call/validate-registered! kernel-call registered)
+         _ (launch/validate-device-geometry! (:geometry kernel-call) @state Integer/MAX_VALUE)
+         _ (doseq [[slot _] pairs]
+             (when (and (= :scalar (:kind slot)) (= :half (:kernel-dtype slot)))
+               (throw (ex-info "CUDA half scalar transport is unsupported"
+                               {:reason :cuda-unsupported-operation :backend :cuda
+                                :operation :bind-scalar :dtype :half}))))
+         buffers (mapv (comp assert-buffer-live! second) pointer-pairs)
+         _ (abi/validate-physical-pointer-dtypes! abi (mapv :dtype buffers))
+         _ (call/validate-resident-output-capacities! kernel-call plan registered (fn [b _] (:n-elements b)))
+         buffer-slots (mapv (fn [_] (cleanup/acquisition-slot)) buffers)
+         arena-slot (cleanup/acquisition-slot) module-slot (cleanup/acquisition-slot)
+         root-slot (cleanup/acquisition-slot)
+         ledger (:prepared-execution @state) stream (:stream @state)
+         pending (prepared-execution/binding-state)
+         resources
+         (into [{:id :pending-completion
+                 :release #(prepared-execution/drain! ledger pending stream native!)}
+                {:id :parameter-arena :after #{:pending-completion}
+                 :release #(cleanup/release-native! arena-slot (fn [a] (.close a)))}
+                {:id :module :after #{:parameter-arena}
+                 :release #(cleanup/release-native! module-slot (fn [m] (native! :module-unload [m])))}]
+               (map-indexed
+                (fn [i slot]
+                  {:id [:buffer-use i] :after #{:module}
+                   :release #(cleanup/release-native! slot (fn [lease] (cleanup/release! (::cleanup/owner lease))))})
+                buffer-slots))
+         owner (cleanup/owner
+                (conj resources
+                      {:id :runtime-root-lease :after (set (map :id resources))
+                       :release #(cleanup/release-native! root-slot
+                                                          (fn [lease] (cleanup/release! (::cleanup/owner lease))))}))]
+     (cleanup/build!
+      owner
+      (fn []
+        ;; Buffer lifetime admission precedes both registration and root locking.
+        (doseq [[slot buffer] (map vector buffer-slots buffers)]
+          (cleanup/acquire-native! slot #(cleanup/retain-use! (owner! buffer))))
+        (root/capture-lease! state root-slot)
+        (cleanup/with-registry-use kernel-registry
+          (cleanup/assert-registration-current! kernel-registry kernel-name registered)
+          (cleanup/assert-live! (::cleanup/owner registered))
+          (cleanup/with-registry-use state
+            (root/assert-live! state)
+            (prepared-execution/assert-admitted! ledger)
+            (doseq [buffer buffers] (assert-buffer-live! buffer))
+            (let [compiled (compiled! registered)
+                  module (cleanup/acquire-native! module-slot #(native! :module-load [(:ptx compiled)]))
+                  function (native! :module-function [module kernel-name])
+                  arena (cleanup/acquire-native! arena-slot #(Arena/ofShared))
+                  parameters (.allocate arena (Math/multiplyExact (long 8) (long (count pairs))) (long 8))]
+              (doseq [[index [slot value]] (map-indexed vector pairs)]
+                (.set parameters ValueLayout/ADDRESS (long (* index 8)) (parameter! arena slot value)))
+              {:function function :parameters parameters :geometry (:geometry kernel-call)
+               :async? (boolean async?) :pending pending
+               :kernel-call kernel-call :binding-plan plan :kernel-name kernel-name
+               :compilation-identity (select-keys compiled [:nvrtc-version :virtual-architecture
+                                                            :include-paths :virtual-header-version
+                                                            :compiler-options])
+               ::context (:context @state)}))))
+      adopt-cleanup!))))
+
+(defn- assert-prepared-live! [prepared]
+  (cleanup/assert-live! (::cleanup/owner prepared))
+  (doseq [[_ buffer] (get-in prepared [:binding-plan :pointer-pairs])] (assert-buffer-live! buffer))
+  (when-not (identical? (::context prepared) (:context @state))
+    (throw (ex-info "CUDA prepared call belongs to another context generation"
+                    {:reason :runtime-generation-mismatch})))
+  prepared)
+
+(defn launch-registered-bound! [prepared]
+  (cleanup/using!
+   (::cleanup/owner prepared)
+   #(prepared-execution/submit!
+     (:prepared-execution @state) (:pending prepared) (:stream @state) native!
+     (fn [] (assert-prepared-live! prepared))
+     :launch [(:function prepared) (:geometry prepared) (:parameters prepared) (:stream @state)]
+     (:async? prepared))))
+
+(defn destroy-prepared! [prepared] (cleanup/release! (::cleanup/owner prepared)))
+
+(defn synchronize-async! []
+  (ensure-init!)
+  (prepared-execution/synchronize! (:prepared-execution @state) (:stream @state) native!))

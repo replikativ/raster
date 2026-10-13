@@ -3,6 +3,28 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]))
 
+(deftest concrete-device-admission-checks-every-axis-product-memory-and-transport
+  (let [limits {:max-workgroup-size 1024 :max-block-dimensions [1024 1024 64]
+                :max-grid-dimensions [2147483647 65535 65535] :shared-local-memory 49152}
+        valid {:workgroup-size [8 2 1] :group-count [3 4 5] :shared-memory-bytes 49152}
+        check #(launch/validate-device-geometry! (launch/geometry %) limits Integer/MAX_VALUE)]
+    (is (= (launch/geometry valid) (check valid)))
+    (doseq [invalid [(assoc valid :workgroup-size [1025 1 1])
+                     (assoc valid :workgroup-size [1 1025 1])
+                     (assoc valid :workgroup-size [1 1 65])
+                     (assoc valid :workgroup-size [1024 2 1])
+                     (assoc valid :group-count [2147483648 1 1])
+                     (assoc valid :group-count [1 65536 1])
+                     (assoc valid :group-count [1 1 65536])
+                     (assoc valid :shared-memory-bytes 49153)]]
+      (is (thrown? clojure.lang.ExceptionInfo (check invalid))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (launch/validate-device-geometry! (launch/geometry valid)
+                                                   (dissoc limits :max-grid-dimensions)
+                                                   Integer/MAX_VALUE)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (launch/validate-device-geometry! (launch/geometry valid) limits 4)))))
+
 (deftest launch-contracts-are-uniformly-one-to-three-dimensional
   (doseq [dims (range 1 4)]
     (let [wg (vec (repeat dims 8))

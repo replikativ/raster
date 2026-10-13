@@ -302,9 +302,9 @@
                   (rebind replacement)
                   :else (->RuntimeValue replacement)))
               (ceil-div? value) (assoc value :value (rebind (:value value))
-                                            :divisor (rebind (:divisor value)))
+                                       :divisor (rebind (:divisor value)))
               (floor-div? value) (assoc value :value (rebind (:value value))
-                                             :divisor (rebind (:divisor value)))
+                                        :divisor (rebind (:divisor value)))
               (sum? value) (assoc value :terms (mapv rebind (:terms value)))
               (product? value) (assoc value :factors (mapv rebind (:factors value)))
               (align-up? value) (assoc value :value (rebind (:value value)))
@@ -405,6 +405,42 @@
     (when-not (and (integer? shared-memory-bytes) (not (neg? shared-memory-bytes)))
       (throw (ex-info "launch shared-memory-bytes must be a non-negative integer"
                       {:shared-memory-bytes shared-memory-bytes}))))
+  geometry)
+
+(defn validate-device-geometry!
+  "Check concrete geometry against observed device limits and the transport's integer range.
+   Missing limits are an admission failure, not permission to invent a device default. This
+   checks device-wide limits; compiled-function resource limits remain a separate obligation."
+  [geometry {:keys [max-block-dimensions max-grid-dimensions max-workgroup-size
+                    shared-local-memory] :as limits} transport-max]
+  (validate-geometry! geometry)
+  (when-not (and (integer? transport-max) (pos? transport-max)
+                 (integer? max-workgroup-size) (pos? max-workgroup-size)
+                 (integer? shared-local-memory) (not (neg? shared-local-memory))
+                 (every? #(and (sequential? %) (= 3 (count %))
+                               (every? (fn [n] (and (integer? n) (pos? n))) %))
+                         [max-block-dimensions max-grid-dimensions]))
+    (throw (ex-info "launch admission requires observed device limits and a transport range"
+                    {:reason :kernel-launch-device-limits :limits limits
+                     :transport-max transport-max})))
+  (doseq [[field bounds] [[:workgroup-size max-block-dimensions]
+                          [:group-count max-grid-dimensions]]
+          [axis value bound] (map vector (range) (get geometry field) bounds)]
+    (when (> value (min bound transport-max))
+      (throw (ex-info "launch dimension exceeds device or transport limit"
+                      {:reason :kernel-launch-device-limit :field field :axis axis
+                       :value value :device-limit bound :transport-max transport-max}))))
+  (let [threads (reduce *' 1 (:workgroup-size geometry))
+        bytes (:shared-memory-bytes geometry)]
+    (when (> threads max-workgroup-size)
+      (throw (ex-info "launch workgroup exceeds device thread limit"
+                      {:reason :kernel-launch-device-limit :field :workgroup-size
+                       :value threads :device-limit max-workgroup-size})))
+    (when (> bytes (min shared-local-memory transport-max))
+      (throw (ex-info "launch shared memory exceeds device or transport limit"
+                      {:reason :kernel-launch-device-limit :field :shared-memory-bytes
+                       :value bytes :device-limit shared-local-memory
+                       :transport-max transport-max}))))
   geometry)
 
 (defn geometry

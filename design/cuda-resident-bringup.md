@@ -157,6 +157,34 @@ record/replay and asynchronous range batches at the subsequent gate. Where the p
 session layer still calls a legacy operation, report an unsupported-route diagnostic
 with its operation and backend; do not implement a second CUDA source compiler to satisfy it.
 
+## Ordered preparation checkpoint
+
+The integrated CUDA foundation now prepares a modern ordered `KernelCall` without
+enabling public CUDA sessions. Shared ABI validation controls scalar and physical
+pointer dtypes, aliasing, ranged offsets and capacities. Concrete launch geometry
+must fit observed device axes, total workgroup threads and dynamic shared memory
+before compilation or native acquisition. The current Driver API transport uses
+signed Java int conversion, so admission also enforces that explicit transport
+range; it does not silently wrap a larger dimension. Compiled-function-specific
+resource limits are a separate qualification obligation, not proved by this check.
+
+Prepared calls retain their buffers through the common lifetime-use leases, keep
+parameter storage and modules alive until the physical stream completes, and
+reject stale registrations before native preparation. Launch and retirement use
+the existing common cleanup and pending-execution authorities. Failed completion
+with unknown safety retains resources and does not retry through another adapter.
+Repeated launches are ordered stream submissions, not native CUDA Graph replay.
+
+The hardware-free preparation/lifecycle fixtures check ordered arguments and
+nonzero buffer offsets, registration replacement, rollback, concurrent launch and
+retirement, completion failure, and impossible launches before compiler contact.
+These do not establish device correctness, public-session completion behavior,
+native graph performance or an improvement to measured host submission overhead.
+Sam's public-session and graph fixtures remain deferred until those APIs are
+integrated; their absence is not counted as passed native coverage. The extracted
+runtime/fixture contribution is credited to `nanparth` from the frozen #1338 tree
+`063e7fc0bd8e4e22ad4e743c39a2cb1cdaeb458c`.
+
 ## Subsequent gates
 
 1. Ordered multi-kernel `KernelGraph` recording/replay with stable resident bindings,
