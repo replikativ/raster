@@ -25,6 +25,7 @@
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
@@ -70,6 +71,24 @@
   (and (soac-dialect/program-form? program)
        (= 1 (count (soac-dialect/equations program)))
        (= 'map (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
+
+(defn lower-typed-scalar
+  "Lower one validated ScalarIR equation to a canonical extent-one SegMap.
+
+   This function is an inactive scheduling substrate: the result must already be an exact
+   resident singleton, and callers must independently establish that tensor captures are
+   initialized device storage before selecting it instead of host execution."
+  [program device-id & {:keys [target-descriptor]}]
+  [(device-scalar/lower program device-id :target-descriptor target-descriptor)])
+
+(defn validate-typed-scalar-schedule!
+  "Validate the exact ScalarIR-to-SegMap semantic correspondence.
+
+   Launch geometry is target-owned and is validated downstream.  Every field that can change
+   scalar computation, capture roles or the one-element write is reconstructed here from the
+   retained TypedSOAC program."
+  [program operation]
+  (device-scalar/validate-correspondence! program operation))
 
 (defn lower-typed-map
   "Lower one functional TypedSOAC map to SegMap from its explicit operands and lambda binders.

@@ -8,7 +8,43 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
-### Current checkpoint
+### October 14 current checkpoint
+
+- #1358 checks Gemma's selected matrix dispatches against independently retained contraction
+  identities, not a fixed kernel count. #1359 performs existing effect-aware DCE only after whole
+  normalized-source admission and rebuilds coherent typed evidence afterward. Tiny Gemma retains
+  its CPU/device numerical trajectories while seven unused contractions disappear (57 → 50).
+- Buffered Adam and LoRA public replay tests freshly pass on CPU, OpenCL and Level Zero
+  (6 tests / 310 assertions). #1360 adds explicit captured aggregate `:state` and exact
+  path-keyed field outputs through that same boundary, merged after independent review and
+  all seven CI contexts. Donation and whole-tree output ownership remain separate obligations.
+- A bounded one-layer Float GSDM forward attempt identifies a precise remaining composition
+  refusal: terminal `(double (aget loss-buffer 0))` is not represented as a typed public result.
+  Naming alone gets past that proof but exposes host-only scalar scheduling of device data.
+  The next activation must prove placement and initialized physical storage through existing
+  authorities, not loosen source-result validation or add a loss-specific lowering rule.
+- Direct ScalarIR → extent-one SegMap scheduling now has an inactive substrate. Exact semantic
+  correspondence retains type metadata and floating-point bits; the existing KernelBody and ABI
+  paths own physical loads/stores. It requires an explicit resident singleton result and does not
+  change scalar dispatch policy. New tests cover all four target dialect emissions and changed-input
+  bit-exact Float-to-Double execution on local OpenCL/Level Zero (7 tests / 76 assertions).
+- CPU batch/conditioning GSDM controls pass (11 tests / 96 assertions). Full resident
+  forward/VJP/update trajectory and statistical acceptance are still open. The historical
+  real-weight Gemma 11/28 failure remains an unchanged acceptance obligation.
+- Selected normalized-AD runtime/derivation gates freshly pass (30 tests / 541 assertions).
+  General equation composition, normalized device execution and default-engine migration remain
+  open; the source AD engine is still the independent default oracle.
+- Distributed planning, cost, training, AMR-cycle contract/restore/state and compatibility
+  hardware-free gates freshly pass (58 tests / 587 assertions). Local OpenCL/Level Zero cycle
+  execution and mapped-file fresh-owner restart pass two existing tests (78 assertions), including
+  independent coordinate/conservation and lineage checks. Local data-parallel AD → all-reduce → SGD,
+  unequal batches, multistep updates and explicit rank-zero loss pass 4 tests / 196 assertions.
+  These are not claims of production persistence, multi-host transport or fabric performance.
+- A paired resident liveness measurement confirms 139 → 132 bound steps and exact equality of
+  all 14 reset-state outputs. Host and device timing samples were nonstationary (CV 0.23–0.35),
+  so timing is inconclusive. No speedup, regression or tuning decision follows from that run.
+
+### October 13 historical checkpoint
 
 - Main contains #1333 and #1334, each squash-merged only after all seven exact-head CI gates passed.
   Generated optimizer scalars follow each parameter leaf's precision. Successful static executable

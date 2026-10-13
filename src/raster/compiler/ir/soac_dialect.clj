@@ -1731,7 +1731,7 @@
                "scalar-region locals require a supported JVM scalar dtype"
                {:equation equation-id :local local :dtype dtype})))
     (when (and (seq locals)
-               (not (contains? #{'map 'scatter 'effect-map
+               (not (contains? #{'scalar 'map 'scatter 'effect-map
                                  'product-reduce 'segmented-fold-map} kind)))
       (fail! :typed-soac-region-operation
              "typed local SSA is not admitted in this operation's scalar region"

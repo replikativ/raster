@@ -23,6 +23,7 @@
             [raster.compiler.passes.parallel.product-reduction-regions :as product-regions]
             [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
+            [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
             [raster.compiler.passes.parallel.segmap-body :as map-body]))
 
 (defn- fail!
@@ -557,6 +558,24 @@
                     "a graph body requires an earlier-only typed host-scalar prefix and numerical equations"
                     {:host-prefix (mapv :id host-prefix)
                      :numerical-equations (mapv :id numerical-equations)}))
+         _ (doseq [equation numerical-equations
+                   :let [algorithm (:algorithm equation)
+                         semantic-equations (soac/equations algorithm)]
+                   :when (some #(= 'scalar (soac/operation-kind %)) semantic-equations)]
+             (when-not (and (= 1 (count semantic-equations))
+                            (= 1 (count (:operations equation))))
+               (fail! :scheduled-device-scalar-boundary
+                      "a numerical ScalarIR equation requires one exact scheduled operation"
+                      {:equation (:id equation)
+                       :semantic-equations (mapv second semantic-equations)
+                       :scheduled-operations (count (:operations equation))}))
+             (try
+               (device-scalar/validate-correspondence!
+                algorithm (first (:operations equation)))
+               (catch clojure.lang.ExceptionInfo exception
+                 (fail! :scheduled-device-scalar-correspondence
+                        "a numerical scalar schedule differs from its retained ScalarIR"
+                        {:equation (:id equation) :cause (ex-data exception)}))))
          retained-equations (vec (mapcat (comp soac/equations :algorithm) numerical-equations))
          ;; A scheduled graph may retain several numerical equations after its host-scalar
          ;; prefix. Infer the boundary of the complete numerical slice; using only the first
