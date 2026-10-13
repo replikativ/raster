@@ -47,7 +47,12 @@
      :name (downcall "cuDeviceGetName" ValueLayout/JAVA_INT
                      [ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT])
      :capability (downcall "cuDeviceComputeCapability" ValueLayout/JAVA_INT
-                           [ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/JAVA_INT])}))
+                           [ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/JAVA_INT])
+     :attribute (downcall "cuDeviceGetAttribute" ValueLayout/JAVA_INT
+                          [ValueLayout/ADDRESS ValueLayout/JAVA_INT ValueLayout/JAVA_INT])
+     ;; Supported Linux CUDA hosts use a 64-bit size_t.
+     :total-memory (downcall "cuDeviceTotalMem_v2" ValueLayout/JAVA_INT
+                             [ValueLayout/ADDRESS ValueLayout/JAVA_INT])}))
 
 (defn- invoke
   [^MethodHandle handle & arguments]
@@ -58,6 +63,44 @@
   (when-not (zero? (int code))
     (throw (ex-info "CUDA Driver API probe failed"
                     {:reason :cuda-driver-error :operation operation :error-code (int code)}))))
+
+(def ^:private device-attributes
+  {:max-threads-per-block 1 :shared-memory-per-block 8 :warp-size 10
+   :registers-per-block 12 :sm-count 16 :max-threads-per-sm 39
+   :shared-memory-per-sm 81 :registers-per-sm 82 :max-blocks-per-sm 106})
+
+(defn- read-attribute
+  [arena device attribute]
+  (let [pointer (.allocate arena ValueLayout/JAVA_INT)
+        code (int (invoke (:attribute @handles) pointer (int attribute) (int device)))]
+    (cond
+      (zero? code) {:value (.get pointer ValueLayout/JAVA_INT (long 0))}
+      (= 1 code) {:error {:reason :cuda-driver-attribute-unavailable
+                         :attribute attribute :error-code code}}
+      :else (throw (ex-info "CUDA Driver API probe failed"
+                            {:reason :cuda-driver-error :operation :device-attribute
+                             :attribute attribute :error-code code})))))
+
+(defn- device-attribute-info
+  [arena device]
+  (let [results (into {} (map (fn [[key attribute]]
+                               [key [(read-attribute arena device attribute)]]))
+                      device-attributes)
+        results (assoc results :max-workgroup-dims
+                       (mapv #(read-attribute arena device %) [2 3 4]))
+        attributes (into {} (keep (fn [[key readings]]
+                                   (when (every? #(contains? % :value) readings)
+                                     [key (if (= key :max-workgroup-dims)
+                                            (mapv :value readings)
+                                            (:value (first readings)))]))) results)
+        errors (into {} (keep (fn [[key readings]]
+                               (when-let [failures (seq (keep :error readings))]
+                                 [key (vec failures)]))) results)
+        memory-pointer (.allocate arena ValueLayout/JAVA_LONG)]
+    (check! :total-memory (invoke (:total-memory @handles) memory-pointer (int device)))
+    {:attributes (assoc attributes :global-memory-bytes
+                        (.get memory-pointer ValueLayout/JAVA_LONG (long 0)))
+     :attribute-errors errors}))
 
 (defn- device-info
   [^Arena arena ordinal]
@@ -70,10 +113,11 @@
       (check! :name (invoke (:name @handles) name-pointer (int 256) (int device)))
       (check! :compute-capability
               (invoke (:capability @handles) major-pointer minor-pointer (int device)))
-      {:ordinal ordinal
-       :name (.getString name-pointer 0)
-       :compute-capability [(.get major-pointer ValueLayout/JAVA_INT 0)
-                            (.get minor-pointer ValueLayout/JAVA_INT 0)]})))
+      (merge (device-attribute-info arena device)
+             {:ordinal ordinal
+              :name (.getString name-pointer 0)
+              :compute-capability [(.get major-pointer ValueLayout/JAVA_INT 0)
+                                   (.get minor-pointer ValueLayout/JAVA_INT 0)]}))))
 
 (defn probe
   "Return driver version and physical CUDA devices without creating a context.

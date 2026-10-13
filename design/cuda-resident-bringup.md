@@ -15,7 +15,12 @@ The path must be `deftm → typed SOAC → schedule → KernelBody → CUDA sour
    compute capability, driver version, toolkit/compiler version, and available memory.
    `raster.gpu.cuda-driver-probe/probe` now performs the read-only driver/name/capability
    part and reports `:no-device` on this laptop; it does not create a session or promise
-   executable CUDA support. Memory and full capability facts remain for the resident adapter.
+   executable CUDA support. It now also queries total memory, block dimensions, warp width,
+   SM count and distinct per-block/per-SM thread, register and shared-memory limits.
+   An unavailable attribute is absent and diagnosed; unexpected driver failures remain errors.
+   The hardware registry admits only ordinal zero at this stage. Observations override
+   catalogue entries with per-field provenance; the thread-derived maximum warp count is
+   a residency upper bound, not measured occupancy. Detection does not enable CUDA sessions.
    On a CUDA host, run its test with `RASTER_REQUIRE_CUDA_DEVICE=1` so a missing device fails.
 2. Create a resident session; allocate input/output buffers; upload the input through the
    existing typed buffer contract. Compile the generated source, load its module, bind its
