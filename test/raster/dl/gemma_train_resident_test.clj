@@ -26,7 +26,8 @@
      • 25 on-device steps: loss decreases, adapters changed on-device;
      • a CPU-interpreted reference loop (same value+grad + sgd-step!, same lr/data)
        tracks the GPU loss trajectory within f32 tolerance."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.set :as set]
+            [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
@@ -35,8 +36,11 @@
             [raster.numeric :as n]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.value :as value]))
@@ -321,8 +325,93 @@
   "Observe fixed graph choices made by public lowering, not requested alternatives."
   [prepared]
   (vec (mapcat (fn [instance]
-                 (filter :graph (get-in instance [:call :steps])))
+                 (map #(assoc % ::instance-id (:id instance))
+                      (filter :graph (get-in instance [:call :steps]))))
                (:instances (compiled/plan prepared)))))
+
+(defn- semantic-contraction-inventory
+  "Derive dense matrix identities from retained TypedSOAC algorithms, before dispatch selection."
+  [prepared]
+  (vec
+   (for [instance (:instances (compiled/plan prepared))
+         :let [program (get-in instance [:call :program])]
+         outer-equation (:equations program)
+         :let [algorithm (:algorithm outer-equation)]
+         :when (dialect/program-form? algorithm)
+         equation (dialect/equations algorithm)
+         :let [parts (dialect/operation-parts equation)]
+         :when (and (= 'segmented-reduce (:kind parts))
+                    (= :raster.par/contract
+                       (get-in parts [:attributes :attributes :source-operation])))
+         :let [components (projection/segmented-reduce-contract-components algorithm equation)
+               facts (contraction-facts/from-components components)
+               view (contraction-facts/dense-matrix-view facts)]]
+     {:identity [(:id instance) (:id outer-equation) (:out facts)]
+      :operation-id (second equation)
+      :dtype (:dtype facts)
+      :result-transform? (some? (get-in parts [:attributes :result-transform]))
+      :variant (:variant view)
+      :matrix-view view})))
+
+(defn- selected-contraction-inventory
+  "Project the actually selected contraction graph with the same public equation/storage identity."
+  [calls]
+  (vec
+   (for [call calls
+         :let [operation (first (get-in call [:equation :operations]))
+               graph (:graph call)]
+         :when (and (equation-dispatch/emitted-equation-dispatch? operation)
+                    (= :contraction (get-in graph [:provenance :semantic-op])))
+         :let [outputs (mapv :id (:outputs graph))]]
+     {:identity [(::instance-id call) (get-in call [:equation :id])
+                 (if (= 1 (count outputs)) (first outputs) ::invalid-outputs)]
+      :outputs outputs
+      :variant (get-in graph [:attributes :variant])
+      :graph graph
+      :description (executable/description graph)})))
+
+(defn- inventory-bijection
+  "Report missing, extra, duplicate, or variant-changing dispatch selections by exact identity."
+  [semantic selected]
+  (let [semantic-groups (group-by :identity semantic)
+        selected-groups (group-by :identity selected)
+        semantic-ids (set (keys semantic-groups))
+        selected-ids (set (keys selected-groups))
+        duplicates (fn [groups]
+                     (into {} (keep (fn [[id entries]]
+                                      (when (< 1 (count entries)) [id (count entries)]))) groups))
+        common (set/intersection semantic-ids selected-ids)]
+    {:semantic-duplicates (duplicates semantic-groups)
+     :selected-duplicates (duplicates selected-groups)
+     :missing (set/difference semantic-ids selected-ids)
+     :extra (set/difference selected-ids semantic-ids)
+     :variant-mismatches
+     (into {}
+           (keep (fn [id]
+                   (let [expected (mapv :variant (get semantic-groups id))
+                         actual (mapv :variant (get selected-groups id))]
+                     (when (not= expected actual) [id {:semantic expected :selected actual}]))))
+           common)}))
+
+(deftest contraction-inventory-bijection-reports-every-mismatch-class
+  (let [left {:identity [:program :equation-a :out-a] :variant :nt}
+        right {:identity [:program :equation-b :out-b] :variant :tn}
+        complete (inventory-bijection [left right] [left right])
+        missing (inventory-bijection [left right] [left])
+        extra (inventory-bijection [left] [left right])
+        semantic-duplicate (inventory-bijection [left left right] [left right])
+        selected-duplicate (inventory-bijection [left right] [left left right])
+        variant-mismatch (inventory-bijection [left right]
+                                              [(assoc left :variant :nn) right])]
+    (is (= {:semantic-duplicates {} :selected-duplicates {}
+            :missing #{} :extra #{} :variant-mismatches {}}
+           complete))
+    (is (= #{(:identity right)} (:missing missing)))
+    (is (= #{(:identity right)} (:extra extra)))
+    (is (= {(:identity left) 2} (:semantic-duplicates semantic-duplicate)))
+    (is (= {(:identity left) 2} (:selected-duplicates selected-duplicate)))
+    (is (= {(:identity left) {:semantic [:nt] :selected [:nn]}}
+           (:variant-mismatches variant-mismatch)))))
 
 (defn- run-trajectory!
   "Replay a public compiled artifact with donated adapters and constant weights.
@@ -336,9 +425,9 @@
                                   :constants (vec (remove (set adapter-syms) (keys st)))})
         calls (planned-equation-calls prepared)
         graphs (mapv :graph calls)
-        dispatch-graphs (mapv :graph
-                              (filter #(equation-dispatch/emitted-equation-dispatch?
-                                        (first (get-in % [:equation :operations]))) calls))
+        semantic-contractions (semantic-contraction-inventory prepared)
+        selected-contractions (selected-contraction-inventory calls)
+        dispatch-graphs (mapv :graph selected-contractions)
         planned (mapv executable/description graphs)]
     (is (zero? (get-in (compiled/plan prepared) [:attributes :driver-allocations]))
         "public lowering must not allocate device storage")
@@ -350,6 +439,8 @@
            :dispatch-selected (mapv executable/description dispatch-graphs)
            :matrix-variants (mapv #(get-in % [:attributes :variant])
                                   dispatch-graphs)
+           :semantic-contractions semantic-contractions
+           :selected-contractions selected-contractions
            :execution-info (compiled/execution-info program)}
           (let [outputs (program {})
                 state (reduce (fn [m s]
@@ -368,7 +459,8 @@
           st0 (init-state cfg)
           {l32 :losses} (run-trajectory! cfg st0 lr n-steps {:precision :f32-scalar})
           {l16 :losses planned :planned variants :matrix-variants bound :execution-info
-           dispatched :dispatch-selected}
+           dispatched :dispatch-selected semantic :semantic-contractions
+           selected :selected-contractions}
           (run-trajectory! cfg st0 lr n-steps
                            {:precision :mixed-f16-f32
                             :typed-contraction {:strategy :dispatch-mixed-matrix
@@ -376,7 +468,18 @@
           (testing "analytic dispatch selects mixed-precision matrix schedules throughout training"
             (println "  [mixed-precision bwd]" (count dispatched) "selected dispatch graphs, variants:"
                      (frequencies variants))
-            (is (= 50 (count dispatched)) "retain every eligible contraction in this fixed fixture")
+            (is (every? #(and (= :float (:dtype %))
+                              (true? (get-in % [:matrix-view :ok]))
+                              (not (:result-transform? %)))
+                        semantic)
+                "the independent retained algorithms are plain FP32 dense contractions")
+            (is (= {:semantic-duplicates {} :selected-duplicates {}
+                    :missing #{} :extra #{} :variant-mismatches {}}
+                   (inventory-bijection semantic selected))
+                "every semantic contraction has exactly one matching selected dispatch")
+            ;; Retained semantics may still include unused frozen-weight gradient products.
+            ;; Dead-result elimination is a separate optimization, not permission for this
+            ;; acceptance test to guess a smaller schedule inventory.
             (is (every? #(and (= :xmx-direct (:strategy %))
                              (= :mixed-f16-f32 (:precision %))) dispatched)
                 "every eligible dispatch must select mixed execution, not only a surviving subset")
