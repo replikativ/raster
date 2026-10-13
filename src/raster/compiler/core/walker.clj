@@ -161,7 +161,24 @@
 ;; Form Classification
 ;; ================================================================
 
-(declare resolve-aliased-symbol)
+(declare resolve-aliased-symbol retain-source-callee-identity)
+
+(defn- primitive-array-operation?
+  "A primitive receiver and resolved intrinsic callee authorize JVM array realization.
+   Existing hints are evidence, not a reason to skip realization on a later walk."
+  [form ctx]
+  (and (seq? form)
+       (symbol? (first form))
+       ;; Candidate filter only: the resolved Var identity below is authority.
+       (contains? #{"aget" "aset" "aclone"} (name (first form)))
+       (symbol? (second form))
+       (not (contains? (:type-env ctx) (first form)))
+       (contains? types/primitive-array-tags (ctx-get-tag ctx (second form)))
+       (let [callee (:raster.op/resolved-callee
+                     (meta (retain-source-callee-identity (first form) ctx)))]
+         (or (descriptor/aget-op? callee)
+             (descriptor/aset-op? callee)
+             (contains? #{'clojure.core/aclone 'raster.arrays/aclone} callee)))))
 
 (defn classify-form
   "Classify a source form for walker dispatch.
@@ -287,11 +304,7 @@
          ;; executable symbol, never an unrelated qualified global callee.
          (not (contains? (:type-env ctx) (first form)))
          (inf/generic-fn?* (:source-ns ctx) (first form))
-         (not (and (let [fn-name (name (first form))]
-                     (contains? #{"aget" "aset" "aclone"} fn-name))
-                   (symbol? (second form))
-                   (let [arr-tag (ctx-get-tag ctx (second form))]
-                     (and arr-tag (contains? types/primitive-array-tags arr-tag))))))
+         (not (primitive-array-operation? form ctx)))
     :deftm-call
 
     ;; dotimes
@@ -301,16 +314,7 @@
     ;; Array op with known type — auto-hint for JVM primitive arrays only.
     ;; Array-like types (registered via register-array-like!) use deftm dispatch.
     ;; alength excluded: goes through deftm dispatch for Long return type.
-    (and (seq? form)
-         (contains? #{'aget 'aset 'aclone
-                      'clojure.core/aget
-                      'clojure.core/aset 'clojure.core/aclone
-                      'raster.arrays/aget 'raster.arrays/aset
-                      'raster.arrays/aclone} (first form))
-         (symbol? (second form))
-         (let [arr-tag (ctx-get-tag ctx (second form))]
-           (and arr-tag (contains? types/primitive-array-tags arr-tag)
-                (not (:tag (meta (second form)))))))
+    (primitive-array-operation? form ctx)
     :array-op
 
     ;; var reference — (var foo) / #'foo — resolve and pass through
@@ -1584,10 +1588,13 @@
         aset? (contains? #{"aset"} (name f))
         walked-args (if (and aset? (= arr-tag 'floats) (= 2 (count walked-args)))
                       (let [[idx-arg val-arg] walked-args
-                            already-float? (and (seq? val-arg) (= 'float (first val-arg)))]
+                            already-float? (and (seq? val-arg) (= 2 (count val-arg))
+                                                (not (contains? (:type-env ctx) (first val-arg)))
+                                                (= 'float (descriptor/cast-result-tag
+                                                           (first val-arg))))]
                         (if already-float?
                           walked-args
-                          [idx-arg (list 'float val-arg)]))
+                          [idx-arg (compiler-cast 'float val-arg)]))
                       walked-args)]
     (apply list core-f hinted-arr walked-args)))
 

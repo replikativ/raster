@@ -105,6 +105,101 @@
                                 :source-ns (the-ns 'raster.compiler.core.walker-test)})]
       (is (= :array-op (walker/classify-form '(aget a 0) ctx))))))
 
+(deftest retained-primitive-array-hints-do-not-skip-the-array-operation-boundary
+  (doseq [tag ['floats 'doubles 'ints 'longs]
+          operation ['raster.arrays/aget 'raster.arrays/aset 'raster.arrays/aclone]]
+    (let [a (with-meta 'a {:tag tag :raster.type/tag tag})
+          expression (case (name operation)
+                       "aget" (list operation a 0)
+                       "aset" (list operation a 0 1.0)
+                       "aclone" (list operation a))
+          ctx (walker/make-ctx {:type-env (te {'a tag}) :source-ns *ns*})]
+      (is (= :array-op (walker/classify-form expression ctx)))
+      (is (= (symbol "clojure.core" (name operation))
+             (first (walker/walk expression ctx)))))))
+
+(deftest primitive-float-store-realization-is-stable-under-rewalking
+  (let [a (with-meta 'a {:tag 'floats :raster.type/tag 'floats})
+        ctx (walker/make-ctx {:type-env (te {'a 'floats 'i 'long 'x 'double})
+                              :source-ns *ns*})]
+    (doseq [value ['x '(float x) '(clojure.core/float x) '(double x)]]
+      (let [once (walker/walk (list 'raster.arrays/aset a 'i value) ctx)
+            twice (walker/walk once ctx)
+            three-times (walker/walk twice ctx)]
+        (is (= 'clojure.core/aset (first once)))
+        (is (= once twice three-times))
+        (is (= 'floats (:raster.type/tag (meta (second twice)))))
+        (is (= 1 (count (filter #(and (seq? %)
+                                      (contains? #{'float 'clojure.core/float} (first %)))
+                               (tree-seq coll? seq twice)))))))))
+
+(deftest primitive-double-store-does-not-insert-a-float-conversion
+  (let [a (with-meta 'a {:tag 'doubles :raster.type/tag 'doubles})
+        ctx (walker/make-ctx {:type-env (te {'a 'doubles 'i 'long 'x 'double})
+                              :source-ns *ns*})]
+    (doseq [value ['x '(double x) '(clojure.core/double x)]]
+      (let [once (walker/walk (list 'raster.arrays/aset a 'i value) ctx)
+            twice (walker/walk once ctx)]
+        (is (= 'clojure.core/aset (first once)))
+        (is (= once twice))
+        (is (not-any? #(and (seq? %)
+                           (contains? #{'float 'clojure.core/float} (first %)))
+                      (tree-seq coll? seq twice)))))))
+
+(deftest primitive-array-realization-does-not-override-unknown-or-custom-receivers
+  (let [a (with-meta 'a {:tag 'floats :raster.type/tag 'floats})
+        expression (list 'raster.arrays/aget a 0)]
+    (doseq [tag [nil 'Object 'CustomArray]]
+      (let [ctx (walker/make-ctx {:type-env (te {'a tag}) :source-ns *ns*})]
+        (is (= :deftm-call (walker/classify-form expression ctx)))))))
+
+(deftest primitive-array-realization-does-not-hijack-lexical-array-operation-names
+  (doseq [operation ['aget 'aset 'aclone]
+          receiver ['a (with-meta 'a {:tag 'floats :raster.type/tag 'floats})]]
+    (let [expression (case operation
+                       aget (list operation receiver 0)
+                       aset (list operation receiver 0 1.0)
+                       aclone (list operation receiver))
+          ctx (walker/make-ctx {:type-env (te {'a 'floats operation nil})
+                                :source-ns *ns*})]
+      (is (= :call (walker/classify-form expression ctx)))
+      (is (= operation (first (walker/walk expression ctx)))))))
+
+(deftm array-operation-name-collision
+  [a :- (Array float), i :- Long] :- Float
+  (float (+ 11.0 (clojure.core/aget a i))))
+
+(deftest primitive-array-realization-uses-resolved-source-callee-identity
+  (let [source (create-ns (gensym "raster.compiler.core.walker-array-shadow-fixture-"))
+        receiver (with-meta 'a {:tag 'floats :raster.type/tag 'floats})
+        ctx (walker/make-ctx {:type-env (te {'a 'floats 'i 'long}) :source-ns source})]
+    (try
+      (let [helper (intern source 'aget (fn [_ _] 99.0))
+            expression (list 'aget receiver 'i)]
+        (is (= :call (walker/classify-form expression ctx)))
+        (is (= (symbol (str (ns-name source)) "aget")
+               (first (walker/walk expression ctx))))
+        ;; A genuine custom deftm exposed under the same source name retains
+        ;; dispatch authority; its basename is not an intrinsic certificate.
+        (alter-var-root helper (constantly @#'array-operation-name-collision))
+        (alter-meta! helper merge
+                     (dissoc (meta #'array-operation-name-collision) :ns :name))
+        (is (= :deftm-call (walker/classify-form expression ctx))))
+      (let [shadowed (walker/ctx-assoc-type ctx 'aget nil)
+            qualified (list 'raster.arrays/aget receiver 'i)]
+        (is (= :array-op (walker/classify-form qualified shadowed)))
+        (is (= 'clojure.core/aget (first (walker/walk qualified shadowed)))))
+      (finally (remove-ns (ns-name source))))))
+
+(deftest float-store-conversion-does-not-call-a-lexical-float-function
+  (let [a (with-meta 'a {:tag 'floats :raster.type/tag 'floats})
+        ctx (walker/make-ctx {:type-env (te {'a 'floats 'x 'double 'float nil})
+                              :source-ns *ns*})
+        walked (walker/walk (list 'raster.arrays/aset a 0 '(float x)) ctx)
+        value (last walked)]
+    (is (= 'clojure.core/float (first value)))
+    (is (= 'float (first (second value))))))
+
 (deftest reduction-uses-typed-compound-initializer-result
   (let [walked (wb '(raster.par/reduce total
                      (raster.numeric/+
