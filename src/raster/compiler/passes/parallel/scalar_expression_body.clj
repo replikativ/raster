@@ -310,7 +310,29 @@
     (when-not (and (fn? lower-index) (fn? decline!))
       (throw (ex-info "scalar KernelBody lowering requires index and decline callbacks"
                       {:reason :raster/bug :lower-index lower-index :decline decline!})))
-    (letfn [(load-ssa [array coordinates]
+    (letfn [(with-fold-index-range [id lower-bound upper-bound upper-mode env emit]
+              ;; Only the actual counted index receives a body-entry fact. Bounds are
+              ;; already lowered, and every prefix is checked by the shared interval
+              ;; authority against retained SSA/ABI types, not a source-name guess.
+              (let [saved @value-ranges
+                    types (into {} (keep (fn [[value type]]
+                                           (let [type (canon-type type)]
+                                             (when (contains? #{:int :long} type)
+                                               [value type]))))
+                                (merge scalar-types env))
+                    ranges (into {} (map (fn [[value type]]
+                                          [value (known-range value type)])) types)
+                    lower-range (scalar-range/typed-index-range lower-bound types ranges)
+                    upper-range (scalar-range/typed-index-range upper-bound types ranges)
+                    entry (when (= :exclusive upper-mode)
+                            (scalar-range/exclusive-positive-loop-entry-range
+                             lower-range upper-range 1 :long))]
+                (try
+                  (when entry (swap! value-ranges assoc id entry))
+                  (emit)
+                  (finally (reset! value-ranges saved)))))
+
+            (load-ssa [array coordinates]
               (let [type (some-> (get array-types array) dtype/canon)]
                 (when-not (and (contains? arrays array) type)
                   (decline! :indexed-load "scalar loads require a declared typed stable tensor"
@@ -752,36 +774,46 @@
                         carry (fresh "fold-carry")
                         result (fresh "fold-result")
                         initial (lower (:identity attributes) fold-type env)
-                        local-state
-                        (reduce
-                         (fn [{:keys [operations substitutions environment]} local]
-                           (let [local-type (canon-type (:dtype local))
-                                 local-expression (util/subst-syms substitutions (:init local))
-                                 lowered (lower local-expression local-type environment)
-                                 local-result (:result lowered)
-                                 tag (:scalar-tag (dtype/info local-type))
-                                 local-result (if (and (symbol? local-result) tag)
-                                                (with-meta local-result
-                                                  (assoc (meta local-result)
-                                                         :raster.type/tag tag))
-                                                local-result)]
-                             (when-not (= local-type (:type lowered))
-                               (decline! :typed-scalar-fold-local-dtype
-                                         "canonical Fold local must preserve its retained dtype"
-                                         {:expression expression :local local
-                                          :actual (:type lowered)}))
-                             {:operations (into operations (:operations lowered))
-                              :substitutions (assoc substitutions (:id local) local-result)
-                              :environment (cond-> environment
-                                             (symbol? local-result)
-                                             (assoc local-result local-type))}))
-                         {:operations []
-                          :substitutions {index loop-index accumulator carry}
-                          :environment (assoc env loop-index :long carry fold-type)}
-                         fold-locals)
-                        update-expression (util/subst-syms (:substitutions local-state)
-                                                           (first body-results))
-                        update (lower update-expression fold-type (:environment local-state))
+                        lower-bound (lower-index (:lower attributes 0) (set (keys env)))
+                        upper-bound (lower-index (:extent attributes) (set (keys env)))
+                        loop-body
+                        (with-fold-index-range
+                         loop-index lower-bound upper-bound
+                         (:upper-bound attributes :exclusive) env
+                         (fn []
+                           (let [local-state
+                                 (reduce
+                                  (fn [{:keys [operations substitutions environment]} local]
+                                    (let [local-type (canon-type (:dtype local))
+                                          local-expression (util/subst-syms substitutions (:init local))
+                                          lowered (lower local-expression local-type environment)
+                                          local-result (:result lowered)
+                                          tag (:scalar-tag (dtype/info local-type))
+                                          local-result (if (and (symbol? local-result) tag)
+                                                         (with-meta local-result
+                                                           (assoc (meta local-result)
+                                                                  :raster.type/tag tag))
+                                                         local-result)]
+                                      (when-not (= local-type (:type lowered))
+                                        (decline! :typed-scalar-fold-local-dtype
+                                                  "canonical Fold local must preserve its retained dtype"
+                                                  {:expression expression :local local
+                                                   :actual (:type lowered)}))
+                                      {:operations (into operations (:operations lowered))
+                                       :substitutions (assoc substitutions (:id local) local-result)
+                                       :environment (cond-> environment
+                                                      (symbol? local-result)
+                                                      (assoc local-result local-type))}))
+                                  {:operations []
+                                   :substitutions {index loop-index accumulator carry}
+                                   :environment (assoc env loop-index :long carry fold-type)}
+                                  fold-locals)
+                                 update-expression (util/subst-syms (:substitutions local-state)
+                                                                   (first body-results))
+                                 update (lower update-expression fold-type (:environment local-state))]
+                             {:local-state local-state :update update})))
+                        local-state (:local-state loop-body)
+                        update (:update loop-body)
                         _ (when-not (= fold-type (:type initial) (:type update))
                             (decline! :typed-scalar-fold-dtype
                                       "canonical scalar fold carry dtype must remain invariant"
@@ -790,8 +822,8 @@
                         loop-operation
                         (body/->ForLoop
                          (body/value loop-index :long)
-                         (lower-index (:lower attributes 0) (set (keys env)))
-                         (lower-index (:extent attributes) (set (keys env)))
+                         lower-bound
+                         upper-bound
                          1
                          [(body/->LoopArg (body/value carry fold-type) (:result initial))]
                          (conj (into (vec (:operations local-state)) (:operations update))

@@ -1755,11 +1755,15 @@
                             {:reason :kernel-body-loop-initial :arg arg :initial initial})))))
       (let [loop-values (into (assoc values (:id index)
                                      {:type (canonical-type (:type index))
-                                      ;; The verifier checks these are the actual loop bounds;
-                                      ;; including the upper endpoint is conservative and avoids
-                                      ;; assuming a particular trip-count convention.
-                                      :range (scalar-range/hull [(:range lower-info)
-                                                                 (:range upper-info)])
+                                      ;; Derive body-entry facts from the actual exclusive loop
+                                      ;; header, never a producer-supplied interval. Carries below
+                                      ;; remain conservative; induction facts do not apply to them.
+                                      :range (or (when (= :exclusive (loop-upper-bound-mode! operation))
+                                                   (scalar-range/exclusive-positive-loop-entry-range
+                                                    (:range lower-info) (:range upper-info)
+                                                    (:step operation) index-type))
+                                                 (scalar-range/hull [(:range lower-info)
+                                                                    (:range upper-info)]))
                                       :uniformity loop-control})
                               (map (fn [arg initial]
                                      [(:id (:binding arg))

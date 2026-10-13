@@ -1020,3 +1020,113 @@
     (is (= 1 (count (:operations result))))
     (is (apply = (:results result)))
     (is (= :half (get-in result [:operations 0 :result :type])))))
+
+;; Bounded extraction of nanparth's finite-volume Fold controls from #1338,
+;; immutable contribution head 063e7fc0. The interval authority is shared.
+(defn- offset-fold-region
+  ([] (offset-fold-region {}))
+  ([{:keys [storage-type upper-bound upper-mode]
+     :or {storage-type :int upper-mode :exclusive}}]
+   (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+         builder (scalar/make-lowerer
+                  {:array-types {'offsets storage-type} :arrays #{'offsets} :scalar-types {}
+                   :require-source-types? true :conversion-policy conversion/policy
+                   :lower-index (fn [expression scope]
+                                  (body/index-cast (index/lower expression scope decline!) :long :exact))
+                   :decline! decline!})
+         fold (list 'fold {:accumulator 'sum :index 'i :identity 0.0 :dtype :double
+                           :lower 0 :extent (if (some? upper-bound) upper-bound 'degree)
+                           :upper-bound upper-mode :association :ordered}
+                    (dialect/lambda-form ['sum 'i]
+                                        [(dialect/local-value 'p :long '(+ start i))]
+                                        ['(+ sum (double p))]))]
+     (assoc ((:lower builder)
+             (list 'let* '[start (long (clojure.core/aget offsets 0))
+                           end (long (clojure.core/aget offsets 1)) degree (- end start)] fold)
+             :double {}) :builder builder))))
+
+(defn- offset-fold-addition [region]
+  (let [loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                            (:operations region)))]
+    (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                        (= :+ (get-in % [:expression :op]))
+                        (= :long (get-in % [:expression :result-type])))
+                   (:operations loop)))))
+
+(deftest scalar-fold-index-range-comes-from-int32-storage-and-the-real-header
+  (let [addition (offset-fold-addition (offset-fold-region))]
+    (is (= :no-overflow (get-in addition [:expression :options :overflow])))
+    (is (= {:lower Integer/MIN_VALUE
+            :upper (+' Integer/MAX_VALUE (-' Integer/MAX_VALUE Integer/MIN_VALUE) -1)
+            :kind :typed-scalar-range}
+           (get-in addition [:expression :options :proof]))))
+  (doseq [options [{:storage-type :long} {:storage-type :long :upper-bound 2}
+                   {:upper-mode :inclusive}]]
+    (is (= :trap (get-in (offset-fold-addition (offset-fold-region options))
+                        [:expression :options :overflow]))))
+  (is (= :no-overflow
+         (get-in (offset-fold-addition (offset-fold-region {:storage-type :long :upper-bound 1}))
+                 [:expression :options :overflow]))))
+
+(deftest scalar-fold-index-range-does-not-escape-its-body
+  (let [region (offset-fold-region)
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                            (:operations region)))
+        id (get-in loop [:index :id])
+        escaped ((:lower (:builder region)) (list '+ id '(long 1)) :long {id :long})]
+    (is (= :trap (get-in (peek (:operations escaped)) [:expression :options :overflow])))))
+
+(deftest scalar-fold-overflow-witness-is-checked-against-the-actual-loop-header
+  (let [region (offset-fold-region)
+        kernel (body/make
+                {:id :offset-fold-range-control
+                 :parameters [(body/->KernelParameter
+                               'offsets :input :int [2] :global
+                               (layout/row-major [2] :int) :input)]
+                 :operations (:operations region)
+                 :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                 :provenance {:dialect :test}})
+        ordinal (first (keep-indexed
+                        (fn [i operation]
+                          (when (instance? raster.compiler.ir.kernel_body.ForLoop operation) i))
+                        (:operations kernel)))
+        loop-path [:operations ordinal]
+        addition-ordinal
+        (first (keep-indexed
+                (fn [i operation]
+                  (when (= operation (offset-fold-addition region)) i))
+                (:operations (get-in kernel loop-path))))
+        proof-path (into loop-path [:operations addition-ordinal :expression :options :proof])
+        refusal (fn [candidate]
+                  (try (body/validate! candidate) nil
+                       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= kernel (body/validate! kernel)))
+    ;; A producer's old witness must not survive a changed entry domain. No
+    ;; producer-supplied index interval or attribute can replace the real header.
+    (doseq [candidate [(assoc-in kernel (conj loop-path :lower)
+                                (body/index-cast -1 :long :exact))
+                       (assoc-in kernel (into loop-path [:attributes :upper-bound]) :inclusive)
+                       (assoc-in kernel (conj proof-path :upper) Integer/MAX_VALUE)]]
+      (is (= :kernel-body-intrinsic-overflow (refusal candidate))))))
+
+(deftest scalar-fold-index-range-is-restored-after-a-lowering-failure
+  (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+        builder (scalar/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {}
+                  :require-source-types? true :conversion-policy conversion/policy
+                  :lower-index (fn [expression scope]
+                                 (body/index-cast (index/lower expression scope decline!) :long :exact))
+                  :decline! decline!})
+        fold (list 'fold {:accumulator 'sum :index 'i :identity 0.0 :dtype :double
+                          :lower 0 :extent 4 :association :ordered}
+                   (dialect/lambda-form ['sum 'i]
+                                       [(dialect/local-value 'bad :long '(opaque-fold-op i))]
+                                       ['sum]))
+        failure (try ((:lower builder) fold :double {}) nil
+                     (catch clojure.lang.ExceptionInfo e e))
+        id (second (:expression (ex-data failure)))]
+    (is (some? failure))
+    (is (symbol? id))
+    (when (symbol? id)
+      (let [escaped ((:lower builder) (list '+ id '(long 1)) :long {id :long})]
+        (is (= :trap (get-in (peek (:operations escaped)) [:expression :options :overflow])))))))
