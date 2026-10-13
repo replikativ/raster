@@ -194,7 +194,7 @@ jobs:
       - run:
           name: Run OpenCL-gated tests on the CPU OpenCL device
           command: >-
-            RASTER_CI_DEBUG_NATIVE_EXIT=1
+            RASTER_CI_DEBUG_NATIVE_EXIT="${RASTER_CI_DEBUG_NATIVE_EXIT:-0}"
             RASTER_TEST_TIMING_REPORT="test-results/opencl-timings-${CIRCLE_NODE_INDEX}.edn"
             scripts/ci-opencl-cpu.sh
       - store_artifacts:
