@@ -20,6 +20,7 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.parallel.typed-soac-ownership :as ownership]
+            [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.core.util :as util]))
 
 (def ^:private dtype->allocation
@@ -1374,6 +1375,50 @@
                  :message "nested continuation requires shared read/write ownership before production admission"})))
           (dialect/equations program))))
 
+(defn- source-projection
+  "Run the existing frontend entry selected by the caller without changing its admission rules."
+  [form {:keys [segmented-plans?] :as frontend-options}]
+  (let [projection (when segmented-plans?
+                     (frontend/form->program-components form frontend-options))
+        typed-input (or (:typed-program projection)
+                        (when-not projection
+                          (frontend/form->program form frontend-options)))]
+    {:projection projection
+     :typed-input typed-input
+     :admitted? (boolean (or typed-input (:segmented-plans? projection)))}))
+
+(defn- validated-live-source-projection
+  "Remove dead canonical source only after the unchanged frontend has validated the whole form.
+
+   The initial projection is the contradiction certificate: malformed operations and inconsistent
+   value/storage facts cannot disappear merely because their results are dead.  A changed source is
+   projected again so source-binding IDs, equation facts and realized-source provenance all describe
+   the filtered form.  If filtering removes the last admitted operation, retain the validated input;
+   liveness is an optional optimization and cannot turn an admitted program into fallback."
+  [form frontend-options]
+  (let [initial (source-projection form frontend-options)]
+    (if-not (:admitted? initial)
+      (assoc initial :form form :bindings-removed 0)
+      (let [{filtered :form {:keys [bindings-removed]} :stats}
+            (dce/eliminate-dead-bindings form)]
+        (if (or (zero? bindings-removed) (= form filtered))
+          (assoc initial :form form :bindings-removed 0)
+          (let [rebuilt
+                (try
+                  (source-projection filtered frontend-options)
+                  (catch clojure.lang.ExceptionInfo exception
+                    (if (frontend/source-decline? exception)
+                      (throw (ex-info
+                              "validated source became inadmissible after liveness filtering"
+                              {:reason :raster/bug
+                               :invariant :canonical-source-liveness-reprojection
+                               :decline (ex-data exception)}
+                              exception))
+                      (throw exception))))]
+            (if (:admitted? rebuilt)
+              (assoc rebuilt :form filtered :bindings-removed bindings-removed)
+              (assoc initial :form form :bindings-removed 0))))))))
+
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
    no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
@@ -1397,20 +1442,19 @@
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}
-               projection (when segmented-plans?
-                            (frontend/form->program-components form frontend-options))
-               typed-input (or (:typed-program projection)
-                               (when-not projection
-                                 (frontend/form->program form frontend-options)))]
-           (if-not (or typed-input (:segmented-plans? projection))
+               {live-form :form :keys [projection typed-input admitted? bindings-removed]}
+               (validated-live-source-projection form frontend-options)
+               form live-form]
+           (if-not admitted?
              (when-let [decline (frontend/coverage-decline form frontend-options)]
                {:declined decline})
              (if (:segmented-plans? projection)
-               (mixed-envelope form projection
-                               {:resident-reductions? resident-reductions?
-                                :resident-initialization? resident-initialization?
-                                :resident-uniform-input-loads? resident-uniform-input-loads?
-                                :abstract-machine abstract-machine})
+               (update (mixed-envelope form projection
+                                       {:resident-reductions? resident-reductions?
+                                        :resident-initialization? resident-initialization?
+                                        :resident-uniform-input-loads? resident-uniform-input-loads?
+                                        :abstract-machine abstract-machine})
+                       :stats assoc :canonical-source-bindings-removed bindings-removed)
                (let [{typed-result :program typed-stats :stats decline :declined}
                      (optimize-typed-component
                       typed-input
@@ -1432,7 +1476,9 @@
                        {:program (envelope typed-result source realized)
                         :stats (merge typed-stats
                                       {:route :typed-soac :typed-validated true
-                                       :front-end :analyzed-source})})))))))
+                                       :front-end :analyzed-source
+                                       :canonical-source-bindings-removed
+                                       bindings-removed})})))))))
          (catch clojure.lang.ExceptionInfo exception
            (if (frontend/source-decline? exception)
              {:declined {:reason (:reason (ex-data exception))
