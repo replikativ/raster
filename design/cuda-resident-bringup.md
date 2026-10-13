@@ -8,6 +8,17 @@ runtime registration until the following acceptance gates pass.
 
 ## First device gate
 
+The independently integrated `raster.gpu.cuda-driver` leaf marshals native operations
+and brackets each calling thread's exact context. It does not register a resident backend.
+Native acquisition publication includes context restoration: allocations, modules, events
+and pinned-host allocations that cannot be published are retired through the existing
+common cleanup contract. Failed retirement retains an unresolved owner and its original
+cause; indeterminate destruction is not retried. Initialization reserves a stream-before-
+context cleanup dependency so a failed stream retirement cannot release its parent context.
+Hardware-free fault tests qualify these contracts, not actual driver execution. The future
+runtime adapter must adopt unresolved ownership and retain resources across submission;
+the contributor's synchronous bounds/admission defects remain separate integration gates.
+
 Use one public equation-first elementwise map from the existing compile-fixture corpus.
 The path must be `deftm → typed SOAC → schedule → KernelBody → CUDA source → module`, then:
 
