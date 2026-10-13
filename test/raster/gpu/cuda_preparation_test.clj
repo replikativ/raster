@@ -14,6 +14,33 @@
 (defn- bind! [a b async?]
   (runtime/bind-kernel-call (call/make a [{:type :float :value (float 2)} b]) {:async? async?}))
 
+(deftest runtime-replay-retains-prepared-storage-through-shared-completion
+  (#'fixture/with-driver
+   (fn [ops _]
+     (let [a (#'fixture/kernel) b (runtime/make-buffer 4 :float)]
+       (runtime/register-kernel! (:kernel-name a) a)
+       (let [left (bind! a b true) right (bind! a b true)
+             graph (runtime/record-graph! [left right left])]
+         (try
+           (is (= :owner-in-use (:reason (ex-data (error-of #(runtime/destroy-prepared! left))))))
+           (let [token (runtime/submit-graph! graph)
+                 launches (filter #(= :launch (first %)) @ops)]
+             (is (= [(:function left) (:function right) (:function left)]
+                    (mapv (comp first second) launches)))
+             (runtime/await-event! token)
+             (is (not @(:pending? (:pending left))))
+             (is (not @(:pending? (:pending right))))
+             (runtime/release-event! token))
+           (runtime/replay-graph! graph)
+           (is (= 6 (count (filter #(= :launch (first %)) @ops))))
+           (finally
+             (runtime/destroy-graph! graph)
+             (runtime/destroy-prepared! left)
+             (runtime/destroy-prepared! right)
+             (runtime/free-buffer! b)
+             (runtime/close-kernel-arena! nil))))
+       (is (zero? (root/lease-count runtime/state)))))))
+
 (deftest impossible-device-launch-refuses-before-compilation-or-resource-acquisition
   (#'fixture/with-driver
    (fn [ops _]

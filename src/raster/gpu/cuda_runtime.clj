@@ -11,6 +11,7 @@
             [raster.gpu.cuda-driver :as driver]
             [raster.gpu.cuda-prepared-execution :as prepared-execution]
             [raster.gpu.cuda-transfer :as transfer]
+            [raster.gpu.cuda-execution :as execution]
             [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.runtime-root :as root])
@@ -281,9 +282,28 @@
    (prepared-execution/assert-admitted! (:prepared-execution @state))
    (transfer/submit-range-batch! state entries direction opts native! assert-buffer-live! validate-range-plan!)))
 
-(defn event-complete? [token] (transfer/event-complete? token native!))
-(defn await-event! [token] (transfer/await-event! token native!))
-(defn release-event! [token] (transfer/release-event! token))
+(defn event-complete? [token]
+  (if (:transfer? token) (transfer/event-complete? token native!)
+      (execution/event-complete? token native!)))
+(defn await-event! [token]
+  (if (:transfer? token) (transfer/await-event! token native!)
+      (execution/await-event! token native!)))
+(defn release-event! [token]
+  (if (:transfer? token) (transfer/release-event! token)
+      (execution/release-event! token)))
+
+(defn record-graph!
+  ([prepareds] (record-graph! prepareds {}))
+  ([prepareds opts]
+   (ensure-init!)
+   (execution/record-graph! state prepareds opts)))
+(defn submit-graph! [graph] (execution/submit-graph! state graph native!))
+(defn destroy-graph! [graph] (execution/destroy-graph! graph))
+(defn reset-graph-events! [graph] (execution/reset-graph-events! graph))
+(defn read-graph-timestamps! [graph] (execution/read-graph-timestamps! graph native!))
+(defn replay-graph! [graph]
+  (let [token (submit-graph! graph)]
+    (try (await-event! token) (finally (release-event! token)))))
 
 (defn transfer-capabilities []
   {:submission :device-event :host-staging :runtime-owned-native :staging-memory :pinned

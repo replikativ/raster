@@ -11,6 +11,10 @@
 (defn assert-admitted! [ledger]
   (when-let [failure (some-> ledger :completion-error deref)] (throw failure)))
 
+(defn assert-binding-admitted! [ledger binding]
+  (assert-admitted! ledger)
+  (when-let [failure @(:launch-error binding)] (throw failure)))
+
 (defn complete! [ledger wait!]
   (locking (:lock ledger)
     (assert-admitted! ledger)
@@ -34,8 +38,7 @@
 (defn submit! [ledger binding stream native! assert-live! operation arguments async?]
   (locking (:lock ledger)
     (assert-live!)
-    (when-let [failure @(:completion-error ledger)] (throw failure))
-    (when-let [failure @(:launch-error binding)] (throw failure))
+    (assert-binding-admitted! ledger binding)
     ;; Reserve use before enqueue: a throwing driver call does not prove absence of work.
     (reset! (:pending? binding) true)
     (swap! (:pending ledger) conj binding)

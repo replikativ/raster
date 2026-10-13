@@ -185,6 +185,37 @@ integrated; their absence is not counted as passed native coverage. The extracte
 runtime/fixture contribution is credited to `nanparth` from the frozen #1338 tree
 `063e7fc0bd8e4e22ad4e743c39a2cb1cdaeb458c`.
 
+## Logical replay checkpoint
+
+CUDA recording orders already-prepared calls on the existing physical stream. It
+does not instantiate a native CUDA Graph or establish a host-overhead speedup.
+Graph and transfer tokens share the runtime event adapter; public CUDA sessions
+remain disabled until the full session seam and exact-tree device qualification.
+
+A recording reserves each exact prepared owner's lifetime before root locking.
+The common cleanup DAG retires its retained submission before prepared leases and
+the root lease. Submission retirement verifies completion before destroying events.
+Queries/profile reads reserve both recording and submission before root/slot locks;
+profiling may retire only the submission it measured, never a newer replay. Unknown
+completion retains dependent resources through the shared sticky completion ledger.
+Replay cannot bypass a failed standalone prepared call by creating a fresh binding;
+each launch uses its original prepared pending state, and admission precedes events.
+
+Graph rollback/adoption belongs to the existing session/graph ownership table,
+not the pending ledger's synchronous-transfer debt table. Sweeping that table
+holds root before owner, while graph destruction holds graph owner before root;
+mixing these scopes would introduce a lock inversion. No second borrower table
+or graph-specific completion poison is introduced.
+
+Hardware-free controls cover ordered/repeated prepared owners, generation refusal
+before native acquisition, query/retirement races, exact profile retirement,
+independent event cleanup failure and failed standalone launch admission. Event
+intervals are labeled device timing; their nanosecond units do not imply nanosecond
+measurement precision. Numerical changed-input replay and Compute Sanitizer
+receipts still require the integrated tree on Sam's CUDA host. This extraction
+credits `nanparth`'s #1338 design while reconciling its lifetime implementation with
+the common contracts.
+
 ## Subsequent gates
 
 1. Ordered multi-kernel `KernelGraph` recording/replay with stable resident bindings,
