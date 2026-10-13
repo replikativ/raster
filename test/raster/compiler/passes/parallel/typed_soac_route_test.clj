@@ -36,6 +36,7 @@
             [raster.compiler.passes.parallel.mixed-matrix-validation :as mixed-validation]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
@@ -234,6 +235,102 @@
            (Float/floatToRawIntBits (execute -0.0 nil))))
     (is (instance? Float
                    (execute 1.0 (fn [& _] (throw (ex-info "shadowed float" {}))))))))
+
+(deftest functional-result-transform-materializes-only-certified-singleton-operands
+  (let [make-transform
+        (fn [operand-map]
+          (dialect/make-result-transform
+           {:accumulator 'acc
+            ;; The axis map, rather than this deliberately stale source index, owns addressing.
+            :expression '(clojure.core/+
+                          acc
+                          (clojure.core/double (clojure.core/aget resident 19))
+                          gain)
+            :operands [{:value 'resident :dtype :float :map operand-map}]
+            :scalars [{:value 'gain :dtype :double}]
+            :result-dtype :double}))
+        expression (#'route/materialize-functional-result-transform
+                    'raw (make-transform {:groups [[]]}))
+        execute (eval (list 'fn '[raw resident gain] expression))]
+    (is (= '(clojure.core/+ raw
+                            (clojure.core/double (clojure.core/aget resident 0))
+                            gain)
+           expression))
+    (is (= 9.5 (execute 2.0 (float-array [3.5]) 4.0)))
+    (try
+      (#'route/materialize-functional-result-transform
+       'raw (make-transform {:groups [[['i 'n]]] }))
+      (is false "an ordinary tensor map must not enter host scalar materialization")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-soac-functional-result-transform-operands
+               (:reason (ex-data exception))))))
+    (let [bare-transform
+          (dialect/make-result-transform
+           {:accumulator 'acc
+            :expression '(clojure.core/+ acc resident)
+            :operands [{:value 'resident :dtype :float :map {:groups [[]]}}]
+            :scalars [] :result-dtype :double})]
+      (try
+        (#'route/materialize-functional-result-transform 'raw bare-transform)
+        (is false "a bare buffer parameter is not a certified element read")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-soac-functional-result-transform-operands
+                 (:reason (ex-data exception)))))))))
+
+(deftest routed-reduction-transform-retains-its-resident-singleton-load
+  (let [float-reduction
+        (with-meta
+          '(raster.par/reduce a (float 0.0) i n (+ a (aget x i)))
+          {:tag 'float :raster.type/tag 'float :raster.type/elem-type :float})
+        source (list 'let*
+                     ['left float-reduction
+                      'right '(raster.par/reduce b 0.0 j n
+                                (+ b (double (aget x j))))
+                      (with-meta 'combined {:tag 'double :raster.type/tag 'double})
+                      '(* (double right) (double left))]
+                     'combined)
+        {:keys [program stats declined]}
+        (route/attempt source :double {'x :float}
+                       {:scalar-types {'n :long} :resident-reductions? true})
+        materialized-loads
+        (filter #(and (seq? %) (= 'clojure.core/aget (first %)) (= 0 (nth % 2 nil)))
+                (tree-seq coll? seq (:source program)))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :double :target-device :ze:0}))
+        reductions (->> (:equations scheduled)
+                        (mapcat :operations)
+                        (filter #(instance? raster.compiler.ir.segop.SegRed %))
+                        vec)
+        terminal (some #(when (seq (get-in % [:reduction :attributes
+                                              :result-region :operands])) %) reductions)
+        operand (first (get-in terminal [:reduction :attributes :result-region :operands]))
+        operand-id (:sym operand)
+        fold-phase (some #(when (and (= :block-local (:phase %))
+                                     (= (:algorithm-equation terminal)
+                                        (:algorithm-equation %))) %) reductions)
+        resident-producer (some #(when (contains? (:outputs %) operand-id) %) reductions)
+        array-types (into {} (map (fn [[id value]] [id (:dtype value)]))
+                          (:values scheduled))
+        body (some-> terminal (segred-body/schedule nil {:array-types array-types
+                                                         :scalar-types {'n :long}})
+                     (get-in [:body]))
+        operand-parameter (some #(when (= operand-id (:id %)) %)
+                                (:parameters body))]
+    (is (nil? declined))
+    (is (pos? (:resident-reductions stats)))
+    (is (some #(= 'left (second %)) materialized-loads))
+    (is (= :float (:dtype operand)))
+    (is (= :cross-block (:phase terminal)))
+    (is (= :block-local (:phase fold-phase)))
+    (is (contains? (:inputs terminal) operand-id))
+    (is (not (contains? (:scalars terminal) operand-id)))
+    (is (not (contains? (:inputs fold-phase) operand-id)))
+    (is (= :cross-block (:phase resident-producer)))
+    (is (< (.indexOf reductions resident-producer) (.indexOf reductions terminal)))
+    (is (contains? (:outputs resident-producer) operand-id))
+    (is (= :float (:dtype operand-parameter)))
+    (is (= [1] (:shape operand-parameter)))
+    (is (= :typed-soac (:dialect program)))))
 
 (deftest production-route-retains-hardware-costed-placement-witnesses
   (let [poor (route/attempt expensive-fanout :float {'x :float}

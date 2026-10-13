@@ -105,6 +105,17 @@
                               (dialect/lambda-form '[acc element resident-capture] [step])))]
      (dialect/make facts [equation] '[sum]))))
 
+(deftest result-transform-operands-require-explicit-element-reads
+  (let [transform
+        (dialect/make-result-transform
+         {:accumulator 'acc
+          :expression '(clojure.core/+ acc resident)
+          :operands [{:value 'resident :dtype :float
+                      :map (axis-map/singleton-broadcast)}]
+          :scalars [] :result-dtype :double})]
+    (is (false? (dialect/result-transform? transform))
+        "a buffer parameter is not a scalar merely because its physical extent is one")))
+
 (deftest full-reduction-result-operands-are-exact-resident-singletons
   (let [program (resident-result-operand-program)]
     (is (= program (dialect/validate! program)))

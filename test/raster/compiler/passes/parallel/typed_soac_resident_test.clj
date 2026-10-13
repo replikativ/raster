@@ -179,24 +179,112 @@
     (is (resident/resident-scalar-value? (get-in (dialect/facts result) [:values 'scaled])))
     (is (= result (dialect/validate! result)))))
 
-(deftest transform-scalars-do-not-silently-become-resident-pointers
-  (let [program (fused
-                 '(let* [left (raster.par/reduce a 0.0 i n (+ a (aget x i)))
-                         right (raster.par/reduce b 0.0 j n (+ b (* (aget x j) 2.0)))
-                         ^double combined (* ^double right ^double left)
-                         result (raster.par/map-void! k n
-                                  (aset out k (* (aget x k) combined)))]
-                    result))
+(defn- two-reduction-transform-program []
+  (fused
+   '(let* [left (raster.par/reduce a 0.0 i n (+ a (aget x i)))
+           right (raster.par/reduce b 0.0 j n (+ b (* (aget x j) 2.0)))
+           ^double combined (* ^double right ^double left)
+           result (raster.par/map-void! k n
+                    (aset out k (* (aget x k) combined)))]
+      result)))
+
+(defn- transform-scalar-values [program]
+  (into #{} (mapcat #(map :value (get-in (fusion/equation-info %)
+                                         [:attributes :result-transform :scalars])))
+        (dialect/equations program)))
+
+(deftest audited-transform-scalars-become-explicit-resident-singleton-loads
+  (let [program (two-reduction-transform-program)
         transform-inputs (into #{} (mapcat #(map :value (get-in (fusion/equation-info %)
                                                                 [:attributes :result-transform :scalars])))
                                (dialect/equations program))
-        [result _] (resident/realize program)]
+        [result stats] (resident/realize program)
+        result-infos (mapv fusion/equation-info (dialect/equations result))
+        transform-operands
+        (into {} (mapcat #(map (juxt :value identity)
+                               (get-in % [:attributes :result-transform :operands])))
+              result-infos)
+        transform-scalars
+        (into #{} (mapcat #(map :value (get-in % [:attributes :result-transform :scalars])))
+              result-infos)]
     (is (seq transform-inputs))
     (doseq [value transform-inputs]
-      (is (not (resident/resident-scalar-value? (get-in (dialect/facts result) [:values value])))))
-    (is (every? empty?
-                (map #(get-in (fusion/equation-info %)
-                              [:attributes :result-transform :operands])
-                     (dialect/equations result)))
-        "landing the resident operand substrate does not activate transform-use realization")
+      (is (resident/resident-scalar-value? (get-in (dialect/facts result) [:values value])))
+      (is (= {:groups [[]]} (:map (get transform-operands value))))
+      (is (not (contains? transform-scalars value)))
+      (let [transform (some #(when (some #{value}
+                                         (map :value (get-in % [:attributes :result-transform
+                                                               :operands])))
+                               (get-in % [:attributes :result-transform]))
+                            result-infos)
+            operand (some #(when (= value (:value %)) %)
+                          (:operands transform))
+            expression (first (:body-results (dialect/lambda-parts (:lambda transform))))]
+        (is (some #{(list 'clojure.core/aget (:parameter operand) 0)}
+                  (tree-seq coll? seq expression))))
+      (is (some (fn [info]
+                  (some #{value}
+                        (get-in info [:attributes :attributes :stable-array-captures])))
+                result-infos)))
+    (is (pos? (:resident-reductions stats)))
+    (is (= result (dialect/validate! result)))))
+
+(deftest transform-load-realization-is-blocked-by-public-or-host-escape
+  (let [program (two-reduction-transform-program)
+        value (first (transform-scalar-values program))
+        facts (dialect/facts program)
+        equations (dialect/equations program)
+        outputs (dialect/outputs program)
+        public (dialect/make facts equations (vec (distinct (conj outputs value))))
+        host (dialect/make (assoc-in facts [:attributes :host-read-values] [value])
+                           equations outputs)]
+    (doseq [[label candidate] [[:public public] [:host host]]]
+      (let [[result _] (resident/realize candidate)
+            transform-values (transform-scalar-values result)]
+        (is (contains? transform-values value) (name label))
+        (is (not (resident/resident-scalar-value?
+                  (get-in (dialect/facts result) [:values value])))
+            (name label))
+        (is (= result (dialect/validate! result)))))))
+
+(deftest transform-load-realization-preserves-incompatible-value-facets
+  (let [program (two-reduction-transform-program)
+        value (first (transform-scalar-values program))]
+    (doseq [[facet facet-value]
+            [[:memory-space :host]
+             [:ownership :owned]
+             [:attributes {:external-contract true}]]]
+      (let [facts (assoc-in (dialect/facts program) [:values value facet] facet-value)
+            candidate (dialect/make facts (dialect/equations program)
+                                    (dialect/outputs program))
+            [result _] (resident/realize candidate)]
+        (is (contains? (transform-scalar-values result) value) (name facet))
+        (is (= facet-value (get-in (dialect/facts result) [:values value facet]))
+            (name facet))
+        (is (not (resident/resident-scalar-value?
+                  (get-in (dialect/facts result) [:values value])))
+            (name facet))
+        (is (= result (dialect/validate! result)))))))
+
+(deftest transform-load-realization-rejects-a-mixed-extent-use
+  (let [program
+        (first
+         (fusion/fusion-fixpoint
+          (frontend/form->program
+           '(let* [left (raster.par/reduce a (long 0) i n
+                          (clojure.core/unchecked-add a (aget x i)))
+                   right (raster.par/reduce b (long 0) j n
+                           (clojure.core/unchecked-add b (aget x j)))
+                   ^long combined (clojure.core/unchecked-add right left)
+                   result (raster.par/map-void! k left
+                            (aset out k (clojure.core/unchecked-add (aget x k) combined)))]
+              result)
+           {:dtype :long :array-types {'x :long 'out :long}
+            :scalar-types {'n :long}})))
+        value (first (transform-scalar-values program))
+        [result _] (resident/realize program)]
+    (is (some? value))
+    (is (contains? (transform-scalar-values result) value))
+    (is (not (resident/resident-scalar-value?
+              (get-in (dialect/facts result) [:values value]))))
     (is (= result (dialect/validate! result)))))

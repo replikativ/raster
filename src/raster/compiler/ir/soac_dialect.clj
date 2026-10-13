@@ -320,6 +320,15 @@
                      (second (:lambda value)))
         [_ _ region] (:lambda value)
         [_ locals results] region
+        operand-parameters (set (map :parameter operands))
+        expression-without-operand-reads
+        (descriptor/rewrite-aget-reads
+         (first results)
+         (fn [read]
+           (when (contains? operand-parameters (descriptor/aget-array-sym read)) 0)))
+        bare-operand-parameters
+        (set/intersection operand-parameters
+                          (util/free-syms expression-without-operand-reads))
         expected-parameters
         (vec (concat [(first parameters)]
                      (map :parameter operands) (map :parameter scalars)))
@@ -345,6 +354,10 @@
                         (keyword? dtype) (dtype/known? dtype) (= dtype (dtype/canon dtype))
                         (axis-map? map)))
                  operands)
+         ;; Operand parameters denote buffers, never scalar values.  Axis maps own the address,
+         ;; but the region must still spell an element read so every consumer preserves the
+         ;; buffer/value boundary instead of silently repairing a malformed bare parameter.
+         (empty? bare-operand-parameters)
          (vector? scalars)
          (every? (fn [{:keys [value parameter dtype]}]
                    (and (value-id? value) (symbol? parameter)

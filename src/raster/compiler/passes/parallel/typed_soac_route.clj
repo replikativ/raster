@@ -7,6 +7,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -112,20 +113,47 @@
 
    Device schedules execute this region at their terminal store.  JVM scalar/SIMD lowering still
    consumes the materialized host expression, so dropping the region there would return the raw
-   accumulator (for example `sum(exp(x-max))` instead of its reciprocal).  Full reductions cannot
-   have tensor operands; their remaining captures are already typed scalar SSA values."
+   accumulator (for example `sum(exp(x-max))` instead of its reciprocal).  The validated full-
+   reduction boundary may also contain resident rank-zero results represented as physical
+   one-element buffers.  Only their canonical singleton-broadcast maps are materialized here, as
+   explicit index-zero host loads; this is not a general tensor-operand projection.  The caller's
+   validated TypedSOAC program remains the authority for each operand's resident storage and
+   dtype.  Remaining captures are already typed scalar SSA values."
   [reduction-source transform]
   (if-not transform
     reduction-source
-    (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda transform))
-          substitutions
-          (into {(first parameters) reduction-source}
-                (map (juxt :parameter :value) (:scalars transform)))]
-      (when (seq (:operands transform))
-        (throw (ex-info "functional scalar reduction result transforms cannot read tensor operands"
+    (let [{:keys [parameters]} (dialect/lambda-parts (:lambda transform))
+          operands (:operands transform)
+          invalid-operand (some #(when-not (axis-map/singleton-broadcast? (:map %)) %) operands)
+          operand-parameters (set (map :parameter operands))
+          raw-expression (first (:body-results (dialect/lambda-parts (:lambda transform))))
+          expression-without-reads
+          (descriptor/rewrite-aget-reads
+           raw-expression
+           (fn [read]
+             (when (contains? operand-parameters (descriptor/aget-array-sym read)) 0)))
+          bare-operands (set/intersection operand-parameters
+                                          (util/free-syms expression-without-reads))]
+      (when invalid-operand
+        (throw (ex-info "functional scalar reduction result transforms require singleton operands"
                         {:reason :typed-soac-functional-result-transform-operands
+                         :operand invalid-operand
                          :transform transform})))
-      (util/subst-syms substitutions (first body-results)))))
+      (when (seq bare-operands)
+        (throw (ex-info "functional scalar reduction operands require explicit element reads"
+                        {:reason :typed-soac-functional-result-transform-operands
+                         :bare-operands bare-operands
+                         :transform transform})))
+      (let [expression (dialect/result-transform-boundary-expression transform)
+            substitutions
+            (into {(first parameters) reduction-source}
+                  (concat
+                   (map (fn [{:keys [parameter value map]}]
+                          [parameter (list 'clojure.core/aget value
+                                           (axis-map/index-expr map))])
+                        operands)
+                   (map (juxt :parameter :value) (:scalars transform))))]
+        (util/subst-syms substitutions expression)))))
 
 (defn- allocation-pair
   [values result extent]

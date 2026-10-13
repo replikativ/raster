@@ -1082,13 +1082,18 @@
                                    (map util/free-syms
                                         (cond-> (vec (get-in reduction [:step :results]))
                                           map-lambda (conj map-lambda))))
+              result-operand-ids (set (map :sym (:operands result-region)))
+              ;; A terminal-only operand belongs to the completed reduction, not to the block-
+              ;; local fold.  Keep any operand which the fold really reads so phase separation
+              ;; cannot hide an ordinary input or its accumulator-dtype requirement.
+              result-only-operands (set/difference result-operand-ids fold-symbols)
               fold-scalars (if result-region
                              (set/intersection (set (:scalars description)) fold-symbols)
                              (:scalars description))
               phase-1 (segop/->SegRed
                        (:id description) space level-1
                        phase-1-reduction map-lambda
-                       (:inputs description)
+                       (set/difference (set (:inputs description)) result-only-operands)
                        #{partials-sym}
                        fold-scalars
                        grid-1 :block-local
@@ -1103,7 +1108,8 @@
               level-2 (segop/->SegLevel :block :none)
               {:keys [combine identity accumulator]} (segred-body/scalar-plan phase-1)
               component (first (:components reduction))
-              result-scalars (set (drop 1 (:parameters result-region)))
+              result-scalars (set/difference (set (drop 1 (:parameters result-region)))
+                                             result-operand-ids)
               phase-2-reduction
               (reduction/scalar
                {:accumulator accumulator
@@ -1120,7 +1126,7 @@
                        [:reduction-phase (:id description) :cross-block]
                        phase-2-space level-2
                        phase-2-reduction nil
-                       #{partials-sym} #{(:sym description)}
+                       (conj result-operand-ids partials-sym) #{(:sym description)}
                        result-scalars grid-2 :cross-block
                        (segred-body/scalar-workgroup-tree-schedule
                         phase-2-reduction grid-2 :cross-block)

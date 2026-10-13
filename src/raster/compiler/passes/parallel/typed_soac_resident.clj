@@ -7,8 +7,10 @@
    depending on a resident reduction are beta-reduced into their parallel consumers, so no device
    value is reconstructed or synchronized through host scalar control."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
 
@@ -69,15 +71,115 @@
                                                  (:product-reduce :segmented-fold-map)
                                                  :multi-region-capture
                                                  :capture)}]) captures))
-           ;; The transform has its own typed scalar boundary. Rewriting the primary
-           ;; lambda cannot turn a transform scalar into a resident buffer load.
-           (into (map (fn [value] [value {:equation id :role :result-transform}])
-                      (result-transform-inputs attributes)))
+           (into (map (fn [operand]
+                        [(:value operand) {:equation id :role :result-transform-operand
+                                           :descriptor operand}])
+                      (get-in attributes [:result-transform :operands])))
+           (into (map (fn [scalar]
+                        [(:value scalar) {:equation id :role :result-transform-scalar
+                                          :descriptor scalar}])
+                      (get-in attributes [:result-transform :scalars])))
            (into (keep (fn [extent]
                          (when (dialect/value-id? extent)
                            [extent {:equation id :role :extent}])))
                  (dialect/operation-extents equation)))))
    [] equations))
+
+(defn- promotable-result-transform-use?
+  "A result-transform scalar may become a device load only when the complete typed producer and
+   consumer boundary already proves that exact use. Rank zero alone is not storage authority."
+  [facts info-by-id position-by-id producer-position value [_ {:keys [equation role descriptor]}]]
+  (let [consumer (get info-by-id equation)
+        transform (get-in consumer [:attributes :result-transform])
+        actual (get-in facts [:values value])
+        declared (:dtype descriptor)]
+    (and (= :result-transform-scalar role)
+         (= :reduce (:kind consumer))
+         (< producer-position (get position-by-id equation -1))
+         (= value (:value descriptor))
+         (= 1 (count (filter #(= value (:value %)) (:scalars transform))))
+         (not-any? #(= value (:value %)) (:operands transform))
+         (= :tensor (:kind actual))
+         (= [] (:shape actual))
+         (keyword? (:dtype actual)) (dtype/known? (:dtype actual))
+         (= (dtype/canon declared) (dtype/canon (:dtype actual)))
+         (= {:kind :plain} (:representation actual))
+         (nil? (:logical-layout actual))
+         (nil? (:memory-space actual))
+         (nil? (:placement actual))
+         (nil? (:sharding actual))
+         (nil? (:ownership actual))
+         (empty? (:effects actual))
+         (empty? (:attributes actual)))))
+
+(defn- transform-load-candidate?
+  [facts info-by-id position-by-id outputs host-reads producer result sites]
+  (let [producer-position (get position-by-id (:id producer))
+        equation-facts (get-in facts [:equations (:id producer)])
+        transform-sites (filter #(= :result-transform-scalar (get-in % [1 :role])) sites)]
+    (and (seq transform-sites)
+         (not (contains? outputs result))
+         (not (contains? host-reads result))
+         (empty? (:effects equation-facts))
+         (empty? (:aliases equation-facts))
+         (empty? (get-in equation-facts [:attributes :result-storage]))
+         (every? (fn [site]
+                   (or (= :capture (get-in site [1 :role]))
+                       (promotable-result-transform-use?
+                        facts info-by-id position-by-id producer-position result site)))
+                 sites))))
+
+(defn- result-transform-expression
+  [info transform promoted]
+  (let [{:keys [parameters body-results]} (dialect/lambda-parts (:lambda transform))
+        accumulator-parameter (first parameters)
+        accumulator (first (get-in info [:attributes :accumulators]))
+        substitutions
+        (into {accumulator-parameter accumulator}
+              (concat
+               (map (fn [{:keys [value parameter]}]
+                      [parameter value])
+                    (:operands transform))
+               (map (fn [{:keys [value parameter]}]
+                      [parameter (if (contains? promoted value)
+                                   (list 'clojure.core/aget value 0)
+                                   value)])
+                    (:scalars transform))))]
+    (util/subst-syms substitutions (first body-results))))
+
+(defn- promote-result-transform-loads
+  "Move only audited resident roots from the scalar ABI to the typed singleton operand ABI.
+   The constructor re-closes the expression after inserting explicit element-zero loads."
+  [info roots]
+  (let [transform (get-in info [:attributes :result-transform])
+        promoted (set/intersection roots (set (map :value (:scalars transform))))]
+    (if (empty? promoted)
+      info
+      (let [old-operands (mapv #(select-keys % [:value :dtype :map]) (:operands transform))
+            promoted-operands
+            (into []
+                  (comp (filter #(contains? promoted (:value %)))
+                        (map #(assoc (select-keys % [:value :dtype])
+                                     :map (axis-map/singleton-broadcast))))
+                  (:scalars transform))
+            retained-scalars
+            (into []
+                  (comp (remove #(contains? promoted (:value %)))
+                        (map #(select-keys % [:value :dtype])))
+                  (:scalars transform))
+            rebuilt (dialect/make-result-transform
+                     {:accumulator (first (get-in info [:attributes :accumulators]))
+                      :expression (result-transform-expression info transform promoted)
+                      :operands (into old-operands promoted-operands)
+                      :scalars retained-scalars
+                      :result-dtype (:result-dtype transform)})]
+        (-> info
+            (assoc :rewritten? true)
+            (assoc-in [:attributes :result-transform] rebuilt)
+            (update-in [:attributes :attributes :stable-array-captures]
+                       (fn [stable]
+                         (vec (filter (set/union (set stable) promoted)
+                                      (:captures info))))))))))
 
 (defn- scalar-definitions
   [equations]
@@ -293,14 +395,22 @@
   "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.
 
    A root declines realization when it is a program result or is used as an element array,
-   extent, or result-transform input (which requires a separate scalar-load schedule).
+   extent, or unsupported region input. A direct full-reduction result-transform scalar is an
+   eligible use only when its unique prior producer and every use are audited together; marking
+   the root resident and rebuilding all such uses as typed singleton loads is one transaction.
    Scalar chains depending on eligible roots must likewise remain internal and capture-only."
   [program]
   (let [program (dialect/validate! program)
         facts (dialect/facts program)
         equations (dialect/equations program)
         infos (mapv operation-info equations)
+        info-by-id (into {} (map (juxt :id identity)) infos)
+        position-by-id (into {} (map-indexed (fn [index info] [(:id info) index])) infos)
+        producers-by-result
+        (group-by first
+                  (mapcat (fn [info] (map (fn [result] [result info]) (:results info))) infos))
         outputs (set (dialect/outputs program))
+        host-reads (set (get-in facts [:attributes :host-read-values]))
         uses (group-by first (use-sites equations))
         stored-reduction-destinations
         (into {}
@@ -312,13 +422,17 @@
               equations)
         stored-reduction-results (set (keys stored-reduction-destinations))
         candidate-roots
-        (set (mapcat (fn [{:keys [kind results]}]
+        (set (mapcat (fn [{:keys [kind results] :as producer}]
                        (when (= :reduce kind)
                          (filter (fn [result]
-                                   (and (or (not (contains? outputs result))
-                                            (contains? stored-reduction-results result))
-                                        (every? #(= :capture (get-in % [1 :role]))
-                                                (get uses result []))))
+                                   (let [sites (get uses result [])]
+                                     (and (= 1 (count (get producers-by-result result)))
+                                          (or (and (or (not (contains? outputs result))
+                                                       (contains? stored-reduction-results result))
+                                              (every? #(= :capture (get-in % [1 :role])) sites))
+                                              (transform-load-candidate?
+                                               facts info-by-id position-by-id outputs host-reads
+                                               producer result sites)))))
                                  results)))
                      infos))
         scalar-defs (scalar-definitions equations)
@@ -359,6 +473,7 @@
                  (remove #(and (= :scalar (:kind %))
                                (some removed-scalars (:results %))))
                  (mapv #(rewrite-consumer % values scalar-defs removed-scalars roots))
+                 (mapv #(promote-result-transform-loads % roots))
                  (mapv emit-equation))
             equation-ids (set (map second rewritten))
             definitions (set (mapcat #(nth % 2) rewritten))

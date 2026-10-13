@@ -6,6 +6,8 @@
             [raster.dl.loss :as loss]
             [raster.dl.optim :as optim]
             [raster.arrays :as arrays]
+            [raster.numeric :as n]
+            [raster.par :as par]
             [raster.ad.reverse :as reverse]))
 
 (deftm delta
@@ -30,6 +32,37 @@
     (optim/sgd-step! B dB (arrays/alength B) (float lr))
     A))
 
+(deftm joint-clipped-lora-adam-step
+  "One deliberately bounded public acceptance step: reverse AD, one joint clipping norm, two
+   Adam updates at the caller-supplied time, and the pre-update scalar loss. Multi-step time
+   transport is intentionally not implied by this fixture."
+  [A :- (Array float) B :- (Array float)
+   mA :- (Array float) vA :- (Array float)
+   mB :- (Array float) vB :- (Array float)
+   x :- (Array float) tgt :- (Array float)
+   rows :- Long in :- Long r :- Long out :- Long
+   max-grad-norm :- Double lr :- Double
+   beta1 :- Double beta2 :- Double eps :- Double adam-t :- Long] :- Double
+  (let [vg ((reverse/value+grad (var raster.compiler.fixtures.lora-training/objective))
+            x A B tgt rows in r out)
+        dA (clojure.core/nth vg 2)
+        dB (clojure.core/nth vg 3)
+        na (arrays/alength A)
+        nb (arrays/alength B)
+        norm-a (par/reduce sum (float 0.0) i na
+                           (let [g (arrays/aget dA i)] (n/+ sum (n/* g g))))
+        norm-b (par/reduce sum (float 0.0) i nb
+                           (let [g (arrays/aget dB i)] (n/+ sum (n/* g g))))
+        norm (n/sqrt (n/+ (double norm-a) (double norm-b)))
+        scale (float (if (> norm max-grad-norm) (n// max-grad-norm norm) 1.0))]
+    (par/map-void! i na (arrays/aset dA i (n/* (arrays/aget dA i) scale)))
+    (par/map-void! i nb (arrays/aset dB i (n/* (arrays/aget dB i) scale)))
+    (optim/adam-step! A dA mA vA na (float lr) (float beta1) (float beta2)
+                      (float eps) adam-t)
+    (optim/adam-step! B dB mB vB nb (float lr) (float beta1) (float beta2)
+                      (float eps) adam-t)
+    (double (clojure.core/nth vg 0))))
+
 (defn inputs
   "Fresh arrays each time. Both adapters are nonzero, so both gradients are exercised."
   ([] (inputs 0))
@@ -42,6 +75,22 @@
 
 (defn arguments [{:keys [A B x tgt rows in r out lr]}]
   [A B x tgt rows in r out lr])
+
+(defn adam-inputs
+  "Fresh one-step Adam state. Time is fixed at one; callers must not treat replay as a
+   multi-step Adam qualification."
+  []
+  (let [input (inputs)]
+    (assoc input
+           :mA (float-array (count (:A input))) :vA (float-array (count (:A input)))
+           :mB (float-array (count (:B input))) :vB (float-array (count (:B input)))
+           :max-grad-norm 1.0e-4 :beta1 0.9 :beta2 0.999 :eps 1.0e-8
+           :adam-t (long 1))))
+
+(defn adam-arguments
+  [{:keys [A B mA vA mB vB x tgt rows in r out max-grad-norm lr
+           beta1 beta2 eps adam-t]}]
+  [A B mA vA mB vB x tgt rows in r out max-grad-norm lr beta1 beta2 eps adam-t])
 
 (defn oracle
   "Real-arithmetic MSE and analytic derivatives for y[b,o]=sum_k B[o,k]sum_j A[k,j]x[b,j].
@@ -81,6 +130,38 @@
     (assoc input
            :A (float-array (map #(- (double %1) (* (double (float lr)) %2)) A dA))
            :B (float-array (map #(- (double %1) (* (double (float lr)) %2)) B dB)))))
+
+(defn joint-clipped-adam-oracle
+  "Independent real-arithmetic one-step oracle over the coordinate derivatives above. The final
+   arrays are rounded to their declared Float storage; no Raster AD, clipping, or optimizer code
+   participates."
+  [{:keys [A B max-grad-norm lr beta1 beta2 eps adam-t] :as input}]
+  (let [{:keys [loss dA dB]} (oracle input)
+        norm (Math/sqrt (+ (reduce + 0.0 (map #(* % %) dA))
+                           (reduce + 0.0 (map #(* % %) dB))))
+        scale (min 1.0 (/ max-grad-norm norm))
+        bc1 (- 1.0 (Math/pow beta1 adam-t))
+        bc2 (- 1.0 (Math/pow beta2 adam-t))
+        update
+        (fn [parameters gradients]
+          (let [moments (mapv (fn [gradient]
+                                (let [g (* scale gradient)]
+                                  [(* (- 1.0 beta1) g)
+                                   (* (- 1.0 beta2) g g)]))
+                              gradients)]
+            {:parameters
+             (float-array
+              (map (fn [parameter [m v]]
+                     (- (double parameter)
+                        (* lr (/ (/ m bc1) (+ (Math/sqrt (/ v bc2)) eps)))))
+                   parameters moments))
+             :m (float-array (map first moments))
+             :v (float-array (map second moments))}))
+        a (update A dA)
+        b (update B dB)]
+    {:loss loss :gradient-norm norm :scale scale
+     :A (:parameters a) :mA (:m a) :vA (:v a)
+     :B (:parameters b) :mB (:m b) :vB (:v b)}))
 
 (defn max-error [a b]
   (assert (= (count a) (count b)))
