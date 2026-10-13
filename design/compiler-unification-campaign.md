@@ -32,6 +32,46 @@ cross-cutting parts of this campaign, not competing replacements for it.
   recorded unchanged real Gemma gate failed 11 of 28 adapter checks; it requires a fresh coherent
   reproduction, not substitution by a microtest or a relaxed numerical oracle.
 
+### CUDA integration: bounded authority audit, not a replacement campaign
+
+The October 13 compiler/runtime reviews of contributor PR #1338 (`063e7fc0`) identify
+shared correctness/completeness work beyond transport: checked intermediate index arithmetic,
+actual lexical guard scopes, known nested-return precision, conditional artifact obligations,
+and rank-zero resident composition. Conservative refusals are distinct from numerical or
+soundness defects. Contributor hardware receipts qualify that frozen tree only, not newer main.
+Newer upstream observable-effect DCE and source/allocation placement fixes must survive reconciliation.
+
+Continue the original eight obligations through these bounded integration gates:
+
+1. **Ownership/completion/prepared replay.** Integrate through the existing root, Cleanup,
+   ordered ABI and executable/session boundaries. Sync and async transfers use the same exact
+   range validator and lifetime-use leases; retire duplicated backend borrow authorities.
+   Check free-first and submission-first races, host publication, unknown outcomes, changed
+   inputs and cleanup. Async return is not proof of independent queues or physical overlap.
+2. **Shared compiler reconciliation.** Separate nested-return precision, lexical guard/index
+   proof closure, condition-preserving artifact transport, and resident scalar/result-view
+   composition. Retained source dtype evidence remains the primary type authority. Do not
+   import recursive source-type reconstruction as a second inference engine. Negative tests
+   must reject overflowing intermediate prefixes, borrowed/unrelated bounds, omitted guards,
+   forged obligations and contradictory body/ABI/source facts. Minimize duplicated retained
+   authority instead of perpetually expanding pairwise checks between copies.
+3. **Exact-tree CUDA qualification.** Hand Sam an immutable integrated main commit and
+   commands for generated public workload replay, numerical checks and sanitizer runs.
+   Keep public runtime activation separate from source-only, mocked transport and memory
+   foundations. Record host submission/staging, event device intervals and synchronized
+   end-to-end timing separately; event units do not imply nanosecond precision. Reuse common
+   measurement/oracle/tuning identity rather than creating a CUDA-specific cache or planner.
+4. **Resume held workload/AD acceptance.** Close resident training and normalized AD with
+   unchanged Gemma/GSDM/density/city/PDE oracles. CUDA integration does not waive these gates,
+   AD obligations or the original distributed/durable completion work.
+
+The contribution remains the credit/evidence umbrella until every source change and deferred
+test has an integration or explicit deferral entry. Ask the contributor to pause broad rebasing
+and implementation during extraction; request device verification when the exact commit is ready.
+Multi-GPU execution additionally needs device-scoped roots, peer route admission and transport.
+The existing topology/cost and empirical route contracts should consume those facts; synthetic
+links, NVLink branding or a forecast never grant ownership, numerical permission or measured overlap.
+
 ### Original campaign obligations
 
 | Item | Landed foundation | Remaining completion gate |
