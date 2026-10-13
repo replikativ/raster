@@ -6,6 +6,7 @@
             [raster.compiler.ir.buffer-view :as view]
             [raster.gpu.cuda-driver :as driver]
             [raster.gpu.cuda-prepared-execution :as prepared-execution]
+            [raster.gpu.cuda-transfer :as transfer]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.runtime-root :as root])
   (:import [java.lang.foreign MemorySegment]))
@@ -31,8 +32,8 @@
       ;; completion cannot be retried through a different public adapter path.
       (prepared-execution/complete! ledger invoke)
       (if (and ledger (contains? #{:launch :copy :upload :download :upload-async :download-async
-                                  :allocate :host-allocate :module-load :module-function
-                                  :event-create :event-record :event-query :event-elapsed} operation))
+                                   :allocate :host-allocate :module-load :module-function
+                                   :event-create :event-record :event-query :event-elapsed} operation))
         (locking (:lock ledger)
           (prepared-execution/assert-admitted! ledger)
           (invoke))
@@ -47,25 +48,25 @@
   ([opts]
    (let [device-ordinal (get opts :device-ordinal 0)
          include-paths (get opts :include-paths (include-paths-from-env (System/getenv)))]
-   (when (and (integer? device-ordinal) (not= 0 device-ordinal))
-     (throw (ex-info "CUDA memory foundation supports only ordinal zero"
-                     {:reason :cuda-runtime-device-unsupported :device-ordinal device-ordinal})))
-   (when-not (and (integer? device-ordinal) (<= 0 device-ordinal Integer/MAX_VALUE)
-                  (vector? include-paths) (every? string? include-paths))
-     (throw (ex-info "Invalid CUDA runtime configuration" {:reason :cuda-runtime-configuration})))
-   (locking state
-     (when (and (:initialized? @state)
-                (not= [device-ordinal include-paths] [(:device-ordinal @state) (:include-paths @state)]))
-       (throw (ex-info "CUDA runtime already has a different device/compiler configuration"
-                       {:reason :cuda-runtime-configuration-mismatch})))
-     (root/initialize!
-      state [{:id :runtime :release #(binding [driver/*context* (:context %)]
-                                     (driver/invoke! :destroy-runtime [%]))}]
-      (fn [entry]
-        (assoc (root/acquire! entry :runtime #(driver/invoke! :initialize [device-ordinal]))
-               :include-paths include-paths :device-ordinal device-ordinal
-               :prepared-execution (prepared-execution/ledger state)))))
-   nil)))
+     (when (and (integer? device-ordinal) (not= 0 device-ordinal))
+       (throw (ex-info "CUDA memory foundation supports only ordinal zero"
+                       {:reason :cuda-runtime-device-unsupported :device-ordinal device-ordinal})))
+     (when-not (and (integer? device-ordinal) (<= 0 device-ordinal Integer/MAX_VALUE)
+                    (vector? include-paths) (every? string? include-paths))
+       (throw (ex-info "Invalid CUDA runtime configuration" {:reason :cuda-runtime-configuration})))
+     (locking state
+       (when (and (:initialized? @state)
+                  (not= [device-ordinal include-paths] [(:device-ordinal @state) (:include-paths @state)]))
+         (throw (ex-info "CUDA runtime already has a different device/compiler configuration"
+                         {:reason :cuda-runtime-configuration-mismatch})))
+       (root/initialize!
+        state [{:id :runtime :release #(binding [driver/*context* (:context %)]
+                                         (driver/invoke! :destroy-runtime [%]))}]
+        (fn [entry]
+          (assoc (root/acquire! entry :runtime #(driver/invoke! :initialize [device-ordinal]))
+                 :include-paths include-paths :device-ordinal device-ordinal
+                 :prepared-execution (prepared-execution/ledger state)))))
+     nil)))
 
 (defn ensure-init! []
   (when-not (:initialized? @state) (initialize!))
@@ -75,9 +76,9 @@
 (defn execution-device-info []
   (ensure-init!)
   (select-keys @state [:name :device-ordinal :compute-capability :driver-api-version
-                      :max-workgroup-size :max-block-dimensions :max-grid-dimensions
-                      :warp-size :shared-local-memory :multiprocessor-count
-                      :free-memory-bytes :total-memory-bytes]))
+                       :max-workgroup-size :max-block-dimensions :max-grid-dimensions
+                       :warp-size :shared-local-memory :multiprocessor-count
+                       :free-memory-bytes :total-memory-bytes]))
 
 (defn- owner! [value]
   (or (cleanup/lifetime-owner value)
@@ -96,10 +97,6 @@
                     {:reason :runtime-generation-mismatch})))
   buffer)
 
-(defn- assert-unborrowed! [borrows reason message]
-  (when (seq @borrows)
-    (throw (ex-info message {:reason reason :cleanup-retry-safe? true}))))
-
 (defn make-buffer
   ([n] (make-buffer n :float))
   ([n dt] (make-buffer n dt {}))
@@ -113,14 +110,11 @@
    (when-not (every? #(or (nil? %) (fn? %)) [retain-owner! adopt-cleanup!])
      (throw (ex-info "Buffer ownership requires callbacks" {:reason :invalid-cleanup-plan})))
    (let [dt (dtype/canon dt) bytes (Math/multiplyExact (long n) (long (dtype/bytes-of dt)))
-         slot (cleanup/acquisition-slot) borrows (atom #{})]
+         slot (cleanup/acquisition-slot)]
      (ensure-init!)
      (root/construct-child!
       state [{:id :memory
-              :release #(do
-                          (assert-unborrowed! borrows :cuda-buffer-in-use
-                                              "CUDA buffer is retained by a prepared call")
-                          (cleanup/release-native! slot (fn [p] (native! :free [p]))))}]
+              :release #(cleanup/release-native! slot (fn [p] (native! :free [p])))}]
       (fn [owner entry]
         (prepared-execution/assert-admitted! (:prepared-execution @state))
         (when retain-owner! (retain-owner! owner))
@@ -130,7 +124,6 @@
                                            :alignment 256 :coherence :explicit-transfer})]
           {::buffer true ::context (:context @(:projection entry))
            :device-pointer p :n-elements n :byte-size bytes :dtype dt :alignment 256
-           :borrows borrows
            :view (view/view allocation {:id (random-uuid) :dtype dt :shape [n]})}))
       (or adopt-cleanup! retain-owner!)))))
 
@@ -156,12 +149,11 @@
                               (min (:alignment buffer) (Long/lowestOneBit (long byte-offset))))
                :byte-size byte-length :n-elements (quot byte-length width)
                :view (view/subview (:view buffer) {:id (random-uuid) :byte-offset byte-offset
-                                                 :shape [(quot byte-length width)]})))))
+                                                   :shape [(quot byte-length width)]})))))
 
 (defn free-buffer! [buffer]
   (when-not (::cleanup/owner buffer)
     (throw (ex-info "Borrowed CUDA slice has no destruction authority" {:reason :missing-cleanup-owner})))
-  (assert-unborrowed! (:borrows buffer) :cuda-buffer-in-use "CUDA buffer is retained by a prepared call")
   (cleanup/release! (::cleanup/owner buffer)))
 
 (defn- host-segment [host]
@@ -222,32 +214,32 @@
                :release #(cleanup/release-native! staging-slot (fn [p] (native! :host-free [p])))}
               {:id :buffer-use :after #{:staging}
                :release #(cleanup/release-native! use-slot
-                                                 (fn [lease] (cleanup/release! (::cleanup/owner lease))))}])]
+                                                  (fn [lease] (cleanup/release! (::cleanup/owner lease))))}])]
         (let [value
-                (cleanup/build!
-                 operation-owner
-                 (fn []
-                   (cleanup/acquire-native! use-slot #(cleanup/retain-use! (owner! buffer)))
+              (cleanup/build!
+               operation-owner
+               (fn []
+                 (cleanup/acquire-native! use-slot #(cleanup/retain-use! (owner! buffer)))
                    ;; Reserve memory before acquiring the root/queue monitor. Free
                    ;; retires its root lease under the owner monitor in the opposite
                    ;; order; holding root while waiting for owner could deadlock.
-                   (locking (:lock ledger)
-                     (assert-buffer-live! buffer)
-                     (let [pointer (cleanup/acquire-native! staging-slot #(native! :host-allocate [n-bytes]))
-                           staging (.reinterpret ^MemorySegment pointer (long n-bytes))]
-                       (prepared-execution/synchronize! ledger (:stream @state) native!)
-                       (when (= :upload direction)
-                         (MemorySegment/copy host-seg (long host-off) staging (long 0) (long n-bytes)))
+                 (locking (:lock ledger)
+                   (assert-buffer-live! buffer)
+                   (let [pointer (cleanup/acquire-native! staging-slot #(native! :host-allocate [n-bytes]))
+                         staging (.reinterpret ^MemorySegment pointer (long n-bytes))]
+                     (prepared-execution/synchronize! ledger (:stream @state) native!)
+                     (when (= :upload direction)
+                       (MemorySegment/copy host-seg (long host-off) staging (long 0) (long n-bytes)))
                        ;; Pinned staging makes successful synchronous upload completion
                        ;; unambiguous. On any uncertain native outcome, rollback drains
                        ;; the actual copy stream before retiring staging or buffer use.
-                       (vreset! started? true)
-                       (native! direction [(+' (:device-pointer buffer) buf-off) staging n-bytes])
-                       (vreset! completed? true)
-                       (when (= :download direction)
-                         (MemorySegment/copy staging (long 0) host-seg (long host-off) (long n-bytes)))
-                       {})))
-                 #(prepared-execution/retain-debt! ledger %))]
+                     (vreset! started? true)
+                     (native! direction [(+' (:device-pointer buffer) buf-off) staging n-bytes])
+                     (vreset! completed? true)
+                     (when (= :download direction)
+                       (MemorySegment/copy staging (long 0) host-seg (long host-off) (long n-bytes)))
+                     {})))
+               #(prepared-execution/retain-debt! ledger %))]
           (try (cleanup/release! (::cleanup/owner value))
                (catch Throwable e
                  (prepared-execution/retain-debt! ledger (::cleanup/owner value))
@@ -275,3 +267,20 @@
 
 (defn shutdown! [] (root/shutdown-construction! state))
 (defn reset! [] (shutdown!))
+
+(defn submit-range-batch!
+  ([entries direction] (submit-range-batch! entries direction {}))
+  ([entries direction opts]
+   (prepared-execution/assert-admitted! (:prepared-execution @state))
+   (transfer/submit-range-batch! state entries direction opts native! assert-buffer-live! validate-range-plan!)))
+
+(defn event-complete? [token] (transfer/event-complete? token native!))
+(defn await-event! [token] (transfer/await-event! token native!))
+(defn release-event! [token] (transfer/release-event! token))
+
+(defn transfer-capabilities []
+  {:submission :device-event :host-staging :runtime-owned-native :staging-memory :pinned
+   :independent-physical-queue? false :queue-ordering :in-order
+   :async-h2d? true :async-d2h? true :peer-transfer? false :peer-mechanisms []
+   :event-semantics :device-completion :host-lease-until-await? true
+   :host-memory :any :physically-serialized? true})

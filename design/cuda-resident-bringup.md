@@ -8,6 +8,37 @@ runtime registration until the following acceptance gates pass.
 
 ## First device gate
 
+### Async completion integration checkpoint
+
+CUDA async range batches reuse the synchronous byte-plan validator and the common
+Cleanup lifetime leases. The backend-local buffer borrow table is retired. Reservations
+precede root/queue locking; one cleanup plan retains buffer uses, a root lease, staging,
+events, completion and download publication. Query and await themselves reserve token
+lifetime against concurrent retirement. Await/publication serialize; unknown completion
+cannot be retried through a second public adapter.
+
+An attempted free during active use now refuses before owner phase changes. It does not
+poison a still-live buffer: independently submitted transfers may drain, followed by a
+successful free. This is the common lifetime-admission contract, not a numerical change.
+
+Capabilities use the existing validated transfer schema. CUDA currently shares an in-order
+physical stream with compute, advertises no independent transfer queue and no peer transport.
+Async host return does not certify physical overlap. Event timing excludes host allocation,
+staging and publication; no CUDA runtime performance claim follows from mocked controls.
+
+The contributor's backend-level transfer tests are integrated with additional lifetime and
+polling-retirement controls. These four session-level tests remain deferred until public
+CUDA registration and session integration; they are not counted as passed or silently skipped:
+
+- `public-session-close-awaits-download-and-frees-transfer-staging`
+- `host-publication-error-preserves-operation-failure-but-retires-native-resources`
+- `public-await-retains-unknown-completion-with-one-native-attempt`
+- `public-await-explicitly-retry-safe-completion-can-retire-after-retry`
+
+Preserve their host-publication, close and unknown/retry-safe completion obligations in the
+later session slice. Genuine CUDA/device/sanitizer qualification remains an exact-commit
+handoff to Sam after the prepared execution and shared compiler fixes are reconciled.
+
 The memory-foundation integration keeps CUDA session registration disabled. It adds
 ordinal-zero allocation/views and checked synchronous ranges under the common root and
 cleanup authorities, not graph binding or public execution. `retain-use!` supplies an
