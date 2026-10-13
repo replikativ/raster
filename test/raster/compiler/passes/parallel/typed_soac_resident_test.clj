@@ -5,13 +5,128 @@
             [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
-            [raster.compiler.passes.parallel.typed-soac-resident :as resident]))
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
+            [raster.numeric :as numeric]))
 
 (defn- fused [source]
   (first (fusion/fusion-fixpoint
           (frontend/form->program source
                                   {:dtype :double :array-types {'x :double 'out :double}
                                    :scalar-types {'scale :double}}))))
+
+(defn- public-reused-reduction-program []
+  (first
+   (fusion/fusion-fixpoint
+    (frontend/form->program
+     '(let* [left (raster.par/reduce sum (float 0.0) i n
+                     (let* [v (clojure.core/aget x i)] (+ sum (* v v))))
+             right (raster.par/reduce sum (float 0.0) i n
+                      (let* [v (clojure.core/aget y i)] (+ sum (* v v))))
+             ^double norm (raster.numeric/sqrt (+ (double left) (double right)))
+             effect (raster.par/map-void! i n
+                      (clojure.core/aset out i (float norm)))]
+        (double norm))
+     {:dtype :float :array-types {'x :float 'y :float 'out :float}
+      :scalar-types {'n :long}}))))
+
+(defn- public-root-proof-context [program]
+  (let [facts (dialect/facts program)
+        infos (mapv #'resident/operation-info (dialect/equations program))
+        info-by-id (into {} (map (juxt :id identity)) infos)
+        position-by-id (into {} (map-indexed (fn [i info] [(:id info) i])) infos)
+        producers (group-by first
+                            (mapcat (fn [info]
+                                      (map (fn [result] [result info]) (:results info)))
+                                    infos))
+        output 'norm
+        producer (second (first (get producers output)))
+        sites (get (group-by first (#'resident/use-sites (dialect/equations program))) output)]
+    {:facts facts :info-by-id info-by-id :position-by-id position-by-id
+     :producers producers :outputs (set (dialect/outputs program)) :output output
+     :producer producer :sites sites}))
+
+(defn- public-root-proof?
+  [{:keys [facts info-by-id position-by-id producers outputs output producer sites]
+    :as context}]
+  (#'resident/public-reused-reduction-root?
+   facts info-by-id position-by-id producers outputs
+   (set (get-in facts [:attributes :host-read-values])) producer output sites))
+
+(deftest direct-public-reduction-reused-by-a-device-capture-becomes-resident
+  (let [program (public-reused-reduction-program)
+        root (:output (public-root-proof-context program))
+        outputs-before (dialect/outputs program)
+        [result stats] (resident/realize program)
+        consumer-equation (some #(when (some #{root} (:captures (fusion/equation-info %))) %)
+                                (dialect/equations result))
+        consumer (fusion/equation-info consumer-equation)
+        capture-index (.indexOf ^java.util.List (:captures consumer) root)
+        capture-parameter (nth (:capture-parameters
+                                (dialect/parameter-layout consumer-equation))
+                               capture-index)]
+    (is (= 2 (:resident-reductions stats))
+        "the internal left norm and the directly returned/reused final norm are resident")
+    (is (= [root] (get-in (dialect/facts result)
+                          [:attributes :public-resident-reduction-outputs])))
+    (is (= outputs-before (dialect/outputs result))
+        "the complete logical public output boundary is unchanged")
+    (is (resident/resident-scalar-value? (get-in (dialect/facts result) [:values root])))
+    (is (some #{(list 'clojure.core/aget capture-parameter 0)}
+              (tree-seq coll? seq (:body-results consumer))))
+    (is (= result (dialect/validate! result)))))
+
+(deftest public-output-only-and-mixed-use-reduction-roots-stay-scalar
+  (let [context (public-root-proof-context (public-reused-reduction-program))
+        producer-position (get (:position-by-id context) (get-in context [:producer :id]))
+        later-id (some (fn [[id position]] (when (< producer-position position) id))
+                       (:position-by-id context))]
+    (is (public-root-proof? context))
+    (is (not (public-root-proof? (assoc context :sites []))) "output-only is unchanged")
+    (is (not (public-root-proof? (assoc context :outputs #{'public-alias})))
+        "an indirect public alias does not authorize residency of its producer root")
+    (doseq [role [:array :extent :contract-capture :multi-region-capture
+                  :result-transform-operand :result-transform-scalar]]
+      (is (not (public-root-proof?
+                (update context :sites conj [(:output context)
+                                             {:equation later-id :role role}])))
+          (name role)))))
+
+(deftest an-indirect-public-alias-does-not-activate-public-root-residency
+  (let [program (fused
+                 '(let* [total (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                         result (raster.par/map-void! j n
+                                  (aset out j (* (aget x j) total)))
+                         ^double returned (double total)]
+                    returned))
+        [result stats] (resident/realize program)]
+    (is (= '[returned] (dialect/outputs program))
+        "the post-effect scalar, not its reduction dependency, is the direct public output")
+    (is (zero? (:resident-reductions stats)))
+    (is (= :plain (get-in (dialect/facts result) [:values 'total :representation :kind])))
+    (is (nil? (get-in (dialect/facts result)
+                      [:attributes :public-resident-reduction-outputs])))
+    (is (= result (dialect/validate! result)))))
+
+(deftest public-residency-requires-pristine-producer-and-value-facets
+  (let [context (public-root-proof-context (public-reused-reduction-program))
+        root (:output context)
+        equation-id (get-in context [:producer :id])]
+    (doseq [[label update-facts]
+            [[:host-read #(assoc-in % [:attributes :host-read-values] [root])]
+             [:effect #(assoc-in % [:equations equation-id :effects] #{:memory/read})]
+             [:alias #(assoc-in % [:equations equation-id :aliases] {root 'other})]
+             [:storage #(assoc-in % [:equations equation-id :attributes :result-storage]
+                                  [{:destination 'scratch :access :write :host-return :buffer}])]
+             [:representation #(assoc-in % [:values root :representation] {:kind :external})]
+             [:logical-layout #(assoc-in % [:values root :logical-layout] :row-major)]
+             [:memory-space #(assoc-in % [:values root :memory-space] :host)]
+             [:placement #(assoc-in % [:values root :placement] :external)]
+             [:sharding #(assoc-in % [:values root :sharding] {:axis 0})]
+             [:ownership #(assoc-in % [:values root :ownership] :owned)]
+             [:value-effects #(assoc-in % [:values root :effects] #{:memory/read})]
+             [:attributes #(assoc-in % [:values root :attributes] {:external true})]
+             [:unknown-dtype #(assoc-in % [:values root :dtype] :unknown)]]]
+      (is (not (public-root-proof? (update context :facts update-facts))) (name label)))))
 
 (deftest resident-realization-preserves-unrelated-fold-map-regions
   (let [program (frontend/form->program

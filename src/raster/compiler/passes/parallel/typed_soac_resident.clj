@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.typed-soac-resident
-  "Realize non-escaping TypedSOAC reduction scalars as resident one-element buffers.
+  "Realize audited TypedSOAC reduction scalars as resident one-element buffers.
 
    Logical reduction results remain rank-zero AbstractValues.  Their representation records the
    physical resident realization, scheduled reductions own the buffer output role, and consuming
@@ -128,6 +128,47 @@
                        (promotable-result-transform-use?
                         facts info-by-id position-by-id producer-position result site)))
                  sites))))
+
+(defn- exact-plain-scalar-value?
+  "Require the complete default scalar value contract before changing physical representation.
+   Rank zero alone is not evidence that a value may become a device buffer."
+  [value]
+  (and (= :tensor (:kind value))
+       (= [] (:shape value))
+       (keyword? (:dtype value)) (dtype/known? (:dtype value))
+       (= {:kind :plain} (:representation value))
+       (nil? (:logical-layout value))
+       (nil? (:memory-space value))
+       (nil? (:placement value))
+       (nil? (:sharding value))
+       (nil? (:ownership value))
+       (empty? (:effects value))
+       (empty? (:attributes value))))
+
+(defn- public-reused-reduction-root?
+  "Admit one direct public reduction result only when it is also a fully audited device capture.
+
+   The public occurrence is deliberately not inferred through dependent scalar equations. Every
+   actual equation use must be a later ordinary capture; array, extent, multi-region and result-
+   transform roles refuse. The producer and value contracts must be pristine because realization
+   changes only their physical representation, never any other semantic facet."
+  [facts info-by-id position-by-id producers-by-result outputs host-reads producer result sites]
+  (let [producer-position (get position-by-id (:id producer))
+        equation-facts (get-in facts [:equations (:id producer)])]
+    (and (contains? outputs result)
+         (= 1 (count (:results producer)))
+         (= 1 (count (get producers-by-result result)))
+         (seq sites)
+         (every? (fn [[_ {:keys [equation role]}]]
+                   (and (= :capture role)
+                        (< producer-position (get position-by-id equation -1))
+                        (some? (get info-by-id equation))))
+                 sites)
+         (not (contains? host-reads result))
+         (empty? (:effects equation-facts))
+         (empty? (:aliases equation-facts))
+         (empty? (get-in equation-facts [:attributes :result-storage]))
+         (exact-plain-scalar-value? (get-in facts [:values result])))))
 
 (defn- result-transform-expression
   [info transform promoted]
@@ -392,13 +433,15 @@
          {:resident-uniform-input-loads (count removed)}]))))
 
 (defn realize
-  "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.
+  "Return `[program stats]`, realizing every eligible audited scalar reduction.
 
-   A root declines realization when it is a program result or is used as an element array,
-   extent, or unsupported region input. A direct full-reduction result-transform scalar is an
-   eligible use only when its unique prior producer and every use are audited together; marking
-   the root resident and rebuilding all such uses as typed singleton loads is one transaction.
-   Scalar chains depending on eligible roots must likewise remain internal and capture-only."
+   Ordinary output-only roots and indirect/dependent outputs remain scalar. A direct public,
+   single-result reduction root may become resident only when it also has at least one later
+   ordinary capture and its complete producer, use and AbstractValue boundaries are pristine.
+   A direct full-reduction result-transform scalar is an eligible use only when its unique prior
+   producer and every use are audited together; marking the root resident and rebuilding all such
+   uses as typed singleton loads is one transaction. Scalar chains depending on eligible roots
+   must likewise remain internal and capture-only."
   [program]
   (let [program (dialect/validate! program)
         facts (dialect/facts program)
@@ -421,6 +464,15 @@
                                (or (dialect/result-storage facts (second equation)) [])))))
               equations)
         stored-reduction-results (set (keys stored-reduction-destinations))
+        public-reused-roots
+        (set (mapcat (fn [{:keys [kind results] :as producer}]
+                       (when (= :reduce kind)
+                         (filter (fn [result]
+                                   (public-reused-reduction-root?
+                                    facts info-by-id position-by-id producers-by-result outputs
+                                    host-reads producer result (get uses result [])))
+                                 results)))
+                     infos))
         candidate-roots
         (set (mapcat (fn [{:keys [kind results] :as producer}]
                        (when (= :reduce kind)
@@ -430,6 +482,7 @@
                                           (or (and (or (not (contains? outputs result))
                                                        (contains? stored-reduction-results result))
                                               (every? #(= :capture (get-in % [1 :role])) sites))
+                                              (contains? public-reused-roots result)
                                               (transform-load-candidate?
                                                facts info-by-id position-by-id outputs host-reads
                                                producer result sites)))))
@@ -504,6 +557,11 @@
                                               m)))
                                         equation-facts rewritten)))
                       (assoc-in [:attributes :resident-reductions] (vec (sort-by pr-str roots))))
+            public-resident-outputs (set/intersection roots public-reused-roots)
+            facts (cond-> facts
+                    (seq public-resident-outputs)
+                    (assoc-in [:attributes :public-resident-reduction-outputs]
+                              (vec (sort-by pr-str public-resident-outputs))))
             result (dialect/make facts rewritten (dialect/outputs program))]
         [result {:resident-reductions (count roots)
                  :inlined-scalars (count removed-scalars)}]))))

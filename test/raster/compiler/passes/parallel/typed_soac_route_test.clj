@@ -8,6 +8,7 @@
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
@@ -21,6 +22,7 @@
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.layout-stage :as layout-stage]
             [raster.compiler.ir.matrix-stage :as matrix-stage]
+            [raster.compiler.ir.par :as par-ir]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.scheduled-graph-refinement :as graph-refinement]
@@ -43,6 +45,7 @@
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
             [raster.gpu.dispatch-tuning :as dispatch-tuning]
+            [raster.numeric :as numeric]
             [raster.gpu.program-tuning :as program-tuning]))
 
 (defn- kernel-body-operations
@@ -62,6 +65,33 @@
   (filterv #(= "raster.compiler.ir.kernel_body.ScalarStore"
                (.getName (class %)))
            (kernel-body-operations artifact)))
+
+(defn- interpret-resident-source-for-test
+  "Interpret the internal reduce-into marker for source-semantic regression only.
+
+   This is not a public raw-source JVM route. It recognizes the shared IR predicate, extracts its
+   canonical plain reduction, evaluates the destination once, stores slot zero, returns that
+   buffer, and then delegates every ordinary parallel form to the shared sequential expansion."
+  [program]
+  (let [expanded
+        (par-ir/expand-par-forms
+         (walk/postwalk
+          (fn [form]
+            (if (par-ir/par-reduce-into-form? form)
+              (let [{:keys [out-buf reduce-form]} (par-ir/extract-par-reduce-into-info form)
+                    destination (gensym "resident_source_out__")
+                    result-dtype (dtype/canon (get-in program [:values out-buf :dtype]))
+                    cast (symbol "clojure.core"
+                                 (name (dtype/scalar-tag-for-dtype result-dtype)))]
+                (list 'let* [destination out-buf]
+                      (list 'clojure.core/aset destination 0 (list cast reduce-form))
+                      destination))
+              form))
+          (:source program)))]
+    ;; Typed compiler hints remain available as :raster.type/tag. JVM reference eval must not
+    ;; reinterpret a retained primitive binder hint after the sequential expansion changes the
+    ;; initializer's host representation; explicit checked cast forms above remain untouched.
+    (walk/postwalk #(if (symbol? %) (vary-meta % dissoc :tag) %) expanded)))
 
 (def ^:private map-map
   '(let* [y (raster.par/pmap i n float
@@ -317,7 +347,7 @@
         operand-parameter (some #(when (= operand-id (:id %)) %)
                                 (:parameters body))]
     (is (nil? declined))
-    (is (pos? (:resident-reductions stats)))
+    (is (= 1 (:resident-reductions stats)))
     (is (some #(= 'left (second %)) materialized-loads))
     (is (= :float (:dtype operand)))
     (is (= :cross-block (:phase terminal)))
@@ -3017,7 +3047,9 @@
     (is (= [] (get-in program [:values 'scaled :shape])))
     (is (= :resident-scalar-buffer
            (get-in program [:values 'scaled :representation :kind])))
-    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (some #{'clojure.core/aset} (flatten (:source program)))
+        "a transformed resident reduction stores the finalized scalar, not its raw accumulator")
     (is (not-any? #{'total} (flatten (:source program))))
     (is (= :float (get-in program [:values 'scaled :dtype])))
     (is (= [:double] (:dtypes reduction-attributes)))
@@ -3083,7 +3115,72 @@
     (is (some #{'raster.par/reduce} (flatten (:source program))))
     (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
 
-(deftest host-visible-dependent-scalar-blocks-its-resident-root
+(deftest public-reduction-reused-on-device-keeps-a-scalar-source-return
+  (let [source
+        '(let* [left (raster.par/reduce sum (float 0.0) i n
+                        (let* [v (clojure.core/aget x i)] (+ sum (* v v))))
+                right (raster.par/reduce sum (float 0.0) i n
+                         (let* [v (clojure.core/aget y i)] (+ sum (* v v))))
+                ^double norm (raster.numeric/sqrt (+ (double left) (double right)))
+                effect (raster.par/map-void! i n
+                         (clojure.core/aset out i (float norm)))]
+           (clojure.core/double norm))
+        {:keys [program stats]} (route/attempt
+                                 source :float {'x :float 'y :float 'out :float}
+                                 {:resident-reductions? true
+                                  :scalar-types {'n :long}})
+        resident-output (first (get-in program
+                                       [:attributes :public-resident-reduction-outputs]))
+        final-result (last (drop 2 (:source program)))
+        inner (some #(when (some #{resident-output} (:results %)) (:algorithm %))
+                    (:equations program))
+        execute (eval (list 'fn '[x y out n]
+                            (interpret-resident-source-for-test program)))
+        out (float-array 3)
+        actual (execute (float-array [1.0 2.0 3.0])
+                        (float-array [4.0 5.0 6.0]) out (long 3))
+        expected (Math/sqrt 91.0)]
+    (is (= 2 (:resident-reductions stats))
+        "the internal left norm and the directly returned/reused final norm are resident")
+    (is (some #{resident-output} (:outputs program)))
+    (is (= [] (get-in program [:values resident-output :shape])))
+    (is (= :double (get-in program [:values resident-output :dtype])))
+    (is (= :resident-scalar-buffer
+           (get-in program [:values resident-output :representation :kind])))
+    (is (some #{(list 'clojure.core/aget resident-output 0)}
+              (tree-seq coll? seq final-result))
+        "routed source loads the scalar element while TypedSOAC retains the logical rank-zero ID")
+    (is (instance? Double actual))
+    (is (< (Math/abs (- expected actual)) 1.0e-12)
+        "checked interpretation proves the routed fused transform precedes the resident store")
+    (is (= (vec (repeat 3 (float expected))) (vec out)))
+    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (= [resident-output]
+           (get-in (dialect/facts inner)
+                   [:attributes :public-resident-reduction-outputs])))))
+
+(deftest public-resident-source-aliases-are-exact-and-cycle-safe
+  (let [substitutions (#'route/public-resident-source-substitutions
+                       '[direct produced
+                         alias root
+                         alias-chain alias
+                         cycle-left cycle-right
+                         cycle-right cycle-left
+                         unrelated other]
+                       #{'root})
+        load '(clojure.core/aget root 0)]
+    (is (= load (get substitutions 'root)))
+    (is (= load (get substitutions 'alias)))
+    (is (= load (get substitutions 'alias-chain)))
+    (is (not (contains? substitutions 'cycle-left)))
+    (is (not (contains? substitutions 'cycle-right)))
+    (is (not (contains? substitutions 'unrelated)))
+    (is (not (contains? substitutions 'direct)))
+    (is (= [(list 'double load) [(list 'clojure.core/double load)]]
+           (clojure.walk/postwalk-replace
+            substitutions '[(double alias) [(clojure.core/double alias-chain)]])))))
+
+(deftest public-direct-reduction-output-with-a-device-capture-becomes-resident
   (let [source
         '(let* [total (raster.par/reduce acc 0.0 i n
                                          (+ acc (clojure.core/aget a i)))
@@ -3098,12 +3195,16 @@
                                  {:resident-reductions? true})]
     (is (= :typed-soac (:dialect program)))
     (is (= 1 (:vertical stats)))
-    (is (zero? (:resident-reductions stats)))
+    (is (= 1 (:resident-reductions stats)))
     (is (nil? (get-in program [:values 'total]))
         "the unobservable pre-epilogue scalar is no longer materialized")
-    (is (= :plain (get-in program [:values 'scaled :representation :kind])))
-    (is (= [:binding 'scaled] (get-in program [:equations 0 :site])))
+    (is (= :resident-scalar-buffer
+           (get-in program [:values 'scaled :representation :kind])))
+    (is (some #{'(clojure.core/aget scaled 0)}
+              (tree-seq coll? seq (last (drop 2 (:source program)))))
+        "the public tuple projects the direct resident root as a scalar")
     (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (some #{'clojure.core/aset} (flatten (:source program))))
     (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
 
 (deftest production-pass-chain-preserves-the-typed-envelope

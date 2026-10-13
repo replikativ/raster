@@ -545,6 +545,57 @@
                       (canonicalize-value-dtype authoritative)))
           outer)))))
 
+(defn- validated-public-resident-output
+  "Return the certified one-element resident value for an exact public reduction output.
+
+   This requires the authoritative inner TypedSOAC certificate written by resident realization;
+   an outer attribute, rank-zero value, or source `aget` spelling is never sufficient."
+  [parallel-program result]
+  (try
+    (let [producers (filterv #(some #{result} (:results %)) (:equations parallel-program))]
+      (when (= 1 (count producers))
+        (let [equation (first producers)
+            algorithm (:algorithm equation)
+            outer (get (:values parallel-program) result)
+            inner-facts (when (and (soac/program-form? algorithm)
+                                   (typed-algorithm-boundary?
+                                    (:values parallel-program) equation algorithm))
+                          (soac/facts algorithm))
+            inner-producers (when inner-facts
+                              (filterv #(some #{result} (nth % 2))
+                                       (soac/equations algorithm)))
+            inner-producer (when (= 1 (count inner-producers))
+                             (first inner-producers))
+            inner (when (and (= 'reduce (some-> inner-producer soac/operation-kind))
+                             (= [result] (nth inner-producer 2 nil))
+                             (some #{result} (soac/outputs algorithm))
+                             (= {:kind :resident-scalar-buffer :elements 1}
+                                (get-in inner-facts
+                                        [:equations (second inner-producer) :attributes
+                                         :resident-realization]))
+                             (some #{result}
+                                   (get-in inner-facts
+                                           [:attributes
+                                            :public-resident-reduction-outputs])))
+                    (get-in inner-facts [:values result]))
+            value (when (= (canonicalize-value-dtype outer)
+                           (canonicalize-value-dtype inner))
+                    outer)]
+        (when (and (= :tensor (:kind value))
+                   (= [] (:shape value))
+                   (keyword? (:dtype value)) (dtype/known? (:dtype value))
+                   (= {:kind :resident-scalar-buffer :elements 1}
+                      (:representation value))
+                   (= :device (:memory-space value))
+                   (nil? (:logical-layout value))
+                   (nil? (:placement value))
+                   (nil? (:sharding value))
+                   (contains? #{nil :owned} (:ownership value))
+                   (empty? (:effects value))
+                   (empty? (:attributes value)))
+          value))))
+    (catch Exception _ nil)))
+
 (defn- source-result-projection
   "Prove one complete source return and return `{:kind ... :outputs [...]}`, or nil.
 
@@ -643,6 +694,15 @@
                       canonical (when-not lexical-call?
                                   (callee-identity/validated-source-callee
                                    head source-ns lexical-heads))
+                      resident-output (when (and (= 'clojure.core/aget canonical)
+                                                 (= 3 (count expression))
+                                                 (symbol? (second expression))
+                                                 (= 0 (nth expression 2)))
+                                        (second expression))
+                      resident-value (when (and resident-output
+                                                (contains? outputs resident-output))
+                                       (validated-public-resident-output
+                                        parallel-program resident-output))
                       target-dtype (some-> canonical descriptor/cast-result-tag
                                            dtype/dtype-for-scalar-tag)
                       operand-projection (when (and target-dtype (= 2 (count expression)))
@@ -651,8 +711,10 @@
                                                 (= 1 (count (:outputs operand-projection))))
                                        (first (:outputs operand-projection)))
                       value (validated-produced-value parallel-program operand-output)]
-                  (when (and operand-output
-                             (valid-scalar-cast-value? value (dtype/canon target-dtype)))
+                  (cond
+                    resident-value {:kind :value :outputs [resident-output]}
+                    (and operand-output
+                         (valid-scalar-cast-value? value (dtype/canon target-dtype)))
                     operand-projection))
 
                 :else nil))]

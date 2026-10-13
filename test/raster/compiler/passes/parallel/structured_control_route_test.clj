@@ -35,6 +35,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.parallel-program :as program-runtime]
+            [raster.numeric :as numeric]
             [raster.nn :as nn]
             [raster.ode.pde :as pde]))
 
@@ -1114,6 +1115,89 @@
       (is (= :structured-control-source-result
              (reason-of #(project forged 'forged-binding)))
           "a mutable outer host binding cannot manufacture a return projection"))))
+
+(deftest public-resident-scalar-load-requires-the-inner-reduction-certificate
+  (let [source '(let* [left (raster.par/reduce sum (float 0.0) i n
+                                (let* [v (clojure.core/aget x i)] (+ sum (* v v))))
+                        right (raster.par/reduce sum (float 0.0) i n
+                                 (let* [v (clojure.core/aget y i)] (+ sum (* v v))))
+                        ^double norm (raster.numeric/sqrt (+ (double left) (double right)))
+                        effect (raster.par/map-void! i n
+                                 (clojure.core/aset out i (float norm)))]
+                   (double norm))
+        parallel (:program (typed-route/attempt
+                            source :float {'x :float 'y :float 'out :float}
+                            {:resident-reductions? true :scalar-types {'n :long}}))
+        root (first (get-in parallel
+                            [:attributes :public-resident-reduction-outputs]))
+        retained-aget (fn [index]
+                        (list (with-meta 'clojure.core/aget
+                                {:raster.op/resolved-callee 'clojure.core/aget})
+                              root index))
+        options {:source-ns *ns* :public-parameters '[x y out n]
+                 :array-types {'x :float 'y :float 'out :float}}
+        validate (fn [program expression]
+                   (#'route/validate-source-result!
+                    (with-source-return program expression) options))]
+    (is (= [root] (:outputs (validate parallel (retained-aget 0)))))
+    (is (= [root] (:outputs (validate parallel [(retained-aget 0) nil])))
+        "tuple projection retains the same certified logical output")
+    (is (= :structured-control-source-result
+           (reason-of #(validate parallel (list 'clojure.core/aget root 0))))
+        "fresh spelling without retained walker identity is not authority")
+    (is (= :structured-control-source-result
+           (reason-of #(validate parallel (retained-aget 1))))
+        "only the generated singleton zero-load is the scalar projection")
+    (is (= :structured-control-source-result
+           (reason-of #(validate parallel
+                                 (list (first (retained-aget 0)) 'x 0))))
+        "an ordinary rank-one input is not a public resident scalar")
+    (is (= :structured-control-source-result
+           (reason-of #(validate (assoc-in parallel [:values root :dtype] :float)
+                                 (retained-aget 0))))
+        "a forged outer dtype cannot override the inner producer")
+    (is (= :structured-control-source-result
+           (reason-of #(validate parallel
+                                 (retained-core-cast :double [(retained-aget 0)]))))
+        "a singleton tuple is not the resident scalar it contains")
+    (doseq [expression [(list (with-meta (first (retained-aget 0))
+                                      {:raster.op/resolved-callee 'clojure.core/aget
+                                       :raster.op/lexical-callee true}) root 0)
+                        (with-meta (retained-aget 0)
+                          {:raster.op/lexical-callee true})]]
+      (is (= :structured-control-source-result
+             (reason-of #(validate parallel expression)))
+          "lexical aget masking refuses the generated-load proof"))
+    (let [forged (update parallel :equations
+                         (fn [equations]
+                           (mapv (fn [equation]
+                                   (let [algorithm (:algorithm equation)]
+                                     (if (and (soac/program-form? algorithm)
+                                              (some #{root} (:results equation)))
+                                       (let [facts (update (soac/facts algorithm) :attributes
+                                                           dissoc
+                                                           :public-resident-reduction-outputs)
+                                             algorithm (soac/make facts
+                                                                  (soac/equations algorithm)
+                                                                  (soac/outputs algorithm))]
+                                         (assoc equation :algorithm algorithm
+                                                :operations (soac/equations algorithm)))
+                                       equation)))
+                                 equations)))]
+      (is (= :structured-control-source-result
+             (reason-of #(validate forged (retained-aget 0))))
+          "an outer resident value cannot replace the authoritative inner certificate"))
+    (let [malformed (update parallel :equations
+                            (fn [equations]
+                              (mapv (fn [equation]
+                                      (if (some #{root} (:results equation))
+                                        (assoc equation :algorithm '(soac-program {} [] [])
+                                               :operations [])
+                                        equation))
+                                    equations)))]
+      (is (= :structured-control-source-result
+             (reason-of #(validate malformed (retained-aget 0))))
+          "malformed inner evidence fails closed at the source-result boundary"))))
 
 (deftest island-live-outs-do-not-prove-whole-source-completion
   (let [options {:dtype :double :public-parameters '[x out n]

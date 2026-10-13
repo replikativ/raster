@@ -450,19 +450,32 @@
             storage (get-in placement-facts [:attributes :result-storage])
             resident-destination (when resident? (:destination (first storage)))
             body (materialize-region region-locals (first bodies))
-            reduction-source
-            (if resident?
-              ;; reduce-into owns its explicit one-element destination first. The scheduled
-              ;; terminal store applies any result transform before writing that destination.
-              (list 'raster.par/reduce-into (or resident-destination result) accumulator
+            scalar-reduction-source
+            (list 'raster.par/reduce accumulator (first (:identities attributes))
+                  (:index attributes) (:extent attributes) body)
+            transform (:result-transform attributes)
+            resident-target (or resident-destination result)
+            result-dtype (:dtype (get values result))
+            result-cast (nth (get dtype->allocation result-dtype) 2 nil)
+            source
+            (cond
+              (and resident? transform)
+              ;; GPU scheduling applies this same checked transform in the terminal reduction
+              ;; phase. Source/JVM materialization must not write the raw accumulator into the
+              ;; resident result: reduce to a scalar, apply the authoritative transform (including
+              ;; its explicit singleton operand loads), then store the transformed value once.
+              (list 'clojure.core/aset resident-target 0
+                    (typed-store-value
+                     result-cast
+                     (materialize-functional-result-transform scalar-reduction-source transform)))
+
+              resident?
+              (list 'raster.par/reduce-into resident-target accumulator
                     (first (:identities attributes)) (:index attributes)
                     (:extent attributes) body)
-              (list 'raster.par/reduce accumulator (first (:identities attributes))
-                    (:index attributes) (:extent attributes) body))
-            source (if resident?
-                     reduction-source
-                     (materialize-functional-result-transform
-                      reduction-source (:result-transform attributes)))]
+
+              :else
+              (materialize-functional-result-transform scalar-reduction-source transform))]
         (if resident?
           (let [effect (gensym (str "typed_soac_reduce_" equation-id "__"))]
             {:equation-id equation-id
@@ -831,6 +844,41 @@
       (with-meta (list* head (with-meta (vec (mapcat identity pairs)) (meta bindings)) body)
         (meta form)))))
 
+(defn- public-resident-source-substitutions
+  "Map direct public resident roots and exact top-level symbol aliases to scalar zero-loads.
+
+   Alias resolution is cycle-safe and deliberately ignores every non-symbol expression. The
+   caller applies these replacements only to the final body expression with scope-aware
+   substitution, so a nested binder cannot be mistaken for a retained top-level alias."
+  [bindings public-resident-outputs]
+  (let [pairs (vec (partition 2 bindings))
+        binders (mapv first pairs)
+        ;; The analyzed flat source is normally SSA-like. If it is not, a symbol map loses binding
+        ;; identity; refuse alias projection instead of guessing which shadowed site was meant.
+        aliases (if (= (count binders) (count (distinct binders)))
+                  (into {} (keep (fn [[binding expression]]
+                                   (when (and (symbol? binding) (symbol? expression))
+                                     [binding expression])))
+                        pairs)
+                  {})
+        resolve-root (fn [value]
+                       (loop [value value seen #{}]
+                         (cond
+                           (contains? seen value) nil
+                           (contains? public-resident-outputs value) value
+                           (contains? aliases value) (recur (get aliases value)
+                                                            (conj seen value))
+                           :else nil)))
+        scalar-load (fn [result]
+                      (list (with-meta 'clojure.core/aget
+                              {:raster.op/resolved-callee 'clojure.core/aget})
+                            result 0))]
+    (into {}
+          (keep (fn [value]
+                  (when-let [root (resolve-root value)]
+                    [value (scalar-load root)])))
+          (concat public-resident-outputs (keys aliases)))))
+
 (defn- realize-source
   [form program]
   (let [form (retain-analyzed-binding-expressions
@@ -841,6 +889,20 @@
                                  (get-in (dialect/facts program) [:attributes :allocations])))
               :allocation-source-binding-mismatch)
         [let-head bindings & body] form
+        public-resident-outputs
+        (set (get-in (dialect/facts program)
+                     [:attributes :public-resident-reduction-outputs]))
+        ;; A public resident reduction keeps one logical rank-zero ID in TypedSOAC and the GPU
+        ;; graph, but source/JVM execution must still return its primitive scalar value. Rewrite
+        ;; only the final source result, capture-avoidantly; this is not a host-read fact and does
+        ;; not alter the typed output or introduce a second physical alias.
+        body (if (seq public-resident-outputs)
+               (update (vec body) (dec (count body))
+                       #(util/subst-syms
+                         (public-resident-source-substitutions
+                          bindings public-resident-outputs)
+                         %))
+               body)
         original-pairs (vec (partition 2 bindings))
         host-binding-ids (set (get-in (dialect/facts program)
                                       [:attributes :host-binding-ids]))
