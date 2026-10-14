@@ -158,6 +158,57 @@
        (empty? (:effects value))
        (empty? (:attributes value))))
 
+(defn- pure-internal-captured-reduction-root?
+  "Prove one ordinary internal reduction whose complete use set can become singleton loads.
+
+   This is deliberately distinct from stored reductions: a pure functional result has no physical
+   destination authority, so changing its representation requires a pristine producer/value and
+   a nonempty, strictly later set of ordinary capture uses."
+  [facts info-by-id position-by-id producers-by-result outputs host-reads producer result sites]
+  (let [producer-position (get position-by-id (:id producer))
+        equation-facts (get-in facts [:equations (:id producer)])]
+    (and (= :reduce (:kind producer))
+         (= 1 (count (:results producer)))
+         (= 1 (count (get producers-by-result result)))
+         (not (contains? outputs result))
+         (not (contains? host-reads result))
+         (seq sites)
+         (every? (fn [[_ {:keys [equation role]}]]
+                   (and (= :capture role)
+                        (< producer-position (get position-by-id equation -1))
+                        (some? (get info-by-id equation))))
+                 sites)
+         (empty? (:effects equation-facts))
+         (empty? (:aliases equation-facts))
+         (empty? (get-in equation-facts [:attributes :result-storage]))
+         (exact-plain-scalar-value? (get-in facts [:values result])))))
+
+(defn- stored-reduction-root?
+  "Retain the existing stored-reduction path under its validated physical destination contract.
+
+   TypedSOAC validation already requires the aligned result/storage relation, explicit alias and
+   memory-write effect. Rechecking those exact facts here makes clear that result-storage metadata
+   alone is not residency authority. Stored roots keep their historical capture-use behavior."
+  [facts producers-by-result host-reads stored-destinations producer result sites]
+  (let [equation-facts (get-in facts [:equations (:id producer)])
+        storage (dialect/result-storage facts (:id producer))
+        result-index (.indexOf ^java.util.List (vec (:results producer)) result)
+        descriptor (when (<= 0 result-index) (nth storage result-index nil))
+        destination (get stored-destinations result)
+        logical (get-in facts [:values result])
+        physical (get-in facts [:values destination])]
+    (and (= :reduce (:kind producer))
+         (= 1 (count (get producers-by-result result)))
+         destination
+         (= destination (:destination descriptor))
+         (contains? #{:write :read-write} (:access descriptor))
+         (= destination (get-in equation-facts [:aliases result]))
+         (contains? (:effects equation-facts) :memory/write)
+         logical physical
+         (= (dissoc logical :shape) (dissoc physical :shape))
+         (not (contains? host-reads result))
+         (every? #(= :capture (get-in % [1 :role])) sites))))
+
 (defn- pristine-public-reduction-root?
   "Prove the representation-neutral boundary shared by every public resident reduction.
 
@@ -1205,7 +1256,6 @@
                                (nth equation 2)
                                (or (dialect/result-storage facts (second equation)) [])))))
               equations)
-        stored-reduction-results (set (keys stored-reduction-destinations))
         demanded (set (filter outputs resident-outputs))
         demanded-roots
         (set (mapcat (fn [{:keys [kind results] :as producer}]
@@ -1237,11 +1287,14 @@
                        (when (= :reduce kind)
                          (filter (fn [result]
                                    (let [sites (get uses result [])]
-                                     (and (= 1 (count (get producers-by-result result)))
-                                          (or (and (or (not (contains? outputs result))
-                                                       (contains? stored-reduction-results result))
-                                              (every? #(= :capture (get-in % [1 :role])) sites))
-                                              (contains? public-reused-roots result)
+                                     (or (pure-internal-captured-reduction-root?
+                                          facts info-by-id position-by-id producers-by-result
+                                          outputs host-reads producer result sites)
+                                         (stored-reduction-root?
+                                          facts producers-by-result host-reads
+                                          stored-reduction-destinations producer result sites)
+                                         (contains? public-reused-roots result)
+                                         (and (= 1 (count (get producers-by-result result)))
                                               (transform-load-candidate?
                                                facts info-by-id position-by-id outputs host-reads
                                                producer result sites)))))
@@ -1253,6 +1306,7 @@
         escaping-dependent
         (set (filter (fn [value]
                        (or (contains? outputs value)
+                           (contains? host-reads value)
                            (not-every? #(= :capture (get-in % [1 :role]))
                                        (get uses value []))))
                      dependent))
@@ -1330,12 +1384,13 @@
         [result {:resident-reductions (count roots)
                  :inlined-scalars (count removed-scalars)}]))))
 
-(defn ^:no-doc realize-public-reduction-outputs
-  "Apply the shared reduction realization transaction with an explicit public-output demand.
+(defn ^:no-doc realize-source-free-reductions
+  "Apply the shared reduction realization transaction before source-free promotion.
 
    This entry deliberately excludes terminal ScalarIR realization. Internal reductions which are
-   independently eligible under the existing use audit remain legal; every requested public ID
-   must additionally pass the stricter output-only demand proof."
+   independently eligible under the existing complete producer/use/facet audit are realized even
+   without a public-output demand. Every requested public ID must additionally pass the stricter
+   output-only demand proof."
   [program resident-outputs]
   (realize-reductions program resident-outputs))
 
