@@ -17,6 +17,22 @@ cross-cutting parts of this campaign, not competing replacements for it.
   succeed: all 30 weight fields agree with CPU within 2.98e-8, loss within 1.43e-6, and captured
   host state remains unchanged. This supersedes the smaller forward-only receipt below, not the
   still-open full-size GSDM statistical, Adam/EMA or real-weight Gemma acceptance gates.
+- Checked normalized AD now composes one bounded pure map→map chain through the existing typed
+  fusion and scalar-rule authorities. The canonical owner retains the original semantic/public
+  interface separately from the independently rederived execution source. Saved coefficient
+  origins describe ordered source lineage and exact scalar-primal scope, including ANF values;
+  they do not pretend every coefficient belongs to the first source equation. The existing CPU
+  runtime executes generated primal/linear/transpose maps, with private snapshots, unchanged
+  source argument order and exact Float checkpoints. Scalar-capture residual keys retain their
+  already-inferred metadata at the shared map-stage owner. General DAGs, device normalized AD
+  and default-engine migration remain open.
+- A fresh larger public GSDM SGD probe (2 layers, embedding 32, batch 2, cosine-100 schedule)
+  prepares and executes three resident Level Zero updates. All 48 weight fields remain finite
+  and agree with compiled CPU within 1.20e-7; loss errors are 4.20e-5, 9.54e-7 and 2.86e-6.
+  Captured host state remains unchanged and the artifact closes afterward. CPU generation took
+  43.8 seconds and GPU preparation 146.3 seconds on the loaded warm process. These are bounded
+  numerical/preparation receipts, not statistical training, steady-state performance, Adam/EMA,
+  real Gemma acceptance or a SOTA kernel claim.
 
 - #1358 checks Gemma's selected matrix dispatches against independently retained contraction
   identities, not a fixed kernel count. #1359 performs existing effect-aware DCE only after whole

@@ -2,22 +2,26 @@
 
 ## Current implementation boundary
 
-One deterministic map-stage constructor now owns fresh interface construction and exact
+One deterministic map-stage constructor owns fresh interface construction and exact
 retained-interface reconstruction. Validation still independently checks scalar derivation before
 reconstructing the stage; it neither trusts producer certification nor allocates new residual or
-interface identities. Existing operation coverage, canonical schema, residual order, numerical
-policies and runtime behavior are unchanged. This consolidation is preparation for checked
-equation composition, not admission of arbitrary map chains or device AD.
+interface identities. The bounded composition below adds an exact execution-source view to the
+canonical map owner while retaining the original source as public authority. Existing operation
+coverage, residual order and numerical policies are unchanged; arbitrary chains and device AD
+remain outside the boundary.
 
-The next evidence-only boundary admits exactly two pure homogeneous maps whose sole intermediate
+A checked composition boundary admits exactly two pure homogeneous maps whose sole intermediate
 is the consumer's element input. Exact equation subprograms must reconstruct the original source
 through `append-pure-spines`; the existing target-neutral fusion pass must then derive exactly one
 vertical map. Scalar projection and differentiation consume that transient fused stage while the
 bundle retains the untouched two-equation source, and validation repeats the same append, fusion,
 rule replay and fixed-interface stage construction. Float conversions and typed locals survive as
 explicit checkpoints; no source facts or fusion provenance are scrubbed. Canonical adaptation and
-runtime execution deliberately refuse this evidence until residual origins can name the correct
-original producer equation. This adds no runtime chain, cache, registry or derivative rule.
+host execution retain both the untouched source/public interface and the independently rederived
+fused execution source. Composite residual origins name the ordered source-equation scope and the
+exact fused scalar coefficient rather than pretending the coefficient belongs to the first source
+equation. Execution still uses the generated primal/JVP/VJP maps, not a new runtime chain. This adds
+no cache, registry, derivative rule, device path or default-engine migration.
 
 Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,

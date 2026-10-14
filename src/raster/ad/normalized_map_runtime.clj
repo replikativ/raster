@@ -59,9 +59,12 @@
   (let [expected (normalized/revisions)
         indexed? (= :checked-scalar-indexed-map (get-in owner [:derivation :kind]))
         sum? (= :checked-scalar-map-sum (get-in owner [:derivation :kind]))
-        {:keys [source primal linear transpose interface residual-bindings physical-bindings]} owner
+        {:keys [source execution-source primal linear transpose interface residual-bindings
+                physical-bindings]} owner
+        execution-source (or execution-source source)
         seed-id (get-in interface [:cotangent-input :id])
-        {:keys [arrays captures attributes lambda]} (soac/operation-parts (first (soac/equations source)))
+        {:keys [arrays captures attributes lambda]}
+        (soac/operation-parts (first (soac/equations execution-source)))
         inputs (mapv :id (:inputs interface))
         values (:values (soac/facts source))
         active (first (:active-inputs interface))

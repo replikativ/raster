@@ -1,7 +1,8 @@
 (ns raster.ad.normalized-program-bundle
   "Canonical TypedSOAC program envelope for checked maps, ordered map sums and indexed maps.
    Scalar derivation evidence remains nested; no rules, evaluator, cache or source importer
-   are added. This migration adapter does not compose equations or add runtime support."
+   are added. Source/execution correspondence is independently rederived through existing
+   scalar and typed-fusion authorities, not a second composition or runtime implementation."
   (:require [raster.ad.normalized-scalar :as scalar]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]))
@@ -29,21 +30,22 @@
 (defn- value-interface [program id source]
   {:id id :source source :value (get-in (soac/facts program) [:values id])})
 
+(defn- exact-scalar-member? [members candidate]
+  (= 1 (count (filter #(fingerprint/equivalent? candidate %) members))))
+
 (defn- program-envelope
   "Pure fixed-ID projection of already checked evidence. It generates no derivative code."
   [bundle kind]
-  (when (and (= :checked-scalar-map kind)
-             (not= 1 (count (soac/equations (get-in bundle [:map-programs :source])))))
-    ;; Map-chain evidence is intentionally construction-only until canonical residual origins
-    ;; can identify the exact original producer equation. Do not let the single-map projection
-    ;; attribute every fused-stage residual to the first source equation.
-    (fail! :ad-program-bundle-composition
-           {:equations (count (soac/equations (get-in bundle [:map-programs :source])))}))
   (let [sum? (= :checked-scalar-map-sum kind)
         indexed? (= :checked-scalar-indexed-map kind)
+        plain-map? (= :checked-scalar-map kind)
         programs (cond indexed? (:gather-programs bundle)
                        sum? (:sum-programs bundle) :else (:map-programs bundle))
         {:keys [source primal linear transpose required-zero-gradient]} programs
+        execution-scope (when plain-map? (scalar/execution-map-scope bundle))
+        execution-source (:source execution-scope)
+        execution-source (or execution-source source)
+        chain? (and plain-map? (= 2 (count (soac/equations source))))
         {:keys [active-input tangent-input tangent-output cotangent-input gradient-output
                 residual-arrays scalar-captures]} (get-in bundle [:map-programs :interface])
         indexed-interface (:interface programs)
@@ -61,6 +63,22 @@
         result (first (soac/outputs source))
         producer (second (first (soac/equations primal)))
         source-equation (second (first (soac/equations source)))
+        source-equations (mapv second (soac/equations source))
+        execution-equation (second (first (soac/equations execution-source)))
+        execution-scalars (:scalar-values execution-scope)
+        coefficients (concat (keys residual-arrays) (keys scalar-captures))
+        _ (when (and plain-map?
+                     (not (every? (partial exact-scalar-member? execution-scalars)
+                                  coefficients)))
+            (fail! :ad-program-bundle-composition
+                   {:coefficients (vec coefficients)
+                    :execution-equation execution-equation}))
+        origin (fn [coefficient]
+                 (if chain?
+                   {:source-equations source-equations
+                    :execution-equation execution-equation
+                    :scalar-value coefficient}
+                   {:equation source-equation :scalar-value coefficient}))
         residual-bindings
         (if indexed?
           {index-input {:id (:index-snapshot indexed-interface) :storage :owned-array
@@ -72,13 +90,13 @@
                (map (fn [[coefficient id]]
                       [coefficient {:id id :storage :owned-array
                                     :producer {:equation producer :result id}
-                                    :origin {:equation source-equation :scalar-value coefficient}
+                                    :origin (origin coefficient)
                                     :value (get-in (soac/facts primal) [:values id])}])
                     residual-arrays)
                (map (fn [[coefficient id]]
                       [coefficient {:id id :storage :immutable-scalar
                                     :producer {:input id}
-                                    :origin {:equation source-equation :scalar-value coefficient}
+                                    :origin (origin coefficient)
                                     :value (get-in (soac/facts source) [:values id])}])
                     scalar-captures))))
         physical-bindings
@@ -90,7 +108,7 @@
                  :consumer {:equation equation :destination id :result gradient-output
                             :alias (get-in (soac/facts transpose) [:equations equation :aliases gradient-output])}}})
           {})]
-    {:source source :primal primal :linear linear :transpose transpose
+    (cond-> {:source source :primal primal :linear linear :transpose transpose
      :interface {:inputs (mapv #(value-interface source % %) inputs)
                  :active-inputs [active-input]
                  :primal-result (value-interface primal result result)
@@ -100,7 +118,8 @@
                  :cotangent-result (value-interface transpose gradient-output active-input)}
      :residual-bindings residual-bindings :physical-bindings physical-bindings
      :derivation {:kind kind :bundle bundle}
-     :source-ns (:source-ns bundle)}))
+     :source-ns (:source-ns bundle)}
+      plain-map? (assoc :execution-source execution-source))))
 
 (defn- pure-envelope [bundle]
   ;; Namespace instances are runtime identity, not process-independent semantic fingerprint data.
@@ -153,8 +172,9 @@
   (adapt-kind bundle (evidence-kind! bundle)))
 
 (defn adapt-map
-  "Adapt one existing admitted map to canonical TypedSOAC primal/linear/transpose programs.
-   Existing map APIs/runtimes remain unchanged; sum/indexed/composed programs are not admitted.
+  "Adapt one admitted map stage or checked two-map composition to canonical AD programs.
+   Original source/public interfaces and rederived execution scope remain distinct. Sum/indexed
+   evidence and arbitrary chains are not admitted through this entry.
    No allocation or execution occurs. The evidence is transitional and may be retired only
    after a common program validator owns the same source/derivative/ownership obligations."
   [bundle]

@@ -896,7 +896,14 @@
   (let [equation (first (soac/equations source))
         {:keys [captures]} (soac/operation-parts equation)
         capture-values (zipmap (:capture-parameters (soac/parameter-layout equation)) captures)
-        scalars (select-keys capture-values (:residuals bundle))]
+        ;; Lookup follows the validated lambda identity, but the residual ID is the typed scalar
+        ;; authority. `select-keys` retained the raw outer-lambda key and silently discarded that
+        ;; metadata, making later exact source-scope checks impossible.
+        scalars (into {}
+                      (keep (fn [id]
+                              (when-let [entry (find capture-values id)]
+                                [id (val entry)])))
+                      (:residuals bundle))]
     ;; Only direct scalar captures have an existing outer scalar value. Snapshot other
     ;; coefficients per lane, including invariant locals, without another activity analysis.
     {:scalars scalars :arrays (vec (remove #(contains? scalars %) (:residuals bundle)))}))
@@ -1070,7 +1077,7 @@
 
    The original two-equation source remains the semantic authority. Existing target-neutral
    fusion derives a transient single-map execution stage which is rebuilt during validation.
-   Canonical runtime adaptation remains deliberately unsupported."
+   Canonical adaptation separately retains and checks source, execution scope and residual lineage."
   ([source source-ns] (linearize-map-chain-program source source-ns {}))
   ([source source-ns options]
    (let [{:keys [primal interface stage-source]}
@@ -1079,6 +1086,32 @@
          programs (assoc (construct-map-stage bundle stage-source) :source source)
          bundle (assoc bundle :map-programs programs)]
      (validate! (assoc bundle :certificate (certificate bundle))))))
+
+(defn execution-map-scope
+  "Return the exact execution source and certified scalar scope of a validated map bundle.
+
+   A singleton retains its original source identity. An admitted two-map chain is rederived
+   through the same checked append and fusion path used by construction; callers cannot supply
+   or cache a substitute execution stage. Scalar values are limited to the validated primal's
+   parameters and ordered binding results; residual-role validation independently proves which
+   of those values are saved coefficients. Other equation counts remain outside this boundary."
+  [bundle]
+  (validate! bundle)
+  (let [source (get-in bundle [:map-programs :source])
+        execution-source
+        (case (count (soac/equations source))
+          1 source
+          2 (exact-map-chain-stage source)
+          (fail! :ad-normalized-map-chain-boundary
+                 {:equations (count (soac/equations source))}))]
+    {:source execution-source
+     :scalar-values (vec (concat (:params bundle)
+                                 (map first (partition 2 (bindings (:primal bundle))))))}))
+
+(defn execution-map-source
+  "Return only the revalidated execution-source view of `execution-map-scope`."
+  [bundle]
+  (:source (execution-map-scope bundle)))
 
 (defn- project-indexed-element
   "Check a functional map's exact indirect read using the existing operand/layout authority."

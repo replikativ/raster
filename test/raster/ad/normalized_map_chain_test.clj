@@ -74,9 +74,11 @@
     (doseq [id residual-ids]
       (is (= :owned (get-in (soac/facts (:primal programs)) [:values id :ownership])))
       (is (= '[n] (get-in (soac/facts (:primal programs)) [:values id :shape]))))
-    (is (= :ad-program-bundle-composition
-           (reason #(canonical/adapt-map bundle)))
-        "runtime projection refuses before assigning single-equation residual origins")))
+    (let [owner (canonical/adapt-map bundle)]
+      (is (identical? source (:source owner)))
+      (is (= '[map] (mapv soac/operation-kind
+                           (soac/equations (:execution-source owner)))))
+      (is (identical? owner (canonical/validate! owner))))))
 
 (deftest retained-public-input-order-is-not-a-type-erasing-canonicalization
   (let [source (typed-source square-chain-source)
