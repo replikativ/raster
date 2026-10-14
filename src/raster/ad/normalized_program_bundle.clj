@@ -24,8 +24,12 @@
 (defn- checked-evidence! [bundle kind]
   (when-not (= kind (evidence-kind! bundle))
     (fail! :ad-program-bundle-scope {:kind kind}))
-  (scalar/validate! bundle)
-  bundle)
+  ;; The public scope entry validates before deriving its reprojected execution view. Carry that
+  ;; exact request-local result into envelope construction instead of validating the same evidence
+  ;; again there. Other families retain their existing direct validation.
+  (if (= :checked-scalar-map kind)
+    {:bundle bundle :execution-scope (scalar/execution-map-scope bundle)}
+    {:bundle (scalar/validate! bundle) :execution-scope nil}))
 
 (defn- value-interface [program id source]
   {:id id :source source :value (get-in (soac/facts program) [:values id])})
@@ -35,14 +39,13 @@
 
 (defn- program-envelope
   "Pure fixed-ID projection of already checked evidence. It generates no derivative code."
-  [bundle kind]
+  [{:keys [bundle execution-scope]} kind]
   (let [sum? (= :checked-scalar-map-sum kind)
         indexed? (= :checked-scalar-indexed-map kind)
         plain-map? (= :checked-scalar-map kind)
         programs (cond indexed? (:gather-programs bundle)
                        sum? (:sum-programs bundle) :else (:map-programs bundle))
         {:keys [source primal linear transpose required-zero-gradient]} programs
-        execution-scope (when plain-map? (scalar/execution-map-scope bundle))
         execution-source (:source execution-scope)
         execution-source (or execution-source source)
         chain? (and plain-map? (= 2 (count (soac/equations source))))
