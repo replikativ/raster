@@ -10,6 +10,17 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 ### October 14 current checkpoint
 
+- Compiler-generated pure TypedSOAC now enters the existing equation-first scheduling/emission
+  tail without fabricated Clojure source or another type-inference authority. Named-entry storage
+  contracts and the shared allocation/executor seams are prerequisites for resident residuals;
+  they do not yet enable normalized device AD, delayed pullbacks or default-engine migration.
+- The fresh unchanged real-checkpoint Gemma gate fails 12 of 28 adapter gradient checks. A
+  same-CPU-operand layer control still fails 4 of 14, so inter-layer input drift alone is not the
+  explanation. The reduced two-layer public chain passes its unchanged numerical bounds on two
+  replays. These are distinct controls: reduced acceptance does not replace real-model acceptance.
+  Localize the remaining discrepancy with same-device-input operation oracles before changing
+  schedules, precision or tolerances. All eight campaign obligations below remain active.
+
 - #1364 activates the independently audited scalar vertical; #1365 gives normalized AD one
   deterministic map-stage constructor/reconstructor. #1366 preserves one unused public ScalarIR
   checkpoint alongside observable state outputs and later independent effects. Genuine public

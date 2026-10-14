@@ -568,7 +568,8 @@ finite differences, transpose pairing and backend comparisons as independent evi
 zero-domain negative cases: unsupported code must not become accepted merely because a loop
 happens not to execute.
 
-The unchanged real Gemma training case still has 11 failing adapter checks out of 28. The
+The latest unchanged real Gemma training case has 12 failing adapter checks out of 28 (the earlier
+recorded run failed 11). A same-CPU-operand layer control still fails 4 of 14 adapter checks. The
 exact generated SFT objective, Gaussian/logistic density composition, city kernel primal
 parity and PDE rollout gradients are complementary gates, not substitutes for that result.
 Microtests passing does not establish model-scale correctness or competitive performance.
