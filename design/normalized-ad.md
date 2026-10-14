@@ -2,6 +2,21 @@
 
 ## Current implementation boundary
 
+Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
+without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
+their retained AbstractValues supply a zero-prefix plan; flat public buffers and every retained
+shape must resolve directly from public integral inputs or supported public-buffer extents.
+Effects, aliases, physical result storage and native initialization providers refuse. The existing
+analyzed-source promotion still independently proves the complete source return.
+
+This is a compiler-frontier prerequisite, not normalized device execution. Canonical map/sum
+primal and transpose programs promote, schedule and emit through all four C-family dialects.
+Their JVP programs also promote and schedule, but emission currently refuses retained `grad-acc`
+at shared scalar-to-KernelBody lowering. That helper must become proven canonical arithmetic
+before backend emission; no target-specific AD rule is introduced. The common source-free
+compilation/Prepared entry and same-session named-entry ownership remain required before delayed
+device pullbacks can retain private residuals safely. No default-engine migration is implied.
+
 One deterministic map-stage constructor owns fresh interface construction and exact
 retained-interface reconstruction. Validation still independently checks scalar derivation before
 reconstructing the stage; it neither trusts producer certification nor allocates new residual or

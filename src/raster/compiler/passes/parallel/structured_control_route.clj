@@ -929,6 +929,147 @@
                 :invocation-plan (invocation/validate-against! plan promoted))
         validate-typed-program!)))
 
+(defn- source-free-dimension!
+  "Validate the deliberately small dimension grammar supported by direct TypedSOAC invocation.
+
+   This is an admission check over retained AbstractValues, not a shape inference pass.  The
+   materializer remains the execution authority for these same forms."
+  [public-values public-buffers public-input? owner dimension]
+  (let [integral-scalar?
+        (fn [id]
+          (let [value (get public-values id)
+                declared (:dtype value)
+                dt (when (and (keyword? declared) (dtype/known? declared))
+                     (dtype/canon declared))]
+            (and (symbol? id) (scalar-value? value) (contains? #{:int :long} dt))))]
+    (cond
+      (and (integer? dimension) (<= 0 dimension Long/MAX_VALUE)) dimension
+
+      (symbol? dimension)
+      (if (integral-scalar? dimension)
+        dimension
+        (fail! :structured-control-source-free-dimension
+               "source-free buffer shape requires a public integral scalar"
+               {:value owner :dimension dimension :public-values (set (keys public-values))}))
+
+      (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
+      (let [id (second dimension)]
+        (if (integral-scalar? id)
+          dimension
+          (fail! :structured-control-source-free-dimension
+                 "source-free value dimension requires a public integral scalar"
+                 {:value owner :dimension dimension :public-values (set (keys public-values))})))
+
+      (and (seq? dimension) (= 'extent (first dimension)) (= 2 (count dimension)))
+      (let [id (second dimension)]
+        (if (and (contains? public-buffers id)
+                 ;; Parameter materialization knows only scalar values plus its own physical
+                 ;; extent. Produced values are materialized afterward and may name any public
+                 ;; buffer extent through the existing concrete-shape environment.
+                 (or (not public-input?) (= owner id)))
+          dimension
+          (fail! :structured-control-source-free-dimension
+                 "source-free extent dimension requires an available public rank-one buffer"
+                 {:value owner :dimension dimension :public-input? public-input?
+                  :public-buffers public-buffers})))
+
+      :else
+      (fail! :structured-control-source-free-dimension
+             "source-free buffer shape is outside the materializable dimension grammar"
+             {:value owner :dimension dimension}))))
+
+(defn- validate-source-free-typed-boundary!
+  [typed-program]
+  (let [typed-program (soac/validate! typed-program)
+        facts (soac/facts typed-program)
+        inputs (:inputs facts)
+        public-inputs (set inputs)
+        values (:values facts)
+        public-values (select-keys values inputs)
+        public-buffers
+        (into #{}
+              (keep (fn [id]
+                      (let [value (get values id)]
+                        (when (and (= :tensor (:kind value)) (= 1 (count (:shape value)))) id))))
+              inputs)]
+    (when-not (and (vector? inputs) (every? symbol? inputs)
+                   (= (count inputs) (count (distinct inputs))))
+      (fail! :structured-control-source-free-inputs
+             "source-free TypedSOAC inputs must be ordered unique symbols"
+             {:inputs inputs}))
+    (doseq [id inputs
+            :let [value (get values id) rank (count (:shape value))
+                  declared (:dtype value)]]
+      (when-not (and (= :tensor (:kind value)) (contains? #{0 1} rank)
+                     (keyword? declared) (dtype/known? declared))
+        (fail! :structured-control-source-free-input
+               "source-free invocation requires known typed scalar and flat buffer inputs"
+               {:input id :value value})))
+    (when-not (and (empty? (:effects facts)) (empty? (:aliases facts))
+                   (empty? (get-in facts [:attributes :native-initialization-providers])))
+      (fail! :structured-control-source-free-effects
+             "source-free invocation requires a pure program without native initialization"
+             {:effects (:effects facts) :aliases (:aliases facts)
+              :native-initialization-providers
+              (get-in facts [:attributes :native-initialization-providers])}))
+    (doseq [equation (soac/equations typed-program)
+            :let [equation-id (second equation)
+                  equation-facts (get-in facts [:equations equation-id])]]
+      (when-not (and (empty? (:effects equation-facts))
+                     (empty? (:aliases equation-facts))
+                     (empty? (soac/result-storage facts equation-id)))
+        (fail! :structured-control-source-free-equation
+               "source-free invocation requires equations without effects, aliases or result storage"
+               {:equation equation-id :effects (:effects equation-facts)
+                :aliases (:aliases equation-facts)
+                :result-storage (soac/result-storage facts equation-id)})))
+    ;; Validate every retained tensor shape because scheduled physical ABIs may mention values
+    ;; beyond the public input/output frontier.  A private scalar must never become an implicit
+    ;; host dimension merely because it appears in an AbstractValue.
+    (doseq [[id value] values
+            :when (and (= :tensor (:kind value)) (seq (:shape value)))
+            dimension (:shape value)]
+      (source-free-dimension! public-values public-buffers (contains? public-inputs id)
+                              id dimension))
+    typed-program))
+
+(defn promote-typed-algorithm
+  "Promote one pure, already constructed TypedSOAC into the ordinary typed invocation boundary.
+
+   Public parameters are exactly the algorithm's ordered inputs and retain their complete
+   AbstractValues.  There is no source prefix, inferred type override, external result storage or
+   host expression.  The initial boundary is deliberately limited to scalar and rank-one inputs
+   whose retained shapes are directly materializable from public integral scalars or public buffer
+   extents.  Scheduling and emission remain separate ordinary compiler stages."
+  [typed-program]
+  (let [typed-program (validate-source-free-typed-boundary! typed-program)
+        facts (soac/facts typed-program)
+        inputs (:inputs facts)
+        outputs (soac/outputs typed-program)
+        values (:values facts)
+        parallel-program (-> (typed-route/program-envelope typed-program)
+                             (assoc :dialect :typed-parallel)
+                             (update :provenance assoc
+                                     :front-end :explicit-typed-algorithm
+                                     :pass :source-free-typed-invocation))
+        plan (invocation/from-prefix
+              {:id [:source-free-typed-invocation (semantic/fingerprint typed-program)]
+               :parameters inputs
+               :parameter-values (select-keys values inputs)
+               :bindings []
+               :binding-values {}
+               :program-values values
+               :program-inputs inputs
+               :program-storage []
+               :program-outputs outputs
+               :attributes {:source-dialect :typed-soac
+                            :algorithm-dialect :typed-soac
+                            :target-dialect :typed-invocation}})
+        promoted (update parallel-program :attributes assoc
+                         :host-control :typed-invocation
+                         :invocation-plan (invocation/validate-against! plan parallel-program))]
+    (validate-typed-program! promoted)))
+
 (defn- merge-values
   [left right]
   (reduce-kv
