@@ -781,6 +781,25 @@
                       {:reason :typed-soac-host-indexed-boundary :equation equation})))
     {:physical-inputs (if effect? destinations []) :output-values (if effect? physical outputs)}))
 
+(defn ^:no-doc source-free-ordered-effect-storage!
+  "Return the sole physical destination of the existing strict sequential ordered effect subset.
+
+   This exposes no initialization or completeness authority. It is the same admission used by
+   host indexed materialization, restricted to its effect branch for source-free resident binding."
+  [program]
+  (let [program (dialect/validate! program)
+        [equation] (dialect/equations program)
+        {:keys [kind destinations]} (when equation (dialect/operation-parts equation))
+        admitted (admit-host-indexed-map-program! program)]
+    (when-not (and (= 'effect-map kind)
+                   (= 1 (count destinations))
+                   (= destinations (:physical-inputs admitted)))
+      (throw (ex-info "source-free external storage requires one ordered effect destination"
+                      {:reason :typed-soac-source-free-effect-storage
+                       :operation kind :destinations destinations})))
+    {:destination (first destinations)
+     :result (first (:output-values admitted))}))
+
 (defn materialize-host-indexed-map
   "Host source projection for checked rank-one indexed maps or sequential ordered stores.
    Unlike the pure homogeneous map API, this admits integral pointwise indices and stable

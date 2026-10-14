@@ -2,8 +2,9 @@
   "Typed semantic boundary from public function arguments to an internal ParallelProgram.
 
    ParallelProgram inputs are compiler SSA values: they may include shape projections, narrowed
-   scalars, cloned state, and fresh scratch. `storage-bindings` separately retain caller-owned
-   write-only destinations, which are physical result storage rather than numerical operands.
+   scalars, cloned state, and fresh scratch. `storage-bindings` separately retain physical result
+   destinations rather than numerical operands. They are either resolved caller-owned values or
+   a closed unresolved external premise that only a later resident binder may discharge.
    InvocationPlan records how ordered public parameters produce both boundaries without asking a
    runtime to inspect the original function body or infer storage roles from names. Physical
    allocation, views, ownership, and transfers remain the job of LinkPlan lowering."
@@ -45,6 +46,13 @@
   (record-kind? "raster.compiler.ir.invocation_plan.ValueAlias" x))
 (defn invocation-plan? [x]
   (record-kind? "raster.compiler.ir.invocation_plan.InvocationPlan" x))
+
+(defn external-storage-binding?
+  "True only for the closed unresolved-storage premise used by source-free resident binding."
+  [binding]
+  (and (map? binding)
+       (= #{:program-value :external} (set (keys binding)))
+       (true? (:external binding))))
 
 (defn invocation-step?
   [x]
@@ -280,7 +288,35 @@
                               (set (map :id parameters)) steps))
           expected-bindings (mapv :program-value bindings)
           storage-values (mapv :program-value storage-bindings)
-          invocation-values (mapv :invocation-value (concat bindings storage-bindings))]
+          external-storage (filterv external-storage-binding? storage-bindings)
+          external-marker? (contains? attributes :external-storage)
+          external-mode? (= :resident-premise (:external-storage attributes))
+          ordinary-storage (remove external-storage-binding? storage-bindings)
+          invocation-values (mapv :invocation-value (concat bindings ordinary-storage))]
+      (when-not (every? #(or (external-storage-binding? %)
+                             (and (map? %) (= #{:program-value :invocation-value}
+                                             (set (keys %)))))
+                        storage-bindings)
+        (fail! :invocation-storage-binding-form
+               "storage bindings must be resolved invocation values or closed external premises"
+               {:bindings storage-bindings}))
+      (when-not (= external-mode?
+                   (boolean (and (seq external-storage)
+                                 (= (count external-storage) (count storage-bindings)))))
+        (fail! :invocation-external-storage-mode
+               "unresolved external storage and its closed invocation mode must coincide"
+               {:mode (:external-storage attributes)
+                :external (mapv :program-value external-storage)
+                :storage-count (count storage-bindings)}))
+      (when (and external-marker? (not external-mode?))
+        (fail! :invocation-external-storage-mode
+               "the external-storage attribute is reserved for the exact resident premise"
+               {:mode (:external-storage attributes)}))
+      (when (and external-mode?
+                 (seq (set/intersection (set storage-values) (set program-outputs))))
+        (fail! :invocation-external-storage-boundary
+               "an unresolved physical destination must be distinct from logical program outputs"
+               {:storage storage-values :outputs program-outputs}))
       (when-not (= program-inputs expected-bindings)
         (fail! :invocation-program-input-order
                "invocation bindings must exactly follow the internal program input order"
@@ -295,7 +331,7 @@
                "internal program input is not produced by the invocation prefix"
                {:values (set missing)}))
       (doseq [{program-value :program-value invocation-value :invocation-value}
-              (concat bindings storage-bindings)]
+              (concat bindings ordinary-storage)]
         (when-not (compatible-value? (get values program-value) (get values invocation-value))
           (fail! :invocation-program-input-contract
                  "public materialization differs from the internal program value contract"
@@ -405,11 +441,11 @@
 
    `parameters` is the public function order. `parameter-values` describes those values before any
    lexical shadowing; `binding-values` describes prefix results. `program-values`, logical inputs,
-   write-only external storage, and outputs are the validated internal program boundary. Stable SSA IDs keep a
+   resolved or unresolved external storage, and outputs are the validated internal program boundary. Stable SSA IDs keep a
    narrowed binding such as `nsteps = (int nsteps)` distinct from its public long parameter."
   [{:keys [id parameters parameter-values bindings binding-values program-values
-           program-inputs program-storage program-outputs attributes]
-    :or {program-storage [] attributes {}}}]
+           program-inputs program-storage external-program-storage program-outputs attributes]
+    :or {program-storage [] external-program-storage [] attributes {}}}]
   (let [parameters (vec parameters)
         public
         (mapv (fn [ordinal symbol]
@@ -444,18 +480,56 @@
                    {:program-value program-value
                     :available (set (keys environment))})))
         input-bindings (mapv #(binding-for :invocation-program-input %) program-inputs)
-        storage-bindings (mapv #(binding-for :invocation-program-storage %) program-storage)
+        storage-bindings (into (mapv #(binding-for :invocation-program-storage %) program-storage)
+                               (map (fn [program-value]
+                                      {:program-value program-value :external true}))
+                               external-program-storage)
         values (merge program-values values)]
     (validate!
      (->InvocationPlan id public steps input-bindings storage-bindings (vec program-inputs)
                        (vec program-outputs) values attributes))))
 
+(defn- program-external-storage
+  [parallel-program]
+  (into []
+        (comp (map :algorithm)
+              (filter soac/program-form?)
+              (mapcat (fn [algorithm]
+                        (let [algorithm (soac/validate! algorithm)
+                              facts (soac/facts algorithm)]
+                          (mapcat
+                           (fn [equation]
+                             (let [equation-id (second equation)
+                                   results (nth equation 2)
+                                   storage (soac/result-storage facts equation-id)
+                                   destinations (mapv :destination storage)
+                                   aliases (get-in facts [:equations equation-id :aliases])
+                                   physical (soac/physical-results facts equation)]
+                               (when (seq storage)
+                                 (when-not (and (= (count results) (count storage))
+                                                (empty? (set/intersection (set results)
+                                                                          (set destinations)))
+                                                (= aliases (zipmap results destinations))
+                                                (= physical destinations))
+                                   (fail! :invocation-external-storage-correspondence
+                                          "external storage must retain exact result, alias and physical correspondence"
+                                          {:equation equation-id :results results
+                                           :storage storage :aliases aliases
+                                           :physical-results physical})))
+                               destinations))
+                           (soac/equations algorithm))))))
+        (:equations parallel-program)))
+
 (defn validate-against!
   "Validate that `plan` still matches a program's explicit value/input/output boundary."
   [plan parallel-program]
-  (let [plan (validate! plan)]
+  (let [plan (validate! plan)
+        external (mapv :program-value
+                       (filter external-storage-binding? (:storage-bindings plan)))]
     (when-not (and (= (:program-inputs plan) (:inputs parallel-program))
                    (= (:program-outputs plan) (:outputs parallel-program))
+                   (or (empty? external)
+                       (= external (program-external-storage parallel-program)))
                    (every? (fn [id] (= (get (:values plan) id)
                                        (get (:values parallel-program) id)))
                            (concat (:inputs parallel-program)

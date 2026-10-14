@@ -40,6 +40,18 @@
             [raster.compiler.backend.gpu.segop-opencl :as sg]
             [raster.compiler.backend.gpu.segmap-retirement-fixture :as retirement]))
 
+(deftest graph-array-shapes-retain-exact-zero-without-inventing-other-capacities
+  (let [project (ns-resolve 'raster.compiler.backend.gpu.segop-opencl
+                            'graph-array-shapes)
+        graph (fn [id elements]
+                (kgraph/make
+                 {:inputs [(kgraph/buffer id :float elements :device :input)]
+                  :outputs [] :nodes []}))]
+    (is (= {'zero [0]} (project (graph 'zero 0))))
+    (is (= {} (project (graph 'negative -1))))
+    (is (= {} (project (graph 'self 'self))))
+    (is (= {} (project (graph 'unknown '(opaque-capacity n)))))))
+
 (deftest scalar-reduction-storage-alias-requires-the-exact-closed-projection
   (let [source '(let* [^long extent (clojure.core/long
                                     ^long (clojure.core/* (clojure.core/long n) (clojure.core/long 1)))
@@ -380,9 +392,12 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no retained storage capacity"
                          (sg/generate-kernel-graph
                           (assoc-in graph [:inputs 0 :elements] 'a))))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no retained storage capacity"
-                         (sg/generate-kernel-graph
-                          (assoc-in graph [:inputs 0 :elements] 0))))))
+    (let [failure (try (sg/generate-kernel-graph
+                        (assoc-in graph [:inputs 0 :elements] 0))
+                       nil
+                       (catch clojure.lang.ExceptionInfo error error))]
+      (is (instance? clojure.lang.ExceptionInfo failure))
+      (is (= [0] (:shape (ex-data failure)))))))
 
 (deftest raw-primary-inout-keeps-its-known-written-prefix
   (let [operation (segop/->SegMap

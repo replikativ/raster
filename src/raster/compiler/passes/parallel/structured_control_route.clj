@@ -980,7 +980,7 @@
              "source-free buffer shape is outside the materializable dimension grammar"
              {:value owner :dimension dimension}))))
 
-(defn- validate-source-free-typed-boundary!
+(defn- validate-source-free-value-boundary!
   [typed-program]
   (let [typed-program (soac/validate! typed-program)
         facts (soac/facts typed-program)
@@ -1007,6 +1007,20 @@
         (fail! :structured-control-source-free-input
                "source-free invocation requires known typed scalar and flat buffer inputs"
                {:input id :value value})))
+    ;; Validate every retained tensor shape because scheduled physical ABIs may mention values
+    ;; beyond the public input/output frontier.  A private scalar must never become an implicit
+    ;; host dimension merely because it appears in an AbstractValue.
+    (doseq [[id value] values
+            :when (and (= :tensor (:kind value)) (seq (:shape value)))
+            dimension (:shape value)]
+      (source-free-dimension! public-values public-buffers (contains? public-inputs id)
+                              id dimension))
+    typed-program))
+
+(defn- validate-source-free-typed-boundary!
+  [typed-program]
+  (let [typed-program (validate-source-free-value-boundary! typed-program)
+        facts (soac/facts typed-program)]
     (when-not (and (empty? (:effects facts)) (empty? (:aliases facts))
                    (empty? (get-in facts [:attributes :native-initialization-providers])))
       (fail! :structured-control-source-free-effects
@@ -1025,14 +1039,6 @@
                {:equation equation-id :effects (:effects equation-facts)
                 :aliases (:aliases equation-facts)
                 :result-storage (soac/result-storage facts equation-id)})))
-    ;; Validate every retained tensor shape because scheduled physical ABIs may mention values
-    ;; beyond the public input/output frontier.  A private scalar must never become an implicit
-    ;; host dimension merely because it appears in an AbstractValue.
-    (doseq [[id value] values
-            :when (and (= :tensor (:kind value)) (seq (:shape value)))
-            dimension (:shape value)]
-      (source-free-dimension! public-values public-buffers (contains? public-inputs id)
-                              id dimension))
     typed-program))
 
 (defn promote-typed-algorithm
@@ -1071,6 +1077,59 @@
                          :host-control :typed-invocation
                          :invocation-plan (invocation/validate-against! plan parallel-program))]
     (validate-typed-program! promoted)))
+
+(defn promote-typed-effect-algorithm
+  "Promote the strict sequential ordered effect-map subset with unresolved resident storage.
+
+   Public parameters remain only the algorithm's declared logical inputs. The sole physical
+   destination is derived from validated result-storage and retained as an unresolved external
+   premise: this function neither allocates nor initializes it. Host materialization refuses this
+   plan; a resident binder and final LinkPlan must separately prove compatible storage and ordered
+   initialization."
+  [typed-program]
+  (let [typed-program (validate-source-free-value-boundary! typed-program)
+        facts (soac/facts typed-program)
+        _ (when (seq (get-in facts [:attributes :native-initialization-providers]))
+            (fail! :structured-control-source-free-effects
+                   "source-free external storage cannot carry native initialization"
+                   {:native-initialization-providers
+                    (get-in facts [:attributes :native-initialization-providers])}))
+        {:keys [destination]} (typed-route/source-free-ordered-effect-storage! typed-program)
+        inputs (:inputs facts)
+        outputs (soac/outputs typed-program)
+        values (:values facts)
+        parallel-program (-> (typed-route/program-envelope typed-program)
+                             (assoc :dialect :typed-parallel)
+                             (update :provenance assoc
+                                     :front-end :explicit-typed-effect-algorithm
+                                     :pass :source-free-typed-effect-invocation))
+        plan (invocation/from-prefix
+              {:id [:source-free-typed-effect-invocation (semantic/fingerprint typed-program)]
+               :parameters inputs
+               :parameter-values (select-keys values inputs)
+               :bindings [] :binding-values {}
+               :program-values values :program-inputs inputs
+               :external-program-storage [destination]
+               :program-outputs outputs
+               :attributes {:source-dialect :typed-soac
+                            :algorithm-dialect :typed-soac
+                            :target-dialect :typed-invocation
+                            :external-storage :resident-premise}})
+        promoted (update parallel-program :attributes assoc
+                         :host-control :typed-invocation
+                         :invocation-plan (invocation/validate-against! plan parallel-program))]
+    (validate-typed-program! promoted)))
+
+(defn promote-source-free-algorithm
+  "Select the unchanged pure promotion or the separately checked ordered-effect promotion."
+  [typed-program]
+  (let [typed-program (soac/validate! typed-program)
+        facts (soac/facts typed-program)]
+    (if (and (empty? (:effects facts)) (empty? (:aliases facts))
+             (every? #(empty? (soac/result-storage facts (second %)))
+                     (soac/equations typed-program)))
+      (promote-typed-algorithm typed-program)
+      (promote-typed-effect-algorithm typed-program))))
 
 (defn- merge-values
   [left right]

@@ -1,6 +1,7 @@
 (ns raster.compiler.source-free-compilation-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.ad.normalized-map-element-test :as map-fixture]
+            [raster.ad.normalized-indexed-map-test :as indexed-fixture]
             [raster.ad.normalized-map-sum-test :as sum-fixture]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-surface-map-test :as surface]
@@ -49,6 +50,190 @@
         :inputs '[x n]
         :equations {'map-0 (soac/default-equation-facts)}})
       [equation] '[y]))))
+
+(defn- static-ordered-effect []
+  (let [source (#'indexed-fixture/indexed-map :float :long 3 4)
+        bundle (#'indexed-fixture/build source)]
+    (get-in bundle [:gather-programs :transpose])))
+
+(defn- static-zero-fill-map []
+  (let [array (av/tensor {:dtype :float :shape [4] :ownership :owned})
+        equation
+        (list '= 'zero-fill '[zeroed]
+              (list 'map {:index 'i :extent 4} '[source] []
+                    (soac/lambda-form
+                     '[element]
+                     [(soac/local-value
+                       'zero :float
+                       (with-meta '(raster.numeric/- element element)
+                         {:raster.type/tag 'float}))]
+                     '[zero])))]
+    (soac/make
+     (soac/default-program-facts
+      {:values {'source array 'zeroed array}
+       :inputs '[source]
+       :equations {'zero-fill (soac/default-equation-facts)}})
+     [equation] '[zeroed])))
+
+(defn- static-owned-template-map []
+  (let [array (av/tensor {:dtype :float :shape [3] :ownership :owned})
+        equation
+        (list '= 'copy '[copied]
+              (list 'map {:index 'i :extent 3} '[source] []
+                    (soac/lambda-form
+                     '[element]
+                     [(soac/local-value
+                       'same :float
+                       (with-meta '(clojure.core/float element)
+                         {:raster.type/tag 'float}))]
+                     '[same])))]
+    (soac/make
+     (soac/default-program-facts
+      {:values {'source array 'copied array}
+       :inputs '[source]
+       :equations {'copy (soac/default-equation-facts)}})
+     [equation] '[copied])))
+
+(defn- static-resident-request
+  [emitted target buffer-ids roles replacements]
+  (let [entries
+        (mapv
+         (fn [compiler-id]
+           (if-let [replacement (get replacements compiler-id)]
+             [compiler-id replacement]
+             (let [abstract (get-in emitted [:values compiler-id])
+                   value-id [:resident-value compiler-id]
+                   node-id [:resident-node compiler-id]
+                   node (link-plan/node
+                         {:id node-id :dtype (:dtype abstract) :shape (:shape abstract)
+                          :device target :role (get roles compiler-id :internal)})
+                   value (link-plan/value
+                          {:id value-id :abstract abstract
+                           :leaves [{:name :value :node node-id}]})]
+               [compiler-id {:value-id value-id :node-id node-id
+                             :node node :value value}])))
+         buffer-ids)]
+    {:id [:resident-static (mapv first entries)]
+     :target target
+     :nodes (into {} (map (fn [[_ {:keys [node-id node]}]] [node-id node])) entries)
+     :values (into {} (map (fn [[_ {:keys [value-id value]}]] [value-id value])) entries)
+     :buffer-bindings (into {} (map (fn [[id {:keys [value-id]}]] [id value-id])) entries)
+     :scalar-values {}}))
+
+(deftest source-free-ordered-effect-compiles-with-an-external-storage-premise
+  (doseq [target [:ocl:source-free-effect :ze:source-free-effect
+                  :cuda:source-free-effect :hip:source-free-effect]]
+    (let [compilation (with-redefs [hardware/descriptor-for
+                                    (fn [device-id] {:device-id device-id})]
+                        (equation-first/compile-typed
+                         (static-ordered-effect)
+                         {:target target :schedule {:precision :f32-scalar}}))
+          plan (get-in compilation [:semantic :attributes :invocation-plan])]
+      (is (= target (:target compilation)))
+      (is (= 1 (count (:storage-bindings plan))))
+      (is (true? (get-in plan [:storage-bindings 0 :external])))
+      (is (seq (:kernels compilation)))
+      (is (= :none (get-in compilation [:stats :fallback]))))))
+
+(deftest external-storage-needs-an-ordered-complete-predecessor-in-a-link-plan
+  (let [target :ocl:external-storage-link
+        compile! #(with-redefs [hardware/descriptor-for (fn [id] {:device-id id})]
+                    (equation-first/compile-typed
+                     % {:target target :schedule {:precision :f32-scalar}}))
+        effect (compile! (static-ordered-effect))
+        effect-plan (get-in effect [:semantic :attributes :invocation-plan])
+        destination (get-in effect-plan [:storage-bindings 0 :program-value])
+        effect-buffers (conj (into [] (filter #(seq (get-in effect [:emitted :values % :shape])))
+                                   (:program-inputs effect-plan))
+                             destination)
+        effect-roles (assoc (zipmap (:program-inputs effect-plan) (repeat :input))
+                            destination :output)
+        logical-output (first (:program-outputs effect-plan))
+        borrowed-inputs
+        (filterv #(= :borrowed (get-in effect [:emitted :values % :ownership]))
+                 (:program-inputs effect-plan))
+        _ (is (= 1 (count borrowed-inputs)))
+        borrowed-input (first borrowed-inputs)
+        template (compile! (static-owned-template-map))
+        template-plan (get-in template [:semantic :attributes :invocation-plan])
+        template-array (float-array [0.0 0.0 0.0])
+        template-materialized
+        (materialization/materialize
+         template-plan [template-array]
+         (fn [& _] (throw (AssertionError. "template map has no host scalar equation"))))
+        layout (invocation-link/project-resident-layout
+                template-materialized (:emitted template) target)
+        template-value (get-in layout [:buffer-bindings 'source])
+        cloned-value-id [:external-owned-value borrowed-input]
+        cloned-node-id [:external-owned-node borrowed-input]
+        cloned-allocation-id [:external-owned-allocation borrowed-input]
+        cloned (invocation-link/clone-resident-value-layout
+                layout
+                {:template-value template-value
+                 :template-compiler-value 'source
+                 :template-abstract (get-in template [:emitted :values 'source])
+                 :compiler-value borrowed-input
+                 :abstract (get-in effect [:emitted :values borrowed-input])
+                 :value-id cloned-value-id
+                 :node-id cloned-node-id
+                 :allocation-id cloned-allocation-id
+                 :role :input
+                 :project-ownership? true})
+        replacements
+        {borrowed-input {:value-id cloned-value-id :node-id cloned-node-id
+                         :node (:node cloned) :value (:value cloned)}}
+        effect-request (static-resident-request (:emitted effect) target effect-buffers
+                                                effect-roles replacements)
+        effect-request (assoc-in effect-request [:buffer-bindings logical-output]
+                                 (get-in effect-request [:buffer-bindings destination]))
+        effect-instance (invocation-link/bind-resident-program
+                         (:emitted effect) effect-request)
+        destination-value (get-in effect-request [:buffer-bindings destination])
+        destination-node (get-in effect-request [:values destination-value :leaves 0 :node])
+        zero (compile! (static-zero-fill-map))
+        replacement {'zeroed {:value-id destination-value :node-id destination-node
+                              :node (get-in effect-request [:nodes destination-node])
+                              :value (get-in effect-request [:values destination-value])}}
+        zero-request (static-resident-request (:emitted zero) target '[source zeroed]
+                                              {'source :input} replacement)
+        zero-instance (invocation-link/bind-resident-program (:emitted zero) zero-request)
+        nodes (merge (:nodes effect-request) (:nodes zero-request))
+        values (merge (:values effect-request) (:values zero-request))]
+    (is (= :borrowed (get-in effect [:emitted :values borrowed-input :ownership])))
+    (is (= :owned (get-in effect-request
+                          [:values cloned-value-id :abstract :ownership])))
+    (is (= cloned-value-id (get-in effect-instance [:call :buffers borrowed-input])))
+    (is (nil? (get-in effect-request [:nodes cloned-node-id :source])))
+    (is (= destination-value (get-in effect-instance [:call :buffers destination])))
+    (is (= destination-value (get-in effect-instance [:call :buffers logical-output])))
+    (is (= :link-read-before-write
+           (reason #(link-plan/make
+                     {:id :uninitialized-external-effect :target target
+                      :nodes (:nodes effect-request) :values (:values effect-request)
+                      :instances [effect-instance] :outputs [destination-node]}))))
+    (let [plan (link-plan/make
+                {:id :initialized-external-effect :target target
+                 :nodes nodes :values values
+                 :instances [zero-instance effect-instance]
+                 :outputs [destination-node]})]
+      (is (= plan (link-plan/validate! plan)))
+      (is (= [(:id zero-instance) (:id effect-instance)]
+             (mapv :id (:instances plan))))
+      (is (= destination-node
+             (get-in plan [:values destination-value :leaves 0 :node]))))
+    (is (= :resident-binding-buffers
+           (reason #(invocation-link/bind-resident-program
+                     (:emitted effect)
+                     (update effect-request :buffer-bindings dissoc destination)))))
+    (is (= :resident-binding-buffers
+           (reason #(invocation-link/bind-resident-program
+                     (:emitted effect)
+                     (update effect-request :buffer-bindings dissoc logical-output)))))
+    (is (some? (reason #(invocation-link/bind-resident-program
+                         (:emitted effect)
+                         (assoc-in effect-request [:buffer-bindings destination]
+                                   (get-in effect-request
+                                           [:buffer-bindings (first (:program-inputs effect-plan))]))))))))
 
 (defn- synthetic-descriptor [target]
   {:device-id target})
