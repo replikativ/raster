@@ -158,6 +158,23 @@
        (empty? (:effects value))
        (empty? (:attributes value))))
 
+(defn- pristine-public-reduction-root?
+  "Prove the representation-neutral boundary shared by every public resident reduction.
+
+   This does not authorize residency by itself. Callers must additionally prove either a complete
+   later device-use audit or one explicit source-free public-output demand."
+  [facts producers-by-result outputs host-reads producer result]
+  (let [equation-facts (get-in facts [:equations (:id producer)])]
+    (and (= :reduce (:kind producer))
+         (contains? outputs result)
+         (= 1 (count (:results producer)))
+         (= 1 (count (get producers-by-result result)))
+         (not (contains? host-reads result))
+         (empty? (:effects equation-facts))
+         (empty? (:aliases equation-facts))
+         (empty? (get-in equation-facts [:attributes :result-storage]))
+         (exact-plain-scalar-value? (get-in facts [:values result])))))
+
 (defn- public-reused-reduction-root?
   "Admit one direct public reduction result only when it is also a fully audited device capture.
 
@@ -166,22 +183,23 @@
    transform roles refuse. The producer and value contracts must be pristine because realization
    changes only their physical representation, never any other semantic facet."
   [facts info-by-id position-by-id producers-by-result outputs host-reads producer result sites]
-  (let [producer-position (get position-by-id (:id producer))
-        equation-facts (get-in facts [:equations (:id producer)])]
-    (and (contains? outputs result)
-         (= 1 (count (:results producer)))
-         (= 1 (count (get producers-by-result result)))
+  (let [producer-position (get position-by-id (:id producer))]
+    (and (pristine-public-reduction-root?
+          facts producers-by-result outputs host-reads producer result)
          (seq sites)
          (every? (fn [[_ {:keys [equation role]}]]
                    (and (= :capture role)
                         (< producer-position (get position-by-id equation -1))
                         (some? (get info-by-id equation))))
-                 sites)
-         (not (contains? host-reads result))
-         (empty? (:effects equation-facts))
-         (empty? (:aliases equation-facts))
-         (empty? (get-in equation-facts [:attributes :result-storage]))
-         (exact-plain-scalar-value? (get-in facts [:values result])))))
+                 sites))))
+
+(defn- demanded-public-reduction-root?
+  [facts producers-by-result outputs host-reads producer result sites]
+  (let [value (get-in facts [:values result])]
+    (and (pristine-public-reduction-root?
+          facts producers-by-result outputs host-reads producer result)
+         (empty? sites)
+         (contains? #{:float :double} (:dtype value)))))
 
 (defn- result-transform-expression
   [info transform promoted]
@@ -1157,14 +1175,16 @@
 (defn- realize-reductions
   "Return `[program stats]`, realizing every eligible audited scalar reduction.
 
-   Ordinary output-only roots and indirect/dependent outputs remain scalar. A direct public,
-   single-result reduction root may become resident only when it also has at least one later
+   Ordinary output-only roots and indirect/dependent outputs remain scalar unless the caller makes
+   an explicit source-free public-output demand. A demanded direct, single-result Float/Double
+   reduction must be output-only and have pristine producer and AbstractValue boundaries. Without
+   that demand, a public reduction may become resident only when it also has at least one later
    ordinary capture and its complete producer, use and AbstractValue boundaries are pristine.
    A direct full-reduction result-transform scalar is an eligible use only when its unique prior
    producer and every use are audited together; marking the root resident and rebuilding all such
    uses as typed singleton loads is one transaction. Scalar chains depending on eligible roots
    must likewise remain internal and capture-only."
-  [program]
+  [program resident-outputs]
   (let [program (dialect/validate! program)
         facts (dialect/facts program)
         equations (dialect/equations program)
@@ -1186,6 +1206,23 @@
                                (or (dialect/result-storage facts (second equation)) [])))))
               equations)
         stored-reduction-results (set (keys stored-reduction-destinations))
+        demanded (set (filter outputs resident-outputs))
+        demanded-roots
+        (set (mapcat (fn [{:keys [kind results] :as producer}]
+                       (when (= :reduce kind)
+                         (filter (fn [result]
+                                   (and (contains? demanded result)
+                                        (demanded-public-reduction-root?
+                                         facts producers-by-result outputs host-reads producer result
+                                         (get uses result []))))
+                                 results)))
+                     infos))
+        _ (when-not (= demanded demanded-roots)
+            (throw (ex-info "requested public resident outputs require pristine output-only reductions"
+                            {:reason :typed-soac-resident-output-demand
+                             :requested (vec resident-outputs)
+                             :component-outputs (vec (dialect/outputs program))
+                             :admitted (vec (sort-by pr-str demanded-roots))})))
         public-reused-roots
         (set (mapcat (fn [{:keys [kind results] :as producer}]
                        (when (= :reduce kind)
@@ -1210,6 +1247,7 @@
                                                producer result sites)))))
                                  results)))
                      infos))
+        candidate-roots (set/union candidate-roots demanded-roots)
         scalar-defs (scalar-definitions equations)
         dependent (dependent-scalars scalar-defs candidate-roots)
         escaping-dependent
@@ -1257,7 +1295,10 @@
                                         (dialect/value-id? (dialect/operation-extent equation))
                                         (conj (dialect/operation-extent equation))))
                                     rewritten))
-            inputs (vec (sort-by pr-str (set/difference references definitions)))
+            input-set (set/difference references definitions)
+            source-inputs (:inputs facts)
+            inputs (into (vec (filter input-set source-inputs))
+                         (sort-by pr-str (set/difference input-set (set source-inputs))))
             storage-destinations
             (set (mapcat (fn [equation]
                            (map :destination
@@ -1279,7 +1320,8 @@
                                               m)))
                                         equation-facts rewritten)))
                       (assoc-in [:attributes :resident-reductions] (vec (sort-by pr-str roots))))
-            public-resident-outputs (set/intersection roots public-reused-roots)
+            public-resident-outputs
+            (set/intersection roots (set/union public-reused-roots demanded-roots))
             facts (cond-> facts
                     (seq public-resident-outputs)
                     (assoc-in [:attributes :public-resident-reduction-outputs]
@@ -1287,6 +1329,15 @@
             result (dialect/make facts rewritten (dialect/outputs program))]
         [result {:resident-reductions (count roots)
                  :inlined-scalars (count removed-scalars)}]))))
+
+(defn ^:no-doc realize-public-reduction-outputs
+  "Apply the shared reduction realization transaction with an explicit public-output demand.
+
+   This entry deliberately excludes terminal ScalarIR realization. Internal reductions which are
+   independently eligible under the existing use audit remain legal; every requested public ID
+   must additionally pass the stricter output-only demand proof."
+  [program resident-outputs]
+  (realize-reductions program resident-outputs))
 
 (defn- lexical-call-marker?
   [form]
@@ -1567,6 +1618,6 @@
 (defn realize
   "Realize audited reduction residents and one bounded direct terminal ScalarIR result."
   [program]
-  (let [[program reduction-stats] (realize-reductions program)
+  (let [[program reduction-stats] (realize-reductions program [])
         [program scalar-stats] (realize-terminal-device-scalar program)]
     [program (merge reduction-stats scalar-stats)]))

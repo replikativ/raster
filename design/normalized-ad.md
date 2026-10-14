@@ -21,6 +21,20 @@ therefore refuses retained borrowed inputs rather than relabeling their ownershi
 same-session named-entry ownership and source-free persistence remain separate follow-ups before delayed
 device pullbacks can retain private residuals safely. No default-engine migration is implied.
 
+Source-free compilation also has one explicit output-representation demand:
+`:resident-outputs` is an ordered vector of exact public TypedSOAC IDs. Each requested ID must be
+an output-only, single-result, pristine Float/Double full reduction. The shared resident pass
+marks it with the existing one-element device-buffer representation and public reduction
+certificate; scheduling, emission and the final compilation boundary independently recheck that
+certificate. The demand remains part of public compilation options and identity but is consumed
+before scheduling rather than forwarded as a second internal realization request. Multiple
+independent direct reductions may be selected, but a multi-result producer,
+alias, effect, result-storage relation, forged resident facet or non-reduction output refuses.
+Omitting the option preserves the prior output-only scalar behavior, and ordinary deftm compilation
+does not accept this source-free ownership request. This is representation substrate only: it does
+not make a scalar cotangent input resident, clone singleton storage, or enable normalized map-sum
+device execution.
+
 One deterministic map-stage constructor owns fresh interface construction and exact
 retained-interface reconstruction. Validation still independently checks scalar derivation before
 reconstructing the stage; it neither trusts producer certification nor allocates new residual or
