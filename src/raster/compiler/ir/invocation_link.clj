@@ -291,6 +291,63 @@
             expanded (into required dependencies)]
         (if (= required expanded) required (recur expanded))))))
 
+(defn- resident-runtime-interface
+  "Partition the required runtime boundary by emitted ABI kind. Rank is consulted only for
+   non-ABI shape dependencies, so a logical rank-zero resident buffer remains a buffer."
+  [parallel-program boundaries projections]
+  (let [boundary-buffer-values
+        (into #{}
+              (mapcat (fn [{:keys [graph]}]
+                        (map :id (concat (:inputs graph) (:outputs graph)))))
+              boundaries)
+        boundary-scalar-values
+        (into #{} (mapcat (comp #(map :id %) :scalars :graph)) boundaries)
+        logical-buffer-values
+        (reduce
+         (fn [buffer-values equation]
+           (if-let [operation (first (:operations equation))]
+             (let [projection (emitted-program/operation-projection projections operation)
+                   physical-results (:physical-results projection)]
+               (into buffer-values
+                     (keep (fn [result]
+                             (when (contains? buffer-values (get physical-results result)) result)))
+                     (:results equation)))
+             buffer-values))
+         boundary-buffer-values
+         (:equations parallel-program))
+        required-values (required-materialized-buffers parallel-program boundaries)
+        _ (when-let [ambiguous (seq (set/intersection logical-buffer-values
+                                                       boundary-scalar-values))]
+            (fail! :resident-binding-runtime-kind
+                   "emitted ABI assigns both buffer and scalar kinds to one program value"
+                   {:values (set ambiguous)}))
+        non-abi-required (set/difference required-values logical-buffer-values)
+        _ (doseq [value-id non-abi-required]
+            (when-not (get-in parallel-program [:values value-id])
+              (fail! :resident-binding-runtime-value
+                     "required resident shape dependency has no retained AbstractValue"
+                     {:value value-id})))
+        shape-only-buffers
+        (into #{}
+              (filter #(seq (:shape (get-in parallel-program [:values %]))))
+              non-abi-required)
+        expected-buffers (into (set/intersection required-values logical-buffer-values)
+                               shape-only-buffers)
+        _ (when-let [ambiguous (seq (set/intersection expected-buffers
+                                                       boundary-scalar-values))]
+            (fail! :resident-binding-runtime-kind
+                   "required resident storage is also declared as an emitted ABI scalar"
+                   {:values (set ambiguous)}))
+        expected-scalars (into boundary-scalar-values
+                               (set/difference non-abi-required shape-only-buffers))]
+    (doseq [value-id expected-scalars]
+      (let [value (get-in parallel-program [:values value-id])]
+        (when-not (and value (empty? (:shape value)))
+          (fail! :resident-binding-runtime-kind
+                 "resident scalar binding requires an exact retained rank-zero value"
+                 {:value value-id :abstract value}))))
+    {:buffers expected-buffers :scalars expected-scalars}))
+
 (defn- add-materialized-inputs
   [state materialized program-values overwrite-inputs required-buffers]
   (reduce-kv
@@ -542,6 +599,144 @@
   (link/without-validation-context
    #(lower-in-context materialized parallel-program target evaluate-host project
                       retained-validation caller-options)))
+
+(def ^:private resident-binding-keys
+  #{:id :target :nodes :values :buffer-bindings :scalar-values})
+
+(defn- resident-single-leaf-storage
+  [nodes values program-values buffer-bindings]
+  (reduce-kv
+   (fn [state compiler-value value-id]
+     (let [expected (get program-values compiler-value)
+           link-value (get values value-id)
+           leaves (:leaves link-value)]
+       (when-not expected
+         (fail! :resident-binding-compiler-value
+                "resident binding names a value absent from the emitted program"
+                {:compiler-value compiler-value}))
+       (when-not link-value
+         (fail! :resident-binding-link-value
+                "resident binding names an absent logical LinkValue"
+                {:compiler-value compiler-value :value value-id}))
+       (when-not (= 1 (count leaves))
+         (fail! :resident-binding-leaf-count
+                "one emitted program buffer requires one whole single-leaf LinkValue"
+                {:compiler-value compiler-value :value value-id :leaves leaves}))
+       (let [node-id (get-in leaves [0 :node])
+             node (get nodes node-id)]
+         (when-not node
+           (fail! :resident-binding-node
+                  "resident binding LinkValue names an absent physical node"
+                  {:compiler-value compiler-value :value value-id :node node-id}))
+         (when-not (av/storage-contract-compatible? expected (:abstract link-value))
+           (fail! :resident-binding-value-contract
+                  "emitted program value differs from its supplied logical LinkValue"
+                  {:compiler-value compiler-value :value value-id
+                   :expected expected :actual (:abstract link-value)}))
+         (add-storage state value-id compiler-value (:abstract link-value)
+                      (get-in node [:view :shape]) nil :unspecified))))
+   {:buffers buffer-bindings :loop-scratch {} :storage {}}
+   buffer-bindings))
+
+(defn- bind-resident-program-in-context
+  [parallel-program request caller-options]
+  (when-not (and (map? request) (= resident-binding-keys (set (keys request))))
+    (fail! :resident-binding-request
+           "resident program binding requires one closed storage request"
+           {:expected resident-binding-keys
+            :actual (when (map? request) (set (keys request)))}))
+  (let [{:keys [id target nodes values buffer-bindings scalar-values]} request
+        _ (when (nil? id)
+            (fail! :resident-binding-id "resident program binding requires a stable identity" {}))
+        _ (when-not (and (map? nodes) (map? values)
+                         (map? buffer-bindings) (map? scalar-values))
+            (fail! :resident-binding-shape
+                   "resident program nodes, values, buffers and scalars must be maps"
+                   {:nodes (type nodes) :values (type values)
+                    :buffer-bindings (type buffer-bindings)
+                    :scalar-values (type scalar-values)}))
+        retained-validation
+        (if (nil? caller-options)
+          (emitted-program/validate-with-physical-results! parallel-program)
+          (emitted-program/validate-with-physical-results! parallel-program caller-options))
+        parallel-program (:program retained-validation)
+        _ (when-let [providers (seq (get-in parallel-program
+                                             [:attributes :native-initialization-providers]))]
+            (fail! :resident-binding-native-initialization
+                   "resident program binding cannot supply native initialization content"
+                   {:destinations (vec providers)}))
+        host-equations (filterv #(true? (get-in % [:attributes :host-only]))
+                                (:equations parallel-program))
+        _ (when (seq host-equations)
+            (fail! :resident-binding-host-equations
+                   "resident program binding cannot evaluate host equations"
+                   {:equations (mapv :id host-equations)}))
+        loop-equations (filterv #(emitted-loop/emitted-loop?
+                                  (first (:operations %)))
+                                (:equations parallel-program))
+        _ (when (seq loop-equations)
+            (fail! :resident-binding-structured-loop
+                   "the first resident binding slice does not allocate loop carry scratch"
+                   {:equations (mapv :id loop-equations)}))
+        boundaries (equation-boundaries parallel-program (:projections retained-validation))
+        {expected-buffers :buffers expected-scalars :scalars}
+        (resident-runtime-interface parallel-program boundaries
+                                    (:projections retained-validation))
+        _ (when-not (= expected-scalars (set (keys scalar-values)))
+            (fail! :resident-binding-scalars
+                   "resident scalar bindings must exactly match scalar program inputs"
+                   {:expected expected-scalars :actual (set (keys scalar-values))}))
+        _ (when-not (= expected-buffers (set (keys buffer-bindings)))
+            (fail! :resident-binding-buffers
+                   "resident buffer bindings must exactly cover the emitted program boundary"
+                   {:expected expected-buffers :actual (set (keys buffer-bindings))}))
+        ;; This check is deliberately structural only. Sources and roles are not consulted as
+        ;; initialization authority; the final LinkPlan/LinkModule proves ordered readiness.
+        initial (resident-single-leaf-storage nodes values (:values parallel-program)
+                                              buffer-bindings)
+        realized (reduce #(lower-equation-storage %1 id %2 (:values parallel-program)
+                                                  scalar-values (:projections retained-validation))
+                         initial (:equations parallel-program))
+        _ (when-not (and (= buffer-bindings (:buffers realized))
+                         (empty? (:loop-scratch realized))
+                         (= (:storage initial) (:storage realized))
+                         (= (set (vals buffer-bindings))
+                            (set (keys (:storage realized))))
+                         (every? #(and (nil? (:backing %)) (nil? (:result-view %)))
+                                 (vals (:storage realized))))
+            (fail! :resident-binding-storage-rewrite
+                   "resident traversal attempted to allocate or rewrite supplied storage"
+                   {:before buffer-bindings :after (:buffers realized)
+                    :loop-scratch (:loop-scratch realized)
+                    :storage (set (keys (:storage realized)))}))
+        call (if (nil? caller-options)
+               (program-call/make parallel-program buffer-bindings scalar-values {} nil {}
+                                  retained-validation)
+               (program-call/make parallel-program buffer-bindings scalar-values {} nil {}
+                                  retained-validation caller-options))
+        instance (if (nil? caller-options)
+                   (link/program-instance {:id id :call call
+                                           :attributes {:source :resident-emitted-program}})
+                   (link/program-instance {:id id :call call
+                                           :attributes {:source :resident-emitted-program}}
+                                          caller-options))]
+    ;; Run the complete graph ABI/bounded-loop/storage checker without effect initialization.
+    (link/validate-program-instance-storage! target nodes values instance caller-options)
+    instance))
+
+(defn bind-resident-program
+  "Bind one freshly validated EmittedParallelProgram to caller-owned resident LinkValues.
+
+   `:buffer-bindings` maps compiler value IDs to whole, exact single-leaf LinkValue IDs;
+   `:scalar-values` supplies only explicitly typed immutable scalar inputs. This function neither
+   allocates nor treats node sources/roles as initialized. A containing LinkPlan/LinkModule must
+   establish all ordered initialization and alias obligations."
+  ([parallel-program request]
+   (link/without-validation-context
+    #(bind-resident-program-in-context parallel-program request nil)))
+  ([parallel-program request caller-options]
+   (link/without-validation-context
+    #(bind-resident-program-in-context parallel-program request caller-options))))
 
 (defn lower
   "Lower a specialized invocation under independent caller math intent, without driver allocation."

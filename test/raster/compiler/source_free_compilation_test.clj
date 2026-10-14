@@ -9,7 +9,10 @@
             [raster.compiler.equation-artifact :as artifact]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.emitted-parallel-program :as emitted-program]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.pipeline :as pipeline]
@@ -53,6 +56,28 @@
             [:float false] (float-array [2.0 -3.0])
             [:double false] (double-array [2.0 -3.0])))
         (get-in compilation [:semantic :attributes :invocation-plan :parameters])))
+
+(defn- resident-map-request
+  ([compilation] (resident-map-request compilation nil))
+  ([compilation input-abstract]
+  (let [values (get-in compilation [:emitted :values])
+        target (:target compilation)
+        input-node (link-plan/node {:id :input-node :dtype :double :shape [2]
+                                    :device target :role :input
+                                    :source (double-array [2.0 -3.0])})
+        output-node (link-plan/node {:id :output-node :dtype :double :shape [2]
+                                     :device target :role :output})]
+    {:id :resident-square
+     :target target
+     :nodes {:input-node input-node :output-node output-node}
+     :values {:input-value (link-plan/value
+                            {:id :input-value :abstract (or input-abstract (get values 'x))
+                             :leaves [{:name :value :node :input-node}]})
+              :output-value (link-plan/value
+                             {:id :output-value :abstract (get values 'y)
+                              :leaves [{:name :value :node :output-node}]})}
+     :buffer-bindings {'x :input-value 'y :output-value}
+     :scalar-values {'n {:type :long :value 2}}})))
 
 (deftest source-free-compilation-uses-the-shared-tail-without-a-frontend
   (let [typed (pure-map)
@@ -108,6 +133,150 @@
     (is (zero? (get-in plan [:attributes :driver-allocations])))
     (is (= #{'y} (set (keys (get-in plan [:attributes :semantic-outputs])))))
     (is (= 1 (count (:outputs plan))))))
+
+(deftest emitted-program-binds-to-existing-resident-link-values-without-initialization-authority
+  (let [compilation (with-redefs [hardware/descriptor-for synthetic-descriptor]
+                      (equation-first/compile-typed
+                       (pure-map) {:target :ocl:resident
+                                   :schedule {:precision :f32-scalar}}))
+        request (resident-map-request compilation)
+        emitted (:emitted compilation)
+        instance (invocation-link/bind-resident-program emitted request)
+        plan (link-plan/make
+              {:id :resident-square-plan :target (:target request)
+               :nodes (:nodes request) :values (:values request)
+               :instances [instance] :outputs [:output-node]})]
+    (is (link-plan/program-link-instance? instance))
+    (is (= {'x :input-value 'y :output-value}
+           (get-in instance [:call :buffers])))
+    (is (= plan (link-plan/validate! plan)))
+    (is (= #{:input-node}
+           (get-in (link-plan/initialization-contract plan) [:reads])))
+    (is (= #{:output-node}
+           (get-in (link-plan/initialization-contract plan) [:writes])))
+    (testing "storage binding does not manufacture initialization"
+      (let [uninitialized (-> request
+                              (assoc-in [:nodes :input-node :role] :internal)
+                              (assoc-in [:nodes :input-node :source] nil))
+            bound (invocation-link/bind-resident-program emitted uninitialized)]
+        (is (link-plan/program-link-instance? bound))
+        (is (= :link-read-before-write
+               (reason #(link-plan/make
+                         {:id :uninitialized-resident :target (:target request)
+                          :nodes (:nodes uninitialized) :values (:values uninitialized)
+                          :instances [bound] :outputs [:output-node]}))))))
+    (testing "the binder is closed over exact existing storage and scalar identities"
+      (is (= :resident-binding-buffers
+             (reason #(invocation-link/bind-resident-program
+                       emitted (update request :buffer-bindings dissoc 'y)))))
+      (is (= :resident-binding-scalars
+             (reason #(invocation-link/bind-resident-program
+                       emitted (assoc request :scalar-values {})))))
+      (is (= :resident-binding-request
+             (reason #(invocation-link/bind-resident-program
+                       emitted (assoc request :source :forged)))))
+      (is (= :link-node-device
+             (reason #(invocation-link/bind-resident-program
+                       emitted (assoc request :target :ze:resident)))))
+      (let [extra-node (link-plan/node {:id :extra-node :dtype :double :shape [2]
+                                        :device (:target request) :role :internal})
+            multileaf (link-plan/value
+                       {:id :input-value :abstract (get-in request [:values :input-value :abstract])
+                        :leaves [{:name :left :node :input-node}
+                                 {:name :right :node :extra-node}]})]
+        (is (= :resident-binding-leaf-count
+               (reason #(invocation-link/bind-resident-program
+                         emitted
+                         (-> request
+                             (assoc-in [:nodes :extra-node] extra-node)
+                             (assoc-in [:values :input-value] multileaf))))))))))
+
+(deftest resident-binding-preserves-borrowed-program-inputs-and-fresh-validation
+  (let [base (pure-map)
+        borrowed (apply list
+                        (assoc (vec base) 1
+                               (assoc-in (soac/facts base) [:values 'x :ownership] :borrowed)))
+        compilation (with-redefs [hardware/descriptor-for synthetic-descriptor]
+                      (equation-first/compile-typed
+                       borrowed {:target :ocl:resident-borrowed
+                                 :schedule {:precision :f32-scalar}}))
+        owned-input (assoc (get-in compilation [:emitted :values 'x]) :ownership :owned)
+        request (resident-map-request compilation owned-input)
+        emitted (:emitted compilation)
+        instance (invocation-link/bind-resident-program emitted request)]
+    (is (= :borrowed (get-in instance [:call :program :values 'x :ownership])))
+    (is (= :owned (get-in request [:values :input-value :abstract :ownership])))
+    (is (= instance
+           (link-plan/validate-program-instance-storage!
+            (:target request) (:nodes request) (:values request) instance)))
+    (is (= :link-value-abstract-ownership
+           (reason #(equation-first/lower compilation [(double-array [2.0 -3.0]) 2])))
+        "ordinary host materialization remains ownership-strict")
+    (testing "full resident validation catches capacity after the logical binding is compatible"
+      (let [short-node (link-plan/node {:id :input-node :dtype :double :shape [1]
+                                        :device (:target request) :role :input
+                                        :source (double-array [2.0])})]
+        (is (= :program-link-value-contract
+               (reason #(invocation-link/bind-resident-program
+                         emitted (assoc-in request [:nodes :input-node] short-node)))))))
+    (testing "an inherited operation projection cannot bless a changed emitted owner"
+      (let [stale (doto (java.util.IdentityHashMap.))
+            tampered (assoc-in emitted [:values 'x :dtype] :float)
+            projection-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                       '*validated-boundary-projections*)
+            policy-var (ns-resolve 'raster.compiler.ir.emitted-parallel-program-call
+                                   '*validated-projection-policy*)
+            expected (reason #(invocation-link/bind-resident-program tampered request))]
+        (is (some? expected))
+        (is (= expected
+               (with-bindings {projection-var stale policy-var {:overrides {}}}
+                 (reason #(invocation-link/bind-resident-program tampered request)))))))))
+
+(deftest resident-binding-retains-a-validated-shape-only-array-without-a-kernel-abi-slot
+  (let [extent-value (av/tensor {:dtype :double :shape [3]})
+        passthrough-value (av/tensor {:dtype :double :shape '[(extent extent-source)]})
+        emitted (parallel-program/make
+                 {:dialect :opencl-parallel
+                  :values {'extent-source extent-value 'passthrough passthrough-value}
+                  :inputs '[extent-source passthrough]
+                  :equations [] :outputs '[passthrough]})
+        validation (emitted-program/validate-with-physical-results! emitted)
+        target :ocl:resident-shape
+        nodes {:extent-node (link-plan/node {:id :extent-node :dtype :double :shape [3]
+                                             :device target :role :input})
+               :passthrough-node
+               (link-plan/node {:id :passthrough-node :dtype :double :shape [3]
+                                :device target :role :input})}
+        values {:extent-value
+                (link-plan/value {:id :extent-value :abstract extent-value
+                                  :leaves [{:name :value :node :extent-node}]})
+                :passthrough-value
+                (link-plan/value {:id :passthrough-value :abstract passthrough-value
+                                  :leaves [{:name :value :node :passthrough-node}]})}
+        request {:id :shape-only-resident :target target :nodes nodes :values values
+                 :buffer-bindings {'extent-source :extent-value
+                                   'passthrough :passthrough-value}
+                 :scalar-values {}}
+        instance (invocation-link/bind-resident-program emitted request)
+        boundaries-fn (ns-resolve 'raster.compiler.ir.invocation-link
+                                  'equation-boundaries)
+        interface-fn (ns-resolve 'raster.compiler.ir.invocation-link
+                                 'resident-runtime-interface)
+        boundaries (boundaries-fn emitted (:projections validation))
+        interface (interface-fn emitted boundaries (:projections validation))]
+    (is (= #{'extent-source 'passthrough} (:buffers interface)))
+    (is (empty? (:scalars interface)))
+    (is (= (:buffer-bindings request) (get-in instance [:call :buffers])))
+    (is (= :passthrough-value (get-in instance [:call :outputs 'passthrough])))
+    (is (= instance
+           (link-plan/validate-program-instance-storage! target nodes values instance)))
+    (testing "an ABI buffer remains a buffer even when its logical shape is rank zero"
+      (is (= {:buffers #{'resident} :scalars #{}}
+             (interface-fn
+              {:values {'resident (av/tensor {:dtype :double :shape []})}
+               :equations [] :outputs []}
+              [{:graph {:inputs [{:id 'resident}] :outputs [] :scalars []}}]
+              (java.util.IdentityHashMap.)))))))
 
 (deftest source-free-compilation-retains-target-policy-and-rejects-interface-overrides
   (doseq [target [:ocl:source-free :ze:source-free :cuda:source-free :hip:source-free]]

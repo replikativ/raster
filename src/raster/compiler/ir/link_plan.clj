@@ -817,6 +817,86 @@
                       {:reason :link-alias-pair :alias pair})))
     pair))
 
+(defn- validate-storage-structure!
+  "Validate the complete target-local physical/logical storage relation without treating
+   sources or roles as initialization evidence. Effect ordering remains a LinkPlan concern."
+  [target nodes values exact-device?]
+  (when-not (keyword? target)
+    (throw (ex-info "a link plan requires a target device keyword"
+                    {:reason :link-target :target target})))
+  (when-not (and (map? nodes) (seq nodes))
+    (throw (ex-info "a link plan requires a non-empty node map"
+                    {:reason :link-nodes :nodes nodes})))
+  (doseq [[node-id link-node] nodes]
+    (validate-node! link-node)
+    (when-not (= node-id (:id link-node))
+      (throw (ex-info "link node map key differs from the node identity"
+                      {:reason :link-node-map-key :key node-id :node (:id link-node)})))
+    (let [device (get-in link-node [:view :allocation :device])]
+      (when-not (if exact-device? (= target device) (or (nil? device) (= target device)))
+        (throw (ex-info "link node allocation belongs to a different device"
+                        {:reason :link-node-device :node node-id
+                         :target target :device device})))))
+  (when-not (and (map? values) (seq values))
+    (throw (ex-info "a link plan requires a non-empty logical value map"
+                    {:reason :link-values :values values})))
+  (let [claimed (volatile! #{})]
+    (doseq [[value-id link-value] values]
+      (value link-value)
+      (when-not (= value-id (:id link-value))
+        (throw (ex-info "link value map key differs from the value identity"
+                        {:reason :link-value-map-key :key value-id
+                         :value (:id link-value)})))
+      (let [leaf-nodes (mapv :node (:leaves link-value))
+            leaf-records (mapv nodes leaf-nodes)
+            roles (set (map :role leaf-records))
+            ownerships (set (map #(get-in % [:view :allocation :ownership]) leaf-records))
+            memory-spaces (set (map #(get-in % [:view :allocation :memory-space]) leaf-records))
+            devices (set (map #(get-in % [:view :allocation :device]) leaf-records))]
+        (when-not (every? some? leaf-records)
+          (throw (ex-info "link value leaf names an absent physical node"
+                          {:reason :link-value-leaf-node :value value-id
+                           :leaves leaf-nodes :nodes (set (keys nodes))})))
+        (when-let [overlap (seq (set/intersection @claimed (set leaf-nodes)))]
+          (throw (ex-info "one physical node cannot belong to multiple logical values"
+                          {:reason :link-value-overlap :value value-id :nodes (set overlap)})))
+        (vswap! claimed into leaf-nodes)
+        (when-not (= 1 (count roles))
+          (throw (ex-info "one logical value requires one dataflow role across its leaves"
+                          {:reason :link-value-roles :value value-id :roles roles})))
+        (when-not (= 1 (count ownerships))
+          (throw (ex-info "one logical value requires atomic ownership across its leaves"
+                          {:reason :link-value-ownership :value value-id
+                           :ownerships ownerships})))
+        (when-not (= 1 (count memory-spaces))
+          (throw (ex-info "one logical value requires one memory space across its leaves"
+                          {:reason :link-value-memory-spaces :value value-id
+                           :memory-spaces memory-spaces})))
+        (when-not (= 1 (count devices))
+          (throw (ex-info "one logical value cannot span devices before sharding lowering"
+                          {:reason :link-value-devices :value value-id :devices devices})))
+        (let [abstract (:abstract link-value)
+              abstract-device (get-in abstract [:placement :device])]
+          (when (and (:ownership abstract)
+                     (not= #{(:ownership abstract)} ownerships))
+            (throw (ex-info "logical ownership differs from its physical realization"
+                            {:reason :link-value-abstract-ownership :value value-id
+                             :abstract (:ownership abstract) :physical ownerships})))
+          (when (and (:memory-space abstract)
+                     (not= #{(:memory-space abstract)} memory-spaces))
+            (throw (ex-info "logical memory space differs from its physical realization"
+                            {:reason :link-value-abstract-memory-space :value value-id
+                             :abstract (:memory-space abstract) :physical memory-spaces})))
+          (when (and abstract-device (not= #{abstract-device} devices))
+            (throw (ex-info "logical placement differs from its physical realization"
+                            {:reason :link-value-abstract-device :value value-id
+                             :abstract abstract-device :physical devices}))))))
+    (when-not (= @claimed (set (keys nodes)))
+      (throw (ex-info "every physical LinkNode must realize exactly one logical value"
+                      {:reason :link-value-coverage :claimed @claimed
+                       :nodes (set (keys nodes))}))))
+  {:nodes nodes :values values})
+
 (defn- validate-plan-structure! [plan]
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
@@ -824,80 +904,7 @@
   (let [{:keys [id target nodes values instances outputs aliases attributes]} plan]
     (when (nil? id)
       (throw (ex-info "a link plan requires a stable identity" {:reason :link-plan-id})))
-    (when-not (keyword? target)
-      (throw (ex-info "a link plan requires a target device keyword"
-                      {:reason :link-target :target target})))
-    (when-not (and (map? nodes) (seq nodes))
-      (throw (ex-info "a link plan requires a non-empty node map"
-                      {:reason :link-nodes :nodes nodes})))
-    (doseq [[node-id link-node] nodes]
-      (validate-node! link-node)
-      (when-not (= node-id (:id link-node))
-        (throw (ex-info "link node map key differs from the node identity"
-                        {:reason :link-node-map-key :key node-id :node (:id link-node)})))
-      (let [device (get-in link-node [:view :allocation :device])]
-        (when-not (or (nil? device) (= target device))
-          (throw (ex-info "link node allocation belongs to a different device"
-                          {:reason :link-node-device :node node-id
-                           :target target :device device})))))
-    (when-not (and (map? values) (seq values))
-      (throw (ex-info "a link plan requires a non-empty logical value map"
-                      {:reason :link-values :values values})))
-    (let [claimed (volatile! #{})]
-      (doseq [[value-id link-value] values]
-        (value link-value)
-        (when-not (= value-id (:id link-value))
-          (throw (ex-info "link value map key differs from the value identity"
-                          {:reason :link-value-map-key :key value-id
-                           :value (:id link-value)})))
-        (let [leaf-nodes (mapv :node (:leaves link-value))
-              leaf-records (mapv nodes leaf-nodes)
-              roles (set (map :role leaf-records))
-              ownerships (set (map #(get-in % [:view :allocation :ownership]) leaf-records))
-              memory-spaces (set (map #(get-in % [:view :allocation :memory-space]) leaf-records))
-              devices (set (map #(get-in % [:view :allocation :device]) leaf-records))]
-          (when-not (every? some? leaf-records)
-            (throw (ex-info "link value leaf names an absent physical node"
-                            {:reason :link-value-leaf-node :value value-id
-                             :leaves leaf-nodes :nodes (set (keys nodes))})))
-          (when-let [overlap (seq (set/intersection @claimed (set leaf-nodes)))]
-            (throw (ex-info "one physical node cannot belong to multiple logical values"
-                            {:reason :link-value-overlap :value value-id :nodes (set overlap)})))
-          (vswap! claimed into leaf-nodes)
-          (when-not (= 1 (count roles))
-            (throw (ex-info "one logical value requires one dataflow role across its leaves"
-                            {:reason :link-value-roles :value value-id :roles roles})))
-          (when-not (= 1 (count ownerships))
-            (throw (ex-info "one logical value requires atomic ownership across its leaves"
-                            {:reason :link-value-ownership :value value-id
-                             :ownerships ownerships})))
-          (when-not (= 1 (count memory-spaces))
-            (throw (ex-info "one logical value requires one memory space across its leaves"
-                            {:reason :link-value-memory-spaces :value value-id
-                             :memory-spaces memory-spaces})))
-          (when-not (= 1 (count devices))
-            (throw (ex-info "one logical value cannot span devices before sharding lowering"
-                            {:reason :link-value-devices :value value-id :devices devices})))
-          (let [abstract (:abstract link-value)
-                abstract-device (get-in abstract [:placement :device])]
-            (when (and (:ownership abstract)
-                       (not= #{(:ownership abstract)} ownerships))
-              (throw (ex-info "logical ownership differs from its physical realization"
-                              {:reason :link-value-abstract-ownership :value value-id
-                               :abstract (:ownership abstract) :physical ownerships})))
-            (when (and (:memory-space abstract)
-                       (not= #{(:memory-space abstract)} memory-spaces))
-              (throw (ex-info "logical memory space differs from its physical realization"
-                              {:reason :link-value-abstract-memory-space :value value-id
-                               :abstract (:memory-space abstract) :physical memory-spaces})))
-            (when (and abstract-device (not= #{abstract-device} devices))
-              (throw (ex-info "logical placement differs from its physical realization"
-                              {:reason :link-value-abstract-device :value value-id
-                               :abstract abstract-device :physical devices}))))))
-      (when-not (= @claimed (set (keys nodes)))
-        (throw (ex-info "every physical LinkNode must realize exactly one logical value"
-                        {:reason :link-value-coverage :claimed @claimed
-                         :nodes (set (keys nodes))}))))
+    (validate-storage-structure! target nodes values false)
     (when-not (and (vector? instances) (seq instances))
       (throw (ex-info "a link plan requires an ordered non-empty instance vector"
                       {:reason :link-instances :instances instances})))
@@ -1519,6 +1526,21 @@
   (binding [*validated-program-instances* nil *retained-program-validations* nil
             *caller-options* caller-options]
     (invoke)))
+
+(defn ^:no-doc validate-program-instance-storage!
+  "Validate a ProgramLinkInstance against complete caller-supplied storage without treating any
+   source or role as initialized. This runs the full graph ABI, bounded-loop and storage-contract
+   binding proof; ordered initialization remains exclusively a containing LinkPlan/LinkModule
+   effect obligation. Returns `instance`; freshly derived access facts do not escape as authority."
+  ([target nodes values instance]
+   (validate-program-instance-storage! target nodes values instance nil))
+  ([target nodes values instance caller-options]
+   (with-independent-request
+    caller-options
+    #(do
+       (validate-storage-structure! target nodes values true)
+       (validate-program-instance-bindings! nodes values instance)
+       instance))))
 
 (defn- validate-plan-for-current-request! [plan]
   (if (nil? *caller-options*) (validate! plan) (validate! plan *caller-options*)))
