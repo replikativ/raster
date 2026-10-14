@@ -3,6 +3,7 @@
             [raster.ad.normalized-map-element-test :as element]
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
+            [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.soac-dialect :as soac]))
 
 (defn- source [dt options]
@@ -131,6 +132,24 @@
                                   #(assoc-in % [:values residual :shape] '[other])))))
     (is (some? (reason (update-in bundle [:map-programs :linear] alter-facts
                                   #(assoc-in % [:values residual :dtype] :float)))))))
+
+(deftest retained-map-stage-reconstruction-preserves-interface-identities
+  (let [bundle (build (source :double {}))
+        {:keys [source interface] :as retained} (:map-programs bundle)
+        original-gensym clojure.core/gensym
+        stage-prefixes #{"ad_residual_" "ad_tangent_" "ad_cotangent_" "ad_push_" "ad_pull_"}
+        fresh-stage-identities (atom [])
+        rebuilt (with-redefs [clojure.core/gensym
+                              (fn
+                                ([] (original-gensym))
+                                ([prefix]
+                                 (when (contains? stage-prefixes prefix)
+                                   (swap! fresh-stage-identities conj prefix))
+                                 (original-gensym prefix)))]
+                  (#'normalized/construct-map-stage bundle source interface))]
+    (is (empty? @fresh-stage-identities))
+    (is (fingerprint/equivalent? interface (:interface rebuilt)))
+    (is (fingerprint/equivalent? retained rebuilt))))
 
 (deftest exact-extent-value-identities-survive-lifting
   (doseq [extent ['count 'seq :extent-id [:binding 'n]]]

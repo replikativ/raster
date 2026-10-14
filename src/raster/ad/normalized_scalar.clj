@@ -858,8 +858,28 @@
     {:arrays (mapv second arrays) :captures (mapv second captures)
      :lambda (scalar-program-lambda program (mapv first ordered) (soac/outputs program))}))
 
-(defn- lift-map-programs [bundle source interface]
-  (let [equation (first (soac/equations source))
+(defn- construct-map-stage
+  "Construct the exact executable map stage owned by a scalar AD bundle.
+
+   Initial construction allocates the stage interface once. Reconstruction accepts that
+   retained interface without allocating new stage identities, so validation exercises the
+   same constructor without changing residual identities."
+  ([bundle source]
+   (let [equation (first (soac/equations source))
+         layout (soac/parameter-layout equation)
+         parts (soac/operation-parts equation)
+         active-input (get (zipmap (concat (:elements layout) (:capture-parameters layout))
+                                   (concat (:arrays parts) (:captures parts)))
+                           (first (:active-inputs bundle)))
+         {:keys [scalars arrays]} (map-residual-roles bundle source)
+         interface {:active-input active-input
+                    :residual-arrays (into {} (map (fn [id] [id (gensym "ad_residual_")])) arrays)
+                    :scalar-captures scalars
+                    :tangent-input (gensym "ad_tangent_") :cotangent-input (gensym "ad_cotangent_")
+                    :tangent-output (gensym "ad_push_") :gradient-output (gensym "ad_pull_")}]
+     (construct-map-stage bundle source interface)))
+  ([bundle source interface]
+   (let [equation (first (soac/equations source))
         {:keys [attributes arrays captures]} (soac/operation-parts equation)
         {:keys [active-input residual-arrays scalar-captures tangent-input cotangent-input
                 tangent-output gradient-output]} interface
@@ -903,7 +923,7 @@
      :linear (make-map 'ad-map-linear (:arrays push) (:captures push) (:lambda push)
                        [tangent-output])
      :transpose (make-map 'ad-map-transpose (:arrays pull) (:captures pull) (:lambda pull)
-                          [gradient-output])}))
+                          [gradient-output])})))
 
 (defn- validate-map-programs! [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} map-programs
@@ -935,27 +955,14 @@
     (doseq [program (map map-programs [:primal :linear :transpose])] (soac/validate! program))
     ;; Fixed interface IDs make reconstruction deterministic. Exact semantic equality includes
     ;; expression metadata and float bits; no fresh AD generation or printed-string comparison.
-    (when-not (fingerprint/equivalent? map-programs (lift-map-programs bundle source interface))
+    (when-not (fingerprint/equivalent? map-programs (construct-map-stage bundle source interface))
       (fail! :ad-normalized-map-programs {:interface interface})))
   bundle)
 
 (defn- build-map-programs
   [source source-ns options]
-   (let [bundle (linearize-map-element source source-ns options)
-         equation (first (soac/equations source))
-         layout (soac/parameter-layout equation)
-         parts (soac/operation-parts equation)
-         active-input (get (zipmap (concat (:elements layout) (:capture-parameters layout))
-                                  (concat (:arrays parts) (:captures parts)))
-                           (first (:active-inputs bundle)))
-         {:keys [scalars arrays]} (map-residual-roles bundle source)
-         interface {:active-input active-input
-                    :residual-arrays (into {} (map (fn [id] [id (gensym "ad_residual_")])) arrays)
-                    :scalar-captures scalars
-                    :tangent-input (gensym "ad_tangent_") :cotangent-input (gensym "ad_cotangent_")
-                    :tangent-output (gensym "ad_push_") :gradient-output (gensym "ad_pull_")}
-         bundle (assoc bundle :map-programs (lift-map-programs bundle source interface))]
-     bundle))
+   (let [bundle (linearize-map-element source source-ns options)]
+     (assoc bundle :map-programs (construct-map-stage bundle source))))
 
 (defn linearize-map-program
   "Lift a checked homogeneous map with one active array. :active-input selects its outer ID;

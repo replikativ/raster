@@ -2,6 +2,13 @@
 
 ## Current implementation boundary
 
+One deterministic map-stage constructor now owns fresh interface construction and exact
+retained-interface reconstruction. Validation still independently checks scalar derivation before
+reconstructing the stage; it neither trusts producer certification nor allocates new residual or
+interface identities. Existing operation coverage, canonical schema, residual order, numerical
+policies and runtime behavior are unchanged. This consolidation is preparation for checked
+equation composition, not admission of arbitrary map chains or device AD.
+
 Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
 map followed by ordered additive sum, and functional indexed map. Those families now execute

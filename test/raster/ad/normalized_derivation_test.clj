@@ -67,10 +67,11 @@
     (let [b (normalized/linearize-map-program (#'element/map-program dt)
                                            (the-ns 'raster.ad.normalized-derivation-test))
         changed (update b phase scale-result)
-        ;; Rebuild matching map programs as well, defeating the old lift comparison alone.
+        ;; Rebuild matching map programs as well, defeating stage reconstruction alone.
         changed (assoc changed :map-programs
-                       (#'normalized/lift-map-programs changed (get-in b [:map-programs :source])
-                                                       (get-in b [:map-programs :interface])))
+                       (#'normalized/construct-map-stage
+                        changed (get-in b [:map-programs :source])
+                        (get-in b [:map-programs :interface])))
         changed (recertify changed)
         envelope (-> (canonical/adapt-map b)
                      (merge (select-keys (:map-programs changed) [:source :primal :linear :transpose]))
