@@ -13,8 +13,12 @@ This is a compiler-frontier prerequisite, not normalized device execution. Canon
 primal, linear and transpose programs promote, schedule and emit through all four C-family
 dialects. Generated map lambdas project only a checked homogeneous non-nil Float/Double
 `grad-acc` to ordinary typed addition; the original scalar programs remain derivation and
-executable-dependency authority. No target-specific AD rule is introduced. The common source-free
-compilation/Prepared entry and same-session named-entry ownership remain required before delayed
+executable-dependency authority. No target-specific AD rule is introduced. `equation-first/compile-typed`
+now consumes these programs through the same scheduling and emission tail as deftm compilation.
+Its public ABI and homogeneous floating carrier come from retained IR, not caller type overrides.
+The current invocation materializer uploads primitive host arrays into owned device storage; it
+therefore refuses retained borrowed inputs rather than relabeling their ownership. Prepared integration,
+same-session named-entry ownership and source-free persistence remain separate follow-ups before delayed
 device pullbacks can retain private residuals safely. No default-engine migration is implied.
 
 One deterministic map-stage constructor owns fresh interface construction and exact
