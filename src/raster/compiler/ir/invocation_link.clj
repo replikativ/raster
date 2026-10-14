@@ -862,6 +862,143 @@
               "resident layout snapshot retained host execution state" {}))
      snapshot)))
 
+(def ^:private resident-layout-clone-keys
+  #{:template-value :template-compiler-value :template-abstract
+    :compiler-value :abstract :value-id :node-id :allocation-id :role
+    :project-ownership?})
+
+(defn- resident-layout-storage
+  [{:keys [nodes values]}]
+  (into {}
+        (map (fn [[value-id value]]
+               (let [leaves (:leaves value)]
+                 (when-not (= 1 (count leaves))
+                   (fail! :resident-layout-clone-leaves
+                          "resident layout cloning requires one whole physical leaf"
+                          {:value value-id :leaves leaves}))
+                 (let [node-id (get-in leaves [0 :node])
+                       node (get nodes node-id)]
+                   (when-not node
+                     (fail! :resident-layout-clone-node
+                            "resident layout cloning found an absent physical leaf"
+                            {:value value-id :node node-id}))
+                   [value-id {:shape (get-in node [:view :shape])}]))))
+        values))
+
+(defn ^:no-doc clone-resident-value-layout
+  "Create one fresh standalone resident value from a validated layout's concrete geometry.
+
+   This is construction, not evidence. The caller supplies the canonical source/target
+   AbstractValues and compiler identities; this function independently realizes both shapes
+   through the existing invocation dimension grammar, requires exact storage correspondence,
+   and preserves every target facet except the proved concrete shape and the one explicit
+   borrowed-to-owned public-input projection. A later resident binder and LinkPlan must validate
+   the returned node/value in their complete program context."
+  [layout request]
+  (when-not (and (map? layout) (= resident-layout-keys (set (keys layout))))
+    (fail! :resident-layout-clone-layout
+           "resident value cloning requires one closed projected layout"
+           {:keys (when (map? layout) (set (keys layout)))}))
+  (when-not (and (map? request) (= resident-layout-clone-keys (set (keys request))))
+    (fail! :resident-layout-clone-request
+           "resident value cloning requires one closed construction request"
+           {:keys (when (map? request) (set (keys request)))}))
+  (let [{:keys [target nodes values buffer-bindings scalar-values]} layout
+        {:keys [template-value template-compiler-value template-abstract compiler-value abstract
+                value-id node-id allocation-id role project-ownership?]} request
+        template-abstract (av/validate! template-abstract)
+        abstract (av/validate! abstract)
+        template (get values template-value)
+        leaves (:leaves template)
+        template-node-id (get-in leaves [0 :node])
+        template-node (get nodes template-node-id)
+        _ (when-not (and template template-node (= 1 (count leaves)))
+            (fail! :resident-layout-clone-template
+                   "resident value cloning requires one exact template value and leaf"
+                   {:template template-value :leaves leaves :node template-node-id}))
+        view (bview/validate-view! (:view template-node))
+        allocation (:allocation view)
+        storage (resident-layout-storage layout)
+        template-shape (concrete-shape template-compiler-value template-abstract scalar-values
+                                       buffer-bindings storage)
+        target-shape (concrete-shape compiler-value abstract scalar-values
+                                     buffer-bindings storage)
+        allocation-users
+        (filterv (fn [[_ node]]
+                   (= [(:device allocation) (:id allocation)]
+                      [(get-in node [:view :allocation :device])
+                       (get-in node [:view :allocation :id])]))
+                 nodes)
+        node-users (filterv (fn [[_ value]]
+                              (some #(= template-node-id (:node %)) (:leaves value)))
+                            values)
+        known-allocation-ids (into #{} (map #(get-in % [:view :allocation :id])) (vals nodes))
+        existing-identities (into (set (keys nodes))
+                                  (concat (keys values) known-allocation-ids))
+        new-identities (set [value-id node-id allocation-id])
+        projected (cond
+                    project-ownership?
+                    (do
+                      (when-not (= :borrowed (:ownership abstract))
+                        (fail! :resident-layout-clone-ownership
+                               "only a canonical borrowed input may project to owned module storage"
+                               {:ownership (:ownership abstract)}))
+                      (assoc abstract :shape target-shape :ownership :owned))
+
+                    :else (assoc abstract :shape target-shape))]
+    (when-not (and (contains? #{:input :output} role)
+                   (= project-ownership? (= :input role))
+                   (or project-ownership? (not= :borrowed (:ownership abstract)))
+                   (= 3 (count new-identities))
+                   (empty? (set/intersection existing-identities new-identities))
+                   (every? some? [value-id node-id allocation-id compiler-value
+                                  template-compiler-value]))
+      (fail! :resident-layout-clone-identity
+             "resident value cloning requires fresh stable identities and a valid node role"
+             {:value value-id :node node-id :allocation allocation-id :role role}))
+    (when-not (and (= target (:device allocation))
+                   (= :owned (:ownership allocation))
+                   (= :device (:memory-space allocation))
+                   (nil? (:source template-node))
+                   (= 0 (:byte-offset view))
+                   (pos? (:byte-length view))
+                   (= (:byte-length view) (:byte-size allocation))
+                   (= (:strides view) (bview/dense-strides (:shape view)))
+                   (every? pos? (:shape view))
+                   (= {:kind :dense} (:physical-layout template))
+                   (every? (comp nil? :source val) nodes)
+                   (= 1 (count allocation-users))
+                   (= 1 (count node-users)))
+      (fail! :resident-layout-clone-storage
+             "resident value cloning requires one dense standalone owned allocation"
+             {:template template-value :node template-node-id :view view
+              :allocation-users (mapv first allocation-users)
+              :value-users (mapv first node-users)}))
+    (when-not (and (= template-shape (:shape view))
+                   (= target-shape (:shape view))
+                   (= (:shape template-abstract) (:shape abstract))
+                   (= template-value (get buffer-bindings template-compiler-value))
+                   (= (:abstract template) (assoc template-abstract :shape template-shape))
+                   (= (:dtype (av/storage-contract abstract)) (:dtype view))
+                   (av/storage-contract-compatible? template-abstract abstract)
+                   (= (dissoc abstract :shape :ownership)
+                      (dissoc projected :shape :ownership))
+                   (or project-ownership? (= (:ownership abstract) (:ownership projected))))
+      (fail! :resident-layout-clone-contract
+             "canonical target and template contracts do not realize the same storage"
+             {:template-shape template-shape :target-shape target-shape
+              :view-shape (:shape view) :template template-abstract :target abstract}))
+    (let [node (link/node {:id node-id :allocation-id allocation-id :dtype (:dtype view)
+                           :shape (:shape view) :strides (:strides view)
+                           :byte-size (:byte-size allocation) :device target
+                           :memory-space (:memory-space allocation)
+                           :ownership :owned :alignment (:alignment allocation)
+                           :coherence (:coherence allocation) :role role})
+          value (link/value {:id value-id :abstract (av/validate! projected)
+                             :physical-layout (:physical-layout template)
+                             :leaves [{:name (get-in leaves [0 :name]) :node node-id}]})]
+      {:node node :value value})))
+
 (defn- derive-certificate
   [plan effect-evidence]
   (let [attributes (:attributes plan)]

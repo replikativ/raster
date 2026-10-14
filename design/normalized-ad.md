@@ -828,3 +828,28 @@ Shared plain-host AbstractValue checks are factored once; numerical order, fresh
 stable array captures and caller-owned indexed transpose destinations are still checked at
 their respective operation boundaries. This does not generalize the accepted topology or
 derive AD rules from mere structural source realizability.
+
+## Opt-in resident normalized-map execution
+
+`raster.ad.normalized-device/prepare-owner` is a bounded lease-oriented device consumer for one
+already canonical checked map or finite linear map spine. Preparation fixes the target, numerical
+policy, scalar values and concrete array geometry, compiles only the canonical primal and
+transpose, and delegates allocation, execution, failure poisoning and lifetime to one ordinary
+named-entry owner. It is deliberately not a CPU-compatible AD function: calls upload exact host
+input buffers and return opaque resident leases plus logical output IDs, with no host readback.
+The target is mandatory; this surface has no hardware-specific default.
+
+The primal result carries the exact residual-frontier dependency map required by transpose. A
+zero-residual transpose receives an empty map and needs no artificial primal lifetime; extra or
+stale leases still refuse at the generic named-entry boundary. Seed and gradient storage are fresh
+standalone allocations cloned from independently validated concrete geometry. Their logical
+contracts come from the canonical cotangent input and transpose output, never from the template
+input value. The seed's borrowed consumer contract is projected to owned global storage at this
+one boundary; every other AbstractValue facet remains exact, and the emitted consumer remains
+borrowed. Fresh resident binding and the final LinkPlan/LinkModule revalidate all storage and
+ordered-effect obligations.
+
+This opt-in slice accepts one active public array and immutable scalar specialization. It retains
+no caller array after preparation and does not add a cache, session owner, lease registry, device
+readback, mutable state, map-sum/indexed execution, or default-engine activation. The original
+campaign gates, real Gemma numerical acceptance and long GSDM qualification remain independent.
