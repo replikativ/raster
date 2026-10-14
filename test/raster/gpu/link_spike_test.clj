@@ -393,6 +393,105 @@
     (is (= [:float 4 nil] (subvec spec-a 0 3)))
     (is (= (dissoc (nth spec-a 3) :allocation-id) (dissoc (nth spec-b 3) :allocation-id)))))
 
+(deftest plan-storage-realization-preserves-transaction-ledger-and-event-order
+  (let [allocation
+        (fn [id ownership]
+          (bview/allocation {:id id :byte-size 4 :memory-space :device
+                             :device :ze:0 :ownership ownership}))
+        nodes
+        (array-map
+         :owned {:view (bview/view (allocation :owned :owned)
+                                   {:id :owned :dtype :float :shape [1]})
+                 :source (float-array [1.0])}
+         :external-a {:view (bview/view (allocation :external-a :external)
+                                        {:id :external-a :dtype :float :shape [1]})}
+         :external-b {:view (bview/view (allocation :external-b :borrowed)
+                                        {:id :external-b :dtype :float :shape [1]})})
+        plan {:nodes nodes}
+        groups (array-map :owned [(:owned nodes)]
+                          :external-a [(:external-a nodes)]
+                          :external-b [(:external-b nodes)])
+        external-buffers {:external-a ::external-a :external-b ::external-b}
+        key (fn [allocation-id]
+              [::gpu-link/allocation :execution allocation-id])
+        invoke
+        (fn [events allocation-keys fail-at]
+          (with-redefs [gpu/alloc!
+                        (fn [_ specs]
+                          (swap! events conj [:allocate (vec (keys specs))])
+                          (when (= fail-at :allocation)
+                            (throw (ex-info "allocation failed" {:at fail-at}))))
+                        gpu/register-buffer!
+                        (fn [_ _ _ {:keys [allocation-id]}]
+                          (swap! events conj [:register allocation-id])
+                          (when (= fail-at [:register allocation-id])
+                            (throw (ex-info "registration failed" {:at fail-at}))))
+                        gpu/buffer-view
+                        (fn [_ _ {:keys [id]}]
+                          (swap! events conj [:view id])
+                          (when (= fail-at [:view id])
+                            (throw (ex-info "view failed" {:at fail-at})))
+                          [:resident id])
+                        gpu/upload-range!
+                        (fn [_ resident _ _]
+                          (swap! events conj [:upload (second resident)])
+                          (when (= fail-at :upload)
+                            (throw (ex-info "upload failed" {:at fail-at}))))]
+            (#'gpu-link/realize-plan-storage!
+             plan (atom {:device-id :ze:0}) :execution groups external-buffers
+             allocation-keys (volatile! {}))))]
+    (testing "success preserves allocate, registration, view, and upload order"
+      (let [events (atom []) allocation-keys (volatile! [])
+            realized (invoke events allocation-keys nil)]
+        (is (= [[:allocate [(key :owned)]]
+                [:register :external-a] [:register :external-b]
+                [:view :owned] [:view :external-a] [:view :external-b]
+                [:upload :owned]]
+               @events))
+        (is (= [(key :owned) (key :external-a) (key :external-b)]
+               @allocation-keys))
+        (is (= {:owned (key :owned)
+                :external-a (key :external-a)
+                :external-b (key :external-b)}
+               (:key-by-allocation realized)))
+        (is (= #{(key :owned)} (set (keys (:owned-specs realized)))))
+        (is (= #{:owned :external-a :external-b}
+               (set (keys (:node-views realized)))))))
+    (testing "a failed allocation enters no root into cleanup and stops realization"
+      (let [events (atom []) allocation-keys (volatile! [])]
+        (is (= :allocation
+               (try (invoke events allocation-keys :allocation) nil
+                    (catch clojure.lang.ExceptionInfo error (:at (ex-data error))))))
+        (is (= [[:allocate [(key :owned)]]] @events))
+        (is (empty? @allocation-keys))))
+    (testing "each external registration is ledgered only after it succeeds"
+      (let [events (atom []) allocation-keys (volatile! [])]
+        (is (= [:register :external-b]
+               (try (invoke events allocation-keys [:register :external-b]) nil
+                    (catch clojure.lang.ExceptionInfo error (:at (ex-data error))))))
+        (is (= [[:allocate [(key :owned)]]
+                [:register :external-a] [:register :external-b]]
+               @events))
+        (is (= [(key :owned) (key :external-a)] @allocation-keys))))
+    (doseq [[label fail-at expected-events]
+            [["view failure precedes every upload" [:view :external-a]
+              [[:allocate [(key :owned)]]
+               [:register :external-a] [:register :external-b]
+               [:view :owned] [:view :external-a]]]
+             ["upload failure retains every realized root" :upload
+              [[:allocate [(key :owned)]]
+               [:register :external-a] [:register :external-b]
+               [:view :owned] [:view :external-a] [:view :external-b]
+               [:upload :owned]]]]]
+      (testing label
+        (let [events (atom []) allocation-keys (volatile! [])]
+          (is (= fail-at
+                 (try (invoke events allocation-keys fail-at) nil
+                      (catch clojure.lang.ExceptionInfo error (:at (ex-data error))))))
+          (is (= expected-events @events))
+          (is (= [(key :owned) (key :external-a) (key :external-b)]
+                 @allocation-keys)))))))
+
 (deftest owned-runtime-allocation-preserves-the-certified-identity
   (let [session (atom {:device-id :ze:0 :session-id :session
                        :buffers {} :allocations {} :closed? false})

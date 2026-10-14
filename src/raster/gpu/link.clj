@@ -174,6 +174,65 @@
 (defn- caller-math-options [opts]
   (when (contains? opts :scalar-math) (select-keys opts [:scalar-math])))
 
+(defn- realize-plan-storage!
+  "Realize one validated plan's physical storage into an existing session transaction ledger."
+  [plan session execution-id groups external-buffers allocation-keys timings]
+  (let [key-by-allocation
+        (into {}
+              (map (fn [[allocation-id _]]
+                     [allocation-id (allocation-key execution-id allocation-id)]))
+              groups)
+        owned-specs
+        (into {}
+              (keep (fn [[allocation-id nodes]]
+                      (when (= :owned (get-in (first nodes) [:view :allocation :ownership]))
+                        (let [key (get key-by-allocation allocation-id)]
+                          ;; Two instantiations allocate distinct physical roots even when their
+                          ;; compiler-local allocation names are equal. Borrowed/external storage
+                          ;; retains its explicit identity.
+                          [key (allocation-spec nodes key)]))))
+              groups)]
+    (when (seq owned-specs)
+      (timed-phase! timings :allocation #(gpu/alloc! session owned-specs))
+      ;; gpu/alloc! is transactional, so roots enter the outer cleanup ledger only after success.
+      (vswap! allocation-keys into (keys owned-specs)))
+    (timed-phase!
+     timings :external-buffer-registration
+     #(doseq [[allocation-id nodes] groups
+              :let [allocation (get-in (first nodes) [:view :allocation])
+                    ownership (:ownership allocation)]
+              :when (contains? #{:borrowed :external} ownership)]
+        (let [key (get key-by-allocation allocation-id)]
+          (gpu/register-buffer! session key (get external-buffers allocation-id)
+                                {:ownership ownership
+                                 :allocation-id allocation-id
+                                 :memory-space (:memory-space allocation)
+                                 :coherence (:coherence allocation)
+                                 :alignment (:alignment allocation)})
+          ;; Registration is per root, so each successful import immediately enters cleanup.
+          (vswap! allocation-keys conj key))))
+    (let [node-views
+          (timed-phase!
+           timings :view-materialization
+           #(into {}
+                  (map (fn [[node-id {:keys [view]}]]
+                         [node-id
+                          (gpu/buffer-view
+                           session (get key-by-allocation (get-in view [:allocation :id]))
+                           {:id (:id view) :byte-offset (:byte-offset view)
+                            :dtype (:dtype view) :shape (:shape view)
+                            :strides (:strides view)})]))
+                  (:nodes plan)))]
+      (timed-phase!
+       timings :initial-upload
+       #(doseq [[node-id {:keys [source view]}] (:nodes plan)
+                :when source]
+          (gpu/upload-range! session (get node-views node-id) source
+                             {:elements (reduce * 1 (:shape view))})))
+      {:key-by-allocation key-by-allocation
+       :owned-specs owned-specs
+       :node-views node-views})))
+
 (defn- instantiate-with-options!
   "Instantiate a validated LinkPlan as one replayable LinkedExecutable.
 
@@ -259,56 +318,9 @@
                                 :missing (set/difference external-ids supplied-external-ids)
                                 :extra (set/difference supplied-external-ids external-ids)})))
              (try
-               (let [key-by-allocation
-                     (into {}
-                           (map (fn [[allocation-id _]]
-                                  [allocation-id (allocation-key execution-id allocation-id)]))
-                           groups)
-                     owned-specs
-                     (into {}
-                           (keep (fn [[allocation-id nodes]]
-                                   (when (= :owned (get-in (first nodes) [:view :allocation :ownership]))
-                                     (let [key (get key-by-allocation allocation-id)]
-                                       ;; Two instantiations allocate distinct physical roots even
-                                       ;; when their compiler-local allocation names are equal.
-                                       ;; Borrowed/external storage retains its explicit identity.
-                                       [key (allocation-spec nodes key)]))))
-                           groups)]
-                 (when (seq owned-specs)
-                   (timed-phase! timings :allocation #(gpu/alloc! session owned-specs))
-                   (vswap! allocation-keys into (keys owned-specs)))
-                 (timed-phase!
-                  timings :external-buffer-registration
-                  #(doseq [[allocation-id nodes] groups
-                           :let [allocation (get-in (first nodes) [:view :allocation])
-                                 ownership (:ownership allocation)]
-                           :when (contains? #{:borrowed :external} ownership)]
-                     (let [key (get key-by-allocation allocation-id)]
-                       (gpu/register-buffer! session key (get external-buffers allocation-id)
-                                             {:ownership ownership
-                                              :allocation-id allocation-id
-                                              :memory-space (:memory-space allocation)
-                                              :coherence (:coherence allocation)
-                                              :alignment (:alignment allocation)})
-                       (vswap! allocation-keys conj key))))
-                 (let [node-views
-                       (timed-phase!
-                        timings :view-materialization
-                        #(into {}
-                               (map (fn [[node-id {:keys [view]}]]
-                                      [node-id
-                                       (gpu/buffer-view
-                                        session (get key-by-allocation (get-in view [:allocation :id]))
-                                        {:id (:id view) :byte-offset (:byte-offset view)
-                                         :dtype (:dtype view) :shape (:shape view)
-                                         :strides (:strides view)})]))
-                               (:nodes plan)))]
-                   (timed-phase!
-                    timings :initial-upload
-                    #(doseq [[node-id {:keys [source view]}] (:nodes plan)
-                             :when source]
-                       (gpu/upload-range! session (get node-views node-id) source
-                                          {:elements (reduce * 1 (:shape view))})))
+               (let [{:keys [owned-specs node-views]}
+                     (realize-plan-storage! plan session execution-id groups external-buffers
+                                            allocation-keys timings)]
                    (when (seq program-instances)
                      (vreset!
                       prepared-program
@@ -443,7 +455,7 @@
                                         (atom 0)
                                         (atom 0)
                                         (atom false)
-                                        (atom {:value-epoch 0})))))
+                                        (atom {:value-epoch 0}))))
                (catch Throwable error
                  (when-not owns-session?
                    (do
