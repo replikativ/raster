@@ -554,6 +554,15 @@ HVP refusals until typed closure is demonstrated.
 
 ## Migration and acceptance gates
 
+The bounded canonical Float square-map now has a durable device composition gate: its
+checked primal and transpose compile through `compile-typed`, bind existing LinkValues,
+and execute through the generic named-entry owner on local OpenCL and Level Zero. An
+independent stepwise-Float oracle checks raw bits across changed seeds and input generations;
+retained residuals survive caller-input mutation. Rule/callee guards and lease-lifetime
+refusals are tested. This is test-only assembly, not a public GPU AD adapter, general DAG
+support, or default-engine migration. Residuals retain their canonical owned contract;
+the borrowed cotangent input binds to globally owned storage without retagging its AV.
+
 | Step | Deliverable | Gate and retirement |
 | --- | --- | --- |
 | 1 | A validated normalized scalar/call boundary using existing IDs and contracts | Direct/helper equivalence, exact-once evaluation, selected-call identity, missing-type refusals and explicit conversions. No source rule is retired yet. |
