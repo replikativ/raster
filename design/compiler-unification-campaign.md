@@ -4579,3 +4579,32 @@ reducible calls, and split/unsplit loop carriers. Explicit Float addition bounda
 and uncast Double promotion are distinct oracles, not interchangeable tolerances.
 The wider conditional-index proof, artifact quotienting, resident-scalar composition
 and unchanged real-model acceptance obligations remain open.
+
+### Observable scalar checkpoints alongside resident state
+
+A returned loss can precede VJP and optimizer effects, while the typed envelope
+also exposes mutated tensor outputs. The existing singleton ScalarIR projection
+now selects exactly one unused public scalar among those observable outputs,
+without moving its equation or dropping any tensor output. Complete source-use
+auditing includes captures, host observations, aliases, shape and allocation
+expressions, and result storage. Singleton writer and host-observation checks
+follow the full physical alias component, including non-symbol value IDs.
+
+The pre-component selection is transported only as a closed candidate hint;
+production revalidation reconstructs the complete enclosing equation spine and
+independently rederives the existing residency proof. Multiple scalar roots,
+later consumers, malformed hints, alias-mediated writes and host observations
+remain refused. No new scalar runtime, host readback or workload-specific rule
+is introduced. Public OpenCL and Level Zero regressions compare changed-input
+replay against an independent CPU oracle, preserving pre-update Float-to-Double
+checkpoints, subsequent state effects and artifact lifetime checks.
+
+A separate bounded real-workload probe prepared the generated public 1-layer,
+8-dimensional, batch-2 GSDM SGD step and executed three resident Level Zero
+updates. Across all 30 weight fields, maximum absolute error against the compiled
+CPU reference was 2.98e-8; loss error was at most 1.43e-6. Captured host state
+remained unchanged. Preparation took 114 seconds in a loaded warm process;
+this is not a controlled compile-time benchmark. Full 2-layer/32-dimensional
+GSDM statistical training, Adam/EMA coverage, real-weight Gemma adapter gates,
+and normalized AD general composition/default migration remain separate open
+acceptance obligations.

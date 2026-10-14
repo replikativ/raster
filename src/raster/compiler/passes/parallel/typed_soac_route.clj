@@ -1200,6 +1200,21 @@
     (set (conj (swr/ordered-input-ids (:plan description))
                (get-in description [:plan :output :id])))))
 
+(defn- public-scalar-checkpoint
+  "Transport one globally unused source-public scalar across component splitting.
+   This selects a candidate; the complete residency and production boundary proofs remain required."
+  [{:keys [typed-program outputs entries]}]
+  (let [facts (dialect/facts typed-program)
+        equations (dialect/equations typed-program)
+        by-id (into {} (map (juxt second identity)) equations)
+        scalar-outputs (resident/public-scalar-results typed-program outputs)
+        result (when (= 1 (count scalar-outputs)) (first scalar-outputs))
+        producer (when result (some #(when (= [result] (nth % 2)) %) equations))]
+    (if (and producer (= 'scalar (dialect/operation-kind producer))
+             (resident/public-scalar-unused-in-program? facts equations result)
+             (not-any? #(some #{result} (entry-operands by-id %)) entries))
+      [result] [])))
+
 (defn- typed-component-program
   [{:keys [typed-program outputs]} component]
   (let [source-facts (dialect/facts typed-program)
@@ -1238,6 +1253,11 @@
                   (assoc :inputs inputs :equations equation-facts :effects effects)
                   (update-in [:attributes :source-bindings]
                              #(filterv (complement prior-definitions) %))
+                  (assoc-in [:attributes :public-scalar-checkpoint]
+                            (public-scalar-checkpoint
+                             {:typed-program typed-program :outputs outputs
+                              :entries (concat (:prefix component) (:entries component)
+                                               (:suffix component))}))
                   (assoc-in [:attributes :allocations] allocations))]
     (dialect/make facts equations chunk-outputs)))
 

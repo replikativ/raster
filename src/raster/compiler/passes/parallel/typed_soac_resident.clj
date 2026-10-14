@@ -545,7 +545,7 @@
   [aliases value]
   (let [neighbors
         (reduce (fn [graph [left right]]
-                  (if (and (symbol? left) (symbol? right))
+                  (if (and (dialect/value-id? left) (dialect/value-id? right))
                     (-> graph (update left (fnil conj #{}) right)
                         (update right (fnil conj #{}) left))
                     graph))
@@ -1359,17 +1359,50 @@
                 (= :typed-soac-device-scalar-subset (:reason (ex-data exception))))
           false (throw exception))))))
 
+(defn public-scalar-unused-in-program?
+  "A public checkpoint may precede later effects only when it has no semantic consumers.
+   Shape and allocation dependencies are uses too, although they are not kernel operands."
+  [facts equations result]
+  (let [occurs? (fn [form] (some #(= result %) (tree-seq coll? seq form)))
+        aliases (mapcat :aliases (vals (:equations facts)))]
+    (and (not-any? #(= result (first %)) (use-sites equations))
+         (not (contains? (set (get-in facts [:attributes :host-read-values])) result))
+         (not-any? occurs? aliases)
+         (not-any? #(occurs? (:shape %)) (vals (:values facts)))
+         (not-any? #(occurs? (:extent %)) (get-in facts [:attributes :allocations]))
+         (not-any? #(occurs? (get-in % [:attributes :result-storage]))
+                   (vals (:equations facts))))))
+
+(defn public-scalar-results
+  "Direct ScalarIR results declared observable by this semantic output boundary."
+  [program outputs]
+  (let [public (set outputs)]
+    (into [] (keep (fn [equation]
+                    (let [results (nth equation 2)]
+                      (when (and (= 'scalar (dialect/operation-kind equation))
+                                 (= 1 (count results)) (contains? public (first results)))
+                        (first results)))))
+          (dialect/equations program))))
+
 (defn- terminal-device-scalar-candidate
-  "Return the sole direct terminal ScalarIR equation whose singleton storage dependency is proved.
+  "Return one observable ScalarIR checkpoint whose singleton storage dependency is proved.
 
    Writer lookup is performed over the complete ordered equation vector before any candidate index
    is selected. Exactly one earlier complete singleton writer is required; a future/latest writer,
-   partial effect, public array read, or non-prefix produced scalar capture refuses."
+   partial effect, public array read, or non-prefix produced scalar capture refuses. Observable
+   tensor outputs and later independent effects are preserved; any internal use of the checkpoint
+   refuses. A transported selection is only a candidate hint, never residency authority."
   [program]
   (let [facts (dialect/facts program)
         equations (dialect/equations program)
         positions (into {} (map-indexed (fn [index equation] [(second equation) index])) equations)
-        outputs (dialect/outputs program)
+        program-outputs (public-scalar-results program (dialect/outputs program))
+        selection (get-in facts [:attributes :public-scalar-checkpoint] ::absent)
+        outputs (if (= ::absent selection)
+                  program-outputs
+                  (if (and (vector? selection) (= 1 (count selection))
+                           (some #{(first selection)} program-outputs))
+                    selection []))
         candidate (when (= 1 (count outputs))
                     (some #(when (= outputs (nth % 2)) %) equations))
         candidate-index (some-> candidate second positions)
@@ -1385,6 +1418,8 @@
         shaped (filterv #(seq (get-in facts [:values % :shape])) captures)
         scalars (filterv #(empty? (get-in facts [:values % :shape])) captures)
         storage (first shaped)
+        aliases (mapcat :aliases (vals (:equations facts)))
+        storage-component (when storage (alias-component aliases storage))
         allocation (when storage
                      (some #(when (= storage (:destination %)) %)
                            (initialization/allocation-contracts! program)))
@@ -1408,7 +1443,7 @@
                 (mapcat
                  (fn [equation]
                    (keep (fn [[logical physical]]
-                           (when (= storage physical)
+                           (when (contains? storage-component physical)
                              {:equation equation :logical logical
                               :position (get positions (second equation))}))
                          (map vector (nth equation 2)
@@ -1428,9 +1463,9 @@
            facts producers positions (set outputs) host-reads
            #{(first outputs) storage} id candidate-index))]
     (when (and candidate (= :scalar (:kind info))
-               (= candidate-index (dec (count equations)))
+               (public-scalar-unused-in-program? facts equations (first outputs))
                (= 1 (count shaped)) singleton-capacity? allocation-before-writer?
-               (not (contains? host-reads storage))
+               (empty? (set/intersection host-reads storage-component))
                (exact-plain-tensor? (get-in facts [:values storage])
                                     (get-in facts [:values storage :shape]))
                writer (< (:position writer) candidate-index)
@@ -1475,7 +1510,7 @@
                            (filter #(seq (get-in terminal-facts [:values % :shape]))
                                    (:captures (dialect/operation-parts terminal-equation))))
         allocated (set (map :destination (get-in parallel-program [:attributes :allocations])))]
-    (when (and (= [result] (:outputs parallel-program))
+    (when (and (some #{result} (:outputs parallel-program))
                (= {:kind :resident-scalar-buffer :elements 1} (:representation outer))
                (= :device (:memory-space outer))
                (every? dialect/program-form? algorithms)
@@ -1521,8 +1556,10 @@
             unmarked (-> facts
                          (assoc-in [:values result :representation] {:kind :plain})
                          (assoc-in [:values result :memory-space] nil)
-                         (dialect/make (vec (mapcat dialect/equations algorithms)) [result]))
-            audited (terminal-device-scalar-projection unmarked)]
+                         (dialect/make (vec (mapcat dialect/equations algorithms))
+                                       (:outputs parallel-program)))
+            audited (when (= [result] (public-scalar-results unmarked (:outputs parallel-program)))
+                      (terminal-device-scalar-projection unmarked))]
         (when (and audited
                    (semantic/equivalent? outer (get-in (dialect/facts audited) [:values result])))
           outer)))))
