@@ -213,4 +213,3 @@
                 (c-family/emit-program scheduled {:target-dialect target :dtype :double})]
             (is (seq kernels))
             (is (some? program))))))))
-
