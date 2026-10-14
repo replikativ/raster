@@ -1510,11 +1510,17 @@
         value (get-in f [:values result])]
     (when (and (some #{result} (nth equation 2))
                (contains? '#{map stencil contract reduce segmented-reduce product-reduce
-                             segmented-fold-map scan} (operation-kind equation))
-               (or (= {:kind :plain} (:representation value))
-                   (and (= 'reduce (operation-kind equation)) (= [] (:shape value))
+                             segmented-fold-map scan scalar} (operation-kind equation))
+               (or (and (not= 'scalar (operation-kind equation))
+                        (= {:kind :plain} (:representation value)))
+                   (and (contains? '#{reduce scalar} (operation-kind equation))
+                        (= [] (:shape value))
                         (= {:kind :resident-scalar-buffer :elements 1} (:representation value))
-                        (= :device (:memory-space value))))
+                        (= :device (:memory-space value))
+                        (or (= 'reduce (operation-kind equation))
+                            (and (nil? (:placement value)) (nil? (:sharding value))
+                                 (nil? (:ownership value)) (empty? (:effects value))
+                                 (empty? (:attributes value))))))
                (nil? (:logical-layout value)))
       (:shape value))))
 

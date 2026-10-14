@@ -5770,6 +5770,63 @@
       (when (and projection (not (:segmented-plans? projection)))
         (:typed-program projection)))))
 
+(defn materialize-terminal-scalar-result
+  "Name one certified scalar continuation at the complete source return.
+
+   This is source normalization, not an alternative scalar typer. It reuses the ordered source
+   descriptions and ordinary admission predicate, requires a preceding semantic storage writer,
+   and derives the generated binding dtype only from that description. Unsupported returns remain
+   unchanged so complete-source validation keeps its existing refusal boundary."
+  [source {:keys [dtype array-types scalar-types values shape-equalities segmented-plans?
+                  preserve-declared-array-storage?]
+           :or {dtype :double array-types {} scalar-types {} values {} shape-equalities {}}}]
+  (when (and (seq? source) (contains? #{'let 'let*} (first source))
+             (= 1 (count (drop 2 source))))
+    (let [[head bindings expression] source]
+      (when (and (vector? bindings) (even? (count bindings)) (seq? expression))
+        (try
+          (binding [util/*shadowing-locals* (source-shadowing-locals
+                                            source array-types scalar-types values)
+                    *region-local-counter* (atom -1)
+                    *region-local-source-symbols* (source-symbols source)]
+            (let [pairs (vec (mapv vec (partition 2 bindings)))
+                  array-types (binder-array-types pairs array-types dtype
+                                                  preserve-declared-array-storage?)
+                  describe (fn [pairs]
+                             (preserve-map-storage-inputs
+                              (normalize-extents
+                               (source-descriptions pairs dtype array-types scalar-types
+                                                    segmented-plans?)
+                               shape-equalities values)
+                              values))
+                  descriptions (describe pairs)
+                  physical-outputs (physical-output-symbols descriptions)
+                  dependencies (set (util/free-syms expression))
+                  occupied (into (set (filter symbol? (tree-seq coll? seq source)))
+                                 (filter symbol?)
+                                 (concat (keys array-types) (keys scalar-types) (keys values)))
+                  result-id (fresh-projected-id "rstr_terminal_scalar_result" occupied)
+                  candidate-pairs (conj pairs [result-id expression])
+                  candidate (last (describe candidate-pairs))
+                  result-dtype (some-> (:scalar-dtype candidate) dtype/canon)
+                  scalar-tag (when (and result-dtype (dtype/known? result-dtype))
+                               (dtype/scalar-tag-for-dtype result-dtype))]
+              (when (and (= :scalar (:kind candidate)) (= result-id (:sym candidate))
+                         scalar-tag
+                         (seq (set/intersection physical-outputs dependencies))
+                         (supported-description? physical-outputs candidate))
+                (let [typed-result (with-meta result-id
+                                     {:raster.type/tag scalar-tag
+                                      :raster.compiler/generated true})
+                      bindings' (with-meta (into (vec bindings) [typed-result expression])
+                                  (meta bindings))]
+                  {:form (with-meta (list head bindings' typed-result) (meta source))
+                   :result typed-result
+                   :description (assoc candidate :sym typed-result
+                                                 :scalar-dtype result-dtype)}))))
+          (catch clojure.lang.ExceptionInfo exception
+            (when-not (source-decline? exception) (throw exception))))))))
+
 (defn form->program-components
   "Construct the shared analyzed-source projection used for staged generic-plan admission.
 

@@ -18,15 +18,22 @@ cross-cutting parts of this campaign, not competing replacements for it.
   (6 tests / 310 assertions). #1360 adds explicit captured aggregate `:state` and exact
   path-keyed field outputs through that same boundary, merged after independent review and
   all seven CI contexts. Donation and whole-tree output ownership remain separate obligations.
-- A bounded one-layer Float GSDM forward attempt identifies a precise remaining composition
-  refusal: terminal `(double (aget loss-buffer 0))` is not represented as a typed public result.
-  Naming alone gets past that proof but exposes host-only scalar scheduling of device data.
-  The next activation must prove placement and initialized physical storage through existing
-  authorities, not loosen source-result validation or add a loss-specific lowering rule.
+- Terminal scalar activation now names only an independently admitted device continuation.
+  Existing allocation/extent and complete-write authorities prove singleton capacity and a unique
+  prior writer; the strict scalar lowerer proves retained types and nontrapping arithmetic.
+  Production scheduling and public result admission independently reconstruct that proof from
+  the enclosing semantic spine, not a resident marker or detached equation. Unsupported candidates,
+  including residency lost after optimization, preserve the original source return and refusal.
+  There is no loss-specific rule or host readback. A bounded one-layer Float GSDM public forward
+  replay on Level Zero matches two changed CPU batches within 8.94e-7 and 1.42e-7; this is not
+  training or statistical acceptance. Generic public tests also replay three exact Float-checkpoint
+  to Double results on both local backends, including output lifetime and input immutability.
 - Direct ScalarIR → extent-one SegMap scheduling now has an inactive substrate. Exact semantic
   correspondence retains type metadata and floating-point bits; the existing KernelBody and ABI
   paths own physical loads/stores. It requires an explicit resident singleton result and does not
-  change scalar dispatch policy. New tests cover all four target dialect emissions and changed-input
+  change scalar dispatch policy by itself. The separately audited terminal activation uses this
+  same schedule, preserving logical rank zero and physical one-element storage. New tests cover
+  all four target dialect emissions and changed-input
   bit-exact Float-to-Double execution on local OpenCL/Level Zero (7 tests / 76 assertions).
 - CPU batch/conditioning GSDM controls pass (11 tests / 96 assertions). Full resident
   forward/VJP/update trajectory and statistical acceptance are still open. The historical

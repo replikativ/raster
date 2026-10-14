@@ -117,7 +117,9 @@
                 (assoc-in [:equations id] equation-facts)
                 (update :effects conj :memory/write))}))
 
-(defn- allocation-contracts! [program]
+(defn allocation-contracts!
+  "Validate and return retained source allocation contracts, including dtype and capacity."
+  [program]
   (let [facts (dialect/facts program)
         definitions (into {} (for [equation (dialect/equations program)
                                    result (nth equation 2)]

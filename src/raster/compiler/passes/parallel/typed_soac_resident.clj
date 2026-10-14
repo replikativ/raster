@@ -1,11 +1,13 @@
 (ns raster.compiler.passes.parallel.typed-soac-resident
-  "Realize audited TypedSOAC reduction scalars as resident one-element buffers.
+  "Realize audited TypedSOAC scalars as resident one-element buffers.
 
    Logical reduction results remain rank-zero AbstractValues.  Their representation records the
    physical resident realization, scheduled reductions own the buffer output role, and consuming
    scalar regions load element zero through an explicit stable capture.  Pure scalar equations
    depending on a resident reduction are beta-reduced into their parallel consumers, so no device
-   value is reconstructed or synchronized through host scalar control."
+   value is reconstructed or synchronized through host scalar control. A separately audited
+   terminal ScalarIR result may use the same physical representation without importing the
+   reduction rewrite rules."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -13,7 +15,13 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.extent-proof :as extent-proof]
+            [raster.compiler.ir.index-expression :as index-expression]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.write-coverage :as write-coverage]
+            [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
+            [raster.compiler.passes.parallel.typed-soac-initialization :as initialization]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
             [raster.compiler.passes.scalar.effects :as effects]))
@@ -403,6 +411,21 @@
     (when (= (count pairs) (count typed-symbols))
       (util/subst-syms typed-symbols (first (:body-results info))))))
 
+(defn- nontrapping-scalar-operations?
+  "Audit a complete emitted scalar operation tree with the existing totality boundary."
+  [operations]
+  (let [nodes (tree-seq #(or (map? %) (sequential? %))
+                        #(if (map? %) (vals %) (seq %))
+                        operations)]
+    (not-any?
+     (fn [operation]
+       (let [expression (:expression operation)
+             result-type (:result-type expression)]
+         (or (= :trap (get-in expression [:options :overflow]))
+             (and (contains? #{:byte :int :long} result-type)
+                  (contains? #{:quot :rem :mod :div} (:op expression))))))
+     nodes)))
+
 (defn- typed-scalar-expression-total?
   "Ask the existing strict typed scalar lowerer to certify compound conversion boundaries.
 
@@ -437,18 +460,8 @@
                         :decline! decline! :id-prefix "uniform-proof"})
               derived ((:source-type lowerer) expression scalar-types)
               lowered (when derived ((:lower lowerer) expression derived scalar-types))
-              operations (when lowered
-                           (tree-seq #(or (map? %) (sequential? %))
-                                     #(if (map? %) (vals %) (seq %))
-                                     (:operations lowered)))
-              trapping?
-              (some (fn [operation]
-                      (let [expression (:expression operation)
-                            result-type (:result-type expression)]
-                        (or (= :trap (get-in expression [:options :overflow]))
-                            (and (contains? #{:byte :int :long} result-type)
-                                 (contains? #{:quot :rem :mod :div} (:op expression))))))
-                    operations)]
+              operations (:operations lowered)
+              trapping? (not (nontrapping-scalar-operations? operations))]
           (and (= result-dtype derived (:type lowered))
                (not trapping?)))
         (catch Exception _ false)))))
@@ -1141,7 +1154,7 @@
         [program load-stats] (inline-single-uniform-input-loads program)]
     [program (merge closure-stats load-stats)]))
 
-(defn realize
+(defn- realize-reductions
   "Return `[program stats]`, realizing every eligible audited scalar reduction.
 
    Ordinary output-only roots and indirect/dependent outputs remain scalar. A direct public,
@@ -1274,3 +1287,249 @@
             result (dialect/make facts rewritten (dialect/outputs program))]
         [result {:resident-reductions (count roots)
                  :inlined-scalars (count removed-scalars)}]))))
+
+(defn- lexical-call-marker?
+  [form]
+  (and (seq? form)
+       (or (:raster.op/lexical-callee (meta form))
+           (:raster.op/lexical-callee (meta (first form))))))
+
+(defn- strict-device-scalar-body?
+  "Prove one projected ScalarIR body through the existing strict scalar lowerer.
+
+   Source dtypes come from capture AVs and typed locals. The result AV is checked only after the
+   body derives its own dtype. This proof admits the bounded singleton read grammar and rejects
+   trapping KernelBody operations; it neither emits nor schedules the result."
+  [program equation]
+  (let [decline! (fn [rule message data]
+                   (throw (ex-info message (assoc data :reason rule
+                                                  :device-scalar-eligibility true))))]
+    (try
+      (let [subprogram (dialect/equation-subprogram program equation)
+          projected (device-scalar/projection subprogram)
+          arrays (:arrays projected)
+          scalars (:scalars projected)
+          locals (:locals projected)
+          body (:body projected)
+          facts (dialect/facts subprogram)
+          values (:values facts)
+          array-types (into {} (map (fn [id] [id (get-in values [id :dtype])])) arrays)
+          scalar-types (into {} (map (fn [id] [id (get-in values [id :dtype])])) scalars)
+          expressions (concat (map :init locals) [body])
+          reads (mapcat descriptor/aget-reads expressions)
+          lexical? (some lexical-call-marker?
+                         (mapcat #(tree-seq coll? seq %) expressions))
+          exact-reads?
+          (and (seq reads)
+               (every? (fn [{:keys [sym idx]}]
+                         (and (contains? arrays sym) (= 0 idx)))
+                       reads))
+          lowerer (scalar-expression/make-lowerer
+                   {:arrays arrays :array-types array-types :scalar-types scalar-types
+                    :index-scope (set (keys scalar-types))
+                    :source-region [locals body]
+                    :require-source-types? true
+                    :conversion-policy scalar-conversion/policy
+                    :lower-index (fn [expression scope]
+                                   (index-expression/lower expression scope decline!))
+                    :decline! decline! :id-prefix "device-scalar-proof"})
+          lowered
+          (when (and (not lexical?) exact-reads?)
+            (reduce
+             (fn [{:keys [environment operations]} {:keys [id dtype init]}]
+               (let [derived ((:source-type lowerer) init environment)
+                     value (when derived ((:lower lowerer) init derived environment))]
+                 (when-not (= dtype derived (:type value))
+                   (decline! :device-scalar-local-type
+                             "device scalar local differs from its retained dtype"
+                             {:local id :dtype dtype :derived derived}))
+                 {:environment (assoc environment id dtype)
+                  :operations (into operations (:operations value))}))
+             {:environment scalar-types :operations []}
+             locals))
+          body-derived (when lowered ((:source-type lowerer) body (:environment lowered)))
+          body-value (when body-derived
+                       ((:lower lowerer) body body-derived (:environment lowered)))
+          result-dtype (:dtype projected)
+          operations (concat (:operations lowered) (:operations body-value))]
+        (and lowered body-value (= result-dtype body-derived (:type body-value))
+             (nontrapping-scalar-operations? operations)))
+      (catch clojure.lang.ExceptionInfo exception
+        (if (or (:device-scalar-eligibility (ex-data exception))
+                (= :typed-soac-device-scalar-subset (:reason (ex-data exception))))
+          false (throw exception))))))
+
+(defn- terminal-device-scalar-candidate
+  "Return the sole direct terminal ScalarIR equation whose singleton storage dependency is proved.
+
+   Writer lookup is performed over the complete ordered equation vector before any candidate index
+   is selected. Exactly one earlier complete singleton writer is required; a future/latest writer,
+   partial effect, public array read, or non-prefix produced scalar capture refuses."
+  [program]
+  (let [facts (dialect/facts program)
+        equations (dialect/equations program)
+        positions (into {} (map-indexed (fn [index equation] [(second equation) index])) equations)
+        outputs (dialect/outputs program)
+        candidate (when (= 1 (count outputs))
+                    (some #(when (= outputs (nth % 2)) %) equations))
+        candidate-index (some-> candidate second positions)
+        info (when candidate (operation-info candidate))
+        info-by-id (into {} (map (juxt :id identity)) (map operation-info equations))
+        producers
+        (group-by first
+                  (mapcat (fn [producer]
+                            (map (fn [result] [result producer]) (:results producer)))
+                          (vals info-by-id)))
+        host-reads (set (get-in facts [:attributes :host-read-values]))
+        captures (:captures info)
+        shaped (filterv #(seq (get-in facts [:values % :shape])) captures)
+        scalars (filterv #(empty? (get-in facts [:values % :shape])) captures)
+        storage (first shaped)
+        allocation (when storage
+                     (some #(when (= storage (:destination %)) %)
+                           (initialization/allocation-contracts! program)))
+        allocation-environment
+        (when allocation
+          (reduce #(extent-proof/advance %1 facts %2)
+                  (extent-proof/initial-environment program)
+                  (take-while #(let [site (get-in facts [:equations (second %)
+                                                       :provenance :source-binding-id])]
+                                 (and (integer? site)
+                                      (< site (:source-binding-id allocation))))
+                              equations)))
+        singleton-capacity?
+        (if allocation
+          (extent-proof/same-volume? allocation-environment
+                                     (:extent allocation) [1])
+          (= [1] (get-in facts [:values storage :shape])))
+        writers
+        (when storage
+          (into []
+                (mapcat
+                 (fn [equation]
+                   (keep (fn [[logical physical]]
+                           (when (= storage physical)
+                             {:equation equation :logical logical
+                              :position (get positions (second equation))}))
+                         (map vector (nth equation 2)
+                              (dialect/physical-results facts equation)))))
+                equations))
+        writer (when (= 1 (count writers)) (first writers))
+        writer-facts (get-in facts [:equations (some-> writer :equation second)])
+        writer-sites (or (seq (keys (get-in writer-facts [:attributes :fusion/constituents])))
+                         [(get-in writer-facts [:provenance :source-binding-id])])
+        allocation-before-writer?
+        (or (nil? allocation)
+            (and (every? integer? writer-sites)
+                 (< (:source-binding-id allocation) (apply min writer-sites))))
+        scalar-prefix?
+        (fn [id]
+          (retained-host-scalar-prefix?
+           facts producers positions (set outputs) host-reads
+           #{(first outputs) storage} id candidate-index))]
+    (when (and candidate (= :scalar (:kind info))
+               (= candidate-index (dec (count equations)))
+               (= 1 (count shaped)) singleton-capacity? allocation-before-writer?
+               (not (contains? host-reads storage))
+               (exact-plain-tensor? (get-in facts [:values storage])
+                                    (get-in facts [:values storage :shape]))
+               writer (< (:position writer) candidate-index)
+               (= [1] (write-coverage/symbolic-complete-write-shape
+                       facts (:equation writer) (:logical writer)))
+               (every? scalar-prefix? scalars)
+               (exact-plain-scalar-value? (get-in facts [:values (first outputs)])))
+      candidate)))
+
+(defn terminal-device-scalar-projection
+  "Return the audited resident projection, or nil for an unsupported terminal scalar.
+   Source normalization and residency use this same admission proof."
+  [program]
+  (when-let [equation (terminal-device-scalar-candidate program)]
+    (let [result (first (nth equation 2))
+          marked (-> program
+                     dialect/facts
+                     (assoc-in [:values result :representation]
+                               {:kind resident-representation :elements 1})
+                     (assoc-in [:values result :memory-space] :device)
+                     (dialect/make (dialect/equations program) (dialect/outputs program)))]
+      (when (strict-device-scalar-body? marked equation) marked))))
+
+(defn- realize-terminal-device-scalar [program]
+  (if-let [marked (terminal-device-scalar-projection program)]
+    [marked {:resident-terminal-scalars 1}]
+    [program {:resident-terminal-scalars 0}]))
+
+(defn validated-terminal-resident-output
+  "Independently reconstruct terminal residency from the enclosing semantic equation spine.
+   A resident AV or an isolated ScalarIR equation is not activation authority."
+  [parallel-program result]
+  (let [equations (:equations parallel-program)
+        algorithms (mapv :algorithm equations)
+        outer (get-in parallel-program [:values result])
+        terminal (some #(when (= [result] (:results %)) %) equations)
+        terminal-facts (when (dialect/program-form? (:algorithm terminal))
+                         (dialect/facts (:algorithm terminal)))
+        terminal-equation (when terminal-facts
+                            (first (dialect/equations (:algorithm terminal))))
+        critical-storage (when terminal-equation
+                           (filter #(seq (get-in terminal-facts [:values % :shape]))
+                                   (:captures (dialect/operation-parts terminal-equation))))
+        allocated (set (map :destination (get-in parallel-program [:attributes :allocations])))]
+    (when (and (= [result] (:outputs parallel-program))
+               (= {:kind :resident-scalar-buffer :elements 1} (:representation outer))
+               (= :device (:memory-space outer))
+               (every? dialect/program-form? algorithms)
+               ;; A compatibility join cannot create the singleton-capacity premise. A capture
+               ;; without its own retained allocator needs an exact inner shape witness.
+               (every? (fn [id]
+                         (or (contains? allocated id)
+                             (some #(semantic/equivalent?
+                                     (get-in (dialect/facts %) [:values id])
+                                     (get-in parallel-program [:values id]))
+                                   algorithms)))
+                       critical-storage)
+               (every? true?
+                       (map (fn [equation algorithm]
+                              (let [inner-equations (dialect/equations algorithm)
+                                    inner-facts (dialect/facts algorithm)]
+                                (and (= 1 (count inner-equations))
+                                     (= (:id equation) (second (first inner-equations)))
+                                     (= (:results equation) (dialect/outputs algorithm))
+                                     (= (:operands equation) (:inputs inner-facts))
+                                     (= (:effects equation) (:effects inner-facts))
+                                     (or (semantic/equivalent? (:operations equation) inner-equations)
+                                         (and (true? (get-in equation [:attributes :host-only]))
+                                              (empty? (:operations equation))
+                                              (= 'scalar (dialect/operation-kind (first inner-equations)))
+                                              (every? #(exact-plain-scalar-value?
+                                                        (get-in inner-facts [:values %]))
+                                                      (:results equation))))
+                                     (every? (fn [[id value]]
+                                               (let [outer-value (get-in parallel-program [:values id])]
+                                                 (and outer-value
+                                                      (semantic/equivalent?
+                                                       (av/merge-refinement value outer-value)
+                                                       outer-value))))
+                                             (:values inner-facts)))))
+                            equations algorithms)))
+      (let [facts {:values (:values parallel-program) :inputs (:inputs parallel-program)
+                   :equations (apply merge (map #(get-in (dialect/facts %) [:equations]) algorithms))
+                   :effects (:effects parallel-program)
+                   :diagnostics (:diagnostics parallel-program)
+                   :provenance (:provenance parallel-program)
+                   :attributes (:attributes parallel-program)}
+            unmarked (-> facts
+                         (assoc-in [:values result :representation] {:kind :plain})
+                         (assoc-in [:values result :memory-space] nil)
+                         (dialect/make (vec (mapcat dialect/equations algorithms)) [result]))
+            audited (terminal-device-scalar-projection unmarked)]
+        (when (and audited
+                   (semantic/equivalent? outer (get-in (dialect/facts audited) [:values result])))
+          outer)))))
+
+(defn realize
+  "Realize audited reduction residents and one bounded direct terminal ScalarIR result."
+  [program]
+  (let [[program reduction-stats] (realize-reductions program)
+        [program scalar-stats] (realize-terminal-device-scalar program)]
+    [program (merge reduction-stats scalar-stats)]))

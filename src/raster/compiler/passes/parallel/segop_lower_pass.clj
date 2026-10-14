@@ -23,6 +23,7 @@
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.ir.form :as form]
@@ -574,8 +575,36 @@
                     scheduling-algorithm (soac-dialect/remap-values algorithm physical)
                     kind (soac-dialect/operation-kind
                           (first (soac-dialect/equations scheduling-algorithm)))
+                    resident-scalar?
+                    (and (= 'scalar kind)
+                         (= 1 (count (soac-dialect/outputs scheduling-algorithm)))
+                         (= {:kind :resident-scalar-buffer :elements 1}
+                            (get-in (soac-dialect/facts scheduling-algorithm)
+                                    [:values (first (soac-dialect/outputs scheduling-algorithm))
+                                     :representation]))
+                         (= :device
+                            (get-in (soac-dialect/facts scheduling-algorithm)
+                                    [:values (first (soac-dialect/outputs scheduling-algorithm))
+                                     :memory-space])))
+                    _ (when (and resident-scalar?
+                                 (let [context (or (:device-scalar-context opts) form)
+                                       contextual (filterv #(= (:id equation) (:id %))
+                                                           (:equations context))]
+                                   (or (not= 1 (count contextual))
+                                       (not (semantic/equivalent? algorithm
+                                                                  (:algorithm (first contextual))))
+                                       (nil? (resident/validated-terminal-resident-output
+                                              context (first (:results equation)))))))
+                        (throw (ex-info "resident scalar lacks its enclosing placement and storage proof"
+                                        {:reason :typed-soac-device-scalar-activation
+                                         :equation (:id equation)})))
                     lowered (case kind
-                              scalar {:operations []}
+                              scalar {:operations
+                                      (if resident-scalar?
+                                        (soac-lower/lower-typed-scalar
+                                         scheduling-algorithm device-id
+                                         :target-descriptor target-descriptor)
+                                        [])}
                               contract {:operations (soac-lower/lower-typed-contract
                                                       scheduling-algorithm device-id)}
                               map {:operations (soac-lower/lower-typed-map
@@ -622,7 +651,7 @@
                         (update :attributes assoc :device device-id)
                         (cond-> (:kernel-graph lowered)
                           (update :attributes assoc :kernel-graph (:kernel-graph lowered)))
-                        (cond-> (= 'scalar kind)
+                        (cond-> (and (= 'scalar kind) (empty? operations))
                           (update :attributes assoc :host-only true)))
                     result-storage (zipmap (:results equation)
                                            (equation-physical-results algorithm))]

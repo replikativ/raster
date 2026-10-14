@@ -21,6 +21,8 @@
             [raster.compiler.ir.structured-control :as control]
             [raster.compiler.ir.structured-control-schedule :as schedule]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
+            [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.parallel.indexed-weighted-reduction-body :as indexed-body]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.structured-control-frontend :as frontend]
@@ -566,17 +568,28 @@
                                        (soac/equations algorithm)))
             inner-producer (when (= 1 (count inner-producers))
                              (first inner-producers))
-            inner (when (and (= 'reduce (some-> inner-producer soac/operation-kind))
-                             (= [result] (nth inner-producer 2 nil))
+            producer-kind (some-> inner-producer soac/operation-kind)
+            reduction-certified?
+            (and (= 'reduce producer-kind)
+                 (= {:kind :resident-scalar-buffer :elements 1}
+                    (get-in inner-facts
+                            [:equations (second inner-producer) :attributes
+                             :resident-realization]))
+                 (some #{result}
+                       (get-in inner-facts
+                               [:attributes :public-resident-reduction-outputs])))
+            scalar-certified?
+            (and (= 'scalar producer-kind)
+                 (resident/validated-terminal-resident-output parallel-program result)
+                 (= {:kind :resident-scalar-buffer :elements 1}
+                    (get-in inner-facts [:values result :representation]))
+                 (= :device (get-in inner-facts [:values result :memory-space]))
+                 (= result
+                    (:result (device-scalar/projection
+                              (soac/equation-subprogram algorithm inner-producer)))))
+            inner (when (and (= [result] (nth inner-producer 2 nil))
                              (some #{result} (soac/outputs algorithm))
-                             (= {:kind :resident-scalar-buffer :elements 1}
-                                (get-in inner-facts
-                                        [:equations (second inner-producer) :attributes
-                                         :resident-realization]))
-                             (some #{result}
-                                   (get-in inner-facts
-                                           [:attributes
-                                            :public-resident-reduction-outputs])))
+                             (or reduction-certified? scalar-certified?))
                     (get-in inner-facts [:values result]))
             value (when (= (canonicalize-value-dtype outer)
                            (canonicalize-value-dtype inner))
@@ -1117,6 +1130,7 @@
                (let [algorithm-values (:values (soac/facts algorithm))
                      schedule-options
                      (assoc opts
+                            :device-scalar-context parallel-program
                             :array-types (merge (:array-types opts)
                                                 (value-types algorithm-values seq))
                             :scalar-types (merge (:scalar-types opts)

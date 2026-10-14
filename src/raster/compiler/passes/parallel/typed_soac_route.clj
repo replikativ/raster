@@ -13,6 +13,7 @@
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.device-scalar-schedule :as device-scalar]
             [raster.compiler.passes.parallel.effect-source :as effect-source]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
@@ -174,6 +175,7 @@
         extent (case kind
                  map (:extent attributes)
                  reduce 1
+                 scalar 1
                  nil)]
     (when extent (allocation-pair values result extent))))
 
@@ -206,14 +208,23 @@
             scalar-tag (dtype/scalar-tag-for-dtype result-dtype)
             source (materialize-region
                     region-locals
-                    (typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))]
-        {:equation-id equation-id
-         :placement placement
-         ;; The explicit conversion carries the JVM initializer type. Clojure rejects an
-         ;; additional primitive :tag on that binding; retain Raster's independent type facts.
-         :pairs [[(vary-meta result dissoc :tag) source]]
-         :site [:binding result]
-         :source source})
+                    (typed-store-value (symbol "clojure.core" (name scalar-tag)) (first bodies)))
+            resident? (resident/resident-scalar-value? (get values result))]
+        (if resident?
+          (let [effect (gensym (str "typed_soac_scalar_" equation-id "__"))
+                store (list 'clojure.core/aset result 0 source)]
+            {:equation-id equation-id
+             :placement placement
+             :pairs [(equation-allocation-pair values equation result) [effect store]]
+             :site [:binding effect]
+             :source store})
+          {:equation-id equation-id
+           :placement placement
+           ;; The explicit conversion carries the JVM initializer type. Clojure rejects an
+           ;; additional primitive :tag on that binding; retain Raster's independent type facts.
+           :pairs [[(vary-meta result dissoc :tag) source]]
+           :site [:binding result]
+           :source source}))
 
       map
       (do
@@ -880,6 +891,33 @@
                     [value (scalar-load root)])))
           (concat public-resident-outputs (keys aliases)))))
 
+(defn- public-resident-source-outputs
+  "Derive resident public values from authoritative TypedSOAC producers.
+
+   Reduction roots retain their existing audited program fact. A scalar root contributes only
+   when its exact equation subprogram passes the shared device-scalar projection; outer rank or
+   spelling alone is not evidence."
+  [program]
+  (let [facts (dialect/facts program)
+        outputs (set (dialect/outputs program))
+        reduction-outputs
+        (set (get-in facts [:attributes :public-resident-reduction-outputs]))
+        scalar-outputs
+        (into #{}
+              (keep (fn [equation]
+                      (let [results (nth equation 2)]
+                        (when (and (= 'scalar (dialect/operation-kind equation))
+                                   (= 1 (count results))
+                                   (contains? outputs (first results))
+                                   (= {:kind :resident-scalar-buffer :elements 1}
+                                      (get-in facts [:values (first results) :representation]))
+                                   (= :device
+                                      (get-in facts [:values (first results) :memory-space])))
+                          (:result (device-scalar/projection
+                                    (dialect/equation-subprogram program equation)))))))
+              (dialect/equations program))]
+    (set/union reduction-outputs scalar-outputs)))
+
 (defn- realize-source
   [form program]
   (let [form (retain-analyzed-binding-expressions
@@ -890,12 +928,10 @@
                                  (get-in (dialect/facts program) [:attributes :allocations])))
               :allocation-source-binding-mismatch)
         [let-head bindings & body] form
-        public-resident-outputs
-        (set (get-in (dialect/facts program)
-                     [:attributes :public-resident-reduction-outputs]))
-        ;; A public resident reduction keeps one logical rank-zero ID in TypedSOAC and the GPU
-        ;; graph, but source/JVM execution must still return its primitive scalar value. Rewrite
-        ;; only the final source result, capture-avoidantly; this is not a host-read fact and does
+        public-resident-outputs (public-resident-source-outputs program)
+        ;; A public resident scalar keeps one logical rank-zero ID in TypedSOAC and the GPU graph,
+        ;; but source/JVM execution must still return its primitive scalar value. Rewrite only the
+        ;; final source result, capture-avoidantly; this is not a host-read fact and does
         ;; not alter the typed output or introduce a second physical alias.
         body (if (seq public-resident-outputs)
                (update (vec body) (dec (count body))
@@ -1419,6 +1455,41 @@
               (assoc rebuilt :form filtered :bindings-removed bindings-removed)
               (assoc initial :form form :bindings-removed 0))))))))
 
+(defn- validated-terminal-scalar-projection
+  "Reproject one frontend-certified named terminal scalar without weakening source admission.
+
+   The original complete source has already passed projection. A speculative candidate which is
+   not admitted leaves that projection unchanged, preserving its later source-result refusal."
+  [{:keys [form projection typed-input] :as admitted} frontend-options]
+  (if (or (:segmented-plans? projection) (nil? typed-input))
+    (assoc admitted :terminal-scalars-materialized 0)
+    (if-let [{candidate-form :form result :result}
+             (frontend/materialize-terminal-scalar-result form frontend-options)]
+      (let [rebuilt (try
+                      (source-projection candidate-form frontend-options)
+                      (catch clojure.lang.ExceptionInfo exception
+                        (if (frontend/source-decline? exception) nil (throw exception))))
+            program (when (:admitted? rebuilt) (:typed-input rebuilt))
+            result-equation (when program
+                              (some #(when (= [result] (nth % 2)) %)
+                                    (dialect/equations program)))]
+        (if-not program
+          (assoc admitted :terminal-scalars-materialized 0)
+          (do
+            (when-not (and (not (:segmented-plans? (:projection rebuilt)))
+                           (= 'scalar (some-> result-equation dialect/operation-kind))
+                           (= [result] (dialect/outputs program))
+                           (= [] (get-in (dialect/facts program) [:values result :shape])))
+              (throw (ex-info "terminal scalar reprojection lost its certified result boundary"
+                              {:reason :raster/bug
+                               :invariant :terminal-scalar-result-projection
+                               :result result :outputs (dialect/outputs program)})))
+            (if (resident/terminal-device-scalar-projection program)
+              (assoc rebuilt :form candidate-form :terminal-scalars-materialized 1
+                     :bindings-removed (:bindings-removed admitted))
+              (assoc admitted :terminal-scalars-materialized 0)))))
+      (assoc admitted :terminal-scalars-materialized 0))))
+
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
    no parallel binding is in this closed subset. Internal :host-scalars? admits host-only packets
@@ -1442,8 +1513,10 @@
                                  :host-scalars? host-scalars?
                                  :segmented-plans? segmented-plans?
                                  :preserve-declared-array-storage? preserve-declared-array-storage?}
-               {live-form :form :keys [projection typed-input admitted? bindings-removed]}
-               (validated-live-source-projection form frontend-options)
+               live-projection (validated-live-source-projection form frontend-options)
+               {live-form :form :keys [projection typed-input admitted? bindings-removed
+                                       terminal-scalars-materialized]}
+               (validated-terminal-scalar-projection live-projection frontend-options)
                form live-form]
            (if-not admitted?
              (when-let [decline (frontend/coverage-decline form frontend-options)]
@@ -1455,13 +1528,21 @@
                                         :resident-uniform-input-loads? resident-uniform-input-loads?
                                         :abstract-machine abstract-machine})
                        :stats assoc :canonical-source-bindings-removed bindings-removed)
-               (let [{typed-result :program typed-stats :stats decline :declined}
-                     (optimize-typed-component
-                      typed-input
-                      {:resident-reductions? resident-reductions?
-                       :resident-initialization? resident-initialization?
-                       :resident-uniform-input-loads? resident-uniform-input-loads?
-                       :abstract-machine abstract-machine})]
+               (let [optimization-options
+                     {:resident-reductions? resident-reductions?
+                      :resident-initialization? resident-initialization?
+                      :resident-uniform-input-loads? resident-uniform-input-loads?
+                      :abstract-machine abstract-machine}
+                     optimized (optimize-typed-component typed-input optimization-options)
+                     lost-terminal? (and (= 1 terminal-scalars-materialized)
+                                         (not= 1 (get-in optimized [:stats :resident-terminal-scalars])))
+                     optimized (if lost-terminal?
+                                 (optimize-typed-component (:typed-input live-projection)
+                                                           optimization-options)
+                                 optimized)
+                     form (if lost-terminal? (:form live-projection) form)
+                     terminal-scalars-materialized (if lost-terminal? 0 terminal-scalars-materialized)
+                     {typed-result :program typed-stats :stats decline :declined} optimized]
                  (if (and (not host-scalars?)
                           (not-any? #(contains? #{:map :scatter :effect-map :stencil :reduce
                                              :segmented-reduce :contract :product-reduce
@@ -1477,6 +1558,7 @@
                         :stats (merge typed-stats
                                       {:route :typed-soac :typed-validated true
                                        :front-end :analyzed-source
+                                        :terminal-scalars-materialized terminal-scalars-materialized
                                        :canonical-source-bindings-removed
                                        bindings-removed})})))))))
          (catch clojure.lang.ExceptionInfo exception

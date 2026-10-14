@@ -79,7 +79,8 @@
         resident-result? (and (= {:kind :resident-scalar-buffer :elements 1}
                                   result-representation)
                               (= :device (:memory-space result-value)))
-        result-dtype (some-> result-value :dtype dtype/canon)]
+        result-dtype (some-> result-value :dtype dtype/canon)
+        equation-attributes (:attributes equation-facts)]
     (when-not (and (= 1 (count equations)) (= 'scalar kind)
                    (= 1 (count results)) (= 1 (count body-results))
                    (= results (dialect/outputs program))
@@ -91,7 +92,9 @@
                    resident-result? (default-value-facets? result-value)
                    (set/subset? (set (keys attributes)) #{:dtypes :attributes})
                    (empty? (:attributes attributes))
-                   (empty? (:attributes equation-facts))
+                   (set/subset? (set (keys equation-attributes)) #{:source-prefix?})
+                   (or (not (contains? equation-attributes :source-prefix?))
+                       (boolean? (:source-prefix? equation-attributes)))
                    (empty? (dialect/result-storage facts equation-id))
                    (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
                    (every? #(or (tensor-capture? %) (scalar-capture? %)) capture-values))
@@ -118,11 +121,13 @@
        :flat-index flat-index
        :arrays arrays
        :scalars scalars
+       :equation-attributes equation-attributes
        :locals locals
        :body body})))
 
 (defn- semantic-fields
-  [{:keys [equation-id result dtype index flat-index arrays scalars locals body]}]
+  [{:keys [equation-id result dtype index flat-index arrays scalars equation-attributes
+           locals body]}]
   (let [space (segop/make-seg-space-nd [{:name index :bound 1}]
                                        :flat-idx flat-index
                                        :scope [arrays scalars locals body result])]
@@ -138,7 +143,8 @@
      :out-sym result
      :cast-fn nil
      :algorithm-dialect :typed-soac
-     :algorithm-equation equation-id}))
+     :algorithm-equation equation-id
+     :algorithm-equation-attributes equation-attributes}))
 
 (defn lower
   "Build the canonical extent-one SegMap for an already certified resident scalar result,
@@ -154,7 +160,8 @@
                                  :scalars :dtype :out-sym :cast-fn])
                    :grid grid))
            :algorithm-dialect :typed-soac
-           :algorithm-equation (:equation-id projected))))
+           :algorithm-equation (:equation-id projected)
+           :algorithm-equation-attributes (:equation-attributes projected))))
 
 (defn validate-correspondence!
   "Check every computation/capture/write field against retained ScalarIR.
