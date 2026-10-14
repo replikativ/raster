@@ -750,6 +750,118 @@
   ([materialized parallel-program target evaluate-host project retained-validation caller-options]
    (lower-for-request materialized parallel-program target evaluate-host project retained-validation caller-options)))
 
+(def ^:private resident-layout-keys
+  #{:target :nodes :values :buffer-bindings :scalar-values :public-inputs})
+
+(defn- resident-layout-projection
+  [candidate caller-options]
+  ;; The ordinary initialized candidate is the authority for initializer, storage and effect
+  ;; correctness. Validate it before removing the caller arrays; the projected plan is then
+  ;; independently validated by make-with-final-projection as a conditional input boundary.
+  (if (nil? caller-options)
+    (link/validate! candidate)
+    (link/validate! candidate caller-options))
+  (let [{:keys [nodes instances attributes]} candidate
+        public-bindings (:public-buffer-bindings attributes)
+        public-roles (:public-buffer-roles attributes)
+        public-tokens (set (vals public-bindings))]
+    (when-not (and (= 1 (count instances))
+                   (link/program-link-instance? (first instances)))
+      (fail! :resident-layout-instance
+             "resident layout projection requires one ordinary emitted program instance"
+             {:instances (mapv type instances)}))
+    (when-not (and (map? public-bindings) (map? public-roles)
+                   (= (set (keys public-bindings)) (set (keys public-roles)))
+                   (every? #(= :input %) (vals public-roles)))
+      (fail! :resident-layout-public-roles
+             "resident layout projection admits only read-only public buffer inputs"
+             {:bindings public-bindings :roles public-roles}))
+    (when-not (= (count public-tokens) (count public-bindings))
+      (fail! :resident-layout-public-alias
+             "resident public inputs require distinct whole storage identities"
+             {:bindings public-bindings}))
+    (doseq [[node-id node] nodes]
+      (cond
+        (contains? public-tokens node-id)
+        (when-not (and (= :state (:role node)) (some? (:source node)))
+          (fail! :resident-layout-public-source
+                 "a resident public input must originate in one checked host initializer"
+                 {:node node-id :role (:role node) :source? (some? (:source node))}))
+
+        (some? (:source node))
+        (fail! :resident-layout-retained-source
+               "resident layout projection cannot retain a non-public host initializer"
+               {:node node-id :role (:role node)})))
+    (when (or (seq (:host-outputs attributes))
+              (not= 0 (:driver-allocations attributes)))
+      (fail! :resident-layout-host-boundary
+             "resident layout projection cannot retain host outputs or driver allocation"
+             {:host-outputs (:host-outputs attributes)
+              :driver-allocations (:driver-allocations attributes)}))
+    {:plan (reduce (fn [plan node-id]
+                     (-> plan
+                         (assoc-in [:nodes node-id :role] :input)
+                         (assoc-in [:nodes node-id :source] nil)))
+                   candidate public-tokens)}))
+
+(defn- ordered-resident-public-inputs
+  [invocation-plan public-bindings]
+  (let [inputs (into []
+                     (keep (fn [{:keys [symbol]}]
+                             (when-let [value (get public-bindings symbol)]
+                               {:symbol symbol :value value})))
+                     (:parameters invocation-plan))
+        symbols (mapv :symbol inputs)]
+    (when-not (and (= (count public-bindings) (count inputs) (count (distinct symbols)))
+                   (= (set (keys public-bindings)) (set symbols)))
+      (fail! :resident-layout-public-inputs
+             "resident public inputs must exactly follow the invocation parameter boundary"
+             {:parameters (mapv :symbol (:parameters invocation-plan))
+              :bindings (set (keys public-bindings)) :projected symbols}))
+    inputs))
+
+(defn project-resident-layout
+  "Project one materialized invocation to non-executable resident storage data.
+
+   Ordinary invocation lowering remains the sole shape, type, initializer and physical-layout
+   authority. Public read-only buffer sources are checked, then removed before final LinkPlan
+   validation. The returned closed map is neither a LinkPlan nor proof: consumers must select its
+   identities through bind-resident-program and validate a complete LinkPlan/LinkModule. It carries
+   no host buffer initializer, executable instance, output capability, callback or validation
+   receipt. AbstractValue metadata and typed immutable scalar values remain authoritative."
+  ([materialized parallel-program target]
+   (project-resident-layout materialized parallel-program target nil))
+  ([materialized parallel-program target caller-options]
+   (let [materialized (materialization/validate! materialized)
+         invocation-plan (:plan materialized)
+         refuse-host (fn [& _]
+                       (fail! :resident-layout-host-boundary
+                              "resident layout projection cannot evaluate host equations" {}))
+         result (lower-for-request
+                 materialized parallel-program target refuse-host
+                 #(resident-layout-projection % caller-options) nil caller-options)
+         plan (:plan result)
+         instance (first (:instances plan))
+         call (:call instance)
+         attributes (:attributes plan)
+         public-bindings (:public-buffer-bindings attributes)
+         public-inputs (ordered-resident-public-inputs invocation-plan public-bindings)
+         snapshot {:target target
+                   :nodes (:nodes plan)
+                   :values (:values plan)
+                   :buffer-bindings (:compiler-buffer-bindings attributes)
+                   :scalar-values (:scalar-values call)
+                   :public-inputs public-inputs}]
+     (when-not (= resident-layout-keys (set (keys snapshot)))
+       (fail! :resident-layout-snapshot
+              "resident layout snapshot must remain a closed non-executable value"
+              {:keys (set (keys snapshot))}))
+     (when (or (some (comp some? :source val) (:nodes snapshot))
+               (some program-call/evaluated-host-equation? (:steps call)))
+       (fail! :resident-layout-host-boundary
+              "resident layout snapshot retained host execution state" {}))
+     snapshot)))
+
 (defn- derive-certificate
   [plan effect-evidence]
   (let [attributes (:attributes plan)]
