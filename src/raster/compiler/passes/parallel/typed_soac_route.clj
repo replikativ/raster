@@ -1087,15 +1087,22 @@
               destinations (set (map :destination
                                      (get-in equation [:attributes :result-storage])))]
           (and (= :binding (first (:site equation)))
-               (parallel-program/equation-for-binding program primary (get source-bindings primary))
                (vector? witness)
+               ;; A nonmatching binding cannot be this equation's auxiliary result. Keep the
+               ;; exact semantic checks below for every potentially matching witness; do not
+               ;; encode unrelated kernel bodies while searching by binding identity.
+               (some #(= symbol (:binding %)) witness)
+               (parallel-program/equation-for-binding program primary (get source-bindings primary))
                (= (count witness) (count (distinct (map :binding witness))))
                (every? (fn [{:keys [binding expression]}]
                          (and (not= primary binding)
-                              (= 1 (count (filter #(semantic/equivalent? [binding expression] (vec %)) source-pairs)))))
+                              (= 1 (count (filter #(and (= binding (first %))
+                                                         (semantic/equivalent? [binding expression] (vec %)))
+                                                   source-pairs)))))
                        witness)
                (some (fn [{binding :binding generated :expression kind :kind}]
-                       (and (semantic/equivalent? [symbol expression] [binding generated])
+                       (and (= symbol binding)
+                            (semantic/equivalent? [symbol expression] [binding generated])
                             (case kind
                               :result-allocation
                               (and (some #{binding} (:results equation))

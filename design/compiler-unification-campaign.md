@@ -10,6 +10,14 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 ### October 14 current checkpoint
 
+- #1364 activates the independently audited scalar vertical; #1365 gives normalized AD one
+  deterministic map-stage constructor/reconstructor. #1366 preserves one unused public ScalarIR
+  checkpoint alongside observable state outputs and later independent effects. Genuine public
+  1-layer/8-dimensional batch-2 GSDM SGD preparation and three resident Level Zero updates now
+  succeed: all 30 weight fields agree with CPU within 2.98e-8, loss within 1.43e-6, and captured
+  host state remains unchanged. This supersedes the smaller forward-only receipt below, not the
+  still-open full-size GSDM statistical, Adam/EMA or real-weight Gemma acceptance gates.
+
 - #1358 checks Gemma's selected matrix dispatches against independently retained contraction
   identities, not a fixed kernel count. #1359 performs existing effect-aware DCE only after whole
   normalized-source admission and rebuilds coherent typed evidence afterward. Tiny Gemma retains
@@ -215,6 +223,23 @@ must not replace a physical capacity or release/completion witness.
   laptop campaign.
 
 ### Bounded compile-cost increment
+
+Auxiliary source-witness matching now filters by necessary binding identity before exact
+semantic encoding. It still compares every same-binding source pair, requires exactly one,
+validates the equation's complete witness set, and independently reconstructs allocation/alias
+authority. Same-name binders with changed semantic metadata reach the canonical comparison;
+ordinary identity equality is not evidence. Matching unsupported expressions still fail loudly.
+Unrelated unsupported expressions are no longer encoded by this binding-scoped predicate;
+whole-source admission remains a separate obligation. No cache or stored index is introduced.
+
+A retained real GSDM training program has 539 source pairs and 66 auxiliary witnesses. Checking
+three witness bindings preserved all three acceptance results while reducing canonical comparisons
+from 55,002 to 11 (2.23 seconds to 1.19 milliseconds in that probe). A warm, loaded-machine
+before/after small train-step compile measured 109.3 and 60.5 seconds, both with 316 semantic
+equations and 260 emitted kernels. The second profile measured promotion at 1.06 seconds;
+SOAC processing and emission still took 22.5 and 19.9 seconds. These single paired observations
+are diagnostic, not a stable throughput or general speedup guarantee. Increasing independent-map
+and map-chain probes remain separate from real-model compilation and device timing.
 
 Vertical candidate enumeration now rejects extent/dataflow mismatches before forcing its existing
 producer exceptional-conversion proof. Eligible pair order and all effect, completion, capture and
