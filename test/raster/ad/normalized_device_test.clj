@@ -164,6 +164,39 @@
         (.close ^java.io.Closeable (:lease extra))
         ((:close! prepared))))))
 
+(deftest canonical-proofs-run-during-preparation-not-resident-replay
+  (let [owner (canonical-owner '(raster.numeric/* element element))
+        validate canonical/validate!
+        validations (atom 0)
+        runs (atom 0)
+        closes (atom 0)
+        runtime (reify java.io.Closeable (close [_]))]
+    (with-redefs [canonical/validate!
+                  (fn [candidate] (swap! validations inc) (validate candidate))
+                  hardware/descriptor-for synthetic-descriptor
+                  link-module/instantiate! (fn [_ _] runtime)
+                  link-module/run-and-lease!
+                  (fn [& _]
+                    (swap! runs inc)
+                    (reify java.io.Closeable (close [_] (swap! closes inc))))]
+      (let [prepared (device/prepare-owner
+                      owner (arguments owner (float-array [1.0 2.0 3.0]))
+                      {:target :ocl:normalized-device :schedule {:precision :f32-scalar}})
+            preparation-validations @validations]
+        (try
+          (is (pos? preparation-validations))
+          (dotimes [_ 2]
+            (let [primal ((:primal! prepared) (float-array [2.0 3.0 4.0]))
+                  transpose ((:transpose! prepared) (float-array [1.0 2.0 3.0])
+                             (:dependencies primal))]
+              (.close ^java.io.Closeable (:lease transpose))
+              (.close ^java.io.Closeable (:lease primal))))
+          (is (= 4 @runs))
+          (is (= 4 @closes))
+          (is (= preparation-validations @validations)
+              "hot closures guard execution identities without reconstructing canonical proofs")
+          (finally ((:close! prepared))))))))
+
 (deftest result-publication-closes-an-issued-lease-and-preserves-the-primary-error
   (let [publish (ns-resolve 'raster.ad.normalized-device 'publish-result!)
         primary (ex-info "publication failed" {:reason :publication-primary})

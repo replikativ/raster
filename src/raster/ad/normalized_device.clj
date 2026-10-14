@@ -52,12 +52,10 @@
         active-id (get-in interface [:cotangent-result :source])
         active (some #(when (= active-id (:id %)) %) inputs)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)
-        scalars (filterv #(empty? (get-in % [:value :shape])) inputs)
         primal (:primal-result interface)
         seed (:cotangent-input interface)
         gradient (:cotangent-result interface)]
     (when-not (and (= 1 (count arrays)) (= active (first arrays))
-                   (= (count inputs) (+ (count arrays) (count scalars)))
                    (= (:id primal) (:source seed))
                    (= active-id (:source gradient)))
       (fail! :normalized-device-interface
@@ -73,7 +71,7 @@
         (fail! :normalized-device-interface-contract
                "canonical derivative ports must preserve exact symbolic storage geometry"
                {:relation relation :left left :right right})))
-    {:inputs inputs :active active :scalars scalars
+    {:inputs inputs :active active
      :primal primal :seed seed :gradient gradient}))
 
 (defn- materialize-layout! [compilation input-descriptors arguments caller-options]
@@ -115,11 +113,11 @@
         (.addSuppressed ^Throwable primary cleanup-error))))
   (throw primary))
 
-(defn- guarded-run! [check! invoke]
-  (check!)
+(defn- guarded-run! [guard! invoke]
+  (guard!)
   (let [lease (invoke)]
     (try
-      (check!)
+      (guard!)
       lease
       (catch Throwable primary (close-preserving! primary lease)))))
 
@@ -278,6 +276,9 @@
          checked (authority owner)
          {:keys [module frontier-values ports]} (assemble! checked arguments options)
          check! (:check! checked)
+         ;; The freshly proved persistent owner is preparation authority only. Returned
+         ;; closures retain the execution fence, not a closure over canonical evidence.
+         guard! (:guard! checked)
          runtime-options (select-keys options [:scalar-math :profile?])
          runtime (link-module/instantiate! module runtime-options)]
      (try
@@ -285,7 +286,7 @@
        (let [primal!
              (fn [input]
                (let [lease (guarded-run!
-                            check!
+                            guard!
                             #(link-module/run-and-lease!
                               runtime :primal {:inputs {(:input ports) input}}))]
                  (publish-result!
@@ -310,7 +311,7 @@
              transpose!
              (fn [seed dependencies]
                (let [lease (guarded-run!
-                            check!
+                            guard!
                             #(link-module/run-and-lease!
                               runtime :transpose
                               {:inputs {(:seed-input ports) seed}
