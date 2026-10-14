@@ -839,6 +839,13 @@ named-entry owner. It is deliberately not a CPU-compatible AD function: calls up
 input buffers and return opaque resident leases plus logical output IDs, with no host readback.
 The target is mandatory; this surface has no hardware-specific default.
 
+Canonical proof reconstruction is preparation-only, including the post-instantiation check.
+Resident replay retains the same pre/post compiler-epoch and effective-callee execution fences
+as the host normalized runtime. Hot closures capture only those fences, immutable port IDs and
+the generic named-entry owner, not canonical evidence or a caller-forgeable validation receipt.
+Post-run fence failures still close newly issued leases before publication; cleanup remains
+available after invalidation. This removes proof replay, not runtime storage or lifetime checks.
+
 The primal result carries the exact residual-frontier dependency map required by transpose. A
 zero-residual transpose receives an empty map and needs no artificial primal lifetime; extra or
 stale leases still refuse at the generic named-entry boundary. Seed and gradient storage are fresh
