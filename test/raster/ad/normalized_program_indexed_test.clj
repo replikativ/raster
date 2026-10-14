@@ -29,6 +29,7 @@
   (doseq [[dt array cast] [[:float float-array float] [:double double-array double]]
           [it indices-array] [[:int int-array] [:long long-array]] n [0 3]]
     (let [b (build dt it (if (zero? n) 0 'n))
+          residual-plan (canonical/execution-residual-plan b)
           interface (:interface b) indices0 (vec (take n [2 0 2]))
           indices (indices-array indices0) data (array [2.0 -1.0 5.0])
           env {'indices indices 'data data 'n (long n) 'm (long 3)}
@@ -50,6 +51,13 @@
       (is (= (:id residual) (get-in residual [:producer :result])))
       (is (= it (get-in residual [:value :dtype])))
       (is (= :owned (get-in residual [:value :ownership])))
+      (is (= #{'indices} (set (keys (:owned-arrays residual-plan)))))
+      (is (empty? (:immutable-scalars residual-plan)))
+      (is (identical? residual (get-in residual-plan [:owned-arrays 'indices])))
+      (is (identical? (:physical-bindings b) (:physical-bindings residual-plan)))
+      (is (identical? obligation (get-in residual-plan [:physical-bindings zero])))
+      (is (not (contains? (:residual-bindings b) zero))
+          "the unchanged physical obligation is not an allocated residual")
       (is (not (identical? indices snapshot)))
       (is (not (identical? y snapshot)))
       (is (= indices0 (vec snapshot)))

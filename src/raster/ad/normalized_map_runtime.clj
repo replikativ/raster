@@ -59,8 +59,7 @@
   (let [expected (normalized/revisions)
         indexed? (= :checked-scalar-indexed-map (get-in owner [:derivation :kind]))
         sum? (= :checked-scalar-map-sum (get-in owner [:derivation :kind]))
-        {:keys [source execution-source primal linear transpose interface residual-bindings
-                physical-bindings]} owner
+        {:keys [source execution-source primal linear transpose interface]} owner
         execution-source (or execution-source source)
         seed-id (get-in interface [:cotangent-input :id])
         {:keys [arrays captures attributes lambda]}
@@ -71,15 +70,7 @@
         dt (:dtype (get values active))
         extent-id (:extent attributes)
         capacity-id (when indexed? (first (:shape (get values active))))
-        owned-residuals (into {} (filter (fn [[_ residual]] (= :owned-array (:storage residual))))
-                              residual-bindings)
-        index-snapshot (when indexed? (:id (get owned-residuals (first arrays))))
         gradient-id (get-in interface [:cotangent-result :id])
-        required-zero-gradient (when indexed?
-                                 (some (fn [[_ binding]]
-                                         (when (= gradient-id (get-in binding [:consumer :result]))
-                                           (:requirement binding)))
-                                       physical-bindings))
         projections (mapv route/materialize-host-program [primal linear transpose])
         source-dependencies (if indexed?
                               ;; Admission requires a single direct read and EMPTY locals.
@@ -92,7 +83,15 @@
                                           (conj projections source-dependencies))
         ;; Bind the captured effective callees to the existing selected-call proof,
         ;; rather than blessing a mutation between adaptation and identity capture.
-        _ (canonical/validate! owner)
+        residual-plan (canonical/execution-residual-plan owner)
+        owned-residuals (:owned-arrays residual-plan)
+        physical-bindings (:physical-bindings residual-plan)
+        index-snapshot (when indexed? (:id (get owned-residuals (first arrays))))
+        required-zero-gradient (when indexed?
+                                 (some (fn [[_ binding]]
+                                         (when (= gradient-id (get-in binding [:consumer :result]))
+                                           (:requirement binding)))
+                                       physical-bindings))
         _ (guard!)
         compiled (mapv #(compile-projection % (:source-ns owner)) projections)
         _ (guard!)

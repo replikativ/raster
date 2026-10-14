@@ -33,6 +33,10 @@ hot calls check compiler/rule epochs and captured executable identities without 
 Host projection selects from actual TypedSOAC operations and declared operand roles, rather
 than AD derivation-family labels. Its bounded map, map→reduce and indexed-store admission
 checks remain separate from derivative validation; arbitrary equation chains still refuse.
+After effective callees are captured, host preparation requests a freshly fully validated,
+exhaustive residual plan from the canonical owner. The plan partitions exact existing bindings
+into owned arrays and immutable scalars and carries physical obligations through unchanged. It is
+preparatory evidence only: it allocates nothing and grants no lifetime, lease or GPU execution.
 Indexed pullbacks additionally require private index snapshots and a fresh typed-zero physical
 gradient owner on every call. These are sequential lifetime contracts, not concurrent mutation
 or asynchronous ownership guarantees.

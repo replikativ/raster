@@ -3,7 +3,8 @@
    Scalar derivation evidence remains nested; no rules, evaluator, cache or source importer
    are added. Source/execution correspondence is independently rederived through existing
    scalar and typed-fusion authorities, not a second composition or runtime implementation."
-  (:require [raster.ad.normalized-scalar :as scalar]
+  (:require [clojure.set :as set]
+            [raster.ad.normalized-scalar :as scalar]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]))
 
@@ -161,6 +162,36 @@
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-program-bundle-certificate {})))
   bundle)
+
+(defn execution-residual-plan
+  "Fully validate `owner`, then exhaustively partition its exact residual bindings for an
+   execution consumer. This is a read-only canonical projection: bindings and physical
+   obligations are returned unchanged, and it grants no allocation, lifetime or device authority."
+  [owner]
+  (let [owner (validate! owner)
+        residual-bindings (:residual-bindings owner)
+        physical-bindings (:physical-bindings owner)]
+    (when-not (and (map? residual-bindings) (map? physical-bindings))
+      (fail! :ad-program-bundle-residual-plan
+             {:residual-bindings residual-bindings :physical-bindings physical-bindings}))
+    (let [partition
+          (reduce-kv
+           (fn [result coefficient binding]
+             (case (:storage binding)
+               :owned-array (assoc-in result [:owned-arrays coefficient] binding)
+               :immutable-scalar (assoc-in result [:immutable-scalars coefficient] binding)
+               (fail! :ad-program-bundle-residual-plan
+                      {:coefficient coefficient :storage (:storage binding)})))
+           {:owned-arrays {} :immutable-scalars {}}
+           residual-bindings)
+          owned-keys (set (keys (:owned-arrays partition)))
+          scalar-keys (set (keys (:immutable-scalars partition)))
+          residual-keys (set (keys residual-bindings))]
+      (when-not (and (empty? (set/intersection owned-keys scalar-keys))
+                     (= residual-keys (set/union owned-keys scalar-keys)))
+        (fail! :ad-program-bundle-residual-plan
+               {:residual-keys residual-keys :owned-keys owned-keys :scalar-keys scalar-keys}))
+      (assoc partition :physical-bindings physical-bindings))))
 
 (defn- adapt-kind [bundle kind]
   (let [result (program-envelope (checked-evidence! bundle kind) kind)]

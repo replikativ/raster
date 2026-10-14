@@ -24,6 +24,45 @@
   (normalized/linearize-map-program (#'element/map-program dt options)
                                     (the-ns 'raster.ad.normalized-program-bundle-test)))
 
+(deftest execution-residual-plan-is-exhaustive-exact-and-read-only
+  (let [empty-owner (canonical/adapt-map (simple :double {:body 'element}))
+        array-owner (canonical/adapt-map (simple :double {}))
+        scalar-owner (canonical/adapt-map
+                      (simple :double {:captures '[scale]
+                                       :body '(raster.numeric/* element scale)}))]
+    (doseq [owner [empty-owner array-owner scalar-owner]
+            :let [plan (with-redefs [route/materialize-host-program
+                                     (fn [& _] (throw (ex-info "materialization" {})))]
+                         (canonical/execution-residual-plan owner))
+                  residuals (:residual-bindings owner)
+                  owned (:owned-arrays plan)
+                  scalars (:immutable-scalars plan)]]
+      (is (= (set (keys residuals)) (set (concat (keys owned) (keys scalars)))))
+      (is (empty? (filter (set (keys owned)) (keys scalars))))
+      (doseq [[coefficient binding] residuals]
+        (is (identical? binding
+                        (get (case (:storage binding)
+                               :owned-array owned
+                               :immutable-scalar scalars)
+                             coefficient))))
+      (is (identical? (:physical-bindings owner) (:physical-bindings plan))))
+    (is (empty? (:owned-arrays (canonical/execution-residual-plan empty-owner))))
+    (is (empty? (:immutable-scalars (canonical/execution-residual-plan empty-owner))))
+    (is (seq (:owned-arrays (canonical/execution-residual-plan array-owner))))
+    (is (seq (:immutable-scalars (canonical/execution-residual-plan scalar-owner))))))
+
+(deftest residual-plan-validation-and-storage-cases-fail-closed
+  (let [owner (canonical/adapt-map (simple :double {}))
+        coefficient (first (keys (:residual-bindings owner)))
+        changed (assoc-in owner [:residual-bindings coefficient :storage] :future-storage)]
+    (is (= :ad-program-bundle-correspondence
+           (reason #(canonical/execution-residual-plan (recertify changed)))))
+    ;; Exercise the projection's own exhaustive case independently of the full validator.
+    ;; This narrowly faulted validator is test-only and grants no production skip path.
+    (with-redefs [canonical/validate! identity]
+      (is (= :ad-program-bundle-residual-plan
+             (reason #(canonical/execution-residual-plan changed)))))))
+
 (deftest canonical-programs-execute-through-existing-host-materialization
   (doseq [[v dt array cast] [[#'excluded/weighted-double :double double-array double]
                              [#'excluded/weighted-float :float float-array float]]

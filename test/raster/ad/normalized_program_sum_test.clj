@@ -35,6 +35,7 @@
                              [#'source/weighted-float-sum :float float-array float]]
           n [0 3] active '[xs weights]]
     (let [p (#'source/surface-source v dt) old (build p active) b (canonical/adapt-map-sum old)
+          residual-plan (canonical/execution-residual-plan b)
           prepared (runtime/prepare old)
           x0 (vec (take n [-2.0 0.0 3.0])) w0 (vec (take n [0.5 2.0 -1.0]))
           xs (array x0) weights (array w0) env {'xs xs 'weights weights 'size (long n)}
@@ -54,6 +55,10 @@
       (is (= [active] (get-in b [:interface :active-inputs])))
       (is (= :checked-scalar-map-sum (get-in b [:derivation :kind])))
       (is (empty? (:physical-bindings b)))
+      (is (= (set (keys (:residual-bindings b)))
+             (set (concat (keys (:owned-arrays residual-plan))
+                          (keys (:immutable-scalars residual-plan))))))
+      (is (identical? (:physical-bindings b) (:physical-bindings residual-plan)))
       (is (fingerprint/equivalent? (second (soac/equations p))
                                    (second (soac/equations (:primal b)))))
       (doseq [binding (vals (:residual-bindings b))]
@@ -98,6 +103,14 @@
       (is (= (vec (repeat n (bits (cast -0.0)))) (mapv bits g)))))
   (let [b (canonical/adapt-map-sum (build (#'source/source :float) 'xs))]
     (is (= :float (get-in b [:interface :cotangent-input :value :dtype])))))
+
+(deftest identity-sum-has-an-exact-empty-residual-plan
+  (let [owner (canonical/adapt-map-sum (build (#'sum-runtime/identity-source :double) 'xs))
+        plan (canonical/execution-residual-plan owner)]
+    (is (empty? (:residual-bindings owner)))
+    (is (= {:owned-arrays {} :immutable-scalars {}
+            :physical-bindings (:physical-bindings owner)} plan))
+    (is (identical? (:physical-bindings owner) (:physical-bindings plan)))))
 
 (deftest both-certificates-cannot-authorize-a-changed-sum-contract
   (let [b (canonical/adapt-map-sum (build (#'source/source :double) 'xs))

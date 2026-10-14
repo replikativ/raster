@@ -166,6 +166,7 @@
                              (soac/equations source) (soac/outputs source))
         checked (evidence reordered)
         owner (canonical/adapt-map checked)
+        residual-plan (canonical/execution-residual-plan owner)
         prepared (runtime/prepare-owner owner)
         xs0 (mapv float [4097.0 -3.0 0.5])
         qs0 (mapv float [0.5 -2.0 4.0])
@@ -202,6 +203,17 @@
         source-equations (mapv second (soac/equations source))]
     (is (= 4 (count source-equations)))
     (is (= 1 (count (soac/equations (:execution-source owner)))))
+    (is (= (set (keys (:residual-bindings owner)))
+           (set (concat (keys (:owned-arrays residual-plan))
+                        (keys (:immutable-scalars residual-plan))))))
+    (is (seq (:owned-arrays residual-plan)))
+    (is (seq (:immutable-scalars residual-plan)))
+    (doseq [[coefficient binding] (:residual-bindings owner)]
+      (is (identical? binding
+                      (get (case (:storage binding)
+                             :owned-array (:owned-arrays residual-plan)
+                             :immutable-scalar (:immutable-scalars residual-plan))
+                           coefficient))))
     (is (= (vec (reverse (:inputs (soac/facts source)))) (:inputs prepared)))
     (is (some #(= :immutable-scalar (:storage %)) (vals (:residual-bindings owner))))
     (is (every? #(= source-equations (get-in % [:origin :source-equations]))

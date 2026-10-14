@@ -1,6 +1,7 @@
 (ns raster.ad.normalized-prepared-owner-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.normalized-map-runtime :as runtime]
+            [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-map-element-test :as element]
             [raster.compiler.core.dispatch :as dispatch]
@@ -48,6 +49,16 @@
           (is (= [2.0 -3.0] (vec (second ((:jvp prepared) args (double-array [0.5 0.5])))))))
         (is (= proof-count @validations))
         (is (= projection-count @projections))))))
+
+(deftest direct-owner-preparation-retains-two-independent-full-proofs
+  (let [owner (canonical/adapt-map (build))
+        validations (atom 0) validate normalized/validate!]
+    (with-redefs [normalized/validate! (fn [bundle]
+                                         (swap! validations inc)
+                                         (validate bundle))]
+      (runtime/prepare-owner owner)
+      (is (= 2 @validations)
+          "public owner admission and the post-capture residual plan each fully validate"))))
 
 (deftest effective-receiver-alias-and-direct-operation-identities-are-fenced
   (let [implementation (selected)]
