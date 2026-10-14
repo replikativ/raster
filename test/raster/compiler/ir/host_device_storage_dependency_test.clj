@@ -8,8 +8,10 @@
 
 (deftm stored-scalar-continuation
   [input :- (Array float)] :- Double
-  (let [out (float-array 1)
-        written (par/map-void! i 1 (aset out i (aget input i)))
+  ;; Singleton continuations now have a verified device schedule. A wider buffer deliberately
+  ;; remains outside that admission while exercising the same physical-output alias guard.
+  (let [out (float-array 2)
+        written (par/map-void! i 2 (aset out i (aget input i)))
         result (double (aget out 0))]
     result))
 
@@ -30,7 +32,7 @@
                       (fn [& arguments]
                         (swap! calls conj (:id (first arguments)))
                         (apply original arguments))]
-          (try (equation-first/lower compilation [(float-array [1.2345679])])
+          (try (equation-first/lower compilation [(float-array [1.2345679 2.3456789])])
                (catch clojure.lang.ExceptionInfo e e)))]
     (is (= :emitted-program-host-device-dependency (:reason (ex-data error))))
     (is (some? terminal-id))
