@@ -1021,8 +1021,8 @@
             executable (gpu-link/instantiate! plan)]
         (try
           (is (seq loss-slots))
-          (is (every? #(= :buffer (:kind %)) loss-slots)
-              "the captured reduction has one physical buffer identity, never a GraphScalar")
+          (is (= [:output :input] (mapv :kind loss-slots))
+              "the producer and consumer use buffer ABI roles, never a scalar slot")
           (gpu-link/run! executable)
           (is (= (mapv float-bits (captured-weighted-sum-result initial weights))
                  (mapv float-bits (gpu-link/download executable output-node))))
