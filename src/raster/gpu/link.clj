@@ -233,6 +233,31 @@
        :owned-specs owned-specs
        :node-views node-views})))
 
+(defn- resident-program-executor
+  "Build the existing emitted-program callback boundary over already realized plan storage."
+  [plan session execution-id node-views static-programs? profile? allocation-keys]
+  {:buffer-view (fn [value-id]
+                  (:view (resident-link-value plan node-views value-id)))
+   :bind! (fn [key graph buffers scalars]
+            (let [resident-buffers
+                  (into {}
+                        (map (fn [[compiler-value value-id]]
+                               [compiler-value (resident-link-value plan node-views value-id)]))
+                        buffers)
+                  extent-scalars
+                  (into {}
+                        (map (fn [[expression extent]]
+                               [expression {:type :long :value extent}]))
+                        (bview/first-dimension-extents
+                         (map (fn [[id resident]] [id (:view resident)]) resident-buffers)))]
+              (gpu/bind-kernel-graph!
+               session [::program-graph execution-id key] graph resident-buffers
+               (merge extent-scalars scalars)
+               {:profile? profile? :record? (not static-programs?)})))
+   :adopt-cleanup! #(gpu/retain-program-cleanup! session % @allocation-keys)
+   :run! #(gpu/run-kernel-graph! session %)
+   :release! #(gpu/release-kernel-graph! session %)})
+
 (defn- instantiate-with-options!
   "Instantiate a validated LinkPlan as one replayable LinkedExecutable.
 
@@ -327,31 +352,9 @@
                       (timed-phase!
                        timings :binding
                        (fn []
-                         (let [executor {:buffer-view (fn [value-id]
-                                                        (:view (resident-link-value plan node-views value-id)))
-                                         :bind! (fn [key graph buffers scalars]
-                                                  (let [resident-buffers
-                                                        (into {}
-                                                              (map (fn [[compiler-value value-id]]
-                                                                     [compiler-value
-                                                                      (resident-link-value plan node-views value-id)]))
-                                                              buffers)
-                                                        extent-scalars
-                                                        (into {}
-                                                              (map (fn [[expression extent]]
-                                                                     [expression {:type :long :value extent}]))
-                                                              (bview/first-dimension-extents
-                                                               (map (fn [[id resident]] [id (:view resident)])
-                                                                    resident-buffers)))]
-                                                    (gpu/bind-kernel-graph!
-                                                     session [::program-graph execution-id key] graph
-                                                     resident-buffers (merge extent-scalars scalars)
-                                                     {:profile? profile?
-                                                      :record? (not static-programs?)})))
-                                         :adopt-cleanup! #(gpu/retain-program-cleanup!
-                                                           session % @allocation-keys)
-                                         :run! #(gpu/run-kernel-graph! session %)
-                                         :release! #(gpu/release-kernel-graph! session %)}]
+                         (let [executor (resident-program-executor
+                                         plan session execution-id node-views static-programs?
+                                         profile? allocation-keys)]
                            (if (and (not mixed?) (= 1 (count program-instances))
                                     (link-plan/program-link-instance? (first program-instances)))
                              (let [call (:call (first program-instances))

@@ -492,6 +492,78 @@
           (is (= [(key :owned) (key :external-a) (key :external-b)]
                  @allocation-keys)))))))
 
+(deftest resident-program-executor-preserves-binding-and-callback-contracts
+  (let [allocation (bview/allocation {:id :resident :byte-size 16 :memory-space :device
+                                      :device :ze:0 :ownership :owned})
+        view (bview/view allocation {:id :resident-view :dtype :float :shape [4]})
+        resident (gpu/->ResidentBufferView ::session :resident-key view)
+        plan {:values {:x (link-plan/value
+                           {:id :x :abstract (av/tensor {:dtype :float :shape [4]})
+                            :leaves [{:name :value :node :x}]})}}
+        node-views {:x resident}
+        allocation-keys (volatile! [:root-a])
+        calls (atom [])
+        owner (cleanup/owner [])]
+    (with-redefs [gpu/bind-kernel-graph!
+                  (fn [session key graph buffers scalars options]
+                    (swap! calls conj [:bind session key graph buffers scalars options])
+                    :bound-handle)
+                  gpu/retain-program-cleanup!
+                  (fn [session actual-owner roots]
+                    (swap! calls conj [:adopt session actual-owner (vec roots)]))
+                  gpu/run-kernel-graph!
+                  (fn [session handle] (swap! calls conj [:run session handle]) :ran)
+                  gpu/release-kernel-graph!
+                  (fn [session handle] (swap! calls conj [:release session handle]) :released)]
+      (let [executor (#'gpu-link/resident-program-executor
+                      plan ::session :execution node-views true true allocation-keys)
+            explicit-scalars {(list 'extent 'x) {:type :long :value 99}
+                              'alpha {:type :float :value 0.5}}
+            graph (Object.)]
+        (is (= view ((:buffer-view executor) :x)))
+        (is (= :bound-handle
+               ((:bind! executor) :binding graph {'x :x 'y :x} explicit-scalars)))
+        (vswap! allocation-keys conj :root-b)
+        ((:adopt-cleanup! executor) owner)
+        (is (= :ran ((:run! executor) :bound-handle)))
+        (is (= :released ((:release! executor) :bound-handle)))
+        (let [[_ session key actual-graph buffers scalars options] (first @calls)]
+          (is (= ::session session))
+          (is (= [::gpu-link/program-graph :execution :binding] key))
+          (is (identical? graph actual-graph))
+          (is (identical? resident (get buffers 'x)))
+          (is (identical? resident (get buffers 'y)))
+          (is (= {(list 'extent 'x) {:type :long :value 99}
+                  (list 'extent 'y) {:type :long :value 4}
+                  'alpha {:type :float :value 0.5}}
+                 scalars)
+              "explicit scalar values retain precedence over derived extents")
+          (is (= {:profile? true :record? false} options)))
+        (is (= [:adopt ::session owner [:root-a :root-b]] (second @calls)))
+        (is (= [:run ::session :bound-handle] (nth @calls 2)))
+        (is (= [:release ::session :bound-handle] (nth @calls 3)))
+        (let [dynamic-executor (#'gpu-link/resident-program-executor
+                                plan ::session :dynamic node-views false false allocation-keys)]
+          (is (= :bound-handle
+                 ((:bind! dynamic-executor) :dynamic-binding graph {'x :x} {})))
+          (is (= {:profile? false :record? true} (last (last @calls))))))))
+  (testing "executor callbacks preserve exact primary failures"
+    (let [failure (ex-info "bind failed" {})
+          allocation (bview/allocation {:id :failure :byte-size 4 :memory-space :device
+                                        :device :ze:0 :ownership :owned})
+          resident (gpu/->ResidentBufferView
+                    ::session :failure-key
+                    (bview/view allocation {:dtype :float :shape [1]}))
+          plan {:values {:x (link-plan/value
+                             {:id :x :abstract (av/tensor {:dtype :float :shape [1]})
+                              :leaves [{:name :value :node :x}]})}}
+          executor (#'gpu-link/resident-program-executor
+                    plan ::session :execution {:x resident} false false (volatile! []))]
+      (with-redefs [gpu/bind-kernel-graph! (fn [& _] (throw failure))]
+        (is (identical? failure
+                        (try ((:bind! executor) :binding ::graph {'x :x} {})
+                             (catch Throwable error error))))))))
+
 (deftest owned-runtime-allocation-preserves-the-certified-identity
   (let [session (atom {:device-id :ze:0 :session-id :session
                        :buffers {} :allocations {} :closed? false})
