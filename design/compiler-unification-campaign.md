@@ -12,8 +12,11 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 - Compiler-generated pure TypedSOAC now enters the existing equation-first scheduling/emission
   tail without fabricated Clojure source or another type-inference authority. Named-entry storage
-  contracts and the shared allocation/executor seams are prerequisites for resident residuals;
-  they do not yet enable normalized device AD, delayed pullbacks or default-engine migration.
+  contracts, the shared owner and generic resident binder now support a durable test-only
+  canonical Float primal/residual/transpose composition on local OpenCL and Level Zero.
+  Independent Float-bit oracles, changed seeds/generations, caller-input mutation and
+  epoch/callee/lifetime refusals pass. Public normalized-device adapters, general DAGs,
+  delayed public pullbacks and default-engine migration remain open.
 - The fresh unchanged real-checkpoint Gemma gate fails 12 of 28 adapter gradient checks. A
   same-CPU-operand layer control still fails 4 of 14, so inter-layer input drift alone is not the
   explanation. The reduced two-layer public chain passes its unchanged numerical bounds on two
