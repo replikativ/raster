@@ -2897,7 +2897,8 @@
    :attributes attributes})
 
 (defn append-pure-spines
-  "Append two validated single-equation pure spines at an explicit consumer→producer boundary.
+  "Append a validated nonempty pure producer spine and one pure consumer equation at an
+   explicit consumer→producer boundary.
    Shared value facts must already agree; this operation infers neither types nor ownership.
    Numerical attributes, equation facts and provenance remain explicit. Output order is caller
    supplied and checked by the ordinary TypedSOAC validator. Opaque extension facts must not
@@ -2909,14 +2910,15 @@
   (let [pf (facts producer) cf (facts consumer)
         consumer-inputs (set (:inputs cf)) producer-outputs (set (outputs producer))
         producer-definitions (set (mapcat #(nth % 2) (equations producer)))]
-    (doseq [p [producer consumer]
-            :let [f (facts p) es (equations p)]]
-      (when-not (and (= 1 (count es)) (empty? (:effects f)) (empty? (:aliases f))
+    (doseq [[role p] [[:producer producer] [:consumer consumer]]
+            :let [f (facts p) es (equations p)
+                  exact-cardinality? (if (= :producer role) (seq es) (= 1 (count es)))]]
+      (when-not (and exact-cardinality? (empty? (:effects f)) (empty? (:aliases f))
                      (every? #(and (empty? (get-in f [:equations (second %) :aliases]))
                                    (empty? (result-storage f (second %)))) es))
         (fail! :typed-soac-composition-boundary
-               "pure spine append requires single-equation programs without effects or physical bindings"
-               {:program p})))
+               "pure spine append requires a nonempty producer, one consumer equation and no effects or physical bindings"
+               {:role role :program p})))
     (when-not (and (map? boundary)
                    (every? (fn [[from to]] (and (contains? consumer-inputs from)
                                               (contains? producer-outputs to))) boundary)

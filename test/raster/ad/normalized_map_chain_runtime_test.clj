@@ -40,6 +40,25 @@
    {:dtype :float :array-types {'x :float}
     :scalar-types {'n :long 'scale :float}}))
 
+(defn- four-map-spine [extent]
+  (frontend/form->program
+   (walk/postwalk-replace
+    {'spine-extent extent}
+    '(let* [squared (raster.par/pmap i spine-extent float
+                                     (raster.numeric/* (clojure.core/aget x i)
+                                                       (clojure.core/aget x i)))
+            fourth (raster.par/pmap j spine-extent float
+                                    (raster.numeric/* (clojure.core/aget squared j)
+                                                      (clojure.core/aget squared j)))
+            scaled (raster.par/pmap k spine-extent float
+                                    (raster.numeric/* (clojure.core/aget fourth k) scale))
+            result (raster.par/pmap l spine-extent float
+                                    (raster.numeric/* (clojure.core/aget scaled l)
+                                                      (clojure.core/aget q l)))]
+           result))
+   {:dtype :float :array-types {'x :float 'q :float}
+    :scalar-types (merge {'scale :float} (if (symbol? extent) {extent :long} {}))}))
+
 (defn- evidence
   ([source] (evidence source 'x))
   ([source active]
@@ -141,6 +160,71 @@
       (dotimes [i 3] (aset grad i (float 42.0)))
       (is (= (mapv fbits gradient) (mapv fbits (nth (pullback dy) x-slot)))))))
 
+(deftest four-stage-runtime-preserves-checkpoints-order-captures-and-snapshots
+  (let [source (four-map-spine 'n)
+        reordered (soac/make (update (soac/facts source) :inputs #(vec (reverse %)))
+                             (soac/equations source) (soac/outputs source))
+        checked (evidence reordered)
+        owner (canonical/adapt-map checked)
+        prepared (runtime/prepare-owner owner)
+        xs0 (mapv float [4097.0 -3.0 0.5])
+        qs0 (mapv float [0.5 -2.0 4.0])
+        dx0 (mapv float [0.25 -0.5 2.0])
+        dy0 (mapv float [-0.5 1.25 3.0])
+        scale (float 0.25)
+        xs (float-array xs0) qs (float-array qs0)
+        dx (float-array dx0) dy (float-array dy0)
+        args (arguments prepared {'n (long 3) 'x xs 'q qs 'scale scale})
+        [output pullback] ((:vjp prepared) args)
+        [jvp-output tangent] ((:jvp prepared) args dx)
+        forward (fn [x q]
+                  (let [a (float (* x x))
+                        b (float (* a a))
+                        c (float (* b scale))]
+                    [a b c (float (* c q))]))
+        tangent-oracle
+        (fn [x q d]
+          (let [[a] (forward x q)
+                da (float (* (float (* (float 2.0) x)) d))
+                db (float (* (float (* (float 2.0) a)) da))
+                dc (float (* db scale))]
+            (float (* dc q))))
+        gradient-oracle
+        (fn [x q seed]
+          (let [[a] (forward x q)
+                dc (float (* q seed))
+                db (float (* scale dc))
+                da (float (* (float (* (float 2.0) a)) db))]
+            (float (* (float (* (float 2.0) x)) da))))
+        primal (mapv (fn [x q] (last (forward x q))) xs0 qs0)
+        expected-tangent (mapv tangent-oracle xs0 qs0 dx0)
+        expected-gradient (mapv gradient-oracle xs0 qs0 dy0)
+        source-equations (mapv second (soac/equations source))]
+    (is (= 4 (count source-equations)))
+    (is (= 1 (count (soac/equations (:execution-source owner)))))
+    (is (= (vec (reverse (:inputs (soac/facts source)))) (:inputs prepared)))
+    (is (some #(= :immutable-scalar (:storage %)) (vals (:residual-bindings owner))))
+    (is (every? #(= source-equations (get-in % [:origin :source-equations]))
+                (vals (:residual-bindings owner))))
+    (is (= (mapv fbits primal) (mapv fbits output) (mapv fbits jvp-output)))
+    (is (= (mapv fbits expected-tangent) (mapv fbits tangent)))
+    (dotimes [i 3]
+      (aset xs i (float 99.0))
+      (aset qs i (float 88.0))
+      (aset output i (float -77.0)))
+    (let [slots (pullback dy)
+          x-slot (.indexOf ^java.util.List (:inputs prepared) 'x)
+          q-slot (.indexOf ^java.util.List (:inputs prepared) 'q)]
+      (is (= (mapv fbits expected-gradient) (mapv fbits (nth slots x-slot))))
+      (is (nil? (nth slots q-slot))))
+    (is (= :ad-program-bundle-correspondence
+           (reason #(canonical/validate!
+                     (recertify
+                      (update-in owner
+                                 [:residual-bindings (first (keys (:residual-bindings owner)))
+                                  :origin :source-equations]
+                                 reverse))))))))
+
 (deftest consumer-scalar-capture-keeps-its-outer-input-owner
   (let [checked (evidence (scalar-capture-chain))
         owner (canonical/adapt-map checked)
@@ -194,6 +278,16 @@
 (deftest zero-extent-executes-without-inventing-residual-values
   (let [prepared (runtime/prepare (evidence (typed-chain 0)))
         args (arguments prepared {'x (float-array 0) 'q (float-array 0)})
+        [output pullback] ((:vjp prepared) args)
+        [jvp-output tangent] ((:jvp prepared) args (float-array 0))
+        slots (pullback (float-array 0))]
+    (is (= [] (vec output) (vec jvp-output) (vec tangent)))
+    (is (= [] (vec (nth slots (.indexOf ^java.util.List (:inputs prepared) 'x)))))
+    (is (nil? (nth slots (.indexOf ^java.util.List (:inputs prepared) 'q))))))
+
+(deftest finite-spine-zero-extent-retains-empty-primal-jvp-and-vjp
+  (let [prepared (runtime/prepare (evidence (four-map-spine 0)))
+        args (arguments prepared {'x (float-array 0) 'q (float-array 0) 'scale (float 0.25)})
         [output pullback] ((:vjp prepared) args)
         [jvp-output tangent] ((:jvp prepared) args (float-array 0))
         slots (pullback (float-array 0))]

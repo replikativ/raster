@@ -1,5 +1,24 @@
 # Local compiler evidence — 2026-09-27
 
+## Unchanged reduced-width external Gemma composition — 2026-10-14
+
+The pinned numerical declarations from finetune-rstr `9e9ba5d62f3822f056e01c37231d7eaa7c84947c`
+execute through the existing public five-component forward/seed/backward composition on Level Zero.
+The configuration is batch 1, sequence 16, width 64, head dimension 32 and adapter rank 8;
+weight seeds are 11/12, adapter seeds 21/22 with scale 0.02, input seed 31 and target seed 32
+with scale 0.5. The unchanged monolithic CPU AD oracle checks every adapter and the input gradient.
+Both resident updates pass the original componentwise 0.02 threshold: the maximum adapter errors
+are 0.00160607 and 0.00132199 across all 28 adapters; input-gradient errors are 0.000173066
+and 0.00199445. Loss errors are 4.76837e-7 and zero. Replay invalidates prior output handles,
+and the composed artifact closes afterward.
+
+The first preparation/binding took 115.7/30.3 seconds, and a subsequent warm preparation/binding
+took 11.4/6.1 seconds in the same capped process under varying background load. These are
+observations, not a controlled cache-speedup or throughput benchmark. This is the synthetic
+reduced-width external Gate 2, **not** the real-checkpoint case whose 11/28 adapter failures remain
+open. The source loader evaluates only byte-checked original numerical/oracle declarations;
+it neither upgrades the stale external session adapter nor substitutes a different training oracle.
+
 ## Explicit widened contraction prototype — 2026-10-10
 
 An isolated branch from coherent compiler head `18164d73` prototypes the named

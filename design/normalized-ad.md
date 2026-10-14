@@ -7,14 +7,16 @@ retained-interface reconstruction. Validation still independently checks scalar 
 reconstructing the stage; it neither trusts producer certification nor allocates new residual or
 interface identities. The bounded composition below adds an exact execution-source view to the
 canonical map owner while retaining the original source as public authority. Existing operation
-coverage, residual order and numerical policies are unchanged; arbitrary chains and device AD
+coverage, residual order and numerical policies are unchanged; arbitrary DAGs and device AD
 remain outside the boundary.
 
-A checked composition boundary admits exactly two pure homogeneous maps whose sole intermediate
-is the consumer's element input. Exact equation subprograms must reconstruct the original source
-through `append-pure-spines`; the existing target-neutral fusion pass must then derive exactly one
-vertical map. Scalar projection and differentiation consume that transient fused stage while the
-bundle retains the untouched two-equation source, and validation repeats the same append, fusion,
+A checked composition boundary admits a finite linear spine of at least two pure homogeneous maps.
+Every intermediate is private, has exactly one consumer equation (the immediately following map), and is proven
+through its exact equation subprogram. Those subprograms must reconstruct the original source
+through repeated `append-pure-spines`; the existing target-neutral fusion pass must then derive
+exactly one vertical map with N-1 vertical fusions in N iterations. Scalar projection and
+differentiation consume that transient fused stage while the bundle retains the untouched
+multi-equation source, and validation repeats the same append, fusion,
 rule replay and fixed-interface stage construction. Float conversions and typed locals survive as
 explicit checkpoints; no source facts or fusion provenance are scrubbed. Canonical adaptation and
 host execution retain both the untouched source/public interface and the independently rederived
@@ -732,9 +734,11 @@ No caller array is retained as a residual. This does not add a runtime mode or g
 composition.
 
 Construction uses `soac/append-pure-spines` instead of a family-local right-biased fact
-merge. The consumer→producer boundary is explicit, including identity mappings. Both
-inputs are validated single-equation pure programs without aliases or physical result
-bindings. Shared AbstractValues and provenance must agree exactly; equation IDs remain
+merge. Each consumer→producer boundary is explicit, including identity mappings. The shared
+operation accepts a validated nonempty pure producer program and one pure consumer equation;
+the normalized-AD caller separately proves that the producer is a linear spine. Neither input may
+carry aliases or physical result bindings. Shared AbstractValues and provenance must
+agree exactly; equation IDs remain
 disjoint, remaining program contracts must match, and ordinary validation checks the
 combined definition/use scope and caller-supplied output order. This operation neither
 infers ownership nor grants reassociation. The AD adapter separately proves its existing

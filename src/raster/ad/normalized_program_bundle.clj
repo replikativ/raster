@@ -48,7 +48,7 @@
         {:keys [source primal linear transpose required-zero-gradient]} programs
         execution-source (:source execution-scope)
         execution-source (or execution-source source)
-        chain? (and plain-map? (= 2 (count (soac/equations source))))
+        composed? (and plain-map? (< 1 (count (soac/equations source))))
         {:keys [active-input tangent-input tangent-output cotangent-input gradient-output
                 residual-arrays scalar-captures]} (get-in bundle [:map-programs :interface])
         indexed-interface (:interface programs)
@@ -77,7 +77,7 @@
                    {:coefficients (vec coefficients)
                     :execution-equation execution-equation}))
         origin (fn [coefficient]
-                 (if chain?
+                 (if composed?
                    {:source-equations source-equations
                     :execution-equation execution-equation
                     :scalar-value coefficient}
@@ -175,9 +175,9 @@
   (adapt-kind bundle (evidence-kind! bundle)))
 
 (defn adapt-map
-  "Adapt one admitted map stage or checked two-map composition to canonical AD programs.
+  "Adapt one admitted map stage or checked finite linear-map composition to canonical AD programs.
    Original source/public interfaces and rederived execution scope remain distinct. Sum/indexed
-   evidence and arbitrary chains are not admitted through this entry.
+   evidence and arbitrary map DAGs are not admitted through this entry.
    No allocation or execution occurs. The evidence is transitional and may be retired only
    after a common program validator owns the same source/derivative/ownership obligations."
   [bundle]

@@ -27,6 +27,18 @@
                                                      (clojure.core/float 16785408.0)))]
          shifted))
 
+(def ^:private three-map-source
+  '(let* [squared (raster.par/pmap i n float
+                                   (raster.numeric/* (clojure.core/aget x i)
+                                                     (clojure.core/aget x i)))
+          fourth (raster.par/pmap j n float
+                                  (raster.numeric/* (clojure.core/aget squared j)
+                                                    (clojure.core/aget squared j)))
+          eighth (raster.par/pmap k n float
+                                  (raster.numeric/* (clojure.core/aget fourth k)
+                                                    (clojure.core/aget fourth k)))]
+         eighth))
+
 (defn- typed-source [source]
   (frontend/form->program source {:dtype :float :array-types {'x :float}
                                   :scalar-types {'n :long}}))
@@ -79,6 +91,21 @@
       (is (= '[map] (mapv soac/operation-kind
                            (soac/equations (:execution-source owner)))))
       (is (identical? owner (canonical/validate! owner))))))
+
+(deftest exact-three-map-source-retains-lineage-and-one-execution-stage
+  (let [source (typed-source three-map-source)
+        bundle (build source)
+        programs (:map-programs bundle)
+        owner (canonical/adapt-map bundle)
+        source-equations (mapv second (soac/equations source))]
+    (is (identical? source (:source programs)))
+    (is (= '[map map map] (mapv soac/operation-kind (soac/equations (:source programs)))))
+    (is (= '[map] (mapv soac/operation-kind (soac/equations (:primal programs)))))
+    (is (= '[map] (mapv soac/operation-kind (soac/equations (:execution-source owner)))))
+    (is (every? #(= source-equations (get-in % [:origin :source-equations]))
+                (vals (:residual-bindings owner))))
+    (is (identical? bundle (normalized/validate! bundle)))
+    (is (identical? owner (canonical/validate! owner)))))
 
 (deftest retained-public-input-order-is-not-a-type-erasing-canonicalization
   (let [source (typed-source square-chain-source)
@@ -199,6 +226,10 @@
         chain (typed-source square-chain-source)
         public-intermediate (soac/make (soac/facts chain) (soac/equations chain)
                                        '[squared fourth])
+        long-chain (typed-source three-map-source)
+        public-long-intermediate (soac/make (soac/facts long-chain)
+                                            (soac/equations long-chain)
+                                            '[squared eighth])
         horizontal
         (frontend/form->program
          '(let* [left (raster.par/pmap i n float
@@ -209,13 +240,32 @@
                                                           (clojure.core/aget q j)))]
                 right)
          {:dtype :float :array-types {'x :float 'q :float} :scalar-types {'n :long}})
-        three-maps
+        dag
         (frontend/form->program
-         '(let* [a (raster.par/pmap i n float (clojure.core/aget x i))
-                 b (raster.par/pmap j n float (clojure.core/aget a j))
-                 c (raster.par/pmap k n float (clojure.core/aget b k))]
+         '(let* [a (raster.par/pmap i n float
+                                    (raster.numeric/* (clojure.core/aget x i)
+                                                      (clojure.core/aget x i)))
+                 b (raster.par/pmap j n float
+                                    (raster.numeric/* (clojure.core/aget a j)
+                                                      (clojure.core/aget a j)))
+                 c (raster.par/pmap k n float
+                                    (raster.numeric/* (clojure.core/aget a k)
+                                                      (clojure.core/aget b k)))]
                 c)
          {:dtype :float :array-types {'x :float} :scalar-types {'n :long}})
+        skipped
+        (frontend/form->program
+         '(let* [a (raster.par/pmap i n float
+                                    (raster.numeric/* (clojure.core/aget x i)
+                                                      (clojure.core/aget x i)))
+                 b (raster.par/pmap j n float
+                                    (raster.numeric/* (clojure.core/aget q j)
+                                                      (clojure.core/aget q j)))
+                 c (raster.par/pmap k n float
+                                    (raster.numeric/* (clojure.core/aget a k)
+                                                      (clojure.core/aget b k)))]
+                c)
+         {:dtype :float :array-types {'x :float 'q :float} :scalar-types {'n :long}})
         conversion
         (frontend/form->program
          '(let* [converted (raster.par/pmap i n float
@@ -241,7 +291,8 @@
            (reason #(build one-map))))
     (is (some? (reason #(build wrong-extent))))
     (is (some? (reason #(build public-intermediate))))
-    (doseq [[label source] [[:horizontal horizontal] [:extra-equation three-maps]
+    (is (some? (reason #(build public-long-intermediate))))
+    (doseq [[label source] [[:horizontal horizontal] [:dag dag] [:skipped-link skipped]
                             [:active-conversion conversion]
                             [:three-fused-arrays three-fused-arrays]]]
       (is (some? (reason #(build source))) (name label)))))

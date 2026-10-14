@@ -4,7 +4,10 @@
             [raster.ad.normalized-map-sum-test :as sums]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
-            [raster.compiler.ir.soac-dialect :as soac]))
+            [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
+            [raster.numeric]
+            [raster.par]))
 
 (defn- parts []
   (soac/equation-subprograms (#'sums/source :double)))
@@ -29,6 +32,34 @@
     (doseq [part [p c] [id facts] (:equations (soac/facts part))]
       (is (fingerprint/equivalent? facts (get-in (soac/facts combined) [:equations id]))))
     (is (identical? combined (soac/validate! combined)))))
+
+(deftest accumulated-pure-spine-accepts-one-more-exact-consumer
+  (let [source
+        (frontend/form->program
+         '(let* [a (raster.par/pmap i n float
+                                     (raster.numeric/* (clojure.core/aget x i)
+                                                       (clojure.core/aget x i)))
+                 b (raster.par/pmap j n float
+                                     (raster.numeric/+ (clojure.core/aget a j)
+                                                       (clojure.core/float 1.0)))
+                 c (raster.par/pmap k n float
+                                     (raster.numeric/* (clojure.core/aget b k)
+                                                       (clojure.core/float 2.0)))]
+                c)
+         {:dtype :float :array-types {'x :float} :scalar-types {'n :long}})
+        [a b c] (soac/equation-subprograms source)
+        ab (soac/append-pure-spines a b {'a 'a} '[b])
+        abc (soac/append-pure-spines ab c {'b 'b} '[c])
+        rebuilt (soac/make (assoc (soac/facts abc)
+                                  :inputs (:inputs (soac/facts source)))
+                           (soac/equations abc) (soac/outputs abc))]
+    (is (= 2 (count (soac/equations ab))))
+    (is (= (soac/equations source) (soac/equations abc)))
+    (is (= (soac/outputs source) (soac/outputs abc)))
+    (is (#'normalized/exact-semantic-members? (:inputs (soac/facts source))
+                                               (:inputs (soac/facts abc))))
+    (is (fingerprint/equivalent? source rebuilt))
+    (is (identical? abc (soac/validate! abc)))))
 
 (deftest conflicting-shared-value-facts-never-prefer-either-side
   (let [[p c] (parts)]
