@@ -72,15 +72,16 @@
         capacity-id (when indexed? (first (:shape (get values active))))
         gradient-id (get-in interface [:cotangent-result :id])
         projections (mapv route/materialize-host-program [primal linear transpose])
-        source-dependencies (if indexed?
-                              ;; Admission requires a single direct read and EMPTY locals.
-                              ;; The scalar identity lane omits this executable read/alias.
-                              ;; Capture its original checked lambda, not another importer.
-                              (let [{:keys [parameters body-results]} (soac/lambda-parts lambda)]
-                                {:parameters parameters :body body-results})
-                              (normalized/execution-source (get-in owner [:derivation :bundle])))
+        source-dependencies
+        (cond-> (normalized/execution-sources (get-in owner [:derivation :bundle]))
+          indexed?
+          ;; Admission requires a single direct read and EMPTY locals. The scalar identity lane
+          ;; omits this executable read/alias, so capture its original checked lambda in addition
+          ;; to all three raw scalar programs, not through another importer.
+          (conj (let [{:keys [parameters body-results]} (soac/lambda-parts lambda)]
+                  {:parameters parameters :body body-results})))
         guard! (normalized/execution-guard (:source-ns owner) expected
-                                          (conj projections source-dependencies))
+                                          (into projections source-dependencies))
         ;; Bind the captured effective callees to the existing selected-call proof,
         ;; rather than blessing a mutation between adaptation and identity capture.
         residual-plan (canonical/execution-residual-plan owner)

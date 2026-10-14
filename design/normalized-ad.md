@@ -10,10 +10,10 @@ Effects, aliases, physical result storage and native initialization providers re
 analyzed-source promotion still independently proves the complete source return.
 
 This is a compiler-frontier prerequisite, not normalized device execution. Canonical map/sum
-primal and transpose programs promote, schedule and emit through all four C-family dialects.
-Their JVP programs also promote and schedule, but emission currently refuses retained `grad-acc`
-at shared scalar-to-KernelBody lowering. That helper must become proven canonical arithmetic
-before backend emission; no target-specific AD rule is introduced. The common source-free
+primal, linear and transpose programs promote, schedule and emit through all four C-family
+dialects. Generated map lambdas project only a checked homogeneous non-nil Float/Double
+`grad-acc` to ordinary typed addition; the original scalar programs remain derivation and
+executable-dependency authority. No target-specific AD rule is introduced. The common source-free
 compilation/Prepared entry and same-session named-entry ownership remain required before delayed
 device pullbacks can retain private residuals safely. No default-engine migration is implied.
 

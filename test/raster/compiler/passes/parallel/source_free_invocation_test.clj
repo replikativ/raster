@@ -13,9 +13,6 @@
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
-(defn- failure-data [f]
-  (try (f) nil (catch clojure.lang.ExceptionInfo error (ex-data error))))
-
 (defn- change-facts [program f]
   (apply list (assoc (vec program) 1 (f (soac/facts program)))))
 
@@ -189,27 +186,7 @@
       (is (= :typed-parallel (:dialect promoted)))
       (is (= :scheduled-parallel (:dialect scheduled)))
       (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
-        (if (= :linear phase)
-          ;; Canonical linear programs currently retain reverse/grad-acc. Promotion and scheduling
-          ;; are valid; the common ScalarIR-to-KernelBody construction does not yet own that
-          ;; operation, independently of the selected C-family target.
-          (let [failure (failure-data
-                         #(c-family/emit-program
-                           scheduled {:target-dialect target :dtype :double}))]
-            (is (= (if (contains? #{:cuda :hip} target)
-                     :kernel-graph-target-lowering-missing
-                     :segmap-kernel-body-declined)
-                   (:reason failure))
-                (str family " " target " linear emission reason"))
-            (when (contains? #{:cuda :hip} target)
-              (is (= :none (:fallback failure))))
-            (is (= :scalar-expression
-                   (:missing-rule (or (:kernel-body-decline failure) failure)))
-                (str family " " target " missing shared scalar rule"))
-            (is (= 'raster.ad.reverse/grad-acc
-                   (first (:expression (or (:kernel-body-decline failure) failure))))
-                (str family " " target " retained canonical operation")))
-          (let [{:keys [program kernels]}
-                (c-family/emit-program scheduled {:target-dialect target :dtype :double})]
-            (is (seq kernels))
-            (is (some? program))))))))
+        (let [{:keys [program kernels]}
+              (c-family/emit-program scheduled {:target-dialect target :dtype :double})]
+          (is (seq kernels) (str family " " phase " " target " kernels"))
+          (is (some? program) (str family " " phase " " target " program")))))))

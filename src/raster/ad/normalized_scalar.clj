@@ -472,12 +472,25 @@
                   :cotangent-seed (:seed transposed)})
         (fail! :ad-normalized-derivation-correspondence {})))))
 
-(defn ^:no-doc execution-source
-  "Project already validated scalar primal bindings for executable dependency capture.
-   This is not source importing, host materialization, or an independent validator."
+(defn- scalar-program-source [program parameters]
+  {:parameters parameters
+   :body (list 'let* (bindings program) (soac/outputs program))})
+
+(defn ^:no-doc execution-sources
+  "Project the raw primal, linear and transpose scalar programs for executable dependency capture.
+
+   Generated map lambdas may use an independently proved canonical operation spelling. These raw
+   projections keep every original helper Var and rule-produced call in the execution guard. This
+   is not source importing, host materialization, or an independent validator."
   [bundle]
-  {:parameters (:params bundle)
-   :body (list 'let* (bindings (:primal bundle)) (soac/outputs (:primal bundle)))})
+  [(scalar-program-source (:primal bundle) (:params bundle))
+   (scalar-program-source (:linear bundle) (:inputs (soac/facts (:linear bundle))))
+   (scalar-program-source (:transpose bundle) (:inputs (soac/facts (:transpose bundle))))])
+
+(defn ^:no-doc execution-source
+  "Project the validated raw scalar primal for compatibility with existing guard callers."
+  [bundle]
+  (scalar-program-source (:primal bundle) (:params bundle)))
 
 (defn ^:no-doc execution-guard
   "Capture effective executable Var identities in already checked source projections.
@@ -943,13 +956,50 @@
     ;; coefficients per lane, including invariant locals, without another activity analysis.
     {:scalars scalars :arrays (vec (remove #(contains? scalars %) (:residuals bundle)))}))
 
+(defn- canonical-scalar-accumulation!
+  "Replace one already checked homogeneous scalar grad-acc with its non-nil addition semantics.
+
+   The exact helper Var, retained AVs and selected call contracts prove both operands and the result
+   inhabit the same Float/Double scalar space. No spelling, result hint, array value or nil identity
+   authorizes this projection. The original scalar program remains the derivation and dependency
+   authority."
+  [values result expression]
+  (if-not (seq? expression)
+    expression
+    (let [{:keys [template-identity arguments dispatch? implementation-op] :as call}
+          (call! values expression)]
+      (if-not (= 'raster.ad.reverse/grad-acc template-identity)
+        expression
+        (let [result-dtype (scalar-dtype! (get values result))
+              argument-dtypes (mapv #(expression-dtype values %) arguments)]
+          (when-not (and (not dispatch?)
+                         (symbol? implementation-op)
+                         (identical? #'raster.ad.reverse/grad-acc (resolve implementation-op))
+                         (= 2 (count arguments))
+                         (= [result-dtype result-dtype] argument-dtypes))
+            (fail! :ad-normalized-scalar-accumulation
+                   {:result result :expression expression
+                    :implementation implementation-op :dispatch dispatch?
+                    :result-dtype result-dtype :argument-dtypes argument-dtypes}))
+          ;; Validate the exact retained grad-acc selection before projecting its checked non-nil
+          ;; scalar case, then prove the replacement through the ordinary addition authority too.
+          (binding-dtype! values result expression)
+          (selected-call-contract! call argument-dtypes result-dtype)
+          (let [addition (tagged (list 'raster.numeric/+ (first arguments) (second arguments))
+                                 result-dtype)
+                addition-call (call! values addition)]
+            (selected-call-contract! addition-call argument-dtypes result-dtype)
+            addition))))))
+
 (defn- scalar-program-lambda [program parameters outputs]
-  (soac/lambda-form
-   parameters
-   (mapv (fn [[id expression]]
-           (soac/local-value id (:dtype (get-in (soac/facts program) [:values id])) expression))
-         (partition 2 (bindings program)))
-   outputs))
+  (let [values (:values (soac/facts program))]
+    (soac/lambda-form
+     parameters
+     (mapv (fn [[id expression]]
+             (soac/local-value id (:dtype (get values id))
+                               (canonical-scalar-accumulation! values id expression)))
+           (partition 2 (bindings program)))
+     outputs)))
 
 (defn- generated-map-program
   "Assemble a generated map using canonical executable dependencies. Extra retained value IDs
