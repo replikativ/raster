@@ -14,7 +14,9 @@
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.backend.jvm.typed-scalar :as scalar]
             [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-equation-dispatch :as equation-dispatch]
             [raster.compiler.ir.emitted-parallel-equation :as emitted-equation]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
@@ -26,7 +28,9 @@
             [raster.compiler.ir.kernel-executable :as kernel-executable]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.numerical-contract :as numerics]
+            [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
@@ -366,6 +370,242 @@
                    :contraction-candidate-declines (get @declines :admission {})
                    :contraction-screen-declines (get @declines :screen {}))}))
 
+(defn- compilation-policy
+  "Resolve one immutable target/schedule policy shared by source and source-free compilation."
+  [function-id target options captured-target]
+  (let [target-descriptor (validate-target-description!
+                           target (or captured-target (hardware/descriptor-for target)))
+        resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
+        _ (when (and (= :dispatch-mixed-matrix
+                        (get-in resolved-schedule [:typed-contraction :strategy]))
+                     (not= :mixed-f16-f32 (get-in options [:schedule :precision])))
+            (fail! :equation-first-matrix-consent
+                   "mixed matrix dispatch requires an explicit :schedule :precision :mixed-f16-f32"
+                   {:function function-id :fallback :none}))
+        _ (when (and (= :dispatch-mixed-matrix
+                        (get-in resolved-schedule [:typed-contraction :strategy]))
+                     (or (not= :default
+                               (get-in resolved-schedule [:typed-contraction :matrix-tiles]))
+                         (seq (get-in resolved-schedule
+                                      [:typed-contraction :split-factors]))))
+            (fail! :equation-first-matrix-candidate-space
+                   "public mixed matrix dispatch currently admits one full-K tile, not a tile space or split-K"
+                   {:function function-id :fallback :none}))
+        _ (when (and (seq (get-in resolved-schedule
+                                  [:typed-contraction :measured-selectors]))
+                     (not (contains? #{:dispatch-register-tiled :dispatch-mixed-matrix}
+                                     (get-in resolved-schedule
+                                             [:typed-contraction :strategy]))))
+            (fail! :equation-first-contraction-selector-unsupported
+                   "equation-first compilation cannot yet consume measured contraction selectors"
+                   {:function function-id :target target
+                    :schedule-path [:typed-contraction :measured-selectors]
+                    :fallback :none}))
+        dispatch-reassociated?
+        (= :dispatch-reassociated
+           (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
+        dispatch-contractions?
+        (contains? #{:dispatch-register-tiled :dispatch-mixed-matrix}
+                   (get-in resolved-schedule [:typed-contraction :strategy]))
+        reference-schedule
+        (cond-> resolved-schedule
+          dispatch-reassociated?
+          (assoc-in [:segmented-weighted-reduction :strategy] :reference)
+          dispatch-contractions?
+          (assoc-in [:typed-contraction :strategy] :portable)
+          dispatch-contractions?
+          (assoc-in [:typed-contraction :measured-selectors] {}))]
+    {:target-descriptor target-descriptor
+     :resolved-schedule resolved-schedule
+     :reference-schedule reference-schedule
+     :dispatch-reassociated? dispatch-reassociated?
+     :dispatch-contractions? dispatch-contractions?}))
+
+(defn- compile-semantic
+  "Schedule and emit one exact typed semantic program without source or ABI reconstruction."
+  [{:keys [id function-id target dtype source-ns options compiler-options]
+    :as context}
+   semantic]
+  (when-not (= :typed-parallel (:dialect semantic))
+    (fail! :equation-first-coverage
+           "program is outside the direct TypedSOAC/structured-control vertical"
+           {:function function-id :dialect (:dialect semantic) :fallback :none}))
+  (let [{:keys [target-descriptor resolved-schedule
+                dispatch-reassociated? dispatch-contractions?]} context
+        scheduled (structured-route/schedule-program semantic compiler-options)
+        backend (device/select-runtime-backend target true nil)
+        target-dialect (target-source-dialect target backend target-descriptor)
+        reference-emission
+        (if target-dialect
+          (program-c-family/emit-program
+           scheduled (assoc compiler-options :target-dialect target-dialect))
+          (fail! :equation-first-target-emitter
+                 "equation-first scheduled program has no public source emitter for this target"
+                 {:target target :backend backend :fallback :none}))
+        emission
+        (if dispatch-reassociated?
+          (let [subgroup-options
+                (assoc-in compiler-options
+                          [:schedule :segmented-weighted-reduction :strategy]
+                          :subgroup-score-reuse)
+                subgroup-scheduled (structured-route/schedule-program semantic subgroup-options)
+                subgroup-emission (program-c-family/emit-program
+                                   subgroup-scheduled
+                                   (assoc subgroup-options :target-dialect target-dialect))]
+            (dispatch-reduction-emissions
+             function-id resolved-schedule target-descriptor
+             reference-emission subgroup-emission options))
+          reference-emission)
+        emission
+        (if dispatch-contractions?
+          (dispatch-contraction-emissions
+           function-id emission
+           (assoc compiler-options :target-dialect target-dialect
+                  :schedule resolved-schedule))
+          emission)
+        invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)]
+    (when-not invocation-plan
+      (fail! :equation-first-invocation
+             "equation-first semantic program has no retained public invocation plan"
+             {:function function-id}))
+    (->EquationFirstCompilation
+     id function-id target dtype source-ns
+     (cond-> (-> compiler-options
+                 (assoc :schedule resolved-schedule)
+                 (dissoc :values))
+       source-ns (assoc :source-ns source-ns))
+     semantic scheduled (:program emission) (:kernels emission)
+     {:semantic {:dialect (:dialect semantic)
+                 :equations (count (:equations semantic))}
+      :schedule {:dialect (:dialect scheduled)
+                 :equations (count (:equations scheduled))}
+      :emission (:stats emission)
+      :fallback :none})))
+
+(def ^:private typed-compilation-options
+  #{:target :schedule :scalar-math})
+
+(defn- scalar-region-local-dtypes
+  "Collect declared locals only through validated TypedSOAC region structure."
+  [lambda]
+  (letfn [(expression-dtypes [expression]
+            (cond
+              (soac/scalar-convert-form? expression)
+              (expression-dtypes (:operand (soac/scalar-convert-parts expression)))
+
+              (soac/while-component-form? expression)
+              (let [{:keys [condition update]} (soac/while-fold-parts (second expression))]
+                (into (lambda-dtypes condition) (lambda-dtypes update)))
+
+              (soac/product-component-form? expression)
+              (lambda-dtypes (:lambda (soac/product-fold-parts (second expression))))
+
+              (soac/scalar-fold-form? expression)
+              (lambda-dtypes (:lambda (soac/scalar-fold-parts expression)))
+
+              (and (seq? expression) (= 'quote (first expression))) []
+              (map? expression) (mapcat expression-dtypes (mapcat identity expression))
+              (coll? expression) (mapcat expression-dtypes expression)
+              :else []))
+          (lambda-dtypes [candidate]
+            (let [{:keys [locals body-results effect-results]} (soac/lambda-parts candidate)]
+              (into (mapv :dtype locals)
+                    (mapcat expression-dtypes
+                            (concat (map :init locals) body-results effect-results)))))]
+    (lambda-dtypes lambda)))
+
+(defn- typed-operation-local-dtypes
+  [equation]
+  (let [{:keys [attributes folds] :as parts} (soac/operation-parts equation)
+        result-transform (:result-transform attributes)
+        lambdas (concat (keep parts [:lambda :element-lambda :combine-lambda :map-lambda])
+                        (map :lambda folds)
+                        (when (and result-transform (soac/result-transform? result-transform))
+                          [(:lambda result-transform)]))]
+    (mapcat scalar-region-local-dtypes lambdas)))
+
+(defn- typed-compilation-dtype
+  "Derive one floating carrier from retained AbstractValues and scalar local declarations."
+  [typed-program]
+  (let [facts (soac/facts typed-program)
+        value-dtypes
+        (keep (fn [[_ value]]
+                (av/validate! value)
+                (when (= :tensor (:kind value)) (:dtype value)))
+              (:values facts))
+        local-dtypes (mapcat typed-operation-local-dtypes (soac/equations typed-program))
+        floating (->> (concat value-dtypes local-dtypes)
+                      (keep #(when (and (keyword? %) (dtype/known? %)) (dtype/canon %)))
+                      (filter #(get-in dtype/dtype-info [% :fp?]))
+                      distinct vec)]
+    (when-not (and (= 1 (count floating))
+                   (contains? #{:float :double} (first floating)))
+      (fail! :equation-first-typed-dtype
+             "source-free compilation requires one retained Float or Double carrier"
+             {:floating-dtypes floating}))
+    (first floating)))
+
+(defn- typed-compiler-options
+  [typed-program target carrier options target-descriptor reference-schedule]
+  (let [facts (soac/facts typed-program)
+        inputs (:inputs facts)
+        values (:values facts)
+        input-values (select-keys values inputs)
+        array-types (into {} (keep (fn [[id value]]
+                                     (when (and (= :tensor (:kind value))
+                                                (seq (:shape value)))
+                                       [id (:dtype value)]))) input-values)
+        scalar-types (into {} (keep (fn [[id value]]
+                                      (when (and (= :tensor (:kind value))
+                                                 (empty? (:shape value)))
+                                        [id (:dtype value)]))) input-values)]
+    (merge {:resident-reductions? true
+            :dtype carrier
+            :segmented-plans? true
+            :target-device target
+            :target-descriptor target-descriptor
+            :active-params inputs
+            :public-parameters inputs
+            :array-types array-types
+            :scalar-types scalar-types
+            :schedule reference-schedule}
+           (select-keys options [:scalar-math]))))
+
+(defn compile-typed
+  "Compile one exact pure TypedSOAC value through the ordinary immutable compilation tail.
+
+   The TypedSOAC owner supplies its complete logical interface. No deftm frontend, type inference,
+   source namespace, persistent artifact identity, Prepared cache, or runtime session is created.
+   Only target, schedule and scalar-math policy are caller-selectable. Plain host arrays satisfy
+   owned public inputs; retained borrowed inputs still require a later same-session/module owner."
+  ([typed-program] (compile-typed typed-program {}))
+  ([typed-program {:keys [target] :or {target :ze:0} :as options}]
+   (let [unsupported (seq (remove typed-compilation-options (keys options)))]
+     (when unsupported
+       (fail! :equation-first-typed-options
+              "source-free compilation accepts only target, schedule and scalar-math policy"
+              {:unsupported (vec (sort unsupported))
+               :allowed (vec (sort typed-compilation-options))})))
+   (let [options (cond-> options
+                   (contains? options :scalar-math)
+                   (update :scalar-math numerics/validate-scalar-math-policy!))
+         ;; Promotion validates the complete source-free boundary before target policy can emit it.
+         promoted (structured-route/promote-typed-algorithm typed-program)
+         carrier (typed-compilation-dtype typed-program)
+         source-fingerprint (semantic/fingerprint typed-program)
+         function-id [::typed-algorithm source-fingerprint]
+         policy (compilation-policy function-id target options nil)
+         compiler-options (typed-compiler-options
+                           typed-program target carrier options (:target-descriptor policy)
+                           (:reference-schedule policy))
+         explicit-policy (select-keys options [:schedule :scalar-math])
+         id [::typed-compilation source-fingerprint target carrier explicit-policy]]
+     (compile-semantic
+      (merge policy
+             {:id id :function-id function-id :target target :dtype carrier :source-ns nil
+              :options options :compiler-options compiler-options})
+      promoted))))
+
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
 
@@ -394,44 +634,9 @@
              (fail! :equation-first-host-only
                     "equation-first specialization resolved to an explicitly host-only method"
                     {:function (function-symbol resolved-var) :target target :dtype dtype}))
-         target-descriptor (validate-target-description!
-                            target (or captured-target (hardware/descriptor-for target)))
-         resolved-schedule (gpu-schedule/compilation-schedule target-descriptor options)
-         _ (when (and (= :dispatch-mixed-matrix
-                         (get-in resolved-schedule [:typed-contraction :strategy]))
-                      (not= :mixed-f16-f32 (get-in options [:schedule :precision])))
-             (fail! :equation-first-matrix-consent
-                    "mixed matrix dispatch requires an explicit :schedule :precision :mixed-f16-f32"
-                    {:function (function-symbol resolved-var) :fallback :none}))
-         _ (when (and (= :dispatch-mixed-matrix
-                         (get-in resolved-schedule [:typed-contraction :strategy]))
-                      (or (not= :default (get-in resolved-schedule [:typed-contraction :matrix-tiles]))
-                          (seq (get-in resolved-schedule [:typed-contraction :split-factors]))))
-             (fail! :equation-first-matrix-candidate-space
-                    "public mixed matrix dispatch currently admits one full-K tile, not a tile space or split-K"
-                    {:function (function-symbol resolved-var) :fallback :none}))
-         _ (when (and (seq (get-in resolved-schedule [:typed-contraction :measured-selectors]))
-                      (not (contains? #{:dispatch-register-tiled :dispatch-mixed-matrix}
-                                      (get-in resolved-schedule [:typed-contraction :strategy]))))
-             (fail! :equation-first-contraction-selector-unsupported
-                    "equation-first compilation cannot yet consume measured contraction selectors"
-                    {:function (function-symbol resolved-var) :target target
-                     :schedule-path [:typed-contraction :measured-selectors]
-                     :fallback :none}))
-         dispatch-reassociated?
-         (= :dispatch-reassociated
-            (get-in resolved-schedule [:segmented-weighted-reduction :strategy]))
-         dispatch-contractions?
-         (contains? #{:dispatch-register-tiled :dispatch-mixed-matrix}
-                    (get-in resolved-schedule [:typed-contraction :strategy]))
-         reference-schedule
-         (cond-> resolved-schedule
-           dispatch-reassociated?
-           (assoc-in [:segmented-weighted-reduction :strategy] :reference)
-           dispatch-contractions?
-           (assoc-in [:typed-contraction :strategy] :portable)
-           dispatch-contractions?
-           (assoc-in [:typed-contraction :measured-selectors] {}))
+         function-id (function-symbol resolved-var)
+         policy (compilation-policy function-id target options captured-target)
+         {:keys [target-descriptor reference-schedule]} policy
          compiler-options (compiler-options resolved-var target dtype
                                             (-> options
                                                 (dissoc :target :gemm-precision)
@@ -474,60 +679,16 @@
          semantic (cond-> semantic
                     projection (assoc-in [:attributes :invocation-plan :attributes :parameter-projection]
                                          projection))
-         scheduled (structured-route/schedule-program semantic compiler-options)
-         backend (device/select-runtime-backend target true nil)
-         target-dialect (target-source-dialect target backend target-descriptor)
-         reference-emission
-         (if target-dialect
-           (program-c-family/emit-program
-            scheduled (assoc compiler-options :target-dialect target-dialect))
-           (fail! :equation-first-target-emitter
-                  "equation-first scheduled program has no public source emitter for this target"
-                  {:target target :backend backend :fallback :none}))
-         emission
-         (if dispatch-reassociated?
-           (let [subgroup-options
-                 (assoc-in compiler-options
-                           [:schedule :segmented-weighted-reduction :strategy]
-                           :subgroup-score-reuse)
-                 subgroup-scheduled (structured-route/schedule-program
-                                     semantic subgroup-options)
-                 subgroup-emission (program-c-family/emit-program
-                                    subgroup-scheduled
-                                    (assoc subgroup-options :target-dialect target-dialect))]
-             (dispatch-reduction-emissions
-              (function-symbol f-var) resolved-schedule target-descriptor
-              reference-emission subgroup-emission options))
-           reference-emission)
-         emission
-         (if dispatch-contractions?
-           (dispatch-contraction-emissions
-            (function-symbol f-var) emission
-            (assoc compiler-options :target-dialect target-dialect
-                   :schedule resolved-schedule))
-           emission)
-         invocation-plan (some-> semantic :attributes :invocation-plan invocation/validate!)
-         _ (when-not invocation-plan
-             (fail! :equation-first-invocation
-                    "equation-first semantic program has no retained public invocation plan"
-                    {:function (function-symbol f-var)}))
          source-ns-symbol (source-namespace-symbol f-var)
          id (cond-> [::compilation (function-symbol f-var) target (:dtype compiler-options)]
               (:preserve-declared-array-storage? compiler-options)
               (conj {:preserve-declared-array-storage? true}))]
-     (->EquationFirstCompilation
-      id (function-symbol f-var) target (:dtype compiler-options) source-ns-symbol
-      (-> compiler-options
-          (assoc :schedule resolved-schedule)
-          (assoc :source-ns source-ns-symbol)
-          (dissoc :values))
-      semantic scheduled (:program emission) (:kernels emission)
-      {:semantic {:dialect (:dialect semantic)
-                  :equations (count (:equations semantic))}
-       :schedule {:dialect (:dialect scheduled)
-                  :equations (count (:equations scheduled))}
-       :emission (:stats emission)
-       :fallback :none}))))
+     (compile-semantic
+      (merge policy
+             {:id id :function-id (function-symbol f-var) :target target
+              :dtype (:dtype compiler-options) :source-ns source-ns-symbol
+              :options options :compiler-options compiler-options})
+      semantic))))
 
 (defn- lower-in-context
   "Specialize a compiled equation-first program against ordered public arguments.
@@ -544,16 +705,26 @@
   (let [started (System/nanoTime)
         source-ns (:source-ns compilation)
         invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        unsupported-host-evaluation
+        (fn [& _]
+          (fail! :equation-first-source-free-host-evaluation
+                 "source-free compilation cannot evaluate a host invocation step or equation"
+                 {:function (:function compilation)}))
+        evaluate-step (if source-ns
+                        (partial scalar/evaluate-invocation-step source-ns)
+                        unsupported-host-evaluation)
         materialized
         (materialization/materialize
          invocation-plan (vec arguments)
-         (partial scalar/evaluate-invocation-step source-ns))
+         evaluate-step)
         materialization-ns (- (System/nanoTime) started)
         buffer-shapes (into {} (map (fn [[id buffer]] [id (:shape buffer)]))
                             (:program-buffers materialized))
-        evaluate-host (fn [equation context]
-                        (scalar/evaluate-host-equation
-                         source-ns equation (assoc context :buffer-shapes buffer-shapes)))
+        evaluate-host (if source-ns
+                        (fn [equation context]
+                          (scalar/evaluate-host-equation
+                           source-ns equation (assoc context :buffer-shapes buffer-shapes)))
+                        unsupported-host-evaluation)
         construction-started (System/nanoTime)
         projection-ns (volatile! 0)
         project (fn [plan]
