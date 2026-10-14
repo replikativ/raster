@@ -103,6 +103,21 @@ does not initialize an `:internal` or `:output` node; it still needs an ordered 
 caller-supplied value as `:input`, `:constant`, or `:state` so validation records that semantic
 boundary explicitly.
 
+`raster.compiler.ir.link-module-plan` is a validation-only projection for several named entry
+points over one canonical LinkPlan storage spine. The spine has no global outputs, and its named
+entries form a complete non-empty contiguous partition of the ordered instances. Each validation
+freshly rederives strict conditional read/write and complete-production facts from sealed LinkPlan
+evidence. Legacy write permission and partial mutation preserve initialized bytes but cannot
+initialize a retained value; only semantic complete writes and certified produced views can do so.
+Cross-entry frontiers are whole logical values with one unique earlier complete producer, and
+dense complete child views may jointly cover a parent view.
+
+This prerequisite does not yet define per-entry callable outputs, execute entries, or establish
+sessions, generations, leases, replay, completion, failure recovery, or allocation lifetime. Host
+source contents and native handles are live inputs, not fingerprinted certificate data. A later
+runtime owner must realize those contracts without treating the validation-only spine as an eager
+all-entry schedule.
+
 Owned `:input`/`:constant`/`:state` nodes without a plan initializer are tracked as pending. Replay
 fails until `gpu-link/upload!` initializes them. This makes input and first-use state readiness
 explicit while still allowing pretrained runtimes to allocate first and publish or upload later.

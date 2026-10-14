@@ -103,6 +103,109 @@
                     {:reason :link-retained-program-validations})))
   (::program-validations (meta evidence)))
 
+(defn- step-accesses [facts]
+  (reduce (fn [m {:keys [node access]}]
+            (update m node kabi/merge-access access)) {} facts))
+
+(defn- ordered-step-accesses [facts]
+  (let [{:keys [order accesses]}
+        (reduce (fn [{:keys [seen] :as state} {:keys [node access]}]
+                  (let [first-occurrence? (not (contains? seen node))
+                        state (update-in state [:accesses node]
+                                         kabi/merge-access access)]
+                    (if first-occurrence?
+                      (-> state
+                          (update :seen conj node)
+                          (update :order conj node))
+                      state)))
+                {:seen #{} :order [] :accesses {}} facts)]
+    (mapv (fn [node] [node (get accesses node)]) order)))
+
+(defn- relative-entry-contract
+  "Derive one conditional entry contract from already checked ordered step facts.
+
+   Unlike the ordinary whole-plan analyzer, this does not credit an internal value merely because
+   another entry writes it somewhere in the spine. Reads and non-complete writes instead become
+   explicit requirements. Only semantic complete-write evidence and certified produced views can
+   initialize fresh storage. Several complete child views may jointly cover a later parent view."
+  [nodes step-facts]
+  (let [complete-ids (volatile! #{})
+        complete-views (volatile! [])
+        requirements (volatile! #{})
+        requirement-order (volatile! [])
+        reads (volatile! #{})
+        writes (volatile! #{})
+        covered? (fn [node-id]
+                   (bview/covered-contiguous? (get-in nodes [node-id :view]) @complete-views))
+        require! (fn [node-id]
+                   (when-not (covered? node-id)
+                     (when-not (contains? @requirements node-id)
+                       (vswap! requirements conj node-id)
+                       (vswap! requirement-order conj node-id))
+                     ;; The contract is conditional on this exact required view being initialized.
+                     (vswap! complete-views conj (get-in nodes [node-id :view]))))
+        produce! (fn [node-id]
+                   (vswap! complete-ids conj node-id)
+                   (vswap! complete-views conj (get-in nodes [node-id :view])))]
+    (doseq [{:keys [facts produced-views complete-writes]} step-facts]
+      (let [by-node (ordered-step-accesses facts)
+            produced-views (set produced-views)
+            certified-child?
+            (fn [node-id]
+              (let [parent (get-in nodes [node-id :view])]
+                (some #(bview/contains-contiguous-view?
+                        parent (get-in nodes [% :view])) produced-views)))]
+        (doseq [[node-id access] by-node]
+          (when (contains? #{:read :read-write} access)
+            (vswap! reads conj node-id)
+            (require! node-id))
+          (when (contains? #{:write :read-write} access)
+            (vswap! writes conj node-id)
+            (if (and (some? complete-writes) (contains? complete-writes node-id))
+              (produce! node-id)
+              ;; Legacy permissions and semantic partial writes preserve prior initialized bytes;
+              ;; they never establish a fresh complete view for another named entry. A certified
+              ;; child result is different: the child is produced below, while the untouched
+              ;; parent remains uninitialized and must not become an artificial requirement for
+              ;; a write-only pointer.
+              (when-not (and (= :write access) (certified-child? node-id))
+                (require! node-id)))))
+        (doseq [node-id produced-views]
+          (produce! node-id))))
+    {:requires @requirements
+     :require-order @requirement-order
+     :reads @reads
+     :writes @writes
+     :full-produces @complete-ids}))
+
+(defn ^:no-doc relative-entry-contracts!
+  "Project strict conditional contracts for a complete ordered instance partition.
+
+   `evidence` must be the sealed evidence for the identical validated spine. Entry groups are
+   non-empty ordered vectors of instance IDs whose concatenation is the spine instance order.
+   Callers cannot provide access or completeness facts."
+  ([plan evidence entry-instance-groups]
+   (relative-entry-contracts! plan evidence entry-instance-groups nil))
+  ([plan evidence entry-instance-groups caller-options]
+   (when-not (retained-effect-evidence-for-request? plan evidence caller-options)
+     (throw (ex-info "relative entry analysis requires exact LinkPlan effect ownership"
+                     {:reason :link-relative-effect-evidence})))
+   (let [instance-order (mapv :id (:instances plan))
+         groups (mapv vec entry-instance-groups)
+         flattened (vec (mapcat identity groups))]
+     (when-not (and (vector? entry-instance-groups)
+                    (every? seq groups)
+                    (= instance-order flattened))
+       (throw (ex-info "relative entries must be one non-empty contiguous partition of the spine"
+                       {:reason :link-relative-entry-partition
+                        :instances instance-order :entries groups})))
+     (mapv (fn [group]
+             (let [members (set group)
+                   facts (filterv #(contains? members (:instance %)) (:step-facts evidence))]
+               (assoc (relative-entry-contract (:nodes plan) facts)
+                      :instances group)))
+           groups))))
+
 (defn link-node? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkNode" (.getName (class x)))))
 
@@ -1271,8 +1374,7 @@
                            (get initially-initialized-by-allocation
                                 (get-in view [:allocation :id])))))))]
     (doseq [{:keys [instance step phase facts produced-views partial-writes complete-writes]} step-facts]
-      (let [by-node (reduce (fn [m {:keys [node access]}]
-                              (update m node kabi/merge-access access)) {} facts)]
+      (let [by-node (step-accesses facts)]
         (doseq [[node-id access] by-node
                 :let [role (get-in nodes [node-id :role])]]
           (when (contains? #{:read :read-write} access)
