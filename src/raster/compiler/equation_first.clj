@@ -615,8 +615,10 @@
    source namespace, persistent artifact identity, Prepared cache, or runtime session is created.
    Target, schedule and scalar-math policy are caller-selectable. `:resident-outputs` may demand an
    ordered subset of exact public output IDs whose direct output-only reductions must remain
-   certified one-element device buffers. Plain host arrays satisfy owned public inputs; retained
-   borrowed inputs still require a later same-session/module owner."
+   certified one-element device buffers. Independently audited reductions captured by later
+   equations are represented as internal resident buffers before equation promotion. Plain host
+   arrays satisfy owned public inputs; retained borrowed inputs still require a later same-session
+   module owner."
   ([typed-program] (compile-typed typed-program {}))
   ([typed-program {:keys [target] :or {target :ze:0} :as options}]
    (let [unsupported (seq (remove typed-compilation-options (keys options)))]
@@ -635,14 +637,13 @@
          options (cond-> options
                    (contains? options :scalar-math)
                    (update :scalar-math numerics/validate-scalar-math-policy!))
-         ;; Promotion validates the complete source-free boundary before target policy can emit it.
-         ;; An explicit representation demand first uses the same resident transaction and
-         ;; certificate as analyzed-source compilation; the no-demand path is byte-for-byte the
-         ;; previous source-free TypedSOAC owner.
+         ;; Promotion splits the complete TypedSOAC into scheduled equation components. Run the
+         ;; shared reduction-only transaction while producer/use/facet authority is still whole;
+         ;; otherwise a reduction result captured by a later map would become a physical buffer in
+         ;; its producer component but remain a scalar in its consumer component. An explicit
+         ;; public representation demand adds stricter roots to this same transaction.
          [compiled-program _resident-stats]
-         (if (seq resident-outputs)
-           (resident/realize-public-reduction-outputs typed-program resident-outputs)
-           [typed-program nil])
+         (resident/realize-source-free-reductions typed-program resident-outputs)
          promoted (structured-route/promote-typed-algorithm compiled-program)
          carrier (typed-compilation-dtype typed-program)
          source-fingerprint (semantic/fingerprint typed-program)

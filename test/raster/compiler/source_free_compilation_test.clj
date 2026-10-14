@@ -15,6 +15,7 @@
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as soac]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
@@ -54,6 +55,42 @@
 
 (defn- weighted-sum [dtype]
   (#'sum-fixture/source dtype))
+
+(defn- captured-weighted-sum [dtype]
+  (let [program (weighted-sum dtype)
+        facts (soac/facts program)
+        consumer
+        (list '= 'map-2 '[y]
+              (list 'map {:index 'j :extent 'size} '[xs] '[loss]
+                    (soac/lambda-form '[x total] '[(raster.numeric/* x total)])))]
+    (soac/make
+     (-> facts
+         (assoc-in [:values 'y] (get-in facts [:values 'xs]))
+         (assoc-in [:equations 'map-2] (soac/default-equation-facts)))
+     (conj (vec (soac/equations program)) consumer)
+     '[y])))
+
+(defn- internal-reduction-proof-context [program]
+  (let [facts (soac/facts program)
+        infos (mapv #'resident/operation-info (soac/equations program))
+        info-by-id (into {} (map (juxt :id identity)) infos)
+        positions (into {} (map-indexed (fn [index info] [(:id info) index])) infos)
+        producers (group-by first
+                            (mapcat (fn [info]
+                                      (map (fn [result] [result info]) (:results info)))
+                                    infos))
+        root 'loss]
+    {:facts facts :info-by-id info-by-id :positions positions :producers producers
+     :outputs (set (soac/outputs program)) :host-reads (set (get-in facts
+                                                                    [:attributes :host-read-values]))
+     :producer (second (first (get producers root))) :root root
+     :sites (get (group-by first (#'resident/use-sites (soac/equations program))) root [])}))
+
+(defn- pure-internal-reduction-root? [program]
+  (let [{:keys [facts info-by-id positions producers outputs host-reads producer root sites]}
+        (internal-reduction-proof-context program)]
+    (#'resident/pure-internal-captured-reduction-root?
+     facts info-by-id positions producers outputs host-reads producer root sites)))
 
 (defn- two-weighted-sums [dtype]
   (let [program (weighted-sum dtype)
@@ -103,6 +140,10 @@
                   product (float (* square (float weight)))]
               (float (+ (float acc) product))))
           (float 0.0) (map vector xs weights)))
+
+(defn- captured-weighted-sum-result [xs weights]
+  (let [loss (reassociation-safe-weighted-square-sum xs weights)]
+    (mapv #(float (* (float %) loss)) xs)))
 
 (defn- arguments-for [compilation]
   (mapv (fn [{:keys [value]}]
@@ -653,15 +694,151 @@
     (is (some? (structured-route/validated-public-resident-output
                 (:scheduled compilation) (second outputs))))))
 
+(deftest source-free-promotion-realizes-a-reduction-captured-by-a-later-map
+  (let [typed (captured-weighted-sum :float)
+        original-inputs (:inputs (soac/facts typed))
+        [realized stats] (resident/realize-source-free-reductions typed [])
+        loss (get-in (soac/facts realized) [:values 'loss])
+        consumer (soac/operation-parts (last (soac/equations realized)))
+        compilation
+        (with-redefs [hardware/descriptor-for synthetic-descriptor]
+          (equation-first/compile-typed
+           typed {:target :cuda:captured-reduction
+                  :schedule {:precision :f32-scalar}}))
+        operations (mapcat :operations (get-in compilation [:scheduled :equations]))
+        consumer-operation
+        (first (filter #(some #{'y} (segop/operation-outputs %)) operations))
+        producer-operations
+        (filter #(some #{'loss} (segop/operation-outputs %)) operations)]
+    (is (identical? typed (soac/validate! typed)))
+    (is (= 1 (:resident-reductions stats)))
+    (is (= {:kind :resident-scalar-buffer :elements 1} (:representation loss)))
+    (is (= :device (:memory-space loss)))
+    (is (some #{'loss} (:captures consumer)))
+    (is (some #{'(clojure.core/aget %capture0 0)}
+              (tree-seq coll? seq (:body-results (soac/lambda-parts (:lambda consumer))))))
+    (is (= original-inputs (:inputs (soac/facts realized))))
+    (is (= original-inputs
+           (mapv :symbol (get-in compilation
+                                 [:semantic :attributes :invocation-plan :parameters]))))
+    (is (= {:kind :resident-scalar-buffer :elements 1}
+           (get-in compilation [:scheduled :values 'loss :representation])))
+    (is (seq producer-operations))
+    (is (= #{'xs 'loss} (segop/operation-inputs consumer-operation)))
+    (is (= #{'size} (segop/operation-scalars consumer-operation)))
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (is (= ['y] (get-in compilation [:scheduled :outputs])))))
+
+(deftest pure-internal-reduction-residency-requires-the-complete-pristine-boundary
+  (let [base (captured-weighted-sum :float)
+        reduction-id 'sum-1
+        change-facts (fn [program f]
+                       (soac/make (f (soac/facts program))
+                                  (soac/equations program) (soac/outputs program)))
+        facet-fixtures
+        [[:logical-layout #(assoc-in % [:values 'loss :logical-layout] {:order :row-major})]
+         [:memory-space #(assoc-in % [:values 'loss :memory-space] :host)]
+         [:ownership #(assoc-in % [:values 'loss :ownership] :owned)]
+         [:value-effects #(assoc-in % [:values 'loss :effects] #{:memory/read})]
+         [:attributes #(assoc-in % [:values 'loss :attributes] {:opaque true})]]
+        effect
+        (change-facts base #(-> %
+                                (assoc :effects #{:memory/read})
+                                (assoc-in [:equations reduction-id :effects] #{:memory/read})))
+        alias
+        (change-facts base #(assoc-in % [:equations reduction-id :aliases]
+                                      {'loss 'mapped}))
+        loss-value (get-in (soac/facts base) [:values 'loss])
+        stored
+        (change-facts
+         base #(-> %
+                   (assoc-in [:values 'scratch] (assoc loss-value :shape [1]))
+                   (assoc :effects #{:memory/write})
+                   (assoc-in [:equations reduction-id :effects] #{:memory/write})
+                   (assoc-in [:equations reduction-id :aliases] {'loss 'scratch})
+                   (assoc-in [:equations reduction-id :attributes :result-storage]
+                             [{:destination 'scratch :access :write :host-return :buffer}])))
+        unused-base (weighted-sum :float)
+        unused (soac/make (soac/facts unused-base) (soac/equations unused-base) '[mapped])
+        multi-base (multi-result-weighted-sum :float)
+        multi-facts (soac/facts multi-base)
+        multi-consumer
+        (list '= 'map-2 '[y]
+              (list 'map {:index 'j :extent 'size} '[xs] '[loss]
+                    (soac/lambda-form '[x total] '[(raster.numeric/* x total)])))
+        multi
+        (soac/make
+         (-> multi-facts
+             (assoc-in [:values 'y] (get-in multi-facts [:values 'xs]))
+             (assoc-in [:equations 'map-2] (soac/default-equation-facts)))
+         (conj (vec (soac/equations multi-base)) multi-consumer) '[y])]
+    (is (pure-internal-reduction-root? base))
+    (doseq [[label update-facts] facet-fixtures
+            :let [fixture (change-facts base update-facts)]]
+      (is (identical? fixture (soac/validate! fixture)) (name label))
+      (is (not (pure-internal-reduction-root? fixture)) (name label)))
+    (doseq [[label fixture] [[:effect effect] [:alias alias] [:storage stored]
+                             [:empty-uses unused] [:multi-result multi]]]
+      (is (identical? fixture (soac/validate! fixture)) (name label))
+      (is (not (pure-internal-reduction-root? fixture)) (name label)))
+    (let [{:keys [facts producers host-reads producer root sites]}
+          (internal-reduction-proof-context stored)]
+      (is (#'resident/stored-reduction-root?
+           facts producers host-reads {'loss 'scratch} producer root sites)
+          "valid result storage retains its separately certified historical path"))))
+
+(deftest source-free-reduction-residency-does-not-launder-host-or-extent-scalars
+  (let [typed (captured-weighted-sum :float)
+        facts (assoc-in (soac/facts typed) [:attributes :host-read-values] ['loss])
+        host-escape (soac/make facts (soac/equations typed) (soac/outputs typed))
+        [result stats] (resident/realize-source-free-reductions host-escape [])
+        base (weighted-sum :float)
+        base-facts (soac/facts base)
+        dependent-scalar
+        (list '= 'scalar-2 '[scaled]
+              (list 'scalar {:dtypes [:float]} '[loss]
+                    (soac/lambda-form '[total] '[total])))
+        dependent-consumer
+        (list '= 'map-2 '[y]
+              (list 'map {:index 'j :extent 'size} '[xs] '[scaled]
+                    (soac/lambda-form '[x total] '[(raster.numeric/* x total)])))
+        dependent-host
+        (soac/make
+         (-> base-facts
+             (assoc-in [:values 'scaled] (get-in base-facts [:values 'loss]))
+             (assoc-in [:values 'y] (get-in base-facts [:values 'xs]))
+             (assoc-in [:equations 'scalar-2] (soac/default-equation-facts))
+             (assoc-in [:equations 'map-2] (soac/default-equation-facts))
+             (assoc-in [:attributes :host-read-values] ['scaled]))
+         (into (vec (soac/equations base)) [dependent-scalar dependent-consumer]) '[y])
+        [dependent-result dependent-stats]
+        (resident/realize-source-free-reductions dependent-host [])]
+    (is (identical? host-escape (soac/validate! host-escape)))
+    (is (zero? (:resident-reductions stats)))
+    (is (= {:kind :plain} (get-in (soac/facts result) [:values 'loss :representation])))
+    (is (= {:kind :plain} (get-in (soac/facts result) [:values 'size :representation])))
+    (is (identical? dependent-host (soac/validate! dependent-host)))
+    (is (zero? (:resident-reductions dependent-stats)))
+    (is (= {:kind :plain}
+           (get-in (soac/facts dependent-result) [:values 'loss :representation])))
+    (is (some #{'scaled} (mapcat #(nth % 2) (soac/equations dependent-result)))
+        "a host-read dependent scalar remains defined rather than beta-reduced")
+    (is (some?
+         (with-redefs [hardware/descriptor-for synthetic-descriptor]
+           (reason #(equation-first/compile-typed
+                     host-escape {:target :cuda:captured-reduction
+                                  :schedule {:precision :f32-scalar}}))))
+        "a blocked scalar capture remains an honest unsupported source-free boundary")))
+
 (deftest empty-resident-output-demand-preserves-supported-reduction-compilation
   (let [typed (weighted-sum :float)
-        demand-realizations (atom 0)
+        reduction-realizations (atom [])
+        realize-source-free-reductions resident/realize-source-free-reductions
         compile #(with-redefs [hardware/descriptor-for synthetic-descriptor
-                               resident/realize-public-reduction-outputs
-                               (fn [& _]
-                                 (swap! demand-realizations inc)
-                                 (throw (AssertionError.
-                                         "an empty public demand invoked realization")))]
+                               resident/realize-source-free-reductions
+                               (fn [program demand]
+                                 (swap! reduction-realizations conj demand)
+                                 (realize-source-free-reductions program demand))]
                    (equation-first/compile-typed
                     typed (cond-> {:target :cuda:resident-output
                                    :schedule {:precision :f32-scalar}}
@@ -669,8 +846,8 @@
         ordinary (compile false)
         explicit-empty (compile true)
         output (first (soac/outputs typed))]
-    (is (zero? @demand-realizations)
-        "both absent and explicit-empty policies bypass the public realization capability")
+    (is (= [[] []] @reduction-realizations)
+        "absent and explicit-empty policies use the same whole-program reduction audit")
     (is (= {:kind :plain}
            (get-in ordinary [:scheduled :values output :representation])))
     (is (semantic/equivalent? (:semantic ordinary) (:semantic explicit-empty)))
@@ -814,6 +991,49 @@
                 (finally
                   (gpu-link/close! zero-executable)
                   (gpu-link/close! zero-executable)))))
+          (finally
+            (gpu-link/close! executable)
+            (gpu-link/close! executable)))))))
+
+(deftest captured-source-free-reduction-replays-as-a-buffer-capture-on-opencl-and-level-zero
+  (doseq [[target available? skip!] [[:ocl:0 opencl/opencl-available? opencl/opencl-skip!]
+                                     [:ze:0 ze/gpu-available? ze/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "source-free captured reduction on " target))
+      (let [initial (float-array [1.5 -2.0 0.5])
+            changed (float-array [-1.0 4.0 -2.0])
+            weights (float-array [2.0 0.5 -4.0])
+            initial-before (vec initial)
+            changed-before (vec changed)
+            weights-before (vec weights)
+            compilation
+            (equation-first/compile-typed
+             (captured-weighted-sum :float)
+             {:target target :schedule {:precision :f32-scalar}})
+            plan (equation-first/lower compilation [initial weights 3])
+            input-node (get-in plan [:attributes :public-buffer-bindings 'xs])
+            output-node (first (:outputs plan))
+            loss-slots
+            (for [kernel (:kernels compilation)
+                  [slot argument] (map vector (:abi kernel) (:arguments kernel))
+                  :when (= 'loss argument)]
+              slot)
+            executable (gpu-link/instantiate! plan)]
+        (try
+          (is (seq loss-slots))
+          (is (every? #(= :buffer (:kind %)) loss-slots)
+              "the captured reduction has one physical buffer identity, never a GraphScalar")
+          (gpu-link/run! executable)
+          (is (= (mapv float-bits (captured-weighted-sum-result initial weights))
+                 (mapv float-bits (gpu-link/download executable output-node))))
+          (gpu-link/upload! executable input-node changed)
+          (gpu-link/run! executable)
+          (is (= (mapv float-bits (captured-weighted-sum-result changed weights))
+                 (mapv float-bits (gpu-link/download executable output-node))))
+          (is (= initial-before (vec initial)))
+          (is (= changed-before (vec changed)))
+          (is (= weights-before (vec weights)))
+          (is (= :none (get-in compilation [:stats :fallback])))
           (finally
             (gpu-link/close! executable)
             (gpu-link/close! executable)))))))
