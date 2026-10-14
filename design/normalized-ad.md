@@ -880,7 +880,17 @@ one boundary; every other AbstractValue facet remains exact, and the emitted con
 borrowed. Fresh resident binding and the final LinkPlan/LinkModule revalidate all storage and
 ordered-effect obligations.
 
-This opt-in slice accepts one active public array and immutable scalar specialization. It retains
-no caller array after preparation and does not add a cache, session owner, lease registry, device
-readback, mutable state, map-sum/indexed execution, or default-engine activation. The original
-campaign gates, real Gemma numerical acceptance and long GSDM qualification remain independent.
+`prepare-sum-owner` adds one separately admitted canonical map→ordered-sum family. Preparation
+fixes the exactly typed scalar cotangent seed; transpose has no fake rank-zero input buffer and no
+per-run scalar override. Primal calls instead upload an exact ID-keyed map covering every canonical
+array input, including excluded coefficient arrays. The demanded rank-zero primal loss uses the
+shared certified resident-reduction representation, while ordered owned-array residuals remain
+private dependency frontiers. Transpose takes only that exact dependency map and publishes a fresh
+gradient lease. The same binder, LinkPlan/LinkModule validation, named-entry owner, epoch fences and
+cleanup path are used by both families.
+
+This opt-in slice still accepts exactly one active public array and immutable scalar specialization.
+It retains no caller array after preparation and does not add a cache, session owner, lease registry,
+device readback, dynamic scalar seed, mutable state, indexed execution, arbitrary DAG execution, or
+default-engine activation. The original campaign gates, real Gemma numerical acceptance and long
+GSDM qualification remain independent.

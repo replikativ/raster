@@ -65,6 +65,15 @@
              {:value-id id :expected abstract :actual value}))
     value))
 
+(defn ^:no-doc checked-scalar-value
+  "Validate one explicit scalar specialization against its retained AbstractValue.
+
+   This is the scalar half of invocation materialization only; it grants no program-input,
+   storage, or execution authority."
+  [id abstract value]
+  (av/validate! abstract)
+  (checked-scalar id abstract value))
+
 (declare scalar-number)
 
 (defn- resolve-dimension [dimension lexical values]
