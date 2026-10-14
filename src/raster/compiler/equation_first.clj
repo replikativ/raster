@@ -34,6 +34,7 @@
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.pipeline :as pipeline]
             [raster.gpu.schedule :as gpu-schedule]
@@ -110,6 +111,10 @@
 
 (defn- compiler-options
   [f-var target requested-dtype options]
+  (when (contains? options :resident-outputs)
+    (fail! :equation-first-resident-outputs
+           "explicit resident outputs are available only for source-free TypedSOAC compilation"
+           {:function (function-symbol f-var)}))
   (let [frontend (pipeline/deftm-frontend-facts f-var requested-dtype)
         parameters (:parameters frontend)
         effective-dtype (:effective-dtype frontend)
@@ -473,7 +478,9 @@
      (cond-> (-> compiler-options
                  (assoc :schedule resolved-schedule)
                  (dissoc :values))
-       source-ns (assoc :source-ns source-ns))
+       source-ns (assoc :source-ns source-ns)
+       (contains? options :resident-outputs)
+       (assoc :resident-outputs (:resident-outputs options)))
      semantic scheduled (:program emission) (:kernels emission)
      {:semantic {:dialect (:dialect semantic)
                  :equations (count (:equations semantic))}
@@ -483,7 +490,37 @@
       :fallback :none})))
 
 (def ^:private typed-compilation-options
-  #{:target :schedule :scalar-math})
+  #{:target :schedule :scalar-math :resident-outputs})
+
+(defn- validate-resident-output-demand!
+  [typed-program resident-outputs]
+  (when-not (vector? resident-outputs)
+    (fail! :equation-first-resident-output-demand
+           "resident-outputs must be an ordered vector of public TypedSOAC output identities"
+           {:resident-outputs resident-outputs}))
+  (let [outputs (soac/outputs typed-program)
+        output-set (set outputs)]
+    (when-not (and (= (count resident-outputs) (count (distinct resident-outputs)))
+                   (every? soac/value-id? resident-outputs)
+                   (every? output-set resident-outputs))
+      (fail! :equation-first-resident-output-demand
+             "resident-outputs must contain distinct exact public TypedSOAC outputs"
+             {:resident-outputs resident-outputs :outputs outputs})))
+  resident-outputs)
+
+(defn- validate-resident-output-compilation!
+  [compilation resident-outputs]
+  (doseq [result resident-outputs]
+    (let [scheduled-value
+          (structured-route/validated-public-resident-output (:scheduled compilation) result)
+          emitted-value (get-in compilation [:emitted :values result])]
+      (when-not (and scheduled-value
+                     (some #{result} (get-in compilation [:emitted :outputs]))
+                     (semantic/equivalent? scheduled-value emitted-value))
+        (fail! :equation-first-resident-output-representation
+               "requested resident output did not retain its certified emitted representation"
+               {:result result :target (:target compilation)}))))
+  compilation)
 
 (defn- scalar-region-local-dtypes
   "Collect declared locals only through validated TypedSOAC region structure."
@@ -576,21 +613,37 @@
 
    The TypedSOAC owner supplies its complete logical interface. No deftm frontend, type inference,
    source namespace, persistent artifact identity, Prepared cache, or runtime session is created.
-   Only target, schedule and scalar-math policy are caller-selectable. Plain host arrays satisfy
-   owned public inputs; retained borrowed inputs still require a later same-session/module owner."
+   Target, schedule and scalar-math policy are caller-selectable. `:resident-outputs` may demand an
+   ordered subset of exact public output IDs whose direct output-only reductions must remain
+   certified one-element device buffers. Plain host arrays satisfy owned public inputs; retained
+   borrowed inputs still require a later same-session/module owner."
   ([typed-program] (compile-typed typed-program {}))
   ([typed-program {:keys [target] :or {target :ze:0} :as options}]
    (let [unsupported (seq (remove typed-compilation-options (keys options)))]
      (when unsupported
        (fail! :equation-first-typed-options
-              "source-free compilation accepts only target, schedule and scalar-math policy"
+              "source-free compilation accepts only target, schedule, scalar-math and resident-output policy"
               {:unsupported (vec (sort unsupported))
                :allowed (vec (sort typed-compilation-options))})))
-   (let [options (cond-> options
+   (let [resident-demand? (contains? options :resident-outputs)
+         resident-outputs (if resident-demand?
+                            (do (soac/validate! typed-program)
+                                (validate-resident-output-demand!
+                                 typed-program (:resident-outputs options)))
+                            [])
+         options (cond-> options resident-demand? (assoc :resident-outputs resident-outputs))
+         options (cond-> options
                    (contains? options :scalar-math)
                    (update :scalar-math numerics/validate-scalar-math-policy!))
          ;; Promotion validates the complete source-free boundary before target policy can emit it.
-         promoted (structured-route/promote-typed-algorithm typed-program)
+         ;; An explicit representation demand first uses the same resident transaction and
+         ;; certificate as analyzed-source compilation; the no-demand path is byte-for-byte the
+         ;; previous source-free TypedSOAC owner.
+         [compiled-program _resident-stats]
+         (if (seq resident-outputs)
+           (resident/realize-public-reduction-outputs typed-program resident-outputs)
+           [typed-program nil])
+         promoted (structured-route/promote-typed-algorithm compiled-program)
          carrier (typed-compilation-dtype typed-program)
          source-fingerprint (semantic/fingerprint typed-program)
          function-id [::typed-algorithm source-fingerprint]
@@ -598,13 +651,15 @@
          compiler-options (typed-compiler-options
                            typed-program target carrier options (:target-descriptor policy)
                            (:reference-schedule policy))
-         explicit-policy (select-keys options [:schedule :scalar-math])
+         explicit-policy (select-keys options [:schedule :scalar-math :resident-outputs])
          id [::typed-compilation source-fingerprint target carrier explicit-policy]]
-     (compile-semantic
-      (merge policy
-             {:id id :function-id function-id :target target :dtype carrier :source-ns nil
-              :options options :compiler-options compiler-options})
-      promoted))))
+     (validate-resident-output-compilation!
+      (compile-semantic
+       (merge policy
+              {:id id :function-id function-id :target target :dtype carrier :source-ns nil
+               :options options :compiler-options compiler-options})
+       promoted)
+      resident-outputs))))
 
 (defn compile
   "Compile one deftm Var into an immutable equation-first target program.
@@ -619,6 +674,10 @@
   ([f-var] (compile f-var {}))
   ([f-var options] (compile f-var options nil))
   ([f-var {:keys [target dtype] :or {target :ze:0} :as options} captured-target]
+   (when (contains? options :resident-outputs)
+     (fail! :equation-first-resident-outputs
+            "explicit resident outputs are available only for source-free TypedSOAC compilation"
+            {:function (when (var? f-var) (function-symbol f-var))}))
    (when-not (var? f-var)
      (fail! :equation-first-function "equation-first compilation requires a deftm Var"
             {:function f-var :actual (type f-var)}))

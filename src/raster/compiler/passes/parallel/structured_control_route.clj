@@ -547,7 +547,7 @@
                       (canonicalize-value-dtype authoritative)))
           outer)))))
 
-(defn- validated-public-resident-output
+(defn ^:no-doc validated-public-resident-output
   "Return the certified one-element resident value for an exact public reduction output.
 
    This requires the authoritative inner TypedSOAC certificate written by resident realization;
@@ -560,8 +560,10 @@
             algorithm (:algorithm equation)
             outer (get (:values parallel-program) result)
             inner-facts (when (and (soac/program-form? algorithm)
-                                   (typed-algorithm-boundary?
-                                    (:values parallel-program) equation algorithm))
+                                   (or (typed-algorithm-boundary?
+                                        (:values parallel-program) equation algorithm)
+                                       (scheduled-algorithm-boundary?
+                                        parallel-program equation algorithm)))
                           (soac/facts algorithm))
             inner-producers (when inner-facts
                               (filterv #(some #{result} (nth % 2))

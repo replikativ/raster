@@ -14,10 +14,15 @@
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.structured-control-route :as structured-route]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.pipeline :as pipeline]
+            [raster.dl.gpu-grad-parity :as ze]
             [raster.gpu.device-probe :as opencl]
+            [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]))
 
 (defn- reason [f]
@@ -46,6 +51,58 @@
 
 (defn- synthetic-descriptor [target]
   {:device-id target})
+
+(defn- weighted-sum [dtype]
+  (#'sum-fixture/source dtype))
+
+(defn- two-weighted-sums [dtype]
+  (let [program (weighted-sum dtype)
+        equations (vec (soac/equations program))
+        reduction (vec (second equations))
+        second-reduction (apply list (assoc reduction 1 'sum-2 2 '[loss-2]))
+        facts (-> (soac/facts program)
+                  (assoc-in [:values 'loss-2] (get-in (soac/facts program) [:values 'loss]))
+                  (assoc-in [:equations 'sum-2] (soac/default-equation-facts)))]
+    (soac/make facts (conj equations second-reduction) '[loss loss-2])))
+
+(defn- multi-result-weighted-sum [dtype]
+  (let [program (weighted-sum dtype)
+        equations (vec (soac/equations program))
+        reduction (second equations)
+        {:keys [attributes arrays captures]} (soac/operation-parts reduction)
+        zero (if (= :float dtype) (float 0.0) 0.0)
+        left '(raster.numeric/+ left element)
+        right '(raster.numeric/+ right element)
+        attributes (assoc attributes
+                          :accumulators '[left right] :identities [zero zero]
+                          :dtypes [dtype dtype]
+                          :algebra [(scan/certify-reassociation
+                                     {:acc 'left :init zero :lambda left} dtype)
+                                    (scan/certify-reassociation
+                                     {:acc 'right :init zero :lambda right} dtype)])
+        reduction (list '= 'sum-1 '[loss loss-2]
+                        (list 'reduce attributes arrays captures
+                              (soac/lambda-form '[left right element] [left right])))
+        facts (assoc-in (soac/facts program) [:values 'loss-2]
+                        (get-in (soac/facts program) [:values 'loss]))]
+    (soac/make facts [(first equations) reduction] '[loss loss-2])))
+
+(defn- change-sum-facts [program f]
+  (soac/make (f (soac/facts program)) (soac/equations program) (soac/outputs program)))
+
+(defn- float-bits [value]
+  (Float/floatToRawIntBits (float value)))
+
+(defn- reassociation-safe-weighted-square-sum [xs weights]
+  ;; The source reduction carries an associative-scan certificate, so a device workgroup may
+  ;; regroup additions. Test inputs below are exact dyadic Floats whose products and every
+  ;; possible partial sum are exact; the serial expression is therefore an independent oracle
+  ;; without imposing a left-fold order that the source contract does not promise.
+  (reduce (fn [acc [x weight]]
+            (let [square (float (* (float x) (float x)))
+                  product (float (* square (float weight)))]
+              (float (+ (float acc) product))))
+          (float 0.0) (map vector xs weights)))
 
 (defn- arguments-for [compilation]
   (mapv (fn [{:keys [value]}]
@@ -500,6 +557,266 @@
           (str family " " phase " requires a future retained borrowed-buffer owner"))
       (let [plan (equation-first/lower compilation (arguments-for compilation))]
         (is (= plan (link-plan/validate! plan)) (str family " " phase " link plan"))))))
+
+(deftest source-free-resident-output-demand-is-closed-and-retains-its-emitted-certificate
+  (doseq [dtype [:float :double]
+          :let [typed (weighted-sum dtype)
+                output (first (soac/outputs typed))
+                array (case dtype :float float-array :double double-array)
+                scheduled-options (atom [])
+                schedule-program structured-route/schedule-program
+                [compilation plan]
+                (with-redefs [hardware/descriptor-for synthetic-descriptor]
+                  (with-redefs [structured-route/schedule-program
+                                (fn [semantic options]
+                                  (swap! scheduled-options conj options)
+                                  (schedule-program semantic options))
+                                gpu/make-session
+                                (fn [& _] (throw (AssertionError. "compile/lower opened a session")))
+                                gpu-link/instantiate!
+                                (fn [& _] (throw (AssertionError. "compile/lower instantiated")))]
+                    (let [compilation
+                          (equation-first/compile-typed
+                           typed {:target :cuda:resident-output
+                                  :resident-outputs [output]
+                                  :schedule {:precision :f32-scalar}})]
+                      [compilation
+                       (equation-first/lower
+                        compilation [(array [2.0 -3.0]) (array [0.5 1.0]) 2])])))
+                scheduled-value
+                (structured-route/validated-public-resident-output
+                 (:scheduled compilation) output)
+                output-node (first (:outputs plan))]]
+    (is (= {:kind :resident-scalar-buffer :elements 1}
+           (:representation scheduled-value)))
+    (is (= [] (:shape scheduled-value)) "the logical public result remains rank zero")
+    (is (= :device (:memory-space scheduled-value)))
+    (is (= scheduled-value (get-in compilation [:emitted :values output])))
+    (is (= 1 (reduce *' 1 (get-in plan [:nodes output-node :view :shape])))
+        "the rank-zero physical view still owns exactly one device element")
+    (is (= [output] (get-in compilation [:options :resident-outputs])))
+    (is (seq @scheduled-options))
+    (is (every? #(not (contains? % :resident-outputs)) @scheduled-options)
+        "the demand is consumed once rather than replayed inside component scheduling")
+    (is (= [output] (get-in compilation [:semantic :outputs])))
+    (is (= (:inputs (soac/facts typed))
+           (mapv :symbol (get-in compilation
+                                 [:semantic :attributes :invocation-plan :parameters])))
+        "physical realization does not reorder the logical public input interface")
+    (is (= :none (get-in compilation [:stats :fallback])))
+    (testing "absence of a demand preserves the old output-only scalar representation"
+      (let [ordinary (with-redefs [hardware/descriptor-for synthetic-descriptor]
+                       (equation-first/compile-typed
+                        typed {:target :cuda:resident-output
+                               :schedule {:precision :f32-scalar}}))]
+        (is (= {:kind :plain} (get-in ordinary [:scheduled :values output :representation])))
+        (is (nil? (structured-route/validated-public-resident-output
+                   (:scheduled ordinary) output)))
+        (is (not= (:id compilation) (:id ordinary))
+            "the explicit representation demand participates in compilation identity")
+        (is (not (contains? (:options ordinary) :resident-outputs)))))))
+
+(deftest source-free-resident-output-demand-preserves-multiple-independent-output-identities
+  (let [typed (two-weighted-sums :float)
+        outputs (soac/outputs typed)
+        compilation
+        (with-redefs [hardware/descriptor-for synthetic-descriptor]
+          (equation-first/compile-typed
+           typed {:target :hip:resident-output :resident-outputs outputs
+                  :schedule {:precision :f32-scalar}}))]
+    (is (= outputs (get-in compilation [:options :resident-outputs])))
+    (is (= outputs (get-in compilation [:scheduled :outputs])))
+    (is (every? #(structured-route/validated-public-resident-output
+                  (:scheduled compilation) %)
+                outputs))
+    (is (every? #(= {:kind :resident-scalar-buffer :elements 1}
+                    (get-in compilation [:emitted :values % :representation]))
+                outputs))))
+
+(deftest source-free-resident-output-demand-selects-an-exact-output-subset
+  (let [typed (two-weighted-sums :float)
+        outputs (soac/outputs typed)
+        requested [(second outputs)]
+        compilation
+        (with-redefs [hardware/descriptor-for synthetic-descriptor]
+          (equation-first/compile-typed
+           typed {:target :hip:resident-output :resident-outputs requested
+                  :schedule {:precision :f32-scalar}}))]
+    (is (= outputs (get-in compilation [:semantic :outputs])))
+    (is (= outputs (get-in compilation [:scheduled :outputs])))
+    (is (= {:kind :plain}
+           (get-in compilation [:emitted :values (first outputs) :representation])))
+    (is (= {:kind :resident-scalar-buffer :elements 1}
+           (get-in compilation [:emitted :values (second outputs) :representation])))
+    (is (nil? (structured-route/validated-public-resident-output
+               (:scheduled compilation) (first outputs))))
+    (is (some? (structured-route/validated-public-resident-output
+                (:scheduled compilation) (second outputs))))))
+
+(deftest empty-resident-output-demand-preserves-supported-reduction-compilation
+  (let [typed (weighted-sum :float)
+        demand-realizations (atom 0)
+        compile #(with-redefs [hardware/descriptor-for synthetic-descriptor
+                               resident/realize-public-reduction-outputs
+                               (fn [& _]
+                                 (swap! demand-realizations inc)
+                                 (throw (AssertionError.
+                                         "an empty public demand invoked realization")))]
+                   (equation-first/compile-typed
+                    typed (cond-> {:target :cuda:resident-output
+                                   :schedule {:precision :f32-scalar}}
+                            % (assoc :resident-outputs []))))
+        ordinary (compile false)
+        explicit-empty (compile true)
+        output (first (soac/outputs typed))]
+    (is (zero? @demand-realizations)
+        "both absent and explicit-empty policies bypass the public realization capability")
+    (is (= {:kind :plain}
+           (get-in ordinary [:scheduled :values output :representation])))
+    (is (semantic/equivalent? (:semantic ordinary) (:semantic explicit-empty)))
+    (doseq [field [:inputs :outputs]]
+      (is (= (get-in ordinary [:scheduled field])
+             (get-in explicit-empty [:scheduled field])))
+      (is (= (get-in ordinary [:emitted field])
+             (get-in explicit-empty [:emitted field]))))
+    (let [public-ids (set (concat (get-in ordinary [:semantic :inputs])
+                                  (get-in ordinary [:semantic :outputs])))]
+      (is (semantic/equivalent?
+           (select-keys (get-in ordinary [:scheduled :values]) public-ids)
+           (select-keys (get-in explicit-empty [:scheduled :values]) public-ids)))
+      (is (semantic/equivalent?
+           (select-keys (get-in ordinary [:emitted :values]) public-ids)
+           (select-keys (get-in explicit-empty [:emitted :values]) public-ids))))
+    (let [ordinary-numerics
+          (mapv #(get-in % [:provenance :scheduled-operation :numerics])
+                (:kernels ordinary))
+          empty-numerics
+          (mapv #(get-in % [:provenance :scheduled-operation :numerics])
+                (:kernels explicit-empty))]
+      (is (seq ordinary-numerics))
+      (is (every? some? ordinary-numerics))
+      (is (= ordinary-numerics empty-numerics)
+          "the retained numerical schedules are identical"))
+    (is (= (get-in ordinary [:stats :emission :emission-routes])
+           (get-in explicit-empty [:stats :emission :emission-routes])))
+    (is (= [] (get-in explicit-empty [:options :resident-outputs])))
+    (is (not (contains? (:options ordinary) :resident-outputs)))
+    (is (not= (:id ordinary) (:id explicit-empty))
+        "the explicit public policy remains part of compilation identity")))
+
+(deftest source-free-resident-output-demand-refuses-malformed-and-forged-boundaries
+  (let [typed (weighted-sum :float)
+        output (first (soac/outputs typed))
+        facts (soac/facts typed)
+        premarked
+        (soac/make (-> facts
+                       (assoc-in [:values output :representation]
+                                 {:kind :resident-scalar-buffer :elements 1})
+                       (assoc-in [:values output :memory-space] :device))
+                   (soac/equations typed) (soac/outputs typed))
+        compile #(with-redefs [hardware/descriptor-for synthetic-descriptor]
+                   (equation-first/compile-typed
+                    %1 (merge {:target :cuda:resident-output
+                               :schedule {:precision :f32-scalar}}
+                              %2)))]
+    (is (= :equation-first-resident-output-demand
+           (reason #(compile typed {:resident-outputs output}))))
+    (is (= :equation-first-resident-output-demand
+           (reason #(compile typed {:resident-outputs [output output]}))))
+    (is (= :equation-first-resident-output-demand
+           (reason #(compile typed {:resident-outputs ['not-an-output]}))))
+    (is (= :typed-soac-resident-output-demand
+           (reason #(compile premarked {:resident-outputs [output]}))))
+    (is (= :equation-first-resident-outputs
+           (reason #(equation-first/compile
+                     #'surface/square-float {:target :cuda:resident-output
+                                             :dtype :float
+                                             :resident-outputs ['result]}))))))
+
+(deftest source-free-resident-output-demand-does-not-create-authority-for-other-producers
+  (let [base (weighted-sum :float)
+        output (first (soac/outputs base))
+        reduction-id (second (second (soac/equations base)))
+        scratch (get-in (soac/facts base) [:values output])
+        fixtures
+        [[:non-reduction (pure-map :float) 'y]
+         [:effect (change-sum-facts
+                   base #(-> %
+                             (assoc :effects #{:memory/read})
+                             (assoc-in [:equations reduction-id :effects] #{:memory/read}))) output]
+         [:alias (change-sum-facts
+                  base #(-> %
+                            (assoc-in [:values 'scratch] scratch)
+                            (assoc-in [:equations reduction-id :aliases] {output 'scratch}))) output]
+         [:stored (change-sum-facts
+                   base #(-> %
+                             (assoc-in [:values 'scratch] scratch)
+                             (assoc :effects #{:memory/write})
+                             (assoc-in [:equations reduction-id :effects] #{:memory/write})
+                             (assoc-in [:equations reduction-id :aliases] {output 'scratch})
+                             (assoc-in [:equations reduction-id :attributes :result-storage]
+                                       [{:destination 'scratch :access :write
+                                         :host-return :buffer}]))) output]
+         [:multi-result (multi-result-weighted-sum :float) output]]]
+    (doseq [[label typed requested] fixtures]
+      (is (identical? typed (soac/validate! typed)) (str label " fixture is valid TypedSOAC"))
+      (is (some?
+           (with-redefs [hardware/descriptor-for synthetic-descriptor]
+             (reason #(equation-first/compile-typed
+                       typed {:target :cuda:resident-output
+                              :resident-outputs [requested]
+                              :schedule {:precision :f32-scalar}}))))
+          (str label " cannot acquire public resident-output authority")))))
+
+(deftest demanded-source-free-reduction-executes-as-a-resident-scalar-on-opencl-and-level-zero
+  (doseq [[target available? skip!] [[:ocl:0 opencl/opencl-available? opencl/opencl-skip!]
+                                     [:ze:0 ze/gpu-available? ze/gpu-skip!]]]
+    (if-not @available?
+      (skip! (str "source-free resident scalar reduction on " target))
+      (let [xs (float-array [1.5 -2.0 0.5])
+            weights (float-array [2.0 0.5 -4.0])
+            before-xs (vec xs)
+            before-weights (vec weights)
+            typed (weighted-sum :float)
+            output (first (soac/outputs typed))
+            algebra (-> typed soac/equations second soac/operation-parts
+                        :attributes :algebra first)
+            compilation (equation-first/compile-typed
+                         typed {:target target :resident-outputs [output]
+                                :schedule {:precision :f32-scalar}})
+            plan (equation-first/lower compilation [xs weights 3])
+            output-node (first (:outputs plan))
+            executable (gpu-link/instantiate! plan)
+            expected (reassociation-safe-weighted-square-sum xs weights)]
+        (try
+          (is (= algebra (scan/validate! algebra))
+              "the numerical oracle respects the source's explicit reassociation authority")
+          (gpu-link/run! executable)
+          (let [actual (first (gpu-link/download executable output-node))]
+            (is (= (float-bits expected) (float-bits actual)) (str target)))
+          (is (= 1 (reduce *' 1 (get-in plan [:nodes output-node :view :shape]))))
+          (is (= before-xs (vec xs)))
+          (is (= before-weights (vec weights)))
+          (is (= :none (get-in compilation [:stats :fallback])))
+          (testing (str target " executes the genuine zero-extent identity reduction")
+            (let [empty-xs (float-array 0)
+                  empty-weights (float-array 0)
+                  zero-plan (equation-first/lower compilation [empty-xs empty-weights 0])
+                  zero-node (first (:outputs zero-plan))
+                  zero-executable (gpu-link/instantiate! zero-plan)]
+              (try
+                (gpu-link/run! zero-executable)
+                (is (= (float-bits (float 0.0))
+                       (float-bits (first (gpu-link/download zero-executable zero-node)))))
+                (is (= 1 (reduce *' 1 (get-in zero-plan [:nodes zero-node :view :shape]))))
+                (is (empty? empty-xs))
+                (is (empty? empty-weights))
+                (finally
+                  (gpu-link/close! zero-executable)
+                  (gpu-link/close! zero-executable)))))
+          (finally
+            (gpu-link/close! executable)
+            (gpu-link/close! executable)))))))
 
 (deftest source-free-compilation-replays-changed-inputs-on-opencl
   (if @opencl/opencl-available?
