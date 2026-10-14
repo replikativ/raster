@@ -11,6 +11,7 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.emitted-parallel-program :as emitted-program]
             [raster.compiler.ir.invocation-link :as invocation-link]
+            [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.semantic-fingerprint :as semantic]
@@ -79,6 +80,51 @@
      :buffer-bindings {'x :input-value 'y :output-value}
      :scalar-values {'n {:type :long :value 2}}})))
 
+(defn- contains-identical?
+  [value target]
+  (cond
+    (identical? value target) true
+    (map? value) (or (some #(contains-identical? % target) (keys value))
+                     (some #(contains-identical? % target) (vals value)))
+    (coll? value) (some #(contains-identical? % target) value)
+    :else false))
+
+(defn- resident-layout-fixture []
+  (let [input (double-array [2.0 -3.0])
+        compilation (with-redefs [hardware/descriptor-for synthetic-descriptor]
+                      (equation-first/compile-typed
+                       (pure-map) {:target :ocl:resident-layout
+                                   :schedule {:precision :f32-scalar}}))
+        invocation-plan (get-in compilation [:semantic :attributes :invocation-plan])
+        materialized (materialization/materialize
+                      invocation-plan [input 2]
+                      (fn [& _] (throw (Exception. "unexpected scalar evaluation"))))
+        ordinary (equation-first/lower compilation [input 2])
+        layout (invocation-link/project-resident-layout
+                materialized (:emitted compilation) (:target compilation))]
+    {:input input :compilation compilation :materialized materialized
+     :ordinary ordinary :layout layout}))
+
+(defn- with-host-equation [emitted]
+  (let [answer-value (av/tensor {:dtype :long :shape []})
+        host-algorithm
+        (soac/make
+         (soac/default-program-facts
+          {:values {'n (get-in emitted [:values 'n]) 'host-answer answer-value}
+           :inputs '[n]
+           :equations {'host-scalar (soac/default-equation-facts)}})
+         [(list '= 'host-scalar '[host-answer]
+                (list 'scalar {:dtypes [:long]} '[n]
+                      (soac/lambda-form '[value] [] '[(unchecked-inc value)])))]
+         '[host-answer])
+        host-equation
+        (parallel-program/->ProgramEquation
+         [:host-scalar] [:test :host-scalar] nil '[n] '[host-answer]
+         host-algorithm [] #{} {:source :test} {:host-only true})]
+    (-> emitted
+        (assoc-in [:values 'host-answer] answer-value)
+        (update :equations conj host-equation))))
+
 (deftest source-free-compilation-uses-the-shared-tail-without-a-frontend
   (let [typed (pure-map)
         calls (atom [])
@@ -133,6 +179,103 @@
     (is (zero? (get-in plan [:attributes :driver-allocations])))
     (is (= #{'y} (set (keys (get-in plan [:attributes :semantic-outputs])))))
     (is (= 1 (count (:outputs plan))))))
+
+(deftest resident-layout-is-a-source-free-non-executable-projection-of-ordinary-lowering
+  (let [{:keys [input compilation ordinary layout]} (resident-layout-fixture)
+        public-bindings (get-in ordinary [:attributes :public-buffer-bindings])
+        public-input (get public-bindings 'x)
+        ordinary-call (get-in ordinary [:instances 0 :call])]
+    (is (= #{:target :nodes :values :buffer-bindings :scalar-values :public-inputs}
+           (set (keys layout))))
+    (is (not (link-plan/link-plan? layout)))
+    (is (not (invocation-link/certified-link? layout)))
+    (is (= :ocl:resident-layout (:target layout)))
+    (is (= [{:symbol 'x :value public-input}] (:public-inputs layout)))
+    (is (= (get-in ordinary [:attributes :compiler-buffer-bindings])
+           (:buffer-bindings layout)))
+    (is (= (:scalar-values ordinary-call) (:scalar-values layout)))
+    (is (= (:values ordinary) (:values layout)))
+    (is (identical? input (get-in ordinary [:nodes public-input :source])))
+    (is (not (contains-identical? layout input)))
+    (is (every? (comp nil? :source val) (:nodes layout)))
+    (doseq [[node-id node] (:nodes ordinary)]
+      (is (= (cond-> node
+               (= node-id public-input) (assoc :role :input :source nil))
+             (get-in layout [:nodes node-id]))))
+    (let [request (-> layout
+                      (dissoc :public-inputs)
+                      (assoc :id :resident-layout-binding))
+          emitted (:emitted compilation)
+          bound (invocation-link/bind-resident-program emitted request)]
+      (is (link-plan/program-link-instance? bound))
+      (testing "the snapshot grants no proof when its copied storage data is changed"
+        (let [input-node (get-in layout [:values public-input :leaves 0 :node])]
+          (is (instance?
+               clojure.lang.ExceptionInfo
+               (try (invocation-link/bind-resident-program
+                     emitted (assoc-in request [:nodes input-node :view :shape] [1]))
+                    nil (catch clojure.lang.ExceptionInfo error error))))
+          (is (some? (reason #(invocation-link/bind-resident-program
+                              emitted (assoc-in request [:values public-input :abstract :dtype]
+                                                :float)))))
+          (is (= :resident-binding-buffers
+                 (reason #(invocation-link/bind-resident-program
+                           emitted (update request :buffer-bindings dissoc 'x)))))
+          (is (= :resident-binding-scalars
+                 (reason #(invocation-link/bind-resident-program
+                           emitted (assoc request :scalar-values {}))))))))))
+
+(deftest resident-layout-refuses-host-and-non-input-boundaries-before-export
+  (let [{:keys [input compilation materialized ordinary]} (resident-layout-fixture)
+        project-var (ns-resolve 'raster.compiler.ir.invocation-link
+                                'resident-layout-projection)
+        order-var (ns-resolve 'raster.compiler.ir.invocation-link
+                              'ordered-resident-public-inputs)
+        public-input (get-in ordinary [:attributes :public-buffer-bindings 'x])
+        output-node (first (:outputs ordinary))
+        invoke-project #(project-var % nil)]
+    (doseq [role [:state :output]]
+      (is (= :resident-layout-public-roles
+             (reason #(invoke-project
+                       (assoc-in ordinary [:attributes :public-buffer-roles 'x] role))))))
+    (is (= :resident-layout-retained-source
+           (reason #(invoke-project
+                     (-> ordinary
+                         (assoc-in [:nodes output-node :role] :state)
+                         (assoc-in [:nodes output-node :source] (double-array 2)))))))
+    (is (= :resident-layout-host-boundary
+           (reason #(invoke-project
+                     (assoc-in ordinary [:attributes :driver-allocations] 1)))))
+    (is (= :resident-layout-host-boundary
+           (reason #(invoke-project
+                     (assoc-in ordinary [:attributes :host-outputs] {'host 1})))))
+    (is (some? (reason #(invoke-project
+                         (update ordinary :instances conj (first (:instances ordinary)))))))
+    (is (= :resident-layout-public-inputs
+           (reason #(order-var (:plan materialized)
+                               {'x public-input 'rogue public-input}))))
+    (testing "a malformed initializer is rejected while it is still ordinary materialization"
+      (let [changed-buffer (assoc (get-in materialized [:program-buffers 'x])
+                                  :source (double-array [2.0]))
+            changed (-> materialized
+                        (assoc-in [:program-buffers 'x] changed-buffer)
+                        (assoc-in [:values (:id changed-buffer)] changed-buffer))]
+        (is (= :invocation-materialization-buffer-source
+               (reason #(invocation-link/project-resident-layout
+                         changed (:emitted compilation) (:target compilation)))))))
+    (testing "native initialization is not converted to a resident input premise"
+      (let [native (assoc-in (:emitted compilation)
+                             [:attributes :native-initialization-providers]
+                             {'y {:provider :fixture}})]
+        (is (= :invocation-link-native-initialization
+               (reason #(invocation-link/project-resident-layout
+                         materialized native (:target compilation)))))))
+    (testing "a validated host equation reaches the explicit closed-boundary refusal"
+      (is (= :resident-layout-host-boundary
+             (reason #(invocation-link/project-resident-layout
+                       materialized (with-host-equation (:emitted compilation))
+                       (:target compilation))))))
+    (is (identical? input (get-in ordinary [:nodes public-input :source])))))
 
 (deftest emitted-program-binds-to-existing-resident-link-values-without-initialization-authority
   (let [compilation (with-redefs [hardware/descriptor-for synthetic-descriptor]
