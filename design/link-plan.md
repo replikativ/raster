@@ -129,6 +129,14 @@ source contents and native handles are live inputs, not fingerprinted certificat
 runtime owner must realize those contracts without treating the validation-only spine as an eager
 all-entry schedule.
 
+The first named-entry runtime owner is deliberately narrower than the module IR. It admits only
+owned, exact-node, state-free, straight-line equation-first entries whose writes are semantic
+complete results. One private session and storage realization serves separately prepared entry
+programs; there is no eager outer graph. Opaque generation leases pin producer frontiers and
+declared outputs, permit dependent reads, and reject overlapping uploads or replays. Backend
+failure poisons the complete owner conservatively. This is not yet an attached-session, mutable
+state, composite-value, AD-tape, or recoverable execution contract.
+
 Owned `:input`/`:constant`/`:state` nodes without a plan initializer are tracked as pending. Replay
 fails until `gpu-link/upload!` initializes them. This makes input and first-use state readiness
 explicit while still allowing pretrained runtimes to allocate first and publish or upload later.

@@ -83,7 +83,7 @@
 
 (def ^:dynamic ^:private *certified-plan-evidence* nil)
 
-(defn- allocation-groups [plan]
+(defn ^:no-doc allocation-groups [plan]
   (group-by #(get-in % [:view :allocation :id]) (vals (:nodes plan))))
 
 (defn- allocation-key [execution-id allocation-id]
@@ -174,7 +174,7 @@
 (defn- caller-math-options [opts]
   (when (contains? opts :scalar-math) (select-keys opts [:scalar-math])))
 
-(defn- realize-plan-storage!
+(defn ^:no-doc realize-plan-storage!
   "Realize one validated plan's physical storage into an existing session transaction ledger."
   [plan session execution-id groups external-buffers allocation-keys timings]
   (let [key-by-allocation
@@ -233,7 +233,7 @@
        :owned-specs owned-specs
        :node-views node-views})))
 
-(defn- resident-program-executor
+(defn ^:no-doc resident-program-executor
   "Build the existing emitted-program callback boundary over already realized plan storage."
   [plan session execution-id node-views static-programs? profile? allocation-keys]
   {:buffer-view (fn [value-id]
