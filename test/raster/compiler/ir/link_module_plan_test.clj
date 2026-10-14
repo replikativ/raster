@@ -15,6 +15,9 @@
 (defn- reason [invoke]
   (try (invoke) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
 
+(defn- interface [inputs state outputs]
+  {:inputs (vec inputs) :state (vec state) :outputs (vec outputs)})
+
 (defn- node
   ([id role] (node id role nil))
   ([id role source]
@@ -128,9 +131,9 @@
       :nodes [(link/node {:id :input :dtype :float :shape [4] :device :ocl:0
                           :role :input :source (float-array 4)})
               (link/node {:id :residual :dtype :float :shape [4] :device :ocl:0
-                          :role :internal})
+                          :role :output})
               (link/node {:id :result :dtype :float :shape [4] :device :ocl:0
-                          :role :internal})]
+                          :role :output})]
       :values [(link/value {:id :input :abstract abstract
                             :leaves [{:name :value :node :input}]})
                (link/value {:id :residual :abstract abstract
@@ -201,34 +204,43 @@
     (is (= node-order (mapv first (#'link/ordered-step-accesses facts))))
     (let [built (module/make
                  {:id :ordered-module :spine (ordered-external-spine node-order)
-                  :entries [{:name :ordered :instances [:ordered-step]}]})
+                  :entries [{:name :ordered :instances [:ordered-step]
+                             :interface (interface (reverse node-order)
+                                                   [:ordered-state] [])}]})
           expected (conj node-order :ordered-state)]
       (is (= expected (get-in built [:entries 0 :contract :require-order])))
+      (is (= (vec (reverse node-order)) (get-in built [:entries 0 :interface :inputs]))
+          "caller interface order is intent, independent of retained ABI fact order")
       (is (= built (module/validate! (module/validate! built)))))))
 
 (deftest module-validation-freshly-enforces-partition-and-complete-producer-authority
   (let [spine (legacy-spine)
         request {:id :training-module :spine spine
-                 :entries [{:name :primal :instances [:primal]}
-                           {:name :pullback :instances [:pullback]}]}]
+                 :entries [{:name :primal :instances [:primal]
+                            :interface (interface [:input] [] [])}
+                           {:name :pullback :instances [:pullback]
+                            :interface (interface [] [] [])}]}]
     (is (= :link-module-frontier-producer (reason #(module/make request)))
         "a legacy ABI writer cannot initialize a retained residual")
     (is (= :link-relative-entry-partition
            (reason #(module/make (assoc request :entries
-                                        [{:name :pullback :instances [:pullback]}
-                                         {:name :primal :instances [:primal]}])))))
+                                        [(second (:entries request))
+                                         (first (:entries request))])))))
     (is (= :link-relative-entry-partition
            (reason #(module/make (assoc request :entries
-                                        [{:name :primal :instances [:primal]}])))))
+                                        [(first (:entries request))])))))
     (is (= :link-module-entry-names
            (reason #(module/make (assoc request :entries
-                                        [{:name :same :instances [:primal]}
-                                         {:name :same :instances [:pullback]}])))))
+                                        [(assoc (first (:entries request)) :name :same)
+                                         (assoc (second (:entries request)) :name :same)])))))
     (is (= :link-module-entry
            (reason #(module/make
                      (assoc request :entries
-                            [{:name (object-array 0) :instances [:primal]}
-                             {:name :pullback :instances [:pullback]}])))))
+                            [(assoc (first (:entries request)) :name (object-array 0))
+                             (second (:entries request))])))))
+    (is (= :link-module-interface-output-role
+           (reason #(module/make
+                     (assoc-in request [:entries 0 :interface :outputs] [:residual])))))
     (let [{:keys [effect-evidence]}
           (link/validate-with-effect-evidence! spine nil nil)
           changed-math
@@ -242,8 +254,10 @@
   (let [spine (semantic-module-spine)
         built (module/make
                {:id :semantic-module :spine spine
-                :entries [{:name :primal :instances [:primal]}
-                          {:name :pullback :instances [:pullback]}]})]
+                :entries [{:name :primal :instances [:primal]
+                           :interface (interface [:input] [] [:residual])}
+                          {:name :pullback :instances [:pullback]
+                           :interface (interface [] [] [:result])}]})]
     (is (= built (module/validate! (module/validate! built))))
     (is (= [{:value :residual :nodes [:residual]
              :producer :primal :consumer :pullback}]
@@ -255,7 +269,151 @@
     (is (= :borrowed
            (get-in built [:spine :instances 1 :call :program :values 'x :ownership])))
     (is (= #{:residual} (get-in built [:entries 0 :contract :full-produces])))
-    (is (= #{:residual} (get-in built [:entries 1 :contract :frontier-requires])))))
+    (is (= #{:residual} (get-in built [:entries 1 :contract :frontier-requires])))
+    (is (= (interface [:input] [] [:residual]) (get-in built [:entries 0 :interface])))
+    (is (= (interface [] [] [:result]) (get-in built [:entries 1 :interface])))
+    (is (= :link-module-interface-output-production
+           (reason #(module/make
+                     {:id :prior-output :spine spine
+                      :entries [{:name :primal :instances [:primal]
+                                 :interface (interface [:input] [] [:residual])}
+                                {:name :pullback :instances [:pullback]
+                                 :interface (interface [] [] [:residual])}]})))
+        "a consumer cannot expose a frontier produced only by an earlier entry")))
+
+(deftest entry-interfaces-are-strict-resident-value-contracts
+  (let [spine (external-state-spine)
+        entry {:name :advance :instances [:advance]
+               :interface (interface [:input] [:state] [])}
+        request {:id :interface-contract :spine spine :entries [entry]}]
+    (is (= :link-module-entry-interface
+           (reason #(module/make (assoc request :entries [(dissoc entry :interface)])))))
+    (is (= :link-module-entry-interface
+           (reason #(module/make
+                     (assoc request :entries
+                            [(assoc-in entry [:interface :certificate] :forged)])))))
+    (is (= :link-module-entry-interface
+           (reason #(module/make
+                     (assoc request :entries
+                            [(assoc-in entry [:interface :inputs] [:input :input])])))))
+    (is (= :link-module-entry-interface-overlap
+           (reason #(module/make
+                     (assoc request :entries
+                            [(assoc entry :interface (interface [:input] [:input :state] []))])))))
+    (is (= :link-module-interface-access
+           (reason #(module/make
+                     (assoc request :entries
+                            [(assoc entry :interface (interface [] [:state] []))])))))
+    (is (= :link-module-interface-access
+           (reason #(module/make
+                     (assoc request :entries
+                            [(assoc entry :interface (interface [:input 'scalar] [:state] []))])))))
+    (let [built (module/make request)]
+      (is (= [:input] (get-in built [:entries 0 :interface :inputs])))
+      (is (= [:state] (get-in built [:entries 0 :interface :state]))
+          "a write-only state value remains an explicit public mutation boundary"))))
+
+(deftest entry-interface-projection-refuses-aliases-and-partial-physical-values
+  (let [make-node
+        (fn [id role allocation-id shape]
+          (link/node {:id id :dtype :float :shape shape :device :ze:0 :role role
+                      :allocation-id allocation-id :byte-size 8 :byte-offset 0}))
+        scalar-node (make-node :scalar-buffer :input :scalar-buffer [])
+        scalar-spine
+        {:nodes {:scalar-buffer scalar-node}
+         :values {:scalar-buffer
+                  (link/value {:id :scalar-buffer
+                               :abstract (av/tensor {:dtype :float :shape []})
+                               :leaves [{:name :value :node :scalar-buffer}]})}}
+        scalar-entry
+        (assoc (module/->LinkModuleEntry
+                :rank-zero [:rank-zero]
+                {:reads #{:scalar-buffer} :writes #{} :full-produces #{}})
+               :interface (interface [:scalar-buffer] [] []))]
+    (is (= scalar-entry
+           (#'module/validate-entry-interface! scalar-spine [scalar-entry] 0 scalar-entry))
+        "a physical one-element rank-zero buffer is a valid resident input value")
+    (let [public (make-node :public :input :shared [1])
+          internal (make-node :internal :internal :shared [1])
+          spine {:nodes {:public public :internal internal}
+                 :values {:public (link/value
+                                   {:id :public
+                                    :abstract (av/tensor {:dtype :float :shape [1]})
+                                    :leaves [{:name :value :node :public}]})
+                          :internal (link/value
+                                     {:id :internal
+                                      :abstract (av/tensor {:dtype :float :shape [1]})
+                                      :leaves [{:name :value :node :internal}]})}}
+          entry (assoc (module/->LinkModuleEntry
+                        :alias [:alias]
+                        {:reads #{:internal} :writes #{} :full-produces #{}})
+                       :interface (interface [:public] [] []))]
+      (is (= :link-module-interface-alias
+             (reason #(#'module/validate-entry-interface! spine [entry] 0 entry)))))
+    (let [input-node (make-node :input-node :input :input-node [1])
+          spine {:nodes {:input-node input-node}
+                 :values {:input (link/value
+                                  {:id :input
+                                   :abstract (av/tensor {:dtype :float :shape [1]})
+                                   :leaves [{:name :value :node :input-node}]})}}
+          writing-entry
+          (assoc (module/->LinkModuleEntry
+                  :writing-input [:writing-input]
+                  {:reads #{:input-node} :writes #{:input-node} :full-produces #{}})
+                 :interface (interface [:input] [] []))
+          producer
+          (assoc (module/->LinkModuleEntry
+                  :producer [:producer]
+                  {:reads #{} :writes #{:input-node} :full-produces #{:input-node}})
+                 :interface (interface [] [] []))
+          consumer
+          (assoc (module/->LinkModuleEntry
+                  :consumer [:consumer]
+                  {:reads #{:input-node} :writes #{} :full-produces #{}})
+                 :interface (interface [:input] [] []))]
+      (is (= :link-module-interface-input-write
+             (reason #(#'module/validate-entry-interface!
+                        spine [writing-entry] 0 writing-entry))))
+      (is (= :link-module-interface-input-producer
+             (reason #(#'module/validate-entry-interface!
+                        spine [producer consumer] 1 consumer)))))
+    (let [internal (make-node :mixed-internal :internal :mixed-internal [1])
+          input-node (make-node :mixed-input :input :mixed-input [1])
+          mixed (link/value
+                 {:id :mixed
+                  :abstract (av/tensor {:dtype :float :shape [2]})
+                  :physical-layout {:kind :ordered-fields :field-order [:internal :input]}
+                  :leaves [{:name :internal :node :mixed-internal}
+                           {:name :input :node :mixed-input}]})
+          spine {:nodes {:mixed-internal internal :mixed-input input-node}
+                 :values {:mixed mixed}}
+          entry (assoc (module/->LinkModuleEntry
+                        :mixed-role [:mixed-role]
+                        {:reads #{:mixed-input} :writes #{} :full-produces #{}})
+                       :interface (interface [:mixed] [] []))]
+      (is (= :link-module-interface-value-roles
+             (reason #(#'module/validate-entry-interface! spine [entry] 0 entry)))
+          "a relevant role in a later leaf cannot be hidden by the first leaf"))
+    (doseq [[role field reason-key]
+            [[:state :state :link-module-interface-whole-value]
+             [:output :outputs :link-module-interface-output-production]]]
+      (let [left (make-node :left role :left [1])
+            right (make-node :right role :right [1])
+            pair (link/value {:id :pair
+                              :abstract (av/tensor {:dtype :float :shape [2]})
+                              :physical-layout {:kind :ordered-fields
+                                                :field-order [:left :right]}
+                              :leaves [{:name :left :node :left}
+                                       {:name :right :node :right}]})
+            spine {:nodes {:left left :right right} :values {:pair pair}}
+            contract {:reads #{} :writes #{:left} :full-produces #{:left}}
+            declared (case field
+                       :state (interface [] [:pair] [])
+                       :outputs (interface [] [] [:pair]))
+            entry (assoc (module/->LinkModuleEntry :partial [:partial] contract)
+                         :interface declared)]
+        (is (= reason-key
+               (reason #(#'module/validate-entry-interface! spine [entry] 0 entry))))))))
 
 (deftest whole-logical-frontiers-and-unique-producers-are-derived-not-declared
   (let [spine (legacy-spine)
@@ -303,11 +461,13 @@
     (is (= :link-module-spine
            (reason #(module/make {:id :bad :spine (assoc spine :outputs [:result])
                                   :entries [{:name :all
-                                             :instances [:primal :pullback]}]}))))))
+                                             :instances [:primal :pullback]
+                                             :interface (interface [:input] [] [])}]}))))))
 
 (deftest constructed-modules-rederive-and-compare-every-stored-contract
   (let [built (module/make {:id :state-module :spine (external-state-spine)
-                            :entries [{:name :advance :instances [:advance]}]})]
+                            :entries [{:name :advance :instances [:advance]
+                                       :interface (interface [:input] [:state] [])}]})]
     (is (= built (module/validate! built)))
     (is (= #{:input :state} (get-in built [:entries 0 :contract :external-requires])))
     (is (empty? (:frontiers built)))

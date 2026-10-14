@@ -112,7 +112,18 @@ initialize a retained value; only semantic complete writes and certified produce
 Cross-entry frontiers are whole logical values with one unique earlier complete producer, and
 dense complete child views may jointly cover a parent view.
 
-This prerequisite does not yet define per-entry callable outputs, execute entries, or establish
+Every named entry passed to `link-module-plan/make` must now declare an exact ordered interface of
+whole logical LinkValue identities: `{:inputs [...] :state [...] :outputs [...]}`. The former
+omitted-interface form refuses. Input membership is freshly derived from resident reads and
+state membership from resident reads or writes, using physical view overlap rather than node-name
+coincidence; their caller-declared order is preserved. Outputs are caller intent, but each must use
+output-role storage and be semantically complete-produced by that entry. Constants are implicit:
+in particular, an owned constant without a host source remains an external initialization premise,
+not ready storage. Scalars, certificates, partial logical values, and ambiguous cross-value aliases
+are not interface fields. A retained frontier may also be a declared producer output; this creates
+no second buffer or implicit lease.
+
+This prerequisite declares resident entry I/O but does not yet execute entries or establish
 sessions, generations, leases, replay, completion, failure recovery, or allocation lifetime. Host
 source contents and native handles are live inputs, not fingerprinted certificate data. A later
 runtime owner must realize those contracts without treating the validation-only spine as an eager
