@@ -9,6 +9,16 @@ interface identities. Existing operation coverage, canonical schema, residual or
 policies and runtime behavior are unchanged. This consolidation is preparation for checked
 equation composition, not admission of arbitrary map chains or device AD.
 
+The next evidence-only boundary admits exactly two pure homogeneous maps whose sole intermediate
+is the consumer's element input. Exact equation subprograms must reconstruct the original source
+through `append-pure-spines`; the existing target-neutral fusion pass must then derive exactly one
+vertical map. Scalar projection and differentiation consume that transient fused stage while the
+bundle retains the untouched two-equation source, and validation repeats the same append, fusion,
+rule replay and fixed-interface stage construction. Float conversions and typed locals survive as
+explicit checkpoints; no source facts or fusion provenance are scrubbed. Canonical adaptation and
+runtime execution deliberately refuse this evidence until residual origins can name the correct
+original producer equation. This adds no runtime chain, cache, registry or derivative rule.
+
 Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
 map followed by ordered additive sum, and functional indexed map. Those families now execute

@@ -23,6 +23,7 @@
             [raster.compiler.ir.semantic-fingerprint :as fingerprint]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as soac]
+            [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
             [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.core :as core]))
@@ -786,6 +787,87 @@
   (project-checked-map-lane source (soac/equation-subprogram source equation)
                             equation source-ns output-id options))
 
+(defn- exact-semantic-members?
+  [left right]
+  (and (= (count left) (count right))
+       (every? #(= 1 (count (filter (partial fingerprint/equivalent? %) right))) left)
+       (every? #(= 1 (count (filter (partial fingerprint/equivalent? %) left))) right)))
+
+(defn- exact-map-chain-stage
+  "Rebuild and fuse one exact pure map→map spine using the shared dialect authorities.
+   The fused stage is transient: callers retain the original two-equation source."
+  [source]
+  (soac/validate! source)
+  (let [equations (soac/equations source)]
+    (when-not (= 2 (count equations))
+      (fail! :ad-normalized-map-chain-boundary {:equations (count equations)}))
+    (let [[producer consumer] equations
+          [producer-program consumer-program] (soac/equation-subprograms source)
+          producer-results (vec (nth producer 2))
+          consumer-inputs (set (soac/operation-inputs consumer))
+          boundary-values (filterv consumer-inputs producer-results)
+          boundary (zipmap boundary-values boundary-values)
+          appended (soac/append-pure-spines producer-program consumer-program
+                                            boundary (soac/outputs source))
+          source-inputs (:inputs (soac/facts source))
+          appended-inputs (:inputs (soac/facts appended))
+          _ (when-not (exact-semantic-members? source-inputs appended-inputs)
+              (fail! :ad-normalized-map-chain-correspondence
+                     {:source-inputs source-inputs :appended-inputs appended-inputs}))
+          ;; Projection canonicalizes executable operands ahead of shape-only inputs. Restore
+          ;; only the already-validated public input order after proving exact typed membership;
+          ;; all other appended facts remain subject to the full fingerprint comparison below.
+          rebuilt (soac/make (assoc (soac/facts appended) :inputs source-inputs)
+                             (soac/equations appended) (soac/outputs appended))
+          _ (when-not (fingerprint/equivalent? source rebuilt)
+              (fail! :ad-normalized-map-chain-correspondence {}))
+          [stage stats] (fusion/fusion-fixpoint rebuilt)
+          [stage-equation] (soac/equations stage)
+          stage-parts (when stage-equation (soac/operation-parts stage-equation))
+          visible-ids (concat (:inputs (soac/facts source)) (soac/outputs source))]
+      (when-not (and (= 1 (count producer-results) (count boundary-values))
+                     (= {:vertical 1 :horizontal 0 :iterations 2}
+                        (select-keys stats [:vertical :horizontal :iterations]))
+                     (= 1 (count (soac/equations stage)))
+                     (= 'map (:kind stage-parts))
+                     ;; Fusion may canonicalize the transient executable input order. The
+                     ;; retained source remains the public ABI; prove that the stage has the
+                     ;; exact same typed members without pretending its internal order is ABI.
+                     (exact-semantic-members? (:inputs (soac/facts source))
+                                              (:inputs (soac/facts stage)))
+                     (fingerprint/equivalent? (soac/outputs source) (soac/outputs stage))
+                     (every? #(fingerprint/equivalent?
+                               (get-in (soac/facts source) [:values %])
+                               (get-in (soac/facts stage) [:values %]))
+                             visible-ids))
+        (fail! :ad-normalized-map-chain-boundary
+               {:producer producer :consumer consumer :boundary boundary :stats stats}))
+      stage)))
+
+(defn- project-map-chain
+  [source source-ns output-id options]
+  (soac/validate! source)
+  (let [equations (soac/equations source)]
+    (when-not (= 2 (count equations))
+      (fail! :ad-normalized-map-chain-boundary {:equations (count equations)}))
+    (let [[producer consumer] equations
+          producer-parts (soac/operation-parts producer)
+          intermediate (first (nth producer 2))
+          producer-local-active (first (concat (:arrays producer-parts)
+                                               (:captures producer-parts)))
+          ;; These are source-member validity checks, not activity selection. The final fused
+          ;; lane applies the caller's option against the complete external operand boundary.
+          _ (project-map-equation-lane source producer source-ns nil
+                                       {:active-input producer-local-active})
+          _ (project-map-equation-lane source consumer source-ns nil
+                                       {:active-input intermediate})
+          stage (exact-map-chain-stage source)
+          equation (first (soac/equations stage))]
+      (assoc (select-keys
+              (project-checked-map-lane source stage equation source-ns output-id options)
+              [:primal :interface])
+             :stage-source stage))))
+
 (defn- project-map-element
   [map-program source-ns output-id options]
   (soac/validate! map-program)
@@ -927,15 +1009,20 @@
 
 (defn- validate-map-programs! [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} map-programs
-        {:keys [primal] :as projected}
-        (project-map-element source source-ns (first (soac/outputs (:primal bundle)))
-                             {:active-input (:active-input interface)})
+        chain? (= 2 (count (soac/equations source)))
+        {:keys [primal stage-source] :as projected}
+        ((if chain? project-map-chain
+             (fn [source source-ns output-id options]
+               (assoc (project-map-element source source-ns output-id options)
+                      :stage-source source)))
+         source source-ns (first (soac/outputs (:primal bundle)))
+         {:active-input (:active-input interface)})
         scalar-interface (:interface projected)
         interface (:interface map-programs)
-        source-parts (soac/operation-parts (first (soac/equations source)))
+        source-parts (soac/operation-parts (first (soac/equations stage-source)))
         source-active (some #(when (= (:active-input interface) %) %)
                             (concat (:arrays source-parts) (:captures source-parts)))
-        {:keys [scalars arrays]} (map-residual-roles bundle source)
+        {:keys [scalars arrays]} (map-residual-roles bundle stage-source)
         ids (concat (vals (:residual-arrays interface))
                     (map interface [:tangent-input :cotangent-input :tangent-output :gradient-output]))]
     (when-not (and (fingerprint/equivalent? primal (:primal bundle))
@@ -947,15 +1034,21 @@
                    (fingerprint/equivalent? (set arrays) (set (keys (:residual-arrays interface))))
                    (fingerprint/equivalent? scalars (:scalar-captures interface))
                    (every? symbol? ids) (= (count ids) (count (distinct ids)))
-                   (empty? (set/intersection (set ids) (set (keys (:values (soac/facts source)))))))
+                   (empty? (set/intersection
+                            (set ids)
+                            (set/union (set (keys (:values (soac/facts source))))
+                                       (set (keys (:values (soac/facts stage-source))))))))
       (fail! :ad-normalized-map-interface {:interface interface :projected projected}))
-    (when (and (= [] (get-in (soac/facts source) [:values (:active-input interface) :shape]))
+    (when (and (= [] (get-in (soac/facts stage-source)
+                             [:values (:active-input interface) :shape]))
                (not (:sum-programs bundle)))
       (fail! :ad-normalized-map-scalar-requires-sum {:active-input (:active-input interface)}))
     (doseq [program (map map-programs [:primal :linear :transpose])] (soac/validate! program))
     ;; Fixed interface IDs make reconstruction deterministic. Exact semantic equality includes
     ;; expression metadata and float bits; no fresh AD generation or printed-string comparison.
-    (when-not (fingerprint/equivalent? map-programs (construct-map-stage bundle source interface))
+    (when-not (fingerprint/equivalent?
+               map-programs
+               (assoc (construct-map-stage bundle stage-source interface) :source source))
       (fail! :ad-normalized-map-programs {:interface interface})))
   bundle)
 
@@ -970,6 +1063,21 @@
   ([source source-ns] (linearize-map-program source source-ns {}))
   ([source source-ns options]
    (let [bundle (build-map-programs source source-ns options)]
+     (validate! (assoc bundle :certificate (certificate bundle))))))
+
+(defn linearize-map-chain-program
+  "Build checked scalar and lifted map programs for exactly one pure map→map chain.
+
+   The original two-equation source remains the semantic authority. Existing target-neutral
+   fusion derives a transient single-map execution stage which is rebuilt during validation.
+   Canonical runtime adaptation remains deliberately unsupported."
+  ([source source-ns] (linearize-map-chain-program source source-ns {}))
+  ([source source-ns options]
+   (let [{:keys [primal interface stage-source]}
+         (project-map-chain source source-ns nil options)
+         bundle (linearize-program primal interface)
+         programs (assoc (construct-map-stage bundle stage-source) :source source)
+         bundle (assoc bundle :map-programs programs)]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 
 (defn- project-indexed-element

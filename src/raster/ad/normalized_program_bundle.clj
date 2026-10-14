@@ -32,6 +32,13 @@
 (defn- program-envelope
   "Pure fixed-ID projection of already checked evidence. It generates no derivative code."
   [bundle kind]
+  (when (and (= :checked-scalar-map kind)
+             (not= 1 (count (soac/equations (get-in bundle [:map-programs :source])))))
+    ;; Map-chain evidence is intentionally construction-only until canonical residual origins
+    ;; can identify the exact original producer equation. Do not let the single-map projection
+    ;; attribute every fused-stage residual to the first source equation.
+    (fail! :ad-program-bundle-composition
+           {:equations (count (soac/equations (get-in bundle [:map-programs :source])))}))
   (let [sum? (= :checked-scalar-map-sum kind)
         indexed? (= :checked-scalar-indexed-map kind)
         programs (cond indexed? (:gather-programs bundle)
