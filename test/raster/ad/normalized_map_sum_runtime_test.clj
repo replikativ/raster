@@ -194,7 +194,8 @@
           arguments (args prepared {'xs xs 'weights weights 'size size})
           [output pullback] ((:vjp prepared) arguments)
           [jvp-output tangent] ((:jvp prepared) arguments xs)]
-      (is (empty? (:residuals bundle)))
+      (is (empty? (get-in bundle [:map-programs :proof :nodes 0
+                                  :scalar-derivation :residuals])))
       ;; Original left-to-right accumulation loses the middle unit. A tree regrouping gives 1.
       (is (= (bits (cast 0.0)) (bits output) (bits jvp-output) (bits tangent)))
       (is (= (class (cast 0.0)) (class output) (class tangent)))

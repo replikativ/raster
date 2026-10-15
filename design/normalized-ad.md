@@ -139,8 +139,18 @@ source-equation coverage, an execution equation, an existing scalar derivation (
 primal-only projection for an inactive node), fixed stage ports and phase identities.
 Validation reprojects each scalar lane and replays its existing
 derivative rules before reconstructing the executable phases. Removing the proof does not
-restore an older plain-map validation path. Map-sum and indexed derivations retain their
-explicit transitional scalar adapters; this is not completion of all-family consolidation.
+restore an older plain-map validation path. Map→ordered-sum consumes the same single active
+node witness directly; it no longer rehydrates duplicate outer scalar fields through a
+transitional adapter. The surrounding sum source must independently prove the original exact
+map/reduce relation before scalar-capture activity is admitted. Plain-map scalar-capture
+activity still refuses. Indexed derivations retain their transitional scalar representation;
+this is not completion of all-family consolidation.
+
+Scalar rule correspondence, map reconstruction and ordered-sum reconstruction share one
+request-local dependency-observation scope and final sequential identity fence. Bare scalar
+public validation retains its own lifecycle. A matching certificate does not replace rule
+replay or authorize a different phase program. Sum evidence admits exactly one active map
+witness; multi-node map→sum and general reduction AD remain separate capabilities.
 
 Singletons and regions whose fused execution frontier has at most two arrays retain their
 existing one-witness programs and numerical model. Only a previously refused homogeneous

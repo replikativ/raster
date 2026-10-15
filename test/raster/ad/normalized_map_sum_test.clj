@@ -110,6 +110,32 @@
         (is (= expected
                (reason #(normalized/validate! forged))))))))
 
+(deftest map-sum-retains-one-node-proof-as-its-only-scalar-authority
+  (let [bundle (build (source :double) 'xs)
+        node (get-in bundle [:map-programs :proof :nodes 0])
+        other-ns (the-ns 'raster.ad.normalized-scalar)]
+    (is (= #{:source-ns :template-revision :compiler-revision
+             :map-programs :sum-programs :certificate}
+           (set (keys bundle))))
+    (is (:scalar-derivation node))
+    (is (not-any? #(contains? bundle %)
+                  [:primal :linear :transpose :params :active-inputs
+                   :tangent-inputs :residuals :cotangent-seed]))
+    (doseq [[expected change]
+            [[:ad-normalized-sum-map-boundary
+              #(update-in % [:map-programs :proof] dissoc :nodes)]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] [node node])]
+             [:ad-normalized-map-node-proof
+              #(assoc % :primal (get-in % [:map-programs :primal]))]
+             [:ad-normalized-map-node-proof
+              #(dissoc % :map-programs)]
+             [:ad-normalized-map-node-namespace
+              #(assoc-in % [:map-programs :proof :nodes 0
+                            :scalar-derivation :source-ns] other-ns)]]]
+      (let [forged (recertify (change bundle))]
+        (is (= expected (reason #(normalized/validate! forged))))))))
+
 (deftest checked-sum-retains-original-ordered-step-and-explicit-scalar-seed
   (doseq [dt [:float :double] active '[xs weights]]
     (let [source (source dt)
@@ -130,7 +156,9 @@
       (is (= dt (:dtype (get-in (soac/facts (:transpose sums)) [:values seed]))))
       (is (= [] (:shape (get-in (soac/facts (:transpose sums)) [:values seed]))))
       (is (= seed (last captures)))
-      (is (= (:cotangent-seed bundle) (last (:parameters (soac/lambda-parts lambda)))))
+      (is (= (get-in bundle [:map-programs :proof :nodes 0
+                             :scalar-derivation :cotangent-seed])
+             (last (:parameters (soac/lambda-parts lambda)))))
       (is (= (set arrays) (set (vals (get-in bundle [:map-programs :interface :residual-arrays])))))
       (is (= #{:inputs :vjp :jvp} (set (keys (runtime/prepare bundle))))))))
 
@@ -252,7 +280,8 @@
         bundle (build source 'xs)
         transpose (:transpose (:sum-programs bundle))
         {:keys [arrays captures]} (soac/operation-parts (first (soac/equations transpose)))]
-    (is (empty? (:residuals bundle)))
+    (is (empty? (get-in bundle [:map-programs :proof :nodes 0
+                                :scalar-derivation :residuals])))
     (is (= [] arrays))
     (is (= [(get-in bundle [:sum-programs :interface :seed])] captures))
     (is (identical? transpose (soac/validate! transpose)))))

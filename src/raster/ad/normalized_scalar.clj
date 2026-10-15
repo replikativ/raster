@@ -611,7 +611,7 @@
   primal)
 
 (declare validate! validate-map-proof! validate-map-programs! validate-sum-programs!
-         validate-gather-programs!)
+         validate-gather-programs! sum-source-map sole-map-scalar!)
 
 (defn- validate-scalar-correspondence!
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
@@ -667,10 +667,6 @@
   (binding [*ns* source-ns
             *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
     (validate-scalar-correspondence! bundle)
-    (when (contains? bundle :map-programs)
-      (validate-map-programs! bundle))
-    (when (contains? bundle :sum-programs)
-      (validate-sum-programs! bundle))
     (when (contains? bundle :gather-programs)
       (validate-gather-programs! bundle))
     ;; Preserve all existing family/certificate refusal ordering. Matching a certificate
@@ -1597,7 +1593,7 @@
                                 primal-id)})))))
 
 (defn- reconstructed-map-proof
-  [{:keys [map-programs source-ns]}]
+  [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface proof]} map-programs
         submitted (:nodes proof)
         equations (vec (soac/equations source))
@@ -1689,8 +1685,9 @@
             ;; Preserve the complete established singleton/fused-stage correspondence check.
             ;; The node wrapper changes evidence ownership, not the one-stage map contract.
             _ (validate-map-programs!
-               (assoc (dissoc scalar :certificate)
-                      :map-programs (dissoc map-programs :proof)))
+               (cond-> (assoc (dissoc scalar :certificate)
+                              :map-programs (dissoc map-programs :proof))
+                 (:sum-programs bundle) (assoc :sum-programs (:sum-programs bundle))))
             source-parts (soac/operation-parts equation)
             options (if (and (= 1 (count requested))
                              (some #{(first requested)} (:captures source-parts)))
@@ -1713,25 +1710,50 @@
         (assoc stage :source source
                :proof (assoc proof :nodes [node]))))))
 
-(defn validate-map-proof!
-  [{:keys [map-programs source-ns] :as bundle}]
-  (when-not (and (= #{:source-ns :template-revision :compiler-revision
-                      :map-programs :certificate}
-                    (set (keys bundle)))
-                 (instance? clojure.lang.Namespace source-ns))
-    (fail! :ad-normalized-map-node-proof {:source-ns source-ns}))
+(defn- validate-proof-header! [bundle expected-keys]
+  (let [source-ns (:source-ns bundle)]
+    (when-not (and (= expected-keys (set (keys bundle)))
+                   (instance? clojure.lang.Namespace source-ns))
+      (fail! :ad-normalized-map-node-proof {:source-ns source-ns})))
   (when-not (= (revisions) (select-keys bundle [:template-revision :compiler-revision]))
     (fail! :ad-normalized-stale-rules
            {:expected (select-keys bundle [:template-revision :compiler-revision])
-            :actual (revisions)}))
+            :actual (revisions)})))
+
+(defn- validate-map-proof-correspondence!
+  [{:keys [map-programs] :as bundle}]
+  (doseq [program (map map-programs [:primal :linear :transpose])]
+    (soac/validate! program))
+  (let [expected (reconstructed-map-proof bundle)]
+    (when-not (fingerprint/equivalent? (pure-map-proof-namespaces map-programs)
+                                       (pure-map-proof-namespaces expected))
+      (fail! :ad-normalized-map-programs {:interface (:interface map-programs)})))
+  bundle)
+
+(defn validate-map-proof!
+  [{:keys [source-ns] :as bundle}]
+  (validate-proof-header! bundle #{:source-ns :template-revision :compiler-revision
+                                   :map-programs :certificate})
   (binding [*ns* source-ns
             *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
-    (doseq [program (map map-programs [:primal :linear :transpose])]
-      (soac/validate! program))
-    (let [expected (reconstructed-map-proof bundle)]
-      (when-not (fingerprint/equivalent? (pure-map-proof-namespaces map-programs)
-                                         (pure-map-proof-namespaces expected))
-        (fail! :ad-normalized-map-programs {:interface (:interface map-programs)})))
+    (validate-map-proof-correspondence! bundle)
+    (when-not (= (:certificate bundle) (certificate bundle))
+      (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
+    (check-dependencies! *proof-dependencies* source-ns))
+  bundle)
+
+(defn- validate-map-sum-proof!
+  [{:keys [source-ns sum-programs] :as bundle}]
+  (validate-proof-header! bundle #{:source-ns :template-revision :compiler-revision
+                                   :map-programs :sum-programs :certificate})
+  (binding [*ns* source-ns
+            *proof-dependencies* (atom {:dependencies {} :disagreements #{}})]
+    ;; Establish the exact surrounding map→sum source before that context permits the
+    ;; existing scalar-active map stage during correspondence reconstruction.
+    (sum-source-map (:source sum-programs) source-ns)
+    (sole-map-scalar! bundle)
+    (validate-map-proof-correspondence! bundle)
+    (validate-sum-programs! bundle)
     (when-not (= (:certificate bundle) (certificate bundle))
       (fail! :ad-normalized-certificate {:certificate (:certificate bundle)}))
     (check-dependencies! *proof-dependencies* source-ns))
@@ -1739,9 +1761,10 @@
 
 (defn validate!
   [bundle]
-  (if (and (:map-programs bundle) (not (:sum-programs bundle)))
-    (validate-map-proof! bundle)
-    (validate-legacy! bundle)))
+  (cond
+    (contains? bundle :sum-programs) (validate-map-sum-proof! bundle)
+    (contains? bundle :map-programs) (validate-map-proof! bundle)
+    :else (validate-legacy! bundle)))
 
 (defn- build-map-programs
   [source source-ns options]
@@ -1773,14 +1796,6 @@
          :compiler-revision (dispatch/compiler-definition-revision)
          :map-programs (assoc stage :source source
                               :proof {:authority :normalized-scalar :nodes [node]})}))))
-
-(defn- sum-legacy-map-adapter [bundle]
-  (let [nodes (get-in bundle [:map-programs :proof :nodes])
-        scalar (:scalar-derivation (first nodes))]
-    (when-not (= 1 (count nodes))
-      (fail! :ad-normalized-sum-map-boundary {:nodes (count nodes)}))
-    (merge (dissoc scalar :certificate)
-           (update bundle :map-programs dissoc :proof))))
 
 (defn linearize-map-program
   "Lift one checked homogeneous map or an admitted closed map region. Regions with at most two
@@ -2173,8 +2188,24 @@
               :gradient-outputs gradient-outputs}))
     active-inputs))
 
+(defn- sole-map-scalar!
+  [bundle]
+  (let [proof (get-in bundle [:map-programs :proof])
+        nodes (:nodes proof)
+        [node] nodes
+        scalar (:scalar-derivation node)]
+    (when-not (and (= :normalized-scalar (:authority proof))
+                   (= 1 (count nodes))
+                   (= #{:source-equations :execution-equation :scalar-derivation
+                        :stage-interface :equation-ids}
+                      (set (keys node)))
+                   (map? scalar))
+      (fail! :ad-normalized-sum-map-boundary {:nodes (count nodes)}))
+    scalar))
+
 (defn- lift-sum-programs [bundle source interface]
-  (let [[_ reduction] (soac/equations source)
+  (let [scalar (sole-map-scalar! bundle)
+        [_ reduction] (soac/equations source)
         map-programs (:map-programs bundle)
         map-interface (:interface map-programs)
         active-inputs (sum-map-activity! map-interface)
@@ -2192,7 +2223,7 @@
         ;; Move the explicit per-lane dy parameter to a scalar capture, leaving its scalar AD
         ;; identity unchanged. No broadcast array, reduction of cotangents or second evaluator.
         transpose-lambda (soac/lambda-form
-                          (into (vec (rest parameters)) [(:cotangent-seed bundle)])
+                          (into (vec (rest parameters)) [(:cotangent-seed scalar)])
                           (mapv (fn [{:keys [id dtype init]}] (soac/local-value id dtype init)) locals)
                           body-results)
         transpose-equation (list '= (second transpose-equation) (nth transpose-equation 2)
@@ -2260,7 +2291,7 @@
   ([source source-ns] (linearize-map-sum-program source source-ns {}))
   ([source source-ns options]
    (let [map-source (sum-source-map source source-ns)
-         bundle (sum-legacy-map-adapter (build-map-programs map-source source-ns options))
+         bundle (build-map-programs map-source source-ns options)
          map-interface (get-in bundle [:map-programs :interface])
          active-inputs (sum-map-activity! map-interface)
          scalar-active? (= [] (get-in (soac/facts map-source)

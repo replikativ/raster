@@ -1,6 +1,7 @@
 (ns raster.ad.normalized-proof-lifetime-test
   (:require [clojure.test :refer [deftest is]]
             [raster.ad.normalized-map-element-test :as element]
+            [raster.ad.normalized-map-sum-test :as map-sum]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-prepared-owner-test :as owner]
             [raster.numeric :as n]))
@@ -46,6 +47,24 @@
                   (reason (fn [] (normalized/validate! bundle))))))
         (is (= revision (normalized/revisions)) "fault does not rely on a registry epoch")
         (finally (alter-var-root v (constantly original)) (reset-meta! v original-meta))))))
+
+(deftest node-scalar-map-and-sum-proof-share-one-derivative-dependency-fence
+  (let [bundle (#'map-sum/build (#'map-sum/source :double) 'xs)
+        revision (normalized/revisions)
+        v #'n/* original @v original-meta (meta v)
+        validate-sum #'normalized/validate-sum-programs! check-sum @validate-sum]
+    (try
+      (with-redefs-fn
+        {validate-sum (fn [b]
+                        (let [result (check-sum b)]
+                          ;; Scalar and map correspondence have already observed the
+                          ;; derivative-only multiplication. Mutate only after sum replay.
+                          (alter-var-root v (constantly (fn [& _] 99.0)))
+                          result))}
+        #(is (= :ad-normalized-execution-callee
+                (reason (fn [] (normalized/validate! bundle))))))
+      (is (= revision (normalized/revisions)))
+      (finally (alter-var-root v (constantly original)) (reset-meta! v original-meta)))))
 
 (deftest successful-proof-rechecks-effective-receiver-metadata
   (binding [owner/receiver (#'owner/selected)]
