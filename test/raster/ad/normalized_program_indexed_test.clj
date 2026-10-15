@@ -141,6 +141,11 @@
              (reason #(canonical/adapt-indexed-map (assoc evidence facet {}))))))
     (is (= :ad-program-bundle-source-namespace
            (reason #(canonical/validate! (assoc b :source-ns (the-ns 'user))))))
+    (is (= :ad-program-bundle-source-namespace
+           (reason #(canonical/validate!
+                     (assoc-in b [:derivation :bundle :gather-programs :proof
+                                  :scalar-derivation :source-ns]
+                               (the-ns 'user))))))
     (is (= :ad-normalized-stale-rules
            (reason #(canonical/validate!
                      (assoc-in b [:derivation :bundle :compiler-revision] -1)))))

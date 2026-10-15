@@ -143,14 +143,25 @@ restore an older plain-map validation path. Map→ordered-sum consumes the same 
 node witness directly; it no longer rehydrates duplicate outer scalar fields through a
 transitional adapter. The surrounding sum source must independently prove the original exact
 map/reduce relation before scalar-capture activity is admitted. Plain-map scalar-capture
-activity still refuses. Indexed derivations retain their transitional scalar representation;
-this is not completion of all-family consolidation.
+activity still refuses. Indexed derivations now retain their scalar identity witness inside
+the indexed proof instead of duplicating its fields at the outer boundary. They do not use
+map-node evidence: direct indexed reads, saved indices, ordered scatter-add and the exclusive
+typed-zero destination remain independently reconstructed indexed obligations. This is proof
+ownership consolidation, not arbitrary indexed composition or additional operation coverage.
 
 Scalar rule correspondence, map reconstruction and ordered-sum reconstruction share one
 request-local dependency-observation scope and final sequential identity fence. Bare scalar
 public validation retains its own lifecycle. A matching certificate does not replace rule
 replay or authorize a different phase program. Sum evidence admits exactly one active map
 witness; multi-node map→sum and general reduction AD remain separate capabilities.
+
+All three lifted families and standalone scalar validation reuse the same scalar
+correspondence and rule-replay authority. Indexed reconstruction shares its enclosing
+dependency-observation scope and final fence, while runtime/device consumers still receive
+the same canonical ports, residual bindings and physical initialization obligations. One
+schema-owned namespace projection is reused for normalized and canonical fingerprints only
+after identity checks. It preserves nested certificates and unknown data; it is not a
+validator or permission to normalize arbitrary runtime objects.
 
 Singletons and regions whose fused execution frontier has at most two arrays retain their
 existing one-witness programs and numerical model. Only a previously refused homogeneous
@@ -942,7 +953,7 @@ fresh interfaces and construction correspondence, including semantic metadata an
 owned residuals. Known frontend binding bookkeeping is projected only after its
 complete two-binding envelope and absent host activity have been checked; unknown
 attributes are not stripped. No derivative rules or numerical interpreter are added.
-The host consumer adapts admitted legacy evidence once at its preparation boundary. All
+The host consumer adapts admitted normalized evidence once at its preparation boundary. All
 three supported families then execute the canonical primal/linear/transpose programs,
 ordered input/value interfaces, owned residual bindings and physical requirements. It
 does not rebuild a separate runtime interface or execute a legacy program facet. Family

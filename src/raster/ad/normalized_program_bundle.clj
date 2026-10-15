@@ -171,33 +171,17 @@
 (defn- pure-envelope [bundle]
   ;; Namespace instances are runtime identity, not process-independent semantic fingerprint data.
   ;; Both identities are checked separately before this projection is used for validation.
-  (let [bundle (-> bundle
-                   (dissoc :certificate)
-                   (assoc :source-ns (ns-name (:source-ns bundle)))
-                   (assoc-in [:derivation :bundle :source-ns]
-                             (ns-name (get-in bundle [:derivation :bundle :source-ns]))))
-        nodes (get-in bundle [:derivation :bundle :map-programs :proof :nodes])]
-    (if-not (vector? nodes)
-      bundle
-      (assoc-in
-       bundle [:derivation :bundle :map-programs :proof :nodes]
-       (mapv (fn [node]
-               (let [key (if (:scalar-derivation node)
-                           :scalar-derivation :primal-derivation)
-                     derivation (get node key)
-                     derivation (assoc derivation :source-ns
-                                       (ns-name (:source-ns derivation)))
-                     derivation (if (= key :primal-derivation)
-                                  (update derivation :interface
-                                          #(assoc % :source-ns (ns-name (:source-ns %))))
-                                  derivation)]
-                 (assoc node key derivation)))
-             nodes)))))
+  (-> bundle
+      (dissoc :certificate)
+      (assoc :source-ns (ns-name (:source-ns bundle)))
+      (update-in [:derivation :bundle] scalar/pure-proof-namespaces)))
 
 (defn- namespace! [{:keys [source-ns derivation]}]
-  (let [nodes (get-in derivation [:bundle :map-programs :proof :nodes])]
+  (let [evidence (:bundle derivation)
+        nodes (get-in evidence [:map-programs :proof :nodes])
+        indexed-scalar (get-in evidence [:gather-programs :proof :scalar-derivation])]
     (when-not (and (instance? clojure.lang.Namespace source-ns)
-                   (identical? source-ns (get-in derivation [:bundle :source-ns]))
+                   (identical? source-ns (:source-ns evidence))
                    (every? (fn [node]
                              (let [d (or (:scalar-derivation node)
                                          (:primal-derivation node))]
@@ -205,7 +189,10 @@
                                     (or (:scalar-derivation node)
                                         (identical? source-ns
                                                     (get-in d [:interface :source-ns]))))))
-                           (or nodes [])))
+                           (or nodes []))
+                   (or (nil? indexed-scalar)
+                       (and (map? indexed-scalar)
+                            (identical? source-ns (:source-ns indexed-scalar)))))
       (fail! :ad-program-bundle-source-namespace {}))))
 
 (defn- certificate [bundle]
@@ -215,7 +202,7 @@
 (defn validate!
   "Check the original scalar authority and fixed-ID source/program/interface correspondence.
    This is not independent proof of custom-rule mathematics or floating reassociation."
-  [{:keys [source-ns derivation] :as bundle}]
+  [{:keys [derivation] :as bundle}]
   (when-not (and (contains? #{:checked-scalar-map :checked-scalar-map-sum :checked-scalar-indexed-map}
                             (:kind derivation))
                  (map? (:bundle derivation)))
