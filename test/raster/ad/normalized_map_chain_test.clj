@@ -111,13 +111,20 @@
         phases (select-keys (:map-programs bundle) [:primal :linear :transpose])
         reject-allocation (fn [& _]
                             (throw (ex-info "retained replay allocated an identity" {})))
-        rebuilt (with-redefs-fn
-                  {#'normalized/allocate-map-stage-interface reject-allocation
-                   #'normalized/node-equation-ids reject-allocation}
-                  #(#'normalized/reconstructed-map-proof bundle))
+        [rebuilt validated] (with-redefs-fn
+                              {#'normalized/allocate-map-stage-interface reject-allocation
+                               #'normalized/allocate-segmented-interface reject-allocation
+                               #'normalized/node-equation-ids reject-allocation
+                               #'normalized/linearize-program reject-allocation}
+                              #(vector (#'normalized/reconstructed-map-proof bundle)
+                                       (normalized/validate! bundle)))
         node-path [:map-programs :proof :nodes]]
+    (is (identical? bundle validated))
     (is (= [false true]
            (mapv #(contains? % :scalar-derivation) (get-in bundle node-path))))
+    (is (= [#{:source-equations :execution-equation :primal-derivation :stage-interface :equation-ids}
+            #{:source-equations :execution-equation :scalar-derivation :stage-interface :equation-ids}]
+           (mapv (comp set keys) (get-in bundle node-path))))
     (is (every? (fn [phase]
                   (fingerprint/equivalent? (get phases phase) (get rebuilt phase)))
                 [:primal :linear :transpose]))
@@ -131,6 +138,17 @@
            (reason (fn []
                      (#'normalized/reconstructed-map-proof
                       (assoc-in bundle (conj node-path 1 :scalar-derivation) nil))))))
+    (is (= :ad-normalized-map-node-derivation
+           (reason #(#'normalized/reconstructed-map-proof
+                     (assoc-in bundle (conj node-path 0 :primal-derivation) nil)))))
+    (doseq [[node-index derivation] [[0 :primal-derivation] [1 :scalar-derivation]]]
+      (is (= :ad-normalized-map-node-namespace
+             (reason #(#'normalized/reconstructed-map-proof
+                       (assoc-in bundle (conj node-path node-index derivation :source-ns)
+                                 (the-ns 'clojure.core))))))
+      (is (= :ad-normalized-map-node-proof
+             (reason #(#'normalized/reconstructed-map-proof
+                       (assoc-in bundle (conj node-path node-index :extra-lifecycle-field) true))))))
     (doseq [changed [(assoc-in bundle (conj node-path 0 :equation-ids :linear)
                                'forged-inactive-linear)
                      (update-in bundle (conj node-path 1 :equation-ids) dissoc :linear)
@@ -443,7 +461,22 @@
                                           scale))]
                 result)
          {:dtype :float :array-types {'x :float 'q :float 'r :float}
-          :scalar-types {'n :long 'scale :float}})]
+          :scalar-types {'n :long 'scale :float}})
+        checked (normalized/linearize-map-chain-program
+                 source (the-ns 'raster.ad.normalized-map-chain-test) {:active-input 'r})
+        reject-allocation (fn [& _] (throw (ex-info "scalar-capture replay allocated an identity" {})))
+        [rebuilt validated]
+        (with-redefs-fn {#'normalized/allocate-map-stage-interface reject-allocation
+                        #'normalized/allocate-segmented-interface reject-allocation
+                        #'normalized/node-equation-ids reject-allocation
+                        #'normalized/linearize-program reject-allocation}
+          #(vector (#'normalized/reconstructed-map-proof checked) (normalized/validate! checked)))]
+    (is (identical? checked validated))
+    (is (= [false true] (mapv #(contains? % :scalar-derivation)
+                             (get-in checked [:map-programs :proof :nodes]))))
+    (is (some #{'scale} (vals (get-in checked [:map-programs :interface :scalar-captures]))))
+    (doseq [phase [:primal :linear :transpose]]
+      (is (fingerprint/equivalent? (get-in checked [:map-programs phase]) (get rebuilt phase))))
     (is (= :ad-normalized-map-scalar-requires-sum
            (reason #(normalized/linearize-map-chain-program
                      source (the-ns 'raster.ad.normalized-map-chain-test)
