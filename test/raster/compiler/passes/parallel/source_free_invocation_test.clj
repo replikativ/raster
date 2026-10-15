@@ -5,7 +5,9 @@
             [raster.ad.normalized-map-sum-test :as sum-fixture]
             [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.backend.gpu.parallel-program-c-family :as c-family]
+            [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.invocation-link :as invocation-link]
             [raster.compiler.ir.invocation-materialization :as materialization]
             [raster.compiler.ir.invocation-plan :as invocation]
             [raster.compiler.ir.kernel-body]
@@ -48,6 +50,34 @@
    (let [source (#'indexed-fixture/indexed-map :float :long extent gradient-extent)
          bundle (#'indexed-fixture/build source)]
      (get-in bundle [:gather-programs :transpose]))))
+
+(defn- private-shape-map
+  ([] (private-shape-map {}))
+  ([{:keys [dimension-value data-shape extra-source?]
+     :or {dimension-value (av/tensor {:dtype :long :shape []})
+          data-shape '[m]}}]
+   (let [indices (av/tensor {:dtype :long :shape [3]})
+         data (av/tensor {:dtype :float :shape data-shape})
+         output (av/tensor {:dtype :float :shape [3] :ownership :owned})
+         values (cond-> {'indices indices 'data data 'm dimension-value 'out output}
+                  extra-source? (assoc 'other data))
+         inputs (cond-> '[indices data] extra-source? (conj 'other))
+         captures (if extra-source? '[data other] '[data])
+         parameters (if extra-source?
+                      '[index data-array other-array]
+                      '[index data-array])]
+     (soac/make
+      (soac/default-program-facts
+       {:values values :inputs inputs
+        :equations {'gather (soac/default-equation-facts)}})
+      [(list '= 'gather '[out]
+             (list 'map {:index 'i :extent 3
+                         :attributes {:stable-array-captures captures}}
+                   '[indices] captures
+                   (soac/lambda-form
+                    parameters []
+                    '[(clojure.core/aget data-array index)])))]
+      '[out]))))
 
 (defn- nested-records
   [value]
@@ -214,6 +244,153 @@
     (is (= plan (invocation/validate-against! plan promoted)))
     (is (= :typed-soac (get-in plan [:attributes :source-dialect])))
     (is (= :explicit-typed-algorithm (get-in promoted [:provenance :front-end])))))
+
+(deftest source-free-private-dimension-uses-one-exact-self-shape-projection
+  (let [typed (private-shape-map)
+        original-values (:values (soac/facts typed))
+        promoted (route/promote-typed-algorithm typed)
+        plan (get-in promoted [:attributes :invocation-plan])
+        marker (get-in plan [:attributes :source-free-shape-projections])
+        [projection] (filter invocation/shape-projection? (:steps plan))
+        data-parameter (some #(when (= 'data (:symbol %)) %) (:parameters plan))
+        materialized
+        (materialization/materialize
+         plan
+         (mapv (fn [{:keys [symbol]}]
+                 (case symbol
+                   indices (long-array [0 1 2])
+                   data (float-array [4.0 5.0 6.0 7.0])))
+               (:parameters plan))
+         nil)]
+    (is (= [{:dimension 'm :source 'data :axis 0}] marker))
+    (is (= 'm (:symbol projection)))
+    (is (= (:id data-parameter) (:source projection)))
+    (is (= '[data] (mapv :symbol (:operands projection))))
+    (is (= '[(extent data)] (get-in data-parameter [:value :shape])))
+    (is (= (dissoc (get original-values 'data) :shape)
+           (dissoc (:value data-parameter) :shape)))
+    (is (= '[m] (get-in (soac/facts typed) [:values 'data :shape])
+           (get-in promoted [:values 'data :shape])))
+    (is (identical? (get original-values 'data) (get-in promoted [:values 'data])))
+    (is (= {:type :long :value 4} (get-in materialized [:values (:id projection)])))
+    (is (= [4] (get-in materialized [:program-buffers 'data :shape])))
+    (is (= plan (invocation/validate-against! plan promoted)))
+    (testing "marker, source and parameter facets participate in fresh correspondence"
+      (is (= :invocation-program-mismatch
+             (reason #(invocation/validate-against!
+                       (update plan :attributes dissoc :source-free-shape-projections)
+                       promoted))))
+      (is (= :invocation-program-mismatch
+             (reason #(invocation/validate-against!
+                       (update plan :attributes dissoc
+                               :source-dialect :source-free-shape-projections)
+                       promoted))))
+      (is (= :invocation-program-mismatch
+             (reason #(invocation/validate-against!
+                       plan (assoc-in promoted [:attributes :host-control]
+                                      :explicit-typed-algorithm)))))
+      (doseq [tampered [(assoc-in plan [:attributes :source-free-shape-projections 0 :axis] 1)
+                        (assoc-in plan [:attributes :source-free-shape-projections 0 :source]
+                                  'indices)
+                        (assoc-in plan [:parameters 1 :value :ownership] :borrowed)
+                        (assoc plan :steps [])]]
+        (is (some? (reason #(invocation/validate-against! tampered promoted)))))))
+  (testing "a storage-compatible parameter cannot replace the projection's exact source"
+    (let [base (private-shape-map)
+          facts (-> (soac/facts base)
+                    (assoc-in [:values 'other]
+                              (av/tensor {:dtype :float :shape [4]}))
+                    (update :inputs conj 'other))
+          typed (soac/make
+                 facts
+                 [(list '= 'gather '[out]
+                        (list 'map {:index 'i :extent 3
+                                    :attributes {:stable-array-captures '[data other]}}
+                              '[indices] '[data other]
+                              (soac/lambda-form
+                               '[index data-array other-array] []
+                               '[(clojure.core/aget data-array index)])))]
+                 '[out])
+          promoted (route/promote-typed-algorithm typed)
+          plan (get-in promoted [:attributes :invocation-plan])
+          data-binding (first (keep-indexed
+                               #(when (= 'data (:program-value %2)) %1)
+                               (:bindings plan)))
+          other-parameter (some #(when (= 'other (:symbol %)) %) (:parameters plan))
+          changed (assoc-in plan [:bindings data-binding :invocation-value]
+                            (:id other-parameter))]
+      (is (= changed (invocation/validate! changed)))
+      (is (= :invocation-program-mismatch
+             (reason #(invocation/validate-against! changed promoted))))))
+  (testing "the current canonical indexed primal uses the same projection"
+    (let [source (#'indexed-fixture/indexed-map :float :long 3 'm)
+          primal (get-in (#'indexed-fixture/build source) [:gather-programs :primal])
+          promoted (route/promote-typed-algorithm primal)]
+      (is (= [{:dimension 'm :source 'data :axis 0}]
+             (get-in promoted [:attributes :invocation-plan :attributes
+                               :source-free-shape-projections])))
+      (is (= '[m] (get-in (soac/facts primal) [:values 'data :shape])
+             (get-in promoted [:values 'data :shape]))))))
+
+(deftest source-free-private-dimension-materializes-and-emits-through-common-boundaries
+  (let [typed (private-shape-map)
+        compilation (equation-first/compile-typed
+                     typed {:target :ocl:shape-projection
+                            :schedule {:precision :f32-scalar}})
+        plan (get-in compilation [:semantic :attributes :invocation-plan])
+        arguments (mapv (fn [{:keys [symbol]}]
+                          (case symbol
+                            indices (long-array [0 1 2])
+                            data (float-array [4.0 5.0 6.0 7.0])))
+                        (:parameters plan))
+        materialized (materialization/materialize plan arguments nil)
+        layout (invocation-link/project-resident-layout
+                materialized (:emitted compilation) (:target compilation))
+        scheduled (route/schedule-program
+                   (route/promote-typed-algorithm typed)
+                   {:target-device :ocl:shape-projection :dtype :float})]
+    (is (= {:type :long :value 4} (get-in layout [:scalar-values 'm])))
+    (is (= [4] (get-in layout [:values (get-in layout [:buffer-bindings 'data])
+                                :abstract :shape])))
+    (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
+      (let [{:keys [program kernels]}
+            (c-family/emit-program scheduled {:target-dialect target :dtype :float})]
+        (is (some? program) (str target))
+        (is (seq kernels) (str target))))))
+
+(deftest source-free-private-dimension-refuses-ambiguous-or-expanded-authority
+  (is (= :invocation-source-free-shape-projection
+         (reason #(route/promote-typed-algorithm
+                   (private-shape-map {:extra-source? true})))))
+  (is (= :invocation-source-free-shape-projection
+         (reason #(route/promote-typed-algorithm
+                   (private-shape-map
+                    {:dimension-value (av/tensor {:dtype :float :shape []})})))))
+  (is (= :structured-control-source-free-dimension
+         (reason #(route/promote-typed-algorithm
+                   (private-shape-map {:data-shape '[(clojure.core/+ m 0)]})))))
+  (let [promoted (route/promote-typed-algorithm (private-shape-map))
+        executable (update-in promoted [:equations 0 :operands] conj 'm)]
+    (is (= :invocation-source-free-shape-projection
+           (reason #(invocation/source-free-shape-projections executable)))))
+  (testing "an explicit public dimension retains the old zero-prefix authority"
+    (let [base (private-shape-map)
+          facts (update (soac/facts base) :inputs conj 'm)
+          typed (soac/make
+                 facts
+                 [(list '= 'gather '[out]
+                        (list 'map {:index 'i :extent 3
+                                    :attributes {:stable-array-captures '[data]}}
+                              '[indices] '[data m]
+                              (soac/lambda-form
+                               '[index data-array data-size] []
+                               '[(clojure.core/aget
+                                  data-array (clojure.core/rem index data-size))])))]
+                 '[out])
+          promoted (route/promote-typed-algorithm typed)]
+      (is (nil? (get-in promoted [:attributes :invocation-plan :attributes
+                                  :source-free-shape-projections])))
+      (is (empty? (get-in promoted [:attributes :invocation-plan :steps]))))))
 
 (deftest source-free-promotion-materializes-through-the-existing-flat-boundary
   (let [promoted (route/promote-typed-algorithm (pure-map))

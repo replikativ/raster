@@ -21,6 +21,16 @@ Current KernelBody storage parameters require positive extents, so target emissi
 explicitly instead of substituting capacity one. Empty-buffer/liveness support is a separate
 compiler capability; this prerequisite does not claim it.
 
+A source-free public rank-one buffer `data[m]` can also supply its own private integral shape
+dimension through the existing invocation `ShapeProjection`. The invocation parameter alone uses
+the checked self-extent view; the original TypedSOAC and program AbstractValues stay unchanged.
+Fresh validation proves the exact source parameter, all non-shape facets, the single public
+projection source, and the dimension's shape-only uses. Materialization derives typed `m` from
+the actual array geometry rather than asking callers for an internal scalar. Shared competing
+sources, compound shapes, executable uses, and forged or removed projection markers refuse.
+This does not yet provide dimensions to a separate phase with no public source buffer, admit
+empty device storage, or enable dynamic indexed device AD.
+
 This is a compiler-frontier prerequisite, not normalized device execution. Canonical map/sum
 primal, linear and transpose programs promote, schedule and emit through all four C-family
 dialects. Generated map lambdas project only a checked homogeneous non-nil Float/Double

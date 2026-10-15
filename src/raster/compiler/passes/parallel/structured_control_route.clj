@@ -936,14 +936,20 @@
 
    This is an admission check over retained AbstractValues, not a shape inference pass.  The
    materializer remains the execution authority for these same forms."
-  [public-values public-buffers public-input? owner dimension]
-  (let [integral-scalar?
-        (fn [id]
-          (let [value (get public-values id)
+  ([public-values public-buffers public-input? owner dimension]
+   (source-free-dimension! public-values public-buffers {} public-input? owner dimension))
+  ([public-values public-buffers projected-values public-input? owner dimension]
+  (let [integral-scalar-in?
+        (fn [values id]
+          (let [value (get values id)
                 declared (:dtype value)
                 dt (when (and (keyword? declared) (dtype/known? declared))
                      (dtype/canon declared))]
-            (and (symbol? id) (scalar-value? value) (contains? #{:int :long} dt))))]
+            (and (symbol? id) (scalar-value? value) (contains? #{:int :long} dt))))
+        integral-scalar?
+        (fn [id]
+          (or (integral-scalar-in? public-values id)
+              (integral-scalar-in? projected-values id)))]
     (cond
       (and (integer? dimension) (<= 0 dimension Long/MAX_VALUE)) dimension
 
@@ -956,7 +962,7 @@
 
       (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension)))
       (let [id (second dimension)]
-        (if (integral-scalar? id)
+        (if (integral-scalar-in? public-values id)
           dimension
           (fail! :structured-control-source-free-dimension
                  "source-free value dimension requires a public integral scalar"
@@ -978,16 +984,18 @@
       :else
       (fail! :structured-control-source-free-dimension
              "source-free buffer shape is outside the materializable dimension grammar"
-             {:value owner :dimension dimension}))))
+             {:value owner :dimension dimension})))))
 
 (defn- validate-source-free-value-boundary!
-  [typed-program]
+  ([typed-program] (validate-source-free-value-boundary! typed-program []))
+  ([typed-program shape-projections]
   (let [typed-program (soac/validate! typed-program)
         facts (soac/facts typed-program)
         inputs (:inputs facts)
         public-inputs (set inputs)
         values (:values facts)
         public-values (select-keys values inputs)
+        projected-values (select-keys values (map :dimension shape-projections))
         public-buffers
         (into #{}
               (keep (fn [id]
@@ -1013,13 +1021,15 @@
     (doseq [[id value] values
             :when (and (= :tensor (:kind value)) (seq (:shape value)))
             dimension (:shape value)]
-      (source-free-dimension! public-values public-buffers (contains? public-inputs id)
+      (source-free-dimension! public-values public-buffers projected-values
+                              (contains? public-inputs id)
                               id dimension))
-    typed-program))
+    typed-program)))
 
 (defn- validate-source-free-typed-boundary!
-  [typed-program]
-  (let [typed-program (validate-source-free-value-boundary! typed-program)
+  ([typed-program] (validate-source-free-typed-boundary! typed-program []))
+  ([typed-program shape-projections]
+  (let [typed-program (validate-source-free-value-boundary! typed-program shape-projections)
         facts (soac/facts typed-program)]
     (when-not (and (empty? (:effects facts)) (empty? (:aliases facts))
                    (empty? (get-in facts [:attributes :native-initialization-providers])))
@@ -1039,42 +1049,59 @@
                {:equation equation-id :effects (:effects equation-facts)
                 :aliases (:aliases equation-facts)
                 :result-storage (soac/result-storage facts equation-id)})))
-    typed-program))
+    typed-program)))
+
+(defn- source-free-invocation-plan
+  [kind typed-program shape-projections external-storage extra-attributes]
+  (let [facts (soac/facts typed-program)
+        inputs (:inputs facts)
+        values (:values facts)
+        parameter-values
+        (reduce (fn [parameter-values {:keys [source]}]
+                  (update parameter-values source assoc :shape [(list 'extent source)]))
+                (select-keys values inputs) shape-projections)
+        bindings (mapv (fn [{:keys [dimension source]}]
+                         [dimension (list 'clojure.core/alength source)])
+                       shape-projections)
+        attributes
+        (cond-> (merge {:source-dialect :typed-soac
+                        :algorithm-dialect :typed-soac
+                        :target-dialect :typed-invocation}
+                       extra-attributes)
+          (seq shape-projections)
+          (assoc :source-free-shape-projections (vec shape-projections)))]
+    (invocation/from-prefix
+     {:id [kind (semantic/fingerprint typed-program)]
+      :parameters inputs :parameter-values parameter-values
+      :bindings bindings
+      :binding-values (select-keys values (map :dimension shape-projections))
+      :program-values values :program-inputs inputs
+      :external-program-storage external-storage
+      :program-outputs (soac/outputs typed-program)
+      :attributes attributes})))
 
 (defn promote-typed-algorithm
   "Promote one pure, already constructed TypedSOAC into the ordinary typed invocation boundary.
 
-   Public parameters are exactly the algorithm's ordered inputs and retain their complete
-   AbstractValues.  There is no source prefix, inferred type override, external result storage or
-   host expression.  The initial boundary is deliberately limited to scalar and rank-one inputs
-   whose retained shapes are directly materializable from public integral scalars or public buffer
-   extents.  Scheduling and emission remain separate ordinary compiler stages."
+   Public parameters are exactly the algorithm's ordered inputs. A rank-one input whose sole
+   dimension is one private retained integral scalar may project that dimension from its own host
+   array extent; the program AbstractValue remains unchanged and every other parameter facet is
+   exact. There is no inferred type override, external result storage or host expression.
+   Scheduling and emission remain separate ordinary compiler stages."
   [typed-program]
-  (let [typed-program (validate-source-free-typed-boundary! typed-program)
-        facts (soac/facts typed-program)
-        inputs (:inputs facts)
-        outputs (soac/outputs typed-program)
-        values (:values facts)
+  (let [typed-program (soac/validate! typed-program)
         parallel-program (-> (typed-route/program-envelope typed-program)
                              (assoc :dialect :typed-parallel)
+                             (update :attributes assoc :host-control :typed-invocation)
                              (update :provenance assoc
                                      :front-end :explicit-typed-algorithm
                                      :pass :source-free-typed-invocation))
-        plan (invocation/from-prefix
-              {:id [:source-free-typed-invocation (semantic/fingerprint typed-program)]
-               :parameters inputs
-               :parameter-values (select-keys values inputs)
-               :bindings []
-               :binding-values {}
-               :program-values values
-               :program-inputs inputs
-               :program-storage []
-               :program-outputs outputs
-               :attributes {:source-dialect :typed-soac
-                            :algorithm-dialect :typed-soac
-                            :target-dialect :typed-invocation}})
+        shape-projections (invocation/source-free-shape-projections parallel-program)
+        typed-program (validate-source-free-typed-boundary! typed-program shape-projections)
+        plan (source-free-invocation-plan
+              :source-free-typed-invocation typed-program
+              shape-projections [] {})
         promoted (update parallel-program :attributes assoc
-                         :host-control :typed-invocation
                          :invocation-plan (invocation/validate-against! plan parallel-program))]
     (validate-typed-program! promoted)))
 
@@ -1087,7 +1114,15 @@
    plan; a resident binder and final LinkPlan must separately prove compatible storage and ordered
    initialization."
   [typed-program]
-  (let [typed-program (validate-source-free-value-boundary! typed-program)
+  (let [typed-program (soac/validate! typed-program)
+        parallel-program (-> (typed-route/program-envelope typed-program)
+                             (assoc :dialect :typed-parallel)
+                             (update :attributes assoc :host-control :typed-invocation)
+                             (update :provenance assoc
+                                     :front-end :explicit-typed-effect-algorithm
+                                     :pass :source-free-typed-effect-invocation))
+        shape-projections (invocation/source-free-shape-projections parallel-program)
+        typed-program (validate-source-free-value-boundary! typed-program shape-projections)
         facts (soac/facts typed-program)
         _ (when (seq (get-in facts [:attributes :native-initialization-providers]))
             (fail! :structured-control-source-free-effects
@@ -1095,28 +1130,10 @@
                    {:native-initialization-providers
                     (get-in facts [:attributes :native-initialization-providers])}))
         {:keys [destination]} (typed-route/source-free-ordered-effect-storage! typed-program)
-        inputs (:inputs facts)
-        outputs (soac/outputs typed-program)
-        values (:values facts)
-        parallel-program (-> (typed-route/program-envelope typed-program)
-                             (assoc :dialect :typed-parallel)
-                             (update :provenance assoc
-                                     :front-end :explicit-typed-effect-algorithm
-                                     :pass :source-free-typed-effect-invocation))
-        plan (invocation/from-prefix
-              {:id [:source-free-typed-effect-invocation (semantic/fingerprint typed-program)]
-               :parameters inputs
-               :parameter-values (select-keys values inputs)
-               :bindings [] :binding-values {}
-               :program-values values :program-inputs inputs
-               :external-program-storage [destination]
-               :program-outputs outputs
-               :attributes {:source-dialect :typed-soac
-                            :algorithm-dialect :typed-soac
-                            :target-dialect :typed-invocation
-                            :external-storage :resident-premise}})
+        plan (source-free-invocation-plan
+              :source-free-typed-effect-invocation typed-program
+              shape-projections [destination] {:external-storage :resident-premise})
         promoted (update parallel-program :attributes assoc
-                         :host-control :typed-invocation
                          :invocation-plan (invocation/validate-against! plan parallel-program))]
     (validate-typed-program! promoted)))
 
