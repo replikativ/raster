@@ -13,6 +13,8 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.equation-first :as equation-first]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.kernel-call :as kernel-call]
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as ops]
@@ -90,6 +92,52 @@
   (let [a (raster.par/map! left i n float (+ (ra/aget x i) 1.0))
         b (raster.par/map! right j n float (* (ra/aget x j) 2.0))]
     [a b]))
+
+(deftest dot-rows-dh-retains-row-parallel-launch
+  (doseq [[dtype make-array] [[:float float-array] [:double double-array]]]
+    (let [arguments [(make-array 17) (make-array 257) (long 17) (long 257)]
+          descriptor (pl/compile-gpu-program #'ops/dot-rows-dh :ocl:0 :dtype dtype)
+          steps (:steps descriptor)]
+      (is (= [:map-void] (mapv :convention steps))
+          "the explicit complete write removes only the redundant initialization")
+      (doseq [[step expected-bound] (map vector steps [17])]
+        (let [artifact (:artifact step)
+              slots (map vector (:abi artifact) (:arguments artifact) (:argument-specs step))
+              bindings (into {} (for [[slot symbol spec] slots :when (= :scalar (:kind slot))]
+                                  [symbol ((:value-fn spec) arguments)]))
+              bounds (for [[slot symbol _] slots :when (= :bound (:role slot))] (get bindings symbol))
+              geometry (kernel-launch/realize (:launch artifact) #(get bindings %))
+              workgroup (:workgroup-size geometry)]
+          (is (= [expected-bound] (vec bounds)) (str dtype " semantic iteration extent"))
+          (is (= 1 (count workgroup)))
+          (is (= [(max 1 (quot (+ expected-bound (dec (first workgroup))) (first workgroup)))]
+                 (:group-count geometry))
+              "ceil-div comes from the actual workgroup, not a vendor-specific constant")))
+      (let [step (first steps)
+            artifact (:artifact step)
+            ordered-values
+            (fn [args]
+              (mapv (fn [slot spec]
+                      (if (= :scalar (:kind slot))
+                        ((:value-fn spec) args)
+                        (case (:name slot)
+                          W (first (rest args))
+                          dy (first args)
+                          out (make-array 0))))
+                    (:abi artifact) (:argument-specs step)))
+            negative-values (ordered-values [(make-array 0) (make-array 0) -1 -3])
+            negative-bindings (zipmap (:arguments artifact) negative-values)]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be non-negative"
+                             (kernel-launch/realize (:launch artifact) negative-bindings))
+            "two negative dimensions must not expose an uncleared positive-size output")
+        (is (= :kernel-body-buffer-capacity
+               (try
+                 (kernel-call/validate-retained-input-capacities!
+                  artifact (ordered-values [(make-array 1) (make-array 0) 2 0])
+                  (fn [value _] (alength value)))
+                 :accepted
+                 (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+            "the row read remains required even when the inner dimension is zero")))))
 
 (deftest public-fused-buffer-maps-remain-a-flat-resident-program
   (let [descriptor (pl/compile-gpu-program #'ocl-session-fused-buffer-maps :ocl:0 :dtype :float)]

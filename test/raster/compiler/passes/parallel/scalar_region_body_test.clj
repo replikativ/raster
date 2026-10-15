@@ -977,6 +977,31 @@
                       [:long :int] {'a :int} {})]
     (is (= [(body/literal 9 :long) (body/literal 3 :int)] (:results result)))))
 
+(deftest typed-index-narrowing-specializes-only-proved-constants
+  (let [decline! (fn [reason message data] (throw (ex-info message (assoc data :reason reason))))
+        lower (fn [ranges]
+                (index/lower-typed '(int n) #{'n} {'n :long} :int decline! ranges))]
+    (doseq [n [Integer/MIN_VALUE 257 Integer/MAX_VALUE]]
+      (is (= (body/index-cast n :int :exact)
+             (lower {'n {:lower n :upper n}}))))
+    (doseq [ranges [nil {} {'n {:lower 0 :upper 257}} {'n {:lower 2 :upper 1}}
+                    {'n {:lower 0.5 :upper 0.5}}
+                    {'n {:lower -2147483649 :upper -2147483649}}
+                    {'n {:lower 2147483648 :upper 2147483648}}]]
+      (is (thrown? clojure.lang.ExceptionInfo (lower ranges))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (index/lower-typed '(int n) #{'n} {'n :long} :int decline!))
+        "the existing launch projection remains strict without concrete evidence")
+    (is (= (body/index-cast (body/index-cast 257 :int :exact) :long :exact)
+           (index/lower-typed '(int n) #{'n} {'n :long} :long decline!
+                              {'n {:lower 257 :upper 257}}))
+        "a specialized cast still widens to its surrounding arithmetic width")
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (index/lower-typed (with-meta '(+ i i) {:tag 'int})
+                                    #{'i} {'i :int} :long decline!
+                                    {'i {:lower 1 :upper 1}}))
+        "constant context does not authorize wrapping int arithmetic")))
+
 (deftest typed-index-lowering-consumes-local-ssa-facts
   (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
         lower (:lower-region

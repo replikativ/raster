@@ -1082,7 +1082,7 @@
    n-rows :- Long dim :- Long]
   :- (Array T)
   (let [out (alloc-like dy (* n-rows dim))]
-    (dotimes [v n-rows]
+    (par/map-void! v n-rows
       (let [dy-v (aget dy v)]
         (dotimes [d dim]
           (aset out (+ (* v (int dim)) d)

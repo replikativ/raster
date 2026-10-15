@@ -623,6 +623,27 @@
 ;; Existing gradient checks
 ;; ================================================================
 
+(deftest dot-rows-dh-retains-loop-edge-semantics
+  ;; Pin the old loop's six outcomes per dtype, including its otherwise dead dy read.
+  (doseq [make-array [float-array double-array]
+          [dy-values w-values rows dim expected exception]
+          [[[1.25 -2.5] [0.5 -0.25 3.0] 2 3 [0.625 -0.3125 3.75 -1.25 0.625 -7.5] nil]
+           [[] [0.5 -0.25 3.0] 0 3 [] nil]
+           [[7.0 11.0] [] 2 0 [] nil]
+           [[7.0] [] 2 0 nil ArrayIndexOutOfBoundsException]
+           [[7.0 11.0] [] 2 -1 nil NegativeArraySizeException]
+           [[] [] -1 -3 [0.0 0.0 0.0] nil]]]
+    (let [dy (make-array dy-values) w (make-array w-values)
+          before (mapv raw-bits [dy w])
+          outcome (try
+                    (let [out (ops/dot-rows-dh dy w rows dim)]
+                      {:class (class out) :bits (raw-bits out)})
+                    (catch Exception error {:exception (class error)}))]
+      (is (= (if exception {:exception exception}
+                 {:class (class dy) :bits (raw-bits (make-array expected))}) outcome)
+          (str (class dy) " rows=" rows " dim=" dim))
+      (is (= before (mapv raw-bits [dy w])) "inputs remain unchanged even on failure"))))
+
 (deftest dot-rows-gradient-test
   (testing "dot-rows gradient"
     (let [n-rows 2 dim 3
