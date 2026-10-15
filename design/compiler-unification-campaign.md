@@ -1,6 +1,6 @@
 # Compiler unification campaign
 
-## October 13 reconciled execution plan
+## Reconciled execution plan
 
 This checkpoint preserves the original eight-item campaign. The entries below are completion
 obligations, not claims that their already-landed foundations must be implemented again. Historical
@@ -8,7 +8,21 @@ receipts remain below; fresh acceptance must distinguish compile-only, hardware-
 co-located execution and actual multi-device measurements. Normalized AD and memory planning are
 cross-cutting parts of this campaign, not competing replacements for it.
 
-### October 14 current checkpoint
+### October 15 current checkpoint
+
+| Boundary | Current opt-in implementation | Still open |
+| --- | --- | --- |
+| Normalized host AD | Canonical pure maps/nonbranching map chains, map→ordered-sum and functional indexed-map owners execute generated primal/JVP/VJP programs with exact residual plans. | General equation DAGs, conditional/loop regions and default-source retirement. |
+| Resident normalized AD | Public lease-oriented `prepare-owner`, `prepare-sum-owner` and `prepare-indexed-owner` reuse the generic resident binder, named-entry owner and LinkPlan/LinkModule validation on OpenCL and Level Zero. | Empty native buffers, general scatter/DAG execution, concurrent mutation, host readback and default-engine activation. |
+| Shape and storage premises | A checked self-`ShapeProjection` derives a private dimension from one public buffer; closed external-storage and external-dimension premises cross separate resident phases without fake parameters or initialization. Program-wide typed shape values remain in `ProgramCall`, while kernels that do not consume them keep an empty scalar ABI. | Automatic source-free projection of compound/shared dimensions, per-call geometry changes and arbitrary dynamic shape programs. |
+| Acceptance | The source AD engine remains the default independent oracle. The unchanged real Gemma gate still fails 12/28 checks and the same-CPU-operand layer control 4/14. | Real-model closure, full GSDM statistical training, Adam/EMA qualification and the other original campaign gates. |
+
+The latest selected SGEMM leaf diagnostic used the same GPU operands and measured maximum absolute
+error 2.3841858e-7 and relative L2 error 3.8074463e-8 against the actual CPU SGEMM. Upstream input
+drift remains, so this narrows one leaf and does not retire the Gemma gate. All eight campaign
+obligations below remain active.
+
+### October 14 historical checkpoint
 
 - Compiler-generated pure TypedSOAC now enters the existing equation-first scheduling/emission
   tail without fabricated Clojure source or another type-inference authority. Named-entry storage

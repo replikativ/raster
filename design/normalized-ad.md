@@ -2,6 +2,21 @@
 
 ## Current implementation boundary
 
+Normalized AD is opt-in. The source AD engine remains the default and the independent oracle.
+The current public boundary is deliberately smaller than general program differentiation:
+
+| Canonical family | Host execution | Opt-in resident device execution | Preparation and call contract |
+| --- | --- | --- | --- |
+| Pure map or finite nonbranching map chain | Canonical primal/JVP/VJP with retained residuals | `normalized-device/prepare-owner` | Concrete array geometry; array cotangent; exact residual dependency leases |
+| Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result | `normalized-device/prepare-sum-owner` | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
+| Functional indexed map | Canonical gather primal and sequential ordered transpose | `normalized-device/prepare-indexed-owner` | Static index/cotangent extent; data/gradient extent static or one private `m` fixed from the prepared data array; array cotangent |
+
+All three device surfaces reuse the generic named-entry owner, resident binder, LinkPlan/LinkModule
+validation, epoch/callee guards and leases. They do not enable arbitrary equation DAGs,
+conditional/loop AD, empty native buffers, per-call geometry changes, concurrent mutation,
+host readback, or default-engine activation. Real Gemma acceptance, full GSDM statistical training
+and Adam/EMA qualification remain independent gates.
+
 Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
 without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
 their retained AbstractValues supply a zero-prefix plan; flat public buffers and every retained
@@ -33,17 +48,18 @@ The external-dimension premise can carry the same exact typed value into a separ
 with no public source buffer. This still does not admit empty device storage or arbitrary dynamic
 shape programs.
 
-This is a compiler-frontier prerequisite, not normalized device execution. Canonical map/sum
+These are generic compiler-frontier premises; only the bounded indexed device family in the table
+consumes their single fixed-preparation case. Canonical map/sum
 primal, linear and transpose programs promote, schedule and emit through all four C-family
 dialects. Generated map lambdas project only a checked homogeneous non-nil Float/Double
 `grad-acc` to ordinary typed addition; the original scalar programs remain derivation and
 executable-dependency authority. No target-specific AD rule is introduced. `equation-first/compile-typed`
 now consumes these programs through the same scheduling and emission tail as deftm compilation.
 Its public ABI and homogeneous floating carrier come from retained IR, not caller type overrides.
-The current invocation materializer uploads primitive host arrays into owned device storage; it
-therefore refuses retained borrowed inputs rather than relabeling their ownership. Prepared integration,
-same-session named-entry ownership and source-free persistence remain separate follow-ups before delayed
-device pullbacks can retain private residuals safely. No default-engine migration is implied.
+The ordinary invocation materializer uploads primitive host arrays into owned device storage and
+therefore refuses retained borrowed inputs rather than relabeling their ownership. The opt-in
+resident surfaces use independently checked resident LinkValues and one same-session named-entry
+owner instead. No default-engine migration is implied.
 
 Before source-free equation promotion, the shared reduction-only resident transaction audits the
 complete TypedSOAC producer/use/facet graph even when `:resident-outputs` is absent or explicitly
@@ -65,17 +81,17 @@ before scheduling rather than forwarded as a second internal realization request
 independent direct reductions may be selected, but a multi-result producer,
 alias, effect, result-storage relation, forged resident facet or non-reduction output refuses.
 Omitting the option preserves output-only scalar behavior, and ordinary deftm compilation
-does not accept this source-free ownership request. This is representation substrate only: it does
-not make a scalar cotangent input resident, clone singleton storage, or enable normalized map-sum
-device execution.
+does not accept this source-free ownership request. The option is representation substrate only:
+it does not itself make a scalar cotangent input resident or clone singleton storage. The bounded
+map-sum device consumer described below adds those separate authorities.
 
 One deterministic map-stage constructor owns fresh interface construction and exact
 retained-interface reconstruction. Validation still independently checks scalar derivation before
 reconstructing the stage; it neither trusts producer certification nor allocates new residual or
 interface identities. The bounded composition below adds an exact execution-source view to the
 canonical map owner while retaining the original source as public authority. Existing operation
-coverage, residual order and numerical policies are unchanged; arbitrary DAGs and device AD
-remain outside the boundary.
+coverage, residual order and numerical policies are unchanged; arbitrary DAGs remain outside the
+boundary, while only the three tabled families have opt-in device consumers.
 
 A checked composition boundary admits a finite linear spine of at least two pure homogeneous maps.
 Every intermediate is private, has exactly one consumer equation (the immediately following map), and is proven
@@ -89,8 +105,9 @@ explicit checkpoints; no source facts or fusion provenance are scrubbed. Canonic
 host execution retain both the untouched source/public interface and the independently rederived
 fused execution source. Composite residual origins name the ordered source-equation scope and the
 exact fused scalar coefficient rather than pretending the coefficient belongs to the first source
-equation. Execution still uses the generated primal/JVP/VJP maps, not a new runtime chain. This adds
-no cache, registry, derivative rule, device path or default-engine migration.
+equation. Execution still uses the generated primal/JVP/VJP maps, not a new runtime chain. This
+composition adds no cache, registry, derivative rule or default-engine migration; its bounded
+device consumer is a separate resident boundary.
 
 Normalized AD remains opt-in; the source AD engine remains the default and independent oracle.
 The checked scalar lane supplies derivation evidence to three bounded host families: pure map,
@@ -133,10 +150,17 @@ It is a sequential staleness contract, not protection against concurrent mutatio
 
 Checked two-equation pure-spine append now builds the admitted map→ordered-sum programs;
 it is not yet a general differentiation rule for arbitrary equation chains.
-General equation composition, conditional/loop AD regions, device execution of these normalized
-families and default-engine migration remain separate gates. Existing real-weight training
-acceptance is still open. The sections below describe the individual construction checkpoints;
+General equation composition, conditional/loop AD regions and default-engine migration remain
+separate gates. Device execution is restricted to the tabled families. Existing real-weight
+training acceptance is still open. The sections below describe the individual construction checkpoints;
 an adapter's lack of runtime effects does not mean its checked envelope is unused by the runtime.
+
+> **Historical checkpoint note:** The sections from “Equation projection and shape facts” through
+> “Migration and acceptance gates” preserve the order in which construction and validation
+> boundaries were established. Statements about what a checkpoint did not yet enable are historical
+> receipts; current availability is governed by the table above and by “Opt-in resident
+> normalized-map execution” below. Numerical, ownership and refusal constraints remain current
+> unless explicitly superseded.
 
 ## Equation projection and shape facts
 
@@ -170,8 +194,9 @@ destination/result alias. This is an unsatisfied allocation/initialization requi
 interface describes the data-shaped gradient even though the logical host effect binding
 is nil; existing host materialization returns the explicitly supplied physical owner.
 Sequential ordered updates, original Float checkpoints and source/rule/Namespace validation
-are unchanged. Map/sum mixtures refuse. No canonical indexed runtime migration, device
-execution, new derivative rule or equation composition is enabled by this adapter.
+are unchanged. Map/sum mixtures refuse. At this construction checkpoint the adapter did not itself
+enable a device runtime, new derivative rule or equation composition; the later resident consumer
+adds only the bounded indexed execution listed above.
 
 `normalized-program-bundle/adapt-map` projects exactly one already-admitted homogeneous map
 into a canonical envelope: top-level source/primal/linear/transpose fields are actual TypedSOAC
@@ -602,13 +627,14 @@ HVP refusals until typed closure is demonstrated.
 
 ## Migration and acceptance gates
 
-The bounded canonical Float square-map now has a durable device composition gate: its
+The bounded canonical Float square-map established the first durable device composition gate: its
 checked primal and transpose compile through `compile-typed`, bind existing LinkValues,
 and execute through the generic named-entry owner on local OpenCL and Level Zero. An
 independent stepwise-Float oracle checks raw bits across changed seeds and input generations;
 retained residuals survive caller-input mutation. Rule/callee guards and lease-lifetime
-refusals are tested. This is test-only assembly, not a public GPU AD adapter, general DAG
-support, or default-engine migration. Residuals retain their canonical owned contract;
+refusals are tested. That test-only assembly preceded the bounded public resident consumers below;
+it remains evidence for their shared boundary, not general DAG support or default-engine migration.
+Residuals retain their canonical owned contract;
 the borrowed cotangent input binds to globally owned storage without retagging its AV.
 
 | Step | Deliverable | Gate and retirement |
@@ -626,8 +652,11 @@ zero-domain negative cases: unsupported code must not become accepted merely bec
 happens not to execute.
 
 The latest unchanged real Gemma training case has 12 failing adapter checks out of 28 (the earlier
-recorded run failed 11). A same-CPU-operand layer control still fails 4 of 14 adapter checks. The
-exact generated SFT objective, Gaussian/logistic density composition, city kernel primal
+recorded run failed 11). A same-CPU-operand layer control still fails 4 of 14 adapter checks.
+The latest selected SGEMM leaf comparison, using the same GPU operands, differs from the actual CPU
+SGEMM by at most 2.3841858e-7 absolute with relative L2 error 3.8074463e-8. Upstream input drift
+remains; this local diagnostic is not model acceptance.
+The exact generated SFT objective, Gaussian/logistic density composition, city kernel primal
 parity and PDE rollout gradients are complementary gates, not substitutes for that result.
 Microtests passing does not establish model-scale correctness or competitive performance.
 
