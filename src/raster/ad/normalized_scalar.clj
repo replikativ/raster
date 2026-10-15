@@ -485,6 +485,45 @@
    (scalar-program-source (:linear scalar) (:inputs (soac/facts (:linear scalar))))
    (scalar-program-source (:transpose scalar) (:inputs (soac/facts (:transpose scalar))))])
 
+(defn- proof-derivation-entries
+  "Project only schema-owned scalar derivation paths in their retained order.
+   This is a pure shape projection: it grants no validation authority and repairs nothing."
+  [bundle]
+  (cond
+    (contains? bundle :map-programs)
+    (let [nodes (get-in bundle [:map-programs :proof :nodes])]
+      {:family :map :container-valid? (boolean (and (vector? nodes) (seq nodes)))
+       :entries
+       (if-not (vector? nodes)
+         []
+         (mapv
+          (fn [index node]
+            (let [scalar? (and (map? node) (contains? node :scalar-derivation))
+                  primal? (and (map? node) (contains? node :primal-derivation))
+                  kind (cond
+                         (and scalar? (not primal?)) :scalar
+                         (and primal? (not scalar?)) :primal-only
+                         :else :invalid)
+                  key (case kind :scalar :scalar-derivation
+                                 :primal-only :primal-derivation nil)]
+              {:family :map :kind kind
+               :path (when key [:map-programs :proof :nodes index key])
+               :derivation (when key (get node key))}))
+          (range) nodes))})
+
+    (contains? bundle :gather-programs)
+    (let [proof (get-in bundle [:gather-programs :proof])
+          present? (and (map? proof) (contains? proof :scalar-derivation))]
+      {:family :gather :container-valid? present?
+       :entries [{:family :gather :kind (if present? :scalar :invalid)
+                  :path (when present?
+                          [:gather-programs :proof :scalar-derivation])
+                  :derivation (when present? (:scalar-derivation proof))}]})
+
+    :else
+    {:family :scalar :container-valid? true
+     :entries [{:family :scalar :kind :scalar :path [] :derivation bundle}]}))
+
 (defn ^:no-doc execution-sources
   "Project the raw primal, linear and transpose scalar programs for executable dependency capture.
 
@@ -492,22 +531,33 @@
    projections keep every original helper Var and rule-produced call in the execution guard. This
    is not source importing, host materialization, or an independent validator."
   [bundle]
-  (cond
-    (get-in bundle [:map-programs :proof :nodes])
-    (vec
-     (mapcat
-      (fn [node]
-        (if-let [scalar (:scalar-derivation node)]
-          (scalar-execution-sources scalar)
-          (let [{:keys [primal interface]} (:primal-derivation node)]
-            [(scalar-program-source primal (:params interface))])))
-      (get-in bundle [:map-programs :proof :nodes])))
-
-    (get-in bundle [:gather-programs :proof :scalar-derivation])
-    (scalar-execution-sources
-     (get-in bundle [:gather-programs :proof :scalar-derivation]))
-
-    :else (scalar-execution-sources bundle)))
+  (let [{:keys [family container-valid? entries]} (proof-derivation-entries bundle)
+        complete? (every? (fn [{:keys [kind derivation]}]
+                            (and (contains? #{:scalar :primal-only} kind)
+                                 (map? derivation)))
+                          entries)]
+    ;; Dependency capture must never turn malformed retained evidence into a
+    ;; partial projection which silently omits executable callees.
+    (when (and (contains? #{:map :gather} family)
+               (not (and container-valid? complete?)))
+      (fail! (if (= :map family)
+               :ad-normalized-map-node-proof
+               :ad-normalized-gather-proof)
+             {:family family}))
+    (case family
+      :map
+      (vec
+       (mapcat
+        (fn [{:keys [kind derivation]}]
+          (case kind
+            :scalar (scalar-execution-sources derivation)
+            :primal-only
+            (let [{:keys [primal interface]} derivation]
+              [(scalar-program-source primal (:params interface))])
+            []))
+        entries))
+      :gather (scalar-execution-sources (:derivation (first entries)))
+      (scalar-execution-sources bundle))))
 
 (defn ^:no-doc execution-guard
   "Capture effective executable Var identities in already checked source projections.
@@ -574,35 +624,44 @@
   (let [bundle (if (contains? bundle :source-ns)
                  (update bundle :source-ns namespace-name)
                  bundle)
-        nodes (get-in bundle [:map-programs :proof :nodes])
-        bundle
-        (if-not (vector? nodes)
-          bundle
-          (assoc-in
-           bundle [:map-programs :proof :nodes]
-           (mapv (fn [node]
-                   (if-let [derivation (let [candidate (or (:scalar-derivation node)
-                                                           (:primal-derivation node))]
-                                        (when (and (map? candidate)
-                                                   (contains? candidate :source-ns))
-                                          candidate))]
-                     (let [key (if (:scalar-derivation node)
-                                 :scalar-derivation :primal-derivation)
-                           derivation (update derivation :source-ns namespace-name)
-                           derivation (if (and (= key :primal-derivation)
-                                               (map? (:interface derivation))
-                                               (contains? (:interface derivation) :source-ns))
-                                        (update-in derivation [:interface :source-ns]
-                                                   namespace-name)
-                                        derivation)]
-                       (assoc node key derivation))
-                     node))
-                 nodes)))
-        scalar-path [:gather-programs :proof :scalar-derivation]
-        scalar (get-in bundle scalar-path)]
-    (if (and (map? scalar) (contains? scalar :source-ns))
-      (update-in bundle (conj scalar-path :source-ns) namespace-name)
-      bundle)))
+        {:keys [family entries]} (proof-derivation-entries bundle)]
+    (if (= :scalar family)
+      bundle
+      (reduce
+       (fn [result {:keys [kind path derivation]}]
+         (if-not (and (contains? #{:scalar :primal-only} kind)
+                      (map? derivation) path (contains? derivation :source-ns))
+           result
+           (let [result (update-in result (conj path :source-ns) namespace-name)]
+             (if (and (= :primal-only kind)
+                      (map? (:interface derivation))
+                      (contains? (:interface derivation) :source-ns))
+               (update-in result (into path [:interface :source-ns]) namespace-name)
+               result))))
+       bundle entries))))
+
+(defn ^:no-doc proof-source-namespaces-identical?
+  "Check nested schema-owned Namespace identities after the caller checks the outer identity."
+  [bundle source-ns]
+  (let [{:keys [family container-valid? entries]} (proof-derivation-entries bundle)]
+    (and container-valid?
+         (case family
+           :map
+           (every?
+            (fn [{:keys [kind derivation]}]
+              (and (contains? #{:scalar :primal-only} kind)
+                   (map? derivation)
+                   (identical? source-ns (:source-ns derivation))
+                   (or (= :scalar kind)
+                       (and (map? (:interface derivation))
+                            (identical? source-ns
+                                        (get-in derivation [:interface :source-ns]))))))
+            entries)
+           :gather
+           (let [{:keys [kind derivation]} (first entries)]
+             (and (= :scalar kind) (map? derivation)
+                  (identical? source-ns (:source-ns derivation))))
+           :scalar (identical? source-ns (:source-ns bundle))))))
 
 (defn- certificate [bundle]
   (fingerprint/fingerprint (dissoc (pure-proof-namespaces bundle) :certificate)))

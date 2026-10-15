@@ -177,22 +177,10 @@
       (update-in [:derivation :bundle] scalar/pure-proof-namespaces)))
 
 (defn- namespace! [{:keys [source-ns derivation]}]
-  (let [evidence (:bundle derivation)
-        nodes (get-in evidence [:map-programs :proof :nodes])
-        indexed-scalar (get-in evidence [:gather-programs :proof :scalar-derivation])]
+  (let [evidence (:bundle derivation)]
     (when-not (and (instance? clojure.lang.Namespace source-ns)
                    (identical? source-ns (:source-ns evidence))
-                   (every? (fn [node]
-                             (let [d (or (:scalar-derivation node)
-                                         (:primal-derivation node))]
-                               (and (identical? source-ns (:source-ns d))
-                                    (or (:scalar-derivation node)
-                                        (identical? source-ns
-                                                    (get-in d [:interface :source-ns]))))))
-                           (or nodes []))
-                   (or (nil? indexed-scalar)
-                       (and (map? indexed-scalar)
-                            (identical? source-ns (:source-ns indexed-scalar)))))
+                   (scalar/proof-source-namespaces-identical? evidence source-ns))
       (fail! :ad-program-bundle-source-namespace {}))))
 
 (defn- certificate [bundle]
