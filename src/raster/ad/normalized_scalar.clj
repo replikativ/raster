@@ -423,6 +423,10 @@
      :seed seed}))
 
 (defn ^:no-doc revisions []
+  ;; Effect analysis cold-loads numerical libraries and their AD/dispatch declarations. Establish
+  ;; that shared semantic context before any construction or execution authority snapshots epochs.
+  ;; The realized delay is cheap on hot calls; later mutations must still fail the existing fences.
+  (effects/init-raster-context!)
   {:template-revision (templates/registry-revision)
    :compiler-revision (dispatch/compiler-definition-revision)})
 
