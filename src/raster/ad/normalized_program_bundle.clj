@@ -58,7 +58,7 @@
         active-inputs (if indexed? [(first (:captures source-parts))] active-inputs)
         tangent-inputs (if indexed? [(:tangent-input indexed-interface)] tangent-inputs)
         gradient-outputs (if indexed? [(:gradient-output indexed-interface)] gradient-outputs)
-        gradient-outputs (if sum? [(get-in programs [:interface :gradient-result])] gradient-outputs)
+        gradient-outputs (if sum? (get-in programs [:interface :gradient-results]) gradient-outputs)
         tangent-output (if sum? (get-in bundle [:sum-programs :interface :tangent-result]) tangent-output)
         tangent-output (if indexed? (:tangent-output indexed-interface) tangent-output)
         cotangent-input (if sum? (get-in bundle [:sum-programs :interface :seed]) cotangent-input)

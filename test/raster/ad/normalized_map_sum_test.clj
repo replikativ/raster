@@ -70,17 +70,45 @@
 (defn- change-facts [program f]
   (apply list (assoc (vec program) 1 (f (soac/facts program)))))
 
-(deftest map-sum-explicitly-refuses-multiple-active-inputs
+(deftest map-sum-retains-ordered-multiple-active-array-ports
   (let [program (source :double)
-        source-ns (the-ns 'raster.ad.normalized-map-sum-test)]
-    (is (= :ad-normalized-sum-boundary
-           (reason #(normalized/linearize-map-sum-program
-                     program source-ns {:active-inputs '[weights xs]}))))
-    (let [map-source (#'normalized/sum-source-map program source-ns)
-          multi-map (#'normalized/build-map-programs
-                     map-source source-ns {:active-inputs '[weights xs]})]
-      (is (= :ad-normalized-sum-interface
-             (reason #(#'normalized/lift-sum-programs multi-map program {})))))))
+        source-ns (the-ns 'raster.ad.normalized-map-sum-test)
+        active '[weights xs]
+        bundle (normalized/linearize-map-sum-program program source-ns {:active-inputs active})
+        map-interface (get-in bundle [:map-programs :interface])
+        sum-interface (get-in bundle [:sum-programs :interface])]
+    (is (identical? bundle (normalized/validate! bundle)))
+    (is (= active (:active-inputs map-interface)))
+    (is (= (:gradient-outputs map-interface) (:gradient-results sum-interface)
+           (soac/outputs (get-in bundle [:sum-programs :transpose]))))
+    (is (= 2 (count (:tangent-inputs map-interface))
+             (count (:gradient-results sum-interface))))
+    (doseq [gradient-results [nil
+                              (apply list (:gradient-results sum-interface))
+                              (vec (butlast (:gradient-results sum-interface)))
+                              (vec (repeat 2 (first (:gradient-results sum-interface))))
+                              (vec (reverse (:gradient-results sum-interface)))]]
+      (let [forged (assoc-in bundle [:sum-programs :interface :gradient-results] gradient-results)
+            forged (assoc forged :certificate (#'normalized/certificate forged))]
+        (is (= :ad-normalized-sum-interface
+               (reason #(normalized/validate! forged))))))
+    (doseq [[tangent-inputs expected]
+            [[nil :ad-normalized-map-interface]
+             [(apply list (:tangent-inputs map-interface)) :ad-normalized-sum-interface]
+             [(vec (butlast (:tangent-inputs map-interface))) :ad-normalized-map-interface]
+             [(vec (repeat 2 (first (:tangent-inputs map-interface)))) :ad-normalized-map-interface]
+             [(vec (reverse (:tangent-inputs map-interface))) :ad-normalized-map-programs]]]
+      (let [forged (assoc-in bundle [:map-programs :interface :tangent-inputs] tangent-inputs)
+            forged (assoc forged :certificate (#'normalized/certificate forged))]
+        (is (= expected
+               (reason #(normalized/validate! forged))))))
+    (doseq [[active-inputs expected] [[(vec (butlast active)) :ad-normalized-map-interface]
+                                      ['[weights weights] :ad-normalized-map-active-array]
+                                      [(vec (reverse active)) :ad-normalized-map-interface]]]
+      (let [forged (assoc-in bundle [:map-programs :interface :active-inputs] active-inputs)
+            forged (assoc forged :certificate (#'normalized/certificate forged))]
+        (is (= expected
+               (reason #(normalized/validate! forged))))))))
 
 (deftest checked-sum-retains-original-ordered-step-and-explicit-scalar-seed
   (doseq [dt [:float :double] active '[xs weights]]

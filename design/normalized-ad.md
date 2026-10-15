@@ -8,7 +8,7 @@ The current public boundary is deliberately smaller than general program differe
 | Canonical family | Host execution | Opt-in resident device execution | Preparation and call contract |
 | --- | --- | --- | --- |
 | Pure map or finite nonbranching map chain | Canonical primal/JVP/VJP with retained residuals and ordered multiple active arrays | `normalized-device/prepare-owner` (one active input) | Concrete array geometry; array cotangent; exact residual dependency leases |
-| Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result | `normalized-device/prepare-sum-owner` | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
+| Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result and ordered multiple active arrays, or one active scalar capture | `normalized-device/prepare-sum-owner` (one active array) | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
 | Functional indexed map | Canonical gather primal and sequential ordered transpose | `normalized-device/prepare-indexed-owner` | Static index/cotangent extent; data/gradient extent static or one private `m` fixed from the prepared data array; array cotangent |
 
 All three device surfaces reuse the generic named-entry owner, resident binder, LinkPlan/LinkModule
@@ -17,7 +17,7 @@ conditional/loop AD, empty native buffers, per-call geometry changes, concurrent
 host readback, or default-engine activation. Real Gemma acceptance, full GSDM statistical training
 and Adam/EMA qualification remain independent gates.
 
-`linearize-map-program` and `linearize-map-chain-program` accept an ordered, nonempty, distinct
+`linearize-map-program`, `linearize-map-chain-program` and `linearize-map-sum-program` accept an ordered, nonempty, distinct
 `:active-inputs` vector of exact public source array IDs, mutually exclusive with the existing singleton
 activity options. This order determines tangent and internal gradient ports, independently of the
 source argument order. Host JVP retains the existing primitive-array argument for one active input;
@@ -25,8 +25,11 @@ with multiple active inputs it requires an exact vector of tangent arrays in act
 VJP still returns cotangents in source argument order, with nil slots for inactive inputs. Saved
 coefficients are privately owned snapshots, so delayed pullbacks do not read subsequently mutated
 caller arrays. Chains use the existing exact append/fusion proof to derive their checked
-single-map execution stage; no separate chain derivative rule is added. Multiple-active sums,
-indexed operations and resident device execution remain explicit refusals; this is not general
+single-map execution stage; no separate chain derivative rule is added. A sum retains the exact
+original ordered reduction for its primal and tangent; its scalar seed feeds the existing
+per-lane transpose, which returns an ordered gradient array for each selected array. Singleton
+scalar-capture differentiation still appends the original ordered reduction to the gradient
+contributions. Multiple-active indexed operations and resident device execution remain explicit refusals; this is not general
 DAG or fan-out differentiation.
 
 The opt-in canonical interface uses only plural `:tangent-inputs` and `:cotangent-results`
@@ -312,7 +315,9 @@ open. No family validator or construction evidence retires on the strength of th
 Float/Double array or scalar capture. Existing `:active-array` remains an array-only option;
 the options cannot be combined. Selection names an existing source value, retaining that
 member's actual metadata and AV rather than trusting metadata supplied on an option symbol.
-The internal canonical interface now uses `:active-input`, not `:active-array`.
+These are source selection options, not canonical port aliases. The canonical interface uses
+ordered plural `:active-inputs`, `:tangent-inputs` and `:cotangent-results`, including for a
+singleton selection.
 
 Derivative operand placement is projected from retained AV shapes through one shared layout:
 arrays become pointwise element parameters and scalars become capture parameters. An active
@@ -320,7 +325,8 @@ scalar therefore supplies one scalar tangent without a materialized broadcast ar
 transpose map produces per-lane contributions, then appends the exact original certified
 ordered reduction to obtain one scalar cotangent. Its identity, addition, Float checkpoints,
 iteration order and numerical attributes stay unchanged. The sum interface identifies the
-final `:gradient-result` explicitly for both array and scalar activity.
+final `:gradient-results` vector explicitly for both array and scalar activity; the scalar case
+is a singleton, not a duplicate singular alias.
 
 Per-lane contributions are never certified as a standalone scalar gradient: the shared private
 builder attaches sum evidence before full validation, and standalone scalar-active map program
@@ -673,6 +679,28 @@ recorded run failed 11). A same-CPU-operand layer control still fails 4 of 14 ad
 The latest selected SGEMM leaf comparison, using the same GPU operands, differs from the actual CPU
 SGEMM by at most 2.3841858e-7 absolute with relative L2 error 3.8074463e-8. Upstream input drift
 remains; this local diagnostic is not model acceptance.
+
+The October 15 paired-operand diagnostic further isolates the layer-1 key-projection LoRA
+gradient. Its final two-term contraction has bit-identical CPU/GPU primal operands; the
+incoming cotangent differs by relative L2 1.4330e-5. Independent ordered Float evaluation
+matches every GPU output (10,240 elements), while CPU execution matches forward Float FMA
+for this particular contraction. At the worst original-metric coordinate, the 6.8274e-6
+CPU/GPU difference decomposes into 6.8274e-6 from changed operands and 1.4438e-11 from
+final arithmetic realization. Cancellation amplifies the small incoming difference; this
+does not justify changing the acceptance criterion.
+
+One contraction upstream, all 4,096 weight elements are identical and independent ordered
+Float evaluation matches all 32 GPU results. Both native endpoints fall inside conservative
+same-input dot-product rounding bounds, under checked finite/no-overflow/no-observed-subnormal
+assumptions. The incoming 512-element cotangent already differs by relative L2 9.0017e-6.
+These are local arithmetic/provenance diagnostics, not an end-to-end error bound or proof
+that the derivative is mathematically correct. CPU BLAS ordering remains implementation-defined.
+
+An independent seeded-Rademacher finite-difference direction is inconclusive: three small
+perturbations leave the Float objective unchanged, and larger steps do not establish a stable
+adjacent-scale resolution window. It is neither a derivative failure nor an acceptance pass.
+The real-model gate remains open; no tolerance, default math policy or AD engine was changed.
+
 The exact generated SFT objective, Gaussian/logistic density composition, city kernel primal
 parity and PDE rollout gradients are complementary gates, not substitutes for that result.
 Microtests passing does not establish model-scale correctness or competitive performance.
@@ -889,8 +917,9 @@ Semantic dtype, selected implementation receivers and primitive array hints are 
 this neither widens the selected arithmetic nor changes its rounding checkpoints.
 
 For a sum, `:vjp` returns a scalar output and a pullback taking an explicit scalar seed
-of exactly the retained Float/Double type; `:jvp` still takes a tangent array but returns
-a scalar tangent. Positional excluded cotangents stay nil. The private residual arrays
+of exactly the retained Float/Double type; `:jvp` takes one tangent for a singleton selection,
+or an exact tangent vector in activity order for several active arrays, and returns a scalar
+tangent. Positional excluded cotangents stay nil. The private residual arrays
 have the same primal-time snapshot ownership as the map consumer, including required
 excluded-array elements. Scalar outputs and seeds are immutable; returned gradients
 are fresh and may be mutated without changing later pullbacks. Caller data cannot be
@@ -910,11 +939,12 @@ one-array entry remains unchanged; two arrays without a selection refuse. Existi
 SOAC parameter layout identifies element parameters separately from inactive scalar
 captures. An excluded element needed as a coefficient is saved into a fresh residual
 array, not borrowed from its mutable source. Runtime validates every source array and
-retains none of them in the pullback. Only the selected positional slot has a cotangent;
-the excluded array, scalar captures and extent retain nil slots. Multiple active arrays,
-reductions and general map composition remain separate capability gates. The unchanged
-real Gemma gate remains FAILED (11/28 adapter components); this map witness is not a
-replacement objective or model acceptance result.
+retains none of them in the pullback. With a singleton selection only its positional slot has
+a cotangent; excluded arrays, scalar captures and extent retain nil slots. Ordered plural
+array selection now extends this same ownership contract to maps, finite map chains and one
+map followed by an ordered sum. General equation DAGs and chain→sum composition remain separate
+gates. The real Gemma gate remains open as described above; this map witness is not a replacement
+objective or model acceptance result.
 
 ## Operation-driven primitive host projection
 
