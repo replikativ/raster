@@ -636,8 +636,10 @@
                       (contains? attributes :result-map)
                       (assoc :result-map (:result-map attributes))
                       contraction?
-                      (assoc :source-arithmetic (get attributes :source-arithmetic
-                                                   numerics/retained-source-arithmetic))))}))))
+                      (assoc :source-arithmetic
+                             (numerics/effective-source-arithmetic
+                              (:source-arithmetic attributes)
+                              (get-in facts [:attributes :source-arithmetic])))))}))))
 
 (defn lower-typed-segmented-reduce
   "Lower one general TypedSOAC segmented reduction directly to SegRed.

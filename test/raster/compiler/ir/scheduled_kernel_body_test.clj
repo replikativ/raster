@@ -239,6 +239,33 @@
                         (assoc-in value [:numerics :source-arithmetic :operands :conversion]
                                   :narrow)))))))
 
+(deftest scoped-source-arithmetic-validates-both-declarations-before-selecting-one
+  (let [retained numerics/retained-source-arithmetic
+        blas (numerics/blas-source-arithmetic :float)
+        ordinary (fixture)]
+    (is (= retained (numerics/effective-source-arithmetic nil nil)))
+    (is (= ordinary (scheduled/validate! ordinary)))
+    (is (not (contains? (:numerics ordinary) :source-arithmetic))
+        "legacy schedules with neither declaration retain their optional field")
+    (doseq [[local global expected] [[nil blas blas] [retained blas retained]
+                                    [blas retained blas] [retained nil retained]]]
+      (let [source (cond-> {:id :scoped-source}
+                     (some? local) (assoc :source-arithmetic local)
+                     (some? global) (assoc :facts {:source-arithmetic global}))
+            value (-> ordinary (assoc :source source)
+                      (assoc-in [:numerics :source-arithmetic] expected))]
+        (is (= expected (numerics/effective-source-arithmetic local global)))
+        (is (= value (scheduled/validate! value)))))
+    (doseq [[local global] [[:invalid blas] [blas :invalid]]]
+      (is (= :source-arithmetic
+             (reason-of #(numerics/effective-source-arithmetic local global))))
+      (is (= :source-arithmetic
+             (reason-of #(scheduled/validate!
+                          (-> ordinary
+                              (assoc :source {:source-arithmetic local
+                                              :facts {:source-arithmetic global}})
+                              (assoc-in [:numerics :source-arithmetic] blas)))))))))
+
 (defn- conditioned-fixture []
   (scheduled/make
    (-> (fixture)

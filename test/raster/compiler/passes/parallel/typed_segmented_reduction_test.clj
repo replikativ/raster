@@ -4,6 +4,7 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.numerical-contract :as numerics]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.segop :as segop]
@@ -12,6 +13,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-pass]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
@@ -61,6 +63,35 @@
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+
+(deftest segmented-projection-and-lowering-use-the-same-validated-policy-scope
+  (let [retained numerics/retained-source-arithmetic
+        blas (numerics/blas-source-arithmetic :float)
+        scoped (fn [local global]
+                 (let [base (program) [equation] (dialect/equations base)
+                       operation (nth equation 3)
+                       attributes (cond-> (assoc-in (second operation) [:attributes :source-operation]
+                                                   :raster.par/contract)
+                                    (some? local) (assoc :source-arithmetic local))
+                       operation (apply list (assoc (vec operation) 1 attributes))
+                       facts (cond-> (dialect/facts base)
+                               (some? global) (assoc-in [:attributes :source-arithmetic] global))]
+                   (dialect/make facts [(apply list (assoc (vec equation) 3 operation))]
+                                 (dialect/outputs base))))]
+    (doseq [[local global expected] [[nil nil retained] [nil retained retained] [nil blas blas]
+                                    [retained blas retained] [blas retained blas]]]
+      (testing (str "local=" local ", global=" global)
+        (let [source (scoped local global) [equation] (dialect/equations source)
+              lowered (:operation (lower/project-typed-segmented-reduce source))]
+          (is (= expected (:source-arithmetic
+                           (projection/segmented-reduce-contract-components source equation))))
+          (is (segop/seg-red? lowered))
+          (is (= expected (:source-arithmetic lowered))))))
+    (is (= :source-arithmetic
+           (reason #(let [source (scoped blas :invalid)]
+                      (projection/segmented-reduce-contract-components source (first (dialect/equations source)))))))
+    (is (= :source-arithmetic
+           (reason #(lower/project-typed-segmented-reduce (scoped blas :invalid)))))))
 
 (deftest segmented-result-map-is-an-explicit-regrouping-witness
   (let [result-map {:groups '[[[i m] [j n]]]}
