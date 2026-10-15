@@ -901,8 +901,25 @@ private dependency frontiers. Transpose takes only that exact dependency map and
 gradient lease. The same binder, LinkPlan/LinkModule validation, named-entry owner, epoch fences and
 cleanup path are used by both families.
 
-This opt-in slice still accepts exactly one active public array and immutable scalar specialization.
+`prepare-indexed-owner` adds one static positive-geometry indexed-map family. Its public primal
+boundary is the canonical ordered pair of excluded Int/Long indices and active Float/Double data.
+Each call clones the indices, validates their exact dtype, length and bounds against the active
+extent, then uploads that same checked clone; the canonical primal owns the resulting device index
+snapshot as its sole dependency frontier. The cotangent is an ordinary array input whose borrowed
+callee contract is projected to fresh owned module storage. Gradient storage preserves the
+canonical owned transpose result and binds both that logical result and its distinct physical
+zero-gradient destination to one value.
+
+Transpose is one named entry containing a genuine input-free complete zero map immediately before
+the canonical sequential ordered effect. The zero map is derived from the freshly validated single
+typed-zero/exclusive physical obligation. Final LinkPlan/LinkModule analysis—not the effect—proves
+initialization and complete production; the ordered effect retains its read-write partial-update
+contract. No atomic or reassociation permission is introduced. Dynamic or empty index/gradient
+geometry remains outside this slice because current external-storage and native buffer boundaries
+do not yet establish that capability.
+
+These opt-in slices still accept exactly one active public array and immutable scalar specialization.
 It retains no caller array after preparation and does not add a cache, session owner, lease registry,
-device readback, dynamic scalar seed, mutable state, indexed execution, arbitrary DAG execution, or
+device readback, dynamic scalar seed, mutable state, general scatter, arbitrary DAG execution, or
 default-engine activation. The original campaign gates, real Gemma numerical acceptance and long
 GSDM qualification remain independent.
