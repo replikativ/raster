@@ -245,13 +245,28 @@
                                               scalars buffers storage projection)) id))))
         (keys program-buffers))))
 
+(defn- shape-dependencies
+  [values abstract]
+  (let [declared (set (keys values))]
+    (into #{}
+          (mapcat
+           (fn [dimension]
+             (let [projected
+                   (index-expression/project-dimension
+                    dimension #(get-in values [% :dtype]) fail!)]
+               (if-let [backing (launch/backing-extent-id projected)]
+                 (when (contains? declared backing) [backing])
+                 (set/intersection declared
+                                   (launch/expression-references projected))))))
+          (:shape abstract))))
+
 (defn- required-materialized-buffers
-  "Return materialized array values still referenced by the emitted program.
+  "Return materialized runtime values still referenced by the emitted program.
 
    A graph refinement may eliminate a source-level allocation entirely (for example, product
    partials replaced by workgroup storage). The invocation plan intentionally predates scheduling,
-   so it can still materialize that binding. Only graph-boundary arrays, host array operands,
-   outputs, and buffers needed to resolve their `(extent x)` shapes survive into the LinkPlan."
+   so it can still materialize that binding. Graph-boundary arrays, host array operands, outputs,
+   and their transitive retained shape dependencies survive into the LinkPlan."
   [parallel-program boundaries]
   (let [values (:values parallel-program)
         array-value? #(seq (:shape (get values %)))
@@ -281,12 +296,7 @@
     (loop [required initial]
       (let [dependencies
             (into #{}
-                  (comp (mapcat #(get-in values [% :shape]))
-                        (keep (fn [dimension]
-                                (when (and (seq? dimension)
-                                           (= 'extent (first dimension))
-                                           (= 2 (count dimension)))
-                                  (second dimension)))))
+                  (mapcat #(shape-dependencies values (get values %)))
                   required)
             expanded (into required dependencies)]
         (if (= required expanded) required (recur expanded))))))
