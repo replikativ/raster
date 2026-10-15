@@ -1475,65 +1475,126 @@
       (checked-primal-map-node-port primal source stage)
       stage)))
 
-(defn- build-map-node
-  [source source-ns {:keys [equation subprogram results]} active-outers equation-ids]
-  (let [{:keys [arrays]} (soac/operation-parts equation)
-        witness-active (if (seq active-outers) active-outers [(first arrays)])
-        projected (project-map-equation-lane
-                   source subprogram equation source-ns nil {:active-inputs (vec witness-active)})
-        scalar-interface (:interface projected)]
-    (if (seq active-outers)
-      (let [scalar (linearize-program (:primal projected) scalar-interface)
-            interface (allocate-map-stage-interface scalar subprogram)
-            stage (construct-map-stage scalar subprogram interface equation-ids)]
-        {:source-equations [(second equation)]
-         :execution-equation (second equation)
-         :result (first results)
-         :active? true
-         :scalar-derivation scalar
-         :stage-interface interface
-         :equation-ids equation-ids
-         :stage stage})
-      (let [primal-id (:primal equation-ids)]
-        {:source-equations [(second equation)]
-         :execution-equation (second equation)
-         :result (first results)
-         :active? false
-         :primal-derivation {:source-ns source-ns
-                             :primal (:primal projected)
-                             :interface scalar-interface}
-         :stage-interface {}
-         :equation-ids {:primal primal-id}
-         :stage {:primal (construct-primal-map-node
-                          (:primal projected) scalar-interface subprogram primal-id)}}))))
+(defn- map-node-lifecycle
+  "Allocate or replay one checked map node. Submitted witnesses retain every identity;
+   newly allocated nodes use the same projection, construction, and port correspondence path."
+  [source source-ns {:keys [equation subprogram results projected source-equations]}
+   active-outers equation-ids submitted]
+  (let [active? (boolean (seq (if projected
+                                (get-in projected [:interface :active-inputs])
+                                active-outers)))
+        submitted-derivation (when submitted
+                               ((if active? :scalar-derivation :primal-derivation) submitted))
+        _ (when (and submitted (not (map? submitted-derivation)))
+            (fail! :ad-normalized-map-node-derivation
+                   {:equation (second equation)}))
+        _ (when (and submitted
+                     (not= (second equation) (:execution-equation submitted)))
+            (fail! :ad-normalized-map-node-coverage
+                   {:expected (second equation) :actual (:execution-equation submitted)}))
+        _ (when (and submitted
+                     (not (identical? source-ns (:source-ns submitted-derivation))))
+            (fail! :ad-normalized-map-node-namespace
+                   {:source-ns source-ns :node-ns (:source-ns submitted-derivation)}))
+        _ (when (and submitted active?) (validate-scalar-proof! submitted-derivation))
+        {:keys [arrays]} (soac/operation-parts equation)
+        witness-active (if active? active-outers [(first arrays)])
+        output-id (when submitted
+                    (first (soac/outputs (:primal submitted-derivation))))
+        projected (or projected
+                      (project-map-equation-lane
+                       source subprogram equation source-ns output-id
+                       {:active-inputs (vec witness-active)}))
+        scalar-interface (:interface projected)
+        derivation (or submitted-derivation
+                       (if active?
+                         (linearize-program (:primal projected) scalar-interface)
+                         {:source-ns source-ns
+                          :primal (:primal projected)
+                          :interface scalar-interface}))
+        _ (when (and submitted
+                     (not
+                      (and
+                       (fingerprint/equivalent? (:primal projected) (:primal derivation))
+                       (if active?
+                         (fingerprint/equivalent?
+                          (select-keys scalar-interface [:params :tags :active-inputs])
+                          (select-keys derivation [:params :tags :active-inputs]))
+                         (and (= #{:source-ns :primal :interface} (set (keys derivation)))
+                              (identical? source-ns (:source-ns (:interface derivation)))
+                              (fingerprint/equivalent?
+                               (dissoc scalar-interface :source-ns)
+                               (dissoc (:interface derivation) :source-ns)))))))
+            (fail! :ad-normalized-map-node-derivation
+                   {:equation (second equation)}))
+        interface (if submitted
+                    (:stage-interface submitted)
+                    (if active? (allocate-map-stage-interface derivation subprogram) {}))
+        equation-ids (if submitted
+                       (:equation-ids submitted)
+                       (if active? equation-ids {:primal (:primal equation-ids)}))
+        expected-equation-id-keys (if active? #{:primal :linear :transpose} #{:primal})
+        _ (when-not (and (= expected-equation-id-keys (set (keys equation-ids)))
+                         (every? symbol? (vals equation-ids)))
+            (fail! :ad-normalized-map-node-interface
+                   {:equation-ids equation-ids :node submitted}))
+        _ (when (and submitted (not active?) (not= {} interface))
+            (fail! :ad-normalized-map-node-interface {:node submitted}))
+        stage (if active?
+                (construct-map-stage derivation subprogram interface equation-ids)
+                {:primal (construct-primal-map-node
+                          (:primal derivation) scalar-interface subprogram
+                          (:primal equation-ids))})
+        ports (if active?
+                (checked-map-node-ports derivation subprogram interface stage)
+                {:result (checked-primal-map-node-port
+                          (:primal derivation) subprogram (:primal stage))})
+        witness (or submitted
+                    (cond->
+                     {:source-equations [(second equation)]
+                      :execution-equation (second equation)
+                      :stage-interface interface
+                      :equation-ids equation-ids}
+                      active? (assoc :scalar-derivation derivation)
+                      (not active?) (assoc :primal-derivation derivation)))]
+    (assoc (if (and (not submitted) source-equations)
+             (assoc witness :source-equations source-equations)
+             witness)
+           :result (first results)
+           :active? active?
+           :ports ports
+           :stage stage)))
 
 (defn- compose-primal-nodes [nodes]
   (loop [program (get-in (first nodes) [:stage :primal])
-         residuals (vec (vals (get-in (first nodes) [:stage-interface :residual-arrays])))
+         residuals (mapv #(get-in (first nodes) [:ports :residual-arrays % :id])
+                         (keys (get-in (first nodes) [:stage-interface :residual-arrays])))
          previous (:result (first nodes))
          remaining (next nodes)]
     (if-let [node (first remaining)]
       (let [node-program (get-in node [:stage :primal])
-            node-residuals (vec (vals (get-in node [:stage-interface :residual-arrays])))
+            node-residuals (mapv #(get-in node [:ports :residual-arrays % :id])
+                                 (keys (get-in node [:stage-interface :residual-arrays])))
             outputs (into [(:result node)] (concat residuals node-residuals))]
         (recur (append-map-node program node-program {previous previous} outputs)
                (into residuals node-residuals) (:result node) (next remaining)))
       program)))
 
-(defn- local-port-map [node port-key]
+(defn- node-derivative-port-map [node port-key]
   (into (array-map)
-        (map vector (get-in node [:stage-interface :active-inputs])
-             (get-in node [:stage-interface port-key]))))
+        (map (fn [{:keys [source] :as port}]
+               [source (get-in port [port-key :id])]))
+        (get-in node [:ports :active])))
 
 (defn- compose-linear-nodes [nodes]
   (let [active-nodes (filterv :active? nodes)]
     (loop [program (get-in (first active-nodes) [:stage :linear])
-           tangent-output (get-in (first active-nodes) [:stage-interface :tangent-output])
+           tangent-output (get-in (first active-nodes) [:ports :tangent-result :id])
            previous (:result (first active-nodes))
            remaining (next active-nodes)]
       (if-let [node (first remaining)]
-        (let [tangent-input (get (local-port-map node :tangent-inputs) previous)
-              output (get-in node [:stage-interface :tangent-output])]
+        (let [tangent-input (get (node-derivative-port-map node :tangent) previous)
+              output (get-in node [:ports :tangent-result :id])]
           (when-not tangent-input
             (fail! :ad-normalized-map-chain-boundary
                    {:previous previous :node (:execution-equation node)}))
@@ -1545,7 +1606,7 @@
 (defn- compose-transpose-nodes [nodes requested]
   (let [active-nodes (filterv :active? nodes)
         downstream (last active-nodes)
-        initial-pairs (vec (local-port-map downstream :gradient-outputs))]
+        initial-pairs (vec (node-derivative-port-map downstream :gradient))]
     (loop [program (get-in downstream [:stage :transpose])
            pairs initial-pairs
            remaining (next (reverse active-nodes))]
@@ -1553,13 +1614,13 @@
         (let [boundary (:result node)
               cotangent (some (fn [[outer gradient]] (when (= outer boundary) gradient)) pairs)
               retained (filterv #(not= boundary (first %)) pairs)
-              node-pairs (vec (local-port-map node :gradient-outputs))
+              node-pairs (vec (node-derivative-port-map node :gradient))
               outputs (mapv second (into retained node-pairs))]
           (when-not cotangent
             (fail! :ad-normalized-map-chain-boundary
                    {:boundary boundary :node (:execution-equation node)}))
           (recur (append-map-node program (get-in node [:stage :transpose])
-                                  {(get-in node [:stage-interface :cotangent-input]) cotangent}
+                                  {(get-in node [:ports :cotangent-input :id]) cotangent}
                                   outputs)
                  (into retained node-pairs) (next remaining)))
         (let [by-outer (into {} pairs)
@@ -1571,28 +1632,30 @@
 
 (defn- node-proof-interface [nodes requested]
   (let [active-nodes (filterv :active? nodes)
-        tangent-ports (into {} (mapcat #(local-port-map % :tangent-inputs) active-nodes))
-        gradient-ports (into {} (mapcat #(local-port-map % :gradient-outputs) active-nodes))
+        tangent-ports (into {} (mapcat #(node-derivative-port-map % :tangent) active-nodes))
+        gradient-ports (into {} (mapcat #(node-derivative-port-map % :gradient) active-nodes))
         coefficient-key (fn [node coefficient]
                           [(:execution-equation node) coefficient])]
     {:active-inputs requested
      :residual-arrays
      (into {}
            (mapcat (fn [node]
-                     (map (fn [[coefficient result]]
-                            [(coefficient-key node coefficient) result])
-                          (get-in node [:stage-interface :residual-arrays])))
+                     (map (fn [coefficient]
+                            [(coefficient-key node coefficient)
+                             (get-in node [:ports :residual-arrays coefficient :id])])
+                          (keys (get-in node [:stage-interface :residual-arrays]))))
                    nodes))
      :scalar-captures
      (into {}
            (mapcat (fn [node]
-                     (map (fn [[coefficient input]]
-                            [(coefficient-key node coefficient) input])
-                          (get-in node [:stage-interface :scalar-captures])))
+                     (map (fn [coefficient]
+                            [(coefficient-key node coefficient)
+                             (get-in node [:ports :scalar-captures coefficient :id])])
+                          (keys (get-in node [:stage-interface :scalar-captures]))))
                    nodes))
      :tangent-inputs (mapv tangent-ports requested)
-     :cotangent-input (get-in (last active-nodes) [:stage-interface :cotangent-input])
-     :tangent-output (get-in (last active-nodes) [:stage-interface :tangent-output])
+     :cotangent-input (get-in (last active-nodes) [:ports :cotangent-input :id])
+     :tangent-output (get-in (last active-nodes) [:ports :tangent-result :id])
      :gradient-outputs (mapv gradient-ports requested)}))
 
 (defn- build-nodewise-map-proof [source source-ns options]
@@ -1616,8 +1679,8 @@
                 (let [{:keys [arrays captures]} (soac/operation-parts (:equation node))
                       local-active (filterv @active-values (concat arrays captures))
                       result (first (:results node))
-                      built (build-map-node source source-ns node local-active
-                                            (node-equation-ids))]
+                      built (map-node-lifecycle source source-ns node local-active
+                                                (node-equation-ids) nil)]
                   (when (seq local-active) (swap! active-values conj result))
                   built))
               nodes)
@@ -1627,7 +1690,7 @@
         primal (compose-primal-nodes built)
         linear (compose-linear-nodes built)
         transpose (compose-transpose-nodes built requested)
-        witnesses (mapv #(dissoc % :stage :result :active?) built)]
+        witnesses (mapv #(dissoc % :stage :ports :result :active?) built)]
     {:source-ns source-ns
      :template-revision (templates/registry-revision)
      :compiler-revision (dispatch/compiler-definition-revision)
@@ -1691,51 +1754,6 @@
       (fail! :ad-normalized-map-programs {:interface interface})))
   bundle)
 
-(defn- rebuild-submitted-node
-  [source source-ns subprogram equation node local-active]
-  (let [active? (boolean (seq local-active))
-        derivation ((if active? :scalar-derivation :primal-derivation) node)
-        _ (when-not (= (second equation) (:execution-equation node))
-            (fail! :ad-normalized-map-node-coverage
-                   {:expected (second equation) :actual (:execution-equation node)}))
-        _ (when-not (identical? source-ns (:source-ns derivation))
-            (fail! :ad-normalized-map-node-namespace
-                   {:source-ns source-ns :node-ns (:source-ns derivation)}))
-        _ (when active? (validate-scalar-proof! derivation))
-        {:keys [arrays]} (soac/operation-parts equation)
-        witness-active (if (seq local-active) local-active [(first arrays)])
-        projected (project-map-equation-lane
-                   source subprogram equation source-ns
-                   (first (soac/outputs (:primal derivation)))
-                   {:active-inputs (vec witness-active)})
-        expected-interface (:interface projected)]
-    (when-not (and (fingerprint/equivalent? (:primal projected) (:primal derivation))
-                   (if active?
-                     (fingerprint/equivalent?
-                      (select-keys expected-interface [:params :tags :active-inputs])
-                      (select-keys derivation [:params :tags :active-inputs]))
-                     (and (= #{:source-ns :primal :interface} (set (keys derivation)))
-                          (identical? source-ns (:source-ns (:interface derivation)))
-                          (fingerprint/equivalent?
-                           (dissoc expected-interface :source-ns)
-                           (dissoc (:interface derivation) :source-ns)))))
-      (fail! :ad-normalized-map-node-derivation
-             {:equation (second equation)}))
-    (if active?
-      (let [interface (:stage-interface node)]
-        (assoc node :result (first (nth equation 2)) :active? true
-               :stage (construct-map-stage derivation subprogram interface
-                                           (:equation-ids node))))
-      (let [primal-id (get-in node [:equation-ids :primal])]
-        (when-not (and (= {} (:stage-interface node))
-                       (= #{:primal} (set (keys (:equation-ids node))))
-                       (symbol? primal-id))
-          (fail! :ad-normalized-map-node-interface {:node node}))
-        (assoc node :result (first (nth equation 2)) :active? false
-               :stage {:primal (construct-primal-map-node
-                                (:primal derivation) expected-interface subprogram
-                                primal-id)})))))
-
 (defn- reconstructed-map-proof
   [{:keys [map-programs source-ns] :as bundle}]
   (let [{:keys [source interface proof]} map-programs
@@ -1790,9 +1808,8 @@
                               (fail! :ad-normalized-map-node-coverage
                                      {:expected expected-source
                                       :actual (:source-equations node)}))
-                          rebuilt (rebuild-submitted-node
-                                   source source-ns (:subprogram source-node)
-                                   (:equation source-node) node local-active)]
+                          rebuilt (map-node-lifecycle
+                                   source source-ns source-node local-active nil node)]
                       (when (seq local-active)
                         (swap! active-values conj (first (:results source-node))))
                       rebuilt))
@@ -1805,7 +1822,8 @@
          :linear (compose-linear-nodes nodes)
          :transpose (compose-transpose-nodes nodes requested)
          :interface expected-interface
-         :proof (assoc proof :nodes (mapv #(dissoc % :stage :result :active?) nodes))})
+         :proof (assoc proof :nodes
+                       (mapv #(dissoc % :stage :ports :result :active?) nodes))})
       (let [stage-source (or fused source)
             equation (first (soac/equations stage-source))
             [node] submitted
@@ -1825,13 +1843,6 @@
                              (= (second equation) (:execution-equation node)))
                 (fail! :ad-normalized-map-node-namespace
                        {:source-ns source-ns :node (:execution-equation node)}))
-            _ (validate-scalar-proof! scalar)
-            ;; Preserve the complete established singleton/fused-stage correspondence check.
-            ;; The node wrapper changes evidence ownership, not the one-stage map contract.
-            _ (validate-map-programs!
-               (cond-> (assoc (dissoc scalar :certificate)
-                              :map-programs (dissoc map-programs :proof))
-                 (:sum-programs bundle) (assoc :sum-programs (:sum-programs bundle))))
             source-parts (soac/operation-parts equation)
             options (if (and (= 1 (count requested))
                              (some #{(first requested)} (:captures source-parts)))
@@ -1842,15 +1853,19 @@
                                             (first (soac/outputs (:primal scalar))) options)
                         (project-map-element source source-ns
                                              (first (soac/outputs (:primal scalar))) options))
-            _ (when-not (and (fingerprint/equivalent? (:primal projected) (:primal scalar))
-                             (fingerprint/equivalent?
-                              (select-keys (:interface projected)
-                                           [:params :tags :active-inputs])
-                              (select-keys scalar [:params :tags :active-inputs])))
-                (fail! :ad-normalized-map-node-derivation
-                       {:equation (second equation)}))
-            stage (construct-map-stage scalar stage-source (:stage-interface node)
-                                       (:equation-ids node))]
+            built (map-node-lifecycle
+                   source source-ns
+                   {:equation equation :subprogram stage-source
+                    :results (vec (nth equation 2))
+                    :projected (select-keys projected [:primal :interface])}
+                   nil nil node)
+            ;; Preserve the complete established singleton/fused-stage correspondence check.
+            ;; The node wrapper changes evidence ownership, not the one-stage map contract.
+            _ (validate-map-programs!
+               (cond-> (assoc (dissoc scalar :certificate)
+                              :map-programs (dissoc map-programs :proof))
+                 (:sum-programs bundle) (assoc :sum-programs (:sum-programs bundle))))
+            stage (:stage built)]
         (assoc stage :source source
                :proof (assoc proof :nodes [node]))))))
 
@@ -1924,23 +1939,23 @@
                                            (first (soac/equations fused)))))]
     (if (and region? (< 2 (count fused-arrays)))
       (build-nodewise-map-proof source source-ns options)
-      (let [{:keys [primal interface stage-source]}
+      (let [{:keys [stage-source] :as projected}
             (if region?
               (project-map-region source source-ns nil options)
               (assoc (project-map-element source source-ns nil options)
                      :stage-source source))
-            scalar (linearize-program primal interface)
             equation-ids {:primal 'ad-map-primal :linear 'ad-map-linear
                           :transpose 'ad-map-transpose}
-            stage (construct-map-stage scalar stage-source
-                                       (allocate-map-stage-interface scalar stage-source)
-                                       equation-ids)
-            execution-equation (second (first (soac/equations stage-source)))
-            node {:source-equations (mapv second (soac/equations source))
-                  :execution-equation execution-equation
-                  :scalar-derivation scalar
-                  :stage-interface (:interface stage)
-                  :equation-ids equation-ids}]
+            equation (first (soac/equations stage-source))
+            built (map-node-lifecycle
+                   source source-ns
+                   {:equation equation :subprogram stage-source
+                    :results (vec (nth equation 2))
+                    :projected (select-keys projected [:primal :interface])
+                    :source-equations (mapv second (soac/equations source))}
+                   nil equation-ids nil)
+            stage (:stage built)
+            node (dissoc built :stage :ports :result :active?)]
         {:source-ns source-ns
          :template-revision (templates/registry-revision)
          :compiler-revision (dispatch/compiler-definition-revision)

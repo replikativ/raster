@@ -184,6 +184,17 @@
                   (#'normalized/construct-map-stage scalar source interface
                                                      (:equation-ids node)))]
     (is (empty? @fresh-stage-identities))
+    (is (= {:primal 'ad-map-primal :linear 'ad-map-linear
+            :transpose 'ad-map-transpose}
+           (:equation-ids node)))
+    (is (identical?
+         bundle
+         (with-redefs-fn
+           {#'normalized/allocate-map-stage-interface
+            (fn [& _] (throw (ex-info "retained replay allocated an identity" {})))
+            #'normalized/node-equation-ids
+            (fn [& _] (throw (ex-info "retained replay allocated an identity" {})))}
+           #(normalized/validate! bundle))))
     (is (fingerprint/equivalent? interface (:interface rebuilt)))
     (is (fingerprint/equivalent? (dissoc retained :proof) rebuilt))))
 
