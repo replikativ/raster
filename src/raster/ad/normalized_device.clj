@@ -285,6 +285,22 @@
               :canonical-values canonical-values}))
     {:ids canonical-ids :values canonical-values}))
 
+(defn- compile-device-phases!
+  "Compile a canonical primal/transpose pair; callers retain family-specific phase policy."
+  [checked options resident-outputs]
+  (let [target (:target options)
+        compile-options (select-keys options [:target :schedule :scalar-math])
+        caller-options (caller-options options)
+        primal-options (cond-> compile-options
+                         (seq resident-outputs) (assoc :resident-outputs resident-outputs))
+        primal-compilation (compile-phase! checked :primal primal-options)
+        transpose-compilation (compile-phase! checked :transpose compile-options)]
+    {:target target
+     :compile-options compile-options
+     :caller-options caller-options
+     :primal-compilation primal-compilation
+     :transpose-compilation transpose-compilation}))
+
 (defn- fresh-id [used base]
   (first (remove used (map #(vector ::resident base %) (range)))))
 
@@ -299,6 +315,41 @@
       (let [id (fresh-id used base)]
         (recur (conj used id) (next bases) (conj result id)))
       result)))
+
+(defn- clone-seed-layout! [layout interface primal-value]
+  (let [[allocation-id node-id value-id]
+        (fresh-layout-ids layout [[:seed :allocation] [:seed :node] [:seed :value]])
+        seed-id (get-in interface [:seed :id])
+        cloned
+        (invocation-link/clone-resident-value-layout
+         layout {:template-value primal-value
+                 :template-compiler-value (get-in interface [:primal :id])
+                 :template-abstract (get-in interface [:primal :value])
+                 :compiler-value seed-id :abstract (get-in interface [:seed :value])
+                 :value-id value-id :node-id node-id :allocation-id allocation-id
+                 :role :input :project-ownership? true})]
+    {:layout (-> layout
+                 (assoc-in [:nodes node-id] (:node cloned))
+                 (assoc-in [:values value-id] (:value cloned)))
+     :value value-id}))
+
+(defn- clone-gradient-layout! [layout interface active-value]
+  (let [[allocation-id node-id value-id]
+        (fresh-layout-ids layout [[:gradient :allocation] [:gradient :node]
+                                  [:gradient :value]])
+        gradient-id (get-in interface [:gradient :id])
+        cloned
+        (invocation-link/clone-resident-value-layout
+         layout {:template-value active-value
+                 :template-compiler-value (get-in interface [:active :id])
+                 :template-abstract (get-in interface [:active :value])
+                 :compiler-value gradient-id :abstract (get-in interface [:gradient :value])
+                 :value-id value-id :node-id node-id :allocation-id allocation-id
+                 :role :output :project-ownership? false})]
+    {:layout (-> layout
+                 (assoc-in [:nodes node-id] (:node cloned))
+                 (assoc-in [:values value-id] (:value cloned)))
+     :value value-id}))
 
 (defn- close-preserving! [primary closeable]
   (try
@@ -443,11 +494,8 @@
                    "device preparation currently requires array-only residual storage"
                    {:immutable-scalars (set (keys (:immutable-scalars residual-plan)))
                     :physical-bindings (set (keys (:physical-bindings residual-plan)))}))
-        target (:target options)
-        compile-options (select-keys options [:target :schedule :scalar-math])
-        caller-options (caller-options options)
-        primal-compilation (compile-phase! checked :primal compile-options)
-        transpose-compilation (compile-phase! checked :transpose compile-options)
+        {:keys [target caller-options primal-compilation transpose-compilation]}
+        (compile-device-phases! checked options nil)
         layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
         active-id (get-in interface [:active :id])
         primal-id (get-in interface [:primal :id])
@@ -467,32 +515,12 @@
                     :public-inputs (:public-inputs layout)}))
         residuals (ordered-residual-frontiers! owner residual-plan compiler-bindings)
         residual-ids (:ids residuals)
-        [seed-allocation seed-node seed-value
-         gradient-allocation gradient-node gradient-value]
-        (fresh-layout-ids layout [[:seed :allocation] [:seed :node] [:seed :value]
-                                  [:gradient :allocation] [:gradient :node]
-                                  [:gradient :value]])
-        seed-layout
-        (invocation-link/clone-resident-value-layout
-         layout {:template-value primal-value :template-compiler-value primal-id
-                 :template-abstract (get-in interface [:primal :value])
-                 :compiler-value seed-id :abstract (get-in interface [:seed :value])
-                 :value-id seed-value :node-id seed-node :allocation-id seed-allocation
-                 :role :input :project-ownership? true})
-        gradient-layout
-        (invocation-link/clone-resident-value-layout
-         layout {:template-value active-value :template-compiler-value active-id
-                 :template-abstract (get-in interface [:active :value])
-                 :compiler-value gradient-id :abstract (get-in interface [:gradient :value])
-                 :value-id gradient-value :node-id gradient-node
-                 :allocation-id gradient-allocation :role :output
-                 :project-ownership? false})
-        nodes (assoc (:nodes layout)
-                     seed-node (:node seed-layout)
-                     gradient-node (:node gradient-layout))
-        values (assoc (:values layout)
-                      seed-value (:value seed-layout)
-                      gradient-value (:value gradient-layout))
+        seed-clone (clone-seed-layout! layout interface primal-value)
+        seed-value (:value seed-clone)
+        gradient-clone (clone-gradient-layout! (:layout seed-clone) interface active-value)
+        gradient-value (:value gradient-clone)
+        nodes (get-in gradient-clone [:layout :nodes])
+        values (get-in gradient-clone [:layout :values])
         residual-values (:values residuals)
         transpose-bindings
         (into {seed-id seed-value gradient-id gradient-value}
@@ -522,21 +550,17 @@
                    "the first map-sum device slice requires array-only residual storage"
                    {:immutable-scalars (set (keys (:immutable-scalars residual-plan)))
                     :physical-bindings (set (keys (:physical-bindings residual-plan)))}))
-        target (:target options)
-        compile-options (select-keys options [:target :schedule :scalar-math])
-        caller-options (caller-options options)
         active-id (get-in interface [:active :id])
         primal-id (get-in interface [:primal :id])
         seed-id (get-in interface [:seed :id])
         gradient-id (get-in interface [:gradient :id])
-        primal-compilation
-        (compile-phase! checked :primal (assoc compile-options :resident-outputs [primal-id]))
-        transpose-compilation (compile-phase! checked :transpose compile-options)
+        {:keys [target caller-options primal-compilation transpose-compilation]}
+        (compile-device-phases! checked options [primal-id])
         layout (materialize-layout! primal-compilation (:inputs interface) arguments caller-options)
         compiler-bindings (:buffer-bindings layout)
+        array-boundary (public-array-boundary! (:arrays interface) layout)
         active-value (get compiler-bindings active-id)
         primal-value (get compiler-bindings primal-id)
-        array-boundary (public-array-boundary! (:arrays interface) layout)
         canonical-array-ids (:ids array-boundary)
         public-array-values (:values array-boundary)
         _ (when-not (and active-value primal-value
@@ -572,19 +596,10 @@
                    {:seed seed-id :inputs transpose-inputs
                     :scalars (set (keys transpose-scalars))
                     :available (set (keys (:scalar-values layout)))}))
-        [gradient-allocation gradient-node gradient-value]
-        (fresh-layout-ids layout [[:gradient :allocation] [:gradient :node]
-                                  [:gradient :value]])
-        gradient-layout
-        (invocation-link/clone-resident-value-layout
-         layout {:template-value active-value :template-compiler-value active-id
-                 :template-abstract (get-in interface [:active :value])
-                 :compiler-value gradient-id :abstract (get-in interface [:gradient :value])
-                 :value-id gradient-value :node-id gradient-node
-                 :allocation-id gradient-allocation :role :output
-                 :project-ownership? false})
-        nodes (assoc (:nodes layout) gradient-node (:node gradient-layout))
-        values (assoc (:values layout) gradient-value (:value gradient-layout))
+        gradient-clone (clone-gradient-layout! layout interface active-value)
+        gradient-value (:value gradient-clone)
+        nodes (get-in gradient-clone [:layout :nodes])
+        values (get-in gradient-clone [:layout :values])
         transpose-bindings
         (into {gradient-id gradient-value}
               (map (fn [id] [id (get compiler-bindings id)])) residual-ids)
@@ -610,11 +625,9 @@
   [{:keys [owner check!] :as checked} arguments options]
   (let [residual-plan (canonical/execution-residual-plan owner)
         interface (indexed-interface! owner residual-plan)
-        target (:target options)
-        compile-options (select-keys options [:target :schedule :scalar-math])
-        caller-options (caller-options options)
-        primal-compilation (compile-phase! checked :primal compile-options)
-        transpose-compilation (compile-phase! checked :transpose compile-options)
+        {:keys [target compile-options caller-options
+                primal-compilation transpose-compilation]}
+        (compile-device-phases! checked options nil)
         layout (materialize-indexed-layout!
                 primal-compilation (:inputs interface) arguments caller-options interface)
         compiler-bindings (:buffer-bindings layout)
@@ -643,32 +656,12 @@
             (fail! :normalized-device-indexed-residual
                    "indexed execution requires the exact canonical index snapshot"
                    {:expected (:index-snapshot interface) :actual residual-ids}))
-        [seed-allocation seed-node seed-value
-         gradient-allocation gradient-node gradient-value]
-        (fresh-layout-ids layout [[:seed :allocation] [:seed :node] [:seed :value]
-                                  [:gradient :allocation] [:gradient :node]
-                                  [:gradient :value]])
-        seed-layout
-        (invocation-link/clone-resident-value-layout
-         layout {:template-value primal-value :template-compiler-value primal-id
-                 :template-abstract (get-in interface [:primal :value])
-                 :compiler-value seed-id :abstract (get-in interface [:seed :value])
-                 :value-id seed-value :node-id seed-node :allocation-id seed-allocation
-                 :role :input :project-ownership? true})
-        gradient-layout
-        (invocation-link/clone-resident-value-layout
-         layout {:template-value active-value :template-compiler-value active-id
-                 :template-abstract (get-in interface [:active :value])
-                 :compiler-value gradient-id :abstract (get-in interface [:gradient :value])
-                 :value-id gradient-value :node-id gradient-node
-                 :allocation-id gradient-allocation :role :output
-                 :project-ownership? false})
-        nodes (assoc (:nodes layout)
-                     seed-node (:node seed-layout)
-                     gradient-node (:node gradient-layout))
-        values (assoc (:values layout)
-                      seed-value (:value seed-layout)
-                      gradient-value (:value gradient-layout))
+        seed-clone (clone-seed-layout! layout interface primal-value)
+        seed-value (:value seed-clone)
+        gradient-clone (clone-gradient-layout! (:layout seed-clone) interface active-value)
+        gradient-value (:value gradient-clone)
+        nodes (get-in gradient-clone [:layout :nodes])
+        values (get-in gradient-clone [:layout :values])
         index-shape (resident-value-shape! nodes values index-value)
         active-shape (resident-value-shape! nodes values active-value)
         primal-shape (resident-value-shape! nodes values primal-value)

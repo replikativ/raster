@@ -150,6 +150,9 @@
         (is (= {} (get-in @calls [1 1 :dependencies])))
         (is (= extra-dependencies (get-in @calls [2 1 :dependencies])))
         (is (empty? (:frontiers @captured-module)))
+        (is (= [:raster.ad.normalized-device/primal
+                :raster.ad.normalized-device/transpose]
+               (mapv :id (get-in @captured-module [:spine :instances]))))
         (is (= :owned (:ownership seed-abstract)))
         (is (= (dissoc (get-in owner [:interface :cotangent-input :value]) :shape :ownership)
                (dissoc seed-abstract :shape :ownership)))

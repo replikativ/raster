@@ -159,6 +159,9 @@
             seed-value (get-in transpose-instance [:call :scalar-values seed-id])
             input-ids (mapv :id (:inputs ports))]
         (is (= '[xs weights] input-ids))
+        (is (= [:raster.ad.normalized-device/primal
+                :raster.ad.normalized-device/transpose]
+               (mapv :id (get-in @captured-module [:spine :instances]))))
         (is (= (mapv :value (:inputs ports)) (get-in entries [:primal :interface :inputs])))
         (is (= [] (get-in entries [:transpose :interface :inputs])))
         (is (= {:type :float :value (float -0.5)} seed-value
