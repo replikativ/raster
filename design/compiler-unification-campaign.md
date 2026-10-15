@@ -10,12 +10,52 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 ### October 15 current checkpoint
 
+The following AD consolidation sequence is interleaved with, not a replacement for,
+the eight compiler obligations below. Further family-specific AD extensions are held
+until the shared structural boundary is established.
+
+### AD consolidation sequence
+
+1. **Admission and evidence.** Extend the existing AD laws into an accepted/refused
+   capability matrix. Distinguish known tangent spaces, proven NoTangent, unknown
+   types, explicit inactivity and symbolic zero. Preserve actual precision checkpoints.
+   Exercise constructor-time refusals without executing the user's primal.
+2. **Shared structural transform.** Generalize the existing normalized program envelope
+   to equation graphs: activity, topological JVP, reverse transposition and ordered
+   fan-out accumulation. Start with test-only equivalence checks; retire superseded
+   family orchestration only as coverage is demonstrated. Do not add another rule table.
+3. **Composition boundary.** Specify ordered parameter/result ports and owned residuals.
+   Qualify an optional synchronous CPU foreign-AD adapter with independent analytic and
+   finite-difference checks, changed inputs/seeds, mutation and cleanup tests. Keep
+   VJP, JVP, batching and higher-order support independent. No core Python dependency,
+   second compiler cache or competing GPU session convention.
+4. **Operator and control coverage.** Compose contractions, broadcasting, reductions
+   and indexed operations through shared linear operators, then admitted conditionals,
+   scans/recurrences and higher-order cases. General effectful loops may remain refused;
+   unsupported derivatives must never silently become zero.
+5. **Residual/resource projection.** Track semantic value/version, dtype, checkpoint,
+   consumers and lifetime through existing memory witnesses, buffer views, leases and
+   completion events. Borrowing, donation and recomputation require these proofs; a live
+   allocation alone does not prove it still contains the saved primal value.
+6. **Workload closure and retirement.** Qualify real Gemma/SFT, GSDM optimizer and
+   statistical training, density and PDE cases; measure preparation and warmed execution
+   separately. Only then consider default-engine migration and remove obsolete paths.
+
+Acceptance uses the existing analytic, finite-difference, pairing, higher-order and
+mutation/refusal tests, plus cold Float-first/Double-first acquisition controls. Pairing
+and CPU/device agreement using shared derivative rules are not independent calculus
+oracles. Hardware-free tests, local device execution and actual distributed performance
+remain distinct evidence tiers. The real Gemma discrepancy below remains open; changing
+tolerances or abandoning strict floating-point semantics is not an acceptance shortcut.
+
+### October 15 implementation boundaries
+
 | Boundary | Current opt-in implementation | Still open |
 | --- | --- | --- |
-| Normalized host AD | Canonical pure maps/nonbranching map chains, map→ordered-sum and functional indexed-map owners execute generated primal/JVP/VJP programs with exact residual plans. Pure maps and their checked fused chains support ordered multiple active array inputs. | Multiple-active reductions/indexed operations, general equation DAGs, conditional/loop regions and default-source retirement. |
+| Normalized host AD | Canonical pure maps/nonbranching map chains, map→ordered-sum and functional indexed-map owners execute generated primal/JVP/VJP programs with exact residual plans. Pure maps, their checked fused chains and a single map→ordered-sum support ordered multiple active array inputs. | Multiple-active map-chain→sum and indexed operations, general equation DAGs, conditional/loop regions and default-source retirement. |
 | Resident normalized AD | Public lease-oriented `prepare-owner`, `prepare-sum-owner` and `prepare-indexed-owner` reuse the generic resident binder, named-entry owner and LinkPlan/LinkModule validation on OpenCL and Level Zero. | Empty native buffers, general scatter/DAG execution, concurrent mutation, host readback and default-engine activation. |
 | Shape and storage premises | A checked self-`ShapeProjection` derives a private dimension from one public buffer; closed external-storage and external-dimension premises cross separate resident phases without fake parameters or initialization. Program-wide typed shape values remain in `ProgramCall`, while kernels that do not consume them keep an empty scalar ABI. | Automatic source-free projection of compound/shared dimensions, per-call geometry changes and arbitrary dynamic shape programs. |
-| Acceptance | The source AD engine remains the default independent oracle. The unchanged real Gemma gate still fails 12/28 checks and the same-CPU-operand layer control 4/14. | Real-model closure, full GSDM statistical training, Adam/EMA qualification and the other original campaign gates. |
+| Acceptance | The source AD engine remains the default structural reference; shared scalar rules mean it is not an independent calculus oracle. The unchanged real Gemma gate still fails 12/28 checks and the same-CPU-operand layer control 4/14. | Real-model closure, full GSDM statistical training, Adam/EMA qualification and the other original campaign gates. |
 
 The latest selected SGEMM leaf diagnostic used the same GPU operands and measured maximum absolute
 error 2.3841858e-7 and relative L2 error 3.8074463e-8 against the actual CPU SGEMM. Upstream input

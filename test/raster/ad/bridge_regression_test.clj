@@ -221,8 +221,9 @@
       (is (nil? dys))
       (is (nil? dcount))
       (is (number? dsigma)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-differentiable"
-                          (rev/value+grad #'normal-strided-observations :wrt [2])))))
+    (is (= :ad-no-tangent-parameter
+           (:reason (try (rev/value+grad #'normal-strided-observations :wrt [2]) nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
 
 (deftest generated-gradient-helper-namespace-is-available
   (is (some? (find-ns 'raster.dl.nn))))

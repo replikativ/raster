@@ -95,6 +95,11 @@
     (is (nil? (tangent/tangent-tag 'boolean)))
     (is (nil? (tangent/tangent-tag 'Object)))
     (is (nil? (tangent/tangent-tag nil))))
+  (testing "classification distinguishes proven primitive ⊥ from missing evidence"
+    (doseq [t '[long int boolean char longs ints booleans]]
+      (is (= {:kind :none} (tangent/tangent-kind t)) (str t)))
+    (doseq [t ['Object 'objects 'java.lang.Number nil]]
+      (is (= {:kind :unknown} (tangent/tangent-kind t)) (str t))))
   (testing "Π agrees with differentiable? on its whole domain"
     (doseq [t '[double float doubles floats long longs int ints boolean Object nil]]
       (is (= (tangent/differentiable? t) (some? (tangent/tangent-tag t)))

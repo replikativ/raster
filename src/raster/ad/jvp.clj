@@ -586,7 +586,7 @@
                       (throw (ex-info "jvp requires a deftm var" {:var f-var})))
            walked-body (or (rcore/ensure-walked-body! resolved)
                            (throw (ex-info "No walked body on var" {:var f-var})))
-           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
            all-params (vec (map-indexed
                             (fn [i p]
                               (let [tag (nth tags i nil)
@@ -595,12 +595,10 @@
                                   (with-meta base {:raster.type/tag tag})
                                   (with-meta base nil))))
                             params))
-           ;; Only differentiable-tag params get tangent slots (⊥ params carry
-           ;; no tangent space — same seeding rule as build-grad-walked-body).
-           diff-params (vec (keep-indexed
-                             (fn [i p]
-                               (when (tangent/differentiable? (nth tags i nil)) p))
-                             all-params))
+           parameter-plan (rev/tangent-parameter-plan all-params tags nil)
+           ;; Only positively known tangent spaces get tangent slots. Proven ⊥
+           ;; parameters carry no tangent; Unknown was refused above.
+           diff-params (:candidate-params parameter-plan)
            _ (when (empty? diff-params)
                (throw (ex-info (str "jvp: no differentiable params on " f-var
                                     " — every param tag is ⊥ (no tangent space)")
@@ -697,7 +695,7 @@
                    (throw (ex-info "hvp requires a deftm var" {:var f-var})))
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
-        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) nil)))
         all-params (vec (map-indexed
                          (fn [i p]
                            (let [tag (nth tags i nil)
@@ -706,10 +704,8 @@
                                (with-meta base {:raster.type/tag tag})
                                (with-meta base nil))))
                          params))
-        diff-params (vec (keep-indexed
-                          (fn [i p]
-                            (when (tangent/differentiable? (nth tags i nil)) p))
-                          all-params))
+        parameter-plan (rev/tangent-parameter-plan all-params tags nil)
+        diff-params (:candidate-params parameter-plan)
         _ (when (empty? diff-params)
             (throw (ex-info (str "hvp: no differentiable params on " f-var
                                  " — every param tag is ⊥ (no tangent space)")
