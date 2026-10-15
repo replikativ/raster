@@ -138,6 +138,57 @@
                                'forged-active-extra)]]
       (is (= :ad-normalized-map-node-interface
              (reason (fn [] (#'normalized/reconstructed-map-proof changed))))))))
+
+(deftest scalar-proof-scope-refuses-malformed-map-nodes-without-repair
+  (let [source (frontend/form->program
+                '(let* [paired (raster.par/pmap i n float
+                                                (raster.numeric/*
+                                                 (clojure.core/aget x i)
+                                                 (clojure.core/aget q i)))
+                        output (raster.par/pmap j n float
+                                                (raster.numeric/*
+                                                 (clojure.core/aget paired j)
+                                                 (clojure.core/aget r j)))]
+                       output)
+                {:dtype :float :array-types {'x :float 'q :float 'r :float}
+                 :scalar-types {'n :long}})
+        bundle (normalized/linearize-map-chain-program
+                source (the-ns 'raster.ad.normalized-map-chain-test)
+                {:active-input 'r})
+        node-path [:map-programs :proof :nodes]
+        scalar (get-in bundle (conj node-path 1 :scalar-derivation))
+        both (assoc-in bundle (conj node-path 1 :primal-derivation) scalar)
+        neither (update-in bundle (conj node-path 1)
+                           dissoc :scalar-derivation :primal-derivation)
+        missing-ns (-> bundle
+                       (update-in (conj node-path 0 :primal-derivation) dissoc :source-ns)
+                       (update-in (conj node-path 0 :primal-derivation :interface)
+                                  dissoc :source-ns))
+        extension-ns (the-ns 'raster.ad.normalized-map-chain-test)
+        extended (assoc-in bundle
+                           (conj node-path 0 :primal-derivation :unknown-extension-ns)
+                           extension-ns)]
+    (doseq [changed [(assoc-in bundle node-path nil)
+                     (assoc-in bundle node-path '())
+                     (assoc-in bundle node-path [])
+                     both neither]]
+      (is (= :ad-normalized-map-node-proof
+             (reason #(normalized/execution-sources changed))))
+      (is (false? (normalized/proof-source-namespaces-identical?
+                   changed (:source-ns bundle)))))
+    (is (= :ad-normalized-map-node-proof
+           (reason #(normalized/validate!
+                     (recertify (assoc-in bundle node-path [1]))))))
+    (let [pure (#'normalized/pure-proof-namespaces missing-ns)]
+      (is (not (contains? (get-in pure (conj node-path 0 :primal-derivation))
+                          :source-ns)))
+      (is (not (contains? (get-in pure (conj node-path 0 :primal-derivation :interface))
+                          :source-ns))))
+    (is (identical?
+         extension-ns
+         (get-in (#'normalized/pure-proof-namespaces extended)
+                 (conj node-path 0 :primal-derivation :unknown-extension-ns))))))
+
 (defn- square-push [x dx] (fadd (fmul dx x) (fmul dx x)))
 
 (defn- alter-facts [program f]

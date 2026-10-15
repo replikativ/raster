@@ -118,12 +118,28 @@
   (let [bundle (build (indexed-map :double :long 'n 'm))
         path [:gather-programs :proof :scalar-derivation]
         without-ns (update-in bundle path dissoc :source-ns)
-        malformed (assoc-in bundle path 1)]
+        malformed (assoc-in bundle path 1)
+        extension-ns (the-ns 'raster.ad.normalized-indexed-map-test)
+        extended (assoc-in bundle (conj path :unknown-extension-ns) extension-ns)
+        counterfeit-map (assoc bundle :map-programs {:proof {:nodes nil}})]
     (is (not (contains? (get-in (#'normalized/pure-proof-namespaces without-ns) path)
                         :source-ns)))
     (is (= :ad-normalized-gather-proof
            (reason #(normalized/validate! (recertify without-ns)))))
     (is (= 1 (get-in (#'normalized/pure-proof-namespaces malformed) path)))
+    (is (identical? extension-ns
+                    (get-in (#'normalized/pure-proof-namespaces extended)
+                            (conj path :unknown-extension-ns))))
+    ;; Top-level family presence is authoritative: malformed map evidence never
+    ;; falls through to the otherwise valid gather proof.
+    (is (= :map (:family (#'normalized/proof-derivation-entries counterfeit-map))))
+    (is (= :ad-normalized-map-node-proof
+           (reason #(normalized/execution-sources counterfeit-map))))
+    (is (false? (normalized/proof-source-namespaces-identical?
+                 counterfeit-map (:source-ns counterfeit-map))))
+    (is (identical? (get-in counterfeit-map (conj path :source-ns))
+                    (get-in (#'normalized/pure-proof-namespaces counterfeit-map)
+                            (conj path :source-ns))))
     (let [changed (assoc-in bundle [:gather-programs :interface] 1)]
       (is (= :ad-normalized-gather-interface
              (reason #(normalized/validate! (recertify changed))))))))

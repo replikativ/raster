@@ -130,7 +130,7 @@
     (is (= :ad-normalized-map-node-interface
            (reason #(normalized/validate! forged))))))
 
-(deftest map-sum-retains-one-node-proof-as-its-only-scalar-authority
+(deftest map-sum-retains-one-checked-map-node
   (let [bundle (build (source :double) 'xs)
         node (get-in bundle [:map-programs :proof :nodes 0])
         other-ns (the-ns 'raster.ad.normalized-scalar)]
@@ -143,19 +143,19 @@
                    :tangent-inputs :residuals :cotangent-seed]))
     ;; A malformed list containing a real namespace-bearing witness is rejected before
     ;; certification; the certificate projector deliberately handles only valid node vectors.
-    (is (= :ad-normalized-sum-map-boundary
+    (is (= :ad-normalized-map-node-proof
            (reason #(normalized/validate!
                      (assoc-in bundle [:map-programs :proof :nodes] (list node))))))
     (doseq [[expected change]
-            [[:ad-normalized-sum-map-boundary
+            [[:ad-normalized-map-node-proof
               #(update-in % [:map-programs :proof] dissoc :nodes)]
-             [:ad-normalized-sum-map-boundary
+             [:ad-normalized-map-node-proof
               #(assoc-in % [:map-programs :proof :nodes] 1)]
-             [:ad-normalized-sum-map-boundary
+             [:ad-normalized-map-node-proof
               #(assoc-in % [:map-programs :proof :nodes] [1])]
-             [:ad-normalized-sum-map-boundary
+             [:ad-normalized-map-node-proof
               #(assoc-in % [:map-programs :proof :nodes] (list 1))]
-             [:ad-normalized-sum-map-boundary
+             [:ad-normalized-map-node-coverage
               #(assoc-in % [:map-programs :proof :nodes] [node node])]
              [:ad-normalized-map-node-proof
               #(assoc % :primal (get-in % [:map-programs :primal]))]
@@ -166,6 +166,36 @@
                             :scalar-derivation :source-ns] other-ns)]]]
       (let [forged (recertify (change bundle))]
         (is (= expected (reason #(normalized/validate! forged))))))))
+
+(deftest sum-lift-refuses-malformed-executable-transpose-geometry
+  (let [bundle (build (source :double) 'xs)
+        sum-programs (:sum-programs bundle)
+        lift-reason
+        (fn [change-equations]
+          (let [transpose (get-in bundle [:map-programs :transpose])
+                changed (apply list
+                               (assoc (vec transpose) 2
+                                      (change-equations (vec (soac/equations transpose)))))]
+            (reason #(#'normalized/lift-sum-programs
+                       (assoc-in bundle [:map-programs :transpose] changed)
+                       (:source sum-programs) (:interface sum-programs)))))
+        change-operation
+        (fn [change]
+          (fn [[equation]]
+            (let [equation (vec equation)
+                  operation (change (vec (nth equation 3)))]
+              [(apply list (assoc equation 3 (apply list operation)))])))]
+    (is (= :ad-normalized-sum-map-boundary
+           (lift-reason (change-operation #(assoc % 2 '[wrong-cotangent])))))
+    (is (= :ad-normalized-sum-map-boundary
+           (lift-reason
+            (change-operation
+             (fn [operation]
+               (let [lambda (vec (nth operation 4))
+                     parameters (assoc (vec (nth lambda 1)) 0 0)]
+                 (assoc operation 4 (apply list (assoc lambda 1 parameters)))))))))
+    (is (= :ad-normalized-sum-map-boundary
+           (lift-reason (fn [[equation]] [equation equation]))))))
 
 (deftest checked-sum-retains-original-ordered-step-and-explicit-scalar-seed
   (doseq [dt [:float :double] active '[xs weights]]
