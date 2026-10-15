@@ -1,5 +1,6 @@
 (ns raster.ad.normalized-excluded-map-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-map-runtime :as runtime]
             [raster.ad.normalized-map-element-test :as element]
@@ -16,6 +17,12 @@
 (deftm weighted-float [xs :- (Array float) weights :- (Array float) size :- Long]
   :- (Array float)
   (par/map [i size] (n/* (n/* (ra/aget xs i) (ra/aget xs i)) (ra/aget weights i))))
+(deftm product-double [xs :- (Array double) weights :- (Array double) size :- Long]
+  :- (Array double)
+  (par/map [i size] (n/* (ra/aget xs i) (ra/aget weights i))))
+(deftm product-float [xs :- (Array float) weights :- (Array float) size :- Long]
+  :- (Array float)
+  (par/map [i size] (n/* (ra/aget xs i) (ra/aget weights i))))
 
 (defn- source [v dt]
   (let [result (gensym "weighted_result_")
@@ -50,7 +57,7 @@
           [jvp-output tangent] ((:jvp prepared) arguments dx)
           coefficients (mapv (fn [x w] (if (= active 'xs) (* 2.0 x w) (* x x))) xs0 ws0)]
       (is (identical? program (get-in bundle [:map-programs :source])))
-      (is (= active (get-in bundle [:map-programs :interface :active-input])))
+      (is (= [active] (get-in bundle [:map-programs :interface :active-inputs])))
       (is (= (vec (v xs weights size)) (vec output) (vec jvp-output)))
       (is (= xs0 (vec xs)))
       (is (= ws0 (vec weights)))
@@ -67,6 +74,128 @@
         (dotimes [i size] (aset gradient i (cast 777.0)))
         (is (= (mapv #(cast (* % -0.5)) coefficients)
                (vec (nth (pullback dy) (.indexOf ^java.util.List (:inputs prepared) active)))))))))
+
+(deftest binary-product-supports-ordered-multiple-active-arrays
+  (doseq [[v dt array cast] [[#'product-double :double double-array double]
+                            [#'product-float :float float-array float]]]
+    (let [program (source v dt)
+          active '[weights xs]
+          bundle (normalized/linearize-map-program
+                  program (the-ns 'raster.ad.normalized-excluded-map-test)
+                  {:active-inputs active})
+          owner (canonical/adapt-map bundle)
+          prepared (runtime/prepare-owner owner)
+          xs0 [-2.0 0.0 3.0] ws0 [0.5 2.0 -1.0]
+          xs (array xs0) weights (array ws0)
+          arguments (args prepared {'xs xs 'weights weights 'size 3})
+          dweights (array [0.25 -0.5 2.0]) dxs (array [-1.0 0.75 0.5])
+          dy (array [-0.5 2.0 0.25])
+          [output pullback] ((:vjp prepared) arguments)
+          [jvp-output tangent] ((:jvp prepared) arguments [dweights dxs])
+          expected-y (mapv #(cast (* %1 %2)) xs0 ws0)
+          ;; The multiplication rule preserves source operand contribution order, independently
+          ;; of the requested tangent-port order: dx*w is accumulated before dw*x.
+          expected-tangent (mapv #(cast (+ (cast (* %1 %2)) (cast (* %3 %4))))
+                                 (vec dxs) ws0 (vec dweights) xs0)]
+      (is (= active (get-in bundle [:map-programs :interface :active-inputs])
+             (get-in owner [:interface :active-inputs])))
+      (is (= 2 (count (get-in owner [:interface :tangent-inputs]))
+             (count (get-in owner [:interface :cotangent-results]))))
+      (is (= 2 (count (get-in (canonical/execution-residual-plan owner) [:owned-arrays]))))
+      (is (not (contains? (:interface owner) :tangent-input)))
+      (is (not (contains? (:interface owner) :cotangent-result)))
+      (is (= expected-y (vec output) (vec jvp-output)))
+      (is (= expected-tangent (vec tangent)))
+      (is (= :ad-map-runtime-tangents
+             (reason #((:jvp prepared) arguments dweights))))
+      (is (= :ad-map-runtime-tangents
+             (reason #((:jvp prepared) arguments [dweights]))))
+      (when (= :float dt)
+        (is (= (mapv #(Float/floatToRawIntBits %) expected-y)
+               (mapv #(Float/floatToRawIntBits %) (vec output))))
+        (is (= (mapv #(Float/floatToRawIntBits %) expected-tangent)
+               (mapv #(Float/floatToRawIntBits %) (vec tangent)))))
+      ;; Delayed reverse owns both coefficient arrays and reads neither caller array nor output.
+      (dotimes [i 3]
+        (aset xs i (cast 91.0))
+        (aset weights i (cast -73.0))
+        (aset output i (cast 44.0)))
+      (let [slots (pullback dy)
+            gx (nth slots (.indexOf ^java.util.List (:inputs prepared) 'xs))
+            gw (nth slots (.indexOf ^java.util.List (:inputs prepared) 'weights))]
+        (is (= (mapv #(cast (* %1 %2)) ws0 (vec dy)) (vec gx)))
+        (is (= (mapv #(cast (* %1 %2)) xs0 (vec dy)) (vec gw)))
+        (is (nil? (nth slots (.indexOf ^java.util.List (:inputs prepared) 'size))))
+        (is (= (reduce + (map * (vec tangent) (vec dy)))
+               (+ (reduce + (map * (vec dweights) (vec gw)))
+                  (reduce + (map * (vec dxs) (vec gx))))))))))
+
+(deftest multiple-active-double-gradient-has-independent-finite-difference-corroboration
+  (let [program (source #'product-double :double)
+        prepared (runtime/prepare
+                  (normalized/linearize-map-program
+                   program (the-ns 'raster.ad.normalized-excluded-map-test)
+                   {:active-inputs '[weights xs]}))
+        xs (double-array [-2.0 3.0]) weights (double-array [0.5 -1.0])
+        environment {'xs xs 'weights weights 'size 2}
+        seed (double-array [0.25 -0.5])
+        [_ pullback] ((:vjp prepared) (args prepared environment))
+        slots (pullback seed)]
+    (doseq [active ['xs 'weights]
+            i (range 2)]
+      (let [gradient (nth slots (.indexOf ^java.util.List (:inputs prepared) active))
+            h 1.0e-5
+            objective (fn [delta]
+                        (let [changed (aclone ^doubles (get environment active))
+                              _ (aset changed i (+ (aget changed i) delta))
+                              values (assoc environment active changed)]
+                          (reduce + (map * (seq seed)
+                                         (seq (product-double ('xs values) ('weights values) 2))))))
+            fd (/ (- (objective h) (objective (- h))) (* 2.0 h))]
+        (is (< (Math/abs (- fd (aget ^doubles gradient i))) 1.0e-8))))))
+
+(deftest plural-singleton-and-empty-multiple-active-map-retain-host-contracts
+  (let [program (source #'product-double :double)
+        source-ns (the-ns 'raster.ad.normalized-excluded-map-test)
+        singleton (runtime/prepare
+                   (normalized/linearize-map-program program source-ns
+                                                    {:active-inputs '[weights]}))
+        multi (runtime/prepare
+               (normalized/linearize-map-program program source-ns
+                                                {:active-inputs '[weights xs]}))
+        environment {'xs (double-array 0) 'weights (double-array 0) 'size 0}
+        singleton-arguments (args singleton environment)
+        multi-arguments (args multi environment)
+        [singleton-y singleton-pb] ((:vjp singleton) singleton-arguments)
+        [multi-y multi-pb] ((:vjp multi) multi-arguments)
+        [_ singleton-tangent] ((:jvp singleton) singleton-arguments (double-array 0))
+        [_ multi-tangent] ((:jvp multi) multi-arguments [(double-array 0) (double-array 0)])
+        singleton-slots (singleton-pb (double-array 0))
+        multi-slots (multi-pb (double-array 0))]
+    (is (= '[weights] (get-in (canonical/adapt-map
+                               (normalized/linearize-map-program
+                                program source-ns {:active-inputs '[weights]}))
+                              [:interface :active-inputs])))
+    (doseq [value [singleton-y multi-y singleton-tangent multi-tangent]]
+      (is (zero? (alength value))))
+    (is (nil? (nth singleton-slots (.indexOf ^java.util.List (:inputs singleton) 'xs))))
+    (is (some? (nth singleton-slots (.indexOf ^java.util.List (:inputs singleton) 'weights))))
+    (is (some? (nth multi-slots (.indexOf ^java.util.List (:inputs multi) 'xs))))
+    (is (some? (nth multi-slots (.indexOf ^java.util.List (:inputs multi) 'weights))))))
+
+(deftest canonical-multiple-active-ports-cannot-be-dropped-or-reordered
+  (let [owner (canonical/adapt-map
+               (normalized/linearize-map-program
+                (source #'product-double :double)
+                (the-ns 'raster.ad.normalized-excluded-map-test)
+                {:active-inputs '[weights xs]}))]
+    (doseq [changed [(update-in owner [:interface :active-inputs] #(vec (reverse %)))
+                     (update-in owner [:interface :tangent-inputs] pop)
+                     (update-in owner [:interface :tangent-inputs] #(vec (reverse %)))
+                     (update-in owner [:interface :cotangent-results] pop)
+                     (update-in owner [:interface :cotangent-results] #(vec (reverse %)))]]
+      (is (= :ad-program-bundle-correspondence
+             (reason #(canonical/validate! changed)))))))
 
 (deftest independent-coordinate-fd-selects-either-array
   (doseq [active ['xs 'weights]]
@@ -122,11 +251,15 @@
     (is (= :ad-normalized-map-active-array
            (reason #(normalized/linearize-map-program program source-ns))))
     (doseq [options [{:active-array 'missing} {:active-array 'size} {:active-array nil}
-                     {:active-array 'xs :active-arrays ['xs 'weights]}]]
+                     {:active-array 'xs :active-arrays ['xs 'weights]}
+                     {:active-inputs []} {:active-inputs ['xs 'xs]}
+                     {:active-inputs ['xs 'size]} {:active-inputs ['xs 'missing]}
+                     {:active-inputs ['xs 'weights] :active-input 'xs}
+                     {:active-inputs ['xs 'weights] :active-array 'xs}]]
       (is (= :ad-normalized-map-active-array
              (reason #(normalized/linearize-map-program program source-ns options)))))
     (let [bundle (build program 'xs)
-          changed (assoc-in bundle [:map-programs :interface :active-input] 'weights)
+          changed (assoc-in bundle [:map-programs :interface :active-inputs] ['weights])
           changed (assoc changed :certificate (#'normalized/certificate changed))]
       (is (= :ad-normalized-map-interface (reason #(normalized/validate! changed)))))
     (let [one (#'element/map-program :double)]
@@ -173,7 +306,7 @@
         current (revisions)
         invoke (ns-resolve 'raster.ad.normalized-map-runtime 'invoke)
         executions (atom 0)
-        forged (assoc-in bundle [:map-programs :interface :active-input] 'weights)
+        forged (assoc-in bundle [:map-programs :interface :active-inputs] ['weights])
         forged (assoc forged :certificate (#'normalized/certificate forged))]
     (with-redefs-fn {invoke (fn [& _] (swap! executions inc))}
       (fn []

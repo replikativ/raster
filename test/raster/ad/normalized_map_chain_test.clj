@@ -169,7 +169,7 @@
         bundle (normalized/linearize-map-chain-program
                 source (the-ns 'raster.ad.normalized-map-chain-test)
                 {:active-input 'q})]
-    (is (= 'q (get-in bundle [:map-programs :interface :active-input])))
+    (is (= ['q] (get-in bundle [:map-programs :interface :active-inputs])))
     (is (every? (set (:inputs (soac/facts (get-in bundle [:map-programs :source]))))
                 '[x q]))
     (is (identical? bundle (normalized/validate! bundle)))))

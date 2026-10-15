@@ -41,11 +41,11 @@
           saved {'n (long n) 'm (long 3) (:id residual) snapshot}
           owner (array 3)
           [gradient] (invoke t (assoc saved zero owner (get-in interface [:cotangent-input :id]) seed))
-          [tangent] (invoke l (assoc saved (get-in interface [:tangent-input :id]) dx))]
+          [tangent] (invoke l (assoc saved (get-in interface [:tangent-inputs 0 :id]) dx))]
       (is (identical? b (canonical/validate! b)))
       (is (= '[data] (:active-inputs interface)))
-      (is (= '[m] (get-in interface [:tangent-input :value :shape])
-             (get-in interface [:cotangent-result :value :shape])))
+      (is (= '[m] (get-in interface [:tangent-inputs 0 :value :shape])
+             (get-in interface [:cotangent-results 0 :value :shape])))
       (is (= [(if (zero? n) 0 'n)] (get-in interface [:cotangent-input :value :shape])))
       (is (= {:equation 'g :input 'indices} (:origin residual)))
       (is (= (:id residual) (get-in residual [:producer :result])))
@@ -65,7 +65,7 @@
       (is (= {:value zero :dtype dt :shape '[m] :ownership :owned
               :initialization :typed-zero :exclusive true} (:requirement obligation)))
       (is (= zero (get-in obligation [:consumer :alias]) (get-in obligation [:consumer :destination])))
-      (is (= (get-in interface [:cotangent-result :id]) (get-in obligation [:consumer :result])))
+      (is (= (get-in interface [:cotangent-results 0 :id]) (get-in obligation [:consumer :result])))
       (is (= [zero] (:physical-inputs t)))
       (doseq [phase [:source :primal :linear :transpose]]
         (is (not (some #{'m zero} (:inputs (soac/facts (get b phase))))))
@@ -119,7 +119,7 @@
                      (assoc-in b [:residual-bindings 'indices :producer :result] 'out)
                      (assoc-in b [:residual-bindings 'indices :value :dtype] :int)
                      (assoc-in b [:interface :active-inputs] '[indices])
-                     (assoc-in b [:interface :tangent-input :value :shape] '[n])
+                     (assoc-in b [:interface :tangent-inputs 0 :value :shape] '[n])
                      (assoc-in b [:physical-bindings zero :requirement :initialization] :unknown)
                      (assoc-in b [:physical-bindings zero :requirement :exclusive] false)
                      (assoc-in b [:physical-bindings zero :consumer :alias] snapshot)]]

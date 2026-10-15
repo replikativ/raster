@@ -78,7 +78,7 @@
           ;; Only immutable source scalars and the declared owned snapshots enter derivatives.
           saved (merge {'size (long n)} (select-keys (zipmap (soac/outputs (:primal b)) results) owned))
           interface (:interface b)
-          tangent-id (get-in interface [:tangent-input :id]) seed-id (get-in interface [:cotangent-input :id])
+          tangent-id (get-in interface [:tangent-inputs 0 :id]) seed-id (get-in interface [:cotangent-input :id])
           tangent (first (execute b :linear (assoc saved tangent-id dx)))
           [old-y old-pb] ((:vjp prepared) (mapv env (:inputs prepared)))
           old-gradient (nth (old-pb dy) (.indexOf ^java.util.List (:inputs prepared) active))
@@ -116,7 +116,7 @@
     (is (= [] (get-in binding [:value :shape])))
     (is (= [6.0] (vec (first (execute b :primal {'x (double-array [2.0]) 'n 1 'scale 3.0})))))
     (is (= [1.5] (vec (first (execute b :linear {'n 1 'scale 3.0
-                                               (get-in b [:interface :tangent-input :id]) (double-array [0.5])}))))))
+                                               (get-in b [:interface :tangent-inputs 0 :id]) (double-array [0.5])}))))))
   (let [b (canonical/adapt-map (simple :float {:body (list 'raster.numeric/+ 'element (float 1.0))}))
         [y] (execute b :primal {'x (float-array [16777216.0]) 'n 1})]
     (is (= (Float/floatToRawIntBits (float 16777216.0)) (Float/floatToRawIntBits (aget ^floats y 0)))))
@@ -173,7 +173,7 @@
         residual-id (first (vals (get-in b [:derivation :bundle :map-programs :interface :residual-arrays])))]
     (is (= :ad-normalized-map-active-array
            (reason #(canonical/validate!
-                     (recertify-evidence (assoc-in b [:derivation :bundle :map-programs :interface :active-input] 'other))))))
+                     (recertify-evidence (assoc-in b [:derivation :bundle :map-programs :interface :active-inputs] ['other]))))))
     (is (= :ad-normalized-map-programs
            (reason #(canonical/validate!
                      (recertify-evidence

@@ -51,7 +51,7 @@
            :n (get-in inputs ['n :id])
            :primal (get-in interface [:primal-result :id])
            :seed (get-in interface [:cotangent-input :id])
-           :gradient (get-in interface [:cotangent-result :id])
+           :gradient (get-in interface [:cotangent-results 0 :id])
            :residual (:id residual)}}))
 
 (defn- check-authority! [{:keys [owner guard!]}]

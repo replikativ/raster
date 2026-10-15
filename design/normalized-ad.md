@@ -7,7 +7,7 @@ The current public boundary is deliberately smaller than general program differe
 
 | Canonical family | Host execution | Opt-in resident device execution | Preparation and call contract |
 | --- | --- | --- | --- |
-| Pure map or finite nonbranching map chain | Canonical primal/JVP/VJP with retained residuals | `normalized-device/prepare-owner` | Concrete array geometry; array cotangent; exact residual dependency leases |
+| Pure map or finite nonbranching map chain | Canonical primal/JVP/VJP with retained residuals and ordered multiple active arrays | `normalized-device/prepare-owner` (one active input) | Concrete array geometry; array cotangent; exact residual dependency leases |
 | Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result | `normalized-device/prepare-sum-owner` | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
 | Functional indexed map | Canonical gather primal and sequential ordered transpose | `normalized-device/prepare-indexed-owner` | Static index/cotangent extent; data/gradient extent static or one private `m` fixed from the prepared data array; array cotangent |
 
@@ -16,6 +16,23 @@ validation, epoch/callee guards and leases. They do not enable arbitrary equatio
 conditional/loop AD, empty native buffers, per-call geometry changes, concurrent mutation,
 host readback, or default-engine activation. Real Gemma acceptance, full GSDM statistical training
 and Adam/EMA qualification remain independent gates.
+
+`linearize-map-program` and `linearize-map-chain-program` accept an ordered, nonempty, distinct
+`:active-inputs` vector of exact public source array IDs, mutually exclusive with the existing singleton
+activity options. This order determines tangent and internal gradient ports, independently of the
+source argument order. Host JVP retains the existing primitive-array argument for one active input;
+with multiple active inputs it requires an exact vector of tangent arrays in activity order.
+VJP still returns cotangents in source argument order, with nil slots for inactive inputs. Saved
+coefficients are privately owned snapshots, so delayed pullbacks do not read subsequently mutated
+caller arrays. Chains use the existing exact append/fusion proof to derive their checked
+single-map execution stage; no separate chain derivative rule is added. Multiple-active sums,
+indexed operations and resident device execution remain explicit refusals; this is not general
+DAG or fan-out differentiation.
+
+The opt-in canonical interface uses only plural `:tangent-inputs` and `:cotangent-results`
+descriptors, related in order to `:active-inputs`; singleton owners use length-one vectors rather
+than duplicate singular aliases. This is an internal experimental AD schema migration, not a
+change to surface `deftm` semantics or activation of the normalized engine by default.
 
 Compiler-generated pure TypedSOAC programs can acquire an exact source-free invocation boundary
 without manufacturing a Clojure `let` or re-inferring parameter types. The ordered IR inputs and
@@ -761,8 +778,10 @@ validated map bundle and constructs the existing three host projections once.
 Its `:inputs` vector defines the argument order. `:vjp` takes that ordered argument
 vector and returns `[output pullback]`; the pullback takes an explicit cotangent
 array and returns positional cotangents, with nil for excluded arrays, inactive scalar captures
-and extent inputs. `:jvp` takes the argument vector and an explicit tangent array
-and returns `[output tangent]`. Array outputs never imply a scalar seed.
+and extent inputs. `:jvp` takes the argument vector and, for one active input, its explicit
+tangent array. Multiple active inputs require an exact vector of tangent arrays in declared
+active-port order and still return `[output tangent]`. VJP slots remain in source-input order.
+Array outputs never imply a scalar seed.
 
 Exact primitive storage, scalar capture types, array lengths and representable
 nonnegative extents are checked before execution. Coefficient arrays remain
@@ -970,8 +989,8 @@ concrete buffer ABI. This is compiler infrastructure only and does not make dyna
 geometry generally available; the indexed adapter consumes only the single fixed-preparation case
 above.
 
-These opt-in slices still accept exactly one active public array and immutable scalar specialization.
-It retains no caller array after preparation and does not add a cache, session owner, lease registry,
+These opt-in resident slices still accept exactly one active public array and immutable scalar
+specialization. They retain no caller array after preparation and do not add a cache, session owner, lease registry,
 device readback, dynamic scalar seed, mutable state, general scatter, arbitrary DAG execution, or
 default-engine activation. The original campaign gates, real Gemma numerical acceptance and long
 GSDM qualification remain independent.

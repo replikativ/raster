@@ -70,6 +70,8 @@
   (mapv environment (:inputs prepared)))
 
 (defn- fbits [x] (Float/floatToRawIntBits (float x)))
+(defn- fmul [left right] (float (* (float left) (float right))))
+(defn- fadd [left right] (float (+ (float left) (float right))))
 
 (defn- alter-facts [program f]
   (apply list (assoc (vec program) 1 (f (soac/facts program)))))
@@ -159,6 +161,50 @@
       (is (every? nil? (keep-indexed #(when (not= %1 x-slot) %2) slots)))
       (dotimes [i 3] (aset grad i (float 42.0)))
       (is (= (mapv fbits gradient) (mapv fbits (nth (pullback dy) x-slot)))))))
+
+(deftest two-stage-chain-reuses-fused-proof-for-reversed-multiple-activity
+  (let [source (typed-chain 'n)
+        checked (normalized/linearize-map-chain-program
+                 source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                 {:active-inputs '[q x]})
+        owner (canonical/adapt-map checked)
+        prepared (runtime/prepare-owner owner)
+        xs0 (mapv float [4097.0 -3.0 0.5 1.0e-20])
+        qs0 (mapv float [0.25 -2.0 4.0 1.0])
+        dq0 (mapv float [-0.5 0.75 2.0 0.0])
+        dx0 (mapv float [0.25 -0.5 1.5 1.0e-25])
+        dy0 (mapv float [-0.5 1.25 3.0 1.0e-25])
+        xs (float-array xs0) qs (float-array qs0)
+        dq (float-array dq0) dx (float-array dx0) dy (float-array dy0)
+        args (arguments prepared {'n (long 4) 'x xs 'q qs})
+        [output pullback] ((:vjp prepared) args)
+        [jvp-output tangent] ((:jvp prepared) args [dq dx])
+        primal (mapv (fn [x q] (fmul (fmul x x) q)) xs0 qs0)
+        jvp (mapv (fn [x q dq dx]
+                    (let [square (fmul x x)
+                          square-tangent (fadd (fmul dx x) (fmul dx x))]
+                      (fadd (fmul square-tangent q) (fmul dq square))))
+                  xs0 qs0 dq0 dx0)
+        gx (mapv (fn [x q seed]
+                   (let [consumer-pull (fmul seed q)]
+                     (fadd (fmul consumer-pull x) (fmul consumer-pull x))))
+                 xs0 qs0 dy0)
+        gq (mapv (fn [x seed] (fmul seed (fmul x x))) xs0 dy0)]
+    (is (= '[q x] (get-in owner [:interface :active-inputs])))
+    (is (= (mapv fbits primal) (mapv fbits output) (mapv fbits jvp-output)))
+    (is (= (mapv fbits jvp) (mapv fbits tangent)))
+    (is (= 2 (fbits (nth jvp 3))) "ordered square JVP retains two subnormal contributions")
+    (is (= 2 (fbits (nth gx 3))) "ordered square VJP retains two subnormal contributions")
+    (dotimes [i 4]
+      (aset xs i (float 99.0))
+      (aset qs i (float -88.0))
+      (aset output i (float 77.0)))
+    (let [slots (pullback dy)
+          x-slot (.indexOf ^java.util.List (:inputs prepared) 'x)
+          q-slot (.indexOf ^java.util.List (:inputs prepared) 'q)]
+      (is (= (mapv fbits gx) (mapv fbits (nth slots x-slot))))
+      (is (= (mapv fbits gq) (mapv fbits (nth slots q-slot))))
+      (is (every? nil? (keep-indexed #(when (not (contains? #{x-slot q-slot} %1)) %2) slots))))))
 
 (deftest four-stage-runtime-preserves-checkpoints-order-captures-and-snapshots
   (let [source (four-map-spine 'n)
