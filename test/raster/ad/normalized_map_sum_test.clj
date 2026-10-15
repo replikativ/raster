@@ -94,12 +94,12 @@
                (reason #(normalized/validate! forged))))))
     (doseq [[tangent-inputs expected]
             [[nil :ad-normalized-map-interface]
-             ;; The shared node-port projection now rejects malformed cardinality/container
-             ;; before reconstructing and comparing the complete generated phase.
-             [(apply list (:tangent-inputs map-interface)) :ad-normalized-map-node-interface]
+             ;; The outer-to-node interface link rejects a malformed container or changed
+             ;; tangent order before comparing the complete generated phase.
+             [(apply list (:tangent-inputs map-interface)) :ad-normalized-map-interface]
              [(vec (butlast (:tangent-inputs map-interface))) :ad-normalized-map-interface]
              [(vec (repeat 2 (first (:tangent-inputs map-interface)))) :ad-normalized-map-interface]
-             [(vec (reverse (:tangent-inputs map-interface))) :ad-normalized-map-programs]]]
+             [(vec (reverse (:tangent-inputs map-interface))) :ad-normalized-map-interface]]]
       (let [forged (assoc-in bundle [:map-programs :interface :tangent-inputs] tangent-inputs)
             forged (assoc forged :certificate (#'normalized/certificate forged))]
         (is (= expected
