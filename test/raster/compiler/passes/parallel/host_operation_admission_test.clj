@@ -177,6 +177,124 @@
 (defn- dbits [^doubles values]
   (mapv #(Double/doubleToRawLongBits (aget values %)) (range (alength values))))
 
+(defn- map-product-graph [dt inputs]
+  (let [product (regrouped-segmented-program dt)
+        [reduction] (soac/equations product)
+        before (map-equation 'before '[A] 'p 4 '[X] '[xe] '[(raster.numeric/* xe xe)])
+        value (fn [extent ownership]
+                (av/tensor {:dtype dt :shape [extent] :ownership ownership}))
+        facts (-> (soac/facts product)
+                  (assoc :inputs inputs :attributes {})
+                  (assoc-in [:values 'X] (value 4 nil))
+                  (assoc-in [:values 'A] (value 4 :owned))
+                  (assoc-in [:values 'B] (value 6 nil))
+                  (assoc-in [:equations 'before] (soac/default-equation-facts)))]
+    (soac/make facts [before reduction] '[C A])))
+
+;; Independent row/column arithmetic, not another invocation of the materializer.
+;; Float explicitly rounds each product and each fold addition, then the store.
+(defn- product-reference [dt a b]
+  (let [cast (if (= :float dt) float double)]
+    (vec (for [i (range 2) j (range 3)]
+           (cast (reduce (fn [acc l]
+                           (cast (+ acc (cast (* (nth a (+ (* i 2) l))
+                                                (nth b (+ (* j 2) l)))))))
+                         (cast 0.0) (range 2)))))))
+
+(deftest ordered-map-product-graphs-retain-independent-host-results-and-owned-edges
+  (let [base (map-product-graph :double '[B X])
+        [before reduction] (soac/equations base)
+        ;; Source order deliberately differs from both lexical equation-ID order
+        ;; and declared result order; neither may decide which results allocate.
+        second-reduction (apply list (assoc (vec reduction) 1 'a-product 2 '[D]))
+        facts (-> (soac/facts base)
+                  (assoc-in [:values 'D] (get-in (soac/facts base) [:values 'C]))
+                  (assoc-in [:equations 'a-product] (soac/default-equation-facts)))
+        program (soac/make facts [before reduction second-reduction] '[D C A])
+        admission (#'route/admit-host-ordered-pure-program! program)
+        {:keys [parameters body outputs]} (route/materialize-host-program program)
+        executable (eval (list 'fn parameters body))
+        x (double-array [-2.0 0.5 3.0 -4.0])
+        b (double-array [1.25 -0.5 -3.0 2.0 0.125 4.5])
+        expected-a (mapv #(* % %) (vec x))
+        expected-c (product-reference :double expected-a (vec b))
+        [d c a] (executable b x)
+        [again-d again-c again-a] (executable b x)]
+    (is (= '[dense-product a-product] (:fresh-segmented-reductions admission)))
+    (is (= '[D C A] (:output-values admission) outputs))
+    (is (= expected-c (vec d) (vec c) (vec again-d) (vec again-c)))
+    (is (= expected-a (vec a) (vec again-a)))
+    (is (not (identical? c d)))
+    (is (every? true? (map #(not (identical? %1 %2)) [d c a] [again-d again-c again-a]))))
+  (doseq [dt [:float :double] inputs ['[X B] '[B X]]]
+    (let [program (map-product-graph dt inputs)
+          {:keys [parameters body] :as projection} (route/materialize-host-program program)
+          executable (eval (list 'fn parameters body))
+          array (if (= :float dt) float-array double-array)
+          cast (if (= :float dt) float double)
+          bits (if (= :float dt) fbits dbits)
+          observations
+          (for [[xs bs] [[[4097.0 -1.25 0.33333334 -0.0009765625]
+                          [0.33333334 -0.3 1025.0 0.0009765625 -7.0 11.0]]
+                         [[-2.0 0.5 3.0 -4.0] [1.25 -0.5 -3.0 2.0 0.125 4.5]]]]
+            (let [x (array xs) b (array bs)
+                  x-before (bits x) b-before (bits b)
+                  environment {'X x 'B b}
+                  arguments (mapv environment (:inputs projection))
+                  expected-a (mapv #(cast (* (cast %) (cast %))) xs)
+                  expected-c (product-reference dt expected-a (mapv cast bs))
+                  [c a] (apply executable arguments)
+                  [again-c again-a] (apply executable arguments)]
+              (is (= inputs (:inputs projection)))
+              (is (= (bits (array expected-c)) (bits c) (bits again-c)))
+              (is (= (bits (array expected-a)) (bits a) (bits again-a)))
+              (is (= x-before (bits x)))
+              (is (= b-before (bits b)))
+              (is (not (identical? x a)))
+              (is (not (identical? c again-c)))
+              (is (not (identical? a again-a)))
+              (if (= dt :float) (aset-float a 0 (float 99.0)) (aset-double a 0 99.0))
+              (let [[fresh-c fresh-a] (apply executable arguments)]
+                (is (= (bits (array expected-c)) (bits fresh-c)))
+                (is (= (bits (array expected-a)) (bits fresh-a))))
+              {:c c :a a}))]
+      ;; Realize both changed invocations of this one compiled projection.
+      (is (= 2 (count observations)))
+      (let [[first-run second-run] (vec observations)]
+        (is (not= (bits (:c first-run)) (bits (:c second-run))))))))
+
+(deftest ordered-map-product-graphs-refuse-unsafe-edges-and-open-policies
+  (let [program (map-product-graph :float '[X B])
+        equations (vec (soac/equations program))
+        facts (soac/facts program)
+        dead (map-equation 'dead '[D] 'd 4 '[X] '[xe] '[xe])]
+    (doseq [[label expected build]
+            [[:unowned-produced-edge :typed-soac-host-pure-graph-boundary
+              #(changed program (fn [f] (assoc-in f [:values 'A :ownership] nil)))]
+             [:undersized-product-operand :typed-soac-host-fresh-segmented-reduce-boundary
+              #(let [before (map-equation 'before '[A] 'p 3 '[X] '[xe] '[(raster.numeric/* xe xe)])
+                     f (-> facts (assoc-in [:values 'A :shape] [3])
+                           (assoc-in [:values 'X :shape] [3]))]
+                 (soac/make f [before (second equations)] '[C A]))]
+             [:dead-equation :typed-soac-host-pure-graph-boundary
+              #(soac/make (-> facts
+                               (assoc-in [:values 'D] (av/tensor {:dtype :float :shape [4] :ownership :owned}))
+                               (assoc-in [:equations 'dead] (soac/default-equation-facts)))
+                          (conj equations dead) '[C A])]
+             [:unclaimed-value :typed-soac-host-pure-graph-boundary
+              #(changed program (fn [f] (assoc-in f [:values 'ghost] (av/tensor {:dtype :float :shape [4]}))))]
+             [:external-caller-output :typed-soac-output-boundary
+              #(soac/make facts equations '[C A X])]
+             [:effect :typed-soac-host-map-boundary
+              #(changed program (fn [f] (-> f (assoc :effects #{:memory/write})
+                                            (assoc-in [:equations 'before :effects] #{:memory/write}))))]
+             [:alias :typed-soac-host-map-boundary
+              #(changed program (fn [f] (-> f (assoc :aliases {'A 'X})
+                                            (assoc-in [:equations 'before :aliases] {'A 'X}))))]
+             [:global-source-policy :typed-soac-host-fresh-segmented-reduce-boundary
+              #(changed program (fn [f] (assoc f :attributes {:source-arithmetic numerics/retained-source-arithmetic})))]]]
+      (is (= expected (reason #(route/materialize-host-program (build)))) (name label)))))
+
 (defn- independent-graph [left-dtype right-dtype left-extent right-extent]
   (let [left (graph-program
               left-dtype left-extent
@@ -313,7 +431,7 @@
     (aset-float b 0 -999.0)
     (is (= before (fbits snapshot)))))
 
-(deftest segmented-reduction-snapshot-topology-is-closed
+(deftest segmented-reduction-graphs-admit-pure-maps-and-refuse-unsafe-contracts
   (let [program (segmented-snapshot-program :float)
         [reduction copy] (soac/equations program)
         refuse? (fn [candidate]
@@ -321,13 +439,20 @@
         copy-with (fn [arrays body]
                     (map-equation 'snapshot '[W-snapshot] 'snapshot-index 6 arrays
                                   '[snapshot-element] [body]))]
-    (is (refuse? (soac/make (soac/facts program)
-                            [reduction (copy-with '[B]
-                                                  '(raster.numeric/+ snapshot-element
-                                                                     (clojure.core/float 1.0)))]
-                            (soac/outputs program))))
-    (is (refuse? (soac/make (soac/facts program) [copy reduction]
-                            (soac/outputs program))))
+    ;; These are general pure functional graphs, not AD snapshot certificates.
+    ;; Both a nonidentity map and an independent earlier map now have ordinary
+    ;; source-ordered host meanings; neither grants ownership to caller storage.
+    (let [a (float-array [4097.0 -1.25 0.33333334 2.0])
+          b (float-array [0.33333334 -0.3 1025.0 0.0009765625 -7.0 11.0])
+          expected-c (float-array (product-reference :float (vec a) (vec b)))]
+      (doseq [[equations expected-map]
+              [[[reduction (copy-with '[B] '(raster.numeric/+ snapshot-element (clojure.core/float 1.0)))]
+                (mapv #(float (+ % (float 1.0))) (vec b))]
+               [[copy reduction] (vec b)]]]
+        (let [[c mapped] (run-host (soac/make (soac/facts program) equations (soac/outputs program)) [a b])]
+          (is (= (fbits expected-c) (fbits c)))
+          (is (= (fbits (float-array expected-map)) (fbits mapped)))
+          (is (not (identical? b mapped))))))
     ;; A produced contraction result is not an external operand snapshot. This malformed shape
     ;; may be rejected by the dialect even before the narrower topology boundary.
     (is (some? (reason (fn []
