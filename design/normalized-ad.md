@@ -58,9 +58,14 @@ order-preserving result regrouping. Exactly one operand is selected with `:activ
 The existing dense-product authority proves additive zero, product and layout; normalized
 scalar AD differentiates the full accumulator-plus-product step. A checked AxisMap fiber
 then determines the JVP/VJP reductions, without a separate derivative rule table. The passive
-operand is privately copied for delayed pullbacks. Generated derivative phases use existing
-TypedSOAC operations and host materialization. Batched/dynamic/empty contractions, epilogues,
-multiple active operands and resident device execution remain refused; the map-only entry
+operand is privately copied for delayed pullbacks. The product may feed a unary, single-use
+map spine through the existing checked node composers. Each activation retains its own owned
+coefficient snapshots and effective arithmetic policy; shared scalar captures remain inactive.
+The original mixed source has an empty program arithmetic scope with an explicit BLAS product
+contract. Shared composition preserves every operation's effective policy rather than rewriting
+the scope to force admission. Generated derivative phases use existing TypedSOAC operations and
+host materialization. Batched/dynamic/empty contractions, maps before the product, fan-out,
+multiple products, multiple active operands and resident device execution remain refused; the map-only entry
 and default source AD engine are unchanged. The historical internal `:map-programs` facet
 holds the checked phases; it is not a second contraction runtime. Float tests qualify host
 precision checkpoints, not bitwise agreement with arbitrary BLAS or device schedules.

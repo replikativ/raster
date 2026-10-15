@@ -692,7 +692,8 @@
 
 (declare validate! validate-map-proof! validate-indexed-proof!
          validate-sum-programs! sum-source-map
-         segmented-description project-segmented-fold segmented-node-lifecycle)
+         segmented-description project-segmented-fold segmented-node-lifecycle
+         reconstructed-segmented-activation-proof)
 
 (defn- validate-scalar-correspondence!
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
@@ -1955,10 +1956,13 @@
 (defn- reconstructed-map-proof [bundle]
   (let [source (get-in bundle [:map-programs :source])
         equations (soac/equations (soac/validate! source))
-        kind (when (= 1 (count equations)) (soac/operation-kind (first equations)))]
-    (case kind
-      segmented-reduce (reconstructed-segmented-proof bundle)
-      (reconstructed-map-proof-map bundle))))
+        kinds (mapv soac/operation-kind equations)]
+    (cond
+      (= '[segmented-reduce] kinds) (reconstructed-segmented-proof bundle)
+      (and (< 1 (count kinds)) (= 'segmented-reduce (first kinds))
+           (every? #{'map} (rest kinds)))
+      (reconstructed-segmented-activation-proof bundle)
+      :else (reconstructed-map-proof-map bundle))))
 
 (defn- validate-proof-header! [bundle expected-keys]
   (let [source-ns (:source-ns bundle)]
@@ -2051,10 +2055,18 @@
   (:active-input options))
 
 (defn- segmented-description
-  "Rederive the exact bounded bilinear fold and its physical axis maps."
-  [source options]
-  (soac/validate! source)
-  (let [[equation :as equations] (soac/equations source)
+  "Rederive the exact bounded bilinear fold and its physical axis maps.
+   The three-argument form derives an operation-local subprogram from an exact member of an
+   already validated mixed source; it never rewrites that subprogram's arithmetic policy."
+  ([source options] (segmented-description source nil options))
+  ([scope-source member-equation options]
+  (let [scope-source (soac/validate! scope-source)
+        mixed? (some? member-equation)
+        scope-facts (soac/facts scope-source)
+        source (if mixed?
+                 (soac/equation-subprogram scope-source member-equation)
+                 scope-source)
+        [equation :as equations] (soac/equations source)
         facts (soac/facts source)
         [_ equation-id results] equation
         {:keys [kind attributes arrays captures lambda]} (when equation
@@ -2103,9 +2115,14 @@
           (empty? (:effects equation-facts)) (empty? (:aliases equation-facts))
           (empty? (:attributes equation-facts))
           (empty? (soac/result-storage source equation-id))
-          (= #{:source-arithmetic} (set (keys source-attrs)))
-          (= expected-arithmetic (:source-arithmetic source-attrs)
-             (:source-arithmetic attributes))
+          (if mixed?
+            (and (= {} (:attributes scope-facts)) (= {} source-attrs)
+                 (some #(fingerprint/equivalent? member-equation %)
+                       (soac/equations scope-source))
+                 (= expected-arithmetic (:source-arithmetic attributes)))
+            (and (= #{:source-arithmetic} (set (keys source-attrs)))
+                 (= expected-arithmetic (:source-arithmetic source-attrs)
+                    (:source-arithmetic attributes))))
           (= #{:segment-axes :index :extent :attributes :accumulators :identities
                :dtypes :algebra :source-arithmetic :result-map}
              (set (keys attributes)))
@@ -2150,7 +2167,7 @@
      :operands operands :active active :passive passive :result result :dtype dt
      :layout layout :parameters params :components components :contraction contraction
      :operand-maps operand-maps :result-map result-map :reduction reduction
-     :matrix-view matrix-view}))
+     :matrix-view matrix-view})))
 
 (defn- project-segmented-fold
   [description source-ns output-id]
@@ -2506,6 +2523,134 @@
                      :equation-ids equation-ids})]
     (assoc witness :result (:result description) :active? true :ports ports :stage stage)))
 
+(defn- segmented-activation-description
+  "Check one bounded segmented product followed by a unary, single-use map spine."
+  [source options]
+  (let [{:keys [nodes consumers controls] :as graph} (graph-spine-description source)
+        facts (soac/facts source)
+        equations (mapv :equation nodes)
+        equation-ids (mapv second equations)
+        parts (mapv soac/operation-parts equations)
+        [segmented-node & map-nodes] nodes
+        operands (vec (:captures (first parts)))
+        map-parts (subvec parts 1)
+        results (mapv #(first (:results %)) nodes)
+        map-captures (vec (mapcat :captures map-parts))
+        expected-inputs (vec (distinct (concat operands map-captures)))
+        values (:values facts)
+        visible-values (set (concat expected-inputs results))]
+    (when-not
+     (and (= {} (:attributes facts))
+          (= 'segmented-reduce (:kind (first parts)))
+          (every? #(= 'map (:kind %)) map-parts)
+          (= 2 (count operands))
+          (every? true?
+                  (map-indexed
+                   (fn [index part]
+                     (= [(nth results index)] (:arrays part)))
+                   map-parts))
+          (= (set expected-inputs) (set (:inputs facts)))
+          (= visible-values (set (keys values)))
+          (every? (fn [capture]
+                    (let [value (get values capture)]
+                      (and (= [] (:shape value))
+                           (contains? #{:float :double} (:dtype value)))))
+                  map-captures)
+          (empty? (:effects facts)) (empty? (:aliases facts))
+          (empty? (get-in facts [:attributes :host-read-values]))
+          (empty? (get-in facts [:attributes :host-read-sites]))
+          (every? #(empty? (soac/result-storage source %)) equation-ids)
+          (every? #(empty? (get controls %)) (butlast results))
+          (every? #(= 1 (count (get consumers %))) (butlast results)))
+      (fail! :ad-normalized-segmented-chain-boundary
+             {:equations equations :inputs (:inputs facts) :outputs (soac/outputs source)}))
+    (let [segmented (segmented-description source (:equation segmented-node) options)]
+      (assoc graph :segmented segmented :map-nodes (vec map-nodes)))))
+
+(defn- actual-node-allocated-ids
+  "Return generated identities from reconstructed phase programs, including child equations."
+  [node]
+  (let [stage (:stage node)
+        interface (:stage-interface node)]
+    (concat
+     (mapcat (fn [phase]
+               (map second (soac/equations (get stage phase))))
+             [:primal :linear :transpose])
+     (vals (:residual-arrays interface))
+     (:tangent-inputs interface)
+     (when-let [id (:cotangent-input interface)] [id])
+     (when-let [id (:tangent-output interface)] [id])
+     (:gradient-outputs interface))))
+
+(defn- segmented-activation-nodes
+  "Allocate or replay the exact checked nodes of one segmented→map spine."
+  [source source-ns {:keys [segmented map-nodes]} submitted]
+  (let [source-nodes (into [{:id (:equation-id segmented)}] map-nodes)
+        expected-node-keys #{:source-equations :execution-equation :scalar-derivation
+                             :stage-interface :equation-ids}
+        _ (when (and submitted
+                     (not (and (vector? submitted)
+                               (= (count source-nodes) (count submitted))
+                               (every? #(and (map? %)
+                                             (= expected-node-keys (set (keys %))))
+                                       submitted))))
+            (fail! :ad-normalized-segmented-proof {:nodes submitted}))
+        first-node (segmented-node-lifecycle segmented source-ns
+                                             (when-not submitted (node-equation-ids))
+                                             (first submitted))
+        built
+        (loop [result [first-node]
+               previous (:result first-node)
+               remaining map-nodes
+               retained (next submitted)]
+          (if-let [node (first remaining)]
+            (let [built-node (map-node-lifecycle source source-ns node [previous]
+                                                 (when-not submitted (node-equation-ids))
+                                                 (first retained))]
+              (recur (conj result built-node) (:result built-node)
+                     (next remaining) (next retained)))
+            result))
+        _ (doseq [[source-node node] (map vector source-nodes built)]
+            (when-not (= [(:id source-node)] (:source-equations node))
+              (fail! :ad-normalized-segmented-proof
+                     {:expected [(:id source-node)] :node node})))
+        allocated (vec (mapcat actual-node-allocated-ids built))
+        source-ids (set (concat (keys (:values (soac/facts source)))
+                                (map second (soac/equations source))))]
+    (when-not (and (every? symbol? allocated)
+                   (= (count allocated) (count (distinct allocated)))
+                   (empty? (set/intersection source-ids (set allocated))))
+      (fail! :ad-normalized-segmented-interface {:allocated-ids allocated}))
+    built))
+
+(defn- segmented-activation-stage
+  [source source-ns options submitted]
+  (let [description (segmented-activation-description source options)
+        nodes (segmented-activation-nodes source source-ns description submitted)
+        requested [(get-in description [:segmented :active])]
+        interface (node-proof-interface nodes requested)]
+    {:source source
+     :primal (compose-primal-nodes nodes)
+     :linear (compose-linear-nodes nodes)
+     :transpose (compose-transpose-nodes nodes requested)
+     :interface interface
+     :proof {:authority :normalized-scalar
+             :nodes (mapv #(dissoc % :stage :ports :result :active?) nodes)}}))
+
+(defn- reconstructed-segmented-activation-proof
+  [{:keys [map-programs source-ns]}]
+  (let [{:keys [source interface proof]} map-programs
+        requested (:active-inputs interface)]
+    (when-not (and (map? proof) (= :normalized-scalar (:authority proof))
+                   (= #{:authority :nodes} (set (keys proof)))
+                   (vector? requested) (= 1 (count requested)))
+      (fail! :ad-normalized-segmented-proof {:proof proof :interface interface}))
+    (let [expected (segmented-activation-stage
+                    source source-ns {:active-input (first requested)} (:nodes proof))]
+      (when-not (fingerprint/equivalent? interface (:interface expected))
+        (fail! :ad-normalized-segmented-interface {:interface interface}))
+      expected)))
+
 (defn- build-segmented-programs [source source-ns options]
   (let [description (segmented-description source options)
         equation-ids {:primal 'ad-map-primal :linear 'ad-map-linear
@@ -2517,6 +2662,12 @@
      :compiler-revision (dispatch/compiler-definition-revision)
      :map-programs (assoc (:stage built)
                           :proof {:authority :normalized-scalar :nodes [node]})}))
+
+(defn- build-segmented-activation-programs [source source-ns options]
+  {:source-ns source-ns
+   :template-revision (templates/registry-revision)
+   :compiler-revision (dispatch/compiler-definition-revision)
+   :map-programs (segmented-activation-stage source source-ns options nil)})
 
 (defn- build-map-programs
   [source source-ns options]
@@ -2568,23 +2719,28 @@
 
    Maps retain `linearize-map-program` byte semantics. The only additional operation is the
    bounded pure bilinear segmented product described by its explicit result/operand AxisMaps;
-   it requires singular `:active-input`. No source-AD fallback or operation registry is involved."
+   it requires singular `:active-input`. That product may feed a unary, single-use map spine;
+   each operation retains its own checked scalar model and arithmetic contract. No source-AD
+   fallback or operation registry is involved."
   ([source source-ns] (linearize-equation-program source source-ns {}))
   ([source source-ns options]
    (let [source (soac/validate! source)
          equations (soac/equations source)
-         kind (when (= 1 (count equations)) (soac/operation-kind (first equations)))]
-     (case kind
-       segmented-reduce
+         kinds (mapv soac/operation-kind equations)]
+     (cond
+       (= '[segmented-reduce] kinds)
        (let [bundle (build-segmented-programs source source-ns options)]
          (validate! (assoc bundle :certificate (certificate bundle))))
 
-       map (linearize-map-program source source-ns options)
+       (and (< 1 (count kinds)) (= 'segmented-reduce (first kinds))
+            (every? #{'map} (rest kinds)))
+       (let [bundle (build-segmented-activation-programs source source-ns options)]
+         (validate! (assoc bundle :certificate (certificate bundle))))
 
-       (if (every? #(= 'map (soac/operation-kind %)) equations)
-         (linearize-map-program source source-ns options)
-         (fail! :ad-normalized-equation-boundary
-                {:operations (mapv soac/operation-kind equations)}))))))
+       (every? #{'map} kinds) (linearize-map-program source source-ns options)
+
+       :else
+       (fail! :ad-normalized-equation-boundary {:operations kinds})))))
 
 (defn linearize-map-chain-program
   "Compatibility entry for a multi-equation map composition.

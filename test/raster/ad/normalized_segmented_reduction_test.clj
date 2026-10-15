@@ -107,6 +107,128 @@
 (def ^:private a0 [-2.0 0.5 3.0 1.25 -4.0 2.0])
 (def ^:private w0 [0.25 -1.0 2.0 0.75 3.0 -0.5 1.5 -2.0 -1.25 4.0 0.125 2.5])
 (def ^:private dy0 [0.5 -1.5 2.0 0.25 -2.5 0.75 1.25 -0.125])
+(def ^:private float-a0 [4097.0 0.33333334 -4096.0 -0.125 3.1415927 0.0009765625])
+(def ^:private float-w0 [0.33333334 -2.5 0.125 3.1415927
+                         2.7182817 0.000244140625 -0.6666667 1.5
+                         0.33333334 -2.5 0.125 3.1415927])
+
+(defn- activated-source [dt inputs]
+  (let [product (source dt 2 3 4 inputs)
+        activation (list '= 'activation '[Y]
+                         (list 'map {:index 'p :extent 8} '[C] []
+                               (soac/lambda-form '[element] [] '[(raster.numeric/* element element)])))
+        facts (-> (soac/facts product)
+                  (assoc :attributes {})
+                  (assoc-in [:values 'Y] (av/tensor {:dtype dt :shape [8] :ownership :owned}))
+                  (assoc-in [:equations 'activation] (soac/default-equation-facts)))]
+    (soac/make facts (conj (vec (soac/equations product)) activation) '[Y])))
+
+(defn- square-push [cast values tangent]
+  ;; The existing elementwise template emits two rounded dx*x contributions,
+  ;; then their rounded sum. This is deliberately not the expression 2*x*dx.
+  (mapv (fn [x dx]
+          (let [contribution (cast (* (cast dx) (cast x)))]
+            (cast (+ contribution contribution)))) values tangent))
+
+(deftest segmented-product-square-composes-independent-host-derivatives
+  (let [base (activated-source :double '[W A])
+        [product-equation] (soac/equations base)
+        scale-map (fn [id output input]
+                    (list '= id [output]
+                          (list 'map {:index 'p :extent 8} [input] '[scale]
+                                (soac/lambda-form '[element scalar] [] '[(raster.numeric/* element scalar)]))))
+        facts (-> (soac/facts base) (assoc :inputs '[scale W A])
+                  (assoc-in [:values 'scale] (av/tensor {:dtype :double :shape []}))
+                  (assoc-in [:values 'T] (get-in (soac/facts base) [:values 'Y]))
+                  (assoc-in [:equations 'scale-one] (soac/default-equation-facts)))
+        checked (evidence (soac/make facts [product-equation (scale-map 'scale-one 'T 'C)
+                                            (scale-map 'activation 'Y 'T)] '[Y]) 'A)
+        owner (canonical/adapt checked) prepared (runtime/prepare checked)
+        args [3.0 (double-array w0) (double-array a0)]
+        [output pb] ((:vjp prepared) args)
+        dx (vec (repeat 6 0.25))
+        [_ tangent] ((:jvp prepared) args (double-array dx))
+        slots (pb (double-array dy0))
+        scalars (filter #(= :immutable-scalar (:storage (val %))) (:residual-bindings owner))]
+    (is (= '[scale W A] (:inputs prepared)))
+    (is (close? (mapv #(* 9.0 %) (product 2 3 4 a0 w0)) output 1.0e-12))
+    (is (close? (mapv #(* 9.0 %) (product 2 3 4 dx w0)) tangent 1.0e-12))
+    (is (= [nil nil] (subvec slots 0 2)))
+    (is (close? (pull 'A 2 3 4 a0 w0 (mapv #(* 9.0 %) dy0)) (nth slots 2) 1.0e-12))
+    (is (= 2 (count scalars)))
+    (is (= #{'scale-one 'activation} (set (map (comp first key) scalars))))
+    (is (every? #(= 'scale (:id (val %)) (get-in (val %) [:producer :input])) scalars)))
+  (doseq [dt [:double :float] active '[A W] inputs ['[A W] '[W A]]]
+    (let [checked (evidence (activated-source dt inputs) active)
+          owner (canonical/adapt checked)
+          prepared (runtime/prepare checked)
+          array (if (= dt :float) float-array double-array)
+          cast (if (= dt :float) float double)
+          a (mapv cast (if (= dt :float) float-a0 a0))
+          w (mapv cast (if (= dt :float) float-w0 w0)) dy (mapv cast dy0)
+          dx (mapv #(cast (* 0.125 (- % 2))) (range (if (= active 'A) 6 12)))
+          c (if (= dt :float) (float-product 2 3 4 a w) (product 2 3 4 a w))
+          dc (if (= dt :float)
+               (if (= active 'A) (float-product 2 3 4 dx w) (float-product 2 3 4 a dx))
+               (if (= active 'A) (product 2 3 4 dx w) (product 2 3 4 a dx)))
+          expected-output (mapv #(cast (* % %)) c)
+          expected-push (square-push cast c dc)
+          seed-c (square-push cast c dy)
+          expected-pull (if (= dt :float) (float-pull active 2 3 4 a w seed-c)
+                            (pull active 2 3 4 a w seed-c))
+          aa (array a) ww (array w)
+          [output pb] ((:vjp prepared) (arguments prepared aa ww))
+          [jvp-output tangent] ((:jvp prepared) (arguments prepared aa ww) (array dx))
+          slots (pb (array dy)) gradient (active-slot prepared active slots)]
+      (if (= dt :float)
+        (do (is (= (float-bits expected-output) (float-bits output) (float-bits jvp-output)))
+            (is (= (float-bits expected-push) (float-bits tangent)))
+            (is (= (float-bits expected-pull) (float-bits gradient))))
+        (do
+          (is (close? expected-output output 1.0e-10))
+          (is (= (vec output) (vec jvp-output)))
+          (is (close? expected-push tangent 1.0e-10))
+          (is (close? expected-pull gradient 1.0e-10))
+          (is (< (Math/abs (- (pairing tangent dy) (pairing dx gradient))) 1.0e-9))
+          (let [h 1.0e-5
+                objective (fn [step]
+                            (let [a1 (if (= active 'A) (mapv + a (map #(* step %) dx)) a)
+                                  w1 (if (= active 'W) (mapv + w (map #(* step %) dx)) w)]
+                              (pairing (first ((:vjp prepared)
+                                               (arguments prepared (array a1) (array w1)))) dy)))
+                difference (/ (- (objective h) (objective (- h))) (* 2.0 h))]
+            (is (< (Math/abs (- difference (pairing dx gradient))) 2.0e-6)))))
+      (is (= inputs (:inputs prepared)))
+      (is (every? true? (map (fn [id slot] (= (= active id) (some? slot))) inputs slots)))
+      (is (= [8] (get-in owner [:interface :primal-result :value :shape])))
+      (is (= [(count dx)] (get-in owner [:interface :cotangent-results 0 :value :shape])))
+      (is (= [['dense-product] ['activation]]
+             (mapv :source-equations (get-in checked [:map-programs :proof :nodes]))))
+      (is (= #{'dense-product 'activation} (set (map first (keys (:residual-bindings owner))))))
+      (doseq [[[equation _] binding] (:residual-bindings owner)]
+        (is (= equation (get-in binding [:origin :execution-equation])))
+        (is (= :owned-array (:storage binding)))
+        (is (= (if (= equation 'activation) [8] (if (= active 'A) [12] [6]))
+               (get-in binding [:value :shape]))))
+      ;; Caller mutations include the returned nonlinear activation, not private
+      ;; owned snapshots. A delayed pullback must still use its primal coefficients.
+      (dotimes [i (count a)] (if (= dt :float) (aset-float aa i (float 19.0)) (aset-double aa i 19.0)))
+      (dotimes [i (count w)] (if (= dt :float) (aset-float ww i (float -7.0)) (aset-double ww i -7.0)))
+      (dotimes [i 8] (if (= dt :float) (aset-float output i (float 99.0)) (aset-double output i 99.0)))
+      (let [again (active-slot prepared active (pb (array dy)))]
+        (is (not (identical? gradient again)))
+        (if (= dt :float) (is (= (float-bits expected-pull) (float-bits again)))
+            (is (close? expected-pull again 1.0e-10))))
+      (let [a1 (vec aa) w1 (vec ww)
+            c1 (if (= dt :float) (float-product 2 3 4 a1 w1) (product 2 3 4 a1 w1))
+            seed1 (square-push cast c1 dy)
+            expected1 (if (= dt :float) (float-pull active 2 3 4 a1 w1 seed1)
+                          (pull active 2 3 4 a1 w1 seed1))
+            [new-output new-pb] ((:vjp prepared) (arguments prepared aa ww))
+            new-gradient (active-slot prepared active (new-pb (array dy)))]
+        (is (not (identical? output new-output)))
+        (if (= dt :float) (is (= (float-bits expected1) (float-bits new-gradient)))
+            (is (close? expected1 new-gradient 1.0e-10)))))))
 
 (deftest retained-segmented-node-ports-keep-independent-operand-and-result-spaces
   (doseq [dt [:float :double] active '[A W]]
@@ -211,10 +333,8 @@
   (doseq [active '[A W]]
     (let [prepared (runtime/prepare (evidence (source :float 2 3 4 '[W A]) active))
           ;; Non-exact products and cancellation expose missing Float checkpoints.
-          a (mapv float [4097.0 0.33333334 -4096.0 -0.125 3.1415927 0.0009765625])
-          w (mapv float [0.33333334 -2.5 0.125 3.1415927
-                         2.7182817 0.000244140625 -0.6666667 1.5
-                         0.33333334 -2.5 0.125 3.1415927])
+          a (mapv float float-a0)
+          w (mapv float float-w0)
           dx (mapv #(float (* 0.125 (- % 2))) (range (if (= active 'A) 6 12)))
           dy (mapv float dy0)
           args (arguments prepared (float-array a) (float-array w))
@@ -387,6 +507,92 @@
 
 (defn- recertify [checked]
   (assoc checked :certificate (#'normalized/certificate checked)))
+
+(deftest segmented-activation-keeps-node-replay-and-topology-boundaries
+  (let [program (activated-source :double '[W A])
+        facts (soac/facts program)
+        [product activation] (soac/equations program)
+        checked (evidence program 'A)
+        owner (canonical/adapt checked)
+        nodes (get-in checked [:map-programs :proof :nodes])
+        reject-allocation (fn [& _] (throw (ex-info "mixed replay allocated an identity" {})))
+        [rebuilt validated]
+        (with-redefs-fn {#'normalized/allocate-map-stage-interface reject-allocation
+                        #'normalized/allocate-segmented-interface reject-allocation
+                        #'normalized/node-equation-ids reject-allocation
+                        #'normalized/linearize-program reject-allocation}
+          #(vector (#'normalized/reconstructed-map-proof checked) (normalized/validate! checked)))
+        unary-map (fn [id result input]
+                    (list '= id [result]
+                          (list 'map {:index 'p :extent 8} [input] []
+                                (soac/lambda-form '[element] [] '[(raster.numeric/* element element)]))))
+        materializations (atom 0)]
+    (is (identical? checked validated))
+    (doseq [phase [:primal :linear :transpose]]
+      (is (fingerprint/equivalent? (get-in checked [:map-programs phase]) (get rebuilt phase))))
+    (with-redefs [route/materialize-host-program
+                  (fn [& _] (swap! materializations inc)
+                    (throw (ex-info "unexpected materialization" {:reason :test-materialization})))]
+      (doseq [[label expected build]
+              [[:map-before-product :ad-normalized-equation-boundary
+                #(let [pre (list '= 'pre '[A]
+                                 (list 'map {:index 'q :extent 6} '[X] []
+                                       (soac/lambda-form '[element] [] '[element])))
+                       f (-> facts (assoc :inputs '[W X])
+                             (assoc-in [:values 'X] (get-in facts [:values 'A]))
+                             (assoc-in [:values 'A :ownership] :owned)
+                             (assoc-in [:equations 'pre] (soac/default-equation-facts)))]
+                   (soac/make f [pre product activation] '[Y]))]
+               [:extra-map-array :ad-normalized-segmented-chain-boundary
+                #(let [map2 (list '= 'activation '[Y]
+                                  (list 'map {:index 'p :extent 8} '[C Q] []
+                                        (soac/lambda-form '[element extra] [] '[(raster.numeric/* element extra)])))
+                       f (-> facts (update :inputs conj 'Q)
+                             (assoc-in [:values 'Q] (av/tensor {:dtype :double :shape [8]})))]
+                   (soac/make f [product map2] '[Y]))]
+               [:fanout :ad-normalized-map-chain-boundary
+                #(let [branch (unary-map 'branch 'Z 'C)
+                       join (list '= 'join '[F]
+                                  (list 'map {:index 'r :extent 8} '[Y Z] []
+                                        (soac/lambda-form '[left right] [] '[(raster.numeric/+ left right)])))
+                       f (-> facts
+                             (assoc-in [:values 'Z] (get-in facts [:values 'Y]))
+                             (assoc-in [:values 'F] (get-in facts [:values 'Y]))
+                             (assoc-in [:equations 'branch] (soac/default-equation-facts))
+                             (assoc-in [:equations 'join] (soac/default-equation-facts)))]
+                   (soac/make f [product activation branch join] '[F]))]
+               [:global-arithmetic-scope :ad-normalized-segmented-chain-boundary
+                #(soac/make (assoc facts :attributes {:source-arithmetic (numerics/blas-source-arithmetic :double)})
+                            [product activation] '[Y])]
+               [:member-arithmetic-scope :ad-normalized-segmented-boundary
+                #(let [operation (nth product 3)
+                       changed (apply list (assoc (vec operation) 1
+                                                  (assoc (second operation) :source-arithmetic numerics/retained-source-arithmetic)))
+                       product (apply list (assoc (vec product) 3 changed))]
+                   (soac/make facts [product activation] '[Y]))]]]
+        (is (= expected (reason #(evidence (build) 'A))) (name label)))
+      (doseq [[label expected changed]
+              [[:node-order :ad-normalized-segmented-proof
+                (assoc-in checked [:map-programs :proof :nodes] (vec (reverse nodes)))]
+               [:actual-child-id-collision :ad-normalized-segmented-interface
+                (assoc-in checked [:map-programs :proof :nodes 1 :equation-ids :primal]
+                          (symbol (str (name (get-in nodes [0 :equation-ids :primal])) "__passive_snapshot")))]]]
+        (is (= expected (reason #(normalized/validate! (recertify changed)))) (name label)))
+      (let [coefficient (first (keys (:residual-bindings owner)))
+            changed (assoc-in owner [:residual-bindings coefficient :origin :execution-equation] 'counterfeit)
+            changed (assoc changed :certificate (#'canonical/certificate changed))]
+        (is (= :ad-program-bundle-correspondence (reason #(canonical/validate! changed)))))
+      (let [compiles (atom 0) instantiations (atom 0)]
+        (with-redefs [equation-first/compile-typed
+                      (fn [& _] (swap! compiles inc) (throw (Exception. "unexpected compile")))
+                      link-module/instantiate!
+                      (fn [& _] (swap! instantiations inc) (throw (Exception. "unexpected instantiate")))]
+          (is (= :normalized-device-interface
+                 (reason #(device/prepare-owner owner [(double-array w0) (double-array a0)]
+                                                {:target :ocl:normalized-segmented})))))
+        (is (zero? @compiles))
+        (is (zero? @instantiations)))
+      (is (zero? @materializations)))))
 
 (defn- nonalias-accumulator-transpose [scalar]
   (let [program (:transpose scalar)

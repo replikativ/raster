@@ -10,6 +10,22 @@ cross-cutting parts of this campaign, not competing replacements for it.
 
 ### October 15 current checkpoint
 
+Normalized host AD now also admits one bounded bilinear segmented product, optionally
+followed by a unary single-use map spine, through `linearize-equation-program`. The
+product requires one selected active array, static positive dimensions, plain Float/Double
+storage and checked operand/result AxisMaps. It uses the existing scalar derivative rules,
+node composers and canonical runtime; there is no new rule registry or evaluator. Passive
+operands and activation coefficients remain owned snapshots for delayed pullbacks. Scalar
+captures may be shared across maps and retain inactive gradient slots.
+
+Shared numerical-scope composition validates local and program declarations and preserves
+every equation's effective policy; an absent/retained fallback join is not reassociation
+permission. Equal-contract fingerprints remain unchanged. The mixed host controls cover
+independent analytic JVP/VJP answers, finite differences, Float checkpoints, reversed ABI,
+caller mutation, changed inputs and proof replay/refusals. This does not enable a device
+contraction AD owner, arbitrary graph transposition, or default-engine migration. The real
+Gemma, full GSDM optimizer/statistical and performance acceptance gates remain open.
+
 The following AD consolidation sequence is interleaved with, not a replacement for,
 the eight compiler obligations below. Further family-specific AD extensions are held
 until the shared structural boundary is established.
