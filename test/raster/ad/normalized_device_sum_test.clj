@@ -101,12 +101,16 @@
 
 (deftest reordered-map-sum-source-binds-public-arrays-by-id
   (let [owner (reordered-owner)
+        selected ((device-private-fn 'sum-interface!) owner)
         xs (float-array [1.0 2.0 3.0])
         weights (float-array [4.0 5.0 6.0])
         compilations (atom [])
         calls (atom [])
         compile equation-first/compile-typed
         runtime (reify java.io.Closeable (close [_]))]
+    (is (identical? (first (get-in owner [:interface :tangent-inputs])) (:tangent selected)))
+    (is (identical? (get-in owner [:interface :cotangent-input]) (:seed selected)))
+    (is (identical? (first (get-in owner [:interface :cotangent-results])) (:gradient selected)))
     (with-redefs [hardware/descriptor-for synthetic-descriptor
                   equation-first/compile-typed
                   (fn [& args]

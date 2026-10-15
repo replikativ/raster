@@ -66,52 +66,58 @@
              {:family family :active-inputs active-inputs
               :tangent-inputs (mapv :id tangent-inputs)
               :cotangent-results (mapv :id cotangent-results)}))
-    {:active-id (first active-inputs)
-     :tangent (first tangent-inputs)
-     :gradient (first cotangent-results)}))
+    (let [inputs (:inputs interface)
+          active-id (first active-inputs)
+          active (some #(when (= active-id (:id %)) %) inputs)
+          tangent (first tangent-inputs)
+          gradient (first cotangent-results)
+          primal (:primal-result interface)
+          seed (:cotangent-input interface)]
+      ;; Select the retained canonical descriptors once. Families below restrict
+      ;; execution capabilities; they do not reconstruct derivative associations.
+      (when-not (and active
+                     (= active-id (:source tangent) (:source gradient))
+                     (= (:id primal) (:source seed)))
+        (fail! :normalized-device-interface
+               "device derivative ports must retain their canonical source associations"
+               {:family family :active active-id :tangent-source (:source tangent)
+                :gradient-source (:source gradient) :primal (:id primal)
+                :seed-source (:source seed)}))
+      (doseq [[relation left right]
+              [[:seed (:value primal) (:value seed)]
+               [:gradient (:value active) (:value gradient)]]]
+        (when-not (and (av/storage-contract-compatible? left right)
+                       (= (:shape left) (:shape right)))
+          (fail! :normalized-device-interface-contract
+                 "canonical derivative ports must preserve exact symbolic storage geometry"
+                 {:relation relation :left left :right right})))
+      {:inputs inputs :active-id active-id :active active :tangent tangent
+       :primal primal :seed seed :gradient gradient})))
 
 (defn- map-interface! [owner]
   (let [interface (:interface owner)
-        inputs (:inputs interface)
-        {:keys [active-id gradient]} (singleton-derivative-ports! interface :map)
-        active (some #(when (= active-id (:id %)) %) inputs)
-        arrays (filterv #(seq (get-in % [:value :shape])) inputs)
-        primal (:primal-result interface)
-        seed (:cotangent-input interface)]
-    (when-not (and (= 1 (count arrays)) (= active (first arrays))
-                   (= (:id primal) (:source seed))
-                   (= active-id (:source gradient)))
+        {:keys [inputs active-id active tangent primal seed gradient]}
+        (singleton-derivative-ports! interface :map)
+        arrays (filterv #(seq (get-in % [:value :shape])) inputs)]
+    (when-not (and (= 1 (count arrays)) (= active (first arrays)))
       (fail! :normalized-device-interface
              "device preparation requires one active array and exact canonical derivative ports"
              {:inputs (mapv :id inputs) :active active-id
               :primal (:id primal) :seed-source (:source seed)
               :gradient-source (:source gradient)}))
-    (doseq [[relation left right]
-            [[:seed (:value primal) (:value seed)]
-             [:gradient (:value active) (:value gradient)]]]
-      (when-not (and (av/storage-contract-compatible? left right)
-                     (= (:shape left) (:shape right)))
-        (fail! :normalized-device-interface-contract
-               "canonical derivative ports must preserve exact symbolic storage geometry"
-               {:relation relation :left left :right right})))
-    {:inputs inputs :active active
+    {:inputs inputs :active active :tangent tangent
      :primal primal :seed seed :gradient gradient}))
 
 (defn- sum-interface! [owner]
   (let [interface (:interface owner)
-        inputs (:inputs interface)
-        {:keys [active-id gradient]} (singleton-derivative-ports! interface :map-sum)
+        {:keys [inputs active-id active tangent primal seed gradient]}
+        (singleton-derivative-ports! interface :map-sum)
         active-ids (vec (:active-inputs interface))
-        active (some #(when (= active-id (:id %)) %) inputs)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)
-        scalars (filterv #(empty? (get-in % [:value :shape])) inputs)
-        primal (:primal-result interface)
-        seed (:cotangent-input interface)]
+        scalars (filterv #(empty? (get-in % [:value :shape])) inputs)]
     (when-not (and (= 1 (count active-ids)) active
                    (some #(= active-id (:id %)) arrays)
                    (= (count inputs) (+ (count arrays) (count scalars)))
-                   (= (:id primal) (:source seed))
-                   (= active-id (:source gradient))
                    (empty? (get-in primal [:value :shape]))
                    (empty? (get-in seed [:value :shape])))
       (fail! :normalized-device-interface
@@ -119,15 +125,7 @@
              {:inputs (mapv :id inputs) :arrays (mapv :id arrays)
               :active active-ids :primal (:id primal) :seed (:id seed)
               :gradient-source (:source gradient)}))
-    (doseq [[relation left right]
-            [[:seed (:value primal) (:value seed)]
-             [:gradient (:value active) (:value gradient)]]]
-      (when-not (and (av/storage-contract-compatible? left right)
-                     (= (:shape left) (:shape right)))
-        (fail! :normalized-device-interface-contract
-               "canonical derivative ports must preserve exact symbolic storage geometry"
-               {:relation relation :left left :right right})))
-    {:inputs inputs :arrays arrays :scalars scalars :active active
+    {:inputs inputs :arrays arrays :scalars scalars :active active :tangent tangent
      :primal primal :seed seed :gradient gradient}))
 
 (defn- static-positive-vector? [value]
@@ -138,12 +136,9 @@
 
 (defn- indexed-interface! [owner residual-plan]
   (let [interface (:interface owner)
-        inputs (:inputs interface)
-        {:keys [active-id gradient]} (singleton-derivative-ports! interface :indexed-map)
-        active (some #(when (= active-id (:id %)) %) inputs)
+        {:keys [inputs active-id active tangent primal seed gradient]}
+        (singleton-derivative-ports! interface :indexed-map)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)
-        primal (:primal-result interface)
-        seed (:cotangent-input interface)
         residuals (vals (:owned-arrays residual-plan))
         physicals (:physical-bindings residual-plan)
         [physical-id physical] (first physicals)
@@ -182,10 +177,6 @@
           (every? static-positive-vector? index-values)
           (or static-geometry? dynamic-geometry?)
           (= (:shape (get-in index [:value])) (:shape (get-in primal [:value])))
-          (= (:shape (get-in primal [:value])) (:shape (get-in seed [:value])))
-          (= (:shape (get-in active [:value])) (:shape (get-in gradient [:value])))
-          (av/storage-contract-compatible? (:value primal) (:value seed))
-          (av/storage-contract-compatible? (:value active) (:value gradient))
           (= :borrowed (get-in seed [:value :ownership]))
           (= :owned (get-in gradient [:value :ownership]))
           (= :owned (:ownership zero-value))
@@ -207,7 +198,7 @@
              "indexed preparation requires a static index space and one exact gradient geometry"
              {:inputs (mapv :id inputs) :active active-id :index index-id
               :residuals (mapv :id residuals) :physical-bindings (set (keys physicals))}))
-    {:inputs inputs :arrays arrays :active active :index index
+    {:inputs inputs :arrays arrays :active active :tangent tangent :index index
      :index-snapshot index-snapshot :primal primal :seed seed :gradient gradient
      :zero-id physical-id :zero-value zero-value :zero-requirement zero-requirement
      :external-dimension (when dynamic-geometry?
@@ -638,6 +629,7 @@
   [{:keys [owner check!] :as checked} arguments options]
   (let [residual-plan (canonical/execution-residual-plan owner)
         interface (indexed-interface! owner residual-plan)
+        input-values (into {} (map (juxt :id :value)) (:inputs interface))
         {:keys [target compile-options caller-options
                 primal-compilation transpose-compilation]}
         (compile-device-phases! checked options nil)
@@ -739,7 +731,7 @@
     {:module (:module bound) :frontier-values (:frontier-values bound)
      :ports {:inputs (mapv (fn [id value]
                              {:id id :value value
-                              :dtype (get-in (soac/facts (:primal owner)) [:values id :dtype])
+                              :dtype (:dtype (get input-values id))
                               :elements (first (resident-value-shape!
                                                 nodes values value))})
                            canonical-array-ids public-array-values)

@@ -108,6 +108,14 @@
             loops (distinct (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
                                     records))]
         (is (= [1 2] (mapv (comp count :instances) entries)))
+        (let [canonical-inputs (into {} (map (juxt :id :value))
+                                     (get-in owner [:interface :inputs]))]
+          (is (= '{indices [:long 3] data [:float 2]}
+                 (into {} (map (fn [{:keys [id dtype elements]}]
+                                 [id [dtype elements]])) (:inputs ports))))
+          (doseq [{:keys [id dtype elements]} (:inputs ports)]
+            (is (= (:dtype (get canonical-inputs id)) dtype))
+            (is (= (:shape (get canonical-inputs id)) [elements]))))
         (is (= 3 (count (:instances spine))))
         (is (= [:raster.ad.normalized-device/primal
                 :raster.ad.normalized-device/zero-fill
