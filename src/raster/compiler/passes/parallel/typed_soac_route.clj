@@ -704,6 +704,56 @@
     ;; value also avoids source-level collisions with casts and the map's lexical binders.
     {:physical-inputs [] :output-values outputs}))
 
+(defn- admit-host-map-graph-program!
+  "Admit an ordered pure homogeneous map graph through the existing per-map host boundary.
+   This proves only that the unchanged graph can use the existing host realization loop; it
+   performs no fusion, pruning, numerical rewriting or AD-family selection."
+  [program]
+  (let [facts (dialect/facts program)
+        equations (dialect/equations program)
+        outputs (dialect/outputs program)
+        ;; This deliberately retains the dialect's validating batch projector. Avoiding its
+        ;; second whole-program validation would require an unchecked projection API.
+        subprograms (dialect/equation-subprograms program)
+        parts (mapv dialect/operation-parts equations)
+        results (mapv #(vec (nth % 2)) equations)
+        produced (set (mapcat identity results))
+        extents (mapv #(get-in % [:attributes :extent]) parts)
+        control-values (set (filter dialect/value-id? extents))
+        operand-values (vec (mapcat #(concat (:arrays %) (:captures %)) parts))
+        external-values (set (remove produced (concat operand-values control-values)))
+        values (:values facts)
+        result-values (mapv values (mapcat identity results))
+        data-values (mapv values operand-values)
+        array-values (mapv values (concat (mapcat :arrays parts) (mapcat identity results)))
+        common-dtype (:dtype (first result-values))
+        common-shape (dialect/extent-shape (first extents))
+        live-produced
+        (reduce (fn [live [part node-results]]
+                  (if (seq (set/intersection live (set node-results)))
+                    (into live (filter produced (concat (:arrays part) (:captures part))))
+                    live))
+                (set outputs) (reverse (map vector parts results)))]
+    (doseq [subprogram subprograms]
+      (admit-host-map-program! subprogram false))
+    (when-not
+     (and (< 1 (count equations))
+          (every? #(= 'map (:kind %)) parts)
+          (empty? (:effects facts)) (empty? (:aliases facts))
+          (empty? (set/intersection produced control-values))
+          (= produced (set/intersection produced live-produced))
+          (= (set (:inputs facts)) external-values)
+          (contains? #{:float :double} common-dtype)
+          (every? #(= common-dtype (:dtype %)) result-values)
+          (every? #(= common-dtype (:dtype %)) data-values)
+          (every? #(= common-shape (:shape %)) array-values)
+          (every? #(semantic/equivalent? (first extents) %) (rest extents))
+          (every? plain-host-value? (vals values)))
+      (throw (ex-info "program cannot be materialized as an ordered homogeneous host map graph"
+                      {:reason :typed-soac-host-map-graph-boundary
+                       :operations (mapv :kind parts) :outputs outputs})))
+    {:physical-inputs [] :output-values outputs}))
+
 (defn- project-admitted-host [program {:keys [physical-inputs output-values]}]
   (host-projection program physical-inputs output-values))
 
@@ -811,9 +861,11 @@
 
 (defn materialize-host-program
   "Project the existing bounded primitive host subset by its actual TypedSOAC operations.
-   Admits only one map, one map→scalar reduction, or one sequential indexed effect map.
+   Admits one map, one pure homogeneous common-extent map graph, one map→scalar reduction,
+   or one sequential indexed effect map.
    Uses the same strict operation/physical-owner checks as the specialized public APIs;
-   arbitrary equation chains and new numerical semantics are not admitted."
+   graph projection preserves every equation/output in source order and adds no numerical
+   semantics. Other equation graphs remain outside this boundary."
   [program]
   (dialect/validate! program)
   (let [equations (dialect/equations program)
@@ -825,13 +877,16 @@
         ;; Selection grants no authority: the selected operation boundary still checks all facts.
         indexed? (or (some #(contains? #{:int :long} (:dtype (get values %))) arrays)
                      (some #(seq (:shape (get values %))) captures))
-        admitted (case kinds
-                   [map] (if indexed? (admit-host-indexed-map-program! program)
-                                      (admit-host-map-program! program false))
-                   [map reduce] (admit-host-map-program! program true)
-                   [effect-map] (admit-host-indexed-map-program! program)
-                   (throw (ex-info "unsupported primitive host program topology"
-                                   {:reason :typed-soac-host-program-topology :operations kinds})))]
+        admitted (if (and (< 1 (count kinds)) (every? #{'map} kinds))
+                   (admit-host-map-graph-program! program)
+                   (case kinds
+                     [map] (if indexed? (admit-host-indexed-map-program! program)
+                                        (admit-host-map-program! program false))
+                     [map reduce] (admit-host-map-program! program true)
+                     [effect-map] (admit-host-indexed-map-program! program)
+                     (throw (ex-info "unsupported primitive host program topology"
+                                     {:reason :typed-soac-host-program-topology
+                                      :operations kinds}))))]
     (project-admitted-host program admitted)))
 
 (defn- required-host-bindings
