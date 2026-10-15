@@ -807,6 +807,85 @@
               [{:graph {:inputs [{:id 'resident}] :outputs [] :scalars []}}]
               (java.util.IdentityHashMap.)))))))
 
+(deftest resident-binding-closes-over-program-wide-shape-scalars
+  (let [wrapped-id [:shape :wrapped]
+        scalar (av/tensor {:dtype :long :shape []})
+        direct (av/tensor {:dtype :double :shape '[m]})
+        wrapped (av/tensor {:dtype :double :shape [(list 'value wrapped-id)]})
+        compound (av/tensor {:dtype :double :shape '[(clojure.core/+ m 1)]})
+        unused (av/tensor {:dtype :long :shape []})
+        emitted
+        (parallel-program/make
+         {:dialect :opencl-parallel
+          :values {'m scalar wrapped-id scalar 'unused unused
+                   'direct direct 'wrapped wrapped 'compound compound}
+          :inputs '[direct wrapped compound]
+          :equations [] :outputs '[direct wrapped compound]})
+        validation (emitted-program/validate-with-physical-results! emitted)
+        target :ocl:resident-direct-shape
+        entries [['direct direct 3] ['wrapped wrapped 4] ['compound compound 4]]
+        nodes
+        (into {}
+              (map (fn [[id abstract elements]]
+                     [[:node id]
+                      (link-plan/node {:id [:node id] :dtype (:dtype abstract)
+                                       :shape [elements] :device target :role :input})]))
+              entries)
+        values
+        (into {}
+              (map (fn [[id abstract _]]
+                     [[:value id]
+                      (link-plan/value {:id [:value id] :abstract abstract
+                                        :leaves [{:name :value :node [:node id]}]})]))
+              entries)
+        request {:id :resident-direct-shape :target target :nodes nodes :values values
+                 :buffer-bindings (into {} (map (fn [[id _ _]] [id [:value id]])) entries)
+                 :scalar-values {'m {:type :long :value 3}
+                                 wrapped-id {:type :long :value 4}}}
+        boundaries-fn (ns-resolve 'raster.compiler.ir.invocation-link 'equation-boundaries)
+        interface-fn (ns-resolve 'raster.compiler.ir.invocation-link
+                                 'resident-runtime-interface)
+        boundaries (boundaries-fn emitted (:projections validation))
+        interface (interface-fn emitted boundaries (:projections validation))
+        instance (invocation-link/bind-resident-program emitted request)]
+    (is (= #{'direct 'wrapped 'compound} (:buffers interface)))
+    (is (= #{'m wrapped-id} (:scalars interface)))
+    (is (= (:scalar-values request) (get-in instance [:call :scalar-values])))
+    (is (not (contains? (:scalars interface) 'unused)))
+    (is (= instance
+           (link-plan/validate-program-instance-storage! target nodes values instance)))
+    (is (= :resident-binding-scalars
+           (reason #(invocation-link/bind-resident-program
+                     emitted (update request :scalar-values dissoc 'm)))))
+    (is (= :resident-binding-scalars
+           (reason #(invocation-link/bind-resident-program
+                     emitted (assoc-in request [:scalar-values 'unused]
+                                       {:type :long :value 9})))))
+    (is (some? (reason #(invocation-link/bind-resident-program
+                         emitted (assoc-in request [:scalar-values 'm]
+                                           {:type :int :value 3})))))
+    (is (= :program-link-value-contract
+           (reason #(invocation-link/bind-resident-program
+                     emitted (assoc-in request [:scalar-values 'm :value] 2)))))))
+
+(deftest resident-shape-dependency-grammar-remains-fail-closed
+  (let [target :ocl:resident-unknown-shape
+        bind! (fn [shape]
+                (let [abstract (av/tensor {:dtype :double :shape [shape]})
+                      emitted (parallel-program/make
+                               {:dialect :opencl-parallel :values {'x abstract}
+                                :inputs '[x] :equations [] :outputs '[x]})
+                      node (link-plan/node {:id :x-node :dtype :double :shape [3]
+                                            :device target :role :input})
+                      value (link-plan/value {:id :x-value :abstract abstract
+                                              :leaves [{:name :value :node :x-node}]})]
+                  (invocation-link/bind-resident-program
+                   emitted {:id [:unknown shape] :target target :nodes {:x-node node}
+                            :values {:x-value value} :buffer-bindings {'x :x-value}
+                            :scalar-values {}})))]
+    (is (some? (reason #(bind! '(unknown-dimension m)))))
+    (is (some? (reason #(bind! '(unsupported-dimension m)))))))
+
 (deftest source-free-compilation-retains-target-policy-and-rejects-interface-overrides
   (doseq [target [:ocl:source-free :ze:source-free :cuda:source-free :hip:source-free]]
     (let [compilation (with-redefs [hardware/descriptor-for synthetic-descriptor]
