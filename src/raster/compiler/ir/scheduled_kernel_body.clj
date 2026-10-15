@@ -274,11 +274,13 @@
     (numerics/validate! numerics {:reason :scheduled-kernel-body-numerics
                                   :ir :scheduled-kernel-body})
     (validate-math-realizations! kernel-body (:scalar-math numerics))
-    (let [source-arithmetic (or (:source-arithmetic source)
-                               (get-in source [:facts :source-arithmetic]))
+    (let [operation-arithmetic (:source-arithmetic source)
+          program-arithmetic (get-in source [:facts :source-arithmetic])
+          source-arithmetic (or operation-arithmetic program-arithmetic)
           numerical-source (:source-arithmetic numerics)]
       (when (and (or source-arithmetic numerical-source)
-                 (not= (or source-arithmetic numerics/retained-source-arithmetic)
+                 (not= (numerics/effective-source-arithmetic
+                        operation-arithmetic program-arithmetic)
                        numerical-source))
         (fail! :scheduled-kernel-body-source-arithmetic
                "scheduled numerical contract changed or omitted its source arithmetic"

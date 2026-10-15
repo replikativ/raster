@@ -268,7 +268,10 @@
                   (not= (:result-storage-dtype attributes) contraction-dtype))
              (assoc :out-dtype (:result-storage-dtype attributes)))
      :dtype contraction-dtype
-     :source-arithmetic (get attributes :source-arithmetic numerics/retained-source-arithmetic)
+     :source-arithmetic
+     (numerics/effective-source-arithmetic
+      (:source-arithmetic attributes)
+      (get-in facts [:attributes :source-arithmetic]))
      :metadata {:raster.type/elem-type contraction-dtype}}))
 
 (defn segmented-reduce-contract-form

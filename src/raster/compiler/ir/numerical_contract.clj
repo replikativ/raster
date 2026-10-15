@@ -93,6 +93,16 @@
                     {:reason :source-arithmetic :value value})))
   value)
 
+(defn effective-source-arithmetic
+  "Resolve descriptive source arithmetic without granting a scheduling refinement.
+
+   An operation-local declaration overrides its program fallback, but every present
+   declaration is validated even when shadowed. Absence retains typed SSA semantics."
+  [operation-local program-fallback]
+  (doseq [policy [operation-local program-fallback] :when (some? policy)]
+    (validate-source-arithmetic! policy))
+  (or operation-local program-fallback retained-source-arithmetic))
+
 (defn- declared-accumulation-preserves-source-floor?
   "A restrictive check on declared product accumulators, never an admission predicate.
    Exact ordered schedules retain their component types in SSA rather than inventing a global

@@ -2961,6 +2961,46 @@
    :provenance provenance
    :attributes attributes})
 
+(defn- composition-contract [program-facts]
+  (dissoc program-facts :values :inputs :equations :diagnostics :provenance :aliases))
+
+(defn- contract-without-source-arithmetic [contract]
+  (update contract :attributes dissoc :source-arithmetic))
+
+(defn- equation-source-arithmetic
+  [equation program-fallback]
+  (numerics/effective-source-arithmetic
+   (get-in (operation-parts equation) [:attributes :source-arithmetic])
+   program-fallback))
+
+(defn- effective-source-arithmetic-vector
+  [equations program-fallback]
+  (mapv (fn [equation]
+          [(second equation) (equation-source-arithmetic equation program-fallback)])
+        equations))
+
+(defn- compatible-source-arithmetic-join
+  "Return producer facts with a canonical absent fallback only when equation semantics survive.
+   This is descriptive source evidence; it grants no schedule or reassociation permission."
+  [producer-facts consumer-facts producer-equations consumer-equations]
+  (let [producer-contract (composition-contract producer-facts)
+        consumer-contract (composition-contract consumer-facts)
+        producer-fallback (get-in producer-facts [:attributes :source-arithmetic])
+        consumer-fallback (get-in consumer-facts [:attributes :source-arithmetic])
+        fallback-pair (set [producer-fallback consumer-fallback])]
+    (when (and (= #{nil numerics/retained-source-arithmetic} fallback-pair)
+               (semantic/equivalent?
+                (contract-without-source-arithmetic producer-contract)
+                (contract-without-source-arithmetic consumer-contract)))
+      (let [before (into (effective-source-arithmetic-vector
+                          producer-equations producer-fallback)
+                         (effective-source-arithmetic-vector
+                          consumer-equations consumer-fallback))
+            after (effective-source-arithmetic-vector
+                   (into (vec producer-equations) consumer-equations) nil)]
+        (when (semantic/equivalent? before after)
+          (update producer-facts :attributes dissoc :source-arithmetic))))))
+
 (defn append-pure-spines
   "Append a validated nonempty pure producer spine and one pure consumer equation at an
    explicit consumer→producer boundary.
@@ -2993,8 +3033,8 @@
              {:boundary boundary :producer-outputs producer-outputs :consumer-inputs consumer-inputs}))
     (let [consumer (remap-values consumer boundary)
           cf (facts consumer)
-          equations (into (vec (equations producer)) (equations consumer))
-          definitions (set (mapcat #(nth % 2) equations))
+          combined-equations (into (vec (equations producer)) (equations consumer))
+          definitions (set (mapcat #(nth % 2) combined-equations))
           merge-exact
           (fn [facet left right]
             (doseq [id (set/intersection (set (keys left)) (set (keys right)))]
@@ -3005,17 +3045,23 @@
       ;; Unknown program-level facets must not disappear from the consumer. The only
       ;; merged facets are explicit interfaces, values, equations, diagnostics and provenance;
       ;; empty aliases were independently checked above.
-      (let [contract #(dissoc % :values :inputs :equations :diagnostics :provenance :aliases)]
-        (when-not (semantic/equivalent? (contract pf) (contract cf))
-          (fail! :typed-soac-composition-numerics "program contracts must agree before composition"
-                 {:producer (contract pf) :consumer (contract cf)})))
+      (let [producer-contract (composition-contract pf)
+            consumer-contract (composition-contract cf)
+            joined-facts (if (semantic/equivalent? producer-contract consumer-contract)
+                           pf
+                           (compatible-source-arithmetic-join
+                            pf cf (equations producer) (equations consumer)))
+            pf (or joined-facts
+                   (fail! :typed-soac-composition-numerics
+                          "program contracts must agree before composition"
+                          {:producer producer-contract :consumer consumer-contract}))]
       ;; Duplicate equation IDs must not disappear into a map merge before make validates.
-      (when (seq (set/intersection (set (keys (:equations pf))) (set (keys (:equations cf)))))
-        (fail! :typed-soac-equation-ids "equation IDs must be disjoint across composed spines" {}))
-      (make (-> pf
-                (assoc :values (merge-exact :values (:values pf) (:values cf))
-                       :inputs (vec (remove definitions (distinct (concat (:inputs pf) (:inputs cf)))))
-                       :equations (merge (:equations pf) (:equations cf))
-                       :diagnostics (into (vec (:diagnostics pf)) (:diagnostics cf))
-                       :provenance (merge-exact :provenance (:provenance pf) (:provenance cf))))
-            equations program-outputs))))
+        (when (seq (set/intersection (set (keys (:equations pf))) (set (keys (:equations cf)))))
+          (fail! :typed-soac-equation-ids "equation IDs must be disjoint across composed spines" {}))
+        (make (-> pf
+                  (assoc :values (merge-exact :values (:values pf) (:values cf))
+                         :inputs (vec (remove definitions (distinct (concat (:inputs pf) (:inputs cf)))))
+                         :equations (merge (:equations pf) (:equations cf))
+                         :diagnostics (into (vec (:diagnostics pf)) (:diagnostics cf))
+                         :provenance (merge-exact :provenance (:provenance pf) (:provenance cf))))
+              combined-equations program-outputs)))))
