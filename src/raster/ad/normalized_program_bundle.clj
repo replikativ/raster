@@ -65,8 +65,9 @@
         cotangent-input (if indexed? (:cotangent-input indexed-interface) cotangent-input)
         inputs (:inputs (soac/facts source))
         source-array-inputs (when plain-map?
-                              (:arrays (soac/operation-parts
-                                        (first (soac/equations execution-source)))))
+                              (filterv #(not= [] (get-in (soac/facts source)
+                                                          [:values % :shape]))
+                                       inputs))
         _ (when-not (and (vector? active-inputs) (seq active-inputs)
                          (= (count active-inputs) (count tangent-inputs) (count gradient-outputs))
                          (= (count active-inputs) (count (distinct active-inputs)))
@@ -78,24 +79,50 @@
                    {:active-inputs active-inputs :tangent-inputs tangent-inputs
                     :gradient-outputs gradient-outputs :source-arrays source-array-inputs}))
         result (first (soac/outputs source))
-        producer (second (first (soac/equations primal)))
+        producer-of (fn [result]
+                      (let [producers (filterv (fn [equation]
+                                                 (some #{result} (nth equation 2)))
+                                               (soac/equations primal))]
+                        (when-not (= 1 (count producers))
+                          (fail! :ad-program-bundle-composition
+                                 {:result result :producers (mapv second producers)}))
+                        (second (first producers))))
+        producer (producer-of result)
         source-equation (second (first (soac/equations source)))
         source-equations (mapv second (soac/equations source))
         execution-equation (second (first (soac/equations execution-source)))
         execution-scalars (:scalar-values execution-scope)
+        execution-nodes (:nodes execution-scope)
         coefficients (concat (keys residual-arrays) (keys scalar-captures))
         _ (when (and plain-map?
-                     (not (every? (partial exact-scalar-member? execution-scalars)
-                                  coefficients)))
+                     (not
+                      (every?
+                       (fn [coefficient]
+                         (if (and (vector? coefficient) (= 2 (count coefficient)))
+                           (let [[equation scalar-value] coefficient
+                                 scopes (filterv #(= equation (:execution-equation %))
+                                                 execution-nodes)]
+                             (and (= 1 (count scopes))
+                                  (exact-scalar-member? (:scalar-values (first scopes))
+                                                        scalar-value)))
+                           (exact-scalar-member? execution-scalars coefficient)))
+                       coefficients)))
             (fail! :ad-program-bundle-composition
                    {:coefficients (vec coefficients)
                     :execution-equation execution-equation}))
         origin (fn [coefficient]
-                 (if composed?
+                 (if (and (vector? coefficient) (= 2 (count coefficient)))
+                   (let [[equation scalar-value] coefficient
+                         node (first (filter #(= equation (:execution-equation %))
+                                             execution-nodes))]
+                     {:source-equations (:source-equations node)
+                      :execution-equation equation
+                      :scalar-value scalar-value})
+                   (if composed?
                    {:source-equations source-equations
                     :execution-equation execution-equation
                     :scalar-value coefficient}
-                   {:equation source-equation :scalar-value coefficient}))
+                   {:equation source-equation :scalar-value coefficient})))
         residual-bindings
         (if indexed?
           {index-input {:id (:index-snapshot indexed-interface) :storage :owned-array
@@ -106,7 +133,7 @@
               (concat
                (map (fn [[coefficient id]]
                       [coefficient {:id id :storage :owned-array
-                                    :producer {:equation producer :result id}
+                                    :producer {:equation (producer-of id) :result id}
                                     :origin (origin coefficient)
                                     :value (get-in (soac/facts primal) [:values id])}])
                     residual-arrays)
@@ -144,16 +171,42 @@
 (defn- pure-envelope [bundle]
   ;; Namespace instances are runtime identity, not process-independent semantic fingerprint data.
   ;; Both identities are checked separately before this projection is used for validation.
-  (-> bundle
-      (dissoc :certificate)
-      (assoc :source-ns (ns-name (:source-ns bundle)))
-      (assoc-in [:derivation :bundle :source-ns]
-                (ns-name (get-in bundle [:derivation :bundle :source-ns])))))
+  (let [bundle (-> bundle
+                   (dissoc :certificate)
+                   (assoc :source-ns (ns-name (:source-ns bundle)))
+                   (assoc-in [:derivation :bundle :source-ns]
+                             (ns-name (get-in bundle [:derivation :bundle :source-ns]))))
+        nodes (get-in bundle [:derivation :bundle :map-programs :proof :nodes])]
+    (if-not (vector? nodes)
+      bundle
+      (assoc-in
+       bundle [:derivation :bundle :map-programs :proof :nodes]
+       (mapv (fn [node]
+               (let [key (if (:scalar-derivation node)
+                           :scalar-derivation :primal-derivation)
+                     derivation (get node key)
+                     derivation (assoc derivation :source-ns
+                                       (ns-name (:source-ns derivation)))
+                     derivation (if (= key :primal-derivation)
+                                  (update derivation :interface
+                                          #(assoc % :source-ns (ns-name (:source-ns %))))
+                                  derivation)]
+                 (assoc node key derivation)))
+             nodes)))))
 
 (defn- namespace! [{:keys [source-ns derivation]}]
-  (when-not (and (instance? clojure.lang.Namespace source-ns)
-                 (identical? source-ns (get-in derivation [:bundle :source-ns])))
-    (fail! :ad-program-bundle-source-namespace {})))
+  (let [nodes (get-in derivation [:bundle :map-programs :proof :nodes])]
+    (when-not (and (instance? clojure.lang.Namespace source-ns)
+                   (identical? source-ns (get-in derivation [:bundle :source-ns]))
+                   (every? (fn [node]
+                             (let [d (or (:scalar-derivation node)
+                                         (:primal-derivation node))]
+                               (and (identical? source-ns (:source-ns d))
+                                    (or (:scalar-derivation node)
+                                        (identical? source-ns
+                                                    (get-in d [:interface :source-ns]))))))
+                           (or nodes [])))
+      (fail! :ad-program-bundle-source-namespace {}))))
 
 (defn- certificate [bundle]
   (namespace! bundle)

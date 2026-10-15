@@ -66,18 +66,26 @@
   (doseq [dt [:float :double] phase [:linear :transpose]]
     (let [b (normalized/linearize-map-program (#'element/map-program dt)
                                            (the-ns 'raster.ad.normalized-derivation-test))
-        changed (update b phase scale-result)
+        scalar-path [:map-programs :proof :nodes 0 :scalar-derivation]
+        changed (update-in b (conj scalar-path phase) scale-result)
+        scalar (get-in changed scalar-path)
+        scalar (assoc scalar :certificate (#'normalized/certificate scalar))
+        changed (assoc-in changed scalar-path scalar)
+        interface (get-in changed [:map-programs :interface])
+        equation-ids (get-in changed [:map-programs :proof :nodes 0 :equation-ids])
         ;; Rebuild matching map programs as well, defeating stage reconstruction alone.
-        changed (assoc changed :map-programs
-                       (#'normalized/construct-map-stage
-                        changed (get-in b [:map-programs :source])
-                        (get-in b [:map-programs :interface])))
+        changed (update changed :map-programs
+                        merge
+                        (#'normalized/construct-map-stage
+                         scalar (get-in b [:map-programs :source]) interface equation-ids))
         changed (recertify changed)
+        legacy (assoc (dissoc scalar :certificate)
+                      :map-programs (dissoc (:map-programs changed) :proof))
         envelope (-> (canonical/adapt-map b)
                      (merge (select-keys (:map-programs changed) [:source :primal :linear :transpose]))
                      (assoc-in [:derivation :bundle] changed))
         envelope (assoc envelope :certificate (#'canonical/certificate envelope))]
-    (is (identical? changed (#'normalized/validate-map-programs! changed)))
+    (is (identical? legacy (#'normalized/validate-map-programs! legacy)))
     (is (= :ad-normalized-derivation-correspondence (reason #(normalized/validate! changed))))
     ;; Recomputed inner AND outer certificates cannot authorize a matching forged map lift.
     (is (= :ad-normalized-derivation-correspondence (reason #(canonical/validate! envelope)))))))

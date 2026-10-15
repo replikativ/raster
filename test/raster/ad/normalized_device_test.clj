@@ -35,6 +35,28 @@
    (normalized/linearize-map-program
     (map-program body) (the-ns 'raster.ad.normalized-device-test))))
 
+(defn- three-boundary-owner []
+  (let [tensor (av/tensor {:dtype :float :shape '[n]})
+        n (av/tensor {:dtype :long :shape []})
+        equation (fn [id output arrays parameters body]
+                   (list '= id [output]
+                         (list 'map {:index 'i :extent 'n} arrays []
+                               (soac/lambda-form parameters [] [body]))))
+        equations [(equation 'pair 'a '[x q] '[left right]
+                             '(raster.numeric/* left right))
+                   (equation 'finish 'y '[a r] '[left right]
+                             '(raster.numeric/* left right))]
+        source (soac/make
+                (soac/default-program-facts
+                 {:values {'n n 'x tensor 'q tensor 'r tensor 'a tensor 'y tensor}
+                  :inputs '[n x q r]
+                  :equations {'pair (soac/default-equation-facts)
+                              'finish (soac/default-equation-facts)}})
+                equations '[y])]
+    (canonical/adapt-map
+     (normalized/linearize-map-chain-program
+      source (the-ns 'raster.ad.normalized-device-test) {:active-input 'r}))))
+
 (defn- diamond-owner []
   (let [base (map-program '(raster.numeric/* element element))
         tensor (get-in (soac/facts base) [:values 'x])
@@ -291,6 +313,23 @@
                   link-module/instantiate!
                   (fn [& _] (swap! instantiations inc) (throw (Exception. "instantiate observed")))]
       (is (= :normalized-device-multi-active
+             (reason #(device/prepare-owner
+                       owner arguments {:target :ocl:normalized-device}))))
+      (is (zero? @compiles))
+      (is (zero? @instantiations)))))
+
+(deftest multi-array-nodewise-map-refuses-before-device-compilation-or-instantiation
+  (let [owner (three-boundary-owner)
+        compiles (atom 0)
+        instantiations (atom 0)
+        values {'n (long 2) 'x (float-array [1.0 2.0])
+                'q (float-array [3.0 4.0]) 'r (float-array [5.0 6.0])}
+        arguments (mapv #(get values (:id %)) (get-in owner [:interface :inputs]))]
+    (with-redefs [equation-first/compile-typed
+                  (fn [& _] (swap! compiles inc) (throw (Exception. "compile observed")))
+                  link-module/instantiate!
+                  (fn [& _] (swap! instantiations inc) (throw (Exception. "instantiate observed")))]
+      (is (= :normalized-device-interface
              (reason #(device/prepare-owner
                        owner arguments {:target :ocl:normalized-device}))))
       (is (zero? @compiles))

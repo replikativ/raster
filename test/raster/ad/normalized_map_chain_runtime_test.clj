@@ -29,6 +29,37 @@
    {:dtype :float :array-types {'x :float 'q :float}
     :scalar-types (if (symbol? extent) {extent :long} {})}))
 
+(defn- typed-three-boundary-chain [extent dt]
+  (frontend/form->program
+   (walk/postwalk-replace
+    {'chain-extent extent 'lane-dtype (if (= dt :float) 'float 'double)}
+    '(let* [paired (raster.par/pmap i chain-extent lane-dtype
+                                    (raster.numeric/* (clojure.core/aget x i)
+                                                      (clojure.core/aget q i)))
+            result (raster.par/pmap j chain-extent lane-dtype
+                                    (raster.numeric/* (clojure.core/aget paired j)
+                                                      (clojure.core/aget r j)))]
+           result))
+   {:dtype dt :array-types {'x dt 'q dt 'r dt}
+    :scalar-types (if (symbol? extent) {extent :long} {})}))
+
+(defn- typed-three-node-reuse [extent]
+  (frontend/form->program
+   (walk/postwalk-replace
+    {'chain-extent extent}
+    '(let* [paired (raster.par/pmap i chain-extent float
+                                    (raster.numeric/- (clojure.core/aget x i)
+                                                      (clojure.core/aget q i)))
+            reused (raster.par/pmap j chain-extent float
+                                    (raster.numeric/* (clojure.core/aget paired j)
+                                                      (clojure.core/aget x j)))
+            result (raster.par/pmap k chain-extent float
+                                    (raster.numeric/* (clojure.core/aget reused k)
+                                                      (clojure.core/aget r k)))]
+           result))
+   {:dtype :float :array-types {'x :float 'q :float 'r :float}
+    :scalar-types (if (symbol? extent) {extent :long} {})}))
+
 (defn- typed-diamond [extent]
   (frontend/form->program
    (walk/postwalk-replace
@@ -225,6 +256,139 @@
       (is (= (mapv fbits gx) (mapv fbits (nth slots x-slot))))
       (is (= (mapv fbits gq) (mapv fbits (nth slots q-slot))))
       (is (every? nil? (keep-indexed #(when (not (contains? #{x-slot q-slot} %1)) %2) slots))))))
+
+(deftest three-boundary-node-composition-preserves-ordered-float-checkpoints
+  (let [source (typed-three-boundary-chain 'n :float)
+        checked (normalized/linearize-map-chain-program
+                 source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                 {:active-inputs '[r q x]})
+        owner (canonical/adapt-map checked)
+        prepared (runtime/prepare-owner owner)
+        xs0 (mapv float [0.1 -3.0 1.0e-20])
+        qs0 (mapv float [0.2 4.0 1.0])
+        rs0 (mapv float [-0.3 0.5 2.0])
+        dx0 (mapv float [0.25 -0.5 1.0e-25])
+        dq0 (mapv float [-0.75 0.125 0.0])
+        dr0 (mapv float [0.5 1.25 0.0])
+        dy0 (mapv float [0.1 -0.75 1.0e-25])
+        xs (float-array xs0) qs (float-array qs0) rs (float-array rs0)
+        args (arguments prepared {'n (long 3) 'x xs 'q qs 'r rs})
+        [output pullback] ((:vjp prepared) args)
+        [jvp-output tangent] ((:jvp prepared) args
+                              [(float-array dr0) (float-array dq0) (float-array dx0)])
+        primal (mapv #(fmul (fmul %1 %2) %3) xs0 qs0 rs0)
+        tangent-oracle
+        (mapv (fn [x q r dx dq dr]
+                (let [paired (fmul x q)
+                      dpaired (fadd (fmul dx q) (fmul x dq))]
+                  (fadd (fmul dpaired r) (fmul paired dr))))
+              xs0 qs0 rs0 dx0 dq0 dr0)
+        ga (mapv fmul dy0 rs0)
+        gx (mapv fmul ga qs0)
+        gq (mapv fmul ga xs0)
+        gr (mapv #(fmul %1 (fmul %2 %3)) dy0 xs0 qs0)]
+    (is (= '[r q x] (get-in owner [:interface :active-inputs])))
+    (is (= (mapv fbits primal) (mapv fbits output) (mapv fbits jvp-output)))
+    (is (= (mapv fbits tangent-oracle) (mapv fbits tangent)))
+    (dotimes [i 3]
+      (aset xs i (float 91.0)) (aset qs i (float 92.0)) (aset rs i (float 93.0)))
+    (let [slots (pullback (float-array dy0))
+          positions (zipmap (:inputs prepared) (range))]
+      (is (= (mapv fbits gx) (mapv fbits (nth slots (positions 'x)))))
+      (is (= (mapv fbits gq) (mapv fbits (nth slots (positions 'q)))))
+      (is (= (mapv fbits gr) (mapv fbits (nth slots (positions 'r))))))))
+
+(deftest inactive-primal-node-snapshots-its-output-for-r-only-ad
+  (doseq [[dt make-array epsilon]
+          [[:float float-array 2.0e-5]
+           [:double double-array 1.0e-10]]]
+    (let [source (typed-three-boundary-chain 'n dt)
+          checked (normalized/linearize-map-chain-program
+                   source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                   {:active-input 'r})
+          nodes (get-in checked [:map-programs :proof :nodes])
+          owner (canonical/adapt-map checked)
+          prepared (runtime/prepare-owner owner)
+          xs0 [0.25 -2.0 3.0] qs0 [-0.5 4.0 0.125] rs0 [2.0 -0.75 1.5]
+          xs (make-array xs0) qs (make-array qs0) rs (make-array rs0)
+          args (arguments prepared {'n (long 3) 'x xs 'q qs 'r rs})
+          [output pullback] ((:vjp prepared) args)
+          [_ tangent] ((:jvp prepared) args (make-array [0.5 -1.0 2.0]))
+          primal (mapv #(* %1 %2 %3) xs0 qs0 rs0)
+          dr-oracle (mapv #(* %1 %2 %3) xs0 qs0 [0.5 -1.0 2.0])]
+      (is (= [false true] (mapv #(contains? % :scalar-derivation) nodes)))
+      (is (contains? (first nodes) :primal-derivation))
+      (is (= {} (:stage-interface (first nodes))))
+      (is (every? true? (map #(<= (Math/abs (- (double %1) (double %2))) epsilon)
+                              primal output)))
+      (is (every? true? (map #(<= (Math/abs (- (double %1) (double %2))) epsilon)
+                              dr-oracle tangent)))
+      (dotimes [i 3]
+        (if (= dt :float)
+          (do (aset-float xs i (float 0.0))
+              (aset-float qs i (float 0.0))
+              (aset-float rs i (float 0.0)))
+          (do (aset-double xs i (double 0.0))
+              (aset-double qs i (double 0.0))
+              (aset-double rs i (double 0.0)))))
+      (let [slots (pullback (make-array [1.0 -0.5 2.0]))
+            r-slot (.indexOf ^java.util.List (:inputs prepared) 'r)
+            expected (mapv #(* %1 %2 %3) [1.0 -0.5 2.0] xs0 qs0)]
+        (is (every? true? (map #(<= (Math/abs (- (double %1) (double %2))) epsilon)
+                                expected (nth slots r-slot))))
+        (is (every? nil? (keep-indexed #(when (not= %1 r-slot) %2) slots)))))))
+
+(deftest three-boundary-node-composition-retains-zero-cardinality-ports
+  (let [prepared (runtime/prepare
+                  (normalized/linearize-map-chain-program
+                   (typed-three-boundary-chain 0 :float)
+                   (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                   {:active-inputs '[r x]}))
+        empty-array (float-array 0)
+        args (arguments prepared {'x empty-array 'q (float-array 0) 'r (float-array 0)})
+        [output pullback] ((:vjp prepared) args)
+        [_ tangent] ((:jvp prepared) args [(float-array 0) (float-array 0)])
+        slots (pullback (float-array 0))]
+    (is (zero? (alength output)))
+    (is (zero? (alength tangent)))
+    (is (= 2 (count (filter some? slots))))
+    (is (every? zero? (map alength (filter some? slots))))))
+
+(deftest passive-external-reuse-allows-three-primal-nodes-but-active-reuse-refuses
+  (let [source (typed-three-node-reuse 'n)
+        checked (normalized/linearize-map-chain-program
+                 source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                 {:active-input 'r})
+        nodes (get-in checked [:map-programs :proof :nodes])
+        owner (canonical/adapt-map checked)
+        bindings (:residual-bindings owner)
+        primal (get-in checked [:map-programs :primal])]
+    (is (= 3 (count nodes)))
+    (is (= [false false true] (mapv #(contains? % :scalar-derivation) nodes)))
+    (is (= :ad-normalized-map-chain-boundary
+           (reason #(normalized/linearize-map-chain-program
+                     source (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                     {:active-input 'x}))))
+    (doseq [[[node-id _] binding] bindings]
+      (is (= node-id (get-in binding [:origin :execution-equation])))
+      (is (= [node-id] (get-in binding [:origin :source-equations])))
+      (is (= 1 (count (filter #(some #{(:id binding)} (nth % 2))
+                             (soac/equations primal)))))
+      (is (= (get-in binding [:producer :equation])
+             (second (first (filter #(some #{(:id binding)} (nth % 2))
+                                    (soac/equations primal)))))))))
+
+(deftest inactive-node-raw-call-remains-in-the-execution-staleness-fence
+  (let [checked (normalized/linearize-map-chain-program
+                 (typed-three-node-reuse 'n)
+                 (the-ns 'raster.ad.normalized-map-chain-runtime-test)
+                 {:active-input 'r})
+        prepared (runtime/prepare checked)
+        args (arguments prepared {'n (long 1) 'x (float-array [2.0])
+                                  'q (float-array [0.5]) 'r (float-array [3.0])})]
+    (with-redefs [raster.numeric/- (fn [& _] (float 99.0))]
+      (is (= :ad-normalized-execution-callee
+             (reason #((:jvp prepared) args (float-array [1.0]))))))))
 
 (deftest closed-diamond-runtime-obeys-fused-float-order-and-snapshots
   (let [prepared (runtime/prepare (evidence (typed-diamond 'n)))

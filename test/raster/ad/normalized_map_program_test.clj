@@ -104,6 +104,8 @@
         reordered (soac/make (soac/facts primal)
                              [(list '= (second eq) (vec (reverse (nth eq 2))) (nth eq 3))]
                              (vec (reverse (soac/outputs primal))))]
+    (is (= :ad-normalized-map-node-proof
+           (reason (assoc bundle :primal primal))))
     (is (= :ad-normalized-map-interface
            (reason (assoc-in bundle [:map-programs :interface :residual-arrays] {}))))
     (is (= :ad-normalized-map-interface
@@ -136,6 +138,8 @@
 (deftest retained-map-stage-reconstruction-preserves-interface-identities
   (let [bundle (build (source :double {}))
         {:keys [source interface] :as retained} (:map-programs bundle)
+        node (get-in bundle [:map-programs :proof :nodes 0])
+        scalar (:scalar-derivation node)
         original-gensym clojure.core/gensym
         stage-prefixes #{"ad_residual_" "ad_tangent_" "ad_cotangent_" "ad_push_" "ad_pull_"}
         fresh-stage-identities (atom [])
@@ -146,10 +150,11 @@
                                  (when (contains? stage-prefixes prefix)
                                    (swap! fresh-stage-identities conj prefix))
                                  (original-gensym prefix)))]
-                  (#'normalized/construct-map-stage bundle source interface))]
+                  (#'normalized/construct-map-stage scalar source interface
+                                                     (:equation-ids node)))]
     (is (empty? @fresh-stage-identities))
     (is (fingerprint/equivalent? interface (:interface rebuilt)))
-    (is (fingerprint/equivalent? retained rebuilt))))
+    (is (fingerprint/equivalent? (dissoc retained :proof) rebuilt))))
 
 (deftest exact-extent-value-identities-survive-lifting
   (doseq [extent ['count 'seq :extent-id [:binding 'n]]]
