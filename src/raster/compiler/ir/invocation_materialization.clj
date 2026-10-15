@@ -39,6 +39,13 @@
            "unresolved resident storage cannot be materialized from host arguments"
            {:storage (mapv :program-value storage)})))
 
+(defn- refuse-external-dimensions!
+  [plan]
+  (when-let [dimensions (seq (get-in plan [:attributes :external-dimension-values]))]
+    (fail! :invocation-materialization-external-dimensions
+           "unresolved resident dimensions cannot be materialized from host arguments"
+           {:dimensions (mapv :id dimensions)})))
+
 (defn- typed-scalar? [value]
   (and (map? value) (keyword? (:type value)) (contains? value :value)))
 
@@ -227,6 +234,7 @@
            {:actual (type materialization)}))
   (let [{:keys [plan values program-buffers program-scalars attributes]} materialization
         plan (invocation/validate! plan)
+        _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
         invocation-ids (set (concat (map :id (:parameters plan)) (map :id (:steps plan))))
         lexical (into {} (map (juxt :symbol :id))
@@ -340,6 +348,7 @@
    aliases are interpreted from structured invocation records."
   [plan arguments evaluate-scalar]
   (let [plan (invocation/validate! plan)
+        _ (refuse-external-dimensions! plan)
         _ (refuse-external-storage! plan)
         arguments (project-parameter-arguments plan arguments)]
     (let [parameter-pairs (mapv vector (:parameters plan) arguments)

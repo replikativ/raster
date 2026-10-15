@@ -56,8 +56,40 @@
        (true? (:external binding))))
 
 (def ^:private source-free-shape-projection-key :source-free-shape-projections)
+(def ^:private external-dimension-values-key :external-dimension-values)
 
 (declare fail! scalar-value?)
+
+(defn- source-free-executable-values
+  [parallel-program]
+  (let [inner
+        (into #{}
+              (mapcat
+               (fn [equation]
+                 (let [algorithm (:algorithm equation)]
+                   (when (soac/program-form? algorithm)
+                     (let [facts (soac/facts algorithm)]
+                       (concat
+                        (get-in facts [:attributes :native-initialization-providers])
+                        (get-in facts [:attributes :host-read-values])
+                        (mapcat :values (get-in facts [:attributes :host-read-sites]))
+                        (mapcat util/free-syms (:effects facts))
+                        (mapcat
+                         (fn [inner]
+                           (let [equation-id (second inner)
+                                 aliases (get-in facts [:equations equation-id :aliases])]
+                             (concat (soac/operation-inputs inner)
+                                     (nth inner 2)
+                                     (mapcat util/free-syms (soac/operation-extents inner))
+                                     (keys aliases) (vals aliases)
+                                     (mapcat util/free-syms
+                                             (get-in facts [:equations equation-id :effects]))
+                                     (map :destination (soac/result-storage facts equation-id)))))
+                         (soac/equations algorithm)))))))
+              (:equations parallel-program)))]
+    (into (into (set (:outputs parallel-program)) inner)
+          (mapcat #(concat (:operands %) (:results %)))
+          (:equations parallel-program))))
 
 (defn source-free-shape-projections
   "Derive the bounded public-buffer shape projections required by a source-free program.
@@ -69,23 +101,7 @@
   (let [inputs (vec (:inputs parallel-program))
         input-set (set inputs)
         values (:values parallel-program)
-        inner-executable-values
-        (into #{}
-              (mapcat
-               (fn [equation]
-                 (let [algorithm (:algorithm equation)]
-                   (when (soac/program-form? algorithm)
-                     (mapcat
-                      (fn [inner]
-                        (concat (soac/operation-inputs inner)
-                                (nth inner 2)
-                                (mapcat util/free-syms (soac/operation-extents inner))))
-                      (soac/equations algorithm)))))
-              (:equations parallel-program)))
-        executable-values
-        (into (into (set (:outputs parallel-program)) inner-executable-values)
-              (mapcat #(concat (:operands %) (:results %)))
-              (:equations parallel-program))
+        executable-values (source-free-executable-values parallel-program)
         candidates
         (into []
               (keep (fn [source]
@@ -116,6 +132,38 @@
                "a projected shape dimension cannot also be an executable value"
                {:dimension dimension :executable-values executable-values})))
     candidates))
+
+(defn source-free-external-dimensions
+  "Derive private direct-symbol shape dimensions that only a resident caller may supply."
+  [parallel-program shape-projections]
+  (let [values (:values parallel-program)
+        public (set (:inputs parallel-program))
+        projected (set (map :dimension shape-projections))
+        executable (source-free-executable-values parallel-program)
+        direct-dimensions
+        (->> (sort-by pr-str (keys values))
+             (mapcat #(get-in values [% :shape]))
+             (filter symbol?)
+             distinct
+             (remove public)
+             (remove projected)
+             vec)]
+    (mapv
+     (fn [id]
+       (let [value (get values id)
+             declared (:dtype value)
+             canonical (when (and (keyword? declared) (dtype/known? declared))
+                         (dtype/canon declared))]
+         (when-not (and (scalar-value? value) (contains? #{:int :long} canonical))
+           (fail! :invocation-source-free-external-dimension
+                  "external dimensions require retained integral scalar facts"
+                  {:dimension id :value value}))
+         (when (contains? executable id)
+           (fail! :invocation-source-free-external-dimension
+                  "external dimensions cannot also be executable values"
+                  {:dimension id :executable-values executable}))
+         {:id id :dtype canonical}))
+     direct-dimensions)))
 
 (defn- validate-source-free-shape-projection-marker!
   [plan]
@@ -158,6 +206,31 @@
                    "source-free shape marker differs from its parameter and ShapeProjection"
                    {:projection {:dimension dimension :source source :axis axis}
                     :parameter parameter :step step :dimension-value dimension-value}))))))
+  plan)
+
+(defn- validate-external-dimension-marker!
+  [plan]
+  (let [attributes (:attributes plan)
+        mode-present? (contains? attributes :external-dimensions)
+        values-present? (contains? attributes external-dimension-values-key)
+        dimensions (get attributes external-dimension-values-key)]
+    (when-not (= mode-present? values-present?)
+      (fail! :invocation-external-dimension-mode
+             "external dimension mode and values must coincide" {}))
+    (when mode-present?
+      (when-not (and (= :resident-premise (:external-dimensions attributes))
+                     (vector? dimensions) (seq dimensions)
+                     (= (count dimensions) (count (distinct (map :id dimensions))))
+                     (every? (fn [{:keys [id dtype] :as dimension}]
+                               (let [value (get-in plan [:values id])]
+                                 (and (= #{:id :dtype} (set (keys dimension)))
+                                      (symbol? id) (contains? #{:int :long} dtype)
+                                      (scalar-value? value)
+                                      (= dtype (dtype/canon (:dtype value))))))
+                             dimensions))
+        (fail! :invocation-external-dimension-mode
+               "external dimensions require one closed ordered retained-scalar marker"
+               {:mode (:external-dimensions attributes) :dimensions dimensions}))))
   plan)
 
 (defn invocation-step?
@@ -387,6 +460,7 @@
       (av/validate! value))
     (validate-parameter-projection! plan)
     (validate-source-free-shape-projection-marker! plan)
+    (validate-external-dimension-marker! plan)
     (let [available (binding [util/*shadowing-locals*
                              (into util/*shadowing-locals*
                                    (map :symbol (concat parameters steps)))]
@@ -666,6 +740,10 @@
         expected-projections (when source-free?
                                (source-free-shape-projections parallel-program))
         declared-projections (get-in plan [:attributes source-free-shape-projection-key])
+        expected-dimensions (when source-free?
+                              (source-free-external-dimensions
+                               parallel-program expected-projections))
+        declared-dimensions (get-in plan [:attributes external-dimension-values-key])
         external (mapv :program-value
                        (filter external-storage-binding? (:storage-bindings plan)))]
     (when-not (and (or (not source-free?)
@@ -675,6 +753,13 @@
                           (select-keys (:attributes plan)
                                        [:source-dialect :algorithm-dialect :target-dialect])))
                    (= (vec expected-projections) (vec (or declared-projections [])))
+                   (= (vec expected-dimensions) (vec (or declared-dimensions [])))
+                   (= (boolean (seq expected-dimensions))
+                      (= :resident-premise (get-in plan [:attributes :external-dimensions])))
+                   (every? (fn [{:keys [id]}]
+                             (= (get-in parallel-program [:values id])
+                                (get-in plan [:values id])))
+                           expected-dimensions)
                    (every?
                     (fn [{:keys [dimension source]}]
                       (let [parameter (some #(when (= source (:symbol %)) %) (:parameters plan))
@@ -705,5 +790,7 @@
              {:plan-inputs (:program-inputs plan) :program-inputs (:inputs parallel-program)
               :plan-outputs (:program-outputs plan) :program-outputs (:outputs parallel-program)
               :shape-projections declared-projections
-              :expected-shape-projections expected-projections}))
+              :expected-shape-projections expected-projections
+              :external-dimensions declared-dimensions
+              :expected-external-dimensions expected-dimensions}))
     plan))

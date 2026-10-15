@@ -928,6 +928,15 @@ contract. No atomic or reassociation permission is introduced. Dynamic or empty 
 geometry remains outside this slice because current external-storage and native buffer boundaries
 do not yet establish that capability.
 
+The source-free compiler can nevertheless retain one closed external-dimension premise for this
+later boundary: a private Int/Long symbol used directly in resident array shape slots, but absent
+from logical inputs, outputs, executable expressions, effects, aliases and storage identities.
+The InvocationPlan records the freshly rederived ordered symbol/dtype set without inventing a
+parameter, binding, initializer or allocation. Ordinary host materialization refuses such a plan;
+only resident binding with the exact typed scalar value can discharge it while rechecking the
+concrete buffer ABI. This is compiler infrastructure only and does not make dynamic indexed
+geometry part of the public device adapter.
+
 These opt-in slices still accept exactly one active public array and immutable scalar specialization.
 It retains no caller array after preparation and does not add a cache, session owner, lease registry,
 device readback, dynamic scalar seed, mutable state, general scatter, arbitrary DAG execution, or

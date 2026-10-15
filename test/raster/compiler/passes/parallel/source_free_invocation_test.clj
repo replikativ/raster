@@ -115,10 +115,18 @@
     (testing "the unchanged pure entry never accepts the external effect boundary"
       (is (= :structured-control-source-free-effects
              (reason #(route/promote-typed-algorithm typed)))))
-    (testing "dynamic private destination extents remain outside this first slice"
-      (is (= :structured-control-source-free-dimension
-             (reason #(route/promote-typed-effect-algorithm
-                       (ordered-effect-program 'm))))))
+    (testing "a dynamic private destination is retained as a closed premise"
+      (let [dynamic (route/promote-typed-effect-algorithm
+                     (ordered-effect-program 'm))
+            dynamic-plan (get-in dynamic [:attributes :invocation-plan])]
+        (is (= [{:id 'm :dtype :long}]
+               (get-in dynamic-plan [:attributes :external-dimension-values])))
+        (is (= :resident-premise
+               (get-in dynamic-plan [:attributes :external-dimensions])))
+        (is (= :resident-premise
+               (get-in dynamic-plan [:attributes :external-storage])))
+        (is (= :invocation-materialization-external-dimensions
+               (reason #(materialization/materialize dynamic-plan [] nil))))))
     (testing "external premise maps and their rederived destination are exact"
       (is (= :invocation-storage-binding-form
              (reason #(invocation/validate!
@@ -173,6 +181,77 @@
                (reason #(invocation/validate!
                          (assoc-in pure-plan [:attributes :external-storage]
                                    :forged)))))))))
+
+(deftest source-free-indexed-transpose-retains-one-closed-external-dimension
+  (let [source (#'indexed-fixture/indexed-map :float :long 3 'm)
+        bundle (#'indexed-fixture/build source)
+        transpose (get-in bundle [:gather-programs :transpose])
+        promoted (route/promote-typed-effect-algorithm transpose)
+        plan (get-in promoted [:attributes :invocation-plan])
+        dimensions (get-in plan [:attributes :external-dimension-values])
+        touched (atom [])
+        hostile (reify clojure.lang.Seqable
+                  (seq [_] (swap! touched conj :arguments) nil))]
+    (is (= [{:id 'm :dtype :long}] dimensions))
+    (is (= :resident-premise (get-in plan [:attributes :external-dimensions])))
+    (is (not (some #{'m} (:program-inputs plan))))
+    (is (not (some #{'m} (:program-outputs plan))))
+    (is (not (some #{'m} (mapv :symbol (:parameters plan)))))
+    (is (= '[m] (get-in (soac/facts transpose)
+                         [:values (get-in bundle [:gather-programs :interface
+                                                  :gradient-output]) :shape])))
+    (is (= :invocation-materialization-external-dimensions
+           (reason #(materialization/materialize
+                     plan hostile (fn [& _] (swap! touched conj :evaluate))))))
+    (is (empty? @touched))
+    (is (= :invocation-program-mismatch
+           (reason #(invocation/validate-against!
+                     (update plan :attributes dissoc
+                             :external-dimensions :external-dimension-values)
+                     promoted))))
+    (is (= :invocation-external-dimension-mode
+           (reason #(invocation/validate!
+                     (assoc-in plan [:attributes :external-dimension-values 0 :dtype]
+                               :int)))))
+    (is (= :invocation-external-dimension-mode
+           (reason #(invocation/validate!
+                     (update-in plan [:attributes :external-dimension-values]
+                                conj {:id 'forged :dtype :long})))))
+    (let [changed (assoc-in plan [:values 'm :attributes :forged] true)]
+      (is (= changed (invocation/validate! changed)))
+      (is (= :invocation-program-mismatch
+             (reason #(invocation/validate-against! changed promoted)))))
+    (let [scheduled (route/schedule-program promoted
+                                            {:target-device :ocl:external-dimension
+                                             :dtype :float})]
+      (doseq [target [:opencl-intel :opencl-portable :cuda :hip]]
+        (let [{:keys [program kernels]}
+              (c-family/emit-program scheduled {:target-dialect target :dtype :float})]
+          (is (some? program) (str target))
+          (is (seq kernels) (str target))))))
+  (testing "an external dimension cannot become executable or native authority"
+    (let [source (#'indexed-fixture/indexed-map :float :long 3 'm)
+          transpose (get-in (#'indexed-fixture/build source) [:gather-programs :transpose])
+          promoted (route/promote-typed-effect-algorithm transpose)]
+      (is (= :invocation-source-free-external-dimension
+             (reason #(invocation/source-free-external-dimensions
+                       (update-in promoted [:equations 0 :operands] conj 'm) []))))
+      (is (= :invocation-source-free-external-dimension
+             (reason #(route/promote-typed-effect-algorithm
+                       (change-facts
+                        transpose
+                        (fn [facts]
+                          (assoc-in facts [:attributes :native-initialization-providers]
+                                    ['m]))))))
+      (doseq [host-attributes [{:host-read-values ['m]}
+                               {:host-read-sites [{:values #{'m}}]}]]
+        (let [changed-algorithm
+              (change-facts transpose #(update % :attributes merge host-attributes))
+              changed (assoc-in promoted [:equations 0 :algorithm] changed-algorithm)]
+          (is (identical? changed-algorithm (soac/validate! changed-algorithm)))
+          (is (= changed (route/validate-typed-program! changed)))
+          (is (= :invocation-source-free-external-dimension
+                 (reason #(invocation/source-free-external-dimensions changed []))))))))))
 
 (deftest source-free-ordered-effect-refuses-native-initialization-and-retains-zero-extent
   (let [base (ordered-effect-program)
@@ -428,17 +507,23 @@
                          [:program-buffers 'self-sized :shape]))))))
 
 (deftest source-free-promotion-refuses-unsupported-physical-boundaries
-  (testing "rank, missing/private and compound dimensions remain outside the flat boundary"
+  (testing "rank, missing facts and compound dimensions remain outside the flat boundary"
     (is (some? (reason #(route/promote-typed-algorithm (pure-map {:shape '[2 n]})))))
-    (doseq [shape '[[private-size] [(value private-size)] [(extent private-buffer)]
-                    [(clojure.core/+ n 1)]]]
+    (let [missing (change-facts
+                   (pure-map)
+                   #(assoc-in % [:values 'unsupported]
+                              (av/tensor {:dtype :double :shape '[private-size]})))]
+      (is (= :invocation-source-free-external-dimension
+             (reason #(route/promote-typed-algorithm missing)))))
+    (doseq [shape '[[(value private-size)] [(extent private-buffer)]
+                     [(clojure.core/+ n 1)]]]
       (let [typed (change-facts
                    (pure-map)
                    #(assoc-in % [:values 'unsupported]
                               (av/tensor {:dtype :double :shape shape})))]
         (is (= :structured-control-source-free-dimension
                (reason #(route/promote-typed-algorithm typed)))))))
-  (testing "present private and wrongly typed public dimensions remain unavailable"
+  (testing "a present private integral dimension becomes an explicit resident premise"
     (let [base (pure-map)
           private-scalar (av/tensor {:dtype :long :shape []})
           private-shaped (change-facts
@@ -446,13 +531,20 @@
                           #(-> %
                                (assoc-in [:values 'private-size] private-scalar)
                                (assoc-in [:values 'private-buffer]
-                                         (av/tensor {:dtype :double :shape '[private-size]}))))]
-      (is (= :structured-control-source-free-dimension
-             (reason #(route/promote-typed-algorithm private-shaped))))
-      (is (= :structured-control-source-free-dimension
-             (reason #(#'route/source-free-dimension!
-                        {'scale (av/tensor {:dtype :double :shape []})}
-                        #{} false 'buffer 'scale))))))
+                                         (av/tensor {:dtype :double :shape '[private-size]}))))
+          promoted (route/promote-typed-algorithm private-shaped)
+          plan (get-in promoted [:attributes :invocation-plan])]
+      (is (= [{:id 'private-size :dtype :long}]
+             (get-in plan [:attributes :external-dimension-values])))
+      (is (= :resident-premise (get-in plan [:attributes :external-dimensions])))
+      (is (not (some #{'private-size} (:program-inputs plan))))
+      (is (= :invocation-materialization-external-dimensions
+             (reason #(materialization/materialize plan [] nil))))
+      (testing "a wrongly typed public dimension remains unavailable"
+        (is (= :structured-control-source-free-dimension
+               (reason #(#'route/source-free-dimension!
+                          {'scale (av/tensor {:dtype :double :shape []})}
+                          #{} false 'buffer 'scale)))))))
   (testing "an input may inspect only its own extent; produced values may use a public buffer"
     (let [base (pure-map)
           other (av/tensor {:dtype :double :shape '[(extent x)]})

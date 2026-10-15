@@ -987,15 +987,17 @@
              {:value owner :dimension dimension})))))
 
 (defn- validate-source-free-value-boundary!
-  ([typed-program] (validate-source-free-value-boundary! typed-program []))
-  ([typed-program shape-projections]
+  ([typed-program] (validate-source-free-value-boundary! typed-program [] []))
+  ([typed-program shape-projections external-dimensions]
   (let [typed-program (soac/validate! typed-program)
         facts (soac/facts typed-program)
         inputs (:inputs facts)
         public-inputs (set inputs)
         values (:values facts)
         public-values (select-keys values inputs)
-        projected-values (select-keys values (map :dimension shape-projections))
+        projected-values (select-keys values
+                                      (concat (map :dimension shape-projections)
+                                              (map :id external-dimensions)))
         public-buffers
         (into #{}
               (keep (fn [id]
@@ -1027,9 +1029,10 @@
     typed-program)))
 
 (defn- validate-source-free-typed-boundary!
-  ([typed-program] (validate-source-free-typed-boundary! typed-program []))
-  ([typed-program shape-projections]
-  (let [typed-program (validate-source-free-value-boundary! typed-program shape-projections)
+  ([typed-program] (validate-source-free-typed-boundary! typed-program [] []))
+  ([typed-program shape-projections external-dimensions]
+  (let [typed-program (validate-source-free-value-boundary!
+                       typed-program shape-projections external-dimensions)
         facts (soac/facts typed-program)]
     (when-not (and (empty? (:effects facts)) (empty? (:aliases facts))
                    (empty? (get-in facts [:attributes :native-initialization-providers])))
@@ -1052,7 +1055,7 @@
     typed-program)))
 
 (defn- source-free-invocation-plan
-  [kind typed-program shape-projections external-storage extra-attributes]
+  [kind typed-program shape-projections external-dimensions external-storage extra-attributes]
   (let [facts (soac/facts typed-program)
         inputs (:inputs facts)
         values (:values facts)
@@ -1069,7 +1072,10 @@
                         :target-dialect :typed-invocation}
                        extra-attributes)
           (seq shape-projections)
-          (assoc :source-free-shape-projections (vec shape-projections)))]
+          (assoc :source-free-shape-projections (vec shape-projections))
+          (seq external-dimensions)
+          (assoc :external-dimensions :resident-premise
+                 :external-dimension-values (vec external-dimensions)))]
     (invocation/from-prefix
      {:id [kind (semantic/fingerprint typed-program)]
       :parameters inputs :parameter-values parameter-values
@@ -1097,10 +1103,13 @@
                                      :front-end :explicit-typed-algorithm
                                      :pass :source-free-typed-invocation))
         shape-projections (invocation/source-free-shape-projections parallel-program)
-        typed-program (validate-source-free-typed-boundary! typed-program shape-projections)
+        external-dimensions (invocation/source-free-external-dimensions
+                             parallel-program shape-projections)
+        typed-program (validate-source-free-typed-boundary!
+                       typed-program shape-projections external-dimensions)
         plan (source-free-invocation-plan
               :source-free-typed-invocation typed-program
-              shape-projections [] {})
+              shape-projections external-dimensions [] {})
         promoted (update parallel-program :attributes assoc
                          :invocation-plan (invocation/validate-against! plan parallel-program))]
     (validate-typed-program! promoted)))
@@ -1122,7 +1131,10 @@
                                      :front-end :explicit-typed-effect-algorithm
                                      :pass :source-free-typed-effect-invocation))
         shape-projections (invocation/source-free-shape-projections parallel-program)
-        typed-program (validate-source-free-value-boundary! typed-program shape-projections)
+        external-dimensions (invocation/source-free-external-dimensions
+                             parallel-program shape-projections)
+        typed-program (validate-source-free-value-boundary!
+                       typed-program shape-projections external-dimensions)
         facts (soac/facts typed-program)
         _ (when (seq (get-in facts [:attributes :native-initialization-providers]))
             (fail! :structured-control-source-free-effects
@@ -1132,7 +1144,8 @@
         {:keys [destination]} (typed-route/source-free-ordered-effect-storage! typed-program)
         plan (source-free-invocation-plan
               :source-free-typed-effect-invocation typed-program
-              shape-projections [destination] {:external-storage :resident-premise})
+              shape-projections external-dimensions [destination]
+              {:external-storage :resident-premise})
         promoted (update parallel-program :attributes assoc
                          :invocation-plan (invocation/validate-against! plan parallel-program))]
     (validate-typed-program! promoted)))
