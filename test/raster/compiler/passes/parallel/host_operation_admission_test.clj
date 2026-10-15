@@ -138,11 +138,33 @@
                  :equations {'dense-product equation-facts}})]
      (soac/make facts [equation] '[C]))))
 
+(defn- segmented-snapshot-program
+  ([dt] (segmented-snapshot-program dt 'B '[A B]))
+  ([dt copied inputs]
+   (let [source (segmented-program dt)
+         [reduction] (soac/equations source)
+         extent (get {'A 4 'B 6} copied)
+         copy (map-equation 'snapshot '[W-snapshot] 'snapshot-index extent [copied]
+                            '[snapshot-element] '[snapshot-element])
+         value (fn [shape ownership]
+                 (av/tensor {:dtype dt :shape shape :ownership ownership}))
+         facts (-> (soac/facts source)
+                   (assoc :inputs inputs :attributes {}
+                          :equations {'dense-product (soac/default-equation-facts)
+                                      'snapshot (soac/default-equation-facts)})
+                   (assoc-in [:values 'A] (value [4] nil))
+                   (assoc-in [:values 'B] (value [6] nil))
+                   (assoc-in [:values 'W-snapshot] (value [extent] :owned)))]
+     (soac/make facts [reduction copy] '[C W-snapshot]))))
+
 (defn- run-projection [projection arguments]
   (apply (eval (list 'fn (:parameters projection) (:body projection))) arguments))
 
 (defn- fbits [^floats values]
   (mapv #(Float/floatToRawIntBits (aget values %)) (range (alength values))))
+
+(defn- dbits [^doubles values]
+  (mapv #(Double/doubleToRawLongBits (aget values %)) (range (alength values))))
 
 (defn- independent-graph [left-dtype right-dtype left-extent right-extent]
   (let [left (graph-program
@@ -248,6 +270,88 @@
                            [(double-array [1.0 2.0 3.0 4.0])
                             (double-array [5.0 6.0 7.0 8.0 9.0 10.0])])]
     (is (= [17.0 23.0 29.0 39.0 53.0 67.0] (vec result)))))
+
+(deftest segmented-reduction-primal-owns-its-exact-operand-snapshot
+  (doseq [dt [:float :double]]
+    (let [standalone (segmented-program dt)
+          mixed (segmented-snapshot-program dt)
+          swapped (segmented-snapshot-program dt 'B '[B A])
+          a ((if (= :float dt) float-array double-array) [4097.0 -1.25 0.03125 8193.0])
+          b ((if (= :float dt) float-array double-array)
+             [0.1 -0.3 1025.0 0.0009765625 -7.0 11.0])
+          bits (if (= :float dt) fbits dbits)
+          [expected] (run-host standalone [a b])
+          [actual snapshot] (run-host mixed [a b])
+          [swapped-actual swapped-snapshot] (run-host swapped [b a])
+          [again again-snapshot] (run-host mixed [a b])]
+      (is (= (bits expected) (bits actual) (bits swapped-actual) (bits again)))
+      (is (= (bits b) (bits snapshot) (bits swapped-snapshot) (bits again-snapshot)))
+      (is (not (identical? b snapshot)))
+      (is (not (identical? snapshot again-snapshot)))
+      (is (not (identical? actual again)))))
+  (let [a (float-array [1.0 2.0 3.0 4.0])
+        b (float-array [5.0 6.0 7.0 8.0 9.0 10.0])
+        [_ a-snapshot] (run-host (segmented-snapshot-program :float 'A '[A B]) [a b])]
+    ;; Contract output has six elements; this snapshot has the copied operand's four.
+    (is (= 4 (alength ^floats a-snapshot)))
+    (is (= (fbits a) (fbits a-snapshot))))
+  (let [a (float-array [1.0 2.0 3.0 4.0])
+        b (float-array [5.0 6.0 7.0 8.0 9.0 10.0])
+        [_ snapshot] (run-host (segmented-snapshot-program :float) [a b])
+        before (fbits snapshot)]
+    (aset-float b 0 -999.0)
+    (is (= before (fbits snapshot)))))
+
+(deftest segmented-reduction-snapshot-topology-is-closed
+  (let [program (segmented-snapshot-program :float)
+        [reduction copy] (soac/equations program)
+        refuse? (fn [candidate]
+                  (some? (reason #(route/materialize-host-program candidate))))
+        copy-with (fn [arrays body]
+                    (map-equation 'snapshot '[W-snapshot] 'snapshot-index 6 arrays
+                                  '[snapshot-element] [body]))]
+    (is (refuse? (soac/make (soac/facts program)
+                            [reduction (copy-with '[B]
+                                                  '(raster.numeric/+ snapshot-element
+                                                                     (clojure.core/float 1.0)))]
+                            (soac/outputs program))))
+    (is (refuse? (soac/make (soac/facts program) [copy reduction]
+                            (soac/outputs program))))
+    ;; A produced contraction result is not an external operand snapshot. This malformed shape
+    ;; may be rejected by the dialect even before the narrower topology boundary.
+    (is (some? (reason (fn []
+                         (soac/make (soac/facts program)
+                                    [reduction (copy-with '[C] 'snapshot-element)]
+                                    (soac/outputs program))))))
+    (is (= :typed-soac-input-boundary
+           (reason (fn []
+                     (route/materialize-host-program
+                      (changed program
+                               #(-> %
+                                    (assoc :inputs '[A B unused])
+                                    (assoc-in [:values 'unused]
+                                              (av/tensor {:dtype :float :shape [1]})))))))))
+    (doseq [policy [(numerics/blas-source-arithmetic :float)
+                    numerics/retained-source-arithmetic]]
+      (is (refuse? (changed program #(assoc % :attributes {:source-arithmetic policy})))))
+    (is (some? (reason (fn []
+                         (changed program #(assoc % :effects #{:memory/write}))))))
+    (is (= :typed-soac-host-fresh-segmented-reduce-boundary
+           (reason (fn []
+                     (route/materialize-host-program
+                      (changed program #(assoc % :aliases {'W-snapshot 'B})))))))
+    (let [destination (av/tensor {:dtype :float :shape [6] :ownership :owned})
+          storage [{:destination 'snapshot-storage :access :write :host-return :buffer}]
+          facts (-> (soac/facts program)
+                    (assoc :effects #{:memory/write}
+                           :aliases {'W-snapshot 'snapshot-storage})
+                    (assoc-in [:values 'snapshot-storage] destination)
+                    (assoc-in [:equations 'snapshot :effects] #{:memory/write})
+                    (assoc-in [:equations 'snapshot :aliases]
+                              {'W-snapshot 'snapshot-storage})
+                    (assoc-in [:equations 'snapshot :attributes :result-storage] storage))
+          stored (soac/make facts (soac/equations program) (soac/outputs program))]
+      (is (refuse? stored)))))
 
 (deftest fresh-segmented-reduction-boundary-is-closed
   (let [program (segmented-program :float)
