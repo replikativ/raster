@@ -94,6 +94,30 @@
        :equations {'copy (soac/default-equation-facts)}})
      [equation] '[copied])))
 
+(defn- private-sized-owned-template-map []
+  (let [indices (av/tensor {:dtype :long :shape [4] :ownership :owned})
+        source (av/tensor {:dtype :float :shape '[m] :ownership :owned})
+        copied (av/tensor {:dtype :float :shape [4] :ownership :owned})
+        m (av/tensor {:dtype :long :shape []})
+        equation
+        (list '= 'copy '[copied]
+              (list 'map {:index 'i :extent 4
+                          :attributes {:stable-array-captures '[source]}}
+                    '[indices] '[source]
+                    (soac/lambda-form
+                     '[index source-array]
+                     [(soac/local-value
+                       'same :float
+                       (with-meta '(clojure.core/aget source-array index)
+                         {:raster.type/tag 'float}))]
+                     '[same])))]
+    (soac/make
+     (soac/default-program-facts
+      {:values {'indices indices 'source source 'm m 'copied copied}
+       :inputs '[indices source]
+       :equations {'copy (soac/default-equation-facts)}})
+     [equation] '[copied])))
+
 (defn- static-resident-request
   [emitted target buffer-ids roles replacements]
   (let [entries
@@ -234,6 +258,85 @@
                          (assoc-in effect-request [:buffer-bindings destination]
                                    (get-in effect-request
                                            [:buffer-bindings (first (:program-inputs effect-plan))]))))))))
+
+(deftest external-dimension-is-discharged-only-by-an-exact-resident-scalar
+  (let [target :ocl:external-dimension-binding
+        compile! #(with-redefs [hardware/descriptor-for (fn [id] {:device-id id})]
+                    (equation-first/compile-typed
+                     % {:target target :schedule {:precision :f32-scalar}}))
+        bundle (#'indexed-fixture/build (#'indexed-fixture/indexed-map :float :long 3 'm))
+        transpose (get-in bundle [:gather-programs :transpose])
+        interface (get-in bundle [:gather-programs :interface])
+        compilation (compile! transpose)
+        emitted (:emitted compilation)
+        plan (get-in compilation [:semantic :attributes :invocation-plan])
+        cotangent (:cotangent-input interface)
+        destination (:zero-gradient interface)
+        result (:gradient-output interface)
+        index-snapshot (:index-snapshot interface)
+        template3 (compile! (static-owned-template-map))
+        template3-plan (get-in template3 [:semantic :attributes :invocation-plan])
+        layout3 (invocation-link/project-resident-layout
+                 (materialization/materialize template3-plan [(float-array 3)] nil)
+                 (:emitted template3) target)
+        template-m (compile! (private-sized-owned-template-map))
+        template-m-plan (get-in template-m [:semantic :attributes :invocation-plan])
+        template-m-arguments
+        (mapv (fn [{:keys [symbol]}]
+                (case symbol
+                  indices (long-array [0 1 2 3])
+                  source (float-array 4)))
+              (:parameters template-m-plan))
+        layout-m (invocation-link/project-resident-layout
+                  (materialization/materialize template-m-plan template-m-arguments nil)
+                  (:emitted template-m) target)
+        clone (fn [layout template abstract compiler-id value-id node-id allocation-id role project?]
+                (invocation-link/clone-resident-value-layout
+                 layout
+                 {:template-value (get-in layout [:buffer-bindings 'source])
+                  :template-compiler-value 'source
+                  :template-abstract template
+                  :compiler-value compiler-id
+                  :abstract abstract
+                  :value-id value-id :node-id node-id :allocation-id allocation-id
+                  :role role :project-ownership? project?}))
+        cotangent-clone
+        (clone layout3 (get-in template3 [:emitted :values 'source])
+               (get-in emitted [:values cotangent]) cotangent
+               :cotangent-value :cotangent-node :cotangent-allocation :input true)
+        gradient-clone
+        (clone layout-m (get-in template-m [:emitted :values 'source])
+               (get-in emitted [:values destination]) destination
+               :gradient-value :gradient-node :gradient-allocation :output false)
+        replacements
+        {cotangent {:value-id :cotangent-value :node-id :cotangent-node
+                    :node (:node cotangent-clone) :value (:value cotangent-clone)}
+         destination {:value-id :gradient-value :node-id :gradient-node
+                      :node (:node gradient-clone) :value (:value gradient-clone)}}
+        buffer-ids (vec (distinct (concat (:program-inputs plan) [destination])))
+        roles (assoc (zipmap (:program-inputs plan) (repeat :input)) destination :output)
+        request (-> (static-resident-request emitted target buffer-ids roles replacements)
+                    (assoc-in [:buffer-bindings result] :gradient-value)
+                    (assoc :scalar-values {'m {:type :long :value 4}}))
+        instance (invocation-link/bind-resident-program emitted request)]
+    (is (= [{:id 'm :dtype :long}]
+           (get-in plan [:attributes :external-dimension-values])))
+    (is (= :owned (get-in request [:values :gradient-value :abstract :ownership])))
+    (is (= :borrowed (get-in emitted [:values cotangent :ownership])))
+    (is (= :owned (get-in request [:values :cotangent-value :abstract :ownership])))
+    (is (= :gradient-value (get-in instance [:call :buffers destination])))
+    (is (= :gradient-value (get-in instance [:call :buffers result])))
+    (is (= {:type :long :value 4} (get-in instance [:call :scalar-values 'm])))
+    (is (contains? (set (:program-inputs plan)) index-snapshot))
+    (is (= :resident-binding-scalars
+           (reason #(invocation-link/bind-resident-program
+                     emitted (assoc request :scalar-values {})))))
+    (is (some? (reason #(invocation-link/bind-resident-program
+                         emitted (assoc request :scalar-values
+                                        {'m {:type :int :value 4}})))))
+    (is (some? (reason #(invocation-link/bind-resident-program
+                         emitted (assoc request :scalar-values
+                                        {'m {:type :long :value 3}})))))))
 
 (defn- synthetic-descriptor [target]
   {:device-id target})
