@@ -566,20 +566,23 @@
 
   (jvp #'f) → (fn [p1 … pN Δp_a … Δp_k] -> [primal tangent])
 
-  where Δp_a … Δp_k are tangent arguments for the DIFFERENTIABLE params only
+  where Δp_a … Δp_k are tangent arguments for the selected DIFFERENTIABLE params only
   (⊥ slots — Long/index/etc. — have no tangent slot), in param order. Pass
   typed zero arrays/0.0 for unseeded directions (the JAX jvp contract). The
-  tangent output is J·v — exact, one forward sweep, no tape.
+  tangent output is J·v — exact, one forward sweep, no tape. `wrt` is nil for
+  all parameters or a sequence of original parameter indices; at least one
+  selected parameter must have a known tangent space.
 
   The transformed body/params are exposed deftm-style as metadata
   (:raster.core/deftm-walked-body / -params / -tags) so compile-aot can
   consume the transform later, mirroring value+grad."
-  [f-var]
-  ;; Preparation and the scalar fold can both emit reverse-owned temporaries.
-  ;; Keep one context across the complete construction, inheriting an outer
-  ;; composer's counter exactly as HVP does, rather than resetting per phase.
-  (rev/call-with-shared-ad-gensym
-   (fn []
+  ([f-var] (source-jvp f-var nil))
+  ([f-var wrt]
+   ;; Preparation and the scalar fold can both emit reverse-owned temporaries.
+   ;; Keep one context across the complete construction, inheriting an outer
+   ;; composer's counter exactly as HVP does, rather than resetting per phase.
+   (rev/call-with-shared-ad-gensym
+    (fn []
      (let [resolved (rev/resolve-deftm-var f-var)
            m (meta resolved)
            params (or (:raster.core/deftm-params m)
@@ -595,14 +598,15 @@
                                   (with-meta base {:raster.type/tag tag})
                                   (with-meta base nil))))
                             params))
-           parameter-plan (rev/tangent-parameter-plan all-params tags nil)
+           parameter-plan (rev/tangent-parameter-plan all-params tags wrt)
            ;; Only positively known tangent spaces get tangent slots. Proven ⊥
            ;; parameters carry no tangent; Unknown was refused above.
            diff-params (:candidate-params parameter-plan)
            _ (when (empty? diff-params)
                (throw (ex-info (str "jvp: no differentiable params on " f-var
-                                    " — every param tag is ⊥ (no tangent space)")
-                               {:var f-var :tags tags})))
+                                    " — source JVP requires at least one selected, known tangent space")
+                               {:reason :ad-no-tangent-parameters
+                                :var f-var :tags tags :wrt wrt})))
            ;; Shared pre-AD prep (identical to the reverse path).
            prepared (rev/ad-prepare (first walked-body)
                                     (zipmap all-params tags))
@@ -629,20 +633,20 @@
           :raster.core/deftm true
           :raster.core/deftm-walked-body [qualified]
           :raster.core/deftm-params fn-params
-          :raster.core/deftm-tags out-tags})))))
+          :raster.core/deftm-tags out-tags}))))))
 
 (defn ^clojure.lang.IFn jvp
   "Construct value-and-directional-derivative. Default :representation :source retains
    existing AD. Opt-in :normalized-scalar uses the checked scalar bundle at runtime only;
-   :wrt selects tangent inputs there. :compile? true is not yet supported on that route."
+   :wrt selects tangent inputs on either route. :compile? true is not yet supported."
   ([f-var] (source-jvp f-var))
   ([f-var & {:keys [representation wrt compile?] :or {representation :source}}]
    (case representation
      :source (do
-               (when (or (some? wrt) compile?)
-                 (throw (ex-info "source JVP does not support :wrt or :compile?"
+               (when compile?
+                 (throw (ex-info "source JVP does not support :compile?"
                                  {:reason :ad-source-jvp-options :wrt wrt :compile? compile?})))
-               (source-jvp f-var))
+               (source-jvp f-var wrt))
      :normalized-scalar
      (do
        (when compile?

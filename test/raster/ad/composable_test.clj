@@ -188,6 +188,25 @@
       (is (= 8.0 val) "f(2) = 8")
       (is (= 12.0 dx) "df/dx = 3x^2 = 12"))))
 
+(deftest source-jvp-explicit-parameter-selection-test
+  (let [select-y ((requiring-resolve 'raster.ad.jvp/jvp) #'quad-loss :wrt [1])
+        reversed ((requiring-resolve 'raster.ad.jvp/jvp) #'quad-loss :wrt [1 0])]
+    (is (= [25.0 8.0] (select-y 3.0 4.0 1.0))
+        "unselected known primals retain their argument but have no tangent slot")
+    (is (= '[x y dy__jt]
+           (mapv #(symbol (name %)) (:raster.core/deftm-params (meta select-y)))))
+    (is (= [25.0 5.0] (reversed 3.0 4.0 0.5 0.25))
+        "selected tangent slots retain source parameter order, not request order"))
+  (doseq [[options expected]
+          [[[:wrt :x] :ad-wrt]
+           [[:wrt []] :ad-no-tangent-parameters]
+           [[:compile? true] :ad-source-jvp-options]]]
+    (is (= expected
+           (:reason (try (apply (requiring-resolve 'raster.ad.jvp/jvp)
+                                #'quad-loss options)
+                         nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
+
 (deftest unknown-tangent-parameter-admission-test
   (testing "missing type evidence cannot grant inactivity"
     (doseq [construct [(fn [] (rev/value+grad #'unknown-active-loss))
@@ -215,6 +234,11 @@
       (is (= :ad-unknown-tangent-space
              (:reason (try ((requiring-resolve 'raster.ad.jvp/jvp)
                             #'unknown-active-loss)
+                           nil
+                           (catch clojure.lang.ExceptionInfo e (ex-data e))))))
+      (is (= :ad-unknown-tangent-space
+             (:reason (try ((requiring-resolve 'raster.ad.jvp/jvp)
+                            #'unknown-active-loss :wrt [0])
                            nil
                            (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
   (testing "every public automatic/selected mode refuses Unknown before invocation"

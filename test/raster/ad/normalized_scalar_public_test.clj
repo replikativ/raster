@@ -122,8 +122,11 @@
     (is (= [-4.0 -0.5] (directional 2.0 3.0 0.5 -0.25)))))
 
 (deftest normalized-scalar-public-options-never-fall-back
-  (is (= :ad-source-jvp-options
+  (is (= :ad-no-tangent-parameters
          (try (jvp/jvp #'square :wrt []) nil
+              (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
+  (is (= :ad-source-jvp-options
+         (try (jvp/jvp #'square :compile? true) nil
               (catch clojure.lang.ExceptionInfo failure (:reason (ex-data failure))))))
   (doseq [construct [reverse/value+grad jvp/jvp]]
     (is (= :ad-representation

@@ -33,6 +33,8 @@ authorize changing the precision of an internal derivative.
 The first admission slice is deliberately conservative at public parameter boundaries:
 default selection includes all parameters and refuses Unknown; explicit `:wrt` can
 exclude unknown-typed controls. A named `reified-grad` parameter is an explicit selection.
+Source JVP accepts `:wrt` too: its arguments are all original primals followed by tangent
+arguments for selected parameters in source order; it requires a nonempty tangent selection.
 This does not establish inactivity through `stop-gradient` for an unknown-typed public
 parameter: use explicit exclusion. Internal generated locals and legacy scalar-loss seed
 fallbacks are not newly admitted or made more precise by this change. Proving inactivity

@@ -64,7 +64,7 @@
 (defn- refusal [construct target wrt]
   (try (if (= construct rev/value+grad)
          (construct target :mode :reverse :wrt wrt)
-         (construct target))
+         (construct target :wrt wrt))
        nil
        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
@@ -90,7 +90,7 @@
   (let [callee #(* % %)]
     (is (= 12.0 (inactive-parameter-core-name callee 3.0)))
     (is (= [12.0 nil 1.0] ((rev/value+grad #'inactive-parameter-core-name :mode :reverse :wrt [1]) callee 3.0)))
-    (is (= [12.0 1.0] ((jvp/jvp #'inactive-parameter-core-name) callee 3.0 1.0)))))
+    (is (= [12.0 1.0] ((jvp/jvp #'inactive-parameter-core-name :wrt [1]) callee 3.0 1.0)))))
 
 (deftest opaque-active-callees-fail-with-specific-contracts
   (is (= 9.0 (parameter-callee #(* % %) 3.0)))
@@ -125,7 +125,7 @@
     (is (= [:first :second] @state)))
   (doseq [[construct invoke expected]
           [[#(rev/value+grad % :mode :reverse :wrt [1]) #(%1 %2 2.0) [5.0 nil 1.0]]
-           [jvp/jvp #(%1 %2 2.0 1.0) [5.0 1.0]]]]
+           [#(jvp/jvp % :wrt [1]) #(%1 %2 2.0 1.0) [5.0 1.0]]]]
     (let [state (atom []) differentiated (construct #'inactive-effect-region)]
       (is (= [] @state))
       (is (= expected (invoke differentiated state)))
