@@ -985,10 +985,60 @@
     {:physical-inputs [] :output-values outputs
      :fresh-segmented-reductions [equation-id]}))
 
+(defn- admit-host-segmented-reduce-snapshot-program!
+  "Admit the exact pure primal pair used by a contraction node: one fresh segmented product
+   followed by one identity map that owns a snapshot of one external product operand. This is
+   not general mixed-graph admission; both equations retain their existing operation gates."
+  [program]
+  (let [facts (dialect/facts program)
+        [reduction copy :as equations] (dialect/equations program)
+        [reduction-program copy-program] (dialect/equation-subprograms program)
+        reduction-admission (admit-host-fresh-segmented-reduce-program! reduction-program)
+        copy-admission (admit-host-map-program! copy-program false)
+        reduction-parts (dialect/operation-parts reduction)
+        copy-parts (dialect/operation-parts copy)
+        reduction-results (vec (nth reduction 2))
+        copy-results (vec (nth copy 2))
+        reduction-operands (vec (concat (:arrays reduction-parts)
+                                        (:captures reduction-parts)))
+        {:keys [parameters locals body-results]} (dialect/lambda-parts (:lambda copy-parts))
+        copied (first (:arrays copy-parts))
+        snapshot (first copy-results)
+        copied-value (get-in facts [:values copied])
+        snapshot-value (get-in facts [:values snapshot])
+        outputs (dialect/outputs program)]
+    (when-not
+     (and (= 2 (count equations))
+          (= ['segmented-reduce 'map] (mapv dialect/operation-kind equations))
+          (empty? (:attributes facts)) (empty? (:effects facts)) (empty? (:aliases facts))
+          (= (set (:inputs facts)) (set reduction-operands))
+          (= (count (:inputs facts)) (count reduction-operands))
+          (= (set (keys (:values facts)))
+             (set (concat reduction-operands reduction-results copy-results)))
+          (= outputs (vec (concat reduction-results copy-results)))
+          (= 1 (count (:arrays copy-parts))) (empty? (:captures copy-parts))
+          (some #{copied} reduction-operands)
+          (not (some #{copied} reduction-results))
+          (= 1 (count parameters) (count body-results) (count copy-results))
+          (empty? locals)
+          (= (first parameters) (first body-results))
+          (= (:extent (:attributes copy-parts)) (first (:shape copied-value)))
+          (= copied-value (assoc snapshot-value :ownership (:ownership copied-value)))
+          (= :owned (:ownership snapshot-value))
+          (= (:output-values reduction-admission) reduction-results)
+          (= (:output-values copy-admission) copy-results))
+      (throw (ex-info "program is not one fresh segmented product with an owned operand snapshot"
+                      {:reason :typed-soac-host-segmented-reduce-snapshot-boundary
+                       :operations (mapv dialect/operation-kind equations)
+                       :inputs (:inputs facts) :outputs outputs})))
+    {:physical-inputs [] :output-values outputs
+     :fresh-segmented-reductions [(second reduction)]}))
+
 (defn materialize-host-program
   "Project the existing bounded primitive host subset by its actual TypedSOAC operations.
    Admits one map, one pure homogeneous common-extent map graph, one map→scalar reduction,
-   one fresh plain-host abstract-BLAS segmented reduction, or one sequential indexed effect map.
+   one fresh plain-host abstract-BLAS segmented reduction, that reduction followed by its exact
+   external-operand snapshot map, or one sequential indexed effect map.
    Uses the same strict operation/physical-owner checks as the specialized public APIs;
    graph projection preserves every equation/output in source order and adds no numerical
    semantics. Other equation graphs remain outside this boundary."
@@ -1003,8 +1053,14 @@
         ;; Selection grants no authority: the selected operation boundary still checks all facts.
         indexed? (or (some #(contains? #{:int :long} (:dtype (get values %))) arrays)
                      (some #(seq (:shape (get values %))) captures))
-        admitted (if (and (< 1 (count kinds)) (every? #{'map} kinds))
+        admitted (cond
+                   (and (< 1 (count kinds)) (every? #{'map} kinds))
                    (admit-host-map-graph-program! program)
+
+                   (= ['segmented-reduce 'map] kinds)
+                   (admit-host-segmented-reduce-snapshot-program! program)
+
+                   :else
                    (case kinds
                      [map] (if indexed? (admit-host-indexed-map-program! program)
                                         (admit-host-map-program! program false))
