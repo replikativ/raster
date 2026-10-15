@@ -1542,24 +1542,29 @@
                                {boundary boundary}
                                (into [result] (rest (soac/outputs map-program)))))))
 
-(defn- singleton-sum-map-activity! [map-interface]
+(defn- sum-map-activity! [map-interface]
   (let [active-inputs (:active-inputs map-interface)
         tangent-inputs (:tangent-inputs map-interface)
         gradient-outputs (:gradient-outputs map-interface)]
-    (when-not (= 1 (count active-inputs) (count tangent-inputs) (count gradient-outputs))
+    (when-not (and (vector? active-inputs) (seq active-inputs)
+                   (vector? tangent-inputs) (vector? gradient-outputs)
+                   (= (count active-inputs) (count tangent-inputs) (count gradient-outputs))
+                   (= (count active-inputs) (count (distinct active-inputs)))
+                   (= (count tangent-inputs) (count (distinct tangent-inputs)))
+                   (= (count gradient-outputs) (count (distinct gradient-outputs))))
       (fail! :ad-normalized-sum-interface
              {:active-inputs active-inputs :tangent-inputs tangent-inputs
               :gradient-outputs gradient-outputs}))
-    (first active-inputs)))
+    active-inputs))
 
 (defn- lift-sum-programs [bundle source interface]
   (let [[_ reduction] (soac/equations source)
         map-programs (:map-programs bundle)
         map-interface (:interface map-programs)
-        active-input (singleton-sum-map-activity! map-interface)
+        active-inputs (sum-map-activity! map-interface)
         map-result (first (soac/outputs (:source map-programs)))
         result (first (soac/outputs source))
-        {:keys [seed tangent-result gradient-result]} interface
+        {:keys [seed tangent-result gradient-results]} interface
         tangent-source (soac/remap-values source
                                          {map-result (:tangent-output map-interface)
                                           result tangent-result})
@@ -1582,36 +1587,45 @@
                             (assoc-in [:values seed] (get-in (soac/facts source) [:values result]))
                             (update :inputs #(conj (vec (remove #{(:cotangent-input map-interface)} %)) seed)))]
     (let [transpose (soac/make transpose-facts [transpose-equation] (soac/outputs transpose))
-          scalar-active? (= [] (get-in (soac/facts source) [:values active-input :shape]))
+          scalar-active? (= [] (get-in (soac/facts source) [:values (first active-inputs) :shape]))
           gradient-source (when scalar-active?
                             (soac/remap-values source {map-result (first (:gradient-outputs map-interface))
-                                                      result gradient-result}))]
+                                                      result (first gradient-results)}))]
+      (when (and scalar-active? (not= 1 (count active-inputs)))
+        (fail! :ad-normalized-sum-interface {:active-inputs active-inputs}))
       {:source source :interface interface
        :primal (append-ordered-sum (:primal map-programs) reduction source result)
        :linear (append-ordered-sum (:linear map-programs) tangent-reduction tangent-source tangent-result)
        :transpose (if scalar-active?
                     (append-ordered-sum transpose (second (soac/equations gradient-source))
-                                        gradient-source gradient-result)
+                                        gradient-source (first gradient-results))
                     transpose)})))
 
 (defn- validate-sum-programs! [{:keys [sum-programs source-ns] :as bundle}]
   (let [{:keys [source interface]} sum-programs
         projected (sum-source-map source source-ns)
-        ids (map interface [:seed :tangent-result])
-        active-input (singleton-sum-map-activity! (get-in bundle [:map-programs :interface]))
+        active-inputs (sum-map-activity! (get-in bundle [:map-programs :interface]))
+        gradient-results (:gradient-results interface)
+        fixed-ids ((juxt :seed :tangent-result) interface)
+        ids (into fixed-ids gradient-results)
         map-value-ids (set (mapcat #(keys (:values (soac/facts %)))
                                   (vals (select-keys (:map-programs bundle) [:primal :linear :transpose]))))
-        scalar-active? (= [] (get-in (soac/facts source) [:values active-input :shape]))]
+        scalar-active? (= [] (get-in (soac/facts source) [:values (first active-inputs) :shape]))]
     (when-not (and (fingerprint/equivalent? projected (get-in bundle [:map-programs :source]))
-                   (= #{:seed :tangent-result :gradient-result} (set (keys interface)))
+                   (= #{:seed :tangent-result :gradient-results} (set (keys interface)))
+                   (vector? gradient-results)
+                   (= (count active-inputs) (count gradient-results))
+                   (= (count gradient-results) (count (distinct gradient-results)))
                    (if scalar-active?
-                     (and (symbol? (:gradient-result interface))
-                          (not (contains? (into map-value-ids (concat ids (keys (:values (soac/facts source)))))
-                                          (:gradient-result interface))))
-                     (= (:gradient-result interface)
-                        (first (get-in bundle [:map-programs :interface :gradient-outputs]))))
+                     (and (= 1 (count active-inputs))
+                          (symbol? (first gradient-results))
+                          (not (contains? (into map-value-ids
+                                                (concat fixed-ids (keys (:values (soac/facts source)))))
+                                          (first gradient-results))))
+                     (= gradient-results
+                        (get-in bundle [:map-programs :interface :gradient-outputs])))
                    (every? symbol? ids) (= (count ids) (count (distinct ids)))
-                   (empty? (set/intersection (set ids)
+                   (empty? (set/intersection (set fixed-ids)
                                             (set (concat (keys (:values (soac/facts source)))
                                                          (mapcat #(keys (:values (soac/facts %)))
                                                                  (vals (select-keys (:map-programs bundle)
@@ -1629,16 +1643,15 @@
    Transpose consumes an explicit scalar seed. This entry constructs programs, not execution."
   ([source source-ns] (linearize-map-sum-program source source-ns {}))
   ([source source-ns options]
-   (when (and (vector? (:active-inputs options)) (< 1 (count (:active-inputs options))))
-     (fail! :ad-normalized-sum-boundary {:active-inputs (:active-inputs options)}))
    (let [map-source (sum-source-map source source-ns)
          bundle (build-map-programs map-source source-ns options)
          map-interface (get-in bundle [:map-programs :interface])
+         active-inputs (sum-map-activity! map-interface)
          scalar-active? (= [] (get-in (soac/facts map-source)
-                                      [:values (first (:active-inputs map-interface)) :shape]))
+                                      [:values (first active-inputs) :shape]))
          interface {:seed (gensym "ad_sum_seed_") :tangent-result (gensym "ad_sum_tangent_")
-                    :gradient-result (if scalar-active? (gensym "ad_sum_gradient_")
-                                         (first (:gradient-outputs map-interface)))}
+                    :gradient-results (if scalar-active? [(gensym "ad_sum_gradient_")]
+                                          (:gradient-outputs map-interface))}
          bundle (assoc bundle :sum-programs (lift-sum-programs bundle source interface))]
      (validate! (assoc bundle :certificate (certificate bundle))))))
 

@@ -104,7 +104,7 @@
   (let [bundle (normalized/linearize-map-sum-program
                 (source #'gaussian-double :double) *ns* {:active-input 'mu})
         transpose (get-in bundle [:sum-programs :transpose])
-        gradient (get-in bundle [:sum-programs :interface :gradient-result])
+        gradient (get-in bundle [:sum-programs :interface :gradient-results 0])
         changed (apply list (assoc (vec transpose) 1
                                    (assoc-in (soac/facts transpose) [:values gradient :shape] '[size])))
         forged (assoc-in bundle [:sum-programs :transpose] changed)

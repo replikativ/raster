@@ -1,5 +1,6 @@
 (ns raster.ad.normalized-map-sum-runtime-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-map-runtime :as runtime]
             [raster.ad.normalized-map-sum-test :as construction]
@@ -9,6 +10,9 @@
 (defn- build [source active]
   (normalized/linearize-map-sum-program source (the-ns 'raster.ad.normalized-map-sum-runtime-test)
                                         {:active-array active}))
+(defn- build-multi [source active]
+  (normalized/linearize-map-sum-program source (the-ns 'raster.ad.normalized-map-sum-runtime-test)
+                                        {:active-inputs active}))
 (defn- args [prepared environment] (mapv environment (:inputs prepared)))
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
@@ -19,6 +23,15 @@
                        (list 'map {:index 'i :extent 'size} '[xs weights] []
                              (soac/lambda-form '[x w] '[x])))]
     (soac/make (soac/facts source) [equation (second (soac/equations source))] '[loss])))
+(defn- product-source [dt]
+  (let [source (#'construction/source dt)
+        equation (list '= 'map-0 '[mapped]
+                       (list 'map {:index 'i :extent 'size} '[xs weights] []
+                             (soac/lambda-form '[x w] '[(raster.numeric/* x w)])))]
+    (soac/make (soac/facts source) [equation (second (soac/equations source))] '[loss])))
+(defn- fmul [left right] (float (* (float left) (float right))))
+(defn- fadd [left right] (float (+ (float left) (float right))))
+(defn- ordered-float-sum [values] (reduce fadd (float 0.0) values))
 
 (deftest host-hints-do-not-replace-retained-scalar-arithmetic
   (let [project #'route/project-host-scalar-hints
@@ -73,6 +86,83 @@
         (dotimes [i size] (aset gradient i (cast 777.0)))
         (is (= (mapv #(cast (* % -0.5)) coefficients)
                (vec (nth (pullback seed) (.indexOf ^java.util.List (:inputs prepared) active)))))))))
+
+(deftest ordered-multiple-active-product-sum-has-independent-host-math-and-snapshots
+  (doseq [[dt array cast] [[:float float-array float] [:double double-array double]]
+          n [0 3]]
+    (let [active '[weights xs]
+          bundle (build-multi (product-source dt) active)
+          owner (canonical/adapt-map-sum bundle)
+          prepared (runtime/prepare-owner owner)
+          xs0 (vec (take n [-2.0 0.5 3.0]))
+          weights0 (vec (take n [0.5 2.0 -1.0]))
+          dxs0 (vec (take n [-1.0 0.75 0.5]))
+          dweights0 (vec (take n [0.25 -0.5 2.0]))
+          xs (array xs0) weights (array weights0)
+          dxs (array dxs0) dweights (array dweights0)
+          arguments (args prepared {'xs xs 'weights weights 'size (long n)})
+          seed (cast -0.5)
+          [output pullback] ((:vjp prepared) arguments)
+          [jvp-output tangent] ((:jvp prepared) arguments [dweights dxs])
+          products (if (= dt :float) (mapv fmul xs0 weights0) (mapv * xs0 weights0))
+          tangent-lanes (if (= dt :float)
+                          (mapv #(fadd (fmul %1 %2) (fmul %3 %4))
+                                dxs0 weights0 dweights0 xs0)
+                          (mapv #(+ (* %1 %2) (* %3 %4)) dxs0 weights0 dweights0 xs0))
+          expected-output (cast (if (= dt :float) (ordered-float-sum products)
+                                    (reduce + 0.0 products)))
+          expected-tangent (cast (if (= dt :float) (ordered-float-sum tangent-lanes)
+                                     (reduce + 0.0 tangent-lanes)))]
+      (is (= active (get-in owner [:interface :active-inputs])))
+      (is (= active (mapv :source (get-in owner [:interface :tangent-inputs]))
+             (mapv :source (get-in owner [:interface :cotangent-results]))))
+      (is (= expected-output output jvp-output))
+      (is (= expected-tangent tangent))
+      (when (= dt :float)
+        (is (= (Float/floatToRawIntBits expected-output) (Float/floatToRawIntBits output)))
+        (is (= (Float/floatToRawIntBits expected-tangent) (Float/floatToRawIntBits tangent))))
+      ;; Both source arrays may change after acquisition: the pullback owns both coefficients.
+      (dotimes [i n] (aset xs i (cast 91.0)) (aset weights i (cast -73.0)))
+      (let [slots (pullback seed)
+            gx (nth slots (.indexOf ^java.util.List (:inputs prepared) 'xs))
+            gw (nth slots (.indexOf ^java.util.List (:inputs prepared) 'weights))
+            expected-gx (mapv #(cast (* seed %)) weights0)
+            expected-gw (mapv #(cast (* seed %)) xs0)]
+        (is (= expected-gx (vec gx)))
+        (is (= expected-gw (vec gw)))
+        (when (= dt :float)
+          (is (= (mapv #(Float/floatToRawIntBits %) expected-gx)
+                 (mapv #(Float/floatToRawIntBits %) (vec gx))))
+          (is (= (mapv #(Float/floatToRawIntBits %) expected-gw)
+                 (mapv #(Float/floatToRawIntBits %) (vec gw)))))
+        (is (nil? (nth slots (.indexOf ^java.util.List (:inputs prepared) 'size))))
+        (is (< (Math/abs (- (* (double seed) (double tangent))
+                            (+ (reduce + 0.0 (map * dweights0 (vec gw)))
+                               (reduce + 0.0 (map * dxs0 (vec gx))))))
+               (if (= dt :float) 1.0e-6 1.0e-12)))
+        (is (= expected-gx
+               (vec (nth (pullback seed) (.indexOf ^java.util.List (:inputs prepared) 'xs)))))
+        (is (= expected-gw
+               (vec (nth (pullback seed) (.indexOf ^java.util.List (:inputs prepared) 'weights)))))))))
+
+(deftest multiple-active-product-sum-double-gradient-has-coordinate-fd-oracle
+  (let [prepared (runtime/prepare (build-multi (product-source :double) '[weights xs]))
+        xs (double-array [-2.0 3.0]) weights (double-array [0.5 -1.0])
+        environment {'xs xs 'weights weights 'size (long 2)}
+        [_ pullback] ((:vjp prepared) (args prepared environment))
+        slots (pullback 0.25)]
+    (doseq [active '[xs weights]
+            i (range 2)]
+      (let [gradient (nth slots (.indexOf ^java.util.List (:inputs prepared) active))
+            h 1.0e-5
+            objective (fn [delta]
+                        (let [changed (aclone ^doubles (get environment active))
+                              _ (aset changed i (+ (aget changed i) delta))
+                              values (assoc environment active changed)]
+                          (* 0.25 (reduce + 0.0 (map * (seq ('xs values))
+                                                     (seq ('weights values)))))))
+            fd (/ (- (objective h) (objective (- h))) (* 2.0 h))]
+        (is (< (Math/abs (- fd (aget ^doubles gradient i))) 1.0e-10))))))
 
 (deftest ordinary-primal-coordinate-fd-checks-either-selected-array
   (doseq [[v dt array cast h tolerance]

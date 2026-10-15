@@ -3,6 +3,7 @@
             [raster.ad.normalized-device :as device]
             [raster.ad.normalized-map-sum-test]
             [raster.ad.normalized-program-bundle :as canonical]
+            [raster.ad.normalized-scalar :as normalized]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -22,6 +23,12 @@
 (defn- owner []
   (canonical/adapt-map-sum
    ((private-fn 'build) ((private-fn 'source) :float) 'xs)))
+
+(defn- multi-active-owner []
+  (canonical/adapt-map-sum
+   (normalized/linearize-map-sum-program
+    ((private-fn 'source) :float) (the-ns 'raster.ad.normalized-map-sum-test)
+    {:active-inputs '[weights xs]})))
 
 (defn- reordered-owner []
   (let [source ((private-fn 'source) :float)
@@ -240,6 +247,23 @@
                          owner (arguments owner (float-array 0) (float-array 0))
                          (float 1.0) {:target :ocl:normalized-sum}))))
         (is (zero? @compilations))))))
+
+(deftest multiple-active-map-sum-refuses-before-device-compilation-or-instantiation
+  (let [owner (multi-active-owner)
+        xs (float-array [1.0])
+        weights (float-array [2.0])
+        compilations (atom 0)
+        instantiations (atom 0)]
+    (with-redefs [equation-first/compile-typed
+                  (fn [& _] (swap! compilations inc) (throw (Exception. "compile observed")))
+                  link-module/instantiate!
+                  (fn [& _] (swap! instantiations inc) (throw (Exception. "instantiate observed")))]
+      (is (= :normalized-device-multi-active
+             (reason #(device/prepare-sum-owner
+                       owner (arguments owner xs weights) (float 1.0)
+                       {:target :ocl:normalized-sum})))))
+    (is (zero? @compilations))
+    (is (zero? @instantiations))))
 
 (defn- run-device-case! [target]
   (let [owner (owner)
