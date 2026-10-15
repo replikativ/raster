@@ -686,7 +686,7 @@
   primal)
 
 (declare validate! validate-map-proof! validate-indexed-proof! validate-map-programs!
-         validate-sum-programs! sum-source-map sole-map-scalar!)
+         validate-sum-programs! sum-source-map)
 
 (defn- validate-scalar-correspondence!
   [{:keys [primal linear transpose params tags active-inputs tangent-inputs residuals
@@ -1847,9 +1847,11 @@
                                            (first (soac/equations fused)))))
         nodewise? (and region? (< 2 (count fused-arrays)))
         requested (:active-inputs interface)]
-    (when-not (and (= :normalized-scalar (:authority proof))
+    (when-not (and (map? proof)
+                   (= :normalized-scalar (:authority proof))
                    (= #{:authority :nodes} (set (keys proof)))
                    (vector? submitted) (seq submitted)
+                   (every? map? submitted)
                    (vector? requested) (seq requested)
                    (= (count requested) (count (distinct requested))))
       (fail! :ad-normalized-map-node-proof {:proof proof :interface interface}))
@@ -1997,7 +1999,6 @@
     ;; Establish the exact surrounding map→sum source before that context permits the
     ;; existing scalar-active map stage during correspondence reconstruction.
     (sum-source-map (:source sum-programs) source-ns)
-    (sole-map-scalar! bundle)
     (validate-map-proof-correspondence! bundle)
     (validate-sum-programs! bundle)
     (when-not (= (:certificate bundle) (certificate bundle))
@@ -2484,26 +2485,8 @@
               :gradient-outputs gradient-outputs}))
     active-inputs))
 
-(defn- sole-map-scalar!
-  [bundle]
-  (let [proof (get-in bundle [:map-programs :proof])
-        nodes (:nodes proof)
-        node (when (vector? nodes) (first nodes))
-        scalar (:scalar-derivation node)]
-    (when-not (and (= :normalized-scalar (:authority proof))
-                   (vector? nodes)
-                   (= 1 (count nodes))
-                   (map? node)
-                   (= #{:source-equations :execution-equation :scalar-derivation
-                        :stage-interface :equation-ids}
-                      (set (keys node)))
-                   (map? scalar))
-      (fail! :ad-normalized-sum-map-boundary {:nodes nodes}))
-    scalar))
-
 (defn- lift-sum-programs [bundle source interface]
-  (let [scalar (sole-map-scalar! bundle)
-        [_ reduction] (soac/equations source)
+  (let [[_ reduction] (soac/equations source)
         map-programs (:map-programs bundle)
         map-interface (:interface map-programs)
         active-inputs (sum-map-activity! map-interface)
@@ -2515,13 +2498,21 @@
                                           result tangent-result})
         tangent-reduction (second (soac/equations tangent-source))
         transpose (:transpose map-programs)
-        transpose-equation (first (soac/equations transpose))
-        {:keys [attributes arrays captures lambda]} (soac/operation-parts transpose-equation)
+        transpose-equations (soac/equations transpose)
+        transpose-equation (first transpose-equations)
+        {:keys [kind attributes arrays captures lambda]} (soac/operation-parts transpose-equation)
         {:keys [parameters locals body-results]} (soac/lambda-parts lambda)
+        scalar-seed (first parameters)
+        _ (when-not (and (= 1 (count transpose-equations))
+                         (= 'map kind)
+                         (= (:cotangent-input map-interface) (first arrays))
+                         (symbol? scalar-seed))
+            (fail! :ad-normalized-sum-map-boundary
+                   {:transpose transpose :interface map-interface}))
         ;; Move the explicit per-lane dy parameter to a scalar capture, leaving its scalar AD
         ;; identity unchanged. No broadcast array, reduction of cotangents or second evaluator.
         transpose-lambda (soac/lambda-form
-                          (into (vec (rest parameters)) [(:cotangent-seed scalar)])
+                          (into (vec (rest parameters)) [scalar-seed])
                           (mapv (fn [{:keys [id dtype init]}] (soac/local-value id dtype init)) locals)
                           body-results)
         transpose-equation (list '= (second transpose-equation) (nth transpose-equation 2)

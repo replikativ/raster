@@ -176,6 +176,9 @@
              (reason #(normalized/execution-sources changed))))
       (is (false? (normalized/proof-source-namespaces-identical?
                    changed (:source-ns bundle)))))
+    (is (= :ad-normalized-map-node-proof
+           (reason #(normalized/validate!
+                     (recertify (assoc-in bundle node-path [1]))))))
     (let [pure (#'normalized/pure-proof-namespaces missing-ns)]
       (is (not (contains? (get-in pure (conj node-path 0 :primal-derivation))
                           :source-ns)))
