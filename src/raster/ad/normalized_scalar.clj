@@ -496,12 +496,17 @@
   [bundle]
   (cond
     (contains? bundle :map-programs)
-    (let [nodes (get-in bundle [:map-programs :proof :nodes])]
-      {:family :map :container-valid? (boolean (and (vector? nodes) (seq nodes)))
+    (let [proof (get-in bundle [:map-programs :proof])
+          nodes (:nodes proof)
+          additions (:accumulations proof)]
+      {:family :map :container-valid? (boolean (and (vector? nodes) (seq nodes)
+                                                   (or (not (contains? proof :accumulations))
+                                                       (and (vector? additions) (seq additions)))))
        :entries
-       (if-not (vector? nodes)
-         []
-         (mapv
+       (into
+        (if-not (vector? nodes)
+          []
+          (mapv
           (fn [index node]
             (let [scalar? (and (map? node) (contains? node :scalar-derivation))
                   primal? (and (map? node) (contains? node :primal-derivation))
@@ -514,7 +519,16 @@
               {:family :map :kind kind
                :path (when key [:map-programs :proof :nodes index key])
                :derivation (when key (get node key))}))
-          (range) nodes))})
+           (range) nodes))
+        (when (vector? additions)
+          (mapv (fn [index addition]
+                  {:family :map
+                   :kind (if (and (map? addition) (contains? addition :primal-derivation)
+                                  (not (contains? addition :scalar-derivation)))
+                           :primal-only :invalid)
+                   :path [:map-programs :proof :accumulations index :primal-derivation]
+                   :derivation (:primal-derivation addition)})
+                (range) additions)))})
 
     (contains? bundle :gather-programs)
     (let [proof (get-in bundle [:gather-programs :proof])
@@ -1676,9 +1690,31 @@
                [source (get-in port [port-key :id])]))
         (get-in node [:ports :active])))
 
+(defn- canonical-node-tangents [nodes]
+  (reduce (fn [ports node]
+            (reduce (fn [ports {:keys [source tangent]}]
+                      (if (contains? ports source) ports (assoc ports source tangent)))
+                    ports (get-in node [:ports :active])))
+          {} (filter :active? nodes)))
+
+(defn- node-linear-view [node tangents]
+  (let [program (get-in node [:stage :linear])
+        renames (into {}
+                      (keep (fn [{:keys [source tangent]}]
+                              (let [canonical (get tangents source)]
+                                (when (not= (:id tangent) (:id canonical))
+                                  (when-not (fingerprint/equivalent? (:value tangent) (:value canonical))
+                                    (fail! :ad-normalized-map-edge
+                                           {:source source :consumer tangent :canonical canonical}))
+                                  [(:id tangent) (:id canonical)]))))
+                      (get-in node [:ports :active]))]
+    ;; Shared public tangents are exact external inputs, not owned producer edges.
+    (if (seq renames) (soac/remap-values program renames) program)))
+
 (defn- compose-linear-nodes [nodes]
-  (let [active-nodes (filterv :active? nodes)]
-    (loop [program (get-in (first active-nodes) [:stage :linear])
+  (let [active-nodes (filterv :active? nodes)
+        tangents (canonical-node-tangents nodes)]
+    (loop [program (node-linear-view (first active-nodes) tangents)
            tangent-output (get-in (first active-nodes) [:ports :tangent-result :id])
            previous (:result (first active-nodes))
            remaining (next active-nodes)]
@@ -1688,17 +1724,74 @@
           (when-not tangent-input
             (fail! :ad-normalized-map-chain-boundary
                    {:previous previous :node (:execution-equation node)}))
-          (recur (append-map-node program (get-in node [:stage :linear])
+          (recur (append-map-node program (node-linear-view node tangents)
                                   {tangent-input tangent-output} [output])
                  output (:result node) (next remaining)))
         program))))
 
-(defn- compose-transpose-nodes [nodes requested]
+(defn- accumulation-allocated-ids [addition]
+  [(:equation addition) (:result addition)])
+
+(defn- cotangent-addition-stage
+  "Construct or replay a primal-only, typed non-nil grad-acc over one ordered contribution pair."
+  [phase-program source-ns outer left right submitted]
+  (let [values (:values (soac/facts phase-program))
+        value (get values left)
+        dt (:dtype value)
+        _ (when-not (and (instance? clojure.lang.Namespace source-ns)
+                         (contains? #{:float :double} dt) (= 1 (count (:shape value)))
+                         (= :owned (:ownership value))
+                         (fingerprint/equivalent? value (get values right)))
+            (fail! :ad-normalized-map-accumulation {:source outer :left left :right right}))
+        _ (when (and submitted
+                     (not (and (= #{:source :contributors :equation :result :primal-derivation}
+                                  (set (keys submitted)))
+                               (= outer (:source submitted))
+                               (= [left right] (:contributors submitted))
+                               (symbol? (:equation submitted)) (symbol? (:result submitted)))))
+            (fail! :ad-normalized-map-accumulation {:addition submitted :source outer
+                                                 :contributors [left right]}))
+        equation-id (if submitted (:equation submitted) (gensym "ad_accumulation_equation_"))
+        result (if submitted (:result submitted) (gensym "ad_accumulation_result_"))
+        params (mapv #(tagged % dt) '[ad_acc_left ad_acc_right])
+        scalar-result (tagged 'ad_acc_value dt)
+        expression (tagged (list 'raster.ad.reverse/grad-acc (first params) (second params)) dt)
+        raw (binding [*ns* source-ns]
+              (program (into (array-map) (map #(vector % (av/tensor {:dtype dt :shape []}))) params)
+                       [scalar-result expression] [scalar-result]))
+        interface {:params params :tags (vec (repeat 2 (tag dt)))
+                   :active-inputs [] :source-ns source-ns}
+        derivation {:source-ns source-ns :primal raw :interface interface}
+        _ (binding [*ns* source-ns] (validate-primal! raw params (:tags interface)))
+        _ (when (and submitted
+                     (not (and (identical? source-ns (get-in submitted [:primal-derivation :source-ns]))
+                               (identical? source-ns (get-in submitted [:primal-derivation :interface :source-ns]))
+                               (= #{:source-ns :primal :interface}
+                                  (set (keys (:primal-derivation submitted))))
+                               (fingerprint/equivalent? raw (get-in submitted [:primal-derivation :primal]))
+                               (fingerprint/equivalent?
+                                (dissoc interface :source-ns)
+                                (dissoc (get-in submitted [:primal-derivation :interface]) :source-ns)))))
+            (fail! :ad-normalized-map-accumulation {:addition submitted}))
+        attributes (select-keys (:attributes (soac/operation-parts (first (soac/equations phase-program))))
+                                [:index :extent])
+        stage (binding [*ns* source-ns]
+                (generated-map-program
+                 (assoc values result value) equation-id attributes [left right] []
+                 (scalar-program-lambda raw params [scalar-result]) [result] []))]
+    {:stage stage
+     :witness (or submitted {:source outer :contributors [left right] :equation equation-id
+                            :result result :primal-derivation derivation})}))
+
+(defn- compose-transpose-nodes
+  ([nodes requested] (:program (compose-transpose-nodes nodes requested nil nil)))
+  ([nodes requested source-ns submitted]
   (let [active-nodes (filterv :active? nodes)
         downstream (last active-nodes)
         initial-pairs (vec (node-derivative-port-map downstream :gradient))]
     (loop [program (get-in downstream [:stage :transpose])
            pairs initial-pairs
+           additions []
            remaining (next (reverse active-nodes))]
       (if-let [node (first remaining)]
         (let [boundary (:result node)
@@ -1709,20 +1802,48 @@
           (when-not cotangent
             (fail! :ad-normalized-map-chain-boundary
                    {:boundary boundary :node (:execution-equation node)}))
-          (recur (append-map-node program (get-in node [:stage :transpose])
-                                  {(get-in node [:ports :cotangent-input :id]) cotangent}
-                                  outputs)
-                 (into retained node-pairs) (next remaining)))
+          (let [appended (append-map-node program (get-in node [:stage :transpose])
+                                          {(get-in node [:ports :cotangent-input :id]) cotangent} outputs)
+                merged
+                (reduce
+                 (fn [{:keys [program pairs additions] :as state} [outer _]]
+                   (let [contributions (filterv #(= outer (first %)) pairs)]
+                     (if (= 1 (count contributions))
+                       state
+                       (do
+                         (when-not (and (= 2 (count contributions)) (some #{outer} requested))
+                           (fail! :ad-normalized-map-chain-boundary {:active outer :uses contributions}))
+                         (let [[left right] (mapv second contributions)
+                               retained-addition (when submitted (nth submitted (count additions) nil))
+                               _ (when (and submitted (nil? retained-addition))
+                                   (fail! :ad-normalized-map-accumulation {:position (count additions)}))
+                               {:keys [stage witness]}
+                               (cotangent-addition-stage program source-ns outer left right retained-addition)
+                               result (:result witness)
+                               combined (reduce (fn [out [source gradient]]
+                                                  (if (= source outer)
+                                                    (if (some #(= source (first %)) out) out
+                                                        (conj out [source result]))
+                                                    (conj out [source gradient]))) [] pairs)]
+                           {:program (append-map-node program stage {left left right right}
+                                                      (mapv second combined))
+                            :pairs combined :additions (conj additions witness)})))))
+                 {:program appended :pairs (into retained node-pairs) :additions additions}
+                 node-pairs)]
+            (recur (:program merged) (:pairs merged) (:additions merged) (next remaining))))
         (let [by-outer (into {} pairs)
               outputs (mapv by-outer requested)]
           (when-not (every? some? outputs)
             (fail! :ad-normalized-map-chain-boundary
                    {:requested requested :available (mapv first pairs)}))
-          (soac/make (soac/facts program) (soac/equations program) outputs))))))
+          (when (and submitted (not= (count submitted) (count additions)))
+            (fail! :ad-normalized-map-accumulation {:expected (count additions) :submitted (count submitted)}))
+          {:program (soac/make (soac/facts program) (soac/equations program) outputs)
+           :accumulations additions}))))))
 
 (defn- node-proof-interface [nodes requested]
   (let [active-nodes (filterv :active? nodes)
-        tangent-ports (into {} (mapcat #(node-derivative-port-map % :tangent) active-nodes))
+        tangent-ports (update-vals (canonical-node-tangents nodes) :id)
         gradient-ports (into {} (mapcat #(node-derivative-port-map % :gradient) active-nodes))
         coefficient-key (fn [node coefficient]
                           [(:execution-equation node) coefficient])]
@@ -1791,23 +1912,28 @@
             (fail! :ad-normalized-map-scalar-requires-sum
                    {:active-inputs requested}))
         _ (doseq [active requested]
-            (when-not (= 1 (count (get consumers active)))
+            (let [uses (get consumers active)]
+             (when-not (and (seq uses) (= (count uses) (count (distinct (map :consumer-index uses)))))
               (fail! :ad-normalized-map-chain-boundary
-                     {:active active :uses (get consumers active)})))
+                     {:active active :uses uses}))))
         {built :nodes active-values :active-values} (map-spine-nodes source source-ns nodes requested nil)
         _ (when-not (contains? active-values (first (soac/outputs source)))
             (fail! :ad-normalized-map-chain-boundary {:active-inputs requested}))
         interface (node-proof-interface built requested)
         primal (compose-primal-nodes built)
         linear (compose-linear-nodes built)
-        transpose (compose-transpose-nodes built requested)
+        transposed (compose-transpose-nodes built requested source-ns nil)
+        transpose (:program transposed)
+        additions (:accumulations transposed)
+        interface (cond-> interface (seq additions) (assoc :gradient-outputs (soac/outputs transpose)))
         witnesses (mapv #(dissoc % :stage :ports :result :active?) built)]
     {:source-ns source-ns
      :template-revision (templates/registry-revision)
      :compiler-revision (dispatch/compiler-definition-revision)
      :map-programs {:source source :primal primal :linear linear :transpose transpose
                     :interface interface
-                    :proof {:authority :normalized-scalar :nodes witnesses}}}))
+                    :proof (cond-> {:authority :normalized-scalar :nodes witnesses}
+                             (seq additions) (assoc :accumulations additions))}}))
 
 (defn- reconstructed-map-proof-map
   [{:keys [map-programs source-ns] :as bundle}]
@@ -1822,7 +1948,10 @@
         requested (:active-inputs interface)]
     (when-not (and (map? proof)
                    (= :normalized-scalar (:authority proof))
-                   (= #{:authority :nodes} (set (keys proof)))
+                   (or (= #{:authority :nodes} (set (keys proof)))
+                       (and nodewise? (= #{:authority :nodes :accumulations} (set (keys proof)))
+                            (vector? (:accumulations proof)) (seq (:accumulations proof))
+                            (every? map? (:accumulations proof))))
                    (vector? submitted) (seq submitted)
                    (every? map? submitted)
                    (vector? requested) (seq requested)
@@ -1830,7 +1959,13 @@
       (fail! :ad-normalized-map-node-proof {:proof proof :interface interface}))
     (if nodewise?
       (let [{source-nodes :nodes consumers :consumers} (graph-spine-description source)
-            allocated-ids (vec (mapcat node-allocated-ids submitted))
+            additions (:accumulations proof)
+            expected-additions (reduce + (map #(max 0 (dec (count (get consumers %)))) requested))
+            _ (when-not (and (= (pos? expected-additions) (contains? proof :accumulations))
+                             (= expected-additions (count additions)))
+                (fail! :ad-normalized-map-node-proof {:proof proof :interface interface}))
+            allocated-ids (vec (concat (mapcat node-allocated-ids submitted)
+                                       (mapcat accumulation-allocated-ids additions)))
             _ (when-not (every? (set fused-arrays) requested)
                 (fail! :ad-normalized-map-node-proof
                        {:active-inputs requested :source-arrays fused-arrays}))
@@ -1838,26 +1973,29 @@
                              (= (count allocated-ids) (count (distinct allocated-ids)))
                              (empty? (set/intersection
                                       (set allocated-ids)
-                                      (set (keys (:values (soac/facts source)))))))
+                                      (cond-> (set (keys (:values (soac/facts source))))
+                                        (seq additions) (into (map second equations))))))
                 (fail! :ad-normalized-map-node-interface {:allocated-ids allocated-ids}))
             _ (when-not (= (count source-nodes) (count submitted))
                 (fail! :ad-normalized-map-node-coverage
                        {:source (count source-nodes) :submitted (count submitted)}))
             _ (doseq [active requested]
-                (when-not (= 1 (count (get consumers active)))
-                  (fail! :ad-normalized-map-chain-boundary {:active active})))
+                (let [uses (get consumers active)]
+                 (when-not (and (seq uses) (= (count uses) (count (distinct (map :consumer-index uses)))))
+                  (fail! :ad-normalized-map-chain-boundary {:active active}))))
             {nodes :nodes active-values :active-values}
             (map-spine-nodes source source-ns source-nodes requested submitted)
             expected-interface (node-proof-interface nodes requested)]
         (when-not (contains? active-values (first (soac/outputs source)))
           (fail! :ad-normalized-map-chain-boundary {:active-inputs requested}))
-        {:source source
-         :primal (compose-primal-nodes nodes)
-         :linear (compose-linear-nodes nodes)
-         :transpose (compose-transpose-nodes nodes requested)
-         :interface expected-interface
-         :proof (assoc proof :nodes
-                       (mapv #(dissoc % :stage :ports :result :active?) nodes))})
+        (let [primal (compose-primal-nodes nodes)
+              linear (compose-linear-nodes nodes)
+              transposed (compose-transpose-nodes nodes requested source-ns (or additions []))]
+          {:source source :primal primal :linear linear :transpose (:program transposed)
+           :interface (cond-> expected-interface
+                        (seq additions) (assoc :gradient-outputs (soac/outputs (:program transposed))))
+           :proof (cond-> (assoc proof :nodes (mapv #(dissoc % :stage :ports :result :active?) nodes))
+                    (seq additions) (assoc :accumulations (:accumulations transposed)))}))
       (let [stage-source (or fused source)
             equation (first (soac/equations stage-source))
             [node] submitted
