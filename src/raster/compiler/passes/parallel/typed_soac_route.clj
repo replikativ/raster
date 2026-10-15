@@ -644,6 +644,11 @@
        (nil? (:placement value)) (nil? (:sharding value))
        (empty? (:effects value)) (empty? (:attributes value))))
 
+(defn- bounded-static-array? [value]
+  (and (vector? (:shape value)) (seq (:shape value))
+       (every? #(and (integer? %) (pos? %)) (:shape value))
+       (<= (reduce *' 1 (:shape value)) Integer/MAX_VALUE)))
+
 (defn- admit-host-map-program!
   [program reduce?]
   (let [facts (dialect/facts program)
@@ -725,56 +730,6 @@
                        :index (:index attributes)})))
     ;; Exact IDs may be keywords/vectors; they are not source expressions. Renaming every outer
     ;; value also avoids source-level collisions with casts and the map's lexical binders.
-    {:physical-inputs [] :output-values outputs}))
-
-(defn- admit-host-map-graph-program!
-  "Admit an ordered pure homogeneous map graph through the existing per-map host boundary.
-   This proves only that the unchanged graph can use the existing host realization loop; it
-   performs no fusion, pruning, numerical rewriting or AD-family selection."
-  [program]
-  (let [facts (dialect/facts program)
-        equations (dialect/equations program)
-        outputs (dialect/outputs program)
-        ;; This deliberately retains the dialect's validating batch projector. Avoiding its
-        ;; second whole-program validation would require an unchecked projection API.
-        subprograms (dialect/equation-subprograms program)
-        parts (mapv dialect/operation-parts equations)
-        results (mapv #(vec (nth % 2)) equations)
-        produced (set (mapcat identity results))
-        extents (mapv #(get-in % [:attributes :extent]) parts)
-        control-values (set (filter dialect/value-id? extents))
-        operand-values (vec (mapcat #(concat (:arrays %) (:captures %)) parts))
-        external-values (set (remove produced (concat operand-values control-values)))
-        values (:values facts)
-        result-values (mapv values (mapcat identity results))
-        data-values (mapv values operand-values)
-        array-values (mapv values (concat (mapcat :arrays parts) (mapcat identity results)))
-        common-dtype (:dtype (first result-values))
-        common-shape (dialect/extent-shape (first extents))
-        live-produced
-        (reduce (fn [live [part node-results]]
-                  (if (seq (set/intersection live (set node-results)))
-                    (into live (filter produced (concat (:arrays part) (:captures part))))
-                    live))
-                (set outputs) (reverse (map vector parts results)))]
-    (doseq [subprogram subprograms]
-      (admit-host-map-program! subprogram false))
-    (when-not
-     (and (< 1 (count equations))
-          (every? #(= 'map (:kind %)) parts)
-          (empty? (:effects facts)) (empty? (:aliases facts))
-          (empty? (set/intersection produced control-values))
-          (= produced (set/intersection produced live-produced))
-          (= (set (:inputs facts)) external-values)
-          (contains? #{:float :double} common-dtype)
-          (every? #(= common-dtype (:dtype %)) result-values)
-          (every? #(= common-dtype (:dtype %)) data-values)
-          (every? #(= common-shape (:shape %)) array-values)
-          (every? #(semantic/equivalent? (first extents) %) (rest extents))
-          (every? plain-host-value? (vals values)))
-      (throw (ex-info "program cannot be materialized as an ordered homogeneous host map graph"
-                      {:reason :typed-soac-host-map-graph-boundary
-                       :operations (mapv :kind parts) :outputs outputs})))
     {:physical-inputs [] :output-values outputs}))
 
 (defn- project-admitted-host
@@ -905,13 +860,6 @@
         operand-values (mapv values operand-ids)
         extents (vec (concat (map second segment-axes) [extent]))
         shape (when attributes (dialect/segmented-reduce-result-shape attributes))
-        static-array? (fn [value]
-                        (let [shape (:shape value)
-                              capacity (when (and (vector? shape)
-                                                  (seq shape)
-                                                  (every? #(and (integer? %) (pos? %)) shape))
-                                         (reduce *' 1 shape))]
-                          (and capacity (<= capacity Integer/MAX_VALUE))))
         capacity (when (every? integer? shape) (reduce *' 1 shape))
         dt (first dtypes)
         expected-arithmetic (when (contains? #{:float :double} dt)
@@ -967,7 +915,7 @@
           (= (set (keys values)) (set (conj operand-ids result)))
           (every? #(= % (av/make %)) (vals values))
           (not (some #{result} operand-ids)) (not (contains? source-free result))
-          (every? #(and (plain-host-value? %) (= dt (:dtype %)) (static-array? %))
+          (every? #(and (plain-host-value? %) (= dt (:dtype %)) (bounded-static-array? %))
                   operand-values)
           (map? read-requirements)
           (= (set operand-ids) (set (keys read-requirements)))
@@ -985,60 +933,107 @@
     {:physical-inputs [] :output-values outputs
      :fresh-segmented-reductions [equation-id]}))
 
-(defn- admit-host-segmented-reduce-snapshot-program!
-  "Admit the exact pure primal pair used by a contraction node: one fresh segmented product
-   followed by one identity map that owns a snapshot of one external product operand. This is
-   not general mixed-graph admission; both equations retain their existing operation gates."
+(defn- admit-host-ordered-pure-program!
+  "Admit an ordered pure graph through the existing operation-local host boundaries.
+   All-map graphs retain their homogeneous contract. Mixed graphs contain only maps and fresh
+   segmented reductions, with exact owned static storage at every cross-kind edge. This function
+   adds no fusion, pruning, arithmetic policy or execution semantics."
   [program]
   (let [facts (dialect/facts program)
-        [reduction copy :as equations] (dialect/equations program)
-        [reduction-program copy-program] (dialect/equation-subprograms program)
-        reduction-admission (admit-host-fresh-segmented-reduce-program! reduction-program)
-        copy-admission (admit-host-map-program! copy-program false)
-        reduction-parts (dialect/operation-parts reduction)
-        copy-parts (dialect/operation-parts copy)
-        reduction-results (vec (nth reduction 2))
-        copy-results (vec (nth copy 2))
-        reduction-operands (vec (concat (:arrays reduction-parts)
-                                        (:captures reduction-parts)))
-        {:keys [parameters locals body-results]} (dialect/lambda-parts (:lambda copy-parts))
-        copied (first (:arrays copy-parts))
-        snapshot (first copy-results)
-        copied-value (get-in facts [:values copied])
-        snapshot-value (get-in facts [:values snapshot])
-        outputs (dialect/outputs program)]
-    (when-not
-     (and (= 2 (count equations))
-          (= ['segmented-reduce 'map] (mapv dialect/operation-kind equations))
-          (empty? (:attributes facts)) (empty? (:effects facts)) (empty? (:aliases facts))
-          (= (set (:inputs facts)) (set reduction-operands))
-          (= (count (:inputs facts)) (count reduction-operands))
-          (= (set (keys (:values facts)))
-             (set (concat reduction-operands reduction-results copy-results)))
-          (= outputs (vec (concat reduction-results copy-results)))
-          (= 1 (count (:arrays copy-parts))) (empty? (:captures copy-parts))
-          (some #{copied} reduction-operands)
-          (not (some #{copied} reduction-results))
-          (= 1 (count parameters) (count body-results) (count copy-results))
-          (empty? locals)
-          (= (first parameters) (first body-results))
-          (= (:extent (:attributes copy-parts)) (first (:shape copied-value)))
-          (= copied-value (assoc snapshot-value :ownership (:ownership copied-value)))
-          (= :owned (:ownership snapshot-value))
-          (= (:output-values reduction-admission) reduction-results)
-          (= (:output-values copy-admission) copy-results))
-      (throw (ex-info "program is not one fresh segmented product with an owned operand snapshot"
-                      {:reason :typed-soac-host-segmented-reduce-snapshot-boundary
-                       :operations (mapv dialect/operation-kind equations)
-                       :inputs (:inputs facts) :outputs outputs})))
+        equations (dialect/equations program)
+        subprograms (dialect/equation-subprograms program)
+        parts (mapv dialect/operation-parts equations)
+        kinds (mapv :kind parts)
+        all-map? (every? #{'map} kinds)
+        results (mapv #(vec (nth % 2)) equations)
+        produced (set (mapcat identity results))
+        outputs (dialect/outputs program)
+        values (:values facts)
+        references
+        (mapv (fn [equation]
+                (into (vec (dialect/operation-inputs equation))
+                      (filter dialect/value-id? (dialect/operation-extents equation))))
+              equations)
+        live-produced
+        (reduce (fn [live [node-results node-references]]
+                  (if (seq (set/intersection live (set node-results)))
+                    (into live (filter produced node-references))
+                    live))
+                (set outputs) (reverse (map vector results references)))
+        admissions
+        (mapv (fn [kind subprogram]
+                (case kind
+                  map (admit-host-map-program! subprogram false)
+                  segmented-reduce (admit-host-fresh-segmented-reduce-program! subprogram)
+                  nil))
+              kinds subprograms)
+        producer-index
+        (into {} (mapcat (fn [index node-results]
+                           (map (fn [result] [result index]) node-results))
+                         (range) results))
+        mixed-edges
+        (mapcat (fn [consumer node-references]
+                  (keep (fn [id]
+                          (when-let [producer (get producer-index id)]
+                            (when (not= (nth kinds producer) (nth kinds consumer))
+                              [producer consumer id])))
+                        node-references))
+                (range) references)]
+    (when-not (and (< 1 (count equations))
+                   (or all-map? (= #{'map 'segmented-reduce} (set kinds)))
+                   (every? some? admissions)
+                   (every? empty? (map :physical-inputs admissions))
+                   (every? true? (map = (map :output-values admissions) results))
+                   (empty? (:effects facts)) (empty? (:aliases facts))
+                   (= produced (set/intersection produced live-produced))
+                   (= (set (:inputs facts))
+                      (set (remove produced (mapcat identity references))))
+                   (if all-map?
+                     (let [extents (mapv #(get-in % [:attributes :extent]) parts)
+                           control-values (set (filter dialect/value-id? extents))
+                           operand-values (vec (mapcat #(concat (:arrays %) (:captures %)) parts))
+                           result-values (mapv values (mapcat identity results))
+                           data-values (mapv values operand-values)
+                           array-values (mapv values
+                                              (concat (mapcat :arrays parts)
+                                                      (mapcat identity results)))
+                           common-dtype (:dtype (first result-values))
+                           common-shape (dialect/extent-shape (first extents))]
+                       (and (empty? (set/intersection produced control-values))
+                            (contains? #{:float :double} common-dtype)
+                            (every? #(= common-dtype (:dtype %)) result-values)
+                            (every? #(= common-dtype (:dtype %)) data-values)
+                            (every? #(= common-shape (:shape %)) array-values)
+                            (every? #(semantic/equivalent? (first extents) %) (rest extents))
+                            (every? plain-host-value? (vals values))))
+                     (and (empty? (:attributes facts))
+                          (= (set (keys values))
+                             (into #{} (mapcat #(keys (:values (dialect/facts %)))) subprograms))
+                          (every?
+                           (fn [[producer consumer id]]
+                             (let [value (get values id)]
+                               (and (plain-host-value? value)
+                                    (= :owned (:ownership value))
+                                    (bounded-static-array? value)
+                                    (= value (get-in (dialect/facts (nth subprograms producer))
+                                                     [:values id]))
+                                    (= value (get-in (dialect/facts (nth subprograms consumer))
+                                                     [:values id])))))
+                           mixed-edges))))
+      (throw (ex-info "program cannot be materialized as an ordered pure host equation graph"
+                      {:reason (if all-map?
+                                 :typed-soac-host-map-graph-boundary
+                                 :typed-soac-host-pure-graph-boundary)
+                       :operations kinds :inputs (:inputs facts) :outputs outputs})))
     {:physical-inputs [] :output-values outputs
-     :fresh-segmented-reductions [(second reduction)]}))
+     :fresh-segmented-reductions
+     (into [] (mapcat :fresh-segmented-reductions) admissions)}))
 
 (defn materialize-host-program
   "Project the existing bounded primitive host subset by its actual TypedSOAC operations.
-   Admits one map, one pure homogeneous common-extent map graph, one map→scalar reduction,
-   one fresh plain-host abstract-BLAS segmented reduction, that reduction followed by its exact
-   external-operand snapshot map, or one sequential indexed effect map.
+   Admits one map, ordered pure map graphs, ordered pure map/segmented-reduction graphs,
+   one map→scalar reduction, one fresh plain-host abstract-BLAS segmented reduction, or one
+   sequential indexed effect map.
    Uses the same strict operation/physical-owner checks as the specialized public APIs;
    graph projection preserves every equation/output in source order and adds no numerical
    semantics. Other equation graphs remain outside this boundary."
@@ -1054,17 +1049,16 @@
         indexed? (or (some #(contains? #{:int :long} (:dtype (get values %))) arrays)
                      (some #(seq (:shape (get values %))) captures))
         admitted (cond
-                   (and (< 1 (count kinds)) (every? #{'map} kinds))
-                   (admit-host-map-graph-program! program)
+                   (= '[map reduce] kinds)
+                   (admit-host-map-program! program true)
 
-                   (= ['segmented-reduce 'map] kinds)
-                   (admit-host-segmented-reduce-snapshot-program! program)
+                   (< 1 (count kinds))
+                   (admit-host-ordered-pure-program! program)
 
                    :else
                    (case kinds
                      [map] (if indexed? (admit-host-indexed-map-program! program)
                                         (admit-host-map-program! program false))
-                     [map reduce] (admit-host-map-program! program true)
                      [segmented-reduce] (admit-host-fresh-segmented-reduce-program! program)
                      [effect-map] (admit-host-indexed-map-program! program)
                      (throw (ex-info "unsupported primitive host program topology"
