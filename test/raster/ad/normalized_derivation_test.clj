@@ -4,6 +4,7 @@
             [raster.ad.normalized-scalar-test :as scalar-test]
             [raster.ad.normalized-scalar-public-test :as public]
             [raster.ad.normalized-map-element-test :as element]
+            [raster.ad.normalized-map-sum-test :as map-sum]
             [raster.ad.normalized-program-bundle :as canonical]
             [raster.ad.reverse :as reverse]
             [raster.ad.templates :as templates]
@@ -89,6 +90,22 @@
     (is (= :ad-normalized-derivation-correspondence (reason #(normalized/validate! changed))))
     ;; Recomputed inner AND outer certificates cannot authorize a matching forged map lift.
     (is (= :ad-normalized-derivation-correspondence (reason #(canonical/validate! envelope)))))))
+
+(deftest recertified-inner-scalar-arithmetic-is-not-sum-authority
+  (let [bundle (#'map-sum/build (#'map-sum/source :double) 'xs)
+        scalar-path [:map-programs :proof :nodes 0 :scalar-derivation]
+        changed (update-in bundle (conj scalar-path :linear) scale-result)
+        scalar (get-in changed scalar-path)
+        scalar (assoc scalar :certificate (#'normalized/certificate scalar))
+        changed (assoc-in changed scalar-path scalar)
+        changed (update changed :map-programs merge
+                        (#'normalized/construct-map-stage
+                         scalar (get-in changed [:map-programs :source])
+                         (get-in changed [:map-programs :interface])
+                         (get-in changed [:map-programs :proof :nodes 0 :equation-ids])))
+        changed (recertify changed)]
+    (is (= :ad-normalized-derivation-correspondence
+           (reason #(normalized/validate! changed))))))
 
 (deftest malformed-generation-never-falls-back-to-fresh-allocation
   (let [b (build) stream (:generation b) first-entry (first stream)

@@ -48,6 +48,7 @@
           size [0 3]]
     (let [program (source v dt)
           bundle (normalized/linearize-map-sum-program program *ns* {:active-input 'mu})
+          node (get-in bundle [:map-programs :proof :nodes 0])
           owner (canonical/adapt-map-sum bundle)
           prepared (runtime/prepare bundle)
           ys (array (take size [0.5 -0.25 1.0])) mu (cast 0.25) sigma (cast 1.7)
@@ -64,6 +65,11 @@
           fd (/ (- (v ys (cast (+ mu h)) sigma size) (v ys (cast (- mu h)) sigma size)) (* 2.0 h))
           original-reduction (soac/operation-parts (second (soac/equations program)))
           gradient-reduction (soac/operation-parts (second (soac/equations (:transpose owner))))]
+      (is (= 1 (count (get-in bundle [:map-programs :proof :nodes]))))
+      (is (:scalar-derivation node))
+      (is (not-any? #(contains? bundle %)
+                    [:primal :linear :transpose :params :active-inputs
+                     :tangent-inputs :residuals :cotangent-seed]))
       (is (= (v ys mu sigma size) value jvalue))
       (is (< (Math/abs (- oracle value)) arithmetic-tolerance))
       (is (< (Math/abs (- analytic gradient)) arithmetic-tolerance))

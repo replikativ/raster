@@ -94,7 +94,8 @@
                (reason #(normalized/validate! forged))))))
     (doseq [[tangent-inputs expected]
             [[nil :ad-normalized-map-interface]
-             [(apply list (:tangent-inputs map-interface)) :ad-normalized-sum-interface]
+             ;; The retained node proof owns exact stage-port shape before the sum consumer.
+             [(apply list (:tangent-inputs map-interface)) :ad-normalized-map-programs]
              [(vec (butlast (:tangent-inputs map-interface))) :ad-normalized-map-interface]
              [(vec (repeat 2 (first (:tangent-inputs map-interface)))) :ad-normalized-map-interface]
              [(vec (reverse (:tangent-inputs map-interface))) :ad-normalized-map-programs]]]
@@ -103,12 +104,50 @@
         (is (= expected
                (reason #(normalized/validate! forged))))))
     (doseq [[active-inputs expected] [[(vec (butlast active)) :ad-normalized-map-interface]
-                                      ['[weights weights] :ad-normalized-map-active-array]
+                                      ;; Ordered activity uniqueness is now a node-proof premise.
+                                      ['[weights weights] :ad-normalized-map-node-proof]
                                       [(vec (reverse active)) :ad-normalized-map-interface]]]
       (let [forged (assoc-in bundle [:map-programs :interface :active-inputs] active-inputs)
             forged (assoc forged :certificate (#'normalized/certificate forged))]
         (is (= expected
                (reason #(normalized/validate! forged))))))))
+
+(deftest map-sum-retains-one-node-proof-as-its-only-scalar-authority
+  (let [bundle (build (source :double) 'xs)
+        node (get-in bundle [:map-programs :proof :nodes 0])
+        other-ns (the-ns 'raster.ad.normalized-scalar)]
+    (is (= #{:source-ns :template-revision :compiler-revision
+             :map-programs :sum-programs :certificate}
+           (set (keys bundle))))
+    (is (:scalar-derivation node))
+    (is (not-any? #(contains? bundle %)
+                  [:primal :linear :transpose :params :active-inputs
+                   :tangent-inputs :residuals :cotangent-seed]))
+    ;; A malformed list containing a real namespace-bearing witness is rejected before
+    ;; certification; the certificate projector deliberately handles only valid node vectors.
+    (is (= :ad-normalized-sum-map-boundary
+           (reason #(normalized/validate!
+                     (assoc-in bundle [:map-programs :proof :nodes] (list node))))))
+    (doseq [[expected change]
+            [[:ad-normalized-sum-map-boundary
+              #(update-in % [:map-programs :proof] dissoc :nodes)]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] 1)]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] [1])]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] (list 1))]
+             [:ad-normalized-sum-map-boundary
+              #(assoc-in % [:map-programs :proof :nodes] [node node])]
+             [:ad-normalized-map-node-proof
+              #(assoc % :primal (get-in % [:map-programs :primal]))]
+             [:ad-normalized-map-node-proof
+              #(dissoc % :map-programs)]
+             [:ad-normalized-map-node-namespace
+              #(assoc-in % [:map-programs :proof :nodes 0
+                            :scalar-derivation :source-ns] other-ns)]]]
+      (let [forged (recertify (change bundle))]
+        (is (= expected (reason #(normalized/validate! forged))))))))
 
 (deftest checked-sum-retains-original-ordered-step-and-explicit-scalar-seed
   (doseq [dt [:float :double] active '[xs weights]]
@@ -130,7 +169,9 @@
       (is (= dt (:dtype (get-in (soac/facts (:transpose sums)) [:values seed]))))
       (is (= [] (:shape (get-in (soac/facts (:transpose sums)) [:values seed]))))
       (is (= seed (last captures)))
-      (is (= (:cotangent-seed bundle) (last (:parameters (soac/lambda-parts lambda)))))
+      (is (= (get-in bundle [:map-programs :proof :nodes 0
+                             :scalar-derivation :cotangent-seed])
+             (last (:parameters (soac/lambda-parts lambda)))))
       (is (= (set arrays) (set (vals (get-in bundle [:map-programs :interface :residual-arrays])))))
       (is (= #{:inputs :vjp :jvp} (set (keys (runtime/prepare bundle))))))))
 
@@ -252,7 +293,8 @@
         bundle (build source 'xs)
         transpose (:transpose (:sum-programs bundle))
         {:keys [arrays captures]} (soac/operation-parts (first (soac/equations transpose)))]
-    (is (empty? (:residuals bundle)))
+    (is (empty? (get-in bundle [:map-programs :proof :nodes 0
+                                :scalar-derivation :residuals])))
     (is (= [] arrays))
     (is (= [(get-in bundle [:sum-programs :interface :seed])] captures))
     (is (identical? transpose (soac/validate! transpose)))))
