@@ -72,6 +72,66 @@
 (defn- alter-facts [program f]
   (apply list (assoc (vec program) 1 (f (soac/facts program)))))
 
+(deftest equation-dataflow-retains-ordered-occurrences-and-separate-controls
+  (let [source (frontend/form->program
+                '(let* [left (raster.par/pmap i n float
+                                               (raster.numeric/* (clojure.core/aget x i)
+                                                                 (clojure.core/aget x i)))
+                        right (raster.par/pmap j n float
+                                                (raster.numeric/+ (clojure.core/aget x j)
+                                                                  (clojure.core/float 1.0)))]
+                       right)
+                {:dtype :float :array-types {'x :float} :scalar-types {'n :long}})
+        {:keys [nodes producers consumers controls]}
+        (#'normalized/equation-dataflow source)
+        equation-ids (mapv (comp second :equation) nodes)]
+    (is (= equation-ids (mapv :id nodes)))
+    (is (= [0 1] (mapv :consumer-index (get consumers 'x)))
+        "repeated data uses across consumers remain ordered occurrences")
+    (is (= [0 1] (mapv :consumer-index (get controls 'n)))
+        "extent references are ordered separately from executable operands")
+    (is (nil? (get consumers 'n)))
+    (is (= {:producer-index 1 :producer-id (second equation-ids) :position 0}
+           (get producers 'right)))
+    (is (every? true?
+                (map #(fingerprint/equivalent? (:equation %)
+                                               (first (soac/equations (:subprogram %))))
+                     nodes)))))
+
+(deftest equation-dataflow-batches-validation-and-defers-malformed-ssa-to-the-dialect
+  (let [source (typed-source square-chain-source)
+        original soac/validate!
+        calls (atom 0)]
+    (with-redefs [soac/validate! (fn [candidate]
+                                  (when (identical? candidate source) (swap! calls inc))
+                                  (original candidate))]
+      (#'normalized/equation-dataflow source))
+    (is (= 1 @calls)))
+  (let [source (typed-source square-chain-source)
+        equations (vec (soac/equations source))
+        first-id (second (first equations))
+        duplicate-id (apply list (assoc (vec (second equations)) 1 first-id))
+        malformed (list 'soac-program (soac/facts source)
+                        [(first equations) duplicate-id] (soac/outputs source))
+        failure (try (#'normalized/equation-dataflow malformed) nil
+                     (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= :typed-soac-equation-ids (:reason failure)))))
+
+(deftest equation-dataflow-does-not-weaken-distinct-outer-port-invariants
+  (let [source (typed-source square-chain-source)
+        equations (vec (soac/equations source))
+        equation (first equations)
+        operation (vec (nth equation 3))
+        ;; Repeated scalar-lambda use (x*x) belongs to scalar AD. Repeating one outer array
+        ;; port is malformed TypedSOAC and must be rejected before the dataflow projection.
+        duplicate-operation (apply list (assoc operation 2 '[x x]))
+        duplicate-equation (apply list (assoc (vec equation) 3 duplicate-operation))
+        malformed (list 'soac-program (soac/facts source)
+                        (assoc equations 0 duplicate-equation) (soac/outputs source))
+        failure (try (#'normalized/equation-dataflow malformed) nil
+                     (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= :typed-soac-operands (:reason failure)))))
+
 (deftest exact-two-map-source-owns-one-reconstructed-stage
   (let [source (typed-source square-chain-source)
         bundle (build source)

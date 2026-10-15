@@ -307,6 +307,20 @@
     (is (every? true? (map #(fingerprint/equivalent? %1 (first (soac/equations %2)))
                            (soac/equations program) projected)))))
 
+(deftest map-sum-topology-consumes-one-batch-projection
+  (let [program (source :double)
+        original soac/validate!
+        calls (atom 0)
+        projected (with-redefs [soac/validate! (fn [candidate]
+                                                (when (identical? candidate program)
+                                                  (swap! calls inc))
+                                                (original candidate))]
+                    (#'normalized/sum-source-map
+                     program (the-ns 'raster.ad.normalized-map-sum-test)))]
+    (is (= 1 @calls))
+    (is (fingerprint/equivalent? (first (soac/equations program))
+                                 (first (soac/equations projected))))))
+
 (deftest scalar-loss-preserves-map-result-physical-facts
   (let [program (source :double)
         bundle (build program 'xs)]
