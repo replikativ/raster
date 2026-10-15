@@ -85,15 +85,18 @@
                 (the-ns 'raster.ad.normalized-proof-lifetime-test))
         revision (normalized/revisions)
         v #'n/+ original @v original-meta (meta v)
-        validate-gather #'normalized/validate-gather-programs! check-gather @validate-gather]
+        gather-lifecycle #'normalized/gather-node-lifecycle
+        check-gather @gather-lifecycle]
     (try
       (with-redefs-fn
-        {validate-gather (fn [b scalar]
-                           (let [result (check-gather b scalar)]
-                             ;; Indexed correspondence has observed the generated ordered
-                             ;; scatter addition; mutate it before the one outer fence.
-                             (alter-var-root v (constantly (fn [& _] 99.0)))
-                             result))}
+        {gather-lifecycle
+         (fn [& args]
+           (let [result (apply check-gather args)]
+             ;; Only retained replay has arity two. It has observed the generated ordered
+             ;; scatter addition; mutate it before the one outer fence.
+             (when (= 2 (count args))
+               (alter-var-root v (constantly (fn [& _] 99.0))))
+             result))}
         #(is (= :ad-normalized-execution-callee
                 (reason (fn [] (normalized/validate! bundle))))))
       (is (= revision (normalized/revisions)))
