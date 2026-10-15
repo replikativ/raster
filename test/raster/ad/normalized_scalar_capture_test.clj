@@ -63,6 +63,7 @@
           oracle (reduce + 0.0 (map #(dist/logpdf (dist/->Normal (double mu) (double sigma))
                                                 (double %)) (seq ys)))
           fd (/ (- (v ys (cast (+ mu h)) sigma size) (v ys (cast (- mu h)) sigma size)) (* 2.0 h))
+          mapped-gradient (first (get-in bundle [:map-programs :interface :gradient-outputs]))
           original-reduction (soac/operation-parts (second (soac/equations program)))
           gradient-reduction (soac/operation-parts (second (soac/equations (:transpose owner))))]
       (is (= 1 (count (get-in bundle [:map-programs :proof :nodes]))))
@@ -78,6 +79,10 @@
       (is (= (class mu) (class value) (class gradient) (class tangent)))
       (is (= [] (get-in owner [:interface :tangent-inputs 0 :value :shape])
              (get-in owner [:interface :cotangent-results 0 :value :shape])))
+      (is (= '[size]
+             (get-in (soac/facts (get-in bundle [:map-programs :transpose]))
+                     [:values mapped-gradient :shape]))
+          "the node-local scalar-capture gradient remains mapped until the ordered sum")
       (is (= '[map reduce] (mapv (comp :kind soac/operation-parts) (soac/equations (:transpose owner)))))
       (is (fingerprint/equivalent? (dissoc original-reduction :arrays)
                                    (dissoc gradient-reduction :arrays)))

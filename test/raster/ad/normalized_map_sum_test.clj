@@ -94,8 +94,9 @@
                (reason #(normalized/validate! forged))))))
     (doseq [[tangent-inputs expected]
             [[nil :ad-normalized-map-interface]
-             ;; The retained node proof owns exact stage-port shape before the sum consumer.
-             [(apply list (:tangent-inputs map-interface)) :ad-normalized-map-programs]
+             ;; The shared node-port projection now rejects malformed cardinality/container
+             ;; before reconstructing and comparing the complete generated phase.
+             [(apply list (:tangent-inputs map-interface)) :ad-normalized-map-node-interface]
              [(vec (butlast (:tangent-inputs map-interface))) :ad-normalized-map-interface]
              [(vec (repeat 2 (first (:tangent-inputs map-interface)))) :ad-normalized-map-interface]
              [(vec (reverse (:tangent-inputs map-interface))) :ad-normalized-map-programs]]]
@@ -111,6 +112,21 @@
             forged (assoc forged :certificate (#'normalized/certificate forged))]
         (is (= expected
                (reason #(normalized/validate! forged))))))))
+
+(deftest jointly-reordered-node-ports-cannot-change-scalar-source-association
+  (let [bundle (normalized/linearize-map-sum-program
+                (source :double) (the-ns 'raster.ad.normalized-map-sum-test)
+                {:active-inputs '[weights xs]})
+        forged (-> bundle
+                   (update-in [:map-programs :proof :nodes 0 :stage-interface :active-inputs]
+                              #(vec (reverse %)))
+                   (update-in [:map-programs :proof :nodes 0 :stage-interface :tangent-inputs]
+                              #(vec (reverse %)))
+                   (update-in [:map-programs :proof :nodes 0 :stage-interface :gradient-outputs]
+                              #(vec (reverse %)))
+                   recertify)]
+    (is (= :ad-normalized-map-node-interface
+           (reason #(normalized/validate! forged))))))
 
 (deftest map-sum-retains-one-node-proof-as-its-only-scalar-authority
   (let [bundle (build (source :double) 'xs)
