@@ -1166,6 +1166,7 @@
           (when-not (and (not dispatch?)
                          (symbol? implementation-op)
                          (identical? #'raster.ad.reverse/grad-acc (resolve implementation-op))
+                         (raster.ad.reverse/approved-grad-acc-definition?)
                          (= 2 (count arguments))
                          (= [result-dtype result-dtype] argument-dtypes))
             (fail! :ad-normalized-scalar-accumulation

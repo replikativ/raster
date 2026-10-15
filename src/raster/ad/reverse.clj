@@ -165,6 +165,22 @@
       result)
     :else (numeric/+ a b)))
 
+(def ^:private approved-grad-acc-definition
+  ;; Capture the library's own definition, never whichever root first prepares an AD owner.
+  ;; Ordinary def deliberately refreshes this premise together with a legitimate source reload.
+  {:var #'grad-acc :root (.getRawRoot ^clojure.lang.Var #'grad-acc) :metadata (meta #'grad-acc)})
+
+(defn ^:no-doc approved-grad-acc-definition?
+  "Whether the exact library-owned helper definition still authorizes scalar addition projection.
+   This is a local definition premise, not a registry or protection against arbitrary source edits."
+  []
+  (let [v (ns-resolve 'raster.ad.reverse 'grad-acc)]
+    (boolean
+     (and (identical? v (:var approved-grad-acc-definition))
+          (.hasRoot ^clojure.lang.Var v)
+          (identical? (:root approved-grad-acc-definition) (.getRawRoot ^clojure.lang.Var v))
+          (= (:metadata approved-grad-acc-definition) (meta v))))))
+
 ;; Typed only when both adjoints share a tag: a known tag rules out nil, and
 ;; mixed scalar/array operands broadcast to the array, so no single arg decides.
 (op/register-result-type! 'raster.ad.reverse/grad-acc :common-arg-tag)

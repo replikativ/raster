@@ -75,6 +75,46 @@
                          {:raster.op/original 'raster.ad.reverse/grad-acc
                           :raster.type/tag 'double}))))))))
 
+(deftest accumulation-projection-refuses-helper-replacement-before-construction
+  (doseq [dtype [:float :double]]
+    (let [values {'left (scalar dtype) 'right (scalar dtype) 'result (scalar dtype)}
+          expression (accumulation dtype)
+          build #(normalized/linearize-map-program
+                  (#'element/map-program dtype)
+                  (the-ns 'raster.ad.normalized-scalar-accumulation-test))
+          bundle (build)
+          calls (atom 0)]
+      (with-redefs [reverse/grad-acc (fn [& _]
+                                     (swap! calls inc)
+                                     (throw (ex-info "projection must never invoke the replacement" {})))]
+        (is (false? (reverse/approved-grad-acc-definition?)))
+        (doseq [construct [#(project values 'result expression) build #(runtime/prepare bundle)]]
+          (is (= :ad-normalized-scalar-accumulation (reason construct))))
+        (is (zero? @calls) "definition/dispatch checks never invoke the unapproved helper"))
+      (is (true? (reverse/approved-grad-acc-definition?)))
+      (is (= '(raster.numeric/+ left right) (project values 'result expression)))
+      (is (map? (build)) "restoring the exact library root restores construction"))))
+
+(deftest accumulation-projection-refuses-helper-metadata-replacement
+  (doseq [dtype [:float :double]]
+    (let [v #'reverse/grad-acc original-metadata (meta v)
+          values {'left (scalar dtype) 'right (scalar dtype) 'result (scalar dtype)}
+          expression (accumulation dtype)
+          build #(normalized/linearize-map-program
+                  (#'element/map-program dtype)
+                  (the-ns 'raster.ad.normalized-scalar-accumulation-test))
+          bundle (build)]
+      (try
+        (alter-meta! v assoc ::unapproved true)
+        (is (false? (reverse/approved-grad-acc-definition?)))
+        (doseq [construct [#(project values 'result expression) build #(runtime/prepare bundle)]]
+          (is (= :ad-normalized-scalar-accumulation (reason construct))))
+        (finally (reset-meta! v original-metadata)))
+      (is (true? (reverse/approved-grad-acc-definition?)))
+      (is (= original-metadata (meta v)))
+      (is (= '(raster.numeric/+ left right) (project values 'result expression)))
+      (is (map? (build)) "restoring exact metadata restores construction"))))
+
 (deftest runtime-guard-retains-the-original-accumulation-helper-dependency
   (doseq [[dtype array cast] [[:double double-array double] [:float float-array float]]]
    (let [bundle (normalized/linearize-map-program
