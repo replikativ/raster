@@ -8,7 +8,7 @@ The current public boundary is deliberately smaller than general program differe
 
 | Canonical family | Host execution | Opt-in resident device execution | Preparation and call contract |
 | --- | --- | --- | --- |
-| Pure map or fully fusible closed homogeneous map region | Canonical primal/JVP/VJP of the rederived execution map, with retained residuals and ordered multiple active arrays | `normalized-device/prepare-owner` (one active input) | Concrete array geometry; array cotangent; exact residual dependency leases |
+| Pure map, supported fused homogeneous region, or bounded single-use map spine | Canonical primal/JVP/VJP with retained residuals and ordered multiple active arrays | `normalized-device/prepare-owner` (one boundary array, one active input; multi-node execution refuses) | Concrete array geometry; array cotangent; exact residual dependency leases |
 | Map followed by one ordered additive sum | Canonical primal/JVP/VJP with a scalar result and ordered multiple active arrays, or one active scalar capture | `normalized-device/prepare-sum-owner` (one active array) | Concrete array geometry; one exactly typed scalar cotangent fixed at preparation |
 | Functional indexed map | Canonical gather primal and sequential ordered transpose | `normalized-device/prepare-indexed-owner` | Static index/cotangent extent; data/gradient extent static or one private `m` fixed from the prepared data array; array cotangent |
 
@@ -25,8 +25,10 @@ source argument order. Host JVP retains the existing primitive-array argument fo
 with multiple active inputs it requires an exact vector of tangent arrays in activity order.
 VJP still returns cotangents in source argument order, with nil slots for inactive inputs. Saved
 coefficients are privately owned snapshots, so delayed pullbacks do not read subsequently mutated
-caller arrays. Closed map regions use the existing fusion pass to derive their checked
-single-map execution stage; no separate region derivative rule is added. A sum retains the exact
+caller arrays. Supported closed map regions use the existing fusion pass to derive their checked
+single-map execution stage; a previously unsupported spine with more than two boundary arrays
+instead composes checked equation-local scalar derivatives. No separate region derivative rule
+is added. A sum retains the exact
 original ordered reduction for its primal and tangent; its scalar seed feeds the existing
 per-lane transpose, which returns an ordered gradient array for each selected array. Singleton
 scalar-capture differentiation still appends the original ordered reduction to the gradient
@@ -128,8 +130,33 @@ name the ordered source-equation scope and exact fused scalar coefficient, rathe
 attributing every coefficient to the first producer. Execution reuses generated primal/JVP/VJP
 maps and the canonical owner, not a region runtime, cache or derivative rule. This is the
 execution-model contract specified under numerical semantics below, not a proof that AD commutes
-with fusion. Graphs that do not fully fuse, escaping intermediates, multiple public results,
-heterogeneous geometry/precision and effects remain outside this boundary.
+with fusion. Escaping intermediates, multiple public results, heterogeneous geometry/precision
+and effects remain outside this boundary.
+
+Plain-map derivation evidence now has one checked node-proof schema, rather than both a
+top-level scalar bundle and an independently described map lift. Each witness retains exact
+source-equation coverage, an execution equation, an existing scalar derivation (or checked
+primal-only projection for an inactive node), fixed stage ports and phase identities.
+Validation reprojects each scalar lane and replays its existing
+derivative rules before reconstructing the executable phases. Removing the proof does not
+restore an older plain-map validation path. Map-sum and indexed derivations retain their
+explicit transitional scalar adapters; this is not completion of all-family consolidation.
+
+Singletons and regions whose fused execution frontier has at most two arrays retain their
+existing one-witness programs and numerical model. Only a previously refused homogeneous
+single-use spine with more boundary arrays acquires source-ordered primal/JVP equations and
+reverse-ordered transpose equations. Internal active results and selected external arrays
+must not require cotangent accumulation across consumers. This is not arbitrary DAG AD or
+a claim that these spines cannot be fused by the ordinary compiler.
+
+Activity is derived across nodes. A node outside the selected derivative path retains only
+its checked primal, not synthetic tangent ports. Downstream derivatives save required values
+as fresh owned residuals, including values produced by such inactive nodes. Residual keys
+are qualified by execution equation, and each saved array names its actual producer.
+Generated ports are globally fresh. An internal read edge preserves every AbstractValue
+facet while relating a fresh owned producer to its checked read-use; composition then uses
+the ordinary pure-spine appender. No new evaluator, derivative registry or accumulation
+semantics is introduced. Public `deftm` semantics and the default source AD engine are unchanged.
 
 The shared host compiler materializer separately admits ordered pure homogeneous map graphs,
 including tuple results and multiple declared outputs. An intermediate may be consumed by a

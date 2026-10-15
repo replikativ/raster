@@ -78,7 +78,8 @@
                           [(list '= (second equation) (nth equation 2) operation)]
                           (soac/outputs source))
         bundle (build source)
-        calls (for [eq (soac/equations (:primal bundle))
+        scalar (get-in bundle [:map-programs :proof :nodes 0 :scalar-derivation])
+        calls (for [eq (soac/equations (:primal scalar))
                     term (tree-seq coll? seq (:lambda (soac/operation-parts eq)))
                     :when (and (seq? term) (= '.invk (first term)))] term)]
     (is (= 1 (count calls)))

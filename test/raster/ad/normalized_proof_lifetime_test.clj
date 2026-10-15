@@ -1,11 +1,33 @@
 (ns raster.ad.normalized-proof-lifetime-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.ad.normalized-map-element-test :as element]
             [raster.ad.normalized-scalar :as normalized]
             [raster.ad.normalized-prepared-owner-test :as owner]
             [raster.numeric :as n]))
 
 (defn- reason [f]
   (try (f) nil (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+
+(deftest node-scalar-and-outer-map-proof-share-one-derivative-dependency-fence
+  (let [bundle (normalized/linearize-map-program
+                (#'element/map-program :double {:body '(raster.math/exp element)})
+                (the-ns 'raster.ad.normalized-proof-lifetime-test))
+        revision (normalized/revisions)
+        v #'n/* original @v original-meta (meta v)
+        certificate #'normalized/certificate certify @certificate]
+    (try
+      (with-redefs-fn
+        {certificate (fn [b]
+                       (let [result (certify b)]
+                         ;; Scalar-proof certification has already replayed the derivative-only
+                         ;; multiplication. Mutate only after the enclosing map certificate.
+                         (when (contains? b :map-programs)
+                           (alter-var-root v (constantly (fn [& _] 99.0))))
+                         result))}
+        #(is (= :ad-normalized-execution-callee
+                (reason (fn [] (normalized/validate! bundle))))))
+      (is (= revision (normalized/revisions)))
+      (finally (alter-var-root v (constantly original)) (reset-meta! v original-meta)))))
 
 (deftest successful-proof-rechecks-actual-operation-observations
   (doseq [change [:value :metadata]]

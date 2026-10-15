@@ -329,6 +329,25 @@
                 '[x q]))
     (is (identical? bundle (normalized/validate! bundle)))))
 
+(deftest nodewise-map-composition-does-not-turn-a-scalar-capture-into-an-array-gradient
+  (let [source
+        (frontend/form->program
+         '(let* [paired (raster.par/pmap i n float
+                                         (raster.numeric/* (clojure.core/aget x i)
+                                                           (clojure.core/aget q i)))
+                 result (raster.par/pmap j n float
+                                         (raster.numeric/*
+                                          (raster.numeric/* (clojure.core/aget paired j)
+                                                            (clojure.core/aget r j))
+                                          scale))]
+                result)
+         {:dtype :float :array-types {'x :float 'q :float 'r :float}
+          :scalar-types {'n :long 'scale :float}})]
+    (is (= :ad-normalized-map-scalar-requires-sum
+           (reason #(normalized/linearize-map-chain-program
+                     source (the-ns 'raster.ad.normalized-map-chain-test)
+                     {:active-input 'scale}))))))
+
 (deftest zero-extent-retains-the-same-composition-evidence
   (let [source
         (frontend/form->program
@@ -441,6 +460,18 @@
                                             (clojure.core/aget r j)))]
                 combined)
          {:dtype :float :array-types {'x :float 'q :float 'r :float}
+          :scalar-types {'n :long}})
+        three-boundary-spine
+        (frontend/form->program
+         '(let* [paired (raster.par/pmap i n float
+                                         (raster.numeric/* (clojure.core/aget x i)
+                                                           (clojure.core/aget q i)))
+                 combined (raster.par/pmap j n float
+                                           (raster.numeric/*
+                                            (clojure.core/aget paired j)
+                                            (clojure.core/aget r j)))]
+                combined)
+         {:dtype :float :array-types {'x :float 'q :float 'r :float}
           :scalar-types {'n :long}})]
     (is (= :ad-normalized-map-chain-boundary
            (reason #(build one-map))))
@@ -454,9 +485,27 @@
                   {:active-inputs ['q 'x]})]
       (is (= ['q 'x] (get-in bundle [:map-programs :interface :active-inputs])))
       (is (identical? bundle (normalized/validate! bundle))))
+    (let [bundle (normalized/linearize-map-chain-program
+                  three-boundary-spine (the-ns 'raster.ad.normalized-map-chain-test)
+                  {:active-input 'x})
+          nodes (get-in bundle [:map-programs :proof :nodes])
+          residual (first (vals (get-in nodes [0 :stage-interface :residual-arrays])))
+          aliased (assoc-in bundle
+                            [:map-programs :proof :nodes 1 :stage-interface :tangent-inputs 0]
+                            residual)]
+      (is (= 2 (count nodes)))
+      (is (= (mapv second (soac/equations three-boundary-spine))
+             (mapv (comp first :source-equations) nodes)))
+      (is (every? :scalar-derivation nodes))
+      (is (identical? bundle (normalized/validate! bundle)))
+      (is (= :ad-normalized-map-node-proof
+             (reason #(normalized/validate!
+                       (recertify (update bundle :map-programs dissoc :proof))))))
+      (is (= :ad-normalized-map-node-interface
+             (reason #(normalized/validate! (recertify aliased))))))
     (doseq [[label source] [[:horizontal horizontal]
                             [:active-conversion conversion]
-                            [:three-fused-arrays three-fused-arrays]]]
+                            [:three-operand-node three-fused-arrays]]]
       (is (some? (reason #(build source))) (name label)))))
 
 (deftest effects-aliases-and-physical-storage-cannot-enter-chain-evidence
