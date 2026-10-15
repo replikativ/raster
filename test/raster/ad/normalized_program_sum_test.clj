@@ -41,7 +41,7 @@
           xs (array x0) weights (array w0) env {'xs xs 'weights weights 'size (long n)}
           dx (array (repeat n 0.25)) seed (cast -0.5)
           results (execute b :primal env) residuals (saved b results n)
-          tangent (first (execute b :linear (assoc residuals (get-in b [:interface :tangent-input :id]) dx)))
+          tangent (first (execute b :linear (assoc residuals (get-in b [:interface :tangent-inputs 0 :id]) dx)))
           [old-y pb] ((:vjp prepared) (mapv env (:inputs prepared)))
           old-gradient (nth (pb seed) (.indexOf ^java.util.List (:inputs prepared) active))
           gradient-env (assoc residuals (get-in b [:interface :cotangent-input :id]) seed)
@@ -95,7 +95,7 @@
     (let [p (#'sum-runtime/identity-source dt) b (canonical/adapt-map-sum (build p 'xs))
           x (array (take n [large 1.0 (- large)])) env {'xs x 'weights (array n) 'size (long n)}
           [y] (execute b :primal env)
-          [tangent] (execute b :linear {'size (long n) (get-in b [:interface :tangent-input :id]) x})
+          [tangent] (execute b :linear {'size (long n) (get-in b [:interface :tangent-inputs 0 :id]) x})
           [g] (execute b :transpose {'size (long n) (get-in b [:interface :cotangent-input :id]) (cast -0.0)})]
       (is (empty? (:residual-bindings b)))
       (is (empty? (:arrays (soac/operation-parts (first (soac/equations (:transpose b)))))))

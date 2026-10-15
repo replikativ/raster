@@ -70,6 +70,18 @@
 (defn- change-facts [program f]
   (apply list (assoc (vec program) 1 (f (soac/facts program)))))
 
+(deftest map-sum-explicitly-refuses-multiple-active-inputs
+  (let [program (source :double)
+        source-ns (the-ns 'raster.ad.normalized-map-sum-test)]
+    (is (= :ad-normalized-sum-boundary
+           (reason #(normalized/linearize-map-sum-program
+                     program source-ns {:active-inputs '[weights xs]}))))
+    (let [map-source (#'normalized/sum-source-map program source-ns)
+          multi-map (#'normalized/build-map-programs
+                     map-source source-ns {:active-inputs '[weights xs]})]
+      (is (= :ad-normalized-sum-interface
+             (reason #(#'normalized/lift-sum-programs multi-map program {})))))))
+
 (deftest checked-sum-retains-original-ordered-step-and-explicit-scalar-seed
   (doseq [dt [:float :double] active '[xs weights]]
     (let [source (source dt)
@@ -167,7 +179,13 @@
                                               change-facts (fn [facts] (assoc-in facts [:values 'loss :dtype] :float))))))))
     (is (= :ad-normalized-sum-interface
            (reason #(normalized/validate!
-                     (recertify (assoc-in bundle [:sum-programs :interface :seed] 'xs))))))))
+                     (recertify (assoc-in bundle [:sum-programs :interface :seed] 'xs))))))
+    (let [multi (-> bundle
+                    (assoc-in [:map-programs :interface :active-inputs] '[xs weights])
+                    (update-in [:map-programs :interface :tangent-inputs] conj 'forged-tangent)
+                    (update-in [:map-programs :interface :gradient-outputs] conj 'forged-gradient))]
+      (is (= :ad-normalized-map-interface
+             (reason #(normalized/validate! (recertify multi))))))))
 
 (deftest frontend-bookkeeping-is-checked-before-map-prefix-projection
   (let [source (source :double)

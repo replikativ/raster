@@ -50,7 +50,7 @@
       (is (= :owned (get-in (soac/facts primal) [:values residual :ownership])))
       (is (= '[n] (get-in (soac/facts primal) [:values residual :shape])))
       (is (= ['y residual] (soac/outputs primal)))
-      (is (= [(get interface :tangent-input) residual]
+      (is (= [(first (:tangent-inputs interface)) residual]
              (:arrays (soac/operation-parts (first (soac/equations linear))))))
       (is (= [(get interface :cotangent-input) residual]
              (:arrays (soac/operation-parts (first (soac/equations transpose))))))

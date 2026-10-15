@@ -35,6 +35,22 @@
    (normalized/linearize-map-program
     (map-program body) (the-ns 'raster.ad.normalized-device-test))))
 
+(defn- multi-active-owner []
+  (let [base (map-program '(raster.numeric/* element element))
+        tensor (get-in (soac/facts base) [:values 'x])
+        equation (list '= 'map-0 '[y]
+                       (list 'map {:index 'i :extent 'n} '[x weights] []
+                             (soac/lambda-form '[element weight] []
+                                               '[(raster.numeric/* element weight)])))
+        source (soac/make (-> (soac/facts base)
+                              (assoc-in [:values 'weights] tensor)
+                              (assoc :inputs '[n x weights]))
+                          [equation] '[y])]
+    (canonical/adapt-map
+     (normalized/linearize-map-program
+      source (the-ns 'raster.ad.normalized-device-test)
+      {:active-inputs '[weights x]}))))
+
 (defn- arguments [owner xs]
   (mapv (fn [{:keys [id]}] (case id n (long (count xs)) x xs))
         (get-in owner [:interface :inputs])))
@@ -156,9 +172,9 @@
         (is (= :owned (:ownership seed-abstract)))
         (is (= (dissoc (get-in owner [:interface :cotangent-input :value]) :shape :ownership)
                (dissoc seed-abstract :shape :ownership)))
-        (is (= (:ownership (get-in owner [:interface :cotangent-result :value]))
+        (is (= (:ownership (get-in owner [:interface :cotangent-results 0 :value]))
                (:ownership gradient-abstract)))
-        (is (= (dissoc (get-in owner [:interface :cotangent-result :value]) :shape)
+        (is (= (dissoc (get-in owner [:interface :cotangent-results 0 :value]) :shape)
                (dissoc gradient-abstract :shape)))
         (is (every? (comp nil? :source val)
                     (get-in @captured-module [:spine :nodes])))
@@ -236,6 +252,23 @@
     (is (= :normalized-device-target
            (reason #(device/prepare-owner
                      owner (arguments owner (float-array [1.0 2.0 3.0])) {}))))))
+
+(deftest multiple-active-map-refuses-before-device-compilation-or-instantiation
+  (let [owner (multi-active-owner)
+        compiles (atom 0)
+        instantiations (atom 0)
+        values {'n (long 2) 'x (float-array [1.0 2.0])
+                'weights (float-array [3.0 4.0])}
+        arguments (mapv #(get values (:id %)) (get-in owner [:interface :inputs]))]
+    (with-redefs [equation-first/compile-typed
+                  (fn [& _] (swap! compiles inc) (throw (Exception. "compile observed")))
+                  link-module/instantiate!
+                  (fn [& _] (swap! instantiations inc) (throw (Exception. "instantiate observed")))]
+      (is (= :normalized-device-multi-active
+             (reason #(device/prepare-owner
+                       owner arguments {:target :ocl:normalized-device}))))
+      (is (zero? @compiles))
+      (is (zero? @instantiations)))))
 
 (deftest post-run-staleness-closes-the-issued-lease-without-publication
   (let [owner (canonical-owner '(raster.numeric/* element element))

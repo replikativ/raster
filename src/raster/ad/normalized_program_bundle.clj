@@ -50,20 +50,33 @@
         execution-source (:source execution-scope)
         execution-source (or execution-source source)
         composed? (and plain-map? (< 1 (count (soac/equations source))))
-        {:keys [active-input tangent-input tangent-output cotangent-input gradient-output
+        {:keys [active-inputs tangent-inputs tangent-output cotangent-input gradient-outputs
                 residual-arrays scalar-captures]} (get-in bundle [:map-programs :interface])
         indexed-interface (:interface programs)
         source-parts (when indexed? (soac/operation-parts (first (soac/equations source))))
         index-input (when indexed? (first (:arrays source-parts)))
-        active-input (if indexed? (first (:captures source-parts)) active-input)
-        tangent-input (if indexed? (:tangent-input indexed-interface) tangent-input)
-        gradient-output (if indexed? (:gradient-output indexed-interface) gradient-output)
-        gradient-output (if sum? (get-in programs [:interface :gradient-result]) gradient-output)
+        active-inputs (if indexed? [(first (:captures source-parts))] active-inputs)
+        tangent-inputs (if indexed? [(:tangent-input indexed-interface)] tangent-inputs)
+        gradient-outputs (if indexed? [(:gradient-output indexed-interface)] gradient-outputs)
+        gradient-outputs (if sum? [(get-in programs [:interface :gradient-result])] gradient-outputs)
         tangent-output (if sum? (get-in bundle [:sum-programs :interface :tangent-result]) tangent-output)
         tangent-output (if indexed? (:tangent-output indexed-interface) tangent-output)
         cotangent-input (if sum? (get-in bundle [:sum-programs :interface :seed]) cotangent-input)
         cotangent-input (if indexed? (:cotangent-input indexed-interface) cotangent-input)
         inputs (:inputs (soac/facts source))
+        source-array-inputs (when plain-map?
+                              (:arrays (soac/operation-parts
+                                        (first (soac/equations execution-source)))))
+        _ (when-not (and (vector? active-inputs) (seq active-inputs)
+                         (= (count active-inputs) (count tangent-inputs) (count gradient-outputs))
+                         (= (count active-inputs) (count (distinct active-inputs)))
+                         (= (count tangent-inputs) (count (distinct tangent-inputs)))
+                         (= (count gradient-outputs) (count (distinct gradient-outputs)))
+                         (or (not (and plain-map? (< 1 (count active-inputs))))
+                             (every? (set source-array-inputs) active-inputs)))
+            (fail! :ad-program-bundle-composition
+                   {:active-inputs active-inputs :tangent-inputs tangent-inputs
+                    :gradient-outputs gradient-outputs :source-arrays source-array-inputs}))
         result (first (soac/outputs source))
         producer (second (first (soac/equations primal)))
         source-equation (second (first (soac/equations source)))
@@ -109,17 +122,20 @@
                 equation (second (first (soac/equations transpose)))]
             {id {:value (get-in (soac/facts transpose) [:values id])
                  :requirement required-zero-gradient
-                 :consumer {:equation equation :destination id :result gradient-output
-                            :alias (get-in (soac/facts transpose) [:equations equation :aliases gradient-output])}}})
+                 :consumer {:equation equation :destination id :result (first gradient-outputs)
+                            :alias (get-in (soac/facts transpose)
+                                           [:equations equation :aliases (first gradient-outputs)])}}})
           {})]
     (cond-> {:source source :primal primal :linear linear :transpose transpose
      :interface {:inputs (mapv #(value-interface source % %) inputs)
-                 :active-inputs [active-input]
+                 :active-inputs active-inputs
                  :primal-result (value-interface primal result result)
-                 :tangent-input (value-interface linear tangent-input active-input)
+                 :tangent-inputs (mapv #(value-interface linear %1 %2)
+                                       tangent-inputs active-inputs)
                  :tangent-result (value-interface linear tangent-output result)
                  :cotangent-input (value-interface transpose cotangent-input result)
-                 :cotangent-result (value-interface transpose gradient-output active-input)}
+                 :cotangent-results (mapv #(value-interface transpose %1 %2)
+                                          gradient-outputs active-inputs)}
      :residual-bindings residual-bindings :physical-bindings physical-bindings
      :derivation {:kind kind :bundle bundle}
      :source-ns (:source-ns bundle)}

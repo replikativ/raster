@@ -35,7 +35,7 @@
           outputs (invoke primal {'n n 'x x})
           snapshot (second outputs)
           residuals (zipmap (:outputs primal) outputs)
-          pushed (first (invoke push (assoc residuals 'n n (:tangent-input interface) dx)))
+          pushed (first (invoke push (assoc residuals 'n n (first (:tangent-inputs interface)) dx)))
           expected-pull (mapv #(cast (* 2.0 % -0.5)) (seq x))]
       (is (= (mapv #(cast (* % %)) (seq x)) (vec (first outputs))))
       (is (= (vec x) (vec snapshot)))

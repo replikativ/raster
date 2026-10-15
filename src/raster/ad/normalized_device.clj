@@ -54,15 +54,30 @@
     (check!)
     compiled))
 
+(defn- singleton-derivative-ports! [interface family]
+  (let [active-inputs (vec (:active-inputs interface))
+        tangent-inputs (vec (:tangent-inputs interface))
+        cotangent-results (vec (:cotangent-results interface))]
+    ;; Canonical validation has already established exact port correspondence. Device lowering is
+    ;; deliberately still the singleton slice, and must refuse before compilation/materialization.
+    (when-not (= 1 (count active-inputs) (count tangent-inputs) (count cotangent-results))
+      (fail! :normalized-device-multi-active
+             "normalized device execution does not yet support multiple active derivative ports"
+             {:family family :active-inputs active-inputs
+              :tangent-inputs (mapv :id tangent-inputs)
+              :cotangent-results (mapv :id cotangent-results)}))
+    {:active-id (first active-inputs)
+     :tangent (first tangent-inputs)
+     :gradient (first cotangent-results)}))
+
 (defn- map-interface! [owner]
   (let [interface (:interface owner)
         inputs (:inputs interface)
-        active-id (get-in interface [:cotangent-result :source])
+        {:keys [active-id gradient]} (singleton-derivative-ports! interface :map)
         active (some #(when (= active-id (:id %)) %) inputs)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)
         primal (:primal-result interface)
-        seed (:cotangent-input interface)
-        gradient (:cotangent-result interface)]
+        seed (:cotangent-input interface)]
     (when-not (and (= 1 (count arrays)) (= active (first arrays))
                    (= (:id primal) (:source seed))
                    (= active-id (:source gradient)))
@@ -85,14 +100,13 @@
 (defn- sum-interface! [owner]
   (let [interface (:interface owner)
         inputs (:inputs interface)
+        {:keys [active-id gradient]} (singleton-derivative-ports! interface :map-sum)
         active-ids (vec (:active-inputs interface))
-        active-id (first active-ids)
         active (some #(when (= active-id (:id %)) %) inputs)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)
         scalars (filterv #(empty? (get-in % [:value :shape])) inputs)
         primal (:primal-result interface)
-        seed (:cotangent-input interface)
-        gradient (:cotangent-result interface)]
+        seed (:cotangent-input interface)]
     (when-not (and (= 1 (count active-ids)) active
                    (some #(= active-id (:id %)) arrays)
                    (= (count inputs) (+ (count arrays) (count scalars)))
@@ -125,12 +139,11 @@
 (defn- indexed-interface! [owner residual-plan]
   (let [interface (:interface owner)
         inputs (:inputs interface)
-        active-id (get-in interface [:cotangent-result :source])
+        {:keys [active-id gradient]} (singleton-derivative-ports! interface :indexed-map)
         active (some #(when (= active-id (:id %)) %) inputs)
         arrays (filterv #(seq (get-in % [:value :shape])) inputs)
         primal (:primal-result interface)
         seed (:cotangent-input interface)
-        gradient (:cotangent-result interface)
         residuals (vals (:owned-arrays residual-plan))
         physicals (:physical-bindings residual-plan)
         [physical-id physical] (first physicals)
